@@ -357,7 +357,7 @@ spec:
                 "mcpServers": {
                   "paperclip": {
                     "command": "node",
-                    "args": ["${MCP_BRIDGE_JS}"]
+                    "args": ["--import", "/app/server/node_modules/tsx/dist/loader.mjs", "${MCP_BRIDGE_JS}"]
                   },
                   "prometheus": {
                     "type": "http",
