@@ -369,7 +369,7 @@ spec:
                   },
                   "kubernetes": {
                     "type": "sse",
-                    "url": "http://kubernetes-mcp-server-readonly.paperclip.svc.cluster.local:8080/sse"
+                    "url": "http://kubernetes-mcp-server-admin.paperclip.svc.cluster.local:8080/sse"
                   },
                   "github": {
                     "command": "/usr/local/bin/github-mcp-server",
