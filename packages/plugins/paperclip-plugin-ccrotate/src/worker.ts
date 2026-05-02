@@ -73,9 +73,60 @@ function runProcess(
 // Columns: active-marker (★ or space) · status (✓ or ✗) · email · tier ·
 // 5h:N% 7d:N% · availability text.
 
-const ROW_RE =
-  /^([★ ])\s*([✓✗])\s+(\S+@\S+)\s+(\S+)\s+5h:(\d+)% 7d:(\d+)%\s+(.+?)\s*$/u;
 const CACHE_AGE_RE = /^Cache:\s*(.+)$/;
+const UTIL_RE = /5h:(\d+)% 7d:(\d+)%/;
+// ccrotate ≥ the glyph-column patch emits one of these between health (✓/✗)
+// and the email column. Older ccrotate omits it; both forms parse here.
+const AVAIL_GLYPH_RE = /^[🟢🟡🔴🔵⏳❔]/u;
+
+function parseWhenRow(line: string): {
+  marker: string;
+  health: string;
+  availMark: string | null;
+  email: string;
+  tier: string;
+  util: { u5: number; u7: number } | null;
+  availability: string;
+} | null {
+  const trimmed = line.trimStart();
+  const marker = line.startsWith("★") ? "★" : " ";
+  let rest = trimmed.startsWith("★") ? trimmed.slice(1).trimStart() : trimmed;
+  if (!rest.startsWith("✓") && !rest.startsWith("✗")) return null;
+  const health = rest[0]!;
+  rest = rest.slice(1).trimStart();
+  let availMark: string | null = null;
+  const ag = AVAIL_GLYPH_RE.exec(rest);
+  if (ag) {
+    availMark = ag[0]!;
+    rest = rest.slice(ag[0]!.length).trimStart();
+  }
+  const tokens = rest.split(/\s+/);
+  if (tokens.length < 2) return null;
+  const email = tokens[0]!;
+  if (!email.includes("@")) return null;
+  const tailStart = rest.indexOf(email) + email.length;
+  const tail = rest.slice(tailStart).trim();
+  const tailTokens = tail.split(/\s+/);
+  if (tailTokens.length < 1) return null;
+  const tier = tailTokens[0]!;
+  const tierEnd = tail.indexOf(tier) + tier.length;
+  let postTier = tail.slice(tierEnd).trim();
+  let util: { u5: number; u7: number } | null = null;
+  const um = UTIL_RE.exec(postTier);
+  if (um) {
+    util = { u5: Number(um[1]), u7: Number(um[2]) };
+    postTier = postTier.replace(UTIL_RE, "").trim();
+  }
+  return {
+    marker,
+    health,
+    availMark,
+    email,
+    tier,
+    util,
+    availability: postTier,
+  };
+}
 
 function parseWhenOutput(target: CcrotateTarget, stdout: string): {
   cacheAge: string | null;
@@ -91,18 +142,17 @@ function parseWhenOutput(target: CcrotateTarget, stdout: string): {
       cacheAge = cm[1] ?? null;
       continue;
     }
-    const m = ROW_RE.exec(line);
-    if (!m) continue;
-    const [, marker, health, email, tier, u5, u7, availability] = m;
+    const parsed = parseWhenRow(line);
+    if (!parsed) continue;
     accounts.push({
-      email: email!,
+      email: parsed.email,
       target,
-      tier: tier!,
-      utilization5h: Number(u5),
-      utilization7d: Number(u7),
-      availability: availability!.trim(),
-      isActive: marker === "★",
-      isHealthy: health === "✓",
+      tier: parsed.tier,
+      utilization5h: parsed.util?.u5 ?? null,
+      utilization7d: parsed.util?.u7 ?? null,
+      availability: parsed.availability,
+      isActive: parsed.marker === "★",
+      isHealthy: parsed.health === "✓",
     });
   }
   return { cacheAge, accounts };
