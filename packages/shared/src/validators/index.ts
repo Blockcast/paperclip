@@ -34,9 +34,14 @@ export {
   createEnvironmentSchema,
   updateEnvironmentSchema,
   probeEnvironmentConfigSchema,
+  k8sEnvironmentConfigSchema,
+  tolerationSchema,
+  tolerationsArraySchema,
   type CreateEnvironment,
   type UpdateEnvironment,
   type ProbeEnvironmentConfig,
+  type K8sEnvironmentConfig,
+  type Toleration,
 } from "./environment.js";
 export {
   feedbackDataSharingPreferenceSchema,

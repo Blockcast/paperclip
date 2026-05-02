@@ -2,11 +2,16 @@ import { ChangeEvent, useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AGENT_ADAPTER_TYPES,
+  K8S_ADAPTERS,
   getAdapterEnvironmentSupport,
   type Environment,
   type EnvironmentProbeResult,
   type JsonSchema,
 } from "@paperclipai/shared";
+import {
+  buildK8sEnvironmentConfig,
+  parseTolerationsJson,
+} from "../lib/environment-form";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useToast } from "../context/ToastContext";
@@ -37,7 +42,7 @@ type AgentSnippetInput = {
 type EnvironmentFormState = {
   name: string;
   description: string;
-  driver: "local" | "ssh" | "sandbox";
+  driver: "local" | "ssh" | "sandbox" | "k8s";
   sshHost: string;
   sshPort: string;
   sshUsername: string;
@@ -48,9 +53,33 @@ type EnvironmentFormState = {
   sshStrictHostKeyChecking: boolean;
   sandboxProvider: string;
   sandboxConfig: Record<string, unknown>;
+  // K8s driver fields. The shared `k8sEnvironmentConfigSchema` is `.strict()`
+  // and rejects empty strings, so the submit handler builds a nested `config`
+  // object that omits blanks via `buildK8sEnvironmentConfig`.
+  k8sKubeconfigSecretRef: string;
+  k8sUseInClusterAuth: boolean;
+  k8sNamespace: string;
+  k8sServiceAccountName: string;
+  k8sNodeSelector: string;
+  k8sTolerations: string;
+  k8sLabels: string;
+  k8sImagePullPolicy: string;
+  k8sResourcesRequestsCpu: string;
+  k8sResourcesRequestsMemory: string;
+  k8sResourcesLimitsCpu: string;
+  k8sResourcesLimitsMemory: string;
+  k8sWorkspaceVolumeClaim: string;
+  k8sWorkspaceMountPath: string;
+  k8sSecretsNamespace: string;
+  k8sProviderAnthropicKind: "ccrotate";
+  k8sProviderAnthropicAccounts: string;
+  k8sProviderOpenaiKind: "ccrotate";
+  k8sProviderOpenaiAccounts: string;
 };
 
-const ENVIRONMENT_SUPPORT_ROWS = AGENT_ADAPTER_TYPES.map((adapterType) => ({
+// AGENT_ADAPTER_TYPES doesn't include the k8s-only adapters, so concatenate
+// them so the fallback row source matches the K8s column header.
+const ENVIRONMENT_SUPPORT_ROWS = [...AGENT_ADAPTER_TYPES, ...K8S_ADAPTERS].map((adapterType) => ({
   adapterType,
   support: getAdapterEnvironmentSupport(adapterType),
 }));
@@ -80,7 +109,9 @@ function buildEnvironmentPayload(form: EnvironmentFormState) {
               provider: form.sandboxProvider.trim(),
               ...form.sandboxConfig,
             }
-          : {},
+          : form.driver === "k8s"
+            ? buildK8sEnvironmentConfig(form)
+            : {},
   } as const;
 }
 
@@ -99,6 +130,25 @@ function createEmptyEnvironmentForm(): EnvironmentFormState {
     sshStrictHostKeyChecking: true,
     sandboxProvider: "",
     sandboxConfig: {},
+    k8sKubeconfigSecretRef: "",
+    k8sUseInClusterAuth: true,
+    k8sNamespace: "",
+    k8sServiceAccountName: "",
+    k8sNodeSelector: "",
+    k8sTolerations: "",
+    k8sLabels: "",
+    k8sImagePullPolicy: "",
+    k8sResourcesRequestsCpu: "",
+    k8sResourcesRequestsMemory: "",
+    k8sResourcesLimitsCpu: "",
+    k8sResourcesLimitsMemory: "",
+    k8sWorkspaceVolumeClaim: "",
+    k8sWorkspaceMountPath: "",
+    k8sSecretsNamespace: "",
+    k8sProviderAnthropicKind: "ccrotate",
+    k8sProviderAnthropicAccounts: "",
+    k8sProviderOpenaiKind: "ccrotate",
+    k8sProviderOpenaiAccounts: "",
   };
 }
 
@@ -129,6 +179,69 @@ function readSshConfig(environment: Environment) {
         ? config.strictHostKeyChecking
         : true,
   };
+}
+
+function formatKeyValueLines(value: unknown): string {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "";
+  return Object.entries(value as Record<string, unknown>)
+    .filter(([_, v]) => typeof v === "string")
+    .map(([k, v]) => `${k}=${v as string}`)
+    .join("\n");
+}
+
+function readK8sFormFromConfig(environment: Environment) {
+  const config = (environment.config ?? {}) as Record<string, unknown>;
+  const ref =
+    typeof config.kubeconfigSecretRef === "string" ? (config.kubeconfigSecretRef as string) : "";
+  const resources =
+    config.resources && typeof config.resources === "object" && !Array.isArray(config.resources)
+      ? (config.resources as { requests?: { cpu?: unknown; memory?: unknown }; limits?: { cpu?: unknown; memory?: unknown } })
+      : null;
+  return {
+    k8sKubeconfigSecretRef: ref,
+    k8sUseInClusterAuth: ref.length === 0,
+    k8sNamespace: typeof config.namespace === "string" ? (config.namespace as string) : "",
+    k8sServiceAccountName:
+      typeof config.serviceAccountName === "string" ? (config.serviceAccountName as string) : "",
+    k8sNodeSelector: formatKeyValueLines(config.nodeSelector),
+    k8sTolerations: Array.isArray(config.tolerations)
+      ? JSON.stringify(config.tolerations, null, 2)
+      : "",
+    k8sLabels: formatKeyValueLines(config.labels),
+    k8sImagePullPolicy:
+      typeof config.imagePullPolicy === "string" ? (config.imagePullPolicy as string) : "",
+    k8sResourcesRequestsCpu:
+      resources?.requests && typeof resources.requests.cpu === "string" ? resources.requests.cpu : "",
+    k8sResourcesRequestsMemory:
+      resources?.requests && typeof resources.requests.memory === "string"
+        ? resources.requests.memory
+        : "",
+    k8sResourcesLimitsCpu:
+      resources?.limits && typeof resources.limits.cpu === "string" ? resources.limits.cpu : "",
+    k8sResourcesLimitsMemory:
+      resources?.limits && typeof resources.limits.memory === "string"
+        ? resources.limits.memory
+        : "",
+    k8sWorkspaceVolumeClaim:
+      typeof config.workspaceVolumeClaim === "string" ? (config.workspaceVolumeClaim as string) : "",
+    k8sWorkspaceMountPath:
+      typeof config.workspaceMountPath === "string" ? (config.workspaceMountPath as string) : "",
+    k8sSecretsNamespace:
+      typeof config.secretsNamespace === "string" ? (config.secretsNamespace as string) : "",
+    k8sProviderAnthropicKind: "ccrotate" as const,
+    k8sProviderAnthropicAccounts: formatProviderAccounts(config.providers, "anthropic"),
+    k8sProviderOpenaiKind: "ccrotate" as const,
+    k8sProviderOpenaiAccounts: formatProviderAccounts(config.providers, "openai"),
+  };
+}
+
+function formatProviderAccounts(providers: unknown, key: string): string {
+  if (!providers || typeof providers !== "object" || Array.isArray(providers)) return "";
+  const entry = (providers as Record<string, unknown>)[key];
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return "";
+  const accounts = (entry as Record<string, unknown>).accounts;
+  if (!Array.isArray(accounts)) return "";
+  return accounts.filter((a) => typeof a === "string").join("\n");
 }
 
 function readSandboxConfig(environment: Environment) {
@@ -515,6 +628,18 @@ export function CompanySettings() {
       return;
     }
 
+    if (environment.driver === "k8s") {
+      const k8s = readK8sFormFromConfig(environment);
+      setEnvironmentForm({
+        ...createEmptyEnvironmentForm(),
+        name: environment.name,
+        description: environment.description ?? "",
+        driver: "k8s",
+        ...k8s,
+      });
+      return;
+    }
+
     setEnvironmentForm({
       ...createEmptyEnvironmentForm(),
       name: environment.name,
@@ -586,7 +711,15 @@ export function CompanySettings() {
     (environmentForm.driver !== "sandbox" ||
       environmentForm.sandboxProvider.trim().length > 0 &&
       environmentForm.sandboxProvider !== "fake" &&
-      Object.keys(sandboxConfigErrors).length === 0);
+      Object.keys(sandboxConfigErrors).length === 0) &&
+    (environmentForm.driver !== "k8s" ||
+      (
+        // Either in-cluster auth, or non-empty kubeconfig secret ref.
+        (environmentForm.k8sUseInClusterAuth ||
+          environmentForm.k8sKubeconfigSecretRef.trim().length > 0) &&
+        // Tolerations textarea must be empty or valid JSON array.
+        parseTolerationsJson(environmentForm.k8sTolerations) !== null
+      ));
 
   return (
     <div className="max-w-2xl space-y-6">
@@ -764,6 +897,7 @@ export function CompanySettings() {
                   <th className="py-2 pr-3 font-medium">Adapter</th>
                   <th className="px-3 py-2 font-medium">Local</th>
                   <th className="px-3 py-2 font-medium">SSH</th>
+                  <th className="px-3 py-2 font-medium">K8s</th>
                   {sandboxSupportVisible ? (
                     <th className="px-3 py-2 font-medium">Sandbox</th>
                   ) : null}
@@ -783,6 +917,9 @@ export function CompanySettings() {
                     </td>
                     <td className="px-3 py-2">
                       <SupportMark supported={support.drivers.ssh === "supported"} />
+                    </td>
+                    <td className="px-3 py-2">
+                      <SupportMark supported={support.drivers.k8s === "supported"} />
                     </td>
                     {sandboxSupportVisible ? (
                       <td className="px-3 py-2">
@@ -834,6 +971,21 @@ export function CompanySettings() {
                               return `${displayName} sandbox provider${summary ? ` · ${summary}` : ""}`;
                             })()}
                           </div>
+                        ) : environment.driver === "k8s" ? (
+                          <div className="text-xs text-muted-foreground">
+                            {(() => {
+                              const ns =
+                                typeof environment.config.namespace === "string"
+                                  ? (environment.config.namespace as string)
+                                  : "(driver default namespace)";
+                              const auth =
+                                typeof environment.config.kubeconfigSecretRef === "string" &&
+                                  (environment.config.kubeconfigSecretRef as string).length > 0
+                                  ? `kubeconfig: ${environment.config.kubeconfigSecretRef as string}`
+                                  : "in-cluster auth";
+                              return `${ns} · ${auth}`;
+                            })()}
+                          </div>
                         ) : (
                           <div className="text-xs text-muted-foreground">Runs on this Paperclip host.</div>
                         )}
@@ -850,7 +1002,9 @@ export function CompanySettings() {
                               ? "Testing..."
                               : environment.driver === "ssh"
                                 ? "Test connection"
-                                : "Test provider"}
+                                : environment.driver === "k8s"
+                                  ? "Test cluster"
+                                  : "Test provider"}
                           </Button>
                         ) : null}
                         <Button
@@ -903,7 +1057,7 @@ export function CompanySettings() {
                   onChange={(e) => setEnvironmentForm((current) => ({ ...current, description: e.target.value }))}
                 />
               </Field>
-              <Field label="Driver" hint="Local runs on this host. SSH stores a remote machine target. Sandbox stores plugin-backed provider config on the shared environment seam.">
+              <Field label="Driver" hint="Local runs on this host. SSH stores a remote machine target. Kubernetes runs adapter pods in a cluster. Sandbox stores plugin-backed provider config on the shared environment seam.">
                 <select
                   className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
                   value={environmentForm.driver}
@@ -929,10 +1083,13 @@ export function CompanySettings() {
                           ? "local"
                           : e.target.value === "sandbox"
                             ? "sandbox"
-                            : "ssh",
+                            : e.target.value === "k8s"
+                              ? "k8s"
+                              : "ssh",
                     }))}
                 >
                   <option value="ssh">SSH</option>
+                  <option value="k8s">Kubernetes</option>
                   {sandboxCreationEnabled || environmentForm.driver === "sandbox" ? (
                     <option value="sandbox">Sandbox</option>
                   ) : null}
@@ -1069,6 +1226,270 @@ export function CompanySettings() {
                         This provider does not declare additional configuration fields.
                       </div>
                     )}
+                  </div>
+                </div>
+              ) : null}
+
+              {environmentForm.driver === "k8s" ? (
+                <div className="grid gap-3 md:grid-cols-2">
+                  <div className="md:col-span-2">
+                    <ToggleField
+                      label="In-cluster auth"
+                      hint="When enabled, Paperclip authenticates using its own pod's service account (the kubeconfig secret is ignored). Disable to point at an external cluster via a stored kubeconfig secret."
+                      checked={environmentForm.k8sUseInClusterAuth}
+                      onChange={(checked) =>
+                        setEnvironmentForm((current) => ({
+                          ...current,
+                          k8sUseInClusterAuth: checked,
+                        }))}
+                    />
+                  </div>
+                  <Field
+                    label="Kubeconfig secret"
+                    hint="Name of a Paperclip secret holding a kubeconfig YAML. Required unless 'In-cluster auth' is on."
+                  >
+                    <input
+                      className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none disabled:opacity-50"
+                      type="text"
+                      placeholder="kubeconfig-prod"
+                      value={environmentForm.k8sKubeconfigSecretRef}
+                      disabled={environmentForm.k8sUseInClusterAuth}
+                      onChange={(e) =>
+                        setEnvironmentForm((current) => ({
+                          ...current,
+                          k8sKubeconfigSecretRef: e.target.value,
+                        }))}
+                    />
+                  </Field>
+                  <Field label="Namespace" hint="Namespace where adapter pods are scheduled. Defaults to the driver's configured namespace.">
+                    <input
+                      className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
+                      type="text"
+                      placeholder="paperclip"
+                      value={environmentForm.k8sNamespace}
+                      onChange={(e) =>
+                        setEnvironmentForm((current) => ({ ...current, k8sNamespace: e.target.value }))}
+                    />
+                  </Field>
+                  <Field label="Service account" hint="ServiceAccount the adapter pod runs as. Optional.">
+                    <input
+                      className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
+                      type="text"
+                      placeholder="paperclip-runner"
+                      value={environmentForm.k8sServiceAccountName}
+                      onChange={(e) =>
+                        setEnvironmentForm((current) => ({
+                          ...current,
+                          k8sServiceAccountName: e.target.value,
+                        }))}
+                    />
+                  </Field>
+                  <Field label="Image pull policy" hint="Pull policy for adapter container images.">
+                    <select
+                      className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
+                      value={environmentForm.k8sImagePullPolicy}
+                      onChange={(e) =>
+                        setEnvironmentForm((current) => ({
+                          ...current,
+                          k8sImagePullPolicy: e.target.value,
+                        }))}
+                    >
+                      <option value="">(driver default)</option>
+                      <option value="Always">Always</option>
+                      <option value="IfNotPresent">IfNotPresent</option>
+                      <option value="Never">Never</option>
+                    </select>
+                  </Field>
+                  <Field label="Workspace volume claim" hint="Name of a PersistentVolumeClaim providing the workspace volume mounted into adapter pods.">
+                    <input
+                      className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
+                      type="text"
+                      placeholder="paperclip-workspace"
+                      value={environmentForm.k8sWorkspaceVolumeClaim}
+                      onChange={(e) =>
+                        setEnvironmentForm((current) => ({
+                          ...current,
+                          k8sWorkspaceVolumeClaim: e.target.value,
+                        }))}
+                    />
+                  </Field>
+                  <Field label="Workspace mount path" hint="Absolute path in the adapter pod where the workspace volume is mounted.">
+                    <input
+                      className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
+                      type="text"
+                      placeholder="/workspace"
+                      value={environmentForm.k8sWorkspaceMountPath}
+                      onChange={(e) =>
+                        setEnvironmentForm((current) => ({
+                          ...current,
+                          k8sWorkspaceMountPath: e.target.value,
+                        }))}
+                    />
+                  </Field>
+                  <Field label="Secrets namespace" hint="Namespace where Paperclip-managed Kubernetes Secrets live. Defaults to the same namespace as the adapter pod.">
+                    <input
+                      className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
+                      type="text"
+                      placeholder="paperclip-secrets"
+                      value={environmentForm.k8sSecretsNamespace}
+                      onChange={(e) =>
+                        setEnvironmentForm((current) => ({
+                          ...current,
+                          k8sSecretsNamespace: e.target.value,
+                        }))}
+                    />
+                  </Field>
+                  <Field label="Requests CPU" hint="Pod CPU request, e.g. 500m or 1.">
+                    <input
+                      className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
+                      type="text"
+                      placeholder="500m"
+                      value={environmentForm.k8sResourcesRequestsCpu}
+                      onChange={(e) =>
+                        setEnvironmentForm((current) => ({
+                          ...current,
+                          k8sResourcesRequestsCpu: e.target.value,
+                        }))}
+                    />
+                  </Field>
+                  <Field label="Requests memory" hint="Pod memory request, e.g. 1Gi.">
+                    <input
+                      className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
+                      type="text"
+                      placeholder="1Gi"
+                      value={environmentForm.k8sResourcesRequestsMemory}
+                      onChange={(e) =>
+                        setEnvironmentForm((current) => ({
+                          ...current,
+                          k8sResourcesRequestsMemory: e.target.value,
+                        }))}
+                    />
+                  </Field>
+                  <Field label="Limits CPU" hint="Pod CPU limit, e.g. 1.">
+                    <input
+                      className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
+                      type="text"
+                      placeholder="1"
+                      value={environmentForm.k8sResourcesLimitsCpu}
+                      onChange={(e) =>
+                        setEnvironmentForm((current) => ({
+                          ...current,
+                          k8sResourcesLimitsCpu: e.target.value,
+                        }))}
+                    />
+                  </Field>
+                  <Field label="Limits memory" hint="Pod memory limit, e.g. 2Gi.">
+                    <input
+                      className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
+                      type="text"
+                      placeholder="2Gi"
+                      value={environmentForm.k8sResourcesLimitsMemory}
+                      onChange={(e) =>
+                        setEnvironmentForm((current) => ({
+                          ...current,
+                          k8sResourcesLimitsMemory: e.target.value,
+                        }))}
+                    />
+                  </Field>
+                  <div className="md:col-span-2">
+                    <Field label="Node selector" hint="One key=value pair per line. Pods are scheduled on nodes matching all entries.">
+                      <textarea
+                        className="h-24 w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-xs font-mono outline-none"
+                        placeholder="tier=runner&#10;zone=us-east-1a"
+                        value={environmentForm.k8sNodeSelector}
+                        onChange={(e) =>
+                          setEnvironmentForm((current) => ({
+                            ...current,
+                            k8sNodeSelector: e.target.value,
+                          }))}
+                      />
+                    </Field>
+                  </div>
+                  <div className="md:col-span-2">
+                    <Field label="Labels" hint="One key=value pair per line. Applied as pod labels.">
+                      <textarea
+                        className="h-24 w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-xs font-mono outline-none"
+                        placeholder="app=paperclip&#10;team=core"
+                        value={environmentForm.k8sLabels}
+                        onChange={(e) =>
+                          setEnvironmentForm((current) => ({ ...current, k8sLabels: e.target.value }))}
+                      />
+                    </Field>
+                  </div>
+                  <div className="md:col-span-2">
+                    <Field label="Tolerations" hint="JSON array of Kubernetes toleration objects. Leave blank if not needed.">
+                      <textarea
+                        className="h-32 w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-xs font-mono outline-none"
+                        placeholder='[{"key":"dedicated","operator":"Equal","value":"paperclip","effect":"NoSchedule"}]'
+                        value={environmentForm.k8sTolerations}
+                        onChange={(e) =>
+                          setEnvironmentForm((current) => ({
+                            ...current,
+                            k8sTolerations: e.target.value,
+                          }))}
+                      />
+                      {parseTolerationsJson(environmentForm.k8sTolerations) === null ? (
+                        <div className="mt-1 text-xs text-destructive">
+                          Tolerations must be a JSON array.
+                        </div>
+                      ) : null}
+                    </Field>
+                  </div>
+                  <div className="md:col-span-2">
+                    <div className="mb-2 text-sm font-medium">Provider pools</div>
+                    <div className="text-xs text-muted-foreground mb-3">
+                      Constrain ccrotate to a subset of accounts at preRun. One email per line (or comma-separated). Leave blank to use the global pool.
+                    </div>
+                    <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                      <Field label="Anthropic accounts" hint="Used by claude_k8s adapters. Passed as `ccrotate next --target claude --accounts <csv>`.">
+                        <select
+                          aria-label="Anthropic pool kind"
+                          className="mb-2 w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-xs outline-none"
+                          value={environmentForm.k8sProviderAnthropicKind}
+                          onChange={(e) =>
+                            setEnvironmentForm((current) => ({
+                              ...current,
+                              k8sProviderAnthropicKind: e.target.value as "ccrotate",
+                            }))}
+                        >
+                          <option value="ccrotate">ccrotate</option>
+                        </select>
+                        <textarea
+                          className="h-24 w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-xs font-mono outline-none"
+                          placeholder={"omar.ramadan@blockcast.net\nbot1@blockcast.net"}
+                          value={environmentForm.k8sProviderAnthropicAccounts}
+                          onChange={(e) =>
+                            setEnvironmentForm((current) => ({
+                              ...current,
+                              k8sProviderAnthropicAccounts: e.target.value,
+                            }))}
+                        />
+                      </Field>
+                      <Field label="OpenAI accounts" hint="Used by opencode_k8s adapters. Passed as `ccrotate next --target codex --accounts <csv>`.">
+                        <select
+                          aria-label="OpenAI pool kind"
+                          className="mb-2 w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-xs outline-none"
+                          value={environmentForm.k8sProviderOpenaiKind}
+                          onChange={(e) =>
+                            setEnvironmentForm((current) => ({
+                              ...current,
+                              k8sProviderOpenaiKind: e.target.value as "ccrotate",
+                            }))}
+                        >
+                          <option value="ccrotate">ccrotate</option>
+                        </select>
+                        <textarea
+                          className="h-24 w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-xs font-mono outline-none"
+                          placeholder={"omar@blockcast.net\nprinceomz2004@gmail.com"}
+                          value={environmentForm.k8sProviderOpenaiAccounts}
+                          onChange={(e) =>
+                            setEnvironmentForm((current) => ({
+                              ...current,
+                              k8sProviderOpenaiAccounts: e.target.value,
+                            }))}
+                        />
+                      </Field>
+                    </div>
                   </div>
                 </div>
               ) : null}

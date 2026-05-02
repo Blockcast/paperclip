@@ -54,3 +54,4 @@ export {
   redactTranscriptEntryPaths,
 } from "./log-redaction.js";
 export { inferOpenAiCompatibleBiller } from "./billing.js";
+export { mergeEnvironmentConfig } from "./merge-environment-config.js";

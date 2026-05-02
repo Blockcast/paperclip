@@ -47,10 +47,59 @@ export interface AdapterSandboxExecutionTarget {
   runner?: CommandManagedRuntimeRunner;
 }
 
+/**
+ * Resolved configuration for executing inside a Kubernetes Pod.
+ *
+ * The shared environment driver builds this from the persisted config schema
+ * (see `@paperclipai/shared` k8s env config) by resolving any `kubeconfig`
+ * secret reference into the literal kubeconfig contents (or `null` for
+ * in-cluster auth). Adapters MUST NOT re-read secrets — `kubeconfig` here is
+ * already the credential to use.
+ */
+export interface K8sRemoteSpec {
+  /** Resolved kubeconfig content (from secret ref). null = use in-cluster auth. */
+  kubeconfig: string | null;
+  namespace: string | null;
+  workspaceVolumeClaim: string | null;
+  workspaceMountPath: string | null;
+  secretsNamespace: string | null;
+  nodeSelector: Record<string, string>;
+  tolerations: ReadonlyArray<{
+    key: string;
+    operator?: "Equal" | "Exists";
+    value?: string;
+    effect?: "NoSchedule" | "PreferNoSchedule" | "NoExecute";
+  }>;
+  labels: Record<string, string>;
+  serviceAccountName: string | null;
+  imagePullPolicy: "Always" | "IfNotPresent" | "Never" | null;
+  resources: {
+    requests?: { cpu?: string; memory?: string };
+    limits?: { cpu?: string; memory?: string };
+  } | null;
+  /**
+   * Per-provider credential pools. When set the adapter constrains its
+   * ccrotate rotation to just the listed accounts; undefined leaves
+   * rotation unconstrained.
+   */
+  providers?: Record<string, { kind: "ccrotate"; accounts: ReadonlyArray<string> }>;
+}
+
+export interface AdapterK8sExecutionTarget {
+  kind: "remote";
+  transport: "k8s";
+  environmentId?: string | null;
+  leaseId?: string | null;
+  remoteCwd: string;
+  paperclipApiUrl?: string | null;
+  config: K8sRemoteSpec;
+}
+
 export type AdapterExecutionTarget =
   | AdapterLocalExecutionTarget
   | AdapterSshExecutionTarget
-  | AdapterSandboxExecutionTarget;
+  | AdapterSandboxExecutionTarget
+  | AdapterK8sExecutionTarget;
 
 export type AdapterRemoteExecutionSpec = SshRemoteExecutionSpec;
 
@@ -144,6 +193,9 @@ export function describeAdapterExecutionTarget(
   if (!target || target.kind === "local") return "local environment";
   if (target.transport === "ssh") {
     return `SSH environment ${target.spec.username}@${target.spec.host}:${target.spec.port}`;
+  }
+  if (target.transport === "k8s") {
+    return `k8s environment${target.config.namespace ? ` (${target.config.namespace})` : ""}`;
   }
   return `sandbox environment${target.providerKey ? ` (${target.providerKey})` : ""}`;
 }
@@ -282,6 +334,12 @@ export async function runAdapterExecutionTargetShellCommand(
       }
     }
 
+    if (target.transport === "k8s") {
+      throw new Error(
+        "k8s execution target — use environment-execution-target service directly",
+      );
+    }
+
     return await requireSandboxRunner(target).execute({
       command: "sh",
       args: ["-lc", command],
@@ -341,6 +399,16 @@ export function adapterExecutionTargetSessionIdentity(
 ): Record<string, unknown> | null {
   if (!target || target.kind === "local") return null;
   if (target.transport === "ssh") return buildRemoteExecutionSessionIdentity(target.spec);
+  if (target.transport === "k8s") {
+    return {
+      transport: "k8s",
+      environmentId: target.environmentId ?? null,
+      leaseId: target.leaseId ?? null,
+      remoteCwd: target.remoteCwd,
+      namespace: target.config.namespace ?? null,
+      ...(target.paperclipApiUrl ? { paperclipApiUrl: target.paperclipApiUrl } : {}),
+    };
+  }
   return {
     transport: "sandbox",
     providerKey: target.providerKey ?? null,
@@ -481,6 +549,12 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
       assetDirs: prepared.assetDirs,
       restoreWorkspace: prepared.restoreWorkspace,
     };
+  }
+
+  if (target.transport === "k8s") {
+    throw new Error(
+      "k8s execution target — use environment-execution-target service directly",
+    );
   }
 
   const prepared = await prepareCommandManagedRuntime({

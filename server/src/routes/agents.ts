@@ -1016,6 +1016,7 @@ export function agentRoutes(
       // codex/claude credentials.
       const environmentId = (req.body as { environmentId?: string | null })?.environmentId ?? null;
       let executionTarget: AdapterExecutionTarget | null = null;
+      let envTargetResolutionError: string | null = null;
       if (environmentId) {
         const environment = await environmentsSvc.getById(environmentId);
         if (environment && environment.companyId === companyId) {
@@ -1032,10 +1033,17 @@ export function agentRoutes(
               leaseId: null,
               leaseMetadata: null,
             });
-          } catch {
-            // Resolution failure (bad env config, missing secrets) is a soft
-            // signal — fall through to local probing rather than 500.
+          } catch (err) {
+            // Soft-fall back to local probing so the user still gets a result,
+            // but the resolution error is folded into result.checks below as
+            // a level=error entry so the UI can't show success on a broken env.
+            console.error(
+              `[agents/test] env=${environment.id} driver=${environment.driver} target resolution failed:`,
+              err,
+            );
             executionTarget = null;
+            envTargetResolutionError =
+              err instanceof Error ? err.message : "Unknown environment resolution error";
           }
         }
       }
@@ -1047,6 +1055,23 @@ export function agentRoutes(
         executionTarget,
       });
 
+      if (envTargetResolutionError) {
+        res.json({
+          ...result,
+          status: "fail" as const,
+          checks: [
+            {
+              code: "environment.target.resolution-failed",
+              level: "error" as const,
+              message: "Could not resolve environment execution target — falling back to local probe.",
+              detail: envTargetResolutionError,
+              hint: "Check the environment's config (kubeconfig secret, credentials) and that referenced secrets exist.",
+            },
+            ...result.checks,
+          ],
+        });
+        return;
+      }
       res.json(result);
     },
   );

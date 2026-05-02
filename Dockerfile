@@ -49,8 +49,22 @@ WORKDIR /vendor
 # production stage installs. We never commit the tgz; it's reproduced on
 # every image build.
 ARG CCROTATE_REF=879467e7a9af14bec7c97b90544079db56d7c36a
-ARG CLAUDE_K8S_REF=e6616b53f046c3835c5b5d13ccd1bf4c9b14a598
-ARG OPENCODE_K8S_REF=691e669820cc4065069fd4fb299dfc0a4f548633
+ARG CLAUDE_K8S_REF=8dce64985417e4f2e5aec2286037bed568b2810b
+ARG OPENCODE_K8S_REF=55299069d2db933b44d3a4d9958426bd535621e2
+
+# Pack paperclip's in-tree adapter-utils so the bundled adapters consume
+# the workspace version (which may include exports newer than the latest
+# npm-published canary, e.g. `mergeEnvironmentConfig`). `npm pack` does
+# not auto-merge `publishConfig.exports`, so do it explicitly before
+# packing.
+COPY packages/adapter-utils /vendor/adapter-utils-src
+RUN cd /vendor/adapter-utils-src \
+  && npm install --no-save typescript@^5.7.3 @types/node@^24.6.0 \
+  && npx tsc \
+  && node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));if(!p.publishConfig||!p.publishConfig.exports){console.error('FATAL: package.json missing publishConfig.exports — cannot rewrite for npm pack');process.exit(1);}Object.assign(p,p.publishConfig);delete p.publishConfig.exports;delete p.publishConfig.main;delete p.publishConfig.types;if(typeof p.exports!=='object'||!p.exports['.']||!p.exports['./*']){console.error('FATAL: rewritten exports missing required entries (./* and .)',p.exports);process.exit(1);}fs.writeFileSync('package.json',JSON.stringify(p,null,2));" \
+  && npm pack \
+  && mv paperclipai-adapter-utils-*.tgz /vendor/adapter-utils.tgz \
+  && rm -rf /vendor/adapter-utils-src
 
 RUN git clone https://github.com/kkroo/ccrotate.git ccrotate \
   && cd ccrotate && git checkout "${CCROTATE_REF}" \
@@ -62,6 +76,7 @@ RUN git clone https://github.com/kkroo/ccrotate.git ccrotate \
 RUN git clone https://github.com/kkroo/paperclip-adapter-claude-k8s.git claude-k8s \
   && cd claude-k8s && git checkout "${CLAUDE_K8S_REF}" \
   && npm ci \
+  && npm install --no-save /vendor/adapter-utils.tgz \
   && npm run build \
   && npm pack \
   && mv paperclip-adapter-claude-k8s-*.tgz /vendor/paperclip-adapter-claude-k8s.tgz
@@ -69,6 +84,7 @@ RUN git clone https://github.com/kkroo/paperclip-adapter-claude-k8s.git claude-k
 RUN git clone https://github.com/kkroo/paperclip-adapter-opencode-k8s.git opencode-k8s \
   && cd opencode-k8s && git checkout "${OPENCODE_K8S_REF}" \
   && npm ci \
+  && npm install --no-save /vendor/adapter-utils.tgz \
   && npm run build \
   && npm pack \
   && mv paperclip-adapter-opencode-k8s-*.tgz /vendor/paperclip-adapter-opencode-k8s.tgz
@@ -115,6 +131,11 @@ COPY --from=vendor /vendor/ccrotate.tgz /tmp/ccrotate.tgz
 RUN mkdir -p /tmp/paperclip-bundled-adapters
 COPY --from=vendor /vendor/paperclip-adapter-claude-k8s.tgz /tmp/paperclip-bundled-adapters/
 COPY --from=vendor /vendor/paperclip-adapter-opencode-k8s.tgz /tmp/paperclip-bundled-adapters/
+# Bundle the in-tree adapter-utils alongside the adapter tgzs so the
+# `npm install` below resolves `@paperclipai/adapter-utils` from local source
+# (matching what the adapter built against in the vendor stage) instead of
+# falling back to whatever npm publishes today.
+COPY --from=vendor /vendor/adapter-utils.tgz /tmp/paperclip-bundled-adapters/
 COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-server
 RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai /tmp/ccrotate.tgz \
   && rm /tmp/ccrotate.tgz \
