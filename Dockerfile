@@ -54,17 +54,15 @@ ARG OPENCODE_K8S_REF=55299069d2db933b44d3a4d9958426bd535621e2
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
-# npm-published canary). `npm pack` does not auto-merge
-# `publishConfig.exports`, so do it explicitly before packing. Each
-# subdir is COPYed individually to skip the pnpm node_modules symlink
-# (which targets the workspace's `.pnpm` store outside the build context
-# and trips BuildKit's `short read: unexpected EOF`).
-RUN mkdir -p /vendor/adapter-utils-src
-COPY packages/adapter-utils/src /vendor/adapter-utils-src/src
-COPY packages/adapter-utils/package.json /vendor/adapter-utils-src/package.json
-COPY packages/adapter-utils/tsconfig.json /vendor/adapter-utils-src/tsconfig.json
+# npm-published canary). Source is pulled from the `deps` stage rather
+# than the build context — local pnpm leaves a node_modules symlink in
+# packages/adapter-utils that targets the workspace's .pnpm store outside
+# the build context, and BuildKit's cache-key walker follows it and
+# fails with `short read: unexpected EOF` even when .dockerignore
+# excludes node_modules. The deps stage already has properly-resolved
+# node_modules baked into its image layer.
+COPY --from=deps /app/packages/adapter-utils /vendor/adapter-utils-src
 RUN cd /vendor/adapter-utils-src \
-  && npm install --no-save typescript@^5.7.3 @types/node@^24.6.0 \
   && npx tsc \
   && node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));if(!p.publishConfig||!p.publishConfig.exports){console.error('FATAL: package.json missing publishConfig.exports — cannot rewrite for npm pack');process.exit(1);}Object.assign(p,p.publishConfig);delete p.publishConfig.exports;delete p.publishConfig.main;delete p.publishConfig.types;if(typeof p.exports!=='object'||!p.exports['.']||!p.exports['./*']){console.error('FATAL: rewritten exports missing required entries (./* and .)',p.exports);process.exit(1);}fs.writeFileSync('package.json',JSON.stringify(p,null,2));" \
   && npm pack \
