@@ -185,7 +185,7 @@ RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/cod
   && apt-get install -y --no-install-recommends openssh-client rsync jq zsh \
   && rm -rf /var/lib/apt/lists/* \
   && mkdir -p /paperclip /paperclip/.local/bin /opt/paperclip-bundled-adapters \
-  && npm install --prefix /opt/paperclip-bundled-adapters --omit=dev --no-save /tmp/paperclip-bundled-adapters/*.tgz \
+  && npm install --prefix /opt/paperclip-bundled-adapters --omit=dev --no-save --legacy-peer-deps /tmp/paperclip-bundled-adapters/*.tgz \
   && rm -rf /tmp/paperclip-bundled-adapters \
   && ln -sf /usr/local/bin/claude /paperclip/.local/bin/claude \
   && chown -R node:node /paperclip /opt/paperclip-bundled-adapters
