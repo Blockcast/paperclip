@@ -21,6 +21,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Self-hosted runner reuses its workspace across builds. A previous
+      # build (or a developer session sharing the same checkout dir) may
+      # leave packages/*/node_modules with pnpm symlinks pointing at
+      # ../../../node_modules/.pnpm/...; `git clean -ffdx` in checkout
+      # does not always clear them, and BuildKit's context walker follows
+      # those symlinks before applying .dockerignore rules — failing with
+      # `short read: unexpected EOF`. Pre-nuke any node_modules so the
+      # Docker context is clean.
+      - name: Clean stale node_modules from runner workspace
+        run: |
+          find . -name node_modules -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          find . -name node_modules -type l -exec rm -f {} + 2>/dev/null || true
+
       # The Blockcast private registry is the only push target. Configure
       # via repo variable BLOCKCAST_REGISTRY_HOST + the USERNAME variable +
       # PASSWORD secret in repo Settings. ghcr.io mirroring was removed
