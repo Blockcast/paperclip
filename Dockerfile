@@ -61,13 +61,18 @@ ARG OPENCODE_K8S_REF=55299069d2db933b44d3a4d9958426bd535621e2
 # fails with `short read: unexpected EOF` even when .dockerignore
 # excludes node_modules. The deps stage already has properly-resolved
 # node_modules baked into its image layer.
-COPY --from=deps /app/packages/adapter-utils /vendor/adapter-utils-src
-# `node_modules/typescript` from deps is a pnpm symlink to the workspace's
-# .pnpm store, which we did NOT copy. The symlink dangles. `rm -rf
-# node_modules` then `npm install --no-save` gets a freestanding copy of
-# typescript. Also overwrite tsconfig.json with a self-contained version
-# (the original extends `../../tsconfig.base.json`, which doesn't resolve
+# Source from the build context (the deps stage only has package.json,
+# not src/ — pnpm install doesn't materialize source). The CI workflow
+# nukes stale node_modules pre-build (.github/workflows/docker.yml) and
+# .dockerignore excludes **/node_modules; local builds use a git-archive
+# context that has no node_modules at all. Either way, BuildKit doesn't
+# trip on the pnpm symlinks during context walk.
+#
+# `npm install --no-save` gets a freestanding copy of typescript, and
+# the printf rewrites tsconfig.json to a self-contained version (the
+# original extends `../../tsconfig.base.json`, which doesn't resolve
 # here since we only copied the package, not the monorepo).
+COPY packages/adapter-utils /vendor/adapter-utils-src
 RUN cd /vendor/adapter-utils-src \
   && rm -rf node_modules \
   && printf '%s\n' '{' \
