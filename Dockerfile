@@ -62,7 +62,13 @@ ARG OPENCODE_K8S_REF=55299069d2db933b44d3a4d9958426bd535621e2
 # excludes node_modules. The deps stage already has properly-resolved
 # node_modules baked into its image layer.
 COPY --from=deps /app/packages/adapter-utils /vendor/adapter-utils-src
+# `node_modules/typescript` from deps is a pnpm symlink to the workspace's
+# .pnpm store, which we did NOT copy. The symlink dangles. `rm -rf
+# node_modules` then `npm install --no-save` gets a freestanding copy of
+# typescript so `npx tsc` can find it.
 RUN cd /vendor/adapter-utils-src \
+  && rm -rf node_modules \
+  && npm install --no-save typescript@^5.7.3 @types/node@^24.6.0 \
   && npx tsc \
   && node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));if(!p.publishConfig||!p.publishConfig.exports){console.error('FATAL: package.json missing publishConfig.exports — cannot rewrite for npm pack');process.exit(1);}Object.assign(p,p.publishConfig);delete p.publishConfig.exports;delete p.publishConfig.main;delete p.publishConfig.types;if(typeof p.exports!=='object'||!p.exports['.']||!p.exports['./*']){console.error('FATAL: rewritten exports missing required entries (./* and .)',p.exports);process.exit(1);}fs.writeFileSync('package.json',JSON.stringify(p,null,2));" \
   && npm pack \
