@@ -92,7 +92,8 @@ RUN cd /vendor/adapter-utils-src \
        '    "resolveJsonModule": true,' \
        '    "isolatedModules": true' \
        '  },' \
-       '  "include": ["src"]' \
+       '  "include": ["src"],' \
+       '  "exclude": ["**/*.test.ts"]' \
        '}' > tsconfig.json \
   && npm install --no-save typescript@^5.7.3 @types/node@^24.6.0 \
   && npx tsc \
