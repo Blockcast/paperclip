@@ -53,11 +53,16 @@ ARG CLAUDE_K8S_REF=8dce64985417e4f2e5aec2286037bed568b2810b
 ARG OPENCODE_K8S_REF=55299069d2db933b44d3a4d9958426bd535621e2
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
-# the workspace version (which may include exports newer than the latest
-# npm-published canary, e.g. `mergeEnvironmentConfig`). `npm pack` does
-# not auto-merge `publishConfig.exports`, so do it explicitly before
-# packing.
-COPY packages/adapter-utils /vendor/adapter-utils-src
+# the workspace version (may include exports newer than the latest
+# npm-published canary). `npm pack` does not auto-merge
+# `publishConfig.exports`, so do it explicitly before packing. Each
+# subdir is COPYed individually to skip the pnpm node_modules symlink
+# (which targets the workspace's `.pnpm` store outside the build context
+# and trips BuildKit's `short read: unexpected EOF`).
+RUN mkdir -p /vendor/adapter-utils-src
+COPY packages/adapter-utils/src /vendor/adapter-utils-src/src
+COPY packages/adapter-utils/package.json /vendor/adapter-utils-src/package.json
+COPY packages/adapter-utils/tsconfig.json /vendor/adapter-utils-src/tsconfig.json
 RUN cd /vendor/adapter-utils-src \
   && npm install --no-save typescript@^5.7.3 @types/node@^24.6.0 \
   && npx tsc \
