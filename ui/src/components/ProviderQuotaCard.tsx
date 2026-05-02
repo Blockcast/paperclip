@@ -128,7 +128,15 @@ export function ProviderQuotaCard({
     [windowRows],
   );
   const isClaudeQuotaPanel = provider === "anthropic";
-  const isCodexQuotaPanel = provider === "openai" && quotaSource?.startsWith("codex-");
+  // Mirror the Claude gate (provider-only). The previous extra requirement —
+  // `quotaSource?.startsWith("codex-")` — meant the codex panel/pool only
+  // rendered when a `codex_local` adapter was registered (it's the only
+  // adapter that emits a `codex-*` quota source). For deployments that run
+  // codex via the `opencode_k8s` adapter — which doesn't implement
+  // getQuotaWindows — `provider="openai"` lands in the ledger but the codex
+  // ccrotate pool stayed invisible. Drop the source gate so the pool renders
+  // alongside any "openai" provider, matching the Claude side.
+  const isCodexQuotaPanel = provider === "openai";
   const supportsSubscriptionQuota = provider === "anthropic" || provider === "openai";
   const showSubscriptionQuotaSection =
     supportsSubscriptionQuota && (quotaLoading || quotaWindows.length > 0 || quotaError != null);
