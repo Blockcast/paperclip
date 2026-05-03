@@ -26,6 +26,7 @@ import {
   issueThreadInteractions,
   issues,
   labels,
+  linearIssueLinks,
   projectWorkspaces,
   projects,
 } from "@paperclipai/db";
@@ -2822,6 +2823,24 @@ export function issueService(db: Db) {
         }
 
         const [issue] = await tx.insert(issues).values(values).returning();
+
+        // When the identifier was minted by Linear (companies.identifier_provider
+        // = 'linear'), persist the link row in the same tx so the paperclip↔Linear
+        // mapping is durably committed alongside the issue itself. If the issue
+        // insert fails, the linear_issue_links row never appears and the Linear
+        // counterpart created via createLinearIssue() becomes a dangling Linear
+        // issue (no paperclip mirror). That's an accepted trade-off: at the
+        // current write rates the rare error path is preferable to a more
+        // complex compensating Linear-delete flow.
+        if (allocation.source === "linear" && allocation.externalIssueId) {
+          await tx.insert(linearIssueLinks).values({
+            companyId,
+            paperclipIssueId: issue.id,
+            linearIssueId: allocation.externalIssueId,
+            linearIdentifier: allocation.identifier,
+          });
+        }
+
         if (inputLabelIds) {
           await syncIssueLabels(issue.id, companyId, inputLabelIds, tx);
         }
