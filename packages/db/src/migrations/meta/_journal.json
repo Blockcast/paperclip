@@ -575,6 +575,13 @@
       "when": 1778100000000,
       "tag": "0081_company_identifier_provider",
       "breakpoints": true
+    },
+    {
+      "idx": 82,
+      "version": "7",
+      "when": 1778100001000,
+      "tag": "0082_issues_legacy_identifier",
+      "breakpoints": true
     }
   ]
 }
