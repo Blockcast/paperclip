@@ -108,14 +108,21 @@ describeEmbeddedPostgres("allocateIdentifier", () => {
   });
 
   it("linear path errors when the plugin has no settings for the company", async () => {
+    // PR #53 collapsed the per-field "is not configured" error into a
+    // single OAuth-aware "has no teamId" error: when no settings row
+    // exists AND no plugin_state oauth-team-id exists, the function
+    // throws on the missing teamId before even looking at tokens.
     const company = await createTestCompany({ identifierProvider: "linear" });
     await installLinearPlugin();
     await expect(
       allocateIdentifier({ db, companyId: company.id, title: "x" }),
-    ).rejects.toThrow(/is not configured for company/);
+    ).rejects.toThrow(/has no teamId for company/);
   });
 
   it("linear path errors when settings are missing teamId", async () => {
+    // settingsTokenRef present, settingsTeamId null → PAT path requires
+    // both, falls through to OAuth fallback. With no plugin_state
+    // oauth-team-id seeded either, throws "has no teamId for company".
     const company = await createTestCompany({ identifierProvider: "linear" });
     const plugin = await installLinearPlugin();
     await db.insert(pluginCompanySettings).values({
@@ -125,10 +132,14 @@ describeEmbeddedPostgres("allocateIdentifier", () => {
     });
     await expect(
       allocateIdentifier({ db, companyId: company.id, title: "x" }),
-    ).rejects.toThrow(/missing teamId/);
+    ).rejects.toThrow(/has no teamId for company/);
   });
 
-  it("linear path errors when settings are missing linearTokenRef", async () => {
+  it("linear path errors when settings have a teamId but no PAT or OAuth token", async () => {
+    // PR #53 added the OAuth fallback: settingsTeamId present but no
+    // tokenRef → falls through PAT path, oauthTeamId resolves to the
+    // settingsTeamId, but neither plugin_state secret-token-ref nor
+    // legacy oauth-token is seeded → throws "is not authenticated".
     const company = await createTestCompany({ identifierProvider: "linear" });
     const plugin = await installLinearPlugin();
     await db.insert(pluginCompanySettings).values({
@@ -138,6 +149,6 @@ describeEmbeddedPostgres("allocateIdentifier", () => {
     });
     await expect(
       allocateIdentifier({ db, companyId: company.id, title: "x" }),
-    ).rejects.toThrow(/missing linearTokenRef/);
+    ).rejects.toThrow(/is not authenticated for company/);
   });
 });

@@ -251,14 +251,19 @@ async function getLinearConfigForCompany(
 
   // OAuth fallback. teamId comes from plugin_state.oauth-team-id when the
   // settings_json copy isn't populated (the OAuth callback writes it there).
-  const oauthTeamId =
+  // readInstanceState returns `unknown` (plugin_state.value_json is JSONB) —
+  // narrow to a non-empty string before use so the typechecker can prove the
+  // returned LinearConfig.teamId is a string. Non-string values would have
+  // failed downstream anyway; failing here surfaces a cleaner error.
+  const oauthTeamIdRaw =
     settingsTeamId ?? (await readInstanceState(db, plugin.id, LINEAR_STATE_KEY_OAUTH_TEAM_ID));
-  if (!oauthTeamId) {
+  if (typeof oauthTeamIdRaw !== "string" || oauthTeamIdRaw === "") {
     throw new Error(
       `${LINEAR_PLUGIN_KEY} has no teamId for company ${companyId} (no plugin_company_settings ` +
         `row, no plugin_state oauth-team-id). Connect via the plugin's settings page first.`,
     );
   }
+  const oauthTeamId = oauthTeamIdRaw;
 
   // Token: prefer the new secret-ref key, fall back to legacy direct-storage.
   const tokenRefValue = await readInstanceState(db, plugin.id, LINEAR_STATE_KEY_SECRET_TOKEN_REF);

@@ -1408,6 +1408,7 @@ const issueListSelect = {
   createdByUserId: issues.createdByUserId,
   issueNumber: issues.issueNumber,
   identifier: issues.identifier,
+  legacyIdentifier: issues.legacyIdentifier,
   originKind: issues.originKind,
   originId: issues.originId,
   originRunId: issues.originRunId,
