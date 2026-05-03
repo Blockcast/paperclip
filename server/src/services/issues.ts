@@ -1628,13 +1628,32 @@ export function issueService(db: Db) {
   }
 
   async function getIssueByIdentifier(identifier: string) {
+    const upper = identifier.toUpperCase();
+    // Primary lookup against the current `identifier`. This is the hot path —
+    // every URL with an identifier in it lands here on every request.
     const row = await db
       .select()
       .from(issues)
-      .where(eq(issues.identifier, identifier.toUpperCase()))
+      .where(eq(issues.identifier, upper))
       .then((rows) => rows[0] ?? null);
-    if (!row) return null;
-    const [enriched] = await withIssueLabels(db, [row]);
+    if (row) {
+      const [enriched] = await withIssueLabels(db, [row]);
+      return enriched;
+    }
+    // Legacy fallback: 0084's BLO→PCL backfill stashed the pre-rename
+    // identifier in `legacy_identifier` so old URLs (bookmarks, agent
+    // memory, copy-pasted refs in chat) still resolve to the correct row.
+    // Returning the row here means the caller transparently lands on the
+    // renamed issue. The route layer wraps this with a 301-equivalent
+    // response so the client URL upgrades to the new identifier on the
+    // next render — see routes/issues.ts:normalizeIssueIdentifier.
+    const legacyRow = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.legacyIdentifier, upper))
+      .then((rows) => rows[0] ?? null);
+    if (!legacyRow) return null;
+    const [enriched] = await withIssueLabels(db, [legacyRow]);
     return enriched;
   }
 
