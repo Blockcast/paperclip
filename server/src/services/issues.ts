@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { and, asc, desc, eq, gt, inArray, isNull, lt, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lt, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -2614,6 +2614,97 @@ export function issueService(db: Db) {
           assigneeAgentId: candidate.assigneeAgentId!,
           blockerIssueIds: candidate.blockerIssueIds,
         }));
+    },
+
+    // Sweep companion to listWakeableBlockedDependents. The latter only fires
+    // at the moment a blocker transitions to `done` (`routes/issues.ts` becameDone
+    // edge); if that wake is lost (process restart, blocker completed before the
+    // dependent existed, etc.) the dependent stays silently stuck with zero wakes
+    // targeting it. This sweep finds all eligible dependents whose every blocker
+    // is already `done`, so a periodic reconciler can re-fire wakes for them.
+    //
+    // Cancelled blockers intentionally remain unresolved (see `listIssueDependencyReadinessMap`).
+    listResolvedBlockerDependentsToSweep: async (
+      companyId: string | undefined,
+      opts: { limit?: number; minBlockerResolvedAge?: { milliseconds: number } } = {},
+    ) => {
+      const limit = Math.max(1, Math.min(opts.limit ?? 100, 500));
+      const minAgeMs = Math.max(0, opts.minBlockerResolvedAge?.milliseconds ?? 0);
+
+      const candidateConditions = [
+        isNotNull(issues.assigneeAgentId),
+        isNull(issues.completedAt),
+        isNull(issues.cancelledAt),
+        notInArray(issues.status, ["done", "cancelled", "backlog"]),
+      ];
+      if (companyId) candidateConditions.push(eq(issues.companyId, companyId));
+
+      const candidates = await db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          assigneeAgentId: issues.assigneeAgentId,
+          status: issues.status,
+        })
+        .from(issues)
+        .where(and(...candidateConditions))
+        .limit(limit * 4); // overfetch; many will fail the all-blockers-done predicate
+
+      if (candidates.length === 0) return [];
+
+      const candidateIds = candidates.map((c) => c.id);
+      const blockerRows = await db
+        .select({
+          dependentId: issueRelations.relatedIssueId,
+          blockerIssueId: issueRelations.issueId,
+          blockerStatus: issues.status,
+          blockerCompletedAt: issues.completedAt,
+        })
+        .from(issueRelations)
+        .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+        .where(
+          and(
+            eq(issueRelations.type, "blocks"),
+            inArray(issueRelations.relatedIssueId, candidateIds),
+          ),
+        );
+
+      const byDependent = new Map<
+        string,
+        { ids: string[]; allDone: boolean; latestResolvedAt: Date | null }
+      >();
+      for (const row of blockerRows) {
+        const entry = byDependent.get(row.dependentId) ?? { ids: [], allDone: true, latestResolvedAt: null };
+        entry.ids.push(row.blockerIssueId);
+        if (row.blockerStatus !== "done") entry.allDone = false;
+        if (row.blockerCompletedAt && (!entry.latestResolvedAt || row.blockerCompletedAt > entry.latestResolvedAt)) {
+          entry.latestResolvedAt = row.blockerCompletedAt;
+        }
+        byDependent.set(row.dependentId, entry);
+      }
+
+      const ageCutoff = minAgeMs > 0 ? new Date(Date.now() - minAgeMs) : null;
+      const results: Array<{
+        id: string;
+        companyId: string;
+        assigneeAgentId: string;
+        blockerIssueIds: string[];
+        latestBlockerResolvedAt: Date | null;
+      }> = [];
+      for (const candidate of candidates) {
+        const blockers = byDependent.get(candidate.id);
+        if (!blockers || blockers.ids.length === 0 || !blockers.allDone) continue;
+        if (ageCutoff && (!blockers.latestResolvedAt || blockers.latestResolvedAt > ageCutoff)) continue;
+        results.push({
+          id: candidate.id,
+          companyId: candidate.companyId,
+          assigneeAgentId: candidate.assigneeAgentId!,
+          blockerIssueIds: blockers.ids,
+          latestBlockerResolvedAt: blockers.latestResolvedAt,
+        });
+        if (results.length >= limit) break;
+      }
+      return results;
     },
 
     getWakeableParentAfterChildCompletion: async (parentIssueId: string) => {

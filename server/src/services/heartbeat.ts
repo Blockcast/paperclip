@@ -4760,6 +4760,76 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return productivityReviews.reconcileProductivityReviews(opts);
   }
 
+  // Sweep companion to the becameDone edge in routes/issues.ts. The edge wakes
+  // dependents at the moment a blocker transitions to `done`; if that wake is
+  // lost (process restart, blocker completed before the dependent existed,
+  // network blip) the dependent stays silently stuck with zero wakes targeting
+  // it. This sweep finds all eligible dependents whose every blocker is already
+  // `done` and re-fires the wake. Idempotency key is bucketed per-minute so
+  // concurrent loops coalesce.
+  async function reconcileResolvedBlockerDependents(opts?: {
+    now?: Date;
+    companyId?: string;
+    limit?: number;
+    minBlockerResolvedAgeMs?: number;
+  }) {
+    const now = opts?.now ?? new Date();
+    const limit = opts?.limit ?? 100;
+    // Wait at least 5 min after a blocker becomes done before sweeping — gives
+    // the becameDone edge wake its chance to land first, avoiding double-wakes
+    // in normal-path flows.
+    const minBlockerResolvedAgeMs = opts?.minBlockerResolvedAgeMs ?? 5 * 60 * 1000;
+
+    const candidates = await issuesSvc.listResolvedBlockerDependentsToSweep(opts?.companyId, {
+      limit,
+      minBlockerResolvedAge: { milliseconds: minBlockerResolvedAgeMs },
+    });
+
+    let woken = 0;
+    let skipped = 0;
+    let failed = 0;
+    const minuteBucket = new Date(Math.floor(now.getTime() / 60000) * 60000).toISOString();
+
+    for (const candidate of candidates) {
+      try {
+        const result = await enqueueWakeup(candidate.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_blockers_resolved_sweep",
+          payload: {
+            issueId: candidate.id,
+            blockerIssueIds: candidate.blockerIssueIds,
+            latestBlockerResolvedAt: candidate.latestBlockerResolvedAt
+              ? candidate.latestBlockerResolvedAt.toISOString()
+              : null,
+          },
+          contextSnapshot: {
+            issueId: candidate.id,
+            taskId: candidate.id,
+            wakeReason: "issue_blockers_resolved_sweep",
+            source: "issue.blockers_resolved_sweep",
+            blockerIssueIds: candidate.blockerIssueIds,
+          },
+          // Bucket per minute to coalesce when both startup + periodic chains
+          // run close together.
+          idempotencyKey: `blockers_resolved_sweep:${candidate.id}:${minuteBucket}`,
+        });
+        // enqueueWakeup returns the run row when queued/coalesced, null when
+        // skipped or deferred.
+        if (result) woken += 1;
+        else skipped += 1;
+      } catch (err) {
+        failed += 1;
+        logger.warn(
+          { err, issueId: candidate.id, assigneeAgentId: candidate.assigneeAgentId },
+          "reconcileResolvedBlockerDependents wake failed",
+        );
+      }
+    }
+
+    return { scanned: candidates.length, woken, skipped, failed };
+  }
+
   async function buildRunOutputSilence(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
@@ -7938,6 +8008,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     scanSilentActiveRuns,
 
     reconcileProductivityReviews,
+
+    reconcileResolvedBlockerDependents,
 
     buildRunOutputSilence,
 

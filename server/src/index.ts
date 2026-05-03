@@ -928,6 +928,12 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
         }
       })
+      .then(async () => {
+        const swept = await heartbeat.reconcileResolvedBlockerDependents();
+        if (swept.woken > 0 || swept.failed > 0) {
+          logger.warn({ ...swept }, "startup resolved-blocker-dependents sweep enqueued wakes");
+        }
+      })
       .catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
       });
@@ -991,6 +997,12 @@ export async function startServer(): Promise<StartedServer> {
           const reviewed = await heartbeat.reconcileProductivityReviews();
           if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
             logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
+          }
+        })
+        .then(async () => {
+          const swept = await heartbeat.reconcileResolvedBlockerDependents();
+          if (swept.woken > 0 || swept.failed > 0) {
+            logger.warn({ ...swept }, "periodic resolved-blocker-dependents sweep enqueued wakes");
           }
         })
         .catch((err) => {
