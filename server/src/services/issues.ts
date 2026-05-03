@@ -48,6 +48,7 @@ import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
 import { getDefaultCompanyGoal } from "./goals.js";
+import { allocateIdentifier } from "./identifier-allocator.js";
 import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
@@ -2776,24 +2777,21 @@ export function issueService(db: Db) {
         if (executionWorkspaceId) {
           await assertValidExecutionWorkspace(companyId, issueData.projectId, executionWorkspaceId, tx);
         }
-        // Self-correcting counter: use MAX(issue_number) + 1 if the counter
-        // has drifted below the actual max, preventing identifier collisions.
-        const [maxRow] = await tx
-          .select({ maxNum: sql<number>`coalesce(max(${issues.issueNumber}), 0)` })
-          .from(issues)
-          .where(eq(issues.companyId, companyId));
-        const currentMax = maxRow?.maxNum ?? 0;
-
-        const [company] = await tx
-          .update(companies)
-          .set({
-            issueCounter: sql`greatest(${companies.issueCounter}, ${currentMax}) + 1`,
-          })
-          .where(eq(companies.id, companyId))
-          .returning({ issueCounter: companies.issueCounter, issuePrefix: companies.issuePrefix });
-
-        const issueNumber = company.issueCounter;
-        const identifier = `${company.issuePrefix}-${issueNumber}`;
+        // Identifier minting is delegated to allocateIdentifier(), which
+        // dispatches on companies.identifier_provider. The paperclip-internal
+        // path runs inside this same tx (atomic counter + insert); the
+        // Linear path (Task 2.2 of the linear-id-unification plan) will hit
+        // Linear's GraphQL before the issues insert, taking the identifier
+        // back out-of-tx. For now every company stays on paperclip-source,
+        // so behaviour is unchanged from before this refactor.
+        const allocation = await allocateIdentifier({
+          db: tx,
+          companyId,
+          title: issueData.title,
+          description: issueData.description,
+        });
+        const issueNumber = allocation.issueNumber;
+        const identifier = allocation.identifier;
 
         const values = {
           ...issueData,
