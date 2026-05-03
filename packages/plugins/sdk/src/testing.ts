@@ -71,6 +71,17 @@ export interface TestHarness {
     issueComments?: IssueComment[];
     agents?: Agent[];
     goals?: Goal[];
+    /**
+     * Seed in-memory `linear_issue_links` rows. Used to test the Linear
+     * plugin's webhook create-handler dedup against host-allocator
+     * mirrors (`ctx.issues.getByLinearIssueId`). Must reference an issue
+     * already seeded via `issues:` for downstream lookups to resolve.
+     */
+    linearIssueLinks?: Array<{
+      companyId: string;
+      linearIssueId: string;
+      paperclipIssueId: string;
+    }>;
   }): void;
   setConfig(config: Record<string, unknown>): void;
   /** Dispatch a host or plugin event to registered handlers. */
@@ -420,6 +431,13 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
   const companies = new Map<string, Company>();
   const projects = new Map<string, Project>();
   const issues = new Map<string, Issue>();
+  // In-memory mirror of the host's `linear_issue_links` table. Keyed
+  // by `${companyId}:${linearIssueId}` (matches the unique scope of
+  // the host service). Used by `getByLinearIssueId` so plugin tests
+  // can exercise the host-allocator-mirror dedup branch without
+  // spinning embedded postgres. Tests seed via `host.linkLinearIssue(...)`.
+  const linearIssueLinksByLinearIssueId = new Map<string, string>();
+  const linkKey = (companyId: string, linearIssueId: string) => `${companyId}:${linearIssueId}`;
   const blockedByIssueIds = new Map<string, string[]>();
   const issueComments = new Map<string, IssueComment[]>();
   const issueInteractions = new Map<string, IssueThreadInteraction[]>();
@@ -725,6 +743,13 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       async get(issueId, companyId) {
         requireCapability(manifest, capabilitySet, "issues.read");
         const issue = issues.get(issueId);
+        return isInCompany(issue, companyId) ? issue : null;
+      },
+      async getByLinearIssueId({ linearIssueId, companyId }) {
+        requireCapability(manifest, capabilitySet, "issues.read");
+        const paperclipIssueId = linearIssueLinksByLinearIssueId.get(linkKey(companyId, linearIssueId));
+        if (!paperclipIssueId) return null;
+        const issue = issues.get(paperclipIssueId);
         return isInCompany(issue, companyId) ? issue : null;
       },
       async create(input) {
@@ -1298,6 +1323,9 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       }
       for (const row of input.agents ?? []) agents.set(row.id, row);
       for (const row of input.goals ?? []) goals.set(row.id, row);
+      for (const row of input.linearIssueLinks ?? []) {
+        linearIssueLinksByLinearIssueId.set(linkKey(row.companyId, row.linearIssueId), row.paperclipIssueId);
+      }
     },
     setConfig(config) {
       currentConfig = { ...config };

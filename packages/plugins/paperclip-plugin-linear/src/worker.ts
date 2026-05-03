@@ -1256,6 +1256,45 @@ async function handleWebhookEvent(
       const existing = await sync.getLinkByLinear(ctx, linearIssueId);
       if (existing) return;
 
+      // Host-side link dedup: when a paperclip issue is created via the
+      // host's allocator path (companies.identifier_provider='linear' →
+      // allocateFromLinear → linear_issue_links insert in same tx), the
+      // resulting paperclip row carries the CALLER's originKind (e.g.
+      // 'manual', 'harness_liveness_escalation') — NOT the plugin's. The
+      // plugin's existingByOrigin check below filters on
+      // originKind='plugin:paperclip-plugin-linear' so it misses host-
+      // allocator mirrors entirely. Without this lookup the inbound Linear
+      // webhook (fired in response to the host's IssueCreate mutation)
+      // proceeds to create a SECOND paperclip mirror, which mints ANOTHER
+      // Linear issue, which fires another webhook — closing a runaway loop
+      // that under cutover produced 305 noise Linear issues + 161 paperclip
+      // rows in ~2 minutes during 2026-05-03 verify.
+      const hostLinkedIssue = await ctx.issues.getByLinearIssueId({
+        linearIssueId,
+        companyId,
+      });
+      if (hostLinkedIssue) {
+        // Webhook re-delivery on a host-allocator-mirrored issue: same
+        // assigneeUserId backfill the existingByOrigin branch below
+        // performs (lines ~1340-1351). Without this, a host-allocator
+        // mirror's first webhook re-delivery never resolves its human
+        // assignee — the legacy branch handled it for plugin mirrors
+        // but the new dedup branch returned early and skipped it.
+        const webhookAssignee = (data.assignee as { email?: string | null } | null | undefined) ?? null;
+        const existingAssigneeUserId =
+          (hostLinkedIssue as unknown as { assigneeUserId?: string | null }).assigneeUserId;
+        if (!existingAssigneeUserId && webhookAssignee?.email) {
+          const userId = await resolvePaperclipUserIdForEmail(ctx, webhookAssignee.email);
+          if (userId) {
+            await ctx.issues.update(hostLinkedIssue.id, { assigneeUserId: userId }, companyId);
+          }
+        }
+        ctx.logger.info(
+          `Webhook create for ${linearIssueId} already mirrored via host allocator path (paperclip ${hostLinkedIssue.identifier}); skipping`,
+        );
+        return;
+      }
+
       // Prevent duplicate creation from simultaneous webhook deliveries
       if (inFlightCreates.has(linearIssueId)) {
         ctx.logger.info(`Skipping duplicate webhook create for ${linearIssueId} — already in flight`);
@@ -1263,7 +1302,48 @@ async function handleWebhookEvent(
       }
       inFlightCreates.add(linearIssueId);
 
-      const identifier = data.identifier as string | undefined;
+      // `data.identifier` is what the conditional `linkedLinearIssue` spread
+      // below depends on — without it, the create call falls through to the
+      // host allocator's MINT path under identifier_provider='linear' and
+      // creates a duplicate Linear issue. That is the original 2026-05-03
+      // loop-trigger condition. We MUST resolve identifier before continuing.
+      //
+      // Linear's stable webhook payload includes identifier; older formats
+      // and replays can omit it. We fetch from Linear's API as fallback.
+      // If both fail under cutover, we ABORT the webhook (rethrow) rather
+      // than degrade to the mint path — Linear's webhook delivery layer
+      // will retry with backoff, and that's strictly safer than spawning
+      // a duplicate Linear issue under the bug-amplification conditions
+      // (rate-limit / 5xx during peak load) we have to assume on this path.
+      let identifier = data.identifier as string | undefined;
+      if (!identifier) {
+        try {
+          const token = await resolveToken(ctx);
+          const linearIssue = await linear.getIssue(
+            ctx.http.fetch.bind(ctx.http),
+            token,
+            linearIssueId,
+          );
+          identifier = linearIssue?.identifier;
+        } catch (err) {
+          ctx.logger.error(
+            `Webhook create for ${linearIssueId} missing data.identifier; Linear API getIssue failed — aborting webhook (Linear will retry) rather than fall through to mint path which would re-trigger the loop. err=${(err as Error).message}`,
+            { linearIssueId, error: (err as Error).message },
+          );
+          inFlightCreates.delete(linearIssueId);
+          throw err;
+        }
+        if (!identifier) {
+          ctx.logger.error(
+            `Webhook create for ${linearIssueId} missing data.identifier and Linear API getIssue returned no identifier — aborting webhook (Linear will retry).`,
+            { linearIssueId },
+          );
+          inFlightCreates.delete(linearIssueId);
+          throw new Error(
+            `Cannot resolve identifier for Linear issue ${linearIssueId}; refusing to proceed to mint path`,
+          );
+        }
+      }
       const state = data.state as Record<string, unknown> | undefined;
       const stateType = (state?.type as string) ?? "backlog";
 

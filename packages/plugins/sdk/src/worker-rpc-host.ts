@@ -656,6 +656,10 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           return callHost("issues.get", { issueId, companyId });
         },
 
+        async getByLinearIssueId({ linearIssueId, companyId }) {
+          return callHost("issues.getByLinearIssueId", { linearIssueId, companyId });
+        },
+
         async create(input) {
           return callHost("issues.create", {
             companyId: input.companyId,

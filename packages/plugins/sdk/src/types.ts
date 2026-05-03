@@ -1171,6 +1171,16 @@ export interface PluginIssuesClient {
     offset?: number;
   }): Promise<Issue[]>;
   get(issueId: string, companyId: string): Promise<Issue | null>;
+  /**
+   * Look up a paperclip issue by its Linear-side issue id (UUID), via
+   * the host's `linear_issue_links` table. Returns null when no link
+   * row exists for (companyId, linearIssueId). Required for the Linear
+   * plugin's pre-create dedup so it can detect mirrors written by the
+   * host's allocator path that the plugin's existing originKind+originId
+   * lookup misses (those mirrors carry a different originKind on the
+   * paperclip row but appear in linear_issue_links). Requires `issues.read`.
+   */
+  getByLinearIssueId(input: { linearIssueId: string; companyId: string }): Promise<Issue | null>;
   create(input: {
     companyId: string;
     projectId?: string;

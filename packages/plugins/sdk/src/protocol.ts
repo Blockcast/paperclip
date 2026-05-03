@@ -801,6 +801,20 @@ export interface WorkerToHostMethods {
     params: { issueId: string; companyId: string },
     result: Issue | null,
   ];
+  /**
+   * Look up a paperclip issue by its Linear-side issue id (UUID), via
+   * the host's `linear_issue_links` table. Returns null when no link
+   * row exists for (companyId, linearIssueId). Closes a dedup gap in
+   * the Linear plugin's webhook create flow: without this, mirrors
+   * already written by the host's allocator path (parent originKind
+   * != 'plugin:paperclip-plugin-linear') are invisible to the plugin's
+   * existing originKind+originId check and the webhook fires a second
+   * mirror create — looping under identifier_provider='linear'.
+   */
+  "issues.getByLinearIssueId": [
+    params: { linearIssueId: string; companyId: string },
+    result: Issue | null,
+  ];
   "issues.create": [
     params: {
       companyId: string;

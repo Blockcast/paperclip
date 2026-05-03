@@ -1009,6 +1009,80 @@ describe("paperclip-plugin-linear", () => {
       // createLink should NOT have been called again
       expect(syncModule.createLink.mock.calls.length).toBe(createLinkCallsBefore);
     });
+
+    // 2026-05-03 cutover-incident regression. Under
+    // companies.identifier_provider='linear', a manual `paperclipCreateIssue`
+    // (or any non-plugin caller) goes through the host allocator → mints a
+    // Linear issue + writes a `linear_issue_links` row → fires a Linear
+    // `Issue.create` webhook back to the plugin. The webhook handler's
+    // pre-existing dedup chain (`sync.getLinkByLinear`, `inFlightCreates`,
+    // `existingByOrigin` filtered to `originKind='plugin:paperclip-plugin-linear'`)
+    // missed the host-allocator mirror because its originKind is the caller's
+    // (e.g. 'manual'), not the plugin's. The handler proceeded to create a
+    // SECOND mirror, which minted ANOTHER Linear issue, which fired ANOTHER
+    // webhook — runaway loop produced 305 noise Linear issues + 161 paperclip
+    // rows in ~2 minutes.
+    //
+    // This test pins the new `ctx.issues.getByLinearIssueId` dedup branch.
+    // If any future change to the dedup ordering or the link-table schema
+    // re-opens the gap, this test catches it before the next deploy.
+    it("regression — skips webhook create for host-allocator-mirrored issue (pre-existing linear_issue_links row)", async () => {
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.companyId },
+        "comp-1",
+      );
+
+      // Seed a paperclip issue with originKind='manual' (the cutover-incident
+      // shape) and a linear_issue_links row pointing at the inbound webhook's
+      // Linear UUID. Without the new dedup, the webhook would create a
+      // duplicate mirror and mint another Linear issue.
+      const PAPERCLIP_ISSUE_ID = "iss-host-allocator-mirror";
+      const LINEAR_ISSUE_ID = "lin-host-allocator-mirror-uuid";
+      harness.seed({
+        issues: [
+          {
+            id: PAPERCLIP_ISSUE_ID,
+            companyId: "comp-1",
+            identifier: "LUC-2569",
+            originKind: "manual",
+            title: "Host-allocator-mirrored manual create",
+          } as never,
+        ],
+        linearIssueLinks: [
+          {
+            companyId: "comp-1",
+            linearIssueId: LINEAR_ISSUE_ID,
+            paperclipIssueId: PAPERCLIP_ISSUE_ID,
+          },
+        ],
+      });
+
+      // Plugin-state link is empty (host allocator path doesn't write it),
+      // so `sync.getLinkByLinear` returns null — exactly the production
+      // condition that exposed the gap.
+      syncModule.getLinkByLinear.mockResolvedValueOnce(null);
+
+      const createLinkCallsBefore = syncModule.createLink.mock.calls.length;
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Issue",
+          action: "create",
+          data: {
+            id: LINEAR_ISSUE_ID,
+            identifier: "LUC-2569",
+            title: "Webhook re-delivery for host-allocator mirror",
+            state: { type: "backlog" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+      });
+
+      // No new mirror should have been created. createLink stays untouched.
+      expect(syncModule.createLink.mock.calls.length).toBe(createLinkCallsBefore);
+    });
   });
 
   // -----------------------------------------------------------------------

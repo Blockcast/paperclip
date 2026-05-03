@@ -2463,6 +2463,50 @@ export function issueService(db: Db) {
       return getIssueByIdentifier(identifier);
     },
 
+    /**
+     * Find a paperclip issue by its Linear-side issue id via the
+     * `linear_issue_links` table. Used by the Linear plugin's webhook
+     * create handler to detect mirrors written by the host's allocator
+     * path (`originKind != 'plugin:paperclip-plugin-linear'` parents
+     * with linker rows). Without this lookup, the plugin's own dedup
+     * (originKind+originId, plugin_state IssueLink) misses host-allocator
+     * mirrors and creates duplicates — closing the post-cutover loop.
+     *
+     * Scoped to (companyId, linearIssueId) — matches the allocator-write
+     * path's row shape. Returns null when no link exists.
+     */
+    getByLinearIssueId: async (companyId: string, linearIssueId: string) => {
+      const link = await db
+        .select({ paperclipIssueId: linearIssueLinks.paperclipIssueId })
+        .from(linearIssueLinks)
+        .where(
+          and(
+            eq(linearIssueLinks.companyId, companyId),
+            eq(linearIssueLinks.linearIssueId, linearIssueId),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      if (!link) return null;
+      const issue = await getIssueByUuid(link.paperclipIssueId);
+      if (!issue) {
+        // Skew: link row points to a paperclip_issue_id that no longer
+        // resolves. The FK is ON DELETE CASCADE so this should be
+        // unreachable under normal operation; surface as console.error
+        // so a pg_dump-restore mishap or out-of-band hard-delete is
+        // caught instead of silently masquerading as "no link" — which
+        // would make the caller (Linear plugin webhook handler) fall
+        // through to mint path and re-open the loop.
+        console.error(
+          `[issues.getByLinearIssueId] linear_issue_links row for ` +
+            `companyId=${companyId} linearIssueId=${linearIssueId} ` +
+            `points to missing issues.id=${link.paperclipIssueId}; ` +
+            `returning null but this is a data-integrity skew that ` +
+            `should not be reachable through normal operations.`,
+        );
+      }
+      return issue;
+    },
+
     getRelationSummaries: async (issueId: string) => {
       const issue = await db
         .select({ id: issues.id, companyId: issues.companyId })

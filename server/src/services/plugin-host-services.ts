@@ -1112,6 +1112,30 @@ export function buildHostServices(
         const issue = await issues.getById(params.issueId);
         return (inCompany(issue, companyId) ? issue : null) as Issue | null;
       },
+      async getByLinearIssueId(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const issue = await issues.getByLinearIssueId(companyId, params.linearIssueId);
+        // Defense in depth: the underlying query is already scoped to
+        // companyId, so an `issue` whose companyId mismatches is data
+        // corruption (link row + issue row out of sync on company
+        // attribution). Surface as console.error rather than silently
+        // returning null — the silent path makes the caller mint a
+        // duplicate Linear issue, which is exactly the loop the new
+        // dedup is supposed to close. Direct field comparison avoids
+        // `inCompany`'s type predicate narrowing `issue` to `null` in
+        // the negative branch.
+        if (issue && issue.companyId !== companyId) {
+          console.error(
+            `[plugin-host-services.issues.getByLinearIssueId] linear_issue_links ` +
+              `row for companyId=${companyId} linearIssueId=${params.linearIssueId} ` +
+              `resolved to issue ${issue.id} whose companyId=${issue.companyId} ` +
+              `differs — data integrity skew, returning null.`,
+          );
+          return null;
+        }
+        return issue as Issue | null;
+      },
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
