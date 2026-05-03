@@ -49,7 +49,7 @@ import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
 import { getDefaultCompanyGoal } from "./goals.js";
-import { allocateIdentifier } from "./identifier-allocator.js";
+import { allocateIdentifier, deleteLinearIssueForCompany } from "./identifier-allocator.js";
 import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
@@ -2694,7 +2694,16 @@ export function issueService(db: Db) {
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
-      return db.transaction(async (tx) => {
+
+      // If the allocator hits Linear during the tx and the tx subsequently
+      // fails, the Linear-side issue would otherwise dangle without a
+      // paperclip mirror. We capture its id from inside the tx and, on tx
+      // rollback, fire a best-effort IssueDelete so the namespaces stay in
+      // sync. Cleanup errors are logged-and-swallowed to avoid masking the
+      // original failure that triggered the rollback.
+      let createdLinearIssueId: string | null = null;
+      try {
+        return await db.transaction(async (tx) => {
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
         const projectGoalId = await getProjectDefaultGoalId(tx, companyId, issueData.projectId);
         let projectWorkspaceId = issueData.projectWorkspaceId ?? null;
@@ -2791,6 +2800,14 @@ export function issueService(db: Db) {
           title: issueData.title,
           description: issueData.description,
         });
+        // Capture the Linear-side issue id as soon as allocation returns so
+        // the outer compensating-delete handler can fire even if the issues
+        // insert below throws (FK violation, status invariant, etc.). The
+        // capture is harmless when the allocation came from the paperclip
+        // path: externalIssueId stays undefined.
+        if (allocation.source === "linear" && allocation.externalIssueId) {
+          createdLinearIssueId = allocation.externalIssueId;
+        }
         const issueNumber = allocation.issueNumber;
         const identifier = allocation.identifier;
 
@@ -2858,7 +2875,22 @@ export function issueService(db: Db) {
         }
         const [enriched] = await withIssueLabels(tx, [issue]);
         return enriched;
-      });
+        });
+      } catch (err) {
+        // tx rolled back. If the allocator already created a Linear issue
+        // (linear path), best-effort IssueDelete it so we don't leave a
+        // dangling Linear issue with no paperclip counterpart. Swallow
+        // cleanup errors — surfacing them would mask the real failure.
+        if (createdLinearIssueId) {
+          await deleteLinearIssueForCompany(db, companyId, createdLinearIssueId).catch(
+            () => {
+              // No logger handle here; the call site logs the original err
+              // via the route layer. Cleanup failure is a known soft drop.
+            },
+          );
+        }
+        throw err;
+      }
     },
 
     update: async (

@@ -15,7 +15,13 @@
 // self-correcting `greatest(issueCounter, currentMax) + 1`.
 import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { companies, issues, pluginCompanySettings, plugins } from "@paperclipai/db";
+import {
+  companies,
+  issues,
+  pluginCompanySettings,
+  pluginState,
+  plugins,
+} from "@paperclipai/db";
 import { secretService } from "./secrets.js";
 
 // Structural subset of `Db` that the allocator actually uses. Same pattern
@@ -138,6 +144,14 @@ interface LinearConfig {
   teamId: string;
 }
 
+// State keys mirrored from packages/plugins/paperclip-plugin-linear/src/constants.ts
+// (kept inline to avoid pulling the plugin package as a server-side dep). These
+// are the identifiers under which the linear plugin's worker stores OAuth state
+// at scope_kind="instance".
+const LINEAR_STATE_KEY_OAUTH_TOKEN = "oauth-token";
+const LINEAR_STATE_KEY_SECRET_TOKEN_REF = "secret-token-ref";
+const LINEAR_STATE_KEY_OAUTH_TEAM_ID = "oauth-team-id";
+
 async function getLinearConfigForCompany(
   db: IdentifierAllocatorDb,
   companyId: string,
@@ -152,6 +166,16 @@ async function getLinearConfigForCompany(
     );
   }
 
+  // Two configuration paths the linear plugin supports — match its
+  // `resolveToken()` precedence in worker.ts so the server-side and worker-side
+  // resolution agree:
+  //   1. Per-company `linearTokenRef` (PAT) in plugin_company_settings
+  //   2. Instance-scoped OAuth state in plugin_state
+  //
+  // OAuth state is keyed by (plugin_id, scope_kind="instance", state_key).
+  // `secret-token-ref` is the newer key (token stored via secret-ref);
+  // `oauth-token` is the legacy direct-storage key, still in use on instances
+  // that connected before the migration. We try secret-token-ref first.
   const [settings] = await db
     .select({ json: pluginCompanySettings.settingsJson })
     .from(pluginCompanySettings)
@@ -161,40 +185,76 @@ async function getLinearConfigForCompany(
         eq(pluginCompanySettings.companyId, companyId),
       ),
     );
-  if (!settings) {
+  const settingsJson = (settings?.json ?? {}) as Record<string, unknown>;
+  const settingsTeamId =
+    typeof settingsJson.teamId === "string" && settingsJson.teamId !== ""
+      ? settingsJson.teamId
+      : null;
+  const settingsTokenRef =
+    typeof settingsJson.linearTokenRef === "string" && settingsJson.linearTokenRef !== ""
+      ? settingsJson.linearTokenRef
+      : null;
+
+  // PAT path takes precedence (matches worker.ts:resolveToken).
+  if (settingsTokenRef && settingsTeamId) {
+    const apiKey = await secretService(db as Db).resolveSecretValue(
+      companyId,
+      settingsTokenRef,
+      "latest",
+    );
+    return { apiKey, teamId: settingsTeamId };
+  }
+
+  // OAuth fallback. teamId comes from plugin_state.oauth-team-id when the
+  // settings_json copy isn't populated (the OAuth callback writes it there).
+  const oauthTeamId =
+    settingsTeamId ?? (await readInstanceState(db, plugin.id, LINEAR_STATE_KEY_OAUTH_TEAM_ID));
+  if (!oauthTeamId) {
     throw new Error(
-      `${LINEAR_PLUGIN_KEY} is not configured for company ${companyId}; ` +
-        `set teamId + linearTokenRef in the plugin UI before flipping ` +
-        `companies.identifier_provider to 'linear'`,
+      `${LINEAR_PLUGIN_KEY} has no teamId for company ${companyId} (no plugin_company_settings ` +
+        `row, no plugin_state oauth-team-id). Connect via the plugin's settings page first.`,
     );
   }
 
-  const json = settings.json as Record<string, unknown>;
-  const teamId = typeof json.teamId === "string" ? json.teamId : null;
-  const linearTokenRef = typeof json.linearTokenRef === "string" ? json.linearTokenRef : null;
-  if (!teamId) {
-    throw new Error(
-      `${LINEAR_PLUGIN_KEY} settings for company ${companyId} are missing teamId`,
+  // Token: prefer the new secret-ref key, fall back to legacy direct-storage.
+  const tokenRefValue = await readInstanceState(db, plugin.id, LINEAR_STATE_KEY_SECRET_TOKEN_REF);
+  if (typeof tokenRefValue === "string" && tokenRefValue !== "") {
+    const apiKey = await secretService(db as Db).resolveSecretValue(
+      companyId,
+      tokenRefValue,
+      "latest",
     );
-  }
-  if (!linearTokenRef) {
-    throw new Error(
-      `${LINEAR_PLUGIN_KEY} settings for company ${companyId} are missing linearTokenRef ` +
-        `(OAuth-only configurations are not yet supported on the server-side identifier path)`,
-    );
+    return { apiKey, teamId: oauthTeamId };
   }
 
-  // The `db` parameter is a Pick<Db, "select" | "update">, but secretService
-  // wants the full Db type. The cast is safe at runtime because Drizzle's tx
-  // is structurally compatible — secretService only uses select/insert which
-  // tx handles too. If a stricter signature on secretService is added later,
-  // re-thread accordingly.
-  const apiKey = await secretService(db as Db).resolveSecretValue(
-    companyId,
-    linearTokenRef,
-    "latest",
+  const directToken = await readInstanceState(db, plugin.id, LINEAR_STATE_KEY_OAUTH_TOKEN);
+  if (typeof directToken === "string" && directToken !== "") {
+    return { apiKey: directToken, teamId: oauthTeamId };
+  }
+
+  throw new Error(
+    `${LINEAR_PLUGIN_KEY} is not authenticated for company ${companyId} ` +
+      `(no PAT in plugin_company_settings, no OAuth token in plugin_state). ` +
+      `Connect via the plugin's settings page first.`,
   );
-  return { apiKey, teamId };
+}
+
+async function readInstanceState(
+  db: IdentifierAllocatorDb,
+  pluginId: string,
+  stateKey: string,
+): Promise<unknown> {
+  const [row] = await db
+    .select({ value: pluginState.valueJson })
+    .from(pluginState)
+    .where(
+      and(
+        eq(pluginState.pluginId, pluginId),
+        eq(pluginState.scopeKind, "instance"),
+        eq(pluginState.stateKey, stateKey),
+      ),
+    );
+  return row?.value;
 }
 
 interface CreatedLinearIssue {
@@ -252,4 +312,53 @@ async function createLinearIssue(params: {
     throw new Error(`Linear IssueCreate did not return an issue (success=false or null)`);
   }
   return issue;
+}
+
+// Compensating delete used by services/issues.ts when the issues-create tx
+// rolls back AFTER allocateFromLinear() already created the issue in Linear.
+// Re-resolves the company's Linear config (the apiKey may have rotated since
+// the create, and the create-time apiKey isn't in scope at the catch handler
+// anyway), then fires Linear's IssueDelete mutation. Best-effort: caller
+// swallows errors so the original failure that triggered the rollback
+// surfaces unmasked.
+export async function deleteLinearIssueForCompany(
+  db: IdentifierAllocatorDb,
+  companyId: string,
+  linearIssueId: string,
+): Promise<void> {
+  const cfg = await getLinearConfigForCompany(db, companyId);
+  await deleteLinearIssue({ apiKey: cfg.apiKey, issueId: linearIssueId });
+}
+
+async function deleteLinearIssue(params: { apiKey: string; issueId: string }): Promise<void> {
+  const { apiKey, issueId } = params;
+  const response = await fetch(LINEAR_GRAPHQL_URL, {
+    method: "POST",
+    headers: {
+      Authorization: apiKey,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      query: `
+        mutation IssueDelete($id: String!) {
+          issueDelete(id: $id) { success }
+        }
+      `,
+      variables: { id: issueId },
+    }),
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`Linear IssueDelete HTTP ${response.status}: ${body.slice(0, 200)}`);
+  }
+  const json = (await response.json()) as {
+    errors?: unknown[];
+    data?: { issueDelete?: { success?: boolean } };
+  };
+  if (Array.isArray(json.errors) && json.errors.length > 0) {
+    throw new Error(`Linear IssueDelete GraphQL errors: ${JSON.stringify(json.errors).slice(0, 300)}`);
+  }
+  if (!json.data?.issueDelete?.success) {
+    throw new Error(`Linear IssueDelete returned success=false for issueId=${issueId}`);
+  }
 }
