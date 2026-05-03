@@ -1651,11 +1651,13 @@ export function issueService(db: Db) {
     }
     // Legacy fallback: 0084's BLO→PCL backfill stashed the pre-rename
     // identifier in `legacy_identifier` so old URLs (bookmarks, agent
-    // memory, copy-pasted refs in chat) still resolve to the correct row.
-    // Returning the row here means the caller transparently lands on the
-    // renamed issue. The route layer wraps this with a 301-equivalent
-    // response so the client URL upgrades to the new identifier on the
-    // next render — see routes/issues.ts:normalizeIssueIdentifier.
+    // memory, copy-pasted refs in chat) still resolve to the correct
+    // row. Returning the row here means the caller transparently lands
+    // on the renamed issue. URL-bar upgrade is handled UI-side: when
+    // the API returns `identifier='PCL-N'` for a request that used the
+    // legacy form, `IssueDetail.tsx`'s identifier-mismatch effect fires
+    // a `navigate(replace: true)` that swaps the address bar to the
+    // current identifier (same effect that handles UUID-via-URL).
     const legacyRow = await db
       .select()
       .from(issues)
