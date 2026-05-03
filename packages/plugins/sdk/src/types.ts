@@ -1194,6 +1194,16 @@ export interface PluginIssuesClient {
     executionWorkspacePreference?: string | null;
     executionWorkspaceSettings?: Record<string, unknown> | null;
     actor?: PluginIssueMutationActor;
+    /**
+     * Mirror an existing Linear issue. When set, the host skips Linear's
+     * IssueCreate API call (for linear-provider companies) and writes a
+     * linear_issue_links row binding this paperclip issue to the supplied
+     * Linear issue. Use from Linear-side webhooks/sync that import an
+     * existing Linear issue rather than create one — without this, post-
+     * cutover imports duplicate Linear issues and the resulting host link
+     * row points at the duplicate, not the original.
+     */
+    linkedLinearIssue?: { id: string; identifier: string };
   }): Promise<Issue>;
   update(
     issueId: string,

@@ -40,6 +40,18 @@ export interface AllocateIdentifierInput {
    *  to Linear's IssueCreate mutation. The paperclip path ignores it. */
   title: string;
   description?: string | null;
+  /**
+   * Mirror-create signal: when set, the caller is importing an existing
+   * Linear issue rather than minting a new one. For linear-provider
+   * companies, the allocator skips the IssueCreate GraphQL call and uses
+   * the supplied identifier verbatim — without this, importing a Linear
+   * webhook into a cutover company would mint a duplicate Linear issue
+   * and silently disconnect from the original. For paperclip-provider
+   * companies the hint is ignored here (allocator returns the next
+   * paperclip-internal id); the caller still uses it to write the
+   * linear_issue_links row.
+   */
+  linkedLinearIssue?: { id: string; identifier: string };
 }
 
 export interface AllocateIdentifierResult {
@@ -51,6 +63,15 @@ export interface AllocateIdentifierResult {
   source: "paperclip" | "linear";
   /** Linear-side issue id, when source === "linear". */
   externalIssueId?: string;
+  /**
+   * True only when allocateFromLinear created a brand-new Linear issue in
+   * this call. False for the paperclip path and for the linkedLinearIssue
+   * passthrough (where the Linear issue pre-existed). The issues-create
+   * tx uses this to gate the compensating-delete-on-rollback handler:
+   * without it, a tx rollback after a mirror import would delete the
+   * pre-existing Linear issue we just linked to.
+   */
+  createdLinearSideIssue: boolean;
 }
 
 export async function allocateIdentifier(
@@ -99,7 +120,7 @@ async function allocateFromPaperclip(
   const issueNumber = company.issueCounter;
   const identifier = `${company.issuePrefix}-${issueNumber}`;
 
-  return { identifier, issueNumber, source: "paperclip" };
+  return { identifier, issueNumber, source: "paperclip", createdLinearSideIssue: false };
 }
 
 // Linear path: read the linear plugin's per-company config, resolve the API
@@ -116,7 +137,29 @@ async function allocateFromPaperclip(
 async function allocateFromLinear(
   input: AllocateIdentifierInput,
 ): Promise<AllocateIdentifierResult> {
-  const { db, companyId, title, description } = input;
+  const { db, companyId, title, description, linkedLinearIssue } = input;
+
+  // Mirror-import path: caller already has the Linear issue and is asking
+  // us to bind to it rather than mint another. Skip IssueCreate entirely
+  // and pass the identifier through. createdLinearSideIssue=false so the
+  // caller's compensating-delete handler ignores this (we did not create
+  // the Linear issue and must not delete it on tx rollback).
+  if (linkedLinearIssue) {
+    const numMatch = linkedLinearIssue.identifier.match(/-(\d+)$/);
+    if (!numMatch) {
+      throw new Error(
+        `Unexpected Linear identifier format in linkedLinearIssue: ${linkedLinearIssue.identifier}`,
+      );
+    }
+    return {
+      identifier: linkedLinearIssue.identifier,
+      issueNumber: Number.parseInt(numMatch[1], 10),
+      source: "linear",
+      externalIssueId: linkedLinearIssue.id,
+      createdLinearSideIssue: false,
+    };
+  }
+
   const cfg = await getLinearConfigForCompany(db, companyId);
   const created = await createLinearIssue({
     apiKey: cfg.apiKey,
@@ -136,6 +179,7 @@ async function allocateFromLinear(
     issueNumber: Number.parseInt(numMatch[1], 10),
     source: "linear",
     externalIssueId: created.id,
+    createdLinearSideIssue: true,
   };
 }
 

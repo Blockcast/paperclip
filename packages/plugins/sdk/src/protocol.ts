@@ -827,6 +827,14 @@ export interface WorkerToHostMethods {
       actorAgentId?: string | null;
       actorUserId?: string | null;
       actorRunId?: string | null;
+      /**
+       * Mirror an existing Linear issue. When set, the host skips
+       * Linear's IssueCreate (for linear-provider companies) and writes
+       * a linear_issue_links row binding this paperclip issue to the
+       * supplied Linear issue. Use from Linear-side webhooks/sync that
+       * import an existing Linear issue rather than create one.
+       */
+      linkedLinearIssue?: { id: string; identifier: string };
     },
     result: Issue,
   ];

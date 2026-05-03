@@ -712,6 +712,10 @@ const plugin = definePlugin({
         originId: linearIssue.id,
         ...(projectId ? { projectId } : {}),
         ...(assigneeUserId ? { assigneeUserId } : {}),
+        linkedLinearIssue: {
+          id: linearIssue.id,
+          identifier: linearIssue.identifier,
+        },
       });
 
       if (status !== "backlog") {
@@ -1342,6 +1346,12 @@ async function handleWebhookEvent(
           originId: linearIssueId,
           ...(projectId ? { projectId } : {}),
           ...(assigneeUserId ? { assigneeUserId } : {}),
+          // Webhook payloads sometimes omit `data.identifier`. When present,
+          // bind to the existing Linear issue so the host doesn't re-mint
+          // (linear-provider) and writes a correct linear_issue_links row.
+          // When absent we fall back to the legacy buggy behavior — better
+          // than failing the webhook outright; PR2 can fetch from Linear.
+          ...(identifier ? { linkedLinearIssue: { id: linearIssueId, identifier } } : {}),
         });
 
         if (status !== "backlog") {
@@ -1958,6 +1968,10 @@ async function runImport(ctx: PluginContext): Promise<{
           ...(projectId ? { projectId } : {}),
           ...(issueLabelIds.length > 0 ? { labelIds: issueLabelIds } : {}),
           ...(assigneeUserId ? { assigneeUserId } : {}),
+          linkedLinearIssue: {
+            id: linearIssue.id,
+            identifier: linearIssue.identifier,
+          },
         });
 
         if (status !== "backlog") {

@@ -159,6 +159,15 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   labelIds?: string[];
   blockedByIssueIds?: string[];
   inheritExecutionWorkspaceFromIssueId?: string | null;
+  /**
+   * Mirror-create signal from Linear-side imports (webhook, manual import,
+   * bulk-import). Plumbs to allocateIdentifier so the linear-provider path
+   * skips IssueCreate and uses this identifier verbatim, and ensures a
+   * linear_issue_links row is written for paperclip-provider companies
+   * too. Suppresses the compensating Linear-delete on tx rollback — the
+   * Linear issue pre-existed.
+   */
+  linkedLinearIssue?: { id: string; identifier: string };
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
@@ -2693,6 +2702,7 @@ export function issueService(db: Db) {
         labelIds: inputLabelIds,
         blockedByIssueIds,
         inheritExecutionWorkspaceFromIssueId,
+        linkedLinearIssue,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -2818,13 +2828,16 @@ export function issueService(db: Db) {
           companyId,
           title: issueData.title,
           description: issueData.description,
+          linkedLinearIssue,
         });
         // Capture the Linear-side issue id as soon as allocation returns so
         // the outer compensating-delete handler can fire even if the issues
-        // insert below throws (FK violation, status invariant, etc.). The
-        // capture is harmless when the allocation came from the paperclip
-        // path: externalIssueId stays undefined.
-        if (allocation.source === "linear" && allocation.externalIssueId) {
+        // insert below throws (FK violation, status invariant, etc.).
+        // Gated on createdLinearSideIssue: if the caller passed
+        // linkedLinearIssue, the Linear issue pre-existed and a tx
+        // rollback must NOT delete it. Paperclip-source allocations leave
+        // externalIssueId undefined and are skipped here too.
+        if (allocation.createdLinearSideIssue && allocation.externalIssueId) {
           createdLinearIssueId = allocation.externalIssueId;
         }
         const issueNumber = allocation.issueNumber;
@@ -2874,6 +2887,18 @@ export function issueService(db: Db) {
             paperclipIssueId: issue.id,
             linearIssueId: allocation.externalIssueId,
             linearIdentifier: allocation.identifier,
+          });
+        } else if (linkedLinearIssue) {
+          // Mirror-import into a paperclip-provider company: identifier
+          // stays paperclip-internal but we still bind the cross-tracker
+          // mapping so Linear-keyed lookups (`WHERE linear_identifier =
+          // 'BLO-N'`) find the mirror. Without this branch, plugin sync
+          // state would diverge from the host link table.
+          await tx.insert(linearIssueLinks).values({
+            companyId,
+            paperclipIssueId: issue.id,
+            linearIssueId: linkedLinearIssue.id,
+            linearIdentifier: linkedLinearIssue.identifier,
           });
         }
 
