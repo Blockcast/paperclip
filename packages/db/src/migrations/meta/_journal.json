@@ -568,6 +568,13 @@
       "when": 1777400005000,
       "tag": "0080_heartbeat_runs_result_columns",
       "breakpoints": true
+    },
+    {
+      "idx": 81,
+      "version": "7",
+      "when": 1778100000000,
+      "tag": "0081_company_identifier_provider",
+      "breakpoints": true
     }
   ]
 }
