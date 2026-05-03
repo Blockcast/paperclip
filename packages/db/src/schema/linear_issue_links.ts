@@ -22,8 +22,13 @@ import { issues } from "./issues.js";
 //   3. Unique on (company_id, linear_identifier) — also enforced at
 //      the DB layer. Catches mis-syncs where the same Linear identifier
 //      gets wired to two paperclip issues.
+//   4. Unique on (company_id, linear_issue_id) — Linear's opaque UUID
+//      is the natural webhook dedup key (linear_identifier can in
+//      principle be reissued; the opaque id cannot). Backs
+//      issueService.getByLinearIssueId on the inbound-webhook hot path
+//      and serializes concurrent inserts at the DB across replicas.
 //
-// Both UNIQUE indexes give O(log n) lookups in either direction
+// All UNIQUE indexes give O(log n) lookups in either direction
 // without app-level dedupe logic.
 export const linearIssueLinks = pgTable(
   "linear_issue_links",
@@ -48,6 +53,10 @@ export const linearIssueLinks = pgTable(
     companyLinearIdentifierUniqueIdx: uniqueIndex("linear_issue_links_company_linear_identifier_idx").on(
       table.companyId,
       table.linearIdentifier,
+    ),
+    companyLinearIssueIdUniqueIdx: uniqueIndex("linear_issue_links_company_linear_issue_id_idx").on(
+      table.companyId,
+      table.linearIssueId,
     ),
   }),
 );

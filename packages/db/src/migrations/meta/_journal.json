@@ -603,6 +603,13 @@
       "when": 1778100004000,
       "tag": "0085_blo_company_linear_provider",
       "breakpoints": true
+    },
+    {
+      "idx": 86,
+      "version": "7",
+      "when": 1778100005000,
+      "tag": "0086_linear_issue_links_company_linear_issue_id_idx",
+      "breakpoints": true
     }
   ]
 }
