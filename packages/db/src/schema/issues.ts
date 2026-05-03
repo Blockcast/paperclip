@@ -42,6 +42,11 @@ export const issues = pgTable(
     createdByUserId: text("created_by_user_id"),
     issueNumber: integer("issue_number"),
     identifier: text("identifier"),
+    // Stash of the identifier as it existed before a Phase-3 BLO→PCL
+    // re-prefix. Null on greenfield rows. Provides a one-line UPDATE to
+    // roll the rename back without re-deriving from row order if Phase 3
+    // misfires. See plan: linear-id-unification.md.
+    legacyIdentifier: text("legacy_identifier"),
     originKind: text("origin_kind").notNull().default("manual"),
     originId: text("origin_id"),
     originRunId: text("origin_run_id"),
