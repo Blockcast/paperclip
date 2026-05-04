@@ -193,17 +193,33 @@ async function probeK8sEnvironment(
       };
     }
   } else {
+    // Guard before loadFromCluster: outside a pod the SDK throws ENOENT on
+    // /var/run/secrets/kubernetes.io/serviceaccount/ca.crt, which is opaque.
+    // Mirrors the pattern in k8s-job-liveness.ts so the probe surfaces a
+    // diagnostic the operator can act on.
+    if (!process.env.KUBERNETES_SERVICE_HOST) {
+      return {
+        ok: false,
+        driver: "k8s",
+        summary: "k8s probe failed: Paperclip is not running in a Kubernetes pod (KUBERNETES_SERVICE_HOST is unset).",
+        details: {
+          error: "KUBERNETES_SERVICE_HOST is unset",
+          stage: "in-cluster-load",
+          namespace,
+          authMode,
+        },
+      };
+    }
     try {
       kc.loadFromCluster();
     } catch (error) {
-      // Pod may not have a service account mounted (KUBERNETES_SERVICE_HOST,
-      // /var/run/secrets/kubernetes.io/serviceaccount/* missing). loadFromCluster
-      // throws synchronously in that case.
+      // KUBERNETES_SERVICE_HOST is set but the SA token isn't mounted —
+      // typically Helm's serviceAccount.automountToken=false.
       const message = error instanceof Error ? error.message : String(error);
       return {
         ok: false,
         driver: "k8s",
-        summary: "k8s probe failed: in-cluster auth not available (no service account mounted).",
+        summary: "k8s probe failed: in-cluster auth not available (no service account token mounted — set serviceAccount.automountToken=true).",
         details: {
           error: message,
           stage: "in-cluster-load",
