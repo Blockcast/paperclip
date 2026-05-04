@@ -15,8 +15,8 @@
  *   PAPERCLIP_ERROR_CODE
  *
  * Maps the adapter to the ccrotate target (claude vs codex), looks up the
- * currently-active email via `ccrotate active --target <t> --json`, and
- * fires `POST http://ccrotate-auth-bot.paperclip.svc:7000/relogin`. The
+ * currently-active email by parsing `ccrotate --target <t> status` output,
+ * and fires `POST http://ccrotate-auth-bot.paperclip.svc:7000/relogin`. The
  * NetworkPolicy on the bot already restricts ingress to paperclip-0, so
  * no auth header is needed.
  *
@@ -37,20 +37,17 @@ function adapterToTarget(adapterType: string): "claude" | "codex" | null {
 }
 
 function readActiveEmail(target: "claude" | "codex"): string | null {
-  // `ccrotate --target <t> active --json` prints JSON like `{"email":"x@y","tier":"base"}`
-  // when an account is active. Returns null if no active account.
-  const r = spawnSync("ccrotate", ["--target", target, "active", "--json"], {
+  // ccrotate has no `active` subcommand — `status` is the closest signal.
+  // First line is `🔍 Checking usage tier for <email>...` (claude) or
+  // `🔍 Checking Codex usage for <email>...` (codex). We pull the email out
+  // of `for <email>...` (or any `<local>@<domain>` token in the output).
+  const r = spawnSync("ccrotate", ["--target", target, "status"], {
     encoding: "utf8",
-    timeout: 5_000,
+    timeout: 10_000,
   });
-  if (r.status !== 0) return null;
-  try {
-    const parsed = JSON.parse(r.stdout.trim());
-    const email = typeof parsed?.email === "string" ? parsed.email.trim() : "";
-    return email.length > 0 ? email : null;
-  } catch {
-    return null;
-  }
+  const out = `${r.stdout ?? ""}\n${r.stderr ?? ""}`;
+  const m = out.match(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/);
+  return m ? m[0] : null;
 }
 
 async function notifyBot(email: string, target: "claude" | "codex"): Promise<void> {
