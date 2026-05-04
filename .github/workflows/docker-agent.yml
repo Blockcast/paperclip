@@ -47,6 +47,13 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          # Same rationale as docker.yml — ephemeral builder per run so a
+          # corrupt content-store blob can't propagate across builds. The
+          # agent buildcache (paperclip-agent:buildcache) hasn't surfaced
+          # the same `short read` symptom yet, but it's the same runner +
+          # same persistent-builder pattern, so apply the fix preemptively.
+          cleanup: true
 
       - name: Resolve build SHA
         id: sha
