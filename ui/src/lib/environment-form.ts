@@ -5,8 +5,15 @@
 import {
   tolerationsArraySchema,
   type K8sEnvironmentConfig,
+  type ProviderPool,
   type Toleration,
 } from "@paperclipai/shared";
+
+/** Provider keys that have first-class textareas in the form. Anything else
+ *  is preserved through the round-trip in `k8sProviderExtras` so we don't
+ *  silently drop unknown providers (e.g. a forward-compat key). */
+export const KNOWN_PROVIDER_KEYS = ["anthropic", "openai"] as const;
+export type KnownProviderKey = typeof KNOWN_PROVIDER_KEYS[number];
 
 export type K8sFormFields = {
   k8sKubeconfigSecretRef: string;
@@ -28,6 +35,9 @@ export type K8sFormFields = {
   k8sProviderAnthropicAccounts: string;
   k8sProviderOpenaiKind: "ccrotate";
   k8sProviderOpenaiAccounts: string;
+  /** Provider-pool entries with keys outside KNOWN_PROVIDER_KEYS. Preserved
+   *  verbatim through edit/save so the UI doesn't silently drop them. */
+  k8sProviderExtras: Record<string, ProviderPool>;
 };
 
 /**
@@ -75,14 +85,22 @@ export function parseKeyValueLines(input: string): Record<string, string> | null
 
 /**
  * Parse a free-form accounts list (newline- or comma-separated emails) into
- * a deduplication-free string array. Whitespace tokens are dropped. Caller
- * is responsible for any deduplication.
+ * a deduplicated string array. Comparison is case-insensitive (emails are
+ * case-insensitive per RFC 5321) but the first-seen casing is preserved in
+ * output. Whitespace tokens are dropped.
  */
 export function parseAccountsList(input: string): string[] {
-  return input
-    .split(/[\s,]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of input.split(/[\s,]+/)) {
+    const s = raw.trim();
+    if (!s) continue;
+    const key = s.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(s);
+  }
+  return out;
 }
 
 /**
@@ -187,7 +205,9 @@ export function buildK8sEnvironmentConfig(
     config.resources = resources;
   }
 
-  const providers: NonNullable<K8sEnvironmentConfigPayload["providers"]> = {};
+  const providers: NonNullable<K8sEnvironmentConfigPayload["providers"]> = {
+    ...form.k8sProviderExtras,
+  };
   const anthropicAccounts = parseAccountsList(form.k8sProviderAnthropicAccounts);
   if (anthropicAccounts.length > 0) {
     providers.anthropic = { kind: form.k8sProviderAnthropicKind, accounts: anthropicAccounts };
@@ -201,4 +221,25 @@ export function buildK8sEnvironmentConfig(
   }
 
   return config;
+}
+
+/** Pull provider entries with keys outside `KNOWN_PROVIDER_KEYS` for
+ *  preservation through the form round-trip. Validates each entry against
+ *  the same shape ProviderPool requires; entries that don't match are
+ *  dropped (the schema would reject them on save anyway). */
+export function readProviderExtras(providers: unknown): Record<string, ProviderPool> {
+  if (!providers || typeof providers !== "object" || Array.isArray(providers)) return {};
+  const out: Record<string, ProviderPool> = {};
+  const known = new Set<string>(KNOWN_PROVIDER_KEYS);
+  for (const [key, entry] of Object.entries(providers as Record<string, unknown>)) {
+    if (known.has(key)) continue;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const e = entry as Record<string, unknown>;
+    if (e.kind !== "ccrotate") continue;
+    if (!Array.isArray(e.accounts)) continue;
+    const accounts = e.accounts.filter((a) => typeof a === "string");
+    if (accounts.length === 0) continue;
+    out[key] = { kind: "ccrotate", accounts };
+  }
+  return out;
 }

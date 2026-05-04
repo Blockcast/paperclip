@@ -4,6 +4,7 @@ import {
   parseAccountsList,
   parseKeyValueLines,
   parseTolerationsJson,
+  readProviderExtras,
 } from "./environment-form";
 
 describe("parseKeyValueLines", () => {
@@ -83,6 +84,7 @@ describe("buildK8sEnvironmentConfig", () => {
         k8sProviderAnthropicAccounts: "",
         k8sProviderOpenaiKind: "ccrotate",
         k8sProviderOpenaiAccounts: "",
+        k8sProviderExtras: {},
       }),
     ).toEqual({});
   });
@@ -108,6 +110,7 @@ describe("buildK8sEnvironmentConfig", () => {
       k8sProviderAnthropicAccounts: "",
       k8sProviderOpenaiKind: "ccrotate",
       k8sProviderOpenaiAccounts: "",
+      k8sProviderExtras: {},
     });
     expect(usingSecret).toEqual({ kubeconfigSecretRef: "kubeconfig-prod" });
 
@@ -131,6 +134,7 @@ describe("buildK8sEnvironmentConfig", () => {
       k8sProviderAnthropicAccounts: "",
       k8sProviderOpenaiKind: "ccrotate",
       k8sProviderOpenaiAccounts: "",
+      k8sProviderExtras: {},
     });
     expect(inCluster).toEqual({});
     expect(inCluster).not.toHaveProperty("kubeconfigSecretRef");
@@ -158,6 +162,7 @@ describe("buildK8sEnvironmentConfig", () => {
         k8sProviderAnthropicAccounts: "",
         k8sProviderOpenaiKind: "ccrotate",
         k8sProviderOpenaiAccounts: "",
+        k8sProviderExtras: {},
       }),
     ).toEqual({
       namespace: "prod",
@@ -190,6 +195,7 @@ describe("buildK8sEnvironmentConfig", () => {
         k8sProviderAnthropicAccounts: "",
         k8sProviderOpenaiKind: "ccrotate",
         k8sProviderOpenaiAccounts: "",
+        k8sProviderExtras: {},
       }),
     ).toEqual({
       nodeSelector: { tier: "runner", zone: "us-east-1a" },
@@ -219,6 +225,7 @@ describe("buildK8sEnvironmentConfig", () => {
         k8sProviderAnthropicAccounts: "",
         k8sProviderOpenaiKind: "ccrotate",
         k8sProviderOpenaiAccounts: "",
+        k8sProviderExtras: {},
       }),
     ).toEqual({
       resources: { requests: { cpu: "500m", memory: "1Gi" } },
@@ -247,6 +254,7 @@ describe("buildK8sEnvironmentConfig", () => {
         k8sProviderAnthropicAccounts: "",
         k8sProviderOpenaiKind: "ccrotate",
         k8sProviderOpenaiAccounts: "",
+        k8sProviderExtras: {},
       }),
     ).toEqual({
       imagePullPolicy: "IfNotPresent",
@@ -279,6 +287,7 @@ describe("buildK8sEnvironmentConfig", () => {
         k8sProviderAnthropicAccounts: "",
         k8sProviderOpenaiKind: "ccrotate",
         k8sProviderOpenaiAccounts: "",
+        k8sProviderExtras: {},
       }),
     ).toEqual({
       tolerations: [
@@ -308,6 +317,7 @@ describe("buildK8sEnvironmentConfig", () => {
       k8sProviderAnthropicAccounts: "",
       k8sProviderOpenaiKind: "ccrotate",
       k8sProviderOpenaiAccounts: "   \n  ",
+      k8sProviderExtras: {},
     });
     expect(result).not.toHaveProperty("providers");
   });
@@ -334,6 +344,7 @@ describe("buildK8sEnvironmentConfig", () => {
         k8sProviderAnthropicAccounts: "a@b.net\nc@d.net",
         k8sProviderOpenaiKind: "ccrotate",
         k8sProviderOpenaiAccounts: "",
+        k8sProviderExtras: {},
       }),
     ).toEqual({
       providers: {
@@ -364,6 +375,7 @@ describe("buildK8sEnvironmentConfig", () => {
         k8sProviderAnthropicAccounts: "a@b.net",
         k8sProviderOpenaiKind: "ccrotate",
         k8sProviderOpenaiAccounts: "x@y.net, z@w.net",
+        k8sProviderExtras: {},
       }),
     ).toEqual({
       providers: {
@@ -400,7 +412,58 @@ describe("parseAccountsList", () => {
     expect(parseAccountsList("   \n  \n,, ")).toEqual([]);
   });
 
-  it("does not deduplicate (caller is responsible)", () => {
-    expect(parseAccountsList("a@b.net\na@b.net")).toEqual(["a@b.net", "a@b.net"]);
+  it("deduplicates exact repeats", () => {
+    expect(parseAccountsList("a@b.net\na@b.net")).toEqual(["a@b.net"]);
+  });
+
+  it("deduplicates case-insensitively, preserving first-seen casing", () => {
+    expect(parseAccountsList("Foo@Bar.net\nfoo@bar.net\nFOO@BAR.NET")).toEqual([
+      "Foo@Bar.net",
+    ]);
+  });
+});
+
+describe("readProviderExtras", () => {
+  it("returns {} for non-object inputs", () => {
+    expect(readProviderExtras(null)).toEqual({});
+    expect(readProviderExtras(undefined)).toEqual({});
+    expect(readProviderExtras("nope")).toEqual({});
+    expect(readProviderExtras([])).toEqual({});
+  });
+
+  it("ignores known provider keys (anthropic, openai)", () => {
+    expect(
+      readProviderExtras({
+        anthropic: { kind: "ccrotate", accounts: ["a@b.net"] },
+        openai: { kind: "ccrotate", accounts: ["c@d.net"] },
+      }),
+    ).toEqual({});
+  });
+
+  it("preserves unknown provider keys with valid ccrotate shape", () => {
+    expect(
+      readProviderExtras({
+        anthropic: { kind: "ccrotate", accounts: ["a@b.net"] },
+        claude: { kind: "ccrotate", accounts: ["e@f.net"] },
+        Anthropic: { kind: "ccrotate", accounts: ["g@h.net"] },
+      }),
+    ).toEqual({
+      claude: { kind: "ccrotate", accounts: ["e@f.net"] },
+      Anthropic: { kind: "ccrotate", accounts: ["g@h.net"] },
+    });
+  });
+
+  it("drops malformed entries (wrong kind, missing accounts, empty accounts)", () => {
+    expect(
+      readProviderExtras({
+        bad1: { kind: "other", accounts: ["x@y.net"] },
+        bad2: { kind: "ccrotate" },
+        bad3: { kind: "ccrotate", accounts: [] },
+        bad4: { kind: "ccrotate", accounts: [123, null] },
+        good: { kind: "ccrotate", accounts: ["v@w.net"] },
+      }),
+    ).toEqual({
+      good: { kind: "ccrotate", accounts: ["v@w.net"] },
+    });
   });
 });

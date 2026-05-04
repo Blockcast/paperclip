@@ -605,6 +605,7 @@ export {
   type UpdateEnvironment,
   type ProbeEnvironmentConfig,
   type K8sEnvironmentConfig,
+  type ProviderPool,
   type Toleration,
   agentSkillStateSchema,
   agentSkillSyncModeSchema,

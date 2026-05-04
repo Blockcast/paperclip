@@ -11,6 +11,7 @@ import {
 import {
   buildK8sEnvironmentConfig,
   parseTolerationsJson,
+  readProviderExtras,
 } from "../lib/environment-form";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
@@ -75,6 +76,7 @@ type EnvironmentFormState = {
   k8sProviderAnthropicAccounts: string;
   k8sProviderOpenaiKind: "ccrotate";
   k8sProviderOpenaiAccounts: string;
+  k8sProviderExtras: Record<string, { kind: "ccrotate"; accounts: string[] }>;
 };
 
 // AGENT_ADAPTER_TYPES doesn't include the k8s-only adapters, so concatenate
@@ -149,6 +151,7 @@ function createEmptyEnvironmentForm(): EnvironmentFormState {
     k8sProviderAnthropicAccounts: "",
     k8sProviderOpenaiKind: "ccrotate",
     k8sProviderOpenaiAccounts: "",
+    k8sProviderExtras: {},
   };
 }
 
@@ -232,6 +235,7 @@ function readK8sFormFromConfig(environment: Environment) {
     k8sProviderAnthropicAccounts: formatProviderAccounts(config.providers, "anthropic"),
     k8sProviderOpenaiKind: "ccrotate" as const,
     k8sProviderOpenaiAccounts: formatProviderAccounts(config.providers, "openai"),
+    k8sProviderExtras: readProviderExtras(config.providers),
   };
 }
 
@@ -1440,6 +1444,14 @@ export function CompanySettings() {
                     <div className="text-xs text-muted-foreground mb-3">
                       Constrain ccrotate to a subset of accounts at preRun. One email per line (or comma-separated). Leave blank to use the global pool.
                     </div>
+                    {Object.keys(environmentForm.k8sProviderExtras).length > 0 ? (
+                      <div className="mb-3 rounded-md border border-yellow-500/40 bg-yellow-500/5 px-3 py-2 text-xs text-yellow-700 dark:text-yellow-400">
+                        Preserved {Object.keys(environmentForm.k8sProviderExtras).length} provider pool
+                        {Object.keys(environmentForm.k8sProviderExtras).length === 1 ? "" : "s"} not editable here:{" "}
+                        <span className="font-mono">{Object.keys(environmentForm.k8sProviderExtras).sort().join(", ")}</span>
+                        . These keys are passed through unchanged on save.
+                      </div>
+                    ) : null}
                     <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                       <Field label="Anthropic accounts" hint="Used by claude_k8s adapters. Passed as `ccrotate next --target claude --accounts <csv>`.">
                         <select
