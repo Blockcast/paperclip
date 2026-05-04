@@ -9,6 +9,11 @@ on:
 
 permissions:
   contents: read
+  # Lets us use GITHUB_TOKEN as a ghcr.io pull credential below, which
+  # bypasses the anonymous-pull rate limit ghcr.io enforces. Buildkit
+  # only reads `FROM ghcr.io/...` lines (e.g. github-mcp-server), it
+  # doesn't push anything, so read scope is enough.
+  packages: read
 
 jobs:
   build-and-push:
@@ -46,6 +51,18 @@ jobs:
           registry: ${{ vars.BLOCKCAST_REGISTRY_HOST }}
           username: ${{ vars.BLOCKCAST_REGISTRY_USERNAME }}
           password: ${{ secrets.BLOCKCAST_REGISTRY_PASSWORD }}
+
+      # github-mcp-server is pulled from ghcr.io as part of the multi-stage
+      # build (Dockerfile FROM ghcr.io/github/github-mcp-server:vX.Y.Z).
+      # Anonymous ghcr.io pulls share a low rate limit pool that has been
+      # tripping master builds with `failed to fetch oauth token: denied`.
+      # Authenticated pulls use the per-repo limit which is high enough.
+      - name: Login to ghcr.io for base-image pulls
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
