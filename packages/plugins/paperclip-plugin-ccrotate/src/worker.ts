@@ -62,19 +62,31 @@ function runProcess(
 
 // ─── ccrotate when parser ────────────────────────────────────────────────────
 //
-// `ccrotate when` text format (one row per saved account):
+// `ccrotate when` text format (one row per saved account). Two minor
+// variations exist depending on installed ccrotate version:
 //
-//   Cache: 1min old
+//   1.1.1-kkroo.2 (installed today, no availability glyph):
 //
-//   ★ ✓ ramadan@blockcast.net          base       5h:64% 7d:22%   usable now
-//     ✓ omar.ramadan@berkeley.edu      extra      5h:100% 7d:63%  in 52m
-//     ✗ omar@blockcast.net             exhausted  5h:0% 7d:100%   stale (needs /login + snap)
+//     Cache: 1min old
 //
-// Columns: active-marker (★ or space) · status (✓ or ✗) · email · tier ·
-// 5h:N% 7d:N% · availability text.
+//     ★ ✓ ramadan@blockcast.net          base       5h:64% 7d:22%   usable now
+//       ✓ omar.ramadan@berkeley.edu      extra      5h:100% 7d:63%  in 52m
+//       ✓ princeomz2004@gmail.com        base                       no data (needs refresh)
+//       ✗ omar@blockcast.net             exhausted  5h:0% 7d:100%   stale (needs /login + snap)
+//
+//   1.1.x with `feat(when): per-row availability glyph` (commit 11541aa,
+//   future release) inserts an extra emoji column between the auth-saved
+//   mark and the email:
+//
+//     ★ ✓ 🟢 ramadan@blockcast.net      base       5h:64% 7d:22%   usable now
+//       ✗ ⏳ omar@blockcast.net         exhausted  5h:0% 7d:100%   stale (needs /login + snap)
+//
+// Columns: active-marker (★ or space) · status (✓ or ✗) · availability glyph?
+// (optional, only present in newer ccrotate) · email · tier · [5h:N% 7d:N%]?
+// (omitted for accounts with no per-account data) · availability text.
 
 const ROW_RE =
-  /^([★ ])\s*([✓✗])\s+(\S+@\S+)\s+(\S+)\s+5h:(\d+)% 7d:(\d+)%\s+(.+?)\s*$/u;
+  /^([★ ])\s+([✓✗])\s+(?:([^\s@]+)\s+)?(\S+@\S+)\s+(\S+)(?:\s+5h:(\d+)%\s+7d:(\d+)%)?\s+(.+?)\s*$/u;
 const CACHE_AGE_RE = /^Cache:\s*(.+)$/;
 
 function parseWhenOutput(target: CcrotateTarget, stdout: string): {
@@ -93,13 +105,13 @@ function parseWhenOutput(target: CcrotateTarget, stdout: string): {
     }
     const m = ROW_RE.exec(line);
     if (!m) continue;
-    const [, marker, health, email, tier, u5, u7, availability] = m;
+    const [, marker, health, _availMark, email, tier, u5, u7, availability] = m;
     accounts.push({
       email: email!,
       target,
       tier: tier!,
-      utilization5h: Number(u5),
-      utilization7d: Number(u7),
+      utilization5h: u5 != null ? Number(u5) : null,
+      utilization7d: u7 != null ? Number(u7) : null,
       availability: availability!.trim(),
       isActive: marker === "★",
       isHealthy: health === "✓",
