@@ -164,6 +164,33 @@ export function evaluateTierCacheSnapshot(
       return { allow: true, resumeAt: null, usableAccount: account.email };
     }
   }
+
+  // Inconclusive-snapshot fallback. When Anthropic's per-account Usage API is
+  // throttling the cluster (`status: "unknown"`, `serviceTier: null`,
+  // `rateLimits: null`), the gate cannot tell whether any account is usable.
+  // The historical behavior was to deny, which deadlocked: no run dispatch →
+  // no quotaExhaustedHook → no ccrotate-auth-bot trigger → tokens never get
+  // refreshed → cache never recovers. Observed 2026-05-04 with all 9 claude
+  // accounts pinned at `status: "unknown" / "Usage API on cooldown"` for
+  // hours despite `ccrotate refresh-one` against the active account
+  // returning a real tier (`5h:58% 7d:54%`).
+  //
+  // When every account is inconclusive AND we have no rate-limit data to set
+  // a sensible resumeAt, allow optimistically — let the run attempt the API
+  // call. If the call hits a real 401/quota, the existing quotaExhaustedHook
+  // chain (server/src/services/quota-exhausted-hook.ts) takes over and
+  // triggers re-login. Cost of being wrong: one failed agent run vs. cluster
+  // deadlock.
+  const inconclusive = snapshot.accounts.every(
+    (acc) =>
+      acc.status === "unknown" &&
+      acc.serviceTier === null &&
+      acc.rateLimits === null,
+  );
+  if (snapshot.accounts.length > 0 && inconclusive) {
+    return { allow: true, resumeAt: null, usableAccount: null };
+  }
+
   const nowSec = Math.floor(now.getTime() / 1000);
   const earliest = pickEarliestFutureResetEpoch(snapshot, nowSec);
   return {

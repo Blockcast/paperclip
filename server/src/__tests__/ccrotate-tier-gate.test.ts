@@ -162,6 +162,70 @@ describe("evaluateTierCacheSnapshot", () => {
     );
     expect(result.allow).toBe(false);
   });
+
+  it("allows optimistically when every account is inconclusive (Usage API on cooldown)", () => {
+    // 2026-05-04 deadlock repro: Anthropic per-account Usage API throttled the
+    // cluster, so every account ended up status="unknown" with no tier and no
+    // rateLimits. Old behavior denied → no run dispatch → no quotaExhaustedHook
+    // → no bot trigger → tokens stayed expired → cache never recovered. Fix
+    // is to allow optimistically and let the post-run quota hook handle the
+    // case where the optimism was wrong.
+    const result = evaluateTierCacheSnapshot(
+      "claude",
+      {
+        updatedAt: "2026-05-04T18:07:42.707Z",
+        accounts: [
+          {
+            email: "a@x.com",
+            status: "unknown",
+            serviceTier: null,
+            response: "Usage API on cooldown — org-level fallback skipped",
+            rateLimits: null,
+          },
+          {
+            email: "b@x.com",
+            status: "unknown",
+            serviceTier: null,
+            rateLimits: null,
+          },
+        ],
+      },
+      now,
+    );
+    expect(result.allow).toBe(true);
+    expect(result.usableAccount).toBeNull();
+    expect(result.resumeAt).toBeNull();
+  });
+
+  it("still denies when at least one account has a known-bad rateLimit despite others being unknown", () => {
+    // Mixed snapshot: one account has rate-limit data showing it's exhausted
+    // until a future epoch; another is inconclusive. The known-bad account
+    // means we have SOME signal — fall through to the deny + earliest-reset
+    // path rather than the inconclusive-allow shortcut.
+    const result = evaluateTierCacheSnapshot(
+      "claude",
+      {
+        updatedAt: "2026-05-04T18:07:42.707Z",
+        accounts: [
+          {
+            email: "exhausted@x.com",
+            status: "success",
+            serviceTier: "extra",
+            rateLimits: { reset5h: now.getTime() / 1000 + 600 },
+          },
+          {
+            email: "unknown@x.com",
+            status: "unknown",
+            serviceTier: null,
+            rateLimits: null,
+          },
+        ],
+      },
+      now,
+    );
+    expect(result.allow).toBe(false);
+    expect(result.resumeAt).not.toBeNull();
+  });
 });
 
 describe("createCcrotateTierGate", () => {
