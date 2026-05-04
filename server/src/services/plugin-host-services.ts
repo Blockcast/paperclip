@@ -1157,6 +1157,13 @@ export function buildHostServices(
           actor: { actorAgentId, actorUserId, actorRunId },
           details: {
             title: issue.title,
+            // `description` is forwarded so issue.created event subscribers
+            // (notably paperclip-plugin-linear's bidirectional sync at
+            // worker.ts:899) receive the body the plugin minted with. Without
+            // it, the Linear-side mirror lands with an empty description —
+            // observed 2026-05-04 with paperclip-plugin-alertmanager: paperclip
+            // rows had 1.2KB descriptions, Linear mirrors had nothing.
+            description: issue.description,
             identifier: issue.identifier,
             status: issue.status,
             priority: issue.priority,
