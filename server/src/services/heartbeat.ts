@@ -6903,7 +6903,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // re-evaluated on the next scheduler tick after the deferral memo expires.
     // User-initiated wakeups are passed through — the caller may have just
     // rotated accounts and we don't want to mask their intent.
-    if (source === "timer") {
+    //
+    // Also gate the *quota-exhausted recovery* automation wake (fired by
+    // runQuotaExhaustedHook.onSuccess after the trigger CLI runs). Without
+    // this, when every account in the pool is exhausted, the recovery wake
+    // would fire immediately, the agent would pick another exhausted account,
+    // run would fail again, hook fires again — looping until the debounce
+    // (60s) finally drops a wake. With the gate, the recovery wake gets
+    // skipped when no account is usable; a later timer heartbeat picks the
+    // run back up after a usable account's reset epoch has passed.
+    const gateAppliesToWake =
+      source === "timer" ||
+      (source === "automation" && reason === "provider_quota_exhausted_recovered");
+    if (gateAppliesToWake) {
       const gateResult = await ccrotateGate.checkAdapter({
         adapterType: agent.adapterType,
         agentId,

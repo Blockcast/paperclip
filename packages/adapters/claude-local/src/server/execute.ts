@@ -16,6 +16,7 @@ import {
   readAdapterExecutionTarget,
   resolveAdapterExecutionTargetCommandForLogs,
   runAdapterExecutionTargetProcess,
+  runAdapterExecutionTargetShellCommand,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -106,6 +107,86 @@ function isBedrockAuth(env: Record<string, string>): boolean {
 function resolveClaudeBillingType(env: Record<string, string>): "api" | "subscription" | "metered_api" {
   if (isBedrockAuth(env)) return "metered_api";
   return hasNonEmptyEnvValue(env, "ANTHROPIC_API_KEY") ? "api" : "subscription";
+}
+
+interface CcrotateAdvanceInput {
+  runId: string;
+  executionTarget: ReturnType<typeof readAdapterExecutionTarget>;
+  cwd: string;
+  env: Record<string, string>;
+  onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+}
+
+interface CcrotateAdvanceResult {
+  /** Whether we successfully invoked ccrotate (regardless of whether the active account changed). */
+  invoked: boolean;
+  /** The email ccrotate switched to. Same as before-switch when no rotation was possible. */
+  toEmail: string | null;
+  /** True when the active account differs from before — i.e., a real rotation happened. */
+  switched: boolean;
+  /** Best-effort skip reason when invoked=false (e.g. command not found, k8s target). */
+  skipReason: string | null;
+}
+
+// Auto-allow extra-tier fallback. Without -y, ccrotate refuses to switch to
+// extra-tier accounts in non-TTY contexts, which would defeat the retry path
+// when the standard pool is exhausted.
+const CCROTATE_NEXT_COMMAND = "ccrotate --target claude next --yes 2>&1";
+
+function parseCcrotateNextOutput(output: string): { toEmail: string | null; switched: boolean } {
+  const switched = output.match(/✓\s+Switched to account:\s*([^\s(]+)/);
+  if (switched) {
+    return { toEmail: switched[1] ?? null, switched: true };
+  }
+  const already = output.match(/✓\s+Already on\s+([^\s(]+)/);
+  if (already) {
+    return { toEmail: already[1] ?? null, switched: false };
+  }
+  return { toEmail: null, switched: false };
+}
+
+/**
+ * Spawn `ccrotate next --yes` against the claude target on the same execution
+ * target as the run. Used to recover from a mid-run 401 / quota-exhausted
+ * failure by switching to a fresh account and retrying claude once.
+ *
+ * Best-effort: failure (ccrotate not installed, k8s execution target,
+ * non-zero exit) returns `invoked=false` with a reason. Caller falls back to
+ * the existing heartbeat-level recovery path in that case.
+ */
+async function tryAdvanceCcrotateAccount(
+  input: CcrotateAdvanceInput,
+): Promise<CcrotateAdvanceResult> {
+  const { runId, executionTarget, cwd, env, onLog } = input;
+  if (executionTarget?.kind === "remote" && executionTarget.transport === "k8s") {
+    return { invoked: false, toEmail: null, switched: false, skipReason: "k8s_execution_target" };
+  }
+  try {
+    const proc = await runAdapterExecutionTargetShellCommand(
+      runId,
+      executionTarget,
+      CCROTATE_NEXT_COMMAND,
+      { cwd, env, timeoutSec: 15, graceSec: 5, onLog: async () => {} },
+    );
+    if (proc.timedOut) {
+      return { invoked: false, toEmail: null, switched: false, skipReason: "ccrotate_timeout" };
+    }
+    if ((proc.exitCode ?? 0) !== 0) {
+      return {
+        invoked: false,
+        toEmail: null,
+        switched: false,
+        skipReason: `ccrotate_exit_${proc.exitCode ?? "?"}`,
+      };
+    }
+    const output = `${proc.stdout}\n${proc.stderr}`;
+    const parsed = parseCcrotateNextOutput(output);
+    return { invoked: true, toEmail: parsed.toEmail, switched: parsed.switched, skipReason: null };
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    void onLog("stderr", `[paperclip] ccrotate advance failed: ${reason}\n`);
+    return { invoked: false, toEmail: null, switched: false, skipReason: "ccrotate_threw" };
+  }
 }
 
 async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<ClaudeRuntimeConfig> {
@@ -771,23 +852,67 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   };
 
   try {
-    const initial = await runAttempt(sessionId ?? null);
+    let attempt = await runAttempt(sessionId ?? null);
+    let resultOpts: { fallbackSessionId: string | null; clearSessionOnMissingSession?: boolean } = {
+      fallbackSessionId: runtimeSessionId || runtime.sessionId,
+    };
+
     if (
       sessionId &&
-      !initial.proc.timedOut &&
-      (initial.proc.exitCode ?? 0) !== 0 &&
-      initial.parsed &&
-      isClaudeUnknownSessionError(initial.parsed)
+      !attempt.proc.timedOut &&
+      (attempt.proc.exitCode ?? 0) !== 0 &&
+      attempt.parsed &&
+      isClaudeUnknownSessionError(attempt.parsed)
     ) {
       await onLog(
         "stdout",
         `[paperclip] Claude resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
       );
-      const retry = await runAttempt(null);
-      return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
+      attempt = await runAttempt(null);
+      resultOpts = { fallbackSessionId: null, clearSessionOnMissingSession: true };
     }
 
-    return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
+    let result = toAdapterResult(attempt, resultOpts);
+
+    // ccrotate-aware retry: on auth/quota failure, advance ccrotate's active
+    // account once and re-run claude with a fresh session. Catches the common
+    // path where the active account's token expired or burned its quota mid
+    // run, before propagating to the heartbeat-level recovery hook.
+    if (
+      result.errorCode === "claude_auth_required" ||
+      result.errorCode === "provider_quota_exhausted"
+    ) {
+      const advance = await tryAdvanceCcrotateAccount({
+        runId,
+        executionTarget,
+        cwd,
+        env,
+        onLog,
+      });
+      if (advance.invoked && advance.switched) {
+        await onLog(
+          "stdout",
+          `[paperclip] ccrotate advanced to ${advance.toEmail ?? "<unknown>"} after ${result.errorCode}; retrying claude with a fresh session.\n`,
+        );
+        attempt = await runAttempt(null);
+        result = toAdapterResult(attempt, {
+          fallbackSessionId: null,
+          clearSessionOnMissingSession: true,
+        });
+      } else if (advance.invoked && !advance.switched) {
+        await onLog(
+          "stdout",
+          `[paperclip] ccrotate has no further account to rotate to (still on ${advance.toEmail ?? "<unknown>"}); leaving ${result.errorCode} for heartbeat-level recovery.\n`,
+        );
+      } else {
+        await onLog(
+          "stdout",
+          `[paperclip] ccrotate advance skipped (${advance.skipReason ?? "unknown"}); leaving ${result.errorCode} for heartbeat-level recovery.\n`,
+        );
+      }
+    }
+
+    return result;
   } finally {
     if (restoreRemoteWorkspace) {
       await onLog(

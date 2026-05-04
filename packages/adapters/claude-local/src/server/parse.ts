@@ -2,6 +2,7 @@ import type { UsageSummary } from "@paperclipai/adapter-utils";
 import {
   asString,
   asNumber,
+  asBoolean,
   parseObject,
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -157,6 +158,7 @@ export function detectClaudeLoginRequired(input: {
 
 export function describeClaudeFailure(parsed: Record<string, unknown>): string | null {
   const subtype = asString(parsed.subtype, "");
+  const isError = asBoolean(parsed.is_error, false);
   const resultText = asString(parsed.result, "").trim();
   const errors = extractClaudeErrorMessages(parsed);
 
@@ -166,7 +168,13 @@ export function describeClaudeFailure(parsed: Record<string, unknown>): string |
   }
 
   const parts = ["Claude run failed"];
-  if (subtype) parts.push(`subtype=${subtype}`);
+  // Skip subtype="success" when is_error=true — that combo is what claude
+  // emits for quota / rate-limit terminations, where the *CLI envelope*
+  // succeeded but the AI request errored. Surfacing "subtype=success" in a
+  // failure message reads as a contradiction.
+  if (subtype && !(isError && subtype === "success")) {
+    parts.push(`subtype=${subtype}`);
+  }
   if (detail) parts.push(detail);
   return parts.length > 1 ? parts.join(": ") : null;
 }
