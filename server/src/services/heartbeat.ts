@@ -4314,6 +4314,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         agentId: hookAgentId,
         companyId: hookCompanyId,
         runId: null,
+        adapterType: existing.adapterType,
         errorCode: opts?.errorCode ?? "provider_quota_exhausted",
         onSuccess: () =>
           enqueueWakeup(hookAgentId, {

@@ -46,7 +46,7 @@ function resolveCommand(configured: string | null): {
   return { command: envCmd, source: "env" };
 }
 
-function runCommand(command: string): Promise<RunResult> {
+function runCommand(command: string, env: Record<string, string>): Promise<RunResult> {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     let stdout = "";
@@ -58,6 +58,7 @@ function runCommand(command: string): Promise<RunResult> {
     const child = spawn(command, {
       shell: true,
       stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, ...env },
     });
 
     const timer = setTimeout(() => {
@@ -108,6 +109,10 @@ export interface RunQuotaExhaustedHookInput {
   agentId: string;
   companyId: string;
   runId: string | null;
+  /** The adapter type that surfaced the quota exhaustion. Forwarded to the
+   *  hook command as `PAPERCLIP_ADAPTER_TYPE` so e.g. ccrotate-relogin-trigger
+   *  can map adapter → ccrotate target without an extra DB lookup. */
+  adapterType: string;
   errorCode: string;
   onSuccess?: (() => void | Promise<void>) | null;
 }
@@ -160,7 +165,14 @@ export async function runQuotaExhaustedHook(
   }
 
   state.lastRunStartedAt = now;
-  const runPromise = runCommand(command);
+  const runPromise = runCommand(command, {
+    PAPERCLIP_HOOK_KIND: "quotaExhausted",
+    PAPERCLIP_AGENT_ID: input.agentId,
+    PAPERCLIP_COMPANY_ID: input.companyId,
+    PAPERCLIP_RUN_ID: input.runId ?? "",
+    PAPERCLIP_ADAPTER_TYPE: input.adapterType,
+    PAPERCLIP_ERROR_CODE: input.errorCode,
+  });
   state.inFlight = runPromise;
 
   let result: RunResult;
