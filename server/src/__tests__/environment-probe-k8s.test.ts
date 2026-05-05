@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetCode = vi.hoisted(() => vi.fn());
@@ -56,6 +56,18 @@ describe("probeEnvironment — k8s", () => {
     mockLoadFromCluster.mockReset();
     mockMakeApiClient.mockReset();
     mockMakeApiClient.mockImplementation(() => ({ getCode: mockGetCode }));
+    // Tests that exercise the in-cluster auth path go through a guard in
+    // environment-probe.ts that returns "KUBERNETES_SERVICE_HOST is unset"
+    // before reaching `loadFromCluster()`. CI runners aren't pods, so the
+    // env var is naturally absent and those assertions used to fail with
+    // `{ error: "KUBERNETES_SERVICE_HOST is unset", stage: "in-cluster-load" }`
+    // instead of the mocked-success path. Stubbing it here keeps the
+    // in-cluster-path tests agnostic to whether the test host is in a pod.
+    vi.stubEnv("KUBERNETES_SERVICE_HOST", "10.96.0.1");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   it("returns ok=true with cluster gitVersion when /version succeeds (in-cluster auth)", async () => {
