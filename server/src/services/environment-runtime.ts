@@ -210,6 +210,55 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   };
 }
 
+// k8s envs are claimed by the claude_k8s / opencode_k8s adapters which create
+// the agent Job pod themselves (using the K8sRemoteSpec produced by
+// environment-execution-target.ts). The runtime's lease lifecycle here just
+// records the claim — same shape as the local driver. Without this driver
+// registered, environmentRuntimeService.requireDriver() throws on any
+// k8s-typed environment and the heartbeat lease acquisition fails.
+function createK8sEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
+  const environmentsSvc = environmentService(db);
+
+  return {
+    driver: "k8s",
+
+    async acquireRunLease(input) {
+      return await environmentsSvc.acquireLease({
+        companyId: input.companyId,
+        environmentId: input.environment.id,
+        executionWorkspaceId: input.executionWorkspaceId,
+        issueId: input.issueId,
+        heartbeatRunId: input.heartbeatRunId,
+        leasePolicy: "ephemeral",
+        provider: "k8s",
+        metadata: {
+          driver: input.environment.driver,
+          executionWorkspaceMode: input.executionWorkspaceMode,
+        },
+      });
+    },
+
+    async releaseRunLease(input) {
+      return await environmentsSvc.releaseLease(input.lease.id, input.status);
+    },
+
+    async realizeWorkspace(input) {
+      const record = buildWorkspaceRealizationRecordFromDriverInput({
+        environment: input.environment,
+        lease: input.lease,
+        workspace: input.workspace,
+        cwd: input.workspace.remotePath ?? null,
+      });
+      return {
+        cwd: input.workspace.remotePath ?? "/workspace",
+        metadata: {
+          workspaceRealization: record,
+        },
+      };
+    },
+  };
+}
+
 function summarizeProbeAttempt(attempt: PaperclipApiProbeAttempt): string {
   const parts: string[] = [
     `candidate=${attempt.candidate}`,
@@ -1010,6 +1059,7 @@ export function environmentRuntimeService(
     createLocalEnvironmentDriver(db),
     createSshEnvironmentDriver(db),
     createSandboxEnvironmentDriver(db, options.pluginWorkerManager),
+    createK8sEnvironmentDriver(db),
     ...(options.pluginWorkerManager
       ? [createPluginEnvironmentDriver(db, options.pluginWorkerManager)]
       : []),
