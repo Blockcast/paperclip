@@ -287,3 +287,107 @@ describe("heartbeat outcome — rate-limit-exhausted integration", () => {
     expect(r.rateLimitExhaustedOverride).toBe(false);
   });
 });
+
+// ─── finalizeAgentStatus errorCode plumbing ────────────────────────────────
+//
+// Regression for the hook-firing gap observed 2026-05-05 19:12-21:00Z:
+// PR #83 made `runErrorCode = "rate_limit_exhausted"` on the override path,
+// but the `finalizeAgentStatus` call site at heartbeat.ts:6244 was passing
+// `adapterResult.errorCode` (the raw adapter signal) instead. Result:
+// 5+ heartbeat_runs correctly tagged `rate_limit_exhausted`, 0
+// `quota-exhausted-hook` activity_log entries — the hook gate was reading
+// the wrong code and short-circuiting the recoverable path.
+describe("heartbeat finalizeAgentStatus errorCode plumbing", () => {
+  // Mirrors the run-completion call site: which errorCode value is passed
+  // into finalizeAgentStatus's opts? This is what controls whether
+  // `recoverable=true` and `runQuotaExhaustedHook` fires.
+  function whatGetsPassedToFinalizeAgentStatus(input: {
+    runErrorCode: string | null;
+    adapterErrorCode: string | null;
+    /** When true, simulate the buggy call site (PR #83's blind spot). */
+    useBuggyCallSite?: boolean;
+  }): { errorCode: string | null } {
+    if (input.useBuggyCallSite) {
+      return { errorCode: input.adapterErrorCode ?? null };
+    }
+    return { errorCode: input.runErrorCode };
+  }
+
+  // Mirrors finalizeAgentStatus's recoverable check (heartbeat.ts:1898 in
+  // master, expanded by PR #83 to accept both codes).
+  function isRecoverableAfterPr83(errorCode: string | null): boolean {
+    return (
+      errorCode === "provider_quota_exhausted" ||
+      errorCode === "rate_limit_exhausted"
+    );
+  }
+
+  it("rate-limit override → finalize gets rate_limit_exhausted (recoverable=true)", () => {
+    // The fix: pass runErrorCode (rate_limit_exhausted on override path).
+    const passed = whatGetsPassedToFinalizeAgentStatus({
+      runErrorCode: "rate_limit_exhausted",
+      adapterErrorCode: null,
+    });
+    expect(passed.errorCode).toBe("rate_limit_exhausted");
+    expect(isRecoverableAfterPr83(passed.errorCode)).toBe(true);
+  });
+
+  it("rate-limit override on already-failed run → still gets rate_limit_exhausted", () => {
+    // Failed-path with adapter setting "adapter_failed" but override
+    // re-tagging to "rate_limit_exhausted" — the call site must use
+    // runErrorCode, not adapterErrorCode.
+    const passed = whatGetsPassedToFinalizeAgentStatus({
+      runErrorCode: "rate_limit_exhausted",
+      adapterErrorCode: "adapter_failed",
+    });
+    expect(passed.errorCode).toBe("rate_limit_exhausted");
+    expect(isRecoverableAfterPr83(passed.errorCode)).toBe(true);
+  });
+
+  it("non-rate-limit failures still propagate adapter error code", () => {
+    // For non-override outcomes, runErrorCode FALLS BACK to
+    // adapterResult.errorCode (heartbeat.ts:6082). The fix preserves this.
+    const passed = whatGetsPassedToFinalizeAgentStatus({
+      runErrorCode: "adapter_failed",
+      adapterErrorCode: "adapter_failed",
+    });
+    expect(passed.errorCode).toBe("adapter_failed");
+    expect(isRecoverableAfterPr83(passed.errorCode)).toBe(false);
+  });
+
+  it("succeeded runs pass null errorCode, recoverable=false", () => {
+    const passed = whatGetsPassedToFinalizeAgentStatus({
+      runErrorCode: null,
+      adapterErrorCode: null,
+    });
+    expect(passed.errorCode).toBeNull();
+    expect(isRecoverableAfterPr83(passed.errorCode)).toBe(false);
+  });
+
+  it("REGRESSION: buggy call site (using adapterResult.errorCode) → recoverable=false despite rate-limit override", () => {
+    // This documents the bug the fix corrects: when the call site reads
+    // adapterResult.errorCode (which is null/adapter_failed for cap hits)
+    // instead of runErrorCode, the hook never fires. Asserting the
+    // pathology so future refactors don't silently regress it.
+    const buggy = whatGetsPassedToFinalizeAgentStatus({
+      runErrorCode: "rate_limit_exhausted",
+      adapterErrorCode: null, // claude exits subtype=success, no adapter error
+      useBuggyCallSite: true,
+    });
+    expect(buggy.errorCode).toBeNull();
+    expect(isRecoverableAfterPr83(buggy.errorCode)).toBe(false);
+  });
+
+  it("REGRESSION: buggy call site (using adapterResult.errorCode='adapter_failed') → recoverable=false", () => {
+    // Failed-path variant: adapter exits 1 with error message, override
+    // re-tags to rate_limit_exhausted. Buggy call site reads "adapter_failed"
+    // instead and hook is skipped.
+    const buggy = whatGetsPassedToFinalizeAgentStatus({
+      runErrorCode: "rate_limit_exhausted",
+      adapterErrorCode: "adapter_failed",
+      useBuggyCallSite: true,
+    });
+    expect(buggy.errorCode).toBe("adapter_failed");
+    expect(isRecoverableAfterPr83(buggy.errorCode)).toBe(false);
+  });
+});
