@@ -20,3 +20,4 @@ export { accessRoutes } from "./access.js";
 export { instanceSettingsRoutes } from "./instance-settings.js";
 export { instanceDatabaseBackupRoutes } from "./instance-database-backups.js";
 export { workspaceScanRoutes } from "./workspace-scan.js";
+export { ccrotateRoutes } from "./ccrotate.js";
