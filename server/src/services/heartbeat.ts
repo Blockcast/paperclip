@@ -6992,9 +6992,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // (60s) finally drops a wake. With the gate, the recovery wake gets
     // skipped when no account is usable; a later timer heartbeat picks the
     // run back up after a usable account's reset epoch has passed.
+    // Gate all non-user-initiated wakeups. Without this, individual tasks
+    // (issue-assignment wakes, recovery sweeps, blocker-resolved sweeps,
+    // bulk-unblock operator pokes via SQL, periodic blocked-rechecker cron
+    // firings) all bypass the ccrotate gate and dispatch into a pool with
+    // no usable accounts — wasting per-account 5h cap on guaranteed-429
+    // requests, surfacing rate_limit_exhausted error_codes that confuse
+    // operators, and burning the on-limit hook's 60s debounce.
+    //
+    // `manual` and `on_demand` are explicitly user-initiated (operator UI
+    // wake button, direct API call) — the caller may have just rotated
+    // accounts manually and we don't want to mask their intent.
+    //
+    // Observed 2026-05-05 21:30-21:46Z: 17+ runs dispatched + 429'd
+    // mid-run despite the pre-run lifecycle hook printing "❌ All accounts
+    // are rate-limited." Each was a non-timer source — `automation`
+    // (recovery), `assignment`, `manual` (the operator bulk-unblock).
+    // Original check (`timer` only, plus the narrow
+    // `provider_quota_exhausted_recovered` reason) only caught the
+    // smallest slice.
     const gateAppliesToWake =
       source === "timer" ||
-      (source === "automation" && reason === "provider_quota_exhausted_recovered");
+      source === "automation" ||
+      source === "assignment";
     if (gateAppliesToWake) {
       const gateResult = await ccrotateGate.checkAdapter({
         adapterType: agent.adapterType,
