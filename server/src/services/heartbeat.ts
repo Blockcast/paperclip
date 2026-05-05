@@ -1027,17 +1027,62 @@ export function isEmptyResult(
   return !hasSubstantiveValue;
 }
 
-// Detect 429 rate-limit-exhaustion runs.  The claude/opencode binaries exit
-// cleanly (exit 0) when the Anthropic API returns 429 "out of extra usage",
-// surfacing the status only via api_error_status in the final result event.
-// Without this detection the run is bucketed as `succeeded` and never enters
-// the bounded transient retry path.
+// Detect rate-limit / cap-exhaustion runs across the multiple shapes the
+// claude/opencode binaries surface them in:
+//
+// 1. 429 from Anthropic API on inference — exits 0, status only in
+//    `api_error_status` of the final result event.
+// 2. 401 when an account is in cap-violation state — Anthropic's refresh
+//    endpoint accepts the refresh_token (so ccrotate considers the account
+//    "healthy") but `/v1/messages` then returns 401. Subsequent runs get
+//    "Failed to authenticate. API Error: 401" until the cap window rolls.
+// 3. Cap-message-as-text — claude CLI sometimes exits with subtype=success
+//    while the response body literally reads "You've hit your limit · resets
+//    May 6, 9pm (UTC)" or "You're out of extra usage · resets ...". The
+//    binary sees this as a normal completion, but inference produced no
+//    actual model output.
+//
+// Without this detection the run is bucketed as `succeeded` and never
+// enters the bounded transient retry path; the on-limit hook never fires;
+// and the agent shows green while the cluster goes silent. The 7/29
+// regression where cluster sat dead for ~80min happened because (2) and
+// (3) weren't being detected.
+const RATE_LIMIT_TEXT_PATTERNS = [
+  /you've hit your limit/i,
+  /you're out of extra usage/i,
+  /you are out of extra usage/i,
+  /out of extra usage/i,
+  /usage limit/i,
+];
+
+function looksLikeRateLimitText(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  return RATE_LIMIT_TEXT_PATTERNS.some((re) => re.test(value));
+}
+
 export function isRateLimitExhausted(
   resultJson: Record<string, unknown> | null | undefined,
+  opts?: { errorMessage?: string | null },
 ): boolean {
-  if (!resultJson) return false;
-  const status = resultJson.api_error_status;
-  return status === 429 || status === "429";
+  // Path 2 + 1: api_error_status 401 or 429 from claude SDK's final event.
+  const status = resultJson?.api_error_status;
+  if (status === 429 || status === "429") return true;
+  if (status === 401 || status === "401") return true;
+
+  // Path 3: cap-message-as-text in any of the textual fields the SDK uses.
+  if (resultJson) {
+    for (const key of ["result", "message", "error", "summary"] as const) {
+      if (looksLikeRateLimitText(resultJson[key])) return true;
+    }
+  }
+
+  // Path 2 (alt-surface): adapter-side error message containing the cap
+  // text or a 401 reference. Covers cases where the run finalizes via the
+  // failed branch (errorMessage set, resultJson minimal/null).
+  if (looksLikeRateLimitText(opts?.errorMessage)) return true;
+  if (typeof opts?.errorMessage === "string" && /API Error:\s*401\b/.test(opts.errorMessage)) return true;
+
+  return false;
 }
 
 function readNonEmptyString(value: unknown): string | null {
@@ -4265,9 +4310,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const isFirstHeartbeat = !existing.lastHeartbeatAt;
 
     const runningCount = await countRunningRunsForAgent(agentId);
-    // Provider quota exhaustion is a transient, self-recovering condition —
-    // keep the agent idle so the dashboard doesn't show a spurious error.
-    const recoverable = opts?.errorCode === "provider_quota_exhausted";
+    // Provider quota exhaustion / Anthropic cap hit is a transient,
+    // self-recovering condition — keep the agent idle so the dashboard
+    // doesn't show a spurious error AND fire the on-limit hook so
+    // ccrotate gets a chance to rotate to a base-tier account.
+    //
+    // Both error codes route here:
+    //  - `provider_quota_exhausted`: legacy/pluggable adapter signal.
+    //  - `rate_limit_exhausted`: set by isRateLimitExhausted() when the
+    //    run hits 429, 401-cap, or "you've hit your limit" cap text.
+    //    Without unifying these, rate-limit-flagged runs flipped agents
+    //    to error and the on-limit hook never fired (cluster sat silent
+    //    until the cap window rolled — observed 2026-05-05 16:08-17:30Z).
+    const recoverable =
+      opts?.errorCode === "provider_quota_exhausted" ||
+      opts?.errorCode === "rate_limit_exhausted";
     const nextStatus =
       runningCount > 0
         ? "running"
@@ -5985,12 +6042,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       } else {
         outcome = "failed";
       }
-      // Override succeeded → failed when the result reports a 429 rate-limit
-      // exhaustion.  Mark it transient_upstream so scheduleBoundedRetryForRun
-      // (called downstream when outcome === "failed") schedules the retry.
+      // Detect rate-limit / cap exhaustion so scheduleBoundedRetryForRun
+      // schedules a transient retry AND so finalizeAgentStatus treats the
+      // outcome as recoverable (keeps agent idle, fires the on-limit hook
+      // to drive ccrotate rotation). Three surfaces:
+      //   - succeeded with api_error_status 429/401 → override to failed
+      //   - succeeded with cap-text in result body → override to failed
+      //   - already failed (e.g. 401 errorMessage) → re-tag errorCode so
+      //     the recoverable path still fires
       let rateLimitExhaustedOverride = false;
-      if (outcome === "succeeded" && isRateLimitExhausted(adapterResult.resultJson)) {
+      const looksRateLimited = isRateLimitExhausted(adapterResult.resultJson, {
+        errorMessage: adapterResult.errorMessage,
+      });
+      if (outcome === "succeeded" && looksRateLimited) {
         outcome = "failed";
+        rateLimitExhaustedOverride = true;
+      } else if (outcome === "failed" && looksRateLimited) {
+        // Outcome already failed — keep it failed but flag for the
+        // recoverable / retry-with-rotation path.
         rateLimitExhaustedOverride = true;
       }
       const runErrorMessage = rateLimitExhaustedOverride

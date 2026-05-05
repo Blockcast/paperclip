@@ -1,4 +1,4 @@
-// Tests for 429 rate-limit-exhausted detection and the corresponding
+// Tests for cap/rate-limit-exhausted detection and the corresponding
 // outcome override that routes the run into the bounded transient retry.
 import { describe, expect, it } from "vitest";
 import { isRateLimitExhausted } from "../services/heartbeat.js";
@@ -16,13 +16,12 @@ describe("isRateLimitExhausted", () => {
     expect(isRateLimitExhausted({})).toBe(false);
   });
 
-  it("returns false when api_error_status is absent", () => {
+  it("returns false when api_error_status is absent and no rate-limit text", () => {
     expect(isRateLimitExhausted({ result: "ok", is_error: false })).toBe(false);
   });
 
-  it("returns false for non-429 api_error_status", () => {
+  it("returns false for non-429/401 api_error_status", () => {
     expect(isRateLimitExhausted({ api_error_status: 500 })).toBe(false);
-    expect(isRateLimitExhausted({ api_error_status: 401 })).toBe(false);
     expect(isRateLimitExhausted({ api_error_status: null })).toBe(false);
   });
 
@@ -32,6 +31,15 @@ describe("isRateLimitExhausted", () => {
 
   it("returns true for api_error_status === \"429\" (string)", () => {
     expect(isRateLimitExhausted({ api_error_status: "429" })).toBe(true);
+  });
+
+  it("returns true for api_error_status === 401 (cap-violation auth-fail)", () => {
+    // Anthropic returns 401 on /v1/messages when the account hit its cap
+    // even though the refresh endpoint still accepts the refresh_token —
+    // this is what produced the "Failed to authenticate. API Error: 401"
+    // error message during the 2026-05-05 cluster silence.
+    expect(isRateLimitExhausted({ api_error_status: 401 })).toBe(true);
+    expect(isRateLimitExhausted({ api_error_status: "401" })).toBe(true);
   });
 
   it("returns true on the real-world 429 result shape", () => {
@@ -45,6 +53,50 @@ describe("isRateLimitExhausted", () => {
         stop_reason: "stop_sequence",
       }),
     ).toBe(true);
+  });
+
+  it("returns true when result body contains cap text (subtype=success path)", () => {
+    // claude CLI sometimes exits cleanly (subtype=success, no api_error_status)
+    // with the cap message embedded in the result body. Observed 2026-05-05:
+    //   "Claude run failed: subtype=success: You've hit your limit · resets May 6, 9pm (UTC)"
+    expect(
+      isRateLimitExhausted({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: "You've hit your limit · resets May 6, 9pm (UTC)",
+      }),
+    ).toBe(true);
+    expect(
+      isRateLimitExhausted({
+        message: "You're out of extra usage · resets in 24h",
+      }),
+    ).toBe(true);
+  });
+
+  it("returns true when adapter errorMessage contains cap-text or 401", () => {
+    // Failed-path: errorMessage is set (resultJson may be null/minimal)
+    // but the message reveals a rate-limit. Both surfaces should fire the
+    // recoverable path so the on-limit hook drives ccrotate rotation.
+    expect(
+      isRateLimitExhausted(null, {
+        errorMessage: "Failed to authenticate. API Error: 401",
+      }),
+    ).toBe(true);
+    expect(
+      isRateLimitExhausted(null, {
+        errorMessage: "Claude run failed: subtype=success: You've hit your limit · resets May 6, 9pm (UTC)",
+      }),
+    ).toBe(true);
+  });
+
+  it("returns false for unrelated 401 messages outside cap context", () => {
+    // Don't false-positive on bare 401s from non-cap paths.
+    expect(
+      isRateLimitExhausted(null, {
+        errorMessage: "Generic error 401: not our format",
+      }),
+    ).toBe(false);
   });
 });
 
@@ -77,8 +129,16 @@ describe("heartbeat outcome — rate-limit-exhausted integration", () => {
     }
 
     let rateLimitExhaustedOverride = false;
-    if (outcome === "succeeded" && isRateLimitExhausted(input.resultJson)) {
+    const looksRateLimited = isRateLimitExhausted(input.resultJson, {
+      errorMessage: input.errorMessage,
+    });
+    if (outcome === "succeeded" && looksRateLimited) {
       outcome = "failed";
+      rateLimitExhaustedOverride = true;
+    } else if (outcome === "failed" && looksRateLimited) {
+      // Already-failed runs whose errorMessage / resultJson reveals a
+      // rate-limit also enter the recoverable path so the on-limit hook
+      // can drive ccrotate rotation.
       rateLimitExhaustedOverride = true;
     }
 
@@ -132,10 +192,13 @@ describe("heartbeat outcome — rate-limit-exhausted integration", () => {
     expect(r.persistedErrorFamily).toBeNull();
   });
 
-  it("does NOT override an already-failed run that happens to carry a 429 result", () => {
-    // If the adapter already failed (non-zero exit), the rate-limit override
-    // shouldn't fire — the run is already on the failed path with whatever
-    // adapter-specific error code applies.
+  it("DOES tag an already-failed run when resultJson reveals 429", () => {
+    // Updated semantics (2026-05-05): the rate-limit override fires on
+    // already-failed runs too, so finalizeAgentStatus's recoverable check
+    // sees rate_limit_exhausted and the on-limit hook drives ccrotate
+    // rotation. Without this, runs that fail via the failed branch (e.g.
+    // 401-after-cap) flipped the agent to error and the cluster sat
+    // silent until the cap window rolled.
     const r = evaluateOutcome({
       exitCode: 1,
       errorMessage: "adapter died",
@@ -144,9 +207,58 @@ describe("heartbeat outcome — rate-limit-exhausted integration", () => {
       resultJson: { api_error_status: 429 },
     });
     expect(r.outcome).toBe("failed");
+    expect(r.rateLimitExhaustedOverride).toBe(true);
+    expect(r.errorCode).toBe("rate_limit_exhausted");
+    expect(r.persistedErrorFamily).toBe("transient_upstream");
+  });
+
+  it("DOES tag a 401 errorMessage failure as rate_limit_exhausted", () => {
+    // The exact pattern the cluster hit on 2026-05-05 16:09:18Z and after:
+    // exit 1 + `Failed to authenticate. API Error: 401` once the active
+    // account's cap window kicked in.
+    const r = evaluateOutcome({
+      exitCode: 1,
+      errorMessage: "Failed to authenticate. API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication\"...",
+      timedOut: false,
+      cancelled: false,
+      resultJson: null,
+    });
+    expect(r.outcome).toBe("failed");
+    expect(r.rateLimitExhaustedOverride).toBe(true);
+    expect(r.errorCode).toBe("rate_limit_exhausted");
+  });
+
+  it("DOES tag exit-0 + cap-text-in-result-body as rate_limit_exhausted", () => {
+    // claude CLI sometimes exits cleanly (subtype=success) with cap text
+    // embedded in the result body and no api_error_status field.
+    const r = evaluateOutcome({
+      exitCode: 0,
+      errorMessage: null,
+      timedOut: false,
+      cancelled: false,
+      resultJson: {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: "You've hit your limit · resets May 6, 9pm (UTC)",
+      },
+    });
+    expect(r.outcome).toBe("failed");
+    expect(r.rateLimitExhaustedOverride).toBe(true);
+    expect(r.errorCode).toBe("rate_limit_exhausted");
+  });
+
+  it("does NOT override unrelated failures with no rate-limit signals", () => {
+    const r = evaluateOutcome({
+      exitCode: 1,
+      errorMessage: "some other adapter error",
+      timedOut: false,
+      cancelled: false,
+      resultJson: { type: "result", is_error: true, result: "boom" },
+    });
+    expect(r.outcome).toBe("failed");
     expect(r.rateLimitExhaustedOverride).toBe(false);
     expect(r.errorCode).toBe("adapter_failed");
-    expect(r.persistedErrorFamily).toBeNull();
   });
 
   it("does NOT override timed-out runs", () => {
