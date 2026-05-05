@@ -6241,8 +6241,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
       }
+      // Pass `runErrorCode` (computed above), NOT `adapterResult.errorCode`.
+      // The rate-limit override path sets `runErrorCode = "rate_limit_exhausted"`
+      // when the run hit a 429/401/cap-text, while `adapterResult.errorCode`
+      // remains the raw adapter signal (typically null or `"adapter_failed"`).
+      // Without this, `finalizeAgentStatus`'s `recoverable` check never sees
+      // `rate_limit_exhausted`, the agent flips to `error`, and
+      // `runQuotaExhaustedHook` never fires — meaning ccrotate rotation isn't
+      // triggered after a cap hit. Observed 2026-05-05 19:12-21:00Z post-PR-#83
+      // deploy: 5+ rate_limit_exhausted runs persisted on heartbeat_runs but
+      // 0 quota-exhausted-hook activity_log entries, because the hook gate
+      // was reading `adapterResult.errorCode` which was never `rate_limit_exhausted`.
       await finalizeAgentStatus(agent.id, outcome, {
-        errorCode: adapterResult.errorCode ?? null,
+        errorCode: runErrorCode,
       });
     } catch (err) {
       const message = redactCurrentUserText(
