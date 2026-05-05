@@ -1497,6 +1497,32 @@ async function handleWebhookEvent(
     const commentBody = data.body as string;
     if (!commentBody || commentBody.includes("[synced from Paperclip]")) return;
 
+    // BLO-2973: idempotency-check by Linear comment UUID before creating.
+    // Linear retries webhook deliveries on transient failures (and our own
+    // retry layer can fire the handler twice for the same payload). Without
+    // this check, every retry creates a duplicate paperclip comment.
+    //
+    // We embed a sentinel HTML comment in the bridged body — invisible in
+    // rendered markdown, but a stable, content-addressable marker we can
+    // grep when listing existing comments. Falls back to skipping the
+    // create if listing fails (better an occasional missed sync than a
+    // duplicate sync).
+    const linearCommentId = data.id as string | undefined;
+    if (!linearCommentId) {
+      ctx.logger.warn("Comment webhook missing data.id; skipping idempotency check (may double-post)");
+    } else {
+      try {
+        const existing = await ctx.issues.listComments(link.paperclipIssueId, link.paperclipCompanyId);
+        const sentinel = `<!-- linear-comment-id: ${linearCommentId} -->`;
+        if (existing.some((c) => typeof c.body === "string" && c.body.includes(sentinel))) {
+          ctx.logger.info(`Webhook comment ${linearCommentId} already mirrored to ${link.linearIdentifier}; skipping`);
+          return;
+        }
+      } catch (err) {
+        ctx.logger.warn(`Idempotency check failed for comment ${linearCommentId}: ${err}; proceeding (may double-post)`);
+      }
+    }
+
     const userName = (data.user as Record<string, unknown>)?.name as string ?? "Linear user";
 
     // Bare `BLO-1234`-style refs in Linear text would otherwise be linkified
@@ -1506,10 +1532,16 @@ async function handleWebhookEvent(
     const workspaceSlug = await resolveLinearWorkspaceSlug(ctx, link.linearUrl);
     const safeBody = linkifyBareLinearIssueRefs(commentBody, workspaceSlug);
 
+    // Prepend the sentinel so future webhook deliveries can detect this
+    // comment was already mirrored. The HTML comment renders invisibly.
+    const sentinelPrefix = linearCommentId
+      ? `<!-- linear-comment-id: ${linearCommentId} -->\n`
+      : "";
+
     try {
       await ctx.issues.createComment(
         link.paperclipIssueId,
-        `**${userName}** (from Linear):\n\n${safeBody}`,
+        `${sentinelPrefix}**${userName}** (from Linear):\n\n${safeBody}`,
         link.paperclipCompanyId,
       );
 
@@ -1518,7 +1550,7 @@ async function handleWebhookEvent(
         message: `issue.comment.synced_from_linear`,
         entityType: "issue",
         entityId: link.paperclipIssueId,
-        metadata: { source: "linear", identifier: link.linearIdentifier, author: userName, bodySnippet: commentBody.slice(0, 120), action: "comment.synced" },
+        metadata: { source: "linear", identifier: link.linearIdentifier, author: userName, bodySnippet: commentBody.slice(0, 120), action: "comment.synced", linearCommentId: linearCommentId ?? null },
       });
 
       ctx.logger.info(`Webhook bridged comment to ${link.linearIdentifier}`);

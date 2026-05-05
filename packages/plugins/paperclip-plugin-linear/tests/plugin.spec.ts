@@ -1086,6 +1086,62 @@ describe("paperclip-plugin-linear", () => {
   });
 
   // -----------------------------------------------------------------------
+  // BLO-2973: Comment webhook idempotency (no double-post on retry)
+  // -----------------------------------------------------------------------
+
+  describe("BLO-2973: comment webhook idempotency", () => {
+    it("does not double-post when the same Linear comment webhook fires twice", async () => {
+      // Set up: a paperclip issue + a link mapping it to the inbound Linear issue.
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      const commentPayload = {
+        type: "Comment",
+        action: "create" as const,
+        data: {
+          id: "lin-comment-uuid-42",
+          body: "Hello from Linear",
+          issue: { id: "lin-iss-1" },
+          user: { name: "Linear Author" },
+        },
+      };
+
+      // First webhook delivery — should create the bridged comment.
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: commentPayload,
+        headers: {},
+        rawBody: "",
+      });
+
+      // Second delivery — Linear retried (or our retry layer fired again).
+      // Should be detected as a duplicate via the embedded sentinel and skipped.
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: commentPayload,
+        headers: {},
+        rawBody: "",
+      });
+
+      const comments = await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1");
+      const bridged = comments.filter((c) => c.body.includes("(from Linear)"));
+      expect(bridged).toHaveLength(1);
+      // Sentinel must be present so future webhook deliveries can detect it.
+      expect(bridged[0]!.body).toContain("<!-- linear-comment-id: lin-comment-uuid-42 -->");
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // Jobs
   // -----------------------------------------------------------------------
 
