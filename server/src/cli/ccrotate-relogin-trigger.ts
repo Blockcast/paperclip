@@ -1,7 +1,9 @@
 /**
  * Lifecycle hook helper: when a `provider_quota_exhausted` event fires
- * (signaling an upstream 401 / rate limit on the active ccrotate account),
- * notify the in-cluster ccrotate-auth-bot to drive a re-login + snap.
+ * (signaling an upstream 401 / rate limit on the active ccrotate account
+ * after the in-process retry-with-rotation in claude-local execute.ts has
+ * failed), notify the in-cluster ccrotate-auth-bot to drive a Camoufox-
+ * driven re-login + snap.
  *
  * Wire as instance setting `general.quotaExhaustedCmd`:
  *
@@ -16,15 +18,31 @@
  *
  * Maps the adapter to the ccrotate target (claude vs codex), looks up the
  * currently-active email by parsing `ccrotate --target <t> status` output,
- * and fires `POST http://ccrotate-auth-bot.paperclip.svc:7000/relogin`. The
- * NetworkPolicy on the bot already restricts ingress to paperclip-0, so
- * no auth header is needed.
+ * and fires `POST http://ccrotate-auth-bot.paperclip.svc:7000/reloginViaSession`.
+ * The NetworkPolicy on the bot already restricts ingress to paperclip-0,
+ * so no auth header is needed.
  *
- * If the bot returns failure (5xx, error in body, or `awaitingCode` for the
- * claude operator-driven flow) AND `PAPERCLIP_SLACK_ESCALATION_WEBHOOK_URL`
- * is set, post a one-line escalation to Slack so an operator can intervene
- * (run `claude /login` + `ccrotate snap` locally, or drive the auth-bot's
- * VNC manual-login flow).
+ * Endpoint choice (/reloginViaSession vs /relogin):
+ *   /reloginViaSession  — Camoufox replays a previously-captured sessionKey
+ *                         against claude.ai/oauth/authorize and clicks
+ *                         through the consent UI; fully automated, ~30-40s.
+ *                         Requires the operator to have seeded a sessionKey
+ *                         for this email via /setSession at least once.
+ *   /relogin            — older email-code flow that returns 202 and waits
+ *                         for the operator to POST /submitCode with the
+ *                         magic code from their inbox. Doesn't fit an
+ *                         automated recovery path; we don't call it.
+ *
+ * Default request timeout is 60s — long enough for /reloginViaSession's
+ * Camoufox launch + click-through + claude CLI exit + ccrotate snap. The
+ * agent's recovery path waits for that result so we know whether tokens
+ * were actually freshened before the next heartbeat picks the run back up.
+ *
+ * If the bot returns failure (4xx with no seeded sessionKey, 5xx, error in
+ * body, or unreachable) AND `PAPERCLIP_SLACK_ESCALATION_WEBHOOK_URL` is
+ * set, post a one-line escalation to Slack so an operator can intervene
+ * (run `claude /login` + `ccrotate snap` locally, or POST /setSession to
+ * seed a key for future auto-recovery).
  *
  * Always exits 0 — never block the agent's recovery path on a bot or Slack
  * side problem. Failures land in stdout/stderr which `runQuotaExhaustedHook`
@@ -34,7 +52,7 @@
 import { spawnSync } from "node:child_process";
 
 const BOT_URL = process.env.CCROTATE_AUTH_BOT_URL ?? "http://ccrotate-auth-bot.paperclip.svc:7000";
-const REQUEST_TIMEOUT_MS = Number(process.env.CCROTATE_AUTH_BOT_TIMEOUT_MS ?? "10000");
+const REQUEST_TIMEOUT_MS = Number(process.env.CCROTATE_AUTH_BOT_TIMEOUT_MS ?? "60000");
 const SLACK_WEBHOOK_URL = (process.env.PAPERCLIP_SLACK_ESCALATION_WEBHOOK_URL ?? "").trim();
 const SLACK_TIMEOUT_MS = Number(process.env.PAPERCLIP_SLACK_ESCALATION_TIMEOUT_MS ?? "5000");
 
@@ -68,7 +86,7 @@ async function notifyBot(email: string, target: "claude" | "codex"): Promise<Bot
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const resp = await fetch(`${BOT_URL}/relogin`, {
+    const resp = await fetch(`${BOT_URL}/reloginViaSession`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ email, target }),
@@ -81,9 +99,22 @@ async function notifyBot(email: string, target: "claude" | "codex"): Promise<Bot
     } catch {
       // non-JSON response — treat as failure with raw body in escalation
     }
-    console.log(
-      `[ccrotate-relogin-trigger] ${resp.status} target=${target} email=${email} body=${body.slice(0, 200)}`,
-    );
+    const summary = body.slice(0, 300);
+    // 200 = bot completed re-login + snap successfully.
+    // 4xx = client error (most often: operator never seeded a sessionKey
+    //       for this email via /setSession; bot can't recover without it).
+    // 5xx / abort = bot side failure; next heartbeat will catch the same
+    //       provider_quota_exhausted state and re-trigger this hook.
+    if (resp.status === 200) {
+      console.log(`[ccrotate-relogin-trigger] ok target=${target} email=${email} body=${summary}`);
+    } else if (resp.status >= 400 && resp.status < 500) {
+      console.log(
+        `[ccrotate-relogin-trigger] bot rejected target=${target} email=${email} status=${resp.status} body=${summary}` +
+          ` — likely no stored sessionKey; seed via POST /setSession to enable auto-recovery`,
+      );
+    } else {
+      console.log(`[ccrotate-relogin-trigger] bot ${resp.status} target=${target} email=${email} body=${summary}`);
+    }
     return { status: resp.status, body, parsed };
   } finally {
     clearTimeout(t);
@@ -101,10 +132,14 @@ interface EscalationContext {
 }
 
 function classifyBotResult(
-  resp: BotResponse | { error: string },
+  resp: BotResponse | { error: string; aborted?: boolean },
 ): { needsEscalation: false } | { needsEscalation: true; reason: EscalationContext["reason"]; detail: string } {
   if ("error" in resp) {
-    return { needsEscalation: true, reason: "bot_unreachable", detail: resp.error };
+    return {
+      needsEscalation: true,
+      reason: "bot_unreachable",
+      detail: resp.aborted ? `timeout after ${REQUEST_TIMEOUT_MS}ms: ${resp.error}` : resp.error,
+    };
   }
   if (resp.status >= 500) {
     return {
@@ -113,14 +148,18 @@ function classifyBotResult(
       detail: `bot HTTP ${resp.status}: ${resp.body.slice(0, 200)}`,
     };
   }
-  // Bot returns 202 + awaitingCode for the claude email-magic-code flow that
-  // requires an operator to type the code from the inbox into the VNC session.
-  // Without operator action the relogin never completes, so escalate.
-  if (resp.status === 202 && resp.parsed && resp.parsed.awaitingCode === true) {
+  if (resp.status >= 400) {
+    // /reloginViaSession returns 4xx when the bot has no stored sessionKey
+    // for this email (operator never seeded one) or the key has expired
+    // beyond the ~30d Cloudflare TTL. Auto-recovery is impossible without
+    // operator action — escalate so someone can re-seed.
+    const detail = resp.parsed && typeof resp.parsed.error === "string"
+      ? resp.parsed.error
+      : `bot HTTP ${resp.status}: ${resp.body.slice(0, 200)}`;
     return {
       needsEscalation: true,
       reason: "operator_action_required",
-      detail: "claude email-magic-code flow waiting on operator (drive VNC + POST /submitCode)",
+      detail: `${detail} — seed sessionKey via POST /setSession to enable auto-recovery`,
     };
   }
   if (resp.parsed && typeof resp.parsed.error === "string") {
@@ -197,7 +236,8 @@ async function main(): Promise<void> {
     result = classifyBotResult(botResp);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    result = classifyBotResult({ error: msg });
+    const aborted = err instanceof Error && err.name === "AbortError";
+    result = classifyBotResult({ error: msg, aborted });
   }
 
   if (result.needsEscalation) {
