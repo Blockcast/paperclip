@@ -297,6 +297,24 @@ function isProductiveContinuationRun(latestRun: LatestIssueRun) {
       latestRun.livenessState === "needs_followup");
 }
 
+// After this many consecutive succeeded-but-non-productive runs on the same
+// in_progress issue, escalate to `blocked` instead of waking the agent
+// again. The pattern looks like the BLO-3182 cycle: agent runs, exits
+// succeeded with livenessState ∈ {plan_only, empty_response, null}, the
+// harness posts "No response requested.", the issue stays in_progress,
+// next sweep wakes the same agent, repeat. Each iteration burns provider
+// quota for zero forward progress. UXDesigner explicitly called out this
+// pattern in BLO-3182's 05:10Z comment.
+//
+// 5 chosen so:
+//   - genuine multi-step continuations (an agent that needs 2-3 wakeups to
+//     finish a plan-then-execute cycle) aren't escalated prematurely; their
+//     intermediate runs typically interleave with at least one productive
+//     liveness transition (advanced/needs_followup)
+//   - a clear no-op loop is caught well within an hour at the typical
+//     5-min heartbeat cadence (~25 min wall clock)
+const NON_PRODUCTIVE_RUN_NOOP_THRESHOLD = 5;
+
 function parseLivenessIncidentKey(incidentKey: string | null | undefined) {
   if (!incidentKey) return null;
   return parseIssueGraphLivenessIncidentKey(incidentKey);
@@ -420,6 +438,45 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
+  }
+
+  // Count the number of consecutive (most-recent-first) succeeded runs for
+  // this issue whose livenessState is non-productive (plan_only,
+  // empty_response, failed, or null). Stops counting at the first
+  // productive run, the first non-succeeded run, or when the limit is hit.
+  // Used by the no-op-loop detector to decide whether to escalate to
+  // blocked instead of waking the agent again.
+  async function countConsecutiveNonProductiveSuccessfulRuns(
+    companyId: string,
+    issueId: string,
+    limit: number,
+  ): Promise<number> {
+    const recent = await db
+      .select({
+        status: heartbeatRuns.status,
+        livenessState: heartbeatRuns.livenessState,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(Math.max(limit, 1));
+
+    let count = 0;
+    for (const run of recent) {
+      const looksProductive = run.status === "succeeded" &&
+        (run.livenessState === "advanced" ||
+          run.livenessState === "completed" ||
+          run.livenessState === "blocked" ||
+          run.livenessState === "needs_followup");
+      if (run.status !== "succeeded" || looksProductive) break;
+      count += 1;
+    }
+    return count;
   }
 
   async function hasActiveExecutionPath(companyId: string, issueId: string) {
@@ -1965,8 +2022,51 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (isSuccessfulInProgressContinuationRun(latestRun)) {
         if (isProductiveContinuationRun(latestRun)) {
           result.productiveContinuationObserved += 1;
-        } else {
-          result.successfulContinuationObserved += 1;
+          result.skipped += 1;
+          continue;
+        }
+        // Non-productive succeeded run: most stranding pattern is the agent
+        // exiting cleanly with no actionable output (plan_only / empty
+        // response / null liveness), the harness posting "No response
+        // requested." and the next sweep waking the agent again. Each
+        // iteration burns provider quota for zero forward progress.
+        // Look back across recent runs; if the consecutive non-productive
+        // streak has hit the threshold, escalate to blocked instead of
+        // waking the agent yet another time.
+        result.successfulContinuationObserved += 1;
+        const nonProductiveStreak = await countConsecutiveNonProductiveSuccessfulRuns(
+          issue.companyId,
+          issue.id,
+          NON_PRODUCTIVE_RUN_NOOP_THRESHOLD,
+        );
+        if (nonProductiveStreak >= NON_PRODUCTIVE_RUN_NOOP_THRESHOLD) {
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_progress",
+            latestRun,
+            comment:
+              `Paperclip detected ${nonProductiveStreak} consecutive succeeded heartbeat runs producing no actionable output ` +
+              "(livenessState ∈ plan_only / empty_response / failed / null) — the \"No response requested.\" no-op loop. " +
+              "Moving to `blocked` so an operator can investigate (assignee may be missing a tool/MCP, or the issue " +
+              "needs a clearer next step) instead of burning more provider quota waking the same agent.",
+          });
+          if (updated) {
+            logger.info(
+              {
+                companyId: issue.companyId,
+                issueId: issue.id,
+                identifier: issue.identifier,
+                streak: nonProductiveStreak,
+                threshold: NON_PRODUCTIVE_RUN_NOOP_THRESHOLD,
+              },
+              "stranded-assigned issue escalated to blocked: non-productive run streak exceeded threshold",
+            );
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
         }
         result.skipped += 1;
         continue;

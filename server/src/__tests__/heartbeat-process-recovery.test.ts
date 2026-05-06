@@ -2477,6 +2477,101 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeups).toHaveLength(1);
   });
 
+  it("escalates an in_progress issue to blocked after 5 consecutive non-productive succeeded runs (no-op loop)", async () => {
+    // BLO-3182 reproducer (compressed): agent succeeds repeatedly with
+    // livenessState=null / plan_only / empty_response — the harness posts
+    // "No response requested." each time, the issue stays in_progress, the
+    // sweep wakes the agent again, and the cycle burns provider quota for
+    // zero forward progress. Threshold is 5; seed 5 consecutive succeeded
+    // runs with livenessState=null to push the streak over the line.
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      retryReason: "issue_continuation_needed",
+      livenessState: null,
+    });
+    // Seed 4 additional non-productive succeeded runs (5 total counting
+    // the fixture's run). createdAt offsets so the lookback orders them
+    // most-recent-first and walks them all before bailing.
+    const baseTs = new Date("2026-03-19T00:05:00.000Z");
+    for (let i = 0; i < 4; i++) {
+      const ts = new Date(baseTs.getTime() + (i + 1) * 60_000);
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "succeeded",
+        contextSnapshot: { issueId, taskId: issueId },
+        startedAt: ts,
+        finishedAt: ts,
+        createdAt: ts,
+        updatedAt: ts,
+        livenessState: null,
+      });
+    }
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.productiveContinuationObserved).toBe(0);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("consecutive succeeded heartbeat runs producing no actionable output");
+    expect(comments[0]?.body).toContain("No response requested.");
+    expect(comments[0]?.body).toContain("`blocked`");
+  });
+
+  it("does NOT escalate when one productive run breaks the non-productive streak", async () => {
+    // Same setup as above but the most-recent run is productive
+    // (livenessState=advanced) — the no-op detector should treat the
+    // streak as broken and skip without escalation, even if older runs
+    // were non-productive.
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      retryReason: "issue_continuation_needed",
+      livenessState: "advanced",
+    });
+    // Seed 4 older non-productive succeeded runs at earlier timestamps.
+    const earlyTs = new Date("2026-03-18T00:00:00.000Z");
+    for (let i = 0; i < 4; i++) {
+      const ts = new Date(earlyTs.getTime() + i * 60_000);
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "succeeded",
+        contextSnapshot: { issueId, taskId: issueId },
+        startedAt: ts,
+        finishedAt: ts,
+        createdAt: ts,
+        updatedAt: ts,
+        livenessState: null,
+      });
+    }
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    expect(result.productiveContinuationObserved).toBe(1);
+    expect(result.successfulContinuationObserved).toBe(0);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+  });
+
   it("does not reconcile user-assigned work through the agent stranded-work recovery path", async () => {
     const { issueId, runId } = await seedStrandedIssueFixture({
       status: "todo",
