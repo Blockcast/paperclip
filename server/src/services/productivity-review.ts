@@ -23,6 +23,9 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY = 10;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS = 30;
 export const DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS = 6 * 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
+// BLO-3281 AC2 defense-in-depth: hard-floor refresh interval at 5 minutes regardless of override.
+// Prevents the 30s evidence-refresh runaway observed on BLO-3277 (14× refreshes in 6 min).
+export const PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS = 3;
 export const DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 3;
@@ -166,9 +169,12 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
       overrides?.resolvedSnoozeMs ?? DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS,
       DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS,
     ),
-    refreshIntervalMs: readPositiveInteger(
-      overrides?.refreshIntervalMs ?? DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
-      DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
+    refreshIntervalMs: Math.max(
+      readPositiveInteger(
+        overrides?.refreshIntervalMs ?? DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
+        DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
+      ),
+      PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS,
     ),
     maxRefreshComments: readPositiveInteger(
       overrides?.maxRefreshComments ?? DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
@@ -663,9 +669,21 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     if (existing) {
       const refreshState = await getRefreshCommentState(evidence.sourceIssue.companyId, existing.id);
       const lastRefreshOrCreationAt = refreshState.latestCreatedAt ?? existing.createdAt;
+      const msSinceLast = evidence.generatedAt.getTime() - lastRefreshOrCreationAt.getTime();
+      logger.debug(
+        {
+          reviewIssueId: existing.id,
+          sourceIssueId: evidence.sourceIssue.id,
+          refreshCount: refreshState.count,
+          maxRefreshComments: opts.thresholds.maxRefreshComments,
+          msSinceLast,
+          refreshIntervalMs: opts.thresholds.refreshIntervalMs,
+        },
+        "productivity review refresh throttle check",
+      );
       if (
         refreshState.count >= opts.thresholds.maxRefreshComments ||
-        evidence.generatedAt.getTime() - lastRefreshOrCreationAt.getTime() < opts.thresholds.refreshIntervalMs
+        msSinceLast < opts.thresholds.refreshIntervalMs
       ) {
         return { kind: "existing" as const, reviewIssueId: existing.id };
       }

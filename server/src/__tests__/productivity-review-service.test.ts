@@ -19,6 +19,7 @@ import {
   DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
   DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
   DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
+  PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS,
   PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX,
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
   productivityReviewService,
@@ -537,6 +538,53 @@ describeEmbeddedPostgres("productivity review service", () => {
       .where(eq(activityLog.action, "issue.productivity_review_continuation_held"));
     expect(activities).toHaveLength(1);
     expect(activities[0]?.entityId).toBe(seeded.issueId);
+  });
+
+  it("hard-floors refreshIntervalMs at 5 minutes regardless of override", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const service = productivityReviewService(db);
+    // Even when the caller pushes a sub-minute override (the runaway shape we saw in
+    // BLO-3277), the floor should pin the effective interval to ≥ 5 minutes.
+    const lowOverride = { refreshIntervalMs: 30_000 };
+
+    const created = await service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: lowOverride,
+    });
+    expect(created.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review).toBeDefined();
+    expect(await listRefreshComments(review!.id)).toHaveLength(0);
+
+    // 4 minutes after creation: under the 5-min floor. With the override naively
+    // applied (30s) this would refresh; the floor should suppress it.
+    const tooSoon = await service.reconcileProductivityReviews({
+      now: new Date(now.getTime() + 4 * 60 * 1000),
+      companyId: seeded.companyId,
+      thresholds: lowOverride,
+    });
+    expect(tooSoon.updated).toBe(0);
+    expect(tooSoon.existing).toBe(1);
+    expect(await listRefreshComments(review!.id)).toHaveLength(0);
+
+    // Past the 5-min floor: refresh is allowed.
+    const allowed = await service.reconcileProductivityReviews({
+      now: new Date(now.getTime() + PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS + 60_000),
+      companyId: seeded.companyId,
+      thresholds: lowOverride,
+    });
+    expect(allowed.updated).toBe(1);
+    expect(await listRefreshComments(review!.id)).toHaveLength(1);
   });
 
   it("honors resolvedSnoozeMs when the prior review was cancelled, not just done", async () => {
