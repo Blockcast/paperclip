@@ -48,7 +48,7 @@ import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
-import { listLiveAgentJobRunIds } from "./k8s-job-liveness.js";
+import { deleteAgentJobsForRun, listLiveAgentJobRunIds } from "./k8s-job-liveness.js";
 import { getServerAdapter, runningProcesses } from "../adapters/index.js";
 import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec, UsageSummary } from "../adapters/index.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
@@ -4728,23 +4728,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? await hasAdapterInvocationEvent(run.id)
         : false;
       const externalLifecyclePreAdapter = externalLifecycleRun && !externalLifecycleStarted;
+      let cascadeDeleteLiveJob = false;
       if (externalLifecycleRun && externalLifecycleStarted) {
+        // RCA 2026-05-06: Job-alive ≠ process-progressing. The reaper used
+        // to trust `liveJobRunIds.has(run.id)` as an oracle and skip
+        // silence checks entirely, so pods stuck in tail-loop / MCP RPC /
+        // rate-limit-overage hangs survived for hours and wedged the
+        // dispatch lock. We now apply the silence threshold uniformly,
+        // and additionally flag the live Job for cascade-deletion so the
+        // next dispatch's "Concurrent run blocked" precondition unwedges.
+        const lastSignalRef = run.lastOutputAt
+          ? new Date(run.lastOutputAt).getTime()
+          : run.startedAt
+          ? new Date(run.startedAt).getTime()
+          : 0;
+        const isSilent = !lastSignalRef || now.getTime() - lastSignalRef >= EXTERNAL_LIFECYCLE_STALE_MS;
+
         if (liveJobRunIds !== null) {
-          // Authoritative kube-API path: keep this run if its Job exists in
-          // the cluster, reap immediately if it's gone. The Job-deleted
-          // case is exactly what helm restarts and manual cleanups produce.
-          if (liveJobRunIds.has(run.id)) continue;
+          // kube API path. If Job is gone, reap immediately (existing
+          // behavior — helm restart / manual cleanup case). If Job is
+          // alive but output is silent past the threshold, fall through
+          // and mark the Job for cascade-deletion.
+          if (liveJobRunIds.has(run.id)) {
+            if (!isSilent) continue;
+            cascadeDeleteLiveJob = true;
+          }
         } else {
-          // Fallback: kube API unavailable (local dev or transient failure).
-          // Treat a long output-quiet window as `process_lost`; healthy
-          // in-flight runs pin `last_output_at` via streamed log events,
-          // so 15 min of silence is a safe floor.
-          const lastSignalRef = run.lastOutputAt
-            ? new Date(run.lastOutputAt).getTime()
-            : run.startedAt
-            ? new Date(run.startedAt).getTime()
-            : 0;
-          if (lastSignalRef && now.getTime() - lastSignalRef < EXTERNAL_LIFECYCLE_STALE_MS) continue;
+          // Fallback: kube API unavailable (local dev or transient
+          // failure). Same silence floor as the kube-up path.
+          if (!isSilent) continue;
         }
       }
 
@@ -4851,6 +4863,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
+
+      // Cascade-delete the live k8s Job whose in-pod process hung. Without
+      // this, the next dispatch's precondition check matches the surviving
+      // Job and rejects with "Concurrent run blocked: orphaned Job ...".
+      // Best-effort: deleteAgentJobsForRun returns null on kube-API failure.
+      if (cascadeDeleteLiveJob) {
+        try {
+          const deleted = await deleteAgentJobsForRun(run.id);
+          logger.info(
+            { runId: run.id, deletedJobs: deleted },
+            "reapOrphanedRuns: cascaded Job deletion for silent external-lifecycle run",
+          );
+        } catch (error) {
+          logger.warn(
+            { runId: run.id, error: error instanceof Error ? error.message : String(error) },
+            "reapOrphanedRuns: cascade Job delete failed (run still finalized as failed)",
+          );
+        }
+      }
     }
 
     if (reaped.length > 0) {

@@ -49,8 +49,12 @@ vi.mock("../telemetry.ts", () => ({
 const mockListLiveAgentJobRunIds = vi.hoisted(() =>
   vi.fn<() => Promise<Set<string> | null>>(async () => null),
 );
+const mockDeleteAgentJobsForRun = vi.hoisted(() =>
+  vi.fn<(runId: string) => Promise<number | null>>(async () => 1),
+);
 vi.mock("../services/k8s-job-liveness.ts", () => ({
   listLiveAgentJobRunIds: mockListLiveAgentJobRunIds,
+  deleteAgentJobsForRun: mockDeleteAgentJobsForRun,
 }));
 
 vi.mock("@paperclipai/shared/telemetry", async () => {
@@ -925,7 +929,38 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.errorCode).toBeNull();
   });
 
-  it("does not reap external-lifecycle runs whose kube-API Job is still live (even past staleness window)", async () => {
+  it("does not reap external-lifecycle runs whose kube-API Job is live AND output is fresh", async () => {
+    // Healthy in-flight case: Job exists in cluster and the agent is
+    // streaming events (lastOutputAt within the staleness window). Reaper
+    // must keep its hands off.
+    const fresh = new Date(Date.now() - 30 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "claude_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: fresh,
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    mockListLiveAgentJobRunIds.mockResolvedValueOnce(new Set([runId]));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(0);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+    expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
+  });
+
+  it("reaps external-lifecycle runs whose kube-API Job is live but output is silent past the staleness window (RCA 2026-05-06)", async () => {
+    // The harness reaper used to trust kube-API Job liveness as an oracle:
+    // if the Job existed, the run was assumed healthy. RCA on 2026-05-06
+    // showed 4 distinct in-pod hang causes (tail-loop wrapper, MCP RPC
+    // with no client timeout, Webflow MCP unresponsiveness, rate-limit
+    // overage rejected) where the Job stayed Running for hours while the
+    // process inside was wedged. The reaper now applies the same silence
+    // floor (EXTERNAL_LIFECYCLE_STALE_MS) regardless of Job liveness, and
+    // cascades the Job deletion so the dispatch lock unwedges.
     const stale = new Date(Date.now() - 16 * 60 * 1000);
     const { companyId, agentId, runId } = await seedRunFixture({
       adapterType: "claude_k8s",
@@ -939,9 +974,33 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reapOrphanedRuns();
-    expect(result.reaped).toBe(0);
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
     const run = await heartbeat.getRun(runId);
-    expect(run?.status).toBe("running");
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+    expect(mockDeleteAgentJobsForRun).toHaveBeenCalledWith(runId);
+  });
+
+  it("does not cascade-delete the Job when the run is reaped because the Job was already gone", async () => {
+    // Job-deleted path (helm restart, manual cleanup). The Job is already
+    // gone, so we have nothing to cascade-delete. Asserts we don't make
+    // a redundant delete call.
+    const fresh = new Date(Date.now() - 30 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "claude_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: fresh,
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    mockListLiveAgentJobRunIds.mockResolvedValueOnce(new Set());
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
   });
 
   it("reaps external-lifecycle runs whose kube-API Job is gone (no staleness wait)", async () => {
