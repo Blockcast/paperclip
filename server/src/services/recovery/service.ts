@@ -99,12 +99,72 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+// `extractAgentMcpKeys` reads the adapter_config.mcpServers map (set by
+// adapter-specific configs like claude_k8s) and returns the sorted list of
+// MCP names. Used in the recovery prompt so the recovery agent can see at
+// a glance what tools the original assignee had vs candidate replacements
+// (e.g. UXDesigner → [figma, webflow], CTO → []). The schema doesn't
+// enforce the shape, so this is best-effort: missing or malformed
+// `mcpServers` returns []. Skill names (paperclipSkillSync.desiredSkills)
+// are intentionally NOT surfaced here — they're long lists with a lot of
+// shared baseline that would obscure the meaningful MCP-coverage signal.
+function extractAgentMcpKeys(agent: typeof agents.$inferSelect | null | undefined): string[] {
+  if (!agent) return [];
+  const adapterConfig = parseObject(agent.adapterConfig);
+  const mcpServers = adapterConfig.mcpServers;
+  if (!mcpServers || typeof mcpServers !== "object" || Array.isArray(mcpServers)) return [];
+  return Object.keys(mcpServers).sort();
+}
+
+function summarizeAgentCapabilities(agent: typeof agents.$inferSelect | null | undefined): string {
+  if (!agent) return "";
+  const cap = readNonEmptyString(agent.capabilities);
+  if (!cap) return "";
+  // Single-line summary; long capability blurbs would dominate the prompt.
+  const trimmed = cap.replace(/\s+/g, " ").trim();
+  return trimmed.length > 200 ? `${trimmed.slice(0, 197)}...` : trimmed;
+}
+
+// PR #4600 redacted this to a "details withheld from the issue thread"
+// sentinel because raw adapter error blobs can carry secrets (API keys,
+// JWTs, internal hostnames). That left the recovery agent flying blind:
+// with no visible signal of WHY the original assignee failed, the only
+// reasonable action was to grab ownership of the parent issue and try
+// itself. Observed BLO-3182 (2026-05-04 → 2026-05-06): UXDesigner failed
+// once, recovery escalated to CTO with no diagnostic, CTO reassigned the
+// parent to itself, then looped for 4 days posting empty "No response
+// requested." runs because CTO doesn't have the Webflow MCP the issue
+// actually needs.
+//
+// Restore a structured summary (errorCode + first line of the error
+// message, capped) but pass it through `redactSensitiveText` first so any
+// secrets in the raw error blob get scrubbed. errorCode is a stable
+// classifier (e.g. `rate_limit_exhausted`, `silent_failure`) and is never
+// itself sensitive — surface it always.
 function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
   if (!run) return null;
 
-  if (readNonEmptyString(run.error) || readNonEmptyString(run.errorCode)) {
-    return " Latest retry failure details were withheld from the issue thread; inspect the linked run for evidence.";
-  }
+  const errorCode = readNonEmptyString(run.errorCode)?.trim() ?? null;
+  const rawError = readNonEmptyString(run.error)?.trim() ?? null;
+
+  // Prefer the JSON `"message": "..."` field if the error body is a JSON
+  // blob (matches the heartbeat-side summarizer); otherwise take the first
+  // non-empty line. Cap to 240 chars before redaction.
+  const apiMessageMatch = rawError?.match(/"message"\s*:\s*"([^"]+)"/);
+  const firstLine = rawError
+    ?.split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean) ?? null;
+  const summarySource = apiMessageMatch?.[1] ?? firstLine;
+  const truncated =
+    summarySource && summarySource.length > 240
+      ? `${summarySource.slice(0, 237)}...`
+      : summarySource;
+  const summary = truncated ? redactSensitiveText(truncated) : null;
+
+  if (errorCode && summary) return ` Latest retry failure: \`${errorCode}\` — ${summary}.`;
+  if (errorCode) return ` Latest retry failure: \`${errorCode}\`.`;
+  if (summary) return ` Latest retry failure: ${summary}.`;
   return null;
 }
 
@@ -1282,6 +1342,48 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows[0] ?? null);
   }
 
+  // Cooldown after a stranded-recovery issue closes before another can fire
+  // for the same source. The active-recovery uniqueness index prevents
+  // *concurrent* duplicates but doesn't prevent *sequential* re-firing —
+  // BLO-3182 spawned 9 separate recoveries over 4 days, each marked done
+  // without changing assignment/status, then re-detected as stranded on the
+  // next sweep. The recovery agent's "no-op succeeded" runs aren't enough
+  // signal on their own to break the loop. Cooldown gives the operator (or
+  // the recovery agent on its next chance) breathing room to take a non-
+  // automatic action — a manual reassignment, a hold, or marking blocked —
+  // before the sweep papers over the underlying problem with another
+  // identical recovery.
+  //
+  // 6 hours: short enough that genuinely transient stranding (e.g. agent
+  // pod crash that the harness recovers from) gets a follow-up recovery
+  // within one shift; long enough that a CEO/manual hold has time to
+  // propagate before the sweep re-fires.
+  const STRANDED_ISSUE_RECOVERY_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+  async function findRecentClosedStrandedIssueRecoveryIssue(
+    companyId: string,
+    sourceIssueId: string,
+    now: Date,
+  ) {
+    const cutoff = new Date(now.getTime() - STRANDED_ISSUE_RECOVERY_COOLDOWN_MS);
+    return db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, STRANDED_ISSUE_RECOVERY_ORIGIN_KIND),
+          eq(issues.originId, sourceIssueId),
+          isNull(issues.hiddenAt),
+          inArray(issues.status, ["done", "cancelled"]),
+          gt(issues.updatedAt, cutoff),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
   async function resolveStrandedIssueRecoveryOwnerAgentId(issue: typeof issues.$inferSelect) {
     const candidateIds: string[] = [];
     if (issue.assigneeAgentId) {
@@ -1323,6 +1425,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     latestRun: LatestIssueRun;
     previousStatus: "todo" | "in_progress";
     prefix: string;
+    originalAssignee: typeof agents.$inferSelect | null;
   }) {
     const sourceIssue = issueUiLink({ identifier: input.issue.identifier, id: input.issue.id }, input.prefix);
     const runLink = input.latestRun
@@ -1330,6 +1433,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       : "none";
     const retryReason = readNonEmptyString(parseObject(input.latestRun?.contextSnapshot)?.retryReason) ?? "unknown";
     const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+
+    // Surface the original assignee's name + role + MCP keys + capability
+    // blurb so the recovery agent can compare to its own (and any candidate
+    // replacement's) capabilities BEFORE reassigning. Closes the BLO-3182
+    // gap where CTO reassigned UXDesigner → CTO without realizing UXDesigner
+    // had webflow + figma MCPs that CTO doesn't.
+    const originalMcpKeys = extractAgentMcpKeys(input.originalAssignee);
+    const originalCapabilities = summarizeAgentCapabilities(input.originalAssignee);
+    const originalAssigneeName = input.originalAssignee?.name ?? "unknown";
+    const originalAssigneeRole = input.originalAssignee?.role ?? "unknown";
+    const mcpsLine = originalMcpKeys.length > 0
+      ? `- Original assignee MCPs: ${originalMcpKeys.map((k) => `\`${k}\``).join(", ")}`
+      : "- Original assignee MCPs: none configured";
 
     return [
       "Paperclip exhausted automatic recovery for an assigned issue and created this explicit recovery task.",
@@ -1344,15 +1460,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       `- Retry reason: \`${retryReason}\``,
       failureSummary ? `- Failure: ${failureSummary.trim()}` : "- Failure: none recorded",
       "",
+      "## Original Assignee Capabilities",
+      "",
+      `- Original assignee: ${originalAssigneeName} (role: \`${originalAssigneeRole}\`)`,
+      mcpsLine,
+      originalCapabilities ? `- Capability blurb: ${originalCapabilities}` : "- Capability blurb: none recorded",
+      "- Compare against your own capabilities before considering reassignment. If the original assignee has MCPs you don't, they probably need re-waking, not replacing.",
+      "",
       "## Ownership",
       "",
       "- Selected owner: the first invokable manager/creator/executive candidate with budget available.",
+      "- The original assignee is still the right owner for the *source* issue unless they provably can't do the work; this recovery task exists to diagnose, not to take over.",
       "",
       "## Required Action",
       "",
-      "- Inspect the latest run and source issue state.",
-      "- Fix the runtime/adapter problem, reassign the source issue, or convert the source issue into a clear manual-review state.",
-      "- When the source issue has a live execution path or has been intentionally resolved, mark this recovery issue done.",
+      "1. **Inspect first**: read the latest run linked above. The `Failure:` line above usually tells you the failure family. If it's transient (rate limit, MCP timeout, network), the original assignee just needs another attempt.",
+      "2. **Default action — re-wake the original assignee.** Most stranding is transient. Post a comment on the source issue explaining what you found, then leave the source issue's existing assignee unchanged. The next heartbeat will pick it up on a fresh provider account.",
+      "3. **Reassign only when the original assignee provably cannot do this work** — i.e. they're missing a required tool/MCP/skill that another agent has. If you reassign, name the missing capability in your comment so future recovery sweeps don't repeat the diagnosis. Do NOT reassign to yourself unless you have the capability the original assignee lacks.",
+      "4. **Mark blocked, not reassigned, when the failure is environmental** (workspace/runtime/credential issue requiring a human). A reassign just moves the same failure to a different agent.",
+      "5. **When the source issue has a live execution path or has been intentionally resolved, mark this recovery issue done.**",
     ].join("\n");
   }
 
@@ -1375,10 +1501,37 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       const existing = await findOpenStrandedIssueRecoveryIssue(input.issue.companyId, input.issue.id);
       if (existing) return existing;
 
+      // Cooldown: if a recovery for this source recently closed (done or
+      // cancelled), don't fire another one. Returns the closed recovery so
+      // the caller treats it as the current artifact and skips work; logs
+      // surface that we suppressed instead of creating fresh.
+      const now = new Date();
+      const recentlyClosed = await findRecentClosedStrandedIssueRecoveryIssue(
+        input.issue.companyId,
+        input.issue.id,
+        now,
+      );
+      if (recentlyClosed) {
+        logger.info(
+          {
+            companyId: input.issue.companyId,
+            sourceIssueId: input.issue.id,
+            recentRecoveryId: recentlyClosed.id,
+            recentRecoveryClosedAt: recentlyClosed.updatedAt,
+            cooldownMs: STRANDED_ISSUE_RECOVERY_COOLDOWN_MS,
+          },
+          "stranded-recovery suppressed by cooldown after recent close",
+        );
+        return recentlyClosed;
+      }
+
       const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
       if (!ownerAgentId) return null;
 
       const prefix = await getCompanyIssuePrefix(input.issue.companyId);
+      const originalAssignee = input.issue.assigneeAgentId
+        ? await getAgent(input.issue.assigneeAgentId)
+        : null;
       let recovery: Awaited<ReturnType<typeof issuesSvc.create>>;
       try {
         recovery = await issuesSvc.create(input.issue.companyId, {
@@ -1388,6 +1541,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             latestRun: input.latestRun,
             previousStatus: input.previousStatus,
             prefix,
+            originalAssignee,
           }),
           status: "todo",
           priority: input.issue.priority,

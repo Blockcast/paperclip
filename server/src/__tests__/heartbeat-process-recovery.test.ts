@@ -701,7 +701,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(recovery.title).toContain("Recover stalled issue");
     expect(recovery.description).toContain(`Previous source status: \`${input.previousStatus}\``);
     expect(recovery.description).toContain(`Retry reason: \`${input.retryReason}\``);
-    expect(recovery.description).toContain("Fix the runtime/adapter problem");
+    // Required Action prompt biases toward re-waking the original assignee;
+    // reassignment should require evidence the original lacks a capability.
+    // (Reordered after BLO-3182 stuck on CTO for 4 days because the older
+    // prompt listed reassignment as a peer option to "fix the runtime".)
+    expect(recovery.description).toContain("Default action — re-wake the original assignee");
+    expect(recovery.description).toContain("Reassign only when the original assignee provably cannot do this work");
+    // Original assignee capability section is always present so the
+    // recovery agent can compare its own capabilities to the original's
+    // before considering reassignment. Closes the BLO-3182 gap where the
+    // recovery agent had no visibility into what MCPs the original
+    // assignee carried (it was UXDesigner with figma+webflow MCPs; CTO
+    // grabbed ownership having neither).
+    expect(recovery.description).toContain("## Original Assignee Capabilities");
+    expect(recovery.description).toContain("Original assignee MCPs:");
 
     const relation = await db
       .select()
@@ -1238,7 +1251,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("stopped automatic stranded-work recovery");
     expect(comments[0]?.body).toContain("recovery issues do not create nested `stranded_issue_recovery` issues");
-    expect(comments[0]?.body).toContain("Latest retry failure details were withheld from the issue thread");
+    // Failure summary surfaces the errorCode (and a redacted error message
+    // when present) so the recovery agent can see WHY the original assignee
+    // failed without inspecting the linked run. Secrets are still scrubbed
+    // — see the explicit `not.toContain` assertion above where applicable.
+    expect(comments[0]?.body).toContain("Latest retry failure:");
     expect(comments[0]?.body).not.toContain("sk-test-recovery-secret");
     await expect(sourceBlockerIssueIds(companyId, sourceIssueId)).resolves.toEqual([issueId]);
   });
@@ -1703,11 +1720,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       retryReason: "assignment_recovery",
     });
     expect(recovery.description ?? "").not.toContain("sk-test-recovery-secret");
+    // Positive: errorCode is surfaced (it's a stable classifier, not
+    // sensitive). Redacted message text follows it so the recovery agent
+    // can see what happened without leaking the embedded bearer token.
+    expect(recovery.description).toContain("`process_lost`");
+    expect(recovery.description).toContain("Authorization: Bearer ***REDACTED***");
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("retried dispatch");
-    expect(comments[0]?.body).toContain("Latest retry failure details were withheld from the issue thread");
+    // Failure summary surfaces the errorCode (and a redacted error message
+    // when present) so the recovery agent can see WHY the original assignee
+    // failed without inspecting the linked run. Secrets are still scrubbed
+    // — see the explicit `not.toContain` assertion above where applicable.
+    expect(comments[0]?.body).toContain("Latest retry failure:");
     expect(comments[0]?.body).toContain(`Recovery issue: [${recovery.identifier}]`);
   });
 
@@ -2024,7 +2050,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("retried continuation");
-    expect(comments[0]?.body).toContain("Latest retry failure details were withheld from the issue thread");
+    // Failure summary surfaces the errorCode (and a redacted error message
+    // when present) so the recovery agent can see WHY the original assignee
+    // failed without inspecting the linked run. Secrets are still scrubbed
+    // — see the explicit `not.toContain` assertion above where applicable.
+    expect(comments[0]?.body).toContain("Latest retry failure:");
     expect(comments[0]?.body).toContain(`Recovery issue: [${recovery.identifier}]`);
   });
 
@@ -2128,13 +2158,65 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       previousStatus: "in_progress",
       retryReason: "issue_continuation_needed",
     });
-    expect(recovery.description).toContain("Latest retry failure details were withheld from the issue thread");
+    expect(recovery.description).toContain("Latest retry failure:");
+    expect(recovery.description).toContain("`adapter_exit_code`");
     expect(recovery.description).not.toContain("- Failure: none recorded");
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("Latest retry failure details were withheld from the issue thread");
+    // Failure summary surfaces the errorCode (and a redacted error message
+    // when present) so the recovery agent can see WHY the original assignee
+    // failed without inspecting the linked run. Secrets are still scrubbed
+    // — see the explicit `not.toContain` assertion above where applicable.
+    expect(comments[0]?.body).toContain("Latest retry failure:");
     expect(comments[0]?.body).not.toContain("- Failure: none recorded");
+  });
+
+  it("renders the original assignee's MCPs and capability blurb in the recovery prompt", async () => {
+    // BLO-3182 reproducer: original assignee has MCPs (figma, webflow) the
+    // recovery agent doesn't. The prompt must surface these so the recovery
+    // agent doesn't reflexively reassign.
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "adapter_exit_code",
+      runError: null,
+    });
+    // Decorate the seeded agent with mcpServers + a capability blurb,
+    // mirroring the live UXDesigner config that BLO-3182 was originally
+    // assigned to.
+    await db
+      .update(agents)
+      .set({
+        capabilities: "Owns frontend execution + Webflow CMS edits.",
+        adapterConfig: {
+          mcpServers: {
+            figma: { url: "http://figma-mcp.example", type: "http" },
+            webflow: { url: "http://webflow-mcp.example", type: "http" },
+          },
+        },
+      })
+      .where(eq(agents.id, agentId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+
+    const recovery = await expectStrandedRecoveryArtifacts({
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      previousStatus: "in_progress",
+      retryReason: "issue_continuation_needed",
+    });
+    expect(recovery.description).toContain("## Original Assignee Capabilities");
+    expect(recovery.description).toContain("Original assignee MCPs: `figma`, `webflow`");
+    expect(recovery.description).toContain("Owns frontend execution + Webflow CMS edits.");
+    // Reminder line nudges the recovery agent to compare capabilities
+    // before reassigning.
+    expect(recovery.description).toContain("Compare against your own capabilities");
   });
 
   it("reuses the raced stranded recovery issue when duplicate active recovery creation conflicts", async () => {
@@ -2219,7 +2301,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("stopped automatic stranded-work recovery");
-    expect(comments[0]?.body).toContain("Latest retry failure details were withheld from the issue thread");
+    // Failure summary surfaces the errorCode (and a redacted error message
+    // when present) so the recovery agent can see WHY the original assignee
+    // failed without inspecting the linked run. Secrets are still scrubbed
+    // — see the explicit `not.toContain` assertion above where applicable.
+    expect(comments[0]?.body).toContain("Latest retry failure:");
     expect(comments[0]?.body).toContain("recovery issues do not create nested `stranded_issue_recovery` issues");
     await expect(sourceBlockerIssueIds(companyId, sourceIssueId)).resolves.toEqual([issueId]);
   });
@@ -2311,7 +2397,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(2);
-    expect(comments[1]?.body).toContain("Latest retry failure details were withheld from the issue thread");
+    expect(comments[1]?.body).toContain("Latest retry failure:");
   });
 
   it("does not escalate paused-tree recovery when the automatic continuation retry was cancelled by the hold", async () => {
