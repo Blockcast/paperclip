@@ -47,11 +47,23 @@ function runCommand(command: string, env: Record<string, string>): Promise<RunRe
       shell: true,
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, ...env },
+      // Detached creates a new process group rooted at child.pid, so a
+      // grandchild (e.g. ccrotate spawning Codex CLI) doesn't inherit the
+      // parent group. Killing -pid then reaches the whole tree, which a plain
+      // `child.kill` does not -- it only signals the shell, leaving
+      // grandchildren holding stdio pipes and stalling the close event.
+      detached: true,
     });
 
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGKILL");
+      if (typeof child.pid === "number") {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          // Process group already exited.
+        }
+      }
     }, HOOK_TIMEOUT_MS);
 
     child.stdout?.on("data", (chunk: Buffer) => {

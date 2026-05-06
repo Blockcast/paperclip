@@ -4717,13 +4717,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const liveJobRunIds = hasExternalCandidates ? await listLiveAgentJobRunIds() : null;
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
-      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+      if (runningProcesses.has(run.id)) continue;
 
       // External-lifecycle adapters (k8s Jobs etc.) manage their own run
       // completion once adapter invocation has actually started. A claimed
       // run with no adapter.invoke event has no known external Job yet, so it
       // must stay eligible for startup/periodic recovery.
       const externalLifecycleRun = hasExternalLifecycle(adapterType);
+
+      // For non-external adapters, the in-process await is authoritative --
+      // the run is being driven by `executeRun` in this very pod, and the
+      // reaper must not race it. For external-lifecycle adapters the kube
+      // Job is the source of truth: the in-process await can be hung on a
+      // preRun hook timeout that left grandchildren holding pipes, on an MCP
+      // RPC that never timed out, or on a Job that vanished without
+      // notifying the awaiting code. In those cases the run sits in the
+      // `activeRunExecutions` Set forever, quarantined from the reaper. Let
+      // the silence/Job-liveness check below decide for external lifecycle.
+      if (activeRunExecutions.has(run.id) && !externalLifecycleRun) continue;
       const externalLifecycleStarted = externalLifecycleRun
         ? await hasAdapterInvocationEvent(run.id)
         : false;
@@ -4862,6 +4873,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await finalizeAgentStatus(run.agentId, "failed");
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
+      // For external-lifecycle adapters, also clear the in-process await
+      // tracking. If we just reaped a run that the local executor was still
+      // awaiting (because the kube Job vanished without notifying us), the
+      // dispatch slot stays held until pod restart unless we clean this up.
+      activeRunExecutions.delete(run.id);
       reaped.push(run.id);
 
       // Cascade-delete the live k8s Job whose in-pod process hung. Without
@@ -8240,6 +8256,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reportRunActivity: clearDetachedRunWarning,
 
     reapOrphanedRuns,
+
+    /**
+     * Test-only handle on the in-process await tracking Set populated by
+     * `executeRun` before invoking the adapter. The reaper used to skip every
+     * run in this Set unconditionally, which silently quarantined runs whose
+     * external-lifecycle adapters had hung mid-dispatch (preRun hook timeout
+     * + grandchild-pipe stall, MCP RPC with no client timeout, k8s Job
+     * vanishing without notifying the awaiting code). The fix lets the
+     * reaper fall through for external-lifecycle adapters; this hook lets
+     * the test mimic the in-flight-await state without spinning up a real
+     * `executeRun` flow. Do not call from production code.
+     */
+    __test_unsafelyTrackActiveRunExecution: (runId: string) =>
+      activeRunExecutions.add(runId),
 
     promoteDueScheduledRetries,
 

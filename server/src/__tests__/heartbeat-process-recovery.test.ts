@@ -1048,6 +1048,61 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.errorCode).toBe("process_lost");
   });
 
+  it("reaps external-lifecycle runs whose in-process await is hung but kube Job is gone (RCA 2026-05-06 #2)", async () => {
+    // Companion to the previous 2026-05-06 RCA. The first fix made the reaper
+    // ignore "Job alive" as proof of progress; this one makes it ignore
+    // "in-process await still pending" as proof of progress for external
+    // lifecycle adapters. Trigger today: opencode_k8s preRun lifecycle hook
+    // (ccrotate Codex switch) timed out at 30s but spawn `child.kill()` only
+    // SIGKILLed the shell, not its grandchildren -- the close event waited
+    // for grandchild pipes (~45-97s observed). The in-process await stayed
+    // queued in `activeRunExecutions` forever; the reaper used to skip on
+    // that and the run was permanently quarantined.
+    const stale = new Date(Date.now() - 16 * 60 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: stale,
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    mockListLiveAgentJobRunIds.mockResolvedValueOnce(new Set());
+    const heartbeat = heartbeatService(db);
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+  });
+
+  it("does NOT reap non-external-lifecycle runs whose in-process await is still pending", async () => {
+    // Inverse guard for the activeRunExecutions skip change. For
+    // sessioned-local adapters (codex_local, claude_local, etc.),
+    // `activeRunExecutions` IS the authoritative signal that THIS pod is
+    // driving the run -- the reaper must not race its own executor. Only
+    // external-lifecycle gets the silence/Job fall-through.
+    const stale = new Date(Date.now() - 30 * 60 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: stale,
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    const heartbeat = heartbeatService(db);
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(0);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+  });
+
   it("retries external-lifecycle runs claimed before adapter invocation", async () => {
     const { agentId, runId } = await seedRunFixture({
       adapterType: "opencode_k8s",
