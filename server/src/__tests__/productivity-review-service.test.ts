@@ -539,6 +539,43 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(activities[0]?.entityId).toBe(seeded.issueId);
   });
 
+  it("honors resolvedSnoozeMs when the prior review was cancelled, not just done", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    const cancelledReviewCreatedAt = new Date(now.getTime() - 30 * 60 * 1000);
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      title: "Cancelled productivity review (manager closed as harness noise)",
+      status: "cancelled",
+      priority: "high",
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      parentId: seeded.issueId,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: cancelledReviewCreatedAt,
+      updatedAt: cancelledReviewCreatedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.snoozed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(1);
+  });
+
   it("does not file a review when 100% of sampling-window runs are routine-origin", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
