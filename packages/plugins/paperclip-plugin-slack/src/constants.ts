@@ -1,7 +1,7 @@
 import type { SlackPluginConfig } from "./types.js";
 
 export const PLUGIN_ID = "paperclip-plugin-slack";
-export const PLUGIN_VERSION = "2.1.0";
+export const PLUGIN_VERSION = "2.1.1";
 
 export const WEBHOOK_KEYS = {
   slackEvents: "slack-events",

@@ -33,6 +33,7 @@ interface PluginListEntry {
   pluginKey: string;
   status: string;
   packageName?: string;
+  packagePath?: string | null;
   version?: string;
 }
 
@@ -159,6 +160,26 @@ async function installLocalPluginIfAbsent(
           path: spec.absPath,
         },
         `${spec.displayName} plugin packageName drifted — force-reinstalling from bundle`,
+      );
+      await forceReinstallLocalPlugin(ctx, spec);
+      return;
+    }
+    // packagePath drift: the registry record was created by the upstream npm
+    // install loop (which leaves package_path NULL) before this bootstrap
+    // entry existed. The version-bump → upgrade route below would fall back
+    // to npm because plugin-loader.upgradePlugin reads localPath from the
+    // stored packagePath; with no path, fetchAndValidate refetches from the
+    // npm registry instead of the in-image bundle dir. Force a re-install
+    // once so the row gets the correct packagePath, after which subsequent
+    // version bumps upgrade correctly from disk.
+    if (!existing.packagePath || existing.packagePath !== spec.absPath) {
+      logger.info(
+        {
+          pluginKey: spec.pluginKey,
+          registryPackagePath: existing.packagePath ?? null,
+          bundlePath: spec.absPath,
+        },
+        `${spec.displayName} plugin packagePath missing or drifted — force-reinstalling from bundle`,
       );
       await forceReinstallLocalPlugin(ctx, spec);
       return;
