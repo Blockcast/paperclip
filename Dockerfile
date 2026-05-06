@@ -35,6 +35,7 @@ COPY packages/plugins/paperclip-plugin-fake-sandbox/package.json packages/plugin
 COPY packages/plugins/paperclip-plugin-ccrotate/package.json packages/plugins/paperclip-plugin-ccrotate/
 COPY packages/plugins/paperclip-plugin-linear/package.json packages/plugins/paperclip-plugin-linear/
 COPY packages/plugins/paperclip-plugin-alertmanager/package.json packages/plugins/paperclip-plugin-alertmanager/
+COPY packages/plugins/paperclip-plugin-slack/package.json packages/plugins/paperclip-plugin-slack/
 COPY patches/ patches/
 
 RUN pnpm install --frozen-lockfile
@@ -141,6 +142,7 @@ RUN pnpm --filter @paperclipai/plugin-sdk build
 RUN pnpm --filter @kkroo/paperclip-plugin-ccrotate build
 RUN pnpm --filter @kkroo/paperclip-plugin-linear build
 RUN pnpm --filter paperclip-plugin-alertmanager build
+RUN pnpm --filter paperclip-plugin-slack build
 RUN pnpm --filter @paperclipai/mcp-server build
 RUN pnpm --filter @paperclipai/server build
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)

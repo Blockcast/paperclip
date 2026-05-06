@@ -263,6 +263,16 @@ export async function installKkrooLocalPlugins(ctx: BootstrapContext): Promise<v
     absPath: resolve(process.cwd(), "packages/plugins/paperclip-plugin-alertmanager"),
     displayName: "alertmanager",
   });
+
+  // Slack: in-tree fork (commit 983662b7) takes over from the npm-published
+  // 2.0.x. Without this entry the host keeps running whatever was installed
+  // when the registry version was first pulled — it never picks up workspace
+  // changes (formatters, tools, etc.) on subsequent image deploys.
+  await installLocalPluginIfAbsent(ctx, {
+    pluginKey: "paperclip-plugin-slack",
+    absPath: resolve(process.cwd(), "packages/plugins/paperclip-plugin-slack"),
+    displayName: "slack",
+  });
 }
 
 /**
