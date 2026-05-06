@@ -28,7 +28,7 @@ concurrency:
 jobs:
   verify_canary:
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 30
     permissions:
       contents: read
@@ -124,7 +124,7 @@ jobs:
 
   verify_stable:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 30
     permissions:
       contents: read
@@ -162,7 +162,7 @@ jobs:
   preview_stable:
     if: github.event_name == 'workflow_dispatch' && inputs.dry_run
     needs: verify_stable
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 45
     permissions:
       contents: read
