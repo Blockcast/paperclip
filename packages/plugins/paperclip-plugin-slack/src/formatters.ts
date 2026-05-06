@@ -170,7 +170,13 @@ export function formatApprovalCreated(event: PluginEvent): SlackMessage {
   if (agentName) fields.push({ type: "mrkdwn", text: `*Agent*\n${agentName}` });
   fields.push({ type: "mrkdwn", text: `*Type*\n\`${approvalType}\`` });
   if (issueIds.length > 0) {
-    fields.push({ type: "mrkdwn", text: `*Linked Issues*\n${issueIds.join(", ")}` });
+    const links = issueIds
+      .map((id) => {
+        const idStr = String(id);
+        return `<${dashboardBase}/issues/${idStr}|${idStr.slice(0, 8)}>`;
+      })
+      .join(", ");
+    fields.push({ type: "mrkdwn", text: `*Linked Issues*\n${links}` });
   }
   const blocks: Array<Record<string, unknown>> = [
     {
@@ -240,40 +246,90 @@ export function formatApprovalResolved(
   };
 }
 
+function agentUrl(agentId: string | null | undefined): string | null {
+  if (!agentId) return null;
+  return `${dashboardBase}/agents/${agentId}`;
+}
+
+function agentRunUrl(
+  agentId: string | null | undefined,
+  runId: string | null | undefined,
+): string | null {
+  if (!agentId || !runId) return null;
+  return `${dashboardBase}/agents/${agentId}/runs/${runId}`;
+}
+
+function issueUrl(issueId: string | null | undefined): string | null {
+  if (!issueId) return null;
+  return `${dashboardBase}/issues/${issueId}`;
+}
+
+function readId(value: unknown): string | null {
+  return typeof value === "string" && value ? value : null;
+}
+
 export function formatAgentError(event: PluginEvent): SlackMessage {
   const p = event.payload as Record<string, unknown>;
   const agentName = String(p.agentName ?? p.name ?? event.entityId);
   const errorMessage = String(p.error ?? p.message ?? "Unknown error");
+  // agent.run.failed: entityId = runId; payload has agentId + optional issueId.
+  const agentId = readId(p.agentId);
+  const runId = readId(p.runId) ?? readId(event.entityId);
+  const issueId = readId(p.issueId);
+  const runHref = agentRunUrl(agentId, runId);
+  const agentHref = agentUrl(agentId);
+  const issueHref = issueUrl(issueId);
+  const blocks: Array<Record<string, unknown>> = [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*Agent error* :warning:\n*${agentName}* encountered an error:\n\`\`\`${errorMessage.slice(0, 500)}\`\`\``,
+      },
+    },
+  ];
+  const buttons: Array<Record<string, unknown>> = [];
+  if (runHref) buttons.push(viewButton("View Run", runHref));
+  else if (agentHref) buttons.push(viewButton("View Agent", agentHref));
+  if (issueHref) buttons.push(viewButton("View Issue", issueHref));
+  if (buttons.length > 0) {
+    blocks.push({ type: "actions", elements: buttons });
+  }
+  blocks.push(contextFooter(event.occurredAt));
   return {
     text: `Agent error: ${agentName}`,
-    blocks: [
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text: `*Agent error* :warning:\n*${agentName}* encountered an error:\n\`\`\`${errorMessage.slice(0, 500)}\`\`\``,
-        },
-      },
-      contextFooter(event.occurredAt),
-    ],
+    blocks,
   };
 }
 
 export function formatAgentConnected(event: PluginEvent): SlackMessage {
   const p = event.payload as Record<string, unknown>;
   const agentName = String(p.agentName ?? p.name ?? event.entityId);
+  // agent.status_changed: entityId is agentId; also accept payload override.
+  const agentId = readId(p.agentId) ?? readId(event.entityId);
+  const agentHref = agentUrl(agentId);
+  const blocks: Array<Record<string, unknown>> = [
+    agentHref
+      ? {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `*Agent online* :white_check_mark:\n*${agentName}* is now connected and ready.`,
+          },
+          accessory: viewButton("View Agent", agentHref),
+        }
+      : {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `*Agent online* :white_check_mark:\n*${agentName}* is now connected and ready.`,
+          },
+        },
+    contextFooter(event.occurredAt),
+  ];
   return {
     text: `Agent online: ${agentName}`,
-    blocks: [
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text: `*Agent online* :white_check_mark:\n*${agentName}* is now connected and ready.`,
-        },
-      },
-      contextFooter(event.occurredAt),
-    ],
+    blocks,
   };
 }
 
@@ -283,18 +339,20 @@ export function formatBudgetThreshold(event: PluginEvent): SlackMessage {
   const spent = p.spent != null ? String(p.spent) : "?";
   const budget = p.budget != null ? String(p.budget) : "?";
   const pct = p.percentUsed != null ? String(p.percentUsed) : "?";
+  // cost_event.created: entityId is agentId; also accept payload override.
+  const agentId = readId(p.agentId) ?? readId(event.entityId);
+  const agentHref = agentUrl(agentId);
+  const sectionBlock: Record<string, unknown> = {
+    type: "section",
+    text: {
+      type: "mrkdwn",
+      text: `*Budget threshold reached* :chart_with_upwards_trend:\n*${agentName}* has used *${pct}%* of budget ($${spent} / $${budget})`,
+    },
+  };
+  if (agentHref) sectionBlock.accessory = viewButton("View Agent", agentHref);
   return {
     text: `Budget alert: ${agentName} at ${pct}%`,
-    blocks: [
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text: `*Budget threshold reached* :chart_with_upwards_trend:\n*${agentName}* has used *${pct}%* of budget ($${spent} / $${budget})`,
-        },
-      },
-      contextFooter(event.occurredAt),
-    ],
+    blocks: [sectionBlock, contextFooter(event.occurredAt)],
   };
 }
 
@@ -302,18 +360,21 @@ export function formatOnboardingMilestone(event: PluginEvent): SlackMessage {
   const p = event.payload as Record<string, unknown>;
   const agentName = String(p.agentName ?? p.name ?? event.entityId);
   const milestone = String(p.milestone ?? "first heartbeat");
+  // agent.run.finished: payload has agentId + runId; entityId is runId.
+  const agentId = readId(p.agentId);
+  const runId = readId(p.runId) ?? readId(event.entityId);
+  const href = agentRunUrl(agentId, runId) ?? agentUrl(agentId);
+  const sectionBlock: Record<string, unknown> = {
+    type: "section",
+    text: {
+      type: "mrkdwn",
+      text: `*Onboarding milestone* :tada:\n*${agentName}* achieved: ${milestone}`,
+    },
+  };
+  if (href) sectionBlock.accessory = viewButton("View Agent", href);
   return {
     text: `Milestone: ${agentName} - ${milestone}`,
-    blocks: [
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text: `*Onboarding milestone* :tada:\n*${agentName}* achieved: ${milestone}`,
-        },
-      },
-      contextFooter(event.occurredAt),
-    ],
+    blocks: [sectionBlock, contextFooter(event.occurredAt)],
   };
 }
 
