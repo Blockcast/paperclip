@@ -120,6 +120,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     count: number;
     now: Date;
     withRunComments?: boolean;
+    contextSource?: string;
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
     for (let index = 0; index < input.count; index += 1) {
@@ -134,7 +135,9 @@ describeEmbeddedPostgres("productivity review service", () => {
         triggerDetail: "system",
         startedAt: createdAt,
         finishedAt: new Date(createdAt.getTime() + 30_000),
-        contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
+        contextSnapshot: input.contextSource
+          ? { issueId: input.issueId, taskId: input.issueId, source: input.contextSource }
+          : { issueId: input.issueId, taskId: input.issueId },
         livenessState: "advanced",
         nextAction: "Continue processing the next batch.",
         createdAt,
@@ -534,6 +537,31 @@ describeEmbeddedPostgres("productivity review service", () => {
       .where(eq(activityLog.action, "issue.productivity_review_continuation_held"));
     expect(activities).toHaveLength(1);
     expect(activities[0]?.entityId).toBe(seeded.issueId);
+  });
+
+  it("does not file a review when 100% of sampling-window runs are routine-origin", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      contextSource: "routine.dispatch",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBeGreaterThanOrEqual(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
   it("clamps poisoned requestDepth metadata instead of aborting productivity reconciliation", async () => {

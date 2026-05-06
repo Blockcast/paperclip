@@ -33,6 +33,9 @@ const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
 const MAX_PARENT_WALK_DEPTH = 25;
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
+// Marker set on heartbeat-run contextSnapshot.source by routine dispatches; see
+// queueIssueAssignmentWakeup callers in routines.ts (`contextSource: "routine.dispatch"`).
+const ROUTINE_DISPATCH_CONTEXT_SOURCE = "routine.dispatch";
 
 type IssueRow = typeof issues.$inferSelect;
 type AgentRow = typeof agents.$inferSelect;
@@ -73,6 +76,7 @@ type ProductivityReviewEvidence = {
   nextAction: string | null;
   thresholds: ProductivityReviewThresholds;
   generatedAt: Date;
+  routineOnlySamplingWindow: boolean;
 };
 
 type EnqueueWakeup = (
@@ -132,6 +136,12 @@ function readPositiveInteger(value: number, fallback: number) {
 function coerceDate(value: Date | string | null | undefined) {
   if (!value) return null;
   return value instanceof Date ? value : new Date(value);
+}
+
+function isRoutineOriginRun(run: HeartbeatRunRow): boolean {
+  const ctx = run.contextSnapshot;
+  if (!ctx || typeof ctx !== "object") return false;
+  return (ctx as Record<string, unknown>).source === ROUTINE_DISPATCH_CONTEXT_SOURCE;
 }
 
 function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): ProductivityReviewThresholds {
@@ -490,6 +500,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       );
     }
 
+    const routineOnlySamplingWindow = latestRuns.length > 0 && latestRuns.every(isRoutineOriginRun);
+
     return {
       trigger,
       triggerReasons,
@@ -515,6 +527,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       nextAction: latestRuns.find((run) => run.nextAction)?.nextAction ?? null,
       thresholds,
       generatedAt: now,
+      routineOnlySamplingWindow,
     };
   }
 
@@ -633,6 +646,19 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     evidence: ProductivityReviewEvidence,
     opts: { prefix: string; thresholds: ProductivityReviewThresholds },
   ) {
+    if (evidence.routineOnlySamplingWindow) {
+      logger.info(
+        {
+          sourceIssueId: evidence.sourceIssue.id,
+          sourceIssueIdentifier: evidence.sourceIssue.identifier,
+          trigger: evidence.trigger,
+          sampledRunCount: evidence.totalRunCount,
+        },
+        "productivity review skipped: source issue's sampling-window runs are 100% routine-origin",
+      );
+      return { kind: "skipped" as const, reviewIssueId: null };
+    }
+
     const existing = await findOpenProductivityReview(evidence.sourceIssue.companyId, evidence.sourceIssue.id);
     if (existing) {
       const refreshState = await getRefreshCommentState(evidence.sourceIssue.companyId, existing.id);
@@ -823,6 +849,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         if (outcome.kind === "created") result.created += 1;
         else if (outcome.kind === "updated") result.updated += 1;
         else if (outcome.kind === "creation_capped") result.creationCapped += 1;
+        else if (outcome.kind === "skipped") result.skipped += 1;
         else result.existing += 1;
         if (outcome.reviewIssueId) result.reviewIssueIds.push(outcome.reviewIssueId);
       } catch (err) {
@@ -864,7 +891,9 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     if (!sourceIssue || !sourceAgent || !openReview) return { held: false as const };
     if (sourceAgent.companyId !== input.companyId) return { held: false as const };
     const evidence = await collectEvidence(sourceIssue, sourceAgent, thresholds, now);
-    if (!evidence || !isSoftStopTrigger(evidence.trigger)) return { held: false as const };
+    if (!evidence || !isSoftStopTrigger(evidence.trigger) || evidence.routineOnlySamplingWindow) {
+      return { held: false as const };
+    }
     return {
       held: true as const,
       reviewIssueId: openReview.id,
