@@ -7895,6 +7895,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runningProcesses.delete(run.id);
     await finalizeAgentStatus(run.agentId, "cancelled");
     await startNextQueuedRunForAgent(run.agentId);
+
+    // RCA 2026-05-06: external-lifecycle adapters (claude_k8s, opencode_k8s)
+    // create a k8s Job that doesn't observe local SIGTERM. Without this,
+    // a manual cancel UPDATE'd `status='cancelled'` but the Job stayed
+    // alive; the next dispatch's precondition matched the surviving Job
+    // and rejected with "Concurrent run blocked". Cascade-delete the
+    // Job so the slot frees up. Best-effort.
+    if (agent && hasExternalLifecycle(agent.adapterType)) {
+      try {
+        const deleted = await deleteAgentJobsForRun(run.id);
+        logger.info(
+          { runId: run.id, deletedJobs: deleted },
+          "cancelRun: cascaded Job deletion for external-lifecycle adapter",
+        );
+      } catch (error) {
+        logger.warn(
+          { runId: run.id, error: error instanceof Error ? error.message : String(error) },
+          "cancelRun: cascade Job delete failed (run still finalized as cancelled)",
+        );
+      }
+    }
     return cancelled;
   }
 
@@ -7939,6 +7960,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
       await releaseIssueExecutionAndPromote(run);
+
+      // Mirrors the cascade in cancelRunInternal — bulk agent cancel must
+      // also release the k8s Job slot for external-lifecycle runs.
+      if (agent && hasExternalLifecycle(agent.adapterType)) {
+        try {
+          const deleted = await deleteAgentJobsForRun(run.id);
+          logger.info(
+            { runId: run.id, deletedJobs: deleted },
+            "cancelActiveForAgent: cascaded Job deletion for external-lifecycle adapter",
+          );
+        } catch (error) {
+          logger.warn(
+            { runId: run.id, error: error instanceof Error ? error.message : String(error) },
+            "cancelActiveForAgent: cascade Job delete failed (run still finalized as cancelled)",
+          );
+        }
+      }
     }
 
     return runs.length;

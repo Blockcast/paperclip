@@ -1465,6 +1465,38 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("cancelRun cascades Job deletion for claude_k8s (RCA 2026-05-06)", async () => {
+    // The reaper-driven path got cascade-delete in PR #108; this is the
+    // sibling path for explicit operator/board cancel. Without this,
+    // UPDATE'ing status='cancelled' still left the Job alive and the
+    // next dispatch hit "Concurrent run blocked".
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_k8s",
+      processPid: null,
+      processGroupId: null,
+      agentStatus: "running",
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const cancelled = await heartbeat.cancelRun(runId);
+    expect(cancelled?.status).toBe("cancelled");
+    expect(mockDeleteAgentJobsForRun).toHaveBeenCalledWith(runId);
+  });
+
+  it("cancelRun does not cascade Job deletion for local adapters", async () => {
+    const { runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      agentStatus: "running",
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const cancelled = await heartbeat.cancelRun(runId);
+    expect(cancelled?.status).toBe("cancelled");
+    expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
+  });
+
   it("dispatches assigned todo work with no prior run as a normal assignment wake", async () => {
     const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture();
     const heartbeat = heartbeatService(db);
