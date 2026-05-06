@@ -16,23 +16,30 @@ image:
 imagePullSecrets:
   - name: registry-blockcast-net-pull
 
+# paperclip.blockcast.net is now served via Cilium Gateway API + HTTPRoute
+# (see onprem-k8s commit 9712d49: gateway-api/httproutes/paperclip.yaml,
+# shared-gateway listener `https-paperclip`, ReferenceGrant in this ns).
+# Public DNS A=69.25.95.135 / AAAA=2602:f74d:1::206 (Azure DNS, TTL 300).
+# The Ingress block below is kept commented for the migration audit trail
+# but disabled — ingress.enabled=false means the chart's templates/ingress.yaml
+# renders nothing and helm upgrade reaps the prior live Ingress.
 ingress:
-  enabled: true
-  className: nginx
-  annotations:
-    cert-manager.io/cluster-issuer: letsencrypt-blockcast-net
-    nginx.ingress.kubernetes.io/proxy-body-size: 50m
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-  hosts:
-    - host: paperclip.blockcast.net
-      paths:
-        - path: /
-          pathType: Prefix
-  tls:
-    - hosts:
-        - paperclip.blockcast.net
-      secretName: paperclip-tls
+  enabled: false
+  # className: nginx
+  # annotations:
+  #   cert-manager.io/cluster-issuer: letsencrypt-blockcast-net
+  #   nginx.ingress.kubernetes.io/proxy-body-size: 50m
+  #   nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+  #   nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+  # hosts:
+  #   - host: paperclip.blockcast.net
+  #     paths:
+  #       - path: /
+  #         pathType: Prefix
+  # tls:
+  #   - hosts:
+  #       - paperclip.blockcast.net
+  #     secretName: paperclip-tls
 
 env:
   host: "0.0.0.0"
