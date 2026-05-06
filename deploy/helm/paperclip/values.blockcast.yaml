@@ -93,6 +93,19 @@ env:
         secretKeyRef:
           name: paperclip-github-mcp-token
           key: token
+    # Same token, exposed under GH_TOKEN so the `gh` CLI inside agent pods
+    # picks it up. Without this, gh falls back to ~/.config/gh/hosts.yml on
+    # the per-agent PVC — which holds whatever stale PAT was cached when an
+    # agent ran `gh auth login` weeks ago, and the github-app-refresh
+    # CronJob's hourly token rotation never reaches gh. With GH_TOKEN set,
+    # gh ignores hosts.yml and uses the env var directly, so agents always
+    # have a fresh installation token without needing to re-run
+    # `gh auth login` on every rotation.
+    - name: GH_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: paperclip-github-mcp-token
+          key: token
     # V8 default heap ceiling is ~2.18 GiB regardless of cgroup limits, so a
     # Node process inside a 4 GiB container hits the heap ceiling well before
     # the cgroup OOM and spends CPU on Scavenger/ConcurrentMarking/Sweeper
