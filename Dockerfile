@@ -50,7 +50,7 @@ WORKDIR /vendor
 # production stage installs. We never commit the tgz; it's reproduced on
 # every image build.
 ARG CCROTATE_REF=2be8d952b7cbf1773518ecb3698fe87e98b7baef
-ARG CLAUDE_K8S_REF=8923573949b81cdd5a510db9b4aff0f8eae22791
+ARG CLAUDE_K8S_REF=3591f883d6bd99a6c88c6e600c71c2161170da52
 ARG OPENCODE_K8S_REF=9699d27842e06a471effb8e3d56a36a35a5b5acf
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
