@@ -189,6 +189,26 @@ const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
+
+// Rate-limit retries (errorFamily = "rate_limit_exhausted") use a flat short
+// delay instead of stacking exponential backoff. Rationale: rate-limit isn't
+// a transient upstream fault — it means "this account's window is closed".
+// The right wait time is the soonest pool reset, not 2hrs of guesswork.
+// The ccrotate gate (PR #87) at dispatch time is the actual decider:
+//   - if pool has capacity now: gate allows, run proceeds on a fresh account
+//   - if pool still empty:      gate denies + skips, next timer tick retries
+// Stacking exponential backoff (2m → 10m → 30m → 2h) repeatedly delayed
+// retries for hours past the actual reset, leaving issues "in_progress" with
+// no activity. (Observed BLO-3182 2026-05-06: 5 rate-limit failures stacked
+// scheduledRetryAttempt to 4, retry pushed to T+95min after the last
+// failure, even though pool reset was much sooner.)
+export const RATE_LIMIT_HEARTBEAT_RETRY_DELAY_MS = 90 * 1000;
+const RATE_LIMIT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
+// Cap rate-limit retry chains so a stuck pool can't queue indefinitely. The
+// gate skips dispatches when pool is empty; we only count retries that
+// actually ran (and re-failed). Practical ceiling: 12 = ~18min of accumulated
+// post-gate retries before we give up and require operator intervention.
+const RATE_LIMIT_HEARTBEAT_RETRY_MAX_ATTEMPTS = 12;
 type CodexTransientFallbackMode =
   | "same_session"
   | "safer_invocation"
@@ -209,6 +229,9 @@ function readHeartbeatRunErrorFamily(
   const persistedFamily = readNonEmptyString(resultJson.errorFamily);
   if (persistedFamily) return persistedFamily;
 
+  if (run.errorCode === "rate_limit_exhausted") {
+    return "rate_limit_exhausted";
+  }
   if (run.errorCode === "codex_transient_upstream" || run.errorCode === "claude_transient_upstream") {
     return "transient_upstream";
   }
@@ -225,15 +248,33 @@ function readTransientRetryNotBeforeFromRun(run: Pick<typeof heartbeatRuns.$infe
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+type TransientRecoveryContract =
+  | {
+      errorFamily: "transient_upstream";
+      retryNotBefore: Date | null;
+    }
+  | {
+      errorFamily: "rate_limit_exhausted";
+      retryNotBefore: Date | null;
+    };
+
 function readTransientRecoveryContractFromRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
-) {
-  return readHeartbeatRunErrorFamily(run) === "transient_upstream"
-    ? {
-        errorFamily: "transient_upstream" as const,
-        retryNotBefore: readTransientRetryNotBeforeFromRun(run),
-      }
-    : null;
+): TransientRecoveryContract | null {
+  const family = readHeartbeatRunErrorFamily(run);
+  if (family === "transient_upstream") {
+    return {
+      errorFamily: "transient_upstream",
+      retryNotBefore: readTransientRetryNotBeforeFromRun(run),
+    };
+  }
+  if (family === "rate_limit_exhausted") {
+    return {
+      errorFamily: "rate_limit_exhausted",
+      retryNotBefore: readTransientRetryNotBeforeFromRun(run),
+    };
+  }
+  return null;
 }
 
 function mergeAdapterRecoveryMetadata(input: {
@@ -359,6 +400,33 @@ export function computeBoundedTransientHeartbeatRetrySchedule(
     delayMs,
     dueAt: new Date(now.getTime() + delayMs),
     maxAttempts: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+  };
+}
+
+/**
+ * Schedule a rate-limit retry: flat short delay (90s ± 25%), capped attempt
+ * count. The actual decision of whether the retry runs is delegated to the
+ * ccrotate gate at dispatch time — this function only sets when we're next
+ * willing to try. Past the cap, returns null so the caller logs retry-
+ * exhausted and stops queuing.
+ */
+export function computeRateLimitHeartbeatRetrySchedule(
+  attempt: number,
+  now = new Date(),
+  random: () => number = Math.random,
+) {
+  if (!Number.isInteger(attempt) || attempt <= 0) return null;
+  if (attempt > RATE_LIMIT_HEARTBEAT_RETRY_MAX_ATTEMPTS) return null;
+  const baseDelayMs = RATE_LIMIT_HEARTBEAT_RETRY_DELAY_MS;
+  const sample = Math.min(1, Math.max(0, random()));
+  const jitterMultiplier = 1 + (((sample * 2) - 1) * RATE_LIMIT_HEARTBEAT_RETRY_JITTER_RATIO);
+  const delayMs = Math.max(1_000, Math.round(baseDelayMs * jitterMultiplier));
+  return {
+    attempt,
+    baseDelayMs,
+    delayMs,
+    dueAt: new Date(now.getTime() + delayMs),
+    maxAttempts: RATE_LIMIT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
   };
 }
 
@@ -3603,13 +3671,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const retryReason = opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
     const wakeReason = opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
     const nextAttempt = (run.scheduledRetryAttempt ?? 0) + 1;
-    const baseSchedule = computeBoundedTransientHeartbeatRetrySchedule(nextAttempt, now, opts?.random);
     const transientRecovery =
       retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
         ? readTransientRecoveryContractFromRun(run)
         : null;
+    // Pick the schedule curve based on the recovery family. Rate-limit gets
+    // a flat short delay (gate is the actual decider); generic transient
+    // upstream gets the original exponential backoff.
+    const isRateLimitFamily = transientRecovery?.errorFamily === "rate_limit_exhausted";
+    const baseSchedule = isRateLimitFamily
+      ? computeRateLimitHeartbeatRetrySchedule(nextAttempt, now, opts?.random)
+      : computeBoundedTransientHeartbeatRetrySchedule(nextAttempt, now, opts?.random);
+    const maxAttemptsForFamily = isRateLimitFamily
+      ? RATE_LIMIT_HEARTBEAT_RETRY_MAX_ATTEMPTS
+      : BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS;
     const codexTransientFallbackMode =
-      agent.adapterType === "codex_local" && transientRecovery
+      agent.adapterType === "codex_local" && transientRecovery && !isRateLimitFamily
         ? resolveCodexTransientFallbackMode(nextAttempt)
         : null;
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
@@ -3622,14 +3699,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         message: `Bounded retry exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts; no further automatic retry will be queued`,
         payload: {
           retryReason,
+          retryFamily: transientRecovery?.errorFamily ?? null,
           scheduledRetryAttempt: run.scheduledRetryAttempt ?? 0,
-          maxAttempts: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+          maxAttempts: maxAttemptsForFamily,
         },
       });
       return {
         outcome: "retry_exhausted" as const,
         attempt: nextAttempt,
-        maxAttempts: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+        maxAttempts: maxAttemptsForFamily,
       };
     }
     const schedule =
@@ -6142,10 +6220,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         mergeRunStopMetadataForAgent(agent, outcome, {
           resultJson: mergeAdapterRecoveryMetadata({
             resultJson: adapterResult.resultJson ?? null,
-            // Force transient_upstream when we overrode for 429 so the bounded
-            // retry contract picks it up regardless of what the adapter set.
+            // Tag the recovery family so scheduleBoundedRetryForRun picks the
+            // right schedule curve. rate_limit_exhausted -> flat 90s retry
+            // (gate decides if pool has capacity); generic adapter-reported
+            // transient_upstream -> exponential backoff.
             errorFamily: rateLimitExhaustedOverride
-              ? "transient_upstream"
+              ? "rate_limit_exhausted"
               : (adapterResult.errorFamily ?? null),
             retryNotBefore: adapterResult.retryNotBefore ?? null,
           }),

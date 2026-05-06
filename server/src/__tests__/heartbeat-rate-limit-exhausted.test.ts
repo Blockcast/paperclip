@@ -153,12 +153,14 @@ describe("heartbeat outcome — rate-limit-exhausted integration", () => {
             : null;
 
     // Persisted errorFamily mirrors the inline override in the merge path.
-    const persistedErrorFamily = rateLimitExhaustedOverride ? "transient_upstream" : null;
+    // (Updated 2026-05-06: rate-limit gets its own family so retry uses a
+    // flat short delay instead of stacking 2hr exponential backoff.)
+    const persistedErrorFamily = rateLimitExhaustedOverride ? "rate_limit_exhausted" : null;
 
     return { outcome, errorCode, rateLimitExhaustedOverride, persistedErrorFamily };
   }
 
-  it("overrides exit-0 + 429-result → failed/rate_limit_exhausted/transient_upstream", () => {
+  it("overrides exit-0 + 429-result → failed/rate_limit_exhausted (own family)", () => {
     const r = evaluateOutcome({
       exitCode: 0,
       errorMessage: null,
@@ -174,8 +176,10 @@ describe("heartbeat outcome — rate-limit-exhausted integration", () => {
     expect(r.outcome).toBe("failed");
     expect(r.errorCode).toBe("rate_limit_exhausted");
     expect(r.rateLimitExhaustedOverride).toBe(true);
-    // The transient_upstream contract is what gates the bounded retry path.
-    expect(r.persistedErrorFamily).toBe("transient_upstream");
+    // The rate_limit_exhausted family routes the bounded retry to a flat
+    // short delay (gate decides if pool has capacity); generic
+    // transient_upstream still uses exponential backoff.
+    expect(r.persistedErrorFamily).toBe("rate_limit_exhausted");
   });
 
   it("does NOT override exit-0 + non-429-result", () => {
@@ -209,7 +213,7 @@ describe("heartbeat outcome — rate-limit-exhausted integration", () => {
     expect(r.outcome).toBe("failed");
     expect(r.rateLimitExhaustedOverride).toBe(true);
     expect(r.errorCode).toBe("rate_limit_exhausted");
-    expect(r.persistedErrorFamily).toBe("transient_upstream");
+    expect(r.persistedErrorFamily).toBe("rate_limit_exhausted");
   });
 
   it("DOES tag a 401 errorMessage failure as rate_limit_exhausted", () => {
