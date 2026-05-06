@@ -268,6 +268,13 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
 
   // Plugin handler registrations (populated during setup())
   const eventHandlers: EventRegistration[] = [];
+  // Track which (pattern, filter) tuples we have already registered on the
+  // host bus so that multiple `ctx.events.on()` calls for the same event don't
+  // produce N parallel host subscriptions — each of which would generate an
+  // independent `onEvent` notification, and each notification fans out to all
+  // local handlers, causing N×N handler invocations and (visibly) duplicate
+  // side-effects like double-posting Slack messages.
+  const hostSubscriptionKeys = new Set<string>();
   const jobHandlers = new Map<string, (job: PluginJobContext) => Promise<void>>();
   const launcherRegistrations = new Map<string, PluginLauncherRegistration>();
   const dataHandlers = new Map<string, (params: Record<string, unknown>) => Promise<unknown>>();
@@ -401,16 +408,33 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             registration = { name, filter: filterOrFn, fn: maybeFn };
           }
           eventHandlers.push(registration);
-          // Register subscription on the host so events are forwarded to this worker
-          void callHost("events.subscribe", { eventPattern: name, filter: registration.filter ?? null }).catch((err) => {
-            notifyHost("log", {
-              level: "warn",
-              message: `Failed to subscribe to event "${name}" on host: ${err instanceof Error ? err.message : String(err)}`,
+          // Register subscription on the host. Dedupe per (pattern, filter) so
+          // that calling `ctx.events.on("issue.updated", fn)` twice (or having
+          // a wildcard loop register the same pattern that an explicit handler
+          // already registered) doesn't create a second host bus subscription.
+          // The local `eventHandlers` array still drives the fan-out — every
+          // local handler matching the event still runs on each notification.
+          const filterKey = registration.filter ? JSON.stringify(registration.filter) : "";
+          const subscriptionKey = `${name}\x00${filterKey}`;
+          if (!hostSubscriptionKeys.has(subscriptionKey)) {
+            hostSubscriptionKeys.add(subscriptionKey);
+            void callHost("events.subscribe", { eventPattern: name, filter: registration.filter ?? null }).catch((err) => {
+              hostSubscriptionKeys.delete(subscriptionKey);
+              notifyHost("log", {
+                level: "warn",
+                message: `Failed to subscribe to event "${name}" on host: ${err instanceof Error ? err.message : String(err)}`,
+              });
             });
-          });
+          }
           return () => {
             const idx = eventHandlers.indexOf(registration);
             if (idx !== -1) eventHandlers.splice(idx, 1);
+            // Note: we don't unsubscribe on the host here. The host bus
+            // subscription is shared across any local handlers that matched
+            // the same (pattern, filter); leaving it alive is harmless when
+            // no local handlers remain because handleOnEvent simply finds
+            // nothing to dispatch to. The host clears all of a plugin's bus
+            // subscriptions when the worker shuts down.
           };
         },
 
