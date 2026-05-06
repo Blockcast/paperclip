@@ -17,7 +17,9 @@ import {
 import { MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
 import {
   DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+  PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS,
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+  PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX,
   productivityReviewService,
 } from "../services/productivity-review.ts";
 
@@ -461,6 +463,78 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(0);
     expect(result.skipped).toBeGreaterThanOrEqual(1);
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("throttles refresh-evidence comments at the 5-minute hard floor (BLO-3281 AC2)", async () => {
+    // Reproduces the 2026-05-05 BLO-3277 incident shape: detector
+    // re-runs faster than 5 min apart should NOT keep adding refresh
+    // comments. PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS gates the
+    // addComment call inside createOrUpdateReview.
+    //
+    // The throttle compares the freshly-generated evidence's wall-clock
+    // time to the DB-side createdAt of the latest refresh comment, both
+    // of which are real-now in production. To exercise both branches in
+    // a unit test without sleeping for 5 min, we backdate the latest
+    // refresh comment via SQL UPDATE between scans.
+    const seeded = await seedAssignedIssue();
+    const scanNow = new Date();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: scanNow,
+    });
+
+    const service = productivityReviewService(db);
+    const first = await service.reconcileProductivityReviews({ now: scanNow, companyId: seeded.companyId });
+    expect(first.created).toBe(1);
+
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    const reviewId = reviews[0]!.id;
+
+    async function countRefreshComments() {
+      const rows = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.issueId, reviewId),
+            sql`${issueComments.body} like ${`${PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX}%`}`,
+          ),
+        );
+      return rows.length;
+    }
+
+    const baselineRefreshCount = await countRefreshComments();
+    expect(baselineRefreshCount).toBe(0);
+
+    // Re-scan: latest refresh comment doesn't exist yet (no refresh on
+    // the create path), so the throttle short-circuits and the existing
+    // branch writes its first refresh comment.
+    const firstRefresh = await service.reconcileProductivityReviews({ now: scanNow, companyId: seeded.companyId });
+    expect(firstRefresh.updated).toBe(1);
+    expect(await countRefreshComments()).toBe(1);
+
+    // Within-floor re-scan: latest refresh just landed seconds ago.
+    // Throttle should kick in — return existing, no new refresh comment.
+    const throttled = await service.reconcileProductivityReviews({ now: new Date(), companyId: seeded.companyId });
+    expect(throttled.existing).toBe(1);
+    expect(throttled.updated).toBe(0);
+    expect(await countRefreshComments()).toBe(1);
+
+    // Backdate the latest refresh comment so the next reconcile sees
+    // it as past the 5-min floor; throttle should release.
+    const backdate = new Date(Date.now() - PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS - 60 * 1000);
+    await db
+      .update(issueComments)
+      .set({ createdAt: backdate })
+      .where(eq(issueComments.issueId, reviewId));
+
+    const allowed = await service.reconcileProductivityReviews({ now: new Date(), companyId: seeded.companyId });
+    expect(allowed.updated).toBe(1);
+    expect(await countRefreshComments()).toBe(2);
   });
 
   it("clamps poisoned requestDepth metadata instead of aborting productivity reconciliation", async () => {

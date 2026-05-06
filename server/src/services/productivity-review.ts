@@ -29,6 +29,11 @@ const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
 const MAX_PARENT_WALK_DEPTH = 25;
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
+// BLO-3281 AC2 hard floor: even if the detector scan cadence is faster
+// than this, the refresh-evidence-comment path stays throttled at 5 min.
+// Defends against the 2026-05-05 incident on BLO-3277 (14 refreshes in
+// 6 minutes, ~30s apart) regardless of scheduler config.
+export const PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 // Marker set on heartbeat-run contextSnapshot.source by routine dispatches; see
 // queueIssueAssignmentWakeup callers in routines.ts (`contextSource: "routine.dispatch"`).
 const ROUTINE_DISPATCH_CONTEXT_SOURCE = "routine.dispatch";
@@ -239,6 +244,22 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       .orderBy(desc(issues.updatedAt))
       .limit(1)
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function findLatestRefreshCommentAt(companyId: string, reviewIssueId: string) {
+    return db
+      .select({ createdAt: issueComments.createdAt })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, companyId),
+          eq(issueComments.issueId, reviewIssueId),
+          sql`${issueComments.body} like ${`${PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX}%`}`,
+        ),
+      )
+      .orderBy(desc(issueComments.createdAt))
+      .limit(1)
+      .then((rows) => rows[0]?.createdAt ?? null);
   }
 
   async function findRecentResolvedProductivityReview(
@@ -574,6 +595,30 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
 
     const existing = await findOpenProductivityReview(evidence.sourceIssue.companyId, evidence.sourceIssue.id);
     if (existing) {
+      // BLO-3281 AC2: hard-floor refresh interval. Even when the
+      // scheduler triggers a re-scan inside the 5-min window, we
+      // skip the addComment so the review thread doesn't accumulate
+      // ~identical "evidence refreshed" comments. The previous run
+      // is reused as the {kind:"existing"} outcome.
+      const lastRefreshAt = await findLatestRefreshCommentAt(
+        evidence.sourceIssue.companyId,
+        existing.id,
+      );
+      if (
+        lastRefreshAt &&
+        evidence.generatedAt.getTime() - lastRefreshAt.getTime() < PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS
+      ) {
+        logger.debug(
+          {
+            reviewIssueId: existing.id,
+            sourceIssueId: evidence.sourceIssue.id,
+            lastRefreshAt: lastRefreshAt.toISOString(),
+            minIntervalMs: PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS,
+          },
+          "productivity review refresh throttled: previous refresh within hard-floor window",
+        );
+        return { kind: "existing" as const, reviewIssueId: existing.id };
+      }
       await issuesSvc.addComment(existing.id, buildRefreshComment(evidence, opts.prefix), {});
       await logActivity(db, {
         companyId: evidence.sourceIssue.companyId,
