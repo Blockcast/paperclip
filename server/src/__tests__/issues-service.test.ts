@@ -1986,6 +1986,227 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  describe("listResolvedBlockerDependentsToSweep executive hold suppression (BLO-3496)", () => {
+    async function setupBlockedDependentWithExecutive(opts: {
+      ctoRole?: string;
+    } = {}) {
+      const companyId = randomUUID();
+      const assigneeAgentId = randomUUID();
+      const ctoAgentId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values([
+        {
+          id: assigneeAgentId,
+          companyId,
+          name: "CodexCoder",
+          role: "engineer",
+          status: "active",
+          adapterType: "codex_local",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        },
+        {
+          id: ctoAgentId,
+          companyId,
+          name: "CTO",
+          role: opts.ctoRole ?? "cto",
+          status: "active",
+          adapterType: "claude_k8s",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        },
+      ]);
+
+      const blockerId = randomUUID();
+      const blockedIssueId = randomUUID();
+      await db.insert(issues).values([
+        { id: blockerId, companyId, title: "Recovery", status: "done", priority: "critical" },
+        {
+          id: blockedIssueId,
+          companyId,
+          title: "Source under hold",
+          status: "blocked",
+          priority: "critical",
+          assigneeAgentId,
+        },
+      ]);
+      await svc.update(blockedIssueId, { blockedByIssueIds: [blockerId] });
+
+      return { companyId, ctoAgentId, assigneeAgentId, blockerId, blockedIssueId };
+    }
+
+    async function insertComment(opts: {
+      companyId: string;
+      issueId: string;
+      authorAgentId: string | null;
+      body: string;
+      createdAt: Date;
+    }) {
+      await db.insert(issueComments).values({
+        id: randomUUID(),
+        companyId: opts.companyId,
+        issueId: opts.issueId,
+        authorAgentId: opts.authorAgentId,
+        body: opts.body,
+        createdAt: opts.createdAt,
+        updatedAt: opts.createdAt,
+      });
+    }
+
+    const sweepOpts = { minBlockerResolvedAge: { milliseconds: 0 } } as const;
+
+    it("suppresses the sweep when an executive `do not retry before <future ts>` hold is active (strict ISO)", async () => {
+      const ctx = await setupBlockedDependentWithExecutive();
+      const future = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      await insertComment({
+        companyId: ctx.companyId,
+        issueId: ctx.blockedIssueId,
+        authorAgentId: ctx.ctoAgentId,
+        body: `Pausing — do not retry before ${future}.`,
+        createdAt: new Date(),
+      });
+
+      await expect(svc.listResolvedBlockerDependentsToSweep(ctx.companyId, sweepOpts)).resolves.toEqual([]);
+
+      const after = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, ctx.blockedIssueId))
+        .then((rows) => rows[0]);
+      expect(after?.status).toBe("blocked");
+    });
+
+    it("suppresses the sweep for the loose `YYYY-MM-DD HH:MM UTC` form too", async () => {
+      const ctx = await setupBlockedDependentWithExecutive();
+      const future = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      const yyyy = future.getUTCFullYear();
+      const mm = String(future.getUTCMonth() + 1).padStart(2, "0");
+      const dd = String(future.getUTCDate()).padStart(2, "0");
+      const hh = String(future.getUTCHours()).padStart(2, "0");
+      const minute = String(future.getUTCMinutes()).padStart(2, "0");
+      await insertComment({
+        companyId: ctx.companyId,
+        issueId: ctx.blockedIssueId,
+        authorAgentId: ctx.ctoAgentId,
+        body: `Hold this — do not retry before ${yyyy}-${mm}-${dd} ${hh}:${minute} UTC.`,
+        createdAt: new Date(),
+      });
+
+      await expect(svc.listResolvedBlockerDependentsToSweep(ctx.companyId, sweepOpts)).resolves.toEqual([]);
+    });
+
+    it("does NOT suppress the sweep when the executive hold timestamp is in the past", async () => {
+      const ctx = await setupBlockedDependentWithExecutive();
+      const past = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      await insertComment({
+        companyId: ctx.companyId,
+        issueId: ctx.blockedIssueId,
+        authorAgentId: ctx.ctoAgentId,
+        body: `Hold expired — do not retry before ${past}.`,
+        createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+      });
+
+      await expect(svc.listResolvedBlockerDependentsToSweep(ctx.companyId, sweepOpts)).resolves.toEqual([
+        expect.objectContaining({
+          id: ctx.blockedIssueId,
+          assigneeAgentId: ctx.assigneeAgentId,
+        }),
+      ]);
+    });
+
+    it("does NOT suppress the sweep when the hold marker is from a non-executive author", async () => {
+      const ctx = await setupBlockedDependentWithExecutive({ ctoRole: "engineer" });
+      const future = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      await insertComment({
+        companyId: ctx.companyId,
+        issueId: ctx.blockedIssueId,
+        authorAgentId: ctx.ctoAgentId,
+        body: `Trying to hold — do not retry before ${future}.`,
+        createdAt: new Date(),
+      });
+
+      await expect(svc.listResolvedBlockerDependentsToSweep(ctx.companyId, sweepOpts)).resolves.toEqual([
+        expect.objectContaining({
+          id: ctx.blockedIssueId,
+          assigneeAgentId: ctx.assigneeAgentId,
+        }),
+      ]);
+    });
+
+    it("does NOT suppress the sweep when there is no hold marker at all", async () => {
+      const ctx = await setupBlockedDependentWithExecutive();
+      await insertComment({
+        companyId: ctx.companyId,
+        issueId: ctx.blockedIssueId,
+        authorAgentId: ctx.ctoAgentId,
+        body: "Just a status update from the CTO, no hold marker here.",
+        createdAt: new Date(),
+      });
+
+      await expect(svc.listResolvedBlockerDependentsToSweep(ctx.companyId, sweepOpts)).resolves.toEqual([
+        expect.objectContaining({
+          id: ctx.blockedIssueId,
+          assigneeAgentId: ctx.assigneeAgentId,
+        }),
+      ]);
+    });
+
+    it("uses the newest matching executive comment when multiple holds are present", async () => {
+      const ctx = await setupBlockedDependentWithExecutive();
+      const oldFuture = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      const newPast = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      await insertComment({
+        companyId: ctx.companyId,
+        issueId: ctx.blockedIssueId,
+        authorAgentId: ctx.ctoAgentId,
+        body: `Initial hold — do not retry before ${oldFuture}.`,
+        createdAt: new Date(Date.now() - 60 * 60 * 1000),
+      });
+      await insertComment({
+        companyId: ctx.companyId,
+        issueId: ctx.blockedIssueId,
+        authorAgentId: ctx.ctoAgentId,
+        body: `Override — do not retry before ${newPast}.`,
+        createdAt: new Date(),
+      });
+
+      await expect(svc.listResolvedBlockerDependentsToSweep(ctx.companyId, sweepOpts)).resolves.toEqual([
+        expect.objectContaining({
+          id: ctx.blockedIssueId,
+          assigneeAgentId: ctx.assigneeAgentId,
+        }),
+      ]);
+    });
+
+    it("does NOT suppress the sweep for non-blocked candidates (todo/in_progress) regardless of hold marker", async () => {
+      const ctx = await setupBlockedDependentWithExecutive();
+      // Flip dependent to `todo`; an exec hold on a non-blocked candidate is meaningless to this sweep.
+      await db.update(issues).set({ status: "todo" }).where(eq(issues.id, ctx.blockedIssueId));
+      const future = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      await insertComment({
+        companyId: ctx.companyId,
+        issueId: ctx.blockedIssueId,
+        authorAgentId: ctx.ctoAgentId,
+        body: `Hold marker — do not retry before ${future}.`,
+        createdAt: new Date(),
+      });
+
+      await expect(svc.listResolvedBlockerDependentsToSweep(ctx.companyId, sweepOpts)).resolves.toEqual([
+        expect.objectContaining({
+          id: ctx.blockedIssueId,
+          assigneeAgentId: ctx.assigneeAgentId,
+        }),
+      ]);
+    });
+  });
+
   it("reports dependency readiness for blocked issue chains", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({

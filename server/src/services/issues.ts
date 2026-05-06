@@ -2794,6 +2794,7 @@ export function issueService(db: Db) {
         blockerIssueIds: string[];
         latestBlockerResolvedAt: Date | null;
       }> = [];
+      const candidateStatusById = new Map(candidates.map((c) => [c.id, c.status]));
       for (const candidate of candidates) {
         const blockers = byDependent.get(candidate.id);
         if (!blockers || blockers.ids.length === 0 || !blockers.allDone) continue;
@@ -2807,7 +2808,52 @@ export function issueService(db: Db) {
         });
         if (results.length >= limit) break;
       }
-      return results;
+
+      // BLO-3496: companion suppression to listWakeableBlockedDependents. The
+      // edge-triggered path checks executive `do not retry before <ts>` markers
+      // before waking; the sweep must too, otherwise a CTO hold gets bypassed
+      // every time the periodic reconciler runs and fires the wake again.
+      const blockedResultIds = results
+        .filter((r) => candidateStatusById.get(r.id) === "blocked")
+        .map((r) => r.id);
+      if (blockedResultIds.length === 0) return results;
+
+      const commentRows = await db
+        .select({
+          id: issueComments.id,
+          issueId: issueComments.issueId,
+          body: issueComments.body,
+          createdAt: issueComments.createdAt,
+          authorRole: agents.role,
+        })
+        .from(issueComments)
+        .leftJoin(agents, eq(agents.id, issueComments.authorAgentId))
+        .where(inArray(issueComments.issueId, blockedResultIds))
+        .orderBy(desc(issueComments.createdAt));
+
+      const commentsByIssueId = new Map<string, typeof commentRows>();
+      for (const row of commentRows) {
+        const list = commentsByIssueId.get(row.issueId) ?? [];
+        list.push(row);
+        commentsByIssueId.set(row.issueId, list);
+      }
+
+      const now = new Date();
+      const suppressedIssueIds = new Set<string>();
+      for (const issueId of blockedResultIds) {
+        const candidateComments = commentsByIssueId.get(issueId) ?? [];
+        const hold = findActiveExecutiveHold(candidateComments, now);
+        if (hold) {
+          suppressedIssueIds.add(issueId);
+          logger.debug(
+            { issueId, until: hold.until.toISOString(), holdCommentId: hold.commentId },
+            `blockers_resolved_sweep: suppressed for issue=${issueId} until=${hold.until.toISOString()} hold_comment=${hold.commentId}`,
+          );
+        }
+      }
+      return suppressedIssueIds.size === 0
+        ? results
+        : results.filter((r) => !suppressedIssueIds.has(r.id));
     },
 
     getWakeableParentAfterChildCompletion: async (parentIssueId: string) => {
