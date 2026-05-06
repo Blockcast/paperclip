@@ -140,12 +140,39 @@ async function doExport(): Promise<void> {
   const pluginId = await loadPluginIdOrExit(db);
   if (!pluginId) exitWith(0, `[ccrotate-hook] plugin ${PLUGIN_KEY} not installed; nothing to export`);
 
-  // Refresh first so the captured tier-cache reflects current API state, not
+  // Snap the active account's freshly-rotated tokens for both targets back
+  // into ccrotate's profiles.* JSONs before export. Without this, codex CLI's
+  // automatic refresh_token rotation (writes new tokens to
+  // /paperclip/.codex/auth.json on first refresh) is invisible to ccrotate's
+  // pool snapshot — `ccrotate refresh` is claude-only ("refresh-one is only
+  // available in Claude Code mode" for codex), so the codex pool's stashed
+  // refresh_token in profiles.codex.json never tracks the rotated value. Next
+  // time ccrotate switches to that account, it loads the OLD refresh_token,
+  // which has been invalidated by OpenAI when the new one was issued, codex
+  // CLI silently fails auth, opencode exits 0 with empty stdout, and the run
+  // is mis-classified as adapter_failed. We saw this live: 5/5 codex pool
+  // accounts had id_tokens 16h–9d expired, snap-after-rotation never ran.
+  //
+  // `--force` overwrites without confirmation. Each target's snap is
+  // best-effort: if the target's CLI hasn't been used in this pod (no
+  // ~/.<target>/auth.json), the snap errors harmlessly. The export below
+  // captures whichever updates landed.
+  for (const target of ["claude", "codex"] as const) {
+    const snap = runCcrotate(["--target", target, "snap", "--force"], 30_000);
+    if (snap.status !== 0) {
+      console.error(
+        `[ccrotate-hook] ccrotate --target ${target} snap exit=${snap.status} (continuing): ${snap.stderr || snap.stdout}`.trim(),
+      );
+    }
+  }
+
+  // Refresh next so the captured tier-cache reflects current API state, not
   // whatever stale snapshot the pod was last left with. ccrotate import on
   // the next run-start is a per-account timestamp merge (lib/commands/import.js),
   // so even if refresh updates only a subset, the survivors merge cleanly with
   // whatever persisted state the next pod sees. Refresh failure is non-fatal —
-  // we still export whatever is on disk.
+  // we still export whatever is on disk. (refresh is claude-only; for a codex
+  // active account it errors and we proceed.)
   const refresh = runCcrotate(["refresh"], 90_000);
   if (refresh.status !== 0) {
     console.error(
