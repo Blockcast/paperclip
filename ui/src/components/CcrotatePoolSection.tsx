@@ -185,6 +185,8 @@ function PoolRow({ row }: { row: CcrotateAccountRow }) {
   const tierColor = tierColorClass(row.tier);
   const u5Color = utilColorClass(row.utilization5h);
   const u7Color = utilColorClass(row.utilization7d);
+  const sColor = utilColorClass(row.utilization7dSonnet);
+  const oColor = utilColorClass(row.utilization7dOpus);
   return (
     <div
       className={cn(
@@ -204,11 +206,29 @@ function PoolRow({ row }: { row: CcrotateAccountRow }) {
       <span className={cn("shrink-0 px-1.5 py-0.5 rounded text-[10px] font-semibold lowercase", tierColor)}>
         {row.tier}
       </span>
-      <span className={cn("font-mono shrink-0 w-12 text-right", u5Color)}>
+      <span
+        className={cn("font-mono shrink-0 w-12 text-right", u5Color)}
+        title="5-hour session window"
+      >
         {row.utilization5h === null ? "—" : `${row.utilization5h}%`}
       </span>
-      <span className={cn("font-mono shrink-0 w-12 text-right", u7Color)}>
+      <span
+        className={cn("font-mono shrink-0 w-12 text-right", u7Color)}
+        title="7-day window (all models)"
+      >
         {row.utilization7d === null ? "—" : `${row.utilization7d}%`}
+      </span>
+      <span
+        className={cn("font-mono shrink-0 w-12 text-right text-[10px]", sColor)}
+        title="7-day window (Sonnet only)"
+      >
+        {row.utilization7dSonnet === null ? "—" : `s${row.utilization7dSonnet}%`}
+      </span>
+      <span
+        className={cn("font-mono shrink-0 w-12 text-right text-[10px]", oColor)}
+        title="7-day window (Opus only)"
+      >
+        {row.utilization7dOpus === null ? "—" : `o${row.utilization7dOpus}%`}
       </span>
       <span className="text-muted-foreground shrink-0 w-24 text-right truncate">
         {row.availability}

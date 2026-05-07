@@ -75,6 +75,8 @@ function runProcess(
 
 const CACHE_AGE_RE = /^Cache:\s*(.+)$/;
 const UTIL_RE = /5h:(\d+)% 7d:(\d+)%/;
+const SONNET_7D_RE = /\bs7d:(\d+)%/;
+const OPUS_7D_RE = /\bo7d:(\d+)%/;
 // ccrotate ≥ the glyph-column patch emits one of these between health (✓/✗)
 // and the email column. Older ccrotate omits it; both forms parse here.
 const AVAIL_GLYPH_RE = /^[🟢🟡🔴🔵⏳❔]/u;
@@ -85,7 +87,7 @@ function parseWhenRow(line: string): {
   availMark: string | null;
   email: string;
   tier: string;
-  util: { u5: number; u7: number } | null;
+  util: { u5: number; u7: number; s7d: number | null; o7d: number | null } | null;
   availability: string;
 } | null {
   const trimmed = line.trimStart();
@@ -111,11 +113,23 @@ function parseWhenRow(line: string): {
   const tier = tailTokens[0]!;
   const tierEnd = tail.indexOf(tier) + tier.length;
   let postTier = tail.slice(tierEnd).trim();
-  let util: { u5: number; u7: number } | null = null;
+  let util: { u5: number; u7: number; s7d: number | null; o7d: number | null } | null = null;
   const um = UTIL_RE.exec(postTier);
   if (um) {
-    util = { u5: Number(um[1]), u7: Number(um[2]) };
-    postTier = postTier.replace(UTIL_RE, "").trim();
+    const sm = SONNET_7D_RE.exec(postTier);
+    const om = OPUS_7D_RE.exec(postTier);
+    util = {
+      u5: Number(um[1]),
+      u7: Number(um[2]),
+      s7d: sm ? Number(sm[1]) : null,
+      o7d: om ? Number(om[1]) : null,
+    };
+    postTier = postTier
+      .replace(UTIL_RE, "")
+      .replace(SONNET_7D_RE, "")
+      .replace(OPUS_7D_RE, "")
+      .replace(/\s+/g, " ")
+      .trim();
   }
   return {
     marker,
@@ -150,6 +164,8 @@ function parseWhenOutput(target: CcrotateTarget, stdout: string): {
       tier: parsed.tier,
       utilization5h: parsed.util?.u5 ?? null,
       utilization7d: parsed.util?.u7 ?? null,
+      utilization7dSonnet: parsed.util?.s7d ?? null,
+      utilization7dOpus: parsed.util?.o7d ?? null,
       availability: parsed.availability,
       isActive: parsed.marker === "★",
       isHealthy: parsed.health === "✓",

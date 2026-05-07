@@ -6,6 +6,8 @@ export interface AccountRow {
   tier: string;
   utilization5h: number | null;
   utilization7d: number | null;
+  utilization7dSonnet: number | null;
+  utilization7dOpus: number | null;
   availability: string;
   isActive: boolean;
   isHealthy: boolean;
