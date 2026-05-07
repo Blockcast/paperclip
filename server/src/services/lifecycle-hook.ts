@@ -4,7 +4,22 @@ import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { instanceSettingsService } from "./instance-settings.js";
 
-const HOOK_TIMEOUT_MS = 30_000;
+// preRun is awaited (blocks the agent run dispatch), so a slow hook delays
+// every run start — keep it tight at 30s. postRun is fire-and-forget (per
+// docstring below: "Post-run is fire-and-forget — it does not gate run
+// finalization"), so we can give it more headroom. ccrotate refresh-one
+// (the canonical postRun command) regularly takes 30-60s when the active
+// account's tier-cache needs re-probing or when an account hits a 5h reset
+// boundary mid-call. With a 30s timeout, postRun consistently shows as
+// `lifecycle hook failed timedOut=true` and the run record carries that
+// failure instead of the SDK's success state, making operator triage harder.
+//
+// Production evidence (2026-05-07 post-deploy): every claude_k8s postRun in
+// the 30 min after deploy was timing out at exactly 30041–30064ms — the 30s
+// ceiling, not the actual operation duration. Bumping postRun to 90s lets
+// these complete cleanly without affecting preRun's tight dispatch budget.
+const PRE_RUN_TIMEOUT_MS = 30_000;
+const POST_RUN_TIMEOUT_MS = 90_000;
 const MAX_OUTPUT_BYTES = 16 * 1024;
 
 /**
@@ -34,7 +49,11 @@ interface RunResult {
   error?: string;
 }
 
-function runCommand(command: string, env: Record<string, string>): Promise<RunResult> {
+function runCommand(
+  command: string,
+  env: Record<string, string>,
+  timeoutMs: number,
+): Promise<RunResult> {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     let stdout = "";
@@ -64,7 +83,7 @@ function runCommand(command: string, env: Record<string, string>): Promise<RunRe
           // Process group already exited.
         }
       }
-    }, HOOK_TIMEOUT_MS);
+    }, timeoutMs);
 
     child.stdout?.on("data", (chunk: Buffer) => {
       if (stdoutBytes >= MAX_OUTPUT_BYTES) return;
@@ -146,7 +165,8 @@ export async function runLifecycleHook(
     env.PAPERCLIP_HOOK_EXIT_CODE = String(input.exitCode);
   }
 
-  const result = await runCommand(command, env);
+  const timeoutMs = input.kind === "preRun" ? PRE_RUN_TIMEOUT_MS : POST_RUN_TIMEOUT_MS;
+  const result = await runCommand(command, env, timeoutMs);
 
   logger.info(
     {
