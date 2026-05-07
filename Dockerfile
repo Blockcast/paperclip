@@ -49,7 +49,7 @@ WORKDIR /vendor
 # Each repo's build → `pnpm pack` (or `npm pack`) produces the .tgz the
 # production stage installs. We never commit the tgz; it's reproduced on
 # every image build.
-ARG CCROTATE_REF=8b44506ecee4d479ba238370b61c7d23e8e3eba5
+ARG CCROTATE_REF=e99fa1be5d043add3885ffbacee2bdbccd7d8034
 ARG CLAUDE_K8S_REF=ab6930171693c9a561e9032b8997eefe40150b5b
 ARG OPENCODE_K8S_REF=085c4a7d190e2d8fb33181d4ee46c4edfc10f484
 
