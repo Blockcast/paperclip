@@ -106,6 +106,21 @@ env:
         secretKeyRef:
           name: paperclip-github-mcp-token
           key: token
+    # HMAC verification key for the /api/webhooks/github route added in
+    # paperclip#118 Phase D. The route reads appConfig.githubWebhookSecret
+    # at startup and refuses every request (503) when it is unset, so the
+    # env must be live in the pod before any GitHub webhook is registered
+    # against the Blockcast repos. The same secret value is configured on
+    # the GitHub-side webhook config as the X-Hub-Signature-256 signing
+    # key. Rotate by updating both the k8s Secret and the GitHub webhook
+    # config in lockstep. Secret pre-created out of band:
+    #   kubectl -n paperclip create secret generic paperclip-github-webhook-secret \
+    #     --from-literal=secret=<openssl rand -hex 32>
+    - name: GITHUB_WEBHOOK_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: paperclip-github-webhook-secret
+          key: secret
     # V8 default heap ceiling is ~2.18 GiB regardless of cgroup limits, so a
     # Node process inside a 4 GiB container hits the heap ceiling well before
     # the cgroup OOM and spends CPU on Scavenger/ConcurrentMarking/Sweeper
