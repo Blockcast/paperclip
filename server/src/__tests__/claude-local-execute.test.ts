@@ -802,6 +802,77 @@ describe("claude execute", () => {
     }
   });
 
+  it("treats subtype=success + is_error=false as success even when CLI exits non-zero", async () => {
+    // Real-world heartbeat-runs from CTO showed status=failed with errorCode=adapter_failed
+    // and the error field literally containing the agent's successful summary text. Trace:
+    // CLI emitted {type:"result", subtype:"success", is_error:false, result:"<summary>"}
+    // and then exited 1 anyway (post-completion cleanup hiccup / stderr noise). The adapter
+    // trusted the exit code and re-queued already-completed work. Trust the SDK's success
+    // signal instead.
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-success-exit1-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFailingClaudeCommand(commandPath, {
+      resultEvent: {
+        type: "result",
+        subtype: "success",
+        session_id: "claude-session-success-exit1",
+        is_error: false,
+        result: "Wave-3 closed: BLO-3850, BLO-3845. All same umbrella pattern.",
+        total_cost_usd: 1.07,
+        usage: { input_tokens: 35, cache_read_input_tokens: 882717, output_tokens: 6275 },
+      },
+      exitCode: 1,
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const result = await execute({
+        runId: "run-claude-success-exit1",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      // CLI's exit code is preserved on the result envelope (it really did exit 1)…
+      expect(result.exitCode).toBe(1);
+      // …but the run is NOT classified as adapter_failed: the SDK explicitly said
+      // subtype=success + is_error=false, so the agent's work landed.
+      expect(result.errorMessage).toBeNull();
+      expect(result.errorCode).toBeNull();
+      expect(result.errorFamily).toBeNull();
+      // Summary is preserved — downstream consumers (continuation logic, audit
+      // trail, billing) see the actual completion text, not "Claude run failed:
+      // subtype=success: <summary>".
+      expect(result.summary).toContain("Wave-3 closed");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("classifies rate-limit / overloaded failures without reset metadata as transient", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-rate-limit-"));
     const workspace = path.join(root, "workspace");

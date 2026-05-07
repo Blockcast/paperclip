@@ -776,7 +776,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const clearSessionForMaxTurns = isClaudeMaxTurnsResult(parsed);
     const resolvedSummary = parsedStream.summary || asString(parsed.result, "");
     const parsedIsError = asBoolean(parsed.is_error, false);
-    const failed = (proc.exitCode ?? 0) !== 0 || parsedIsError;
+    // Trust the SDK's explicit success signal over the CLI's exit code. The
+    // Claude CLI sometimes exits non-zero even after emitting
+    // `{type:"result", subtype:"success", is_error:false}` (e.g. post-completion
+    // cleanup hiccups, stderr writes from background tasks). Treating those as
+    // failures re-queues already-completed agent work and burns budget — and
+    // the resulting "Claude run failed: subtype=success: <summary>" message is
+    // self-contradicting on its face.
+    //
+    // When `is_error` is true (the SDK's actual failure flag) we still mark
+    // failed regardless of subtype — that's the quota / rate-limit path and
+    // must continue to short-circuit. The downstream silent-failure detector
+    // (isClaudeSilentFailure below) still runs on this path and catches the
+    // "claimed success but did nothing real" subset.
+    const claudeReportedSuccess =
+      asString(parsed.subtype, "") === "success" && !parsedIsError;
+    const failed =
+      parsedIsError || ((proc.exitCode ?? 0) !== 0 && !claudeReportedSuccess);
     const errorMessage = failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : null;
