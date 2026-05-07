@@ -857,10 +857,18 @@ export function pluginLoader(
         // --ignore-scripts prevents preinstall/install/postinstall hooks from
         // executing arbitrary code on the host before manifest validation.
         // --cache uses a writable temp dir to avoid EPERM on root-owned ~/.npm cache.
+        // --legacy-peer-deps absorbs ERESOLVE failures from third-party plugin
+        // packages whose `@paperclipai/plugin-sdk` peer ranges don't reconcile
+        // (e.g. `@lucitra/paperclip-plugin-secrets@>=1.0.0` vs
+        // `@lucitra/paperclip-plugin-chat`'s pinned canary). Plugin manifests
+        // are validated separately downstream, so a "potentially broken"
+        // peer-dep tree at install time is bounded — we'd reject a bad
+        // manifest before loading it, rather than letting npm refuse to
+        // install at all.
         const npmCacheDir = path.join(os.tmpdir(), "paperclip-npm-cache");
         await execFileAsync(
           "npm",
-          ["install", spec, "--prefix", targetInstallDir, "--save", "--ignore-scripts", "--cache", npmCacheDir],
+          ["install", spec, "--prefix", targetInstallDir, "--save", "--ignore-scripts", "--legacy-peer-deps", "--cache", npmCacheDir],
           { timeout: 120_000 }, // 2 minute timeout for npm install
         );
       } catch (err) {
