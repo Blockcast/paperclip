@@ -512,6 +512,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     livenessState?: "completed" | "advanced" | "plan_only" | "empty_response" | "blocked" | "failed" | "needs_followup" | null;
     runErrorCode?: string | null;
     runError?: string | null;
+    resultJson?: Record<string, unknown> | null;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -584,6 +585,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ? null
         : ("runError" in input ? input.runError : "run failed before issue advanced"),
       livenessState: input.livenessState ?? null,
+      resultJson: input.resultJson ?? null,
     });
 
     await db.insert(issues).values([
@@ -2674,6 +2676,52 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("consecutive succeeded heartbeat runs producing no actionable output");
     expect(comments[0]?.body).toContain("No response requested.");
     expect(comments[0]?.body).toContain("`blocked`");
+  });
+
+  it("escalates when liveness reads `advanced` but the run summary admits no change (BLO-3182 RCA #2)", async () => {
+    // 2026-05-06 RCA: UXDesigner waking on heartbeat-timer for BLO-3182
+    // had livenessState=advanced ("Run produced concrete action evidence:
+    // 1 activity event(s)") because the agent fetched the inbox or read
+    // a comment, but the run's own resultJson.summary said "No change.
+    // Exiting." The pre-RCA streak counter trusted liveness as the
+    // oracle, so the streak never accumulated and the no-op loop
+    // escalation never fired. Override: explicit no-op summaries count
+    // as non-productive even when liveness disagrees.
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      retryReason: "issue_continuation_needed",
+      livenessState: "advanced",
+      resultJson: { summary: "No change. Exiting.", result: "No change. Exiting." },
+    });
+    const baseTs = new Date("2026-03-19T00:05:00.000Z");
+    for (let i = 0; i < 4; i++) {
+      const ts = new Date(baseTs.getTime() + (i + 1) * 60_000);
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "succeeded",
+        contextSnapshot: { issueId, taskId: issueId },
+        startedAt: ts,
+        finishedAt: ts,
+        createdAt: ts,
+        updatedAt: ts,
+        livenessState: "advanced",
+        resultJson: { summary: "No change. Exiting.", result: "No change. Exiting." },
+      });
+    }
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
   });
 
   it("does NOT escalate when one productive run breaks the non-productive streak", async () => {

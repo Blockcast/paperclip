@@ -49,6 +49,22 @@ export interface LinearAuthConfig {
   triggerPluginJob?: (jobKey: "initial-import" | "periodic-sync") => Promise<
     { runId: string; jobId: string } | null
   >;
+  /**
+   * Called when a Linear comment is bridged into a paperclip issue. Should
+   * enqueue an agent wakeup on the issue's assignee so the assignee
+   * actually picks up the comment instead of letting it sit silently
+   * in the issue thread until the next heartbeat-timer tick (or, in the
+   * BLO-3182 pattern, never). Optional only because the legacy test
+   * setup constructs LinearAuthConfig without paperclip server context;
+   * production wiring in app.ts always supplies it.
+   */
+  wakeIssueAssigneeOnComment?: (input: {
+    companyId: string;
+    issueId: string;
+    commentId: string;
+    linearCommentBody: string;
+    linearCommentAuthor: string | null;
+  }) => Promise<void>;
 }
 
 export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
@@ -1636,11 +1652,12 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
           const { issueComments } = await import("@paperclipai/db");
 
           if (companyId) {
-            await db.insert(issueComments).values({
+            const insertedComments = await db.insert(issueComments).values({
               issueId: paperclipIssueId,
               companyId,
               body: `**${userName || "Linear user"}** (from Linear):\n\n${commentBody}`,
-            });
+            }).returning({ id: issueComments.id });
+            const insertedCommentId = insertedComments[0]?.id ?? null;
 
             const commentDetails = {
               source: "linear",
@@ -1671,6 +1688,34 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
                 details: commentDetails,
               },
             });
+
+            // 2026-05-06 BLO-3182 RCA: previously, Linear comments were
+            // bridged into paperclip's comment table but no wake was
+            // fired -- the operator had to hope the agent's next 5-min
+            // heartbeat-timer tick (a) noticed the new comment in its
+            // inbox-fetch and (b) didn't classify the wake as a
+            // "no change" exit. In the BLO-3182 case neither held.
+            // Drive an explicit wake on the assignee with
+            // wakeReason=linear_comment + the comment id so the run
+            // context carries the trigger, matching what
+            // /api/issues/:id/comments does for paperclip-native
+            // comments.
+            if (config.wakeIssueAssigneeOnComment && insertedCommentId && action === "create") {
+              try {
+                await config.wakeIssueAssigneeOnComment({
+                  companyId,
+                  issueId: paperclipIssueId,
+                  commentId: insertedCommentId,
+                  linearCommentBody: commentBody,
+                  linearCommentAuthor: userName ?? null,
+                });
+              } catch (err) {
+                console.error(
+                  `[linear-webhook] wakeIssueAssigneeOnComment failed for ${issueIdentifier}:`,
+                  err instanceof Error ? err.message : String(err),
+                );
+              }
+            }
 
             console.log(`[linear-webhook] comment bridged to ${issueIdentifier}`);
           }

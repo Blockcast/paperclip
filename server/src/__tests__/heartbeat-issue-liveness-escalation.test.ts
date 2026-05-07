@@ -117,7 +117,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     });
   }
 
-  async function seedBlockedChain(opts: { outsideLookback?: boolean } = {}) {
+  async function seedBlockedChain(opts: { notYetStale?: boolean } = {}) {
     const companyId = randomUUID();
     const managerId = randomUUID();
     const coderId = randomUUID();
@@ -158,9 +158,13 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       },
     ]);
 
-    const issueTimestamp = opts.outsideLookback === true
-      ? new Date(Date.now() - 25 * 60 * 60 * 1000)
-      : new Date(Date.now() - 60 * 60 * 1000);
+    // Post-2026-05-06 RCA the gate is INVERTED: findings escalate when
+    // the recoveryIssue has been silently quiet for at least the
+    // staleness threshold. `notYetStale: true` means "just touched --
+    // operator may still be acting", which the gate skips.
+    const issueTimestamp = opts.notYetStale === true
+      ? new Date(Date.now() - 60 * 60 * 1000)
+      : new Date(Date.now() - 25 * 60 * 60 * 1000);
     await db.insert(issues).values([
       {
         id: blockedIssueId,
@@ -173,6 +177,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         identifier: `${issuePrefix}-1`,
         createdAt: issueTimestamp,
         updatedAt: issueTimestamp,
+        lastActivityAt: issueTimestamp,
       },
       {
         id: blockerIssueId,
@@ -184,6 +189,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         identifier: `${issuePrefix}-2`,
         createdAt: issueTimestamp,
         updatedAt: issueTimestamp,
+        lastActivityAt: issueTimestamp,
       },
     ]);
 
@@ -218,15 +224,20 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(escalations).toHaveLength(0);
   });
 
-  it("does not create recovery issues outside the configured lookback window", async () => {
+  it("does not escalate findings whose recovery issue was just touched (within the staleness threshold)", async () => {
+    // Post-2026-05-06 RCA: the gate flipped from "must be touched within
+    // lookback" to "must be silently quiet for at least lookback hours".
+    // A recently-edited issue is presumed still under operator/agent
+    // attention -- escalating it would race with that work.
     await enableAutoRecovery();
-    const { companyId } = await seedBlockedChain({ outsideLookback: true });
+    const { companyId } = await seedBlockedChain({ notYetStale: true });
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileIssueGraphLiveness();
 
     expect(result.findings).toBe(1);
     expect(result.escalationsCreated).toBe(0);
+    // Field name preserved for back-compat with existing telemetry.
     expect(result.skippedOutsideLookback).toBe(1);
 
     const escalations = await db
@@ -358,6 +369,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         status: "in_review",
         assigneeAgentId: coderId,
         updatedAt: issueTimestamp,
+        lastActivityAt: issueTimestamp,
       })
       .where(eq(issues.id, blockerIssueId));
     await db.insert(budgetPolicies).values({
@@ -428,7 +440,8 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     const dependentExecutionWorkspaceId = randomUUID();
     const blockerExecutionWorkspaceId = randomUUID();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    const issueTimestamp = new Date(Date.now() - 60 * 60 * 1000);
+    // 25h ago — past the default 24h staleness threshold (post-2026-05-06 RCA gate inversion).
+    const issueTimestamp = new Date(Date.now() - 25 * 60 * 60 * 1000);
 
     await db.insert(companies).values({
       id: companyId,
@@ -515,6 +528,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         identifier: `${issuePrefix}-1`,
         createdAt: issueTimestamp,
         updatedAt: issueTimestamp,
+        lastActivityAt: issueTimestamp,
       },
       {
         id: blockerIssueId,
@@ -531,6 +545,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         identifier: `${issuePrefix}-2`,
         createdAt: issueTimestamp,
         updatedAt: issueTimestamp,
+        lastActivityAt: issueTimestamp,
       },
     ]);
     await db.insert(issueRelations).values({
@@ -563,7 +578,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     const { companyId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
     const secondBlockedIssueId = randomUUID();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    const issueTimestamp = new Date(Date.now() - 60 * 60 * 1000);
+    const issueTimestamp = new Date(Date.now() - 25 * 60 * 60 * 1000);
     await db.insert(issues).values({
       id: secondBlockedIssueId,
       companyId,
@@ -574,6 +589,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       identifier: `${issuePrefix}-3`,
       createdAt: issueTimestamp,
       updatedAt: issueTimestamp,
+      lastActivityAt: issueTimestamp,
     });
     await db.insert(issueRelations).values({
       companyId,
@@ -659,5 +675,140 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       .where(eq(issueRelations.relatedIssueId, blockedIssueId));
     expect(blockers.some((row) => row.blockerIssueId === closedEscalationId)).toBe(false);
     expect(blockers.some((row) => row.blockerIssueId === freshEscalation?.id)).toBe(true);
+  });
+
+  it("escalates an agent-assigned in_review issue once it crosses the staleness threshold (BLO-3182 RCA)", async () => {
+    // The smoking-gun scenario: an in_review issue with an agent
+    // assignee, no participant/interaction/approval/active-run/open-
+    // recovery waiting paths, last touched > staleness ago. Pre-RCA the
+    // gate was inverted and skipped these, so BLO-3182 sat in_review
+    // for 12+ hours with the recovery loop completing without fixing
+    // the parent.
+    await enableAutoRecovery();
+    await instanceSettingsService(db).updateExperimental({
+      issueGraphLivenessAutoRecoveryLookbackHours: 6,
+    });
+
+    const companyId = randomUUID();
+    const ownerId = randomUUID();
+    const assigneeId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const stuckSince = new Date(Date.now() - 7 * 60 * 60 * 1000);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: ownerId,
+        companyId,
+        name: "Manager",
+        role: "manager",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: false } },
+        permissions: {},
+      },
+      {
+        id: assigneeId,
+        companyId,
+        name: "Designer",
+        role: "designer",
+        status: "idle",
+        reportsTo: ownerId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: false } },
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Stuck in_review (BLO-3182 lookalike)",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: assigneeId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      createdAt: stuckSince,
+      updatedAt: stuckSince,
+      lastActivityAt: stuckSince,
+    });
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result.findings).toBe(1);
+    expect(result.escalationsCreated).toBe(1);
+    expect(result.skippedOutsideLookback).toBe(0);
+    const escalations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+    expect(escalations).toHaveLength(1);
+  });
+
+  it("escalates an UNASSIGNED in_review issue and routes recovery to the chain of command", async () => {
+    // The 9 PCL-* unassigned-at-86h batch on Blockcast prod (2026-05-06
+    // observation). Pre-RCA `reviewFinding` short-circuited on
+    // `!reviewIssue.assigneeAgentId`, leaving these issues parked
+    // indefinitely with no agent considering them theirs.
+    await enableAutoRecovery();
+    await instanceSettingsService(db).updateExperimental({
+      issueGraphLivenessAutoRecoveryLookbackHours: 6,
+    });
+
+    const companyId = randomUUID();
+    const rootAgentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const stuckSince = new Date(Date.now() - 86 * 60 * 60 * 1000);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: rootAgentId,
+      companyId,
+      name: "CEO",
+      role: "ceo",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: false } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Unassigned in_review (PCL-* lookalike)",
+      status: "in_review",
+      priority: "medium",
+      // No assigneeAgentId, no assigneeUserId.
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      createdAt: stuckSince,
+      updatedAt: stuckSince,
+      lastActivityAt: stuckSince,
+    });
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result.findings).toBe(1);
+    expect(result.escalationsCreated).toBe(1);
+    const escalations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]!.assigneeAgentId).toBe(rootAgentId);
   });
 });

@@ -23,6 +23,11 @@ export interface IssueLivenessIssueInput {
   createdByAgentId?: string | null;
   createdByUserId?: string | null;
   executionState?: Record<string, unknown> | null;
+  // Last meaningful change to the issue (status flip, comment, assignee
+  // change). Used by the auto-recovery sweep to gate "is this stale enough
+  // to escalate?" — kept distinct from the row's `updatedAt` so that
+  // frequent metadata-only writes don't reset the staleness clock.
+  lastActivityAt?: Date | null;
 }
 
 export interface IssueLivenessRelationInput {
@@ -407,18 +412,28 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       });
     }
 
-    if (!reviewIssue.assigneeAgentId || reviewIssue.assigneeUserId) return null;
+    // User-assigned reviews are operator territory -- escalation belongs
+    // upstream of paperclip's automation. Agent-assigned and unassigned
+    // both surface findings; routing fans out to the chain of command via
+    // ownerCandidates so unassigned issues don't sit silently forever.
+    if (reviewIssue.assigneeUserId) return null;
+
+    const reason = reviewIssue.assigneeAgentId
+      ? `${issueLabel(reviewIssue)} is in review with an agent assignee but no participant, interaction, approval, user owner, wake, active run, or recovery issue owning the next action.`
+      : `${issueLabel(reviewIssue)} is in review with no assignee and no participant, interaction, approval, user owner, wake, active run, or recovery issue owning the next action.`;
+    const recommendedAction = reviewIssue.assigneeAgentId
+      ? `Review ${issueLabel(reviewIssue)} and make the next action explicit: add a reviewer/interaction, return it to active work with a change request, mark it done if accepted, or open a bounded recovery issue.`
+      : `Assign ${issueLabel(reviewIssue)} to a clear owner from the project / chain-of-command, or move it back to an active status with a change request.`;
 
     return finding({
       issue: source,
       state: "in_review_without_action_path",
-      reason: `${issueLabel(reviewIssue)} is in review with an agent assignee but no participant, interaction, approval, user owner, wake, active run, or recovery issue owning the next action.`,
+      reason,
       dependencyPath,
       recoveryIssue: reviewIssue,
       recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
       recommendedOwnerCandidates: ownerCandidates,
-      recommendedAction:
-        `Review ${issueLabel(reviewIssue)} and make the next action explicit: add a reviewer/interaction, return it to active work with a change request, mark it done if accepted, or open a bounded recovery issue.`,
+      recommendedAction,
       blockerIssueId: reviewIssue.id,
     });
   }

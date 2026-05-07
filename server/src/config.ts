@@ -110,6 +110,12 @@ export interface Config {
   linearOAuthClientId: string;
   linearOAuthClientSecret: string;
   linearOAuthRedirectUri: string;
+  // Shared secret configured on the GitHub webhook ("Secret" field in
+  // the repo / org / app webhook settings). Used to verify
+  // x-hub-signature-256 on POST /api/webhooks/github. When unset the
+  // route refuses every request -- accepting unsigned webhooks would
+  // let any caller drive paperclip wakes by impersonating GitHub.
+  githubWebhookSecret: string;
   telemetryEnabled: boolean;
 }
 
@@ -361,6 +367,7 @@ export function loadConfig(): Config {
     linearOAuthRedirectUri:
       process.env.PAPERCLIP_LINEAR_REDIRECT_URI ??
       `http://localhost:${Number(process.env.PORT) || fileConfig?.server.port || 3100}/api/auth/linear/callback`,
+    githubWebhookSecret: process.env.GITHUB_WEBHOOK_SECRET ?? "",
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };
 }

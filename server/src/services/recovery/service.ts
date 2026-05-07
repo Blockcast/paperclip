@@ -72,7 +72,7 @@ type RecoveryWakeup = (
 
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
-  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState"
+  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState" | "resultJson"
 > | null;
 
 type WatchdogDecisionActor =
@@ -290,11 +290,41 @@ function isSuccessfulInProgressContinuationRun(latestRun: LatestIssueRun) {
 }
 
 function isProductiveContinuationRun(latestRun: LatestIssueRun) {
-  return latestRun?.status === "succeeded" &&
-    (latestRun.livenessState === "advanced" ||
-      latestRun.livenessState === "completed" ||
-      latestRun.livenessState === "blocked" ||
-      latestRun.livenessState === "needs_followup");
+  if (latestRun?.status !== "succeeded") return false;
+  const livenessLooksProductive =
+    latestRun.livenessState === "advanced" ||
+    latestRun.livenessState === "completed" ||
+    latestRun.livenessState === "blocked" ||
+    latestRun.livenessState === "needs_followup";
+  if (!livenessLooksProductive) return false;
+  // 2026-05-06 BLO-3182 RCA: liveness can be fooled by trivial activity
+  // (one inbox-fetch tool call gets classified as "advanced") even when
+  // the agent's own result summary admits no work was done. Treat
+  // explicit no-op summaries as non-productive regardless of liveness.
+  return !runResultLooksLikeNoChangeExit(latestRun.resultJson);
+}
+
+const NO_CHANGE_EXIT_SUMMARY_PATTERNS = [
+  /^\s*no\s+change\b/i,
+  /^\s*same\s+sweep\s+wake\b/i,
+  /^\s*exiting\.?\s*$/i,
+  /^\s*nothing\s+to\s+do\b/i,
+  /^\s*no\s+new\s+context\b/i,
+  /^\s*no\s+actionable\b/i,
+  /\bno\s+response\s+requested\b/i,
+];
+
+function runResultLooksLikeNoChangeExit(resultJson: unknown) {
+  if (!resultJson || typeof resultJson !== "object") return false;
+  const raw = resultJson as Record<string, unknown>;
+  const summaryFields = [raw.summary, raw.result, raw.message];
+  for (const value of summaryFields) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed.length === 0) continue;
+    if (NO_CHANGE_EXIT_SUMMARY_PATTERNS.some((pattern) => pattern.test(trimmed))) return true;
+  }
+  return false;
 }
 
 // After this many consecutive succeeded-but-non-productive runs on the same
@@ -427,6 +457,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         errorCode: heartbeatRuns.errorCode,
         contextSnapshot: heartbeatRuns.contextSnapshot,
         livenessState: heartbeatRuns.livenessState,
+        resultJson: heartbeatRuns.resultJson,
       })
       .from(heartbeatRuns)
       .where(
@@ -455,6 +486,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .select({
         status: heartbeatRuns.status,
         livenessState: heartbeatRuns.livenessState,
+        resultJson: heartbeatRuns.resultJson,
       })
       .from(heartbeatRuns)
       .where(
@@ -468,12 +500,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     let count = 0;
     for (const run of recent) {
-      const looksProductive = run.status === "succeeded" &&
-        (run.livenessState === "advanced" ||
-          run.livenessState === "completed" ||
-          run.livenessState === "blocked" ||
-          run.livenessState === "needs_followup");
-      if (run.status !== "succeeded" || looksProductive) break;
+      if (run.status !== "succeeded") break;
+      const livenessLooksProductive =
+        run.livenessState === "advanced" ||
+        run.livenessState === "completed" ||
+        run.livenessState === "blocked" ||
+        run.livenessState === "needs_followup";
+      // 2026-05-06 BLO-3182 RCA: liveness was being marked `advanced` on
+      // wake-and-exit runs because the agent fetched the inbox or read
+      // a comment ("Run produced concrete action evidence: 1 activity
+      // event(s)"). The actual result body said "No change. Exiting."
+      // Override liveness as non-productive when the summary itself is
+      // explicit about it -- a trivial API call ≠ progress.
+      if (livenessLooksProductive && !runResultLooksLikeNoChangeExit(run.resultJson)) break;
       count += 1;
     }
     return count;
@@ -2162,6 +2201,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           createdByAgentId: issues.createdByAgentId,
           createdByUserId: issues.createdByUserId,
           executionState: issues.executionState,
+          lastActivityAt: issues.lastActivityAt,
         })
         .from(issues)
         .where(
@@ -2462,46 +2502,86 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return `${companyId}:${issueId}`;
   }
 
-  async function loadLivenessDependencyUpdatedAtByIssue(findings: IssueLivenessFinding[]) {
+  /**
+   * Load `lastActivityAt` for every recoveryIssue referenced by the
+   * findings (and, defensively, every dependency hop). Used by the
+   * staleness gate to decide which findings have been silently stuck
+   * long enough to escalate.
+   *
+   * Pre-2026-05-06 RCA this loaded `updatedAt` for dependencyPath entries
+   * only and the gate REQUIRED activity within the lookback window --
+   * which silently quarantined any finding whose recoveryIssue wasn't
+   * also a dependency, and any finding whose entire chain went quiet for
+   * longer than 24h. We now key off the recoveryIssue itself, with
+   * `lastActivityAt` (status flips, comments, assignment changes) as the
+   * primary clock so that pure-metadata writes don't reset staleness.
+   */
+  async function loadLivenessRecoveryIssueLastActivityByKey(findings: IssueLivenessFinding[]) {
     const issueIds = [
       ...new Set(
-        findings.flatMap((finding) => finding.dependencyPath.map((entry) => entry.issueId)),
+        findings.flatMap((finding) => [
+          finding.recoveryIssueId,
+          ...finding.dependencyPath.map((entry) => entry.issueId),
+        ]),
       ),
     ];
     if (issueIds.length === 0) return new Map<string, Date>();
     const rows = await db
-      .select({ id: issues.id, companyId: issues.companyId, updatedAt: issues.updatedAt })
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        lastActivityAt: issues.lastActivityAt,
+        updatedAt: issues.updatedAt,
+      })
       .from(issues)
       .where(inArray(issues.id, issueIds));
     return new Map(rows.map((row) => [
       livenessDependencyIssueKey(row.companyId, row.id),
-      row.updatedAt,
+      row.lastActivityAt ?? row.updatedAt,
     ]));
   }
 
-  function latestDependencyUpdatedAtForLivenessFinding(
+  function recoveryIssueLastActivityForFinding(
     finding: IssueLivenessFinding,
-    updatedAtByIssueKey: Map<string, Date>,
+    activityByIssueKey: Map<string, Date>,
   ) {
+    const directKey = livenessDependencyIssueKey(finding.companyId, finding.recoveryIssueId);
+    const directHit = activityByIssueKey.get(directKey);
+    if (directHit) return directHit;
+    // Fallback: walk dependency hops and take the OLDEST observed
+    // activity. The gate logic below escalates when this is older than
+    // the staleness threshold; using the oldest dep ensures we don't
+    // refuse to escalate just because some dep upstream got touched
+    // recently.
     const dependencyIssueIds = [...new Set(finding.dependencyPath.map((entry) => entry.issueId))];
     if (dependencyIssueIds.length === 0) return null;
-    const timestamps = dependencyIssueIds.map((issueId) =>
-      updatedAtByIssueKey.get(livenessDependencyIssueKey(finding.companyId, issueId)) ?? null
-    );
-    if (timestamps.some((timestamp) => !timestamp)) return null;
-    const [firstTimestamp, ...remainingTimestamps] = timestamps as Date[];
-    return remainingTimestamps.reduce((latest, updatedAt) =>
-      updatedAt > latest ? updatedAt : latest,
-    firstTimestamp!);
+    const timestamps = dependencyIssueIds
+      .map((issueId) => activityByIssueKey.get(livenessDependencyIssueKey(finding.companyId, issueId)))
+      .filter((timestamp): timestamp is Date => Boolean(timestamp));
+    if (timestamps.length === 0) return null;
+    return timestamps.reduce((oldest, current) => (current < oldest ? current : oldest), timestamps[0]!);
   }
 
-  function isLivenessFindingInsideAutoRecoveryLookback(
+  /**
+   * Inverted from the original "is the finding's dependency activity
+   * within the lookback window?" gate. The recoveryIssue must be STALE
+   * for at least `staleThresholdMs` to qualify for auto-recovery --
+   * recently-touched issues aren't yet stuck (operator may still be
+   * acting on them), and the longer-since-touched the finding is, the
+   * more it deserves escalation.
+   */
+  function isLivenessFindingStaleEnoughForEscalation(
     finding: IssueLivenessFinding,
-    cutoff: Date,
-    updatedAtByIssueKey: Map<string, Date>,
+    staleAt: Date,
+    activityByIssueKey: Map<string, Date>,
   ) {
-    const latestUpdatedAt = latestDependencyUpdatedAtForLivenessFinding(finding, updatedAtByIssueKey);
-    return Boolean(latestUpdatedAt && latestUpdatedAt >= cutoff);
+    const lastActivityAt = recoveryIssueLastActivityForFinding(finding, activityByIssueKey);
+    // No activity record at all -> definitely stale (defensive: an issue
+    // missing from the activity map is either deleted or pre-dates the
+    // lastActivityAt column backfill; either way escalation is safe and
+    // the finding-suppression elsewhere will dedupe duplicates).
+    if (!lastActivityAt) return true;
+    return lastActivityAt <= staleAt;
   }
 
   async function buildIssueGraphLivenessAutoRecoveryPreview(
@@ -2509,9 +2589,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   ): Promise<IssueGraphLivenessAutoRecoveryPreview> {
     const now = opts?.now ?? new Date();
     const lookbackHours = normalizeIssueGraphLivenessAutoRecoveryLookbackHours(opts?.lookbackHours);
-    const cutoff = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
+    // `lookbackHours` is now a min-staleness threshold (post-2026-05-06
+    // RCA gate inversion). A finding is escalation-eligible when its
+    // recoveryIssue hasn't seen meaningful activity since this cutoff.
+    const staleAt = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
     const findings = await collectIssueGraphLivenessFindings();
-    const updatedAtByIssueKey = await loadLivenessDependencyUpdatedAtByIssue(findings);
+    const activityByIssueKey = await loadLivenessRecoveryIssueLastActivityByKey(findings);
     const issueIds = [...new Set(findings.map((finding) => finding.recoveryIssueId))];
     const recoveryRows = issueIds.length > 0
       ? await db
@@ -2521,15 +2604,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       : [];
     const recoveryById = new Map(recoveryRows.map((row) => [row.id, row]));
     const items: IssueGraphLivenessAutoRecoveryPreviewItem[] = [];
-    let skippedOutsideLookback = 0;
+    let skippedNotYetStale = 0;
 
     for (const finding of findings) {
-      const latestDependencyUpdatedAt = latestDependencyUpdatedAtForLivenessFinding(
-        finding,
-        updatedAtByIssueKey,
-      );
-      if (!latestDependencyUpdatedAt || latestDependencyUpdatedAt < cutoff) {
-        skippedOutsideLookback += 1;
+      const lastActivityAt = recoveryIssueLastActivityForFinding(finding, activityByIssueKey);
+      if (!isLivenessFindingStaleEnoughForEscalation(finding, staleAt, activityByIssueKey)) {
+        skippedNotYetStale += 1;
         continue;
       }
       const recoveryIssue = recoveryById.get(finding.recoveryIssueId);
@@ -2545,18 +2625,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         recoveryTitle: recoveryIssue?.title ?? null,
         recommendedOwnerAgentId: finding.recommendedOwnerAgentId,
         incidentKey: finding.incidentKey,
-        latestDependencyUpdatedAt: latestDependencyUpdatedAt.toISOString(),
+        latestDependencyUpdatedAt: lastActivityAt?.toISOString() ?? null,
         dependencyPath: finding.dependencyPath,
       });
     }
 
     return {
       lookbackHours,
-      cutoff: cutoff.toISOString(),
+      cutoff: staleAt.toISOString(),
       generatedAt: now.toISOString(),
       findings: findings.length,
       recoverableFindings: items.length,
-      skippedOutsideLookback,
+      skippedOutsideLookback: skippedNotYetStale,
       items,
     };
   }
@@ -2836,14 +2916,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       opts?.lookbackHours ?? experimentalSettings.issueGraphLivenessAutoRecoveryLookbackHours,
     );
     const now = new Date();
-    const cutoff = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
+    // `lookbackHours` is now a min-staleness threshold (post-2026-05-06
+    // RCA gate inversion). Escalate when an issue has been silently quiet
+    // for at least this long.
+    const staleAt = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
     const obsoleteRecoveryCleanup = await retireObsoleteLivenessRecoveryIssues(findings);
-    const updatedAtByIssueKey = await loadLivenessDependencyUpdatedAtByIssue(findings);
+    const activityByIssueKey = await loadLivenessRecoveryIssueLastActivityByKey(findings);
     const result = {
       findings: findings.length,
       autoRecoveryEnabled,
       lookbackHours,
-      cutoff: cutoff.toISOString(),
+      cutoff: staleAt.toISOString(),
       escalationsCreated: 0,
       existingEscalations: 0,
       skipped: 0,
@@ -2863,7 +2946,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     for (const finding of findings) {
-      if (!isLivenessFindingInsideAutoRecoveryLookback(finding, cutoff, updatedAtByIssueKey)) {
+      if (!isLivenessFindingStaleEnoughForEscalation(finding, staleAt, activityByIssueKey)) {
+        // Field name preserved for back-compat with existing telemetry/dashboards.
         result.skippedOutsideLookback += 1;
         result.skipped += 1;
         continue;

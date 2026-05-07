@@ -2,7 +2,7 @@ import express, { Router, type Request as ExpressRequest } from "express";
 import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
-import { plugins, type Db } from "@paperclipai/db";
+import { issues, plugins, type Db } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
 import type { StorageService } from "./storage/types.js";
@@ -40,6 +40,7 @@ import { llmRoutes } from "./routes/llms.js";
 import { ccrotateRoutes } from "./routes/ccrotate.js";
 import { authRoutes } from "./routes/auth.js";
 import { linearAuthRoutes } from "./routes/linear-auth.js";
+import { githubWebhookRoutes } from "./routes/github-webhook.js";
 import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { workspaceScanRoutes } from "./routes/workspace-scan.js";
@@ -433,11 +434,61 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
       redirectUri: appConfig.linearOAuthRedirectUri,
       secretsProvider: appConfig.secretsProvider,
       triggerPluginJob: triggerLinearPluginJob,
+      // 2026-05-06 BLO-3182 RCA: Linear comments must drive a wake on
+      // the issue's assignee, not just sit silently in the comment
+      // thread. We construct heartbeatService lazily so the existing
+      // route signature stays clean. enqueueWakeup is no-op-safe when
+      // the assignee is missing or paused.
+      wakeIssueAssigneeOnComment: async (input) => {
+        const [issueRow] = await db
+          .select({ assigneeAgentId: issues.assigneeAgentId })
+          .from(issues)
+          .where(eq(issues.id, input.issueId))
+          .limit(1);
+        if (!issueRow?.assigneeAgentId) return;
+        const { heartbeatService } = await import("./services/heartbeat.js");
+        const heartbeat = heartbeatService(db, { pluginWorkerManager: workerManager });
+        await heartbeat.wakeup(issueRow.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "linear_comment",
+          payload: {
+            issueId: input.issueId,
+            commentId: input.commentId,
+            source: "linear",
+          },
+          contextSnapshot: {
+            issueId: input.issueId,
+            taskId: input.issueId,
+            commentId: input.commentId,
+            wakeReason: "issue_commented",
+            wakeSource: "automation",
+            wakeTriggerDetail: "system",
+            commentSource: "linear",
+            commentAuthor: input.linearCommentAuthor,
+          },
+        });
+      },
     }),
   );
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
   }
+
+  // 2026-05-06 BLO-3182 RCA Phase D: GitHub webhook receiver. CI is the
+  // priority external trigger ("particularly CI job completion since
+  // that takes a long time" per operator) -- a 13-min round-trip
+  // (8min CI + 5min heartbeat tick) just to react to a failure was
+  // the operator-facing pain. The route is HMAC-verified against
+  // GITHUB_WEBHOOK_SECRET and refuses every request when the secret
+  // isn't configured.
+  app.use(
+    "/api/webhooks/github",
+    githubWebhookRoutes(db, {
+      webhookSecret: appConfig.githubWebhookSecret || null,
+      pluginWorkerManager: workerManager,
+    }),
+  );
 
   const hostServiceCleanup = createPluginHostServiceCleanup(lifecycle, hostServicesDisposers);
   let viteHtmlRenderer: ReturnType<typeof createCachedViteHtmlRenderer> | null = null;
