@@ -112,6 +112,7 @@ import {
 } from "./execution-workspace-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
+import { captureQuotaBurnIntoCcrotateTierCache } from "./ccrotate-quota-writeback.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
 import {
   createCcrotateTierGate,
@@ -4376,7 +4377,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function finalizeAgentStatus(
     agentId: string,
     outcome: "succeeded" | "failed" | "cancelled" | "timed_out",
-    opts?: { errorCode?: string | null },
+    opts?: { errorCode?: string | null; retryNotBefore?: Date | null },
   ) {
     const existing = await getAgent(agentId);
     if (!existing) return;
@@ -4444,6 +4445,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (recoverable) {
       const hookAgentId = existing.id;
       const hookCompanyId = existing.companyId;
+      // Best-effort: write the burn into ccrotate's shared tier-cache so
+      // subsequent `ccrotate next` skips this account before refresh probes
+      // can update it (Anthropic's per-org Usage API throttles after a 429,
+      // leaving ccrotate's own probe blind for minutes). The hook below
+      // separately drives re-login; this writeback closes the rotation
+      // candidate-scoring gap that caused the 2026-05-08 retry storm.
+      void captureQuotaBurnIntoCcrotateTierCache({
+        adapterType: existing.adapterType,
+        retryNotBefore: opts?.retryNotBefore ?? null,
+        log: logger,
+      }).catch((err) => {
+        logger.warn(
+          { err, agentId: hookAgentId },
+          "ccrotate tier-cache writeback failed",
+        );
+      });
       void runQuotaExhaustedHook({
         db,
         agentId: hookAgentId,
@@ -6379,8 +6396,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // deploy: 5+ rate_limit_exhausted runs persisted on heartbeat_runs but
       // 0 quota-exhausted-hook activity_log entries, because the hook gate
       // was reading `adapterResult.errorCode` which was never `rate_limit_exhausted`.
+      const adapterRetryNotBefore = adapterResult.retryNotBefore
+        ? new Date(adapterResult.retryNotBefore)
+        : null;
       await finalizeAgentStatus(agent.id, outcome, {
         errorCode: runErrorCode,
+        retryNotBefore:
+          adapterRetryNotBefore && !Number.isNaN(adapterRetryNotBefore.getTime())
+            ? adapterRetryNotBefore
+            : null,
       });
     } catch (err) {
       const message = redactCurrentUserText(
