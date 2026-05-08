@@ -533,6 +533,115 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     });
   });
 
+  it("rebinds checkout ownership when the same assignee agent resumes on a new run id", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const previousRunId = randomUUID();
+    const resumedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      {
+        id: previousRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "assignment",
+        contextSnapshot: { issueId },
+      },
+      {
+        id: resumedRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "assignment",
+        contextSnapshot: { issueId },
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Checked out issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: previousRunId,
+      executionRunId: previousRunId,
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    await expect(
+      services.issues.assertCheckoutOwner({
+        issueId,
+        companyId,
+        actorAgentId: agentId,
+        actorRunId: resumedRunId,
+      }),
+    ).resolves.toMatchObject({
+      issueId,
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      checkoutRunId: resumedRunId,
+      adoptedFromRunId: previousRunId,
+    });
+  });
+
+  it("keeps cross-agent ownership conflicts guarded by 409", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "Other Engineer",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const issueId = randomUUID();
+    const ownerRunId = randomUUID();
+    const otherRunId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      {
+        id: ownerRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "assignment",
+        contextSnapshot: { issueId },
+      },
+      {
+        id: otherRunId,
+        companyId,
+        agentId: otherAgentId,
+        status: "running",
+        invocationSource: "assignment",
+        contextSnapshot: { issueId },
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Checked out issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: ownerRunId,
+      executionRunId: ownerRunId,
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    await expect(
+      services.issues.assertCheckoutOwner({
+        issueId,
+        companyId,
+        actorAgentId: otherAgentId,
+        actorRunId: otherRunId,
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+  });
+
   it("refuses plugin wakeups for issues with unresolved blockers", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const blockerIssueId = randomUUID();

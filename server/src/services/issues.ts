@@ -2144,6 +2144,41 @@ export function issueService(db: Db) {
     return adopted;
   }
 
+  async function rebindCheckoutRunForAssignee(input: {
+    issueId: string;
+    actorAgentId: string;
+    actorRunId: string;
+    expectedCheckoutRunId: string;
+  }) {
+    const now = new Date();
+    const rebound = await db
+      .update(issues)
+      .set({
+        checkoutRunId: input.actorRunId,
+        executionRunId: input.actorRunId,
+        executionLockedAt: now,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(issues.id, input.issueId),
+          eq(issues.status, "in_progress"),
+          eq(issues.assigneeAgentId, input.actorAgentId),
+          eq(issues.checkoutRunId, input.expectedCheckoutRunId),
+        ),
+      )
+      .returning({
+        id: issues.id,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .then((rows) => rows[0] ?? null);
+
+    return rebound;
+  }
+
   async function adoptUnownedCheckoutRun(input: {
     issueId: string;
     actorAgentId: string;
@@ -3491,6 +3526,19 @@ export function issueService(db: Db) {
         current.checkoutRunId &&
         current.checkoutRunId !== checkoutRunId
       ) {
+        const rebound = await rebindCheckoutRunForAssignee({
+          issueId: id,
+          actorAgentId: agentId,
+          actorRunId: checkoutRunId,
+          expectedCheckoutRunId: current.checkoutRunId,
+        });
+        if (rebound) {
+          const row = await db.select().from(issues).where(eq(issues.id, id)).then((rows) => rows[0] ?? null);
+          if (!row) throw notFound("Issue not found");
+          const [enriched] = await withIssueLabels(db, [row]);
+          return enriched;
+        }
+
         const adopted = await adoptStaleCheckoutRun({
           issueId: id,
           actorAgentId: agentId,
@@ -3578,6 +3626,20 @@ export function issueService(db: Db) {
         current.checkoutRunId &&
         current.checkoutRunId !== actorRunId
       ) {
+        const rebound = await rebindCheckoutRunForAssignee({
+          issueId: id,
+          actorAgentId,
+          actorRunId,
+          expectedCheckoutRunId: current.checkoutRunId,
+        });
+
+        if (rebound) {
+          return {
+            ...rebound,
+            adoptedFromRunId: current.checkoutRunId,
+          };
+        }
+
         const adopted = await adoptStaleCheckoutRun({
           issueId: id,
           actorAgentId,
