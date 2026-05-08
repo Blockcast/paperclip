@@ -7,9 +7,9 @@ import {
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
 
-const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?claude\s+login`?|login\s+required|requires\s+login)/i;
-const CLAUDE_GENERIC_AUTH_RE = /(?:unauthorized|authentication\s+required)/i;
-const CLAUDE_GENERIC_AUTH_CONTEXT_RE = /(?:claude|anthropic|oauth)/i;
+const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?claude\s+login`?|login\s+required|requires\s+login|failed\s+to\s+authenticate|invalid\s+authentication\s+credentials|invalid_auth|invalid_credential)/i;
+const CLAUDE_GENERIC_AUTH_RE = /(?:unauthorized|authentication\s+(?:required|failed))/i;
+const CLAUDE_GENERIC_AUTH_CONTEXT_RE = /(?:claude|anthropic|oauth|api\s+error)/i;
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
 
 const CLAUDE_TRANSIENT_UPSTREAM_RE =

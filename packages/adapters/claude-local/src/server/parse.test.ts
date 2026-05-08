@@ -121,6 +121,67 @@ describe("isClaudeTransientUpstreamError", () => {
   });
 });
 
+describe("detectClaudeLoginRequired", () => {
+  // Real-world failure mode 2026-05-08: claude CLI emits
+  //   {type:"result", subtype:"success", is_error:false,
+  //    result:"Failed to authenticate. API Error: 401 Invalid authentication credentials"}
+  // when the OAuth refresh failed during init. The original auth regex only
+  // matched the friendly "Not logged in · Please run /login" form and missed
+  // this 401-style result. Without classification as auth-required, the
+  // ccrotate-aware retry at execute.ts:898 never fires and the agent loops on
+  // a stale active account until manual intervention.
+  it("matches 'Failed to authenticate' API-error result text", () => {
+    const parsed = {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Failed to authenticate. API Error: 401 Invalid authentication credentials",
+    };
+    expect(
+      detectClaudeLoginRequired({ parsed, stdout: "", stderr: "" }).requiresLogin,
+    ).toBe(true);
+  });
+
+  it("matches the legacy 'Not logged in · Please run /login' form", () => {
+    const parsed = {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Not logged in · Please run /login",
+    };
+    expect(
+      detectClaudeLoginRequired({ parsed, stdout: "", stderr: "" }).requiresLogin,
+    ).toBe(true);
+  });
+
+  it("matches generic 'authentication failed' against Claude/Anthropic context", () => {
+    const parsed = {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Anthropic API error: authentication failed.",
+    };
+    expect(
+      detectClaudeLoginRequired({ parsed, stdout: "", stderr: "" }).requiresLogin,
+    ).toBe(true);
+  });
+
+  it("does not flag random text containing 'authentication'", () => {
+    // Plain "authentication required" without a Claude/Anthropic/oauth
+    // context word should still be treated as out-of-context noise (e.g. an
+    // Paperclip-side auth message bubbling through stdout).
+    const parsed = {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "ResearchTool: authentication required for upstream service.",
+    };
+    expect(
+      detectClaudeLoginRequired({ parsed, stdout: "", stderr: "" }).requiresLogin,
+    ).toBe(false);
+  });
+});
+
 describe("quota / transient classifier overlap", () => {
   // Both classifiers match quota-style messages — callers must check
   // isClaudeQuotaExhausted first so quota gets routed to the rotation hook

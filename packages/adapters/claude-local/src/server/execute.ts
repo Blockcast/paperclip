@@ -789,10 +789,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // must continue to short-circuit. The downstream silent-failure detector
     // (isClaudeSilentFailure below) still runs on this path and catches the
     // "claimed success but did nothing real" subset.
+    //
+    // Auth-required exception: claude CLI emits
+    // `{subtype:"success", is_error:false, result:"Not logged in · Please run /login"}`
+    // when the OAuth refresh failed during init — the envelope reports
+    // success but the result text screams auth failure. Trusting the
+    // envelope here means the run gets classified as success with a
+    // benign-sounding summary, the heartbeat upgrades errorCode to
+    // adapter_failed (line 6207 of heartbeat.ts), and the ccrotate-aware
+    // retry at line ~898 below NEVER fires because errorCode isn't
+    // claude_auth_required. So a stale-active-account bug masquerades
+    // as an inert "adapter failed" loop and the pool never advances.
+    // Override claudeReportedSuccess when loginMeta says auth is needed.
     const claudeReportedSuccess =
-      asString(parsed.subtype, "") === "success" && !parsedIsError;
+      asString(parsed.subtype, "") === "success" && !parsedIsError && !loginMeta.requiresLogin;
     const failed =
-      parsedIsError || ((proc.exitCode ?? 0) !== 0 && !claudeReportedSuccess);
+      parsedIsError || loginMeta.requiresLogin || ((proc.exitCode ?? 0) !== 0 && !claudeReportedSuccess);
     const errorMessage = failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : null;
