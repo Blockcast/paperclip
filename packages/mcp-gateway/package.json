@@ -1,0 +1,21 @@
+{
+  "name": "@paperclipai/mcp-gateway",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "paperclip-mcp-gateway": "./dist/server.js"
+  },
+  "exports": {
+    "./session-keepalive": "./src/session-keepalive.ts"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "vitest": "3.2.4"
+  }
+}
