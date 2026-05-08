@@ -51,6 +51,9 @@ import {
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
+import { markAccountExhausted } from "./ccrotate-state.js";
+import { readFileSync as readFileSyncNode } from "node:fs";
+import os from "node:os";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -154,6 +157,58 @@ function parseCcrotateNextOutput(output: string): { toEmail: string | null; swit
  * non-zero exit) returns `invoked=false` with a reason. Caller falls back to
  * the existing heartbeat-level recovery path in that case.
  */
+/**
+ * Write the just-burned account into ccrotate's shared tier-cache.json
+ * with `serviceTier: 'exhausted'` and the parsed reset epoch. Same
+ * advisory lock + atomic-rename recipe ccrotate uses; the contract
+ * is the file format, not the code (see ccrotate-state.ts).
+ *
+ * Skipped for k8s execution targets — the file lives on the local pod's
+ * filesystem (the same /paperclip PVC ccrotate-on-paperclip-0 reads),
+ * so writing here only makes sense when the heartbeat run is executed
+ * locally, which is the same condition `tryAdvanceCcrotateAccount`
+ * already checks before calling `ccrotate next`.
+ */
+async function captureQuotaExhaustionToTierCache(input: {
+  executionTarget: CcrotateAdvanceInput["executionTarget"];
+  cwd: string;
+  env: Record<string, string>;
+  onLog: CcrotateAdvanceInput["onLog"];
+  resetEpochSec: number;
+  response: string | null;
+}): Promise<void> {
+  const { executionTarget, env, onLog, resetEpochSec, response } = input;
+  if (executionTarget?.kind === "remote" && executionTarget.transport === "k8s") {
+    return;
+  }
+  try {
+    const home = env.HOME || env.PAPERCLIP_HOME || os.homedir();
+    const profilesDir = path.join(home, ".ccrotate");
+    const claudeJsonPath = path.join(home, ".claude.json");
+    let activeEmail: string | null = null;
+    try {
+      const raw = readFileSyncNode(claudeJsonPath, "utf8");
+      const parsed = JSON.parse(raw) as { oauthAccount?: { emailAddress?: string } };
+      activeEmail = parsed.oauthAccount?.emailAddress ?? null;
+    } catch {
+      // ~/.claude.json missing or malformed; can't attribute the burn
+      return;
+    }
+    if (!activeEmail) return;
+    markAccountExhausted(profilesDir, activeEmail, {
+      reset5h: resetEpochSec,
+      response,
+    });
+    await onLog(
+      "stdout",
+      `[paperclip] tier-cache: marked ${activeEmail} exhausted until ${new Date(resetEpochSec * 1000).toISOString()}\n`,
+    );
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    void onLog("stderr", `[paperclip] tier-cache writeback failed: ${reason}\n`);
+  }
+}
+
 async function tryAdvanceCcrotateAccount(
   input: CcrotateAdvanceInput,
 ): Promise<CcrotateAdvanceResult> {
@@ -910,6 +965,32 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       result.errorCode === "claude_auth_required" ||
       result.errorCode === "provider_quota_exhausted"
     ) {
+      // Capture runtime quota burns into the shared tier-cache state
+      // BEFORE rotating, so the next `ccrotate next` invocation sees this
+      // account as `serviceTier: 'exhausted'` and skips it. Without this
+      // writeback, runtime burns are invisible to ccrotate's state machine
+      // (Anthropic's per-org Usage API throttles its own probes), so the
+      // pool can spiral into a retry storm rotating between exhausted
+      // accounts that all look "no per-account data" in tier-cache.
+      // Real incident 2026-05-08.
+      const resultBag = result as unknown as Record<string, unknown>;
+      const retryNotBeforeIso =
+        typeof resultBag.retryNotBefore === "string"
+          ? (resultBag.retryNotBefore as string)
+          : null;
+      if (result.errorCode === "provider_quota_exhausted" && retryNotBeforeIso) {
+        const resetEpochSec = Math.floor(new Date(retryNotBeforeIso).getTime() / 1000);
+        if (Number.isFinite(resetEpochSec) && resetEpochSec > 0) {
+          await captureQuotaExhaustionToTierCache({
+            executionTarget,
+            cwd,
+            env,
+            onLog,
+            resetEpochSec,
+            response: typeof result.summary === "string" ? result.summary : null,
+          });
+        }
+      }
       const advance = await tryAdvanceCcrotateAccount({
         runId,
         executionTarget,
