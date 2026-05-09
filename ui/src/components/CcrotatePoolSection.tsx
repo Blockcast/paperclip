@@ -133,6 +133,7 @@ export function CcrotatePoolSection({ companyId, target }: CcrotatePoolSectionPr
         ) : null}
         {slot?.error ? <p className="text-xs text-destructive">{slot.error}</p> : null}
         <div className="space-y-1.5">
+          <PoolHeader />
           {accounts.map((row) => (
             <PoolRow key={row.email} row={row} />
           ))}
@@ -181,12 +182,29 @@ export function CcrotatePoolSection({ companyId, target }: CcrotatePoolSectionPr
   );
 }
 
+/** Column headings for the pool table — kept in sync with PoolRow widths.
+ * Model-specific 7d-Sonnet and 7d-Opus columns were removed: the per-model
+ * breakdown is rarely actionable for an operator (rotation decisions hinge on
+ * the all-models 7d total + the 5h session window), and dropping them frees
+ * horizontal space for the availability text on narrow viewports. The data
+ * is still in the API row if a future view needs it. */
+function PoolHeader() {
+  return (
+    <div className="flex items-center gap-2 text-[10px] uppercase tracking-wider text-muted-foreground">
+      <span className="shrink-0 w-3" aria-hidden />
+      <span className="flex-1 min-w-0">Email</span>
+      <span className="shrink-0 w-14 text-center">Tier</span>
+      <span className="shrink-0 w-12 text-right" title="5-hour session window">5h</span>
+      <span className="shrink-0 w-12 text-right" title="7-day window (all models)">7d</span>
+      <span className="shrink-0 w-24 text-right">Availability</span>
+    </div>
+  );
+}
+
 function PoolRow({ row }: { row: CcrotateAccountRow }) {
   const tierColor = tierColorClass(row.tier);
   const u5Color = utilColorClass(row.utilization5h);
   const u7Color = utilColorClass(row.utilization7d);
-  const sColor = utilColorClass(row.utilization7dSonnet);
-  const oColor = utilColorClass(row.utilization7dOpus);
   return (
     <div
       className={cn(
@@ -203,32 +221,19 @@ function PoolRow({ row }: { row: CcrotateAccountRow }) {
         {row.isActive ? "★" : row.isHealthy ? "✓" : "✗"}
       </span>
       <span className="font-mono truncate flex-1 min-w-0">{row.email}</span>
-      <span className={cn("shrink-0 px-1.5 py-0.5 rounded text-[10px] font-semibold lowercase", tierColor)}>
+      <span
+        className={cn(
+          "shrink-0 w-14 text-center px-1.5 py-0.5 rounded text-[10px] font-semibold lowercase",
+          tierColor,
+        )}
+      >
         {row.tier}
       </span>
-      <span
-        className={cn("font-mono shrink-0 w-12 text-right", u5Color)}
-        title="5-hour session window"
-      >
+      <span className={cn("font-mono shrink-0 w-12 text-right", u5Color)}>
         {row.utilization5h === null ? "—" : `${row.utilization5h}%`}
       </span>
-      <span
-        className={cn("font-mono shrink-0 w-12 text-right", u7Color)}
-        title="7-day window (all models)"
-      >
+      <span className={cn("font-mono shrink-0 w-12 text-right", u7Color)}>
         {row.utilization7d === null ? "—" : `${row.utilization7d}%`}
-      </span>
-      <span
-        className={cn("font-mono shrink-0 w-12 text-right text-[10px]", sColor)}
-        title="7-day window (Sonnet only)"
-      >
-        {row.utilization7dSonnet === null ? "—" : `s${row.utilization7dSonnet}%`}
-      </span>
-      <span
-        className={cn("font-mono shrink-0 w-12 text-right text-[10px]", oColor)}
-        title="7-day window (Opus only)"
-      >
-        {row.utilization7dOpus === null ? "—" : `o${row.utilization7dOpus}%`}
       </span>
       <span className="text-muted-foreground shrink-0 w-24 text-right truncate">
         {row.availability}
