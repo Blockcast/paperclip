@@ -122,6 +122,12 @@ resources:
 # pod-IP Host header kubelet would otherwise send is rejected.
 probes:
   # -- Liveness probe. Paperclip serves HTTP on the configured port once the embedded Postgres is up.
+  # timeoutSeconds=5 (k8s default is 1) — under load /healthz can spike past
+  # 1s when the event loop is briefly busy (e.g. during a fs-write batch
+  # under contention with ccrotate-auth-bot's pool sweep). Observed
+  # 2026-05-09 ~04:55Z: kubelet flagged "Killing — failed liveness probe"
+  # but the process recovered before the kill landed. 5s is a generous
+  # ceiling that absorbs those spikes without hiding a real wedge.
   liveness:
     httpGet:
       path: /healthz
@@ -131,6 +137,7 @@ probes:
           value: 127.0.0.1:3100
     initialDelaySeconds: 60
     periodSeconds: 30
+    timeoutSeconds: 5
     failureThreshold: 3
   # -- Readiness probe. Shorter cadence pulls the pod out of rotation quickly on transient failures.
   readiness:
@@ -142,6 +149,7 @@ probes:
           value: 127.0.0.1:3100
     initialDelaySeconds: 15
     periodSeconds: 10
+    timeoutSeconds: 5
     failureThreshold: 3
   # -- Startup probe. Long timeout tolerates first-run DB init + 45 migrations.
   startup:

@@ -10,12 +10,18 @@ import path from "node:path";
  * Contract is the file format + lock filename, not the code. If you change
  * the lock path, change it in ccrotate too. If you change the tier-cache
  * schema, update both writers.
+ *
+ * Async to avoid blocking the event loop while waiting for a contended
+ * lock. The previous sync implementation used a 50ms busy-wait loop which,
+ * under contention with the auth-bot's pool-sweep refresh, blocked the
+ * paperclip server's /healthz long enough to fail the kubelet's 1s probe
+ * (observed 2026-05-09 ~04:55Z).
  */
-export function withCcrotateLock<T>(
+export async function withCcrotateLock<T>(
   profilesDir: string,
-  fn: () => T,
+  fn: () => T | Promise<T>,
   opts: { timeout?: number; staleMs?: number } = {},
-): T {
+): Promise<T> {
   const lockPath = path.join(profilesDir, ".active-files.lock");
   const timeout = opts.timeout ?? 10_000;
   const staleMs = opts.staleMs ?? 30_000;
@@ -57,14 +63,11 @@ export function withCcrotateLock<T>(
     if (Date.now() - start > timeout) {
       throw new Error(`ccrotate: timed out waiting for ${lockPath} after ${timeout}ms`);
     }
-    const sleepUntil = Date.now() + sleepMs;
-    while (Date.now() < sleepUntil) {
-      // synchronous spin
-    }
+    await new Promise((resolve) => setTimeout(resolve, sleepMs));
   }
 
   try {
-    return fn();
+    return await fn();
   } finally {
     if (fd !== undefined) {
       try {
@@ -124,7 +127,7 @@ function tierCacheFilename(target: TierCacheTarget): string {
  * while the runtime is observing the same burns and dropping the data on
  * the floor. Pool spirals into a retry storm. Real incident 2026-05-08.
  */
-export function markAccountExhausted(
+export async function markAccountExhausted(
   profilesDir: string,
   email: string,
   fields: {
@@ -133,13 +136,13 @@ export function markAccountExhausted(
     reset7d?: number | null;
     response?: string | null;
   } = {},
-): void {
+): Promise<void> {
   const target = fields.target ?? "claude";
   const reset5h = fields.reset5h ?? null;
   const reset7d = fields.reset7d ?? null;
   const response = fields.response ?? null;
 
-  withCcrotateLock(profilesDir, () => {
+  await withCcrotateLock(profilesDir, () => {
     const tierCachePath = path.join(profilesDir, tierCacheFilename(target));
 
     let cache: TierCache = { updatedAt: null, accounts: [] };

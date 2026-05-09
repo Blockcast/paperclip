@@ -118,7 +118,7 @@ export async function captureQuotaBurnIntoCcrotateTierCache(
       : null;
 
   try {
-    markAccountExhausted(profilesDir, email, {
+    await markAccountExhausted(profilesDir, email, {
       target,
       reset5h: resetEpochSec,
     });
