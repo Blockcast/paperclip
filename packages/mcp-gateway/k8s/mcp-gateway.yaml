@@ -81,7 +81,12 @@ spec:
         runAsGroup: 1000
       containers:
         - name: gateway
-          image: registry.blockcast.net/paperclip-mcp-gateway:latest
+          # Pin to a specific build. Bump after `kubectl apply -f ...` +
+          # `kubectl set image` proves the new image healthy across all
+          # routes. Latest verified rollout: 2026-05-09 (initialize +
+          # session-keepalive recovery confirmed against figma upstream
+          # restart).
+          image: registry.blockcast.net/paperclip-mcp-gateway:sha-7f00682
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
