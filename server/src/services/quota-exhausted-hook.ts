@@ -4,7 +4,18 @@ import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { instanceSettingsService } from "./instance-settings.js";
 
-const HOOK_TIMEOUT_MS = 30_000;
+// 60s gives `ccrotate next`'s pool-probe step room to finish under load —
+// when Anthropic's per-org Usage API throttles, probing 10 accounts can
+// take 30–45s. The earlier 30s ceiling was killing `next` mid-probe in
+// ~85% of hook fires (observed 2026-05-09 00:11–00:48Z) so the active
+// account never got switched and the agent's onSuccess wakeup never fired,
+// leaving runs to self-recover only via the writeback's tier-cache
+// candidate-skip on the NEXT heartbeat.
+//
+// 60s == DEBOUNCE_MS is intentional: the inFlight guard already coalesces
+// concurrent hooks onto a single shared promise, so a hook that takes the
+// full 60s simply holds the debounce window; we never get two snaps racing.
+const HOOK_TIMEOUT_MS = 60_000;
 const DEBOUNCE_MS = 60_000;
 const MAX_OUTPUT_BYTES = 16 * 1024;
 
