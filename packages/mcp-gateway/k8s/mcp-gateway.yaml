@@ -83,10 +83,11 @@ spec:
         - name: gateway
           # Pin to a specific build. Bump after `kubectl apply -f ...` +
           # `kubectl set image` proves the new image healthy across all
-          # routes. Latest verified rollout: 2026-05-09 (initialize +
-          # session-keepalive recovery confirmed against figma upstream
-          # restart).
-          image: registry.blockcast.net/paperclip-mcp-gateway:sha-7f00682
+          # routes. Latest verified rollout: 2026-05-09 (sha-11e28a6f
+          # adds method/url/cause to request-handler error log so the
+          # SSE-style HeadersTimeoutErrors that show up every ~5min
+          # become attributable to a specific upstream).
+          image: registry.blockcast.net/paperclip-mcp-gateway:sha-11e28a6
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
