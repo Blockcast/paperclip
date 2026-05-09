@@ -166,17 +166,27 @@ async function doExport(): Promise<void> {
     }
   }
 
-  // Refresh next so the captured tier-cache reflects current API state, not
-  // whatever stale snapshot the pod was last left with. ccrotate import on
-  // the next run-start is a per-account timestamp merge (lib/commands/import.js),
-  // so even if refresh updates only a subset, the survivors merge cleanly with
-  // whatever persisted state the next pod sees. Refresh failure is non-fatal —
-  // we still export whatever is on disk. (refresh is claude-only; for a codex
-  // active account it errors and we proceed.)
-  const refresh = runCcrotate(["refresh"], 90_000);
+  // Refresh-one (not full pool refresh) so the captured tier-cache reflects
+  // current API state for the account that just finished a run, without
+  // hammering Anthropic's per-org Usage API. The full-pool `ccrotate refresh`
+  // we used to call here was probing every account in the pool on EVERY
+  // postRun — at peak, ~30 sweeps/hour into an API that throttles per-org
+  // and was the actual source of the "Usage API on cooldown" entries that
+  // poisoned tier-cache for hours during the 2026-05-09 storm.
+  //
+  // `refresh-one` (lib/commands/refresh-one.js) prioritizes the active
+  // account first (score=-1 in its candidate ranking) and skips
+  // cooldown'd tokens — so this stays an efficient ~1 Usage API call
+  // per postRun. The auth-bot's separate */5 cron handles whole-pool
+  // sweeps; postRun's job is just to keep the active account fresh.
+  // ccrotate import on the next run-start is a per-account timestamp
+  // merge so partial freshness still wins over stale-pod state.
+  // (refresh-one is claude-only; for codex active it errors and we
+  // proceed — the codex snap above already saved tokens.)
+  const refresh = runCcrotate(["refresh-one"], 30_000);
   if (refresh.status !== 0) {
     console.error(
-      `[ccrotate-hook] ccrotate refresh exit=${refresh.status} (continuing with stale tier-cache): ${refresh.stderr || refresh.stdout}`,
+      `[ccrotate-hook] ccrotate refresh-one exit=${refresh.status} (continuing with stale tier-cache): ${refresh.stderr || refresh.stdout}`,
     );
   }
 
