@@ -219,9 +219,13 @@ async function handleRequest(
   writeResponse(res, result, clientSessionId ?? null);
 }
 
-function safeOnError(e: unknown, res: http.ServerResponse): void {
+function safeOnError(e: unknown, req: http.IncomingMessage, res: http.ServerResponse): void {
+  const cause = (e as { cause?: unknown }).cause;
+  const causeCode = (cause as { code?: string } | undefined)?.code;
   // eslint-disable-next-line no-console
-  console.error("[mcp-gateway] request handler error:", e);
+  console.error(
+    `[mcp-gateway] request handler error: method=${req.method} url=${req.url} cause=${causeCode ?? (e as Error).name}: ${(e as Error).message}`,
+  );
   if (!res.headersSent) {
     res.statusCode = 502;
     res.setHeader("content-type", "application/json");
@@ -237,7 +241,7 @@ function main(): void {
   const state: GatewayState = { upstreams, sessions: new Map() };
 
   const server = http.createServer((req, res) => {
-    handleRequest(req, res, state).catch((e) => safeOnError(e, res));
+    handleRequest(req, res, state).catch((e) => safeOnError(e, req, res));
   });
 
   server.listen(port, () => {
