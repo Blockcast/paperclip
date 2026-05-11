@@ -395,6 +395,218 @@ describe("evaluateEvidence — comment recency window", () => {
   });
 });
 
+describe("evaluateEvidence — additional shape coverage (review-driven)", () => {
+  it("cms-data-op label: passes when a curl + URL is in the comment", () => {
+    const result = evaluateEvidence({
+      issue: {
+        description: "## Done when\n- field is set",
+        labels: [{ name: "cms-data-op" }],
+      },
+      comments: [
+        agentComment("Updated. Verified:\n```\ncurl https://www.blockcast.network/api/x\n```"),
+      ],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.verdict).toBe("pass");
+  });
+
+  it("cms-data-op label: blocks when no curl is mentioned", () => {
+    const result = evaluateEvidence({
+      issue: {
+        description: "## Done when\n- field is set",
+        labels: [{ name: "cms-data-op" }],
+      },
+      comments: [agentComment("Updated the field — trust me.")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.verdict).toBe("block");
+    expect(result.missing).toEqual(["url-probe"]);
+  });
+
+  it("detects ci-green via 'All checks have passed' string", () => {
+    const customRegistry = {
+      ...DEFAULT_EVIDENCE_REGISTRY,
+      "pr-with-ci": { required: ["pr-link" as const, "ci-green" as const] },
+    };
+    const result = evaluateEvidence({
+      issue: {
+        description: "## Done when\n- PR green",
+        labels: [{ name: "pr-with-ci" }],
+      },
+      comments: [
+        agentComment(
+          "https://github.com/Blockcast/paperclip/pull/133\n\nCI: All checks have passed",
+        ),
+      ],
+      workProducts: [],
+      registry: customRegistry,
+    });
+    expect(result.verdict).toBe("pass");
+  });
+
+  it("detects e2e-script via inline Playwright code in a comment", () => {
+    const customRegistry = {
+      ...DEFAULT_EVIDENCE_REGISTRY,
+      e2e: { required: ["e2e-script" as const] },
+    };
+    const body = [
+      "Wrote a script:",
+      "```js",
+      "await page.goto('https://www.blockcast.network/blog');",
+      "await page.click('.blog-card');",
+      "```",
+    ].join("\n");
+    const result = evaluateEvidence({
+      issue: { description: "## Done when\n- e2e", labels: [{ name: "e2e" }] },
+      comments: [agentComment(body)],
+      workProducts: [],
+      registry: customRegistry,
+    });
+    expect(result.verdict).toBe("pass");
+  });
+
+  it("does NOT count e2e-run when result is 'fail'", () => {
+    const customRegistry = {
+      ...DEFAULT_EVIDENCE_REGISTRY,
+      "e2e-strict": { required: ["e2e-run" as const] },
+    };
+    const result = evaluateEvidence({
+      issue: { description: "## Done when\n- e2e", labels: [{ name: "e2e-strict" }] },
+      comments: [agentComment("Ran the script.")],
+      workProducts: [
+        { kind: "e2e-run", result: "fail", metadata: null },
+      ] as EvidenceWorkProductLite[],
+      registry: customRegistry,
+    });
+    expect(result.verdict).toBe("block");
+    expect(result.missing).toEqual(["e2e-run"]);
+  });
+
+  it("recentCommentLimit: 0 yields empty text and blocks on labeled issues", () => {
+    const result = evaluateEvidence({
+      issue: { description: FRONTEND_DONE_WHEN, labels: [{ name: "frontend" }] },
+      comments: [agentComment("![](./shot_1440x900.png)\n![](./shot_390x844.png)")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      recentCommentLimit: 0,
+    });
+    expect(result.verdict).toBe("block");
+  });
+
+  it("empty comments array blocks on labeled frontend issue", () => {
+    const result = evaluateEvidence({
+      issue: { description: FRONTEND_DONE_WHEN, labels: [{ name: "frontend" }] },
+      comments: [],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.verdict).toBe("block");
+    expect(result.missing).toEqual(
+      expect.arrayContaining([
+        "screenshot:1440x900",
+        "screenshot:390x844",
+        "checklist:done-when",
+      ]),
+    );
+  });
+
+  it("multi-label union: a frontend + backend + pr issue must satisfy ALL", () => {
+    // Partial coverage: has screenshots + PR link, but missing test-output.
+    const body = [
+      "![desktop](./blog_entry_desktop_1440x900.png)",
+      "![mobile](./blog_entry_mobile_390x844.png)",
+      "PR: https://github.com/Blockcast/paperclip/pull/133",
+      "",
+      "| Item | Status |",
+      "|---|---|",
+      "| a | ✅ |",
+      "| b | ✅ |",
+      "| c | ✅ |",
+    ].join("\n");
+    const result = evaluateEvidence({
+      issue: {
+        description: "## Done when\n- ui works\n- tests pass\n- pr open",
+        labels: [{ name: "frontend" }, { name: "backend" }, { name: "pr" }],
+      },
+      comments: [agentComment(body)],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.verdict).toBe("block");
+    expect(result.missing).toEqual(["test-output"]);
+  });
+
+  it("NaN createdAt sorts to bottom deterministically and does not reorder valid comments", () => {
+    // Per silent-failure review: a single malformed timestamp must not silently
+    // re-order the sort and push real evidence outside the recent-comment
+    // window. With limit=2, the two valid recent comments should both survive,
+    // and the malformed-timestamp comment is sorted to the bottom.
+    const evidence = agentComment(
+      [
+        "![desktop](./shot_1440x900.png)",
+        "![mobile](./shot_390x844.png)",
+        "| C | S |",
+        "|---|---|",
+        "| entry | ✅ |",
+        "| listing | ✅ |",
+        "| footer | ✅ |",
+      ].join("\n"),
+      "2026-05-11T20:00:00Z",
+    );
+    const bogus = agentComment("nothing", "not-a-date");
+    const stale = agentComment("old", "2024-01-01T00:00:00Z");
+    const result = evaluateEvidence({
+      issue: { description: FRONTEND_DONE_WHEN, labels: [{ name: "frontend" }] },
+      comments: [bogus, evidence, stale],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      recentCommentLimit: 2,
+    });
+    // The two most-recent valid comments survive: `evidence` (2026) and
+    // `stale` (2024). `bogus` (NaN) sorts to the bottom and is sliced out.
+    expect(result.verdict).toBe("pass");
+  });
+
+  it("known Phase-1 looseness (BLO-4828 will tighten): screenshot looseFilename matches prose", () => {
+    // Documents intentional Phase-1 leniency: a comment mentioning
+    // "screenshot 1440x900" without an actual image satisfies the inline
+    // detector. The gate is shape-only in Phase 1; QA Engineer (BLO-4827)
+    // re-runs the artifact in their own context to catch fakery. When
+    // BLO-4828 ships Phase-2 enforcement, this test should be FLIPPED to
+    // `expect("block")` after tightening detectScreenshotViewport's
+    // looseFilename branch (per code-reviewer M1 + test-analyzer #7).
+    const body = "I'll add a screenshot at 1440x900 and 390x844 later.\n" +
+      "| C | S |\n|---|---|\n| a | ✅ |\n| b | ✅ |\n| c | ✅ |";
+    const result = evaluateEvidence({
+      issue: { description: FRONTEND_DONE_WHEN, labels: [{ name: "frontend" }] },
+      comments: [agentComment(body)],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.verdict).toBe("pass");
+  });
+
+  it("known Phase-1 looseness (BLO-4828 will tighten): CI green substring matches prose", () => {
+    // Documents intentional Phase-1 leniency: "TODO: make sure CI green" or
+    // similar prose satisfies the detector. Phase-2 (BLO-4828) tightens this
+    // to require co-occurrence with a PR link or a status URL. Flip this
+    // expectation when that lands.
+    const customRegistry = {
+      ...DEFAULT_EVIDENCE_REGISTRY,
+      "ci-only": { required: ["ci-green" as const] },
+    };
+    const result = evaluateEvidence({
+      issue: { description: "## Done when\n- ci green", labels: [{ name: "ci-only" }] },
+      comments: [agentComment("Working on the fix — need to verify CI green before merge.")],
+      workProducts: [],
+      registry: customRegistry,
+    });
+    expect(result.verdict).toBe("pass");
+  });
+});
+
 describe("evaluateEvidence — shapeDetections shape", () => {
   it("returns booleans for every known shape", () => {
     const result = evaluateEvidence({

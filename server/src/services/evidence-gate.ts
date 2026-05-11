@@ -119,8 +119,17 @@ function buildAgentEvidenceText(
 ): string {
   const agentComments = comments.filter((c) => c.authorAgentId !== null);
   agentComments.sort((a, b) => {
-    const aT = new Date(a.createdAt).getTime();
-    const bT = new Date(b.createdAt).getTime();
+    // Defensive: `new Date(badString).getTime()` returns NaN, and a NaN
+    // comparator return value silently produces an engine-dependent order in
+    // V8's TimSort — which would let a single malformed timestamp push real
+    // evidence outside the recent-comment window and false-block the gate.
+    // Coerce NaN/Infinity to epoch 0 so bad timestamps sort to the bottom of
+    // the window deterministically. Caller should validate inputs upstream;
+    // this is the last-line defense.
+    const aRaw = new Date(a.createdAt).getTime();
+    const bRaw = new Date(b.createdAt).getTime();
+    const aT = Number.isFinite(aRaw) ? aRaw : 0;
+    const bT = Number.isFinite(bRaw) ? bRaw : 0;
     return bT - aT;
   });
   return agentComments
