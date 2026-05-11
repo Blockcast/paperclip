@@ -281,6 +281,20 @@ export interface Issue {
   blocks?: IssueRelationIssueSummary[];
   blockerAttention?: IssueBlockerAttention;
   productivityReview?: IssueProductivityReview | null;
+  /**
+   * Last verdict from the artifact-evidence gate (BLO-4461). Written by the
+   * server on PATCH transitions to `in_review`. Null when the issue has
+   * never transitioned to `in_review` under the gate. Phase 1 is warn-only
+   * (verdict recorded but never blocks PATCH); Phase 2 (BLO-4828) flips
+   * block verdicts to 422.
+   */
+  lastEvidenceVerdict?: {
+    verdict: "pass" | "warn" | "block";
+    missing: string[];
+    evidenceFound: string[];
+    unlabeledFallback: boolean;
+    evaluatedAt: string;
+  } | null;
   relatedWork?: IssueRelatedWorkSummary;
   referencedIssueIdentifiers?: string[];
   planDocument?: IssueDocument | null;
