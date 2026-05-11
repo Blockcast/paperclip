@@ -1169,6 +1169,73 @@ describe("paperclip-plugin-linear", () => {
 
       expect(createIssue).not.toHaveBeenCalled();
     });
+
+    // BLO-3763/3764 regression: webhook-imported mirrors (created via the
+    // Issue.create webhook handler with originKind=ORIGIN_KIND_SELF) must NOT
+    // be pushed back to Linear. The `recentlyCreatedFromLinear` Set defense
+    // races with this event handler — Set.add runs AFTER ctx.issues.create
+    // resolves, but the event can fire in a microtask before that. The
+    // originKind gate is race-safe because the field is persisted inside the
+    // issue insert and surfaces via the event payload before the handler runs.
+    //
+    // Before the gate: filing an issue via Linear API spawned a duplicate
+    // Linear issue 1.4–5s later (observed on 2026-05-11 across ~85 historical
+    // pairs in the BLO backlog).
+    it("BLO-3763/3764: skips when originKind=ORIGIN_KIND_SELF (race-safe webhook-mirror defense)", async () => {
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthToken },
+        "lin_token_123",
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.companyId },
+        "comp-1",
+      );
+
+      const { createIssue } = await import("../src/linear.js");
+
+      await harness.emit(
+        "issue.created",
+        {
+          id: "iss-mirror",
+          title: "Webhook-imported mirror",
+          originKind: "plugin:paperclip-plugin-linear",
+        },
+        { entityId: "iss-mirror" },
+      );
+
+      expect(createIssue).not.toHaveBeenCalled();
+      expect(syncModule.createLink).not.toHaveBeenCalled();
+    });
+
+    it("BLO-3763/3764: skips when originKind has a sub-origin extension (forward-compat)", async () => {
+      // `normalizePluginOriginKind` in plugin-host-services.ts permits
+      // sub-origin extensions like `ORIGIN_KIND_SELF + ":<sub>"`. The gate
+      // must accept those too, otherwise any future sub-origin path silently
+      // bypasses the defense and re-opens the duplicate-loop.
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthToken },
+        "lin_token_123",
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.companyId },
+        "comp-1",
+      );
+
+      const { createIssue } = await import("../src/linear.js");
+
+      await harness.emit(
+        "issue.created",
+        {
+          id: "iss-mirror-sub",
+          title: "Sub-origin webhook mirror",
+          originKind: "plugin:paperclip-plugin-linear:backfill",
+        },
+        { entityId: "iss-mirror-sub" },
+      );
+
+      expect(createIssue).not.toHaveBeenCalled();
+      expect(syncModule.createLink).not.toHaveBeenCalled();
+    });
   });
 
   // -----------------------------------------------------------------------

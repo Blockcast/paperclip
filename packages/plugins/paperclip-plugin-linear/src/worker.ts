@@ -25,6 +25,7 @@ import {
   STATE_KEYS,
   LINEAR_OAUTH,
   GOALS_LINEAR_PROJECT_NAME,
+  ORIGIN_KIND_SELF,
 } from "./constants.js";
 import * as linear from "./linear.js";
 import * as sync from "./sync.js";
@@ -669,7 +670,7 @@ const plugin = definePlugin({
       // originId) tuple is the only stable identity across re-imports.
       const existingByOrigin = await ctx.issues.list({
         companyId,
-        originKind: "plugin:paperclip-plugin-linear",
+        originKind: ORIGIN_KIND_SELF,
         originId: linearIssue.id,
         limit: 1,
       });
@@ -708,7 +709,7 @@ const plugin = definePlugin({
         title: linearIssue.title,
         description: linearIssue.description ?? undefined,
         priority: priority as "critical" | "high" | "medium" | "low",
-        originKind: "plugin:paperclip-plugin-linear",
+        originKind: ORIGIN_KIND_SELF,
         originId: linearIssue.id,
         ...(projectId ? { projectId } : {}),
         ...(assigneeUserId ? { assigneeUserId } : {}),
@@ -913,6 +914,41 @@ const plugin = definePlugin({
 
       // Skip if this issue was created by the Linear webhook (prevents feedback loop)
       if (payload?.source === "linear") { ctx.logger.info("issue.created: source=linear, skipping"); return; }
+      // Race-safe defense for webhook-imported mirrors.
+      //
+      // The Issue.create webhook handler below calls `ctx.issues.create` with
+      // `originKind: ORIGIN_KIND_SELF`. The host stamps that value onto the
+      // issue row during the insert and surfaces it via the issue.created
+      // event payload (plugin-host-services.ts's logPluginActivity → activity-log.ts's
+      // publishPluginDomainEvent, which spreads `details.originKind` into
+      // `event.payload`).
+      //
+      // This is the only race-safe gate against the feedback push. The
+      // `recentlyCreatedFromLinear` Set check below is populated AFTER
+      // `ctx.issues.create` resolves (via `recentlyCreatedFromLinear.add` in
+      // the Issue.create webhook branch). publishPluginDomainEvent is
+      // fire-and-forget (`void bus.emit().then(...)`), so this handler can run
+      // in a later microtask BEFORE the Set.add lands — leaving the Set empty
+      // and producing a duplicate Linear issue (the 2026-05-03 runaway-loop
+      // pattern; see prior-incident note in the Issue.create branch).
+      //
+      // `normalizePluginOriginKind` in plugin-host-services.ts permits
+      // sub-origin extensions like `${ORIGIN_KIND_SELF}:<sub>`, so this gate
+      // accepts both the bare value and any sub-origin form. Exact `===` alone
+      // would silently miss any future sub-origin path.
+      //
+      // The Set-based check below remains as a defense-in-depth fallback for
+      // any non-originKind webhook-import path that may be added later.
+      if (
+        payload?.originKind === ORIGIN_KIND_SELF ||
+        (typeof payload?.originKind === "string" &&
+          payload.originKind.startsWith(`${ORIGIN_KIND_SELF}:`))
+      ) {
+        ctx.logger.info(
+          `issue.created: originKind=${String(payload.originKind)}, skipping (webhook-imported mirror)`,
+        );
+        return;
+      }
       if (recentlyCreatedFromLinear.has(issueId)) { ctx.logger.info("issue.created: recently created from linear, skipping"); return; }
 
       const config = await ctx.config.get();
@@ -1397,7 +1433,7 @@ async function handleWebhookEvent(
         // Dedup against prior imports of the same Linear issue.
         const existingByOrigin = await ctx.issues.list({
           companyId,
-          originKind: "plugin:paperclip-plugin-linear",
+          originKind: ORIGIN_KIND_SELF,
           originId: linearIssueId,
           limit: 1,
         });
@@ -1457,7 +1493,7 @@ async function handleWebhookEvent(
           title: (data.title as string) ?? "Untitled",
           description,
           priority: priority as "critical" | "high" | "medium" | "low",
-          originKind: "plugin:paperclip-plugin-linear",
+          originKind: ORIGIN_KIND_SELF,
           originId: linearIssueId,
           ...(projectId ? { projectId } : {}),
           ...(assigneeUserId ? { assigneeUserId } : {}),
@@ -2082,7 +2118,7 @@ async function runImport(ctx: PluginContext): Promise<{
         // workspace. Skip Paperclip rows that already point at this Linear id.
         const existingByOrigin = await ctx.issues.list({
           companyId,
-          originKind: "plugin:paperclip-plugin-linear",
+          originKind: ORIGIN_KIND_SELF,
           originId: linearIssue.id,
           limit: 1,
         });
@@ -2110,7 +2146,7 @@ async function runImport(ctx: PluginContext): Promise<{
           title: linearIssue.title,
           description,
           priority: priority as "critical" | "high" | "medium" | "low",
-          originKind: "plugin:paperclip-plugin-linear",
+          originKind: ORIGIN_KIND_SELF,
           originId: linearIssue.id,
           ...(projectId ? { projectId } : {}),
           ...(issueLabelIds.length > 0 ? { labelIds: issueLabelIds } : {}),

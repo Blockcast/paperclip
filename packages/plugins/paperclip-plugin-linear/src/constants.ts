@@ -1,6 +1,19 @@
 export const PLUGIN_ID = "paperclip-plugin-linear";
 export const PLUGIN_VERSION = "0.9.3";
 
+/**
+ * The originKind value the host stamps on issues created by this plugin.
+ * Matches `defaultPluginOriginKind = `plugin:${pluginKey}`` in the host's
+ * plugin-host-services.ts. Used by:
+ *   - the webhook `Issue.create` handler when calling `ctx.issues.create`
+ *   - the `issue.created` event-handler defense that suppresses feedback
+ *     push-back-to-Linear for webhook-imported mirrors
+ * The host's `normalizePluginOriginKind` allows extended forms like
+ * `ORIGIN_KIND_SELF + ":<sub-origin>"`, so consumers should match on
+ * `=== ORIGIN_KIND_SELF || startsWith(ORIGIN_KIND_SELF + ":")`.
+ */
+export const ORIGIN_KIND_SELF = `plugin:${PLUGIN_ID}` as const;
+
 /** Linear project name used to bucket Paperclip goals as Linear issues. */
 export const GOALS_LINEAR_PROJECT_NAME = "Company Goals";
 
