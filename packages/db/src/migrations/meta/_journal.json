@@ -610,6 +610,13 @@
       "when": 1778100005000,
       "tag": "0086_linear_issue_links_company_linear_issue_id_idx",
       "breakpoints": true
+    },
+    {
+      "idx": 87,
+      "version": "7",
+      "when": 1778538040577,
+      "tag": "0087_issues_last_evidence_verdict",
+      "breakpoints": true
     }
   ]
 }
