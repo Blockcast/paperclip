@@ -61,6 +61,10 @@ vi.mock("../src/linear.js", () => ({
     url: "https://linear.app/lucitra/issue/LUC-43",
     state: { name: "Backlog", type: "backlog" },
   }),
+  attachmentLinkURL: vi.fn().mockResolvedValue({
+    success: true,
+    attachmentId: "att-1",
+  }),
   createProject: vi.fn().mockResolvedValue({
     id: "lin-proj-1",
     name: "Test Project",
@@ -647,6 +651,249 @@ describe("paperclip-plugin-linear", () => {
 
       expect(result.imported).toBe(0);
       expect(result.skipped).toBe(0);
+    });
+  });
+
+  describe("import-issue: Paperclip back-link", () => {
+    it("fires attachmentLinkURL after creating the Paperclip mirror when paperclipBaseUrl is configured", async () => {
+      // Configure base URL on this harness instance so the back-link path triggers.
+      harness = createTestHarness({
+        manifest,
+        config: {
+          linearClientId: "client-id-123",
+          linearClientSecret: "client-secret-456",
+          teamId: "team-1",
+          syncComments: true,
+          syncDirection: "bidirectional",
+          paperclipBaseUrl: "https://paperclip.test",
+          linearBacklinkBestEffort: true, // swallow API failures in test
+        },
+      });
+      await plugin.definition.setup(harness.ctx);
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthToken },
+        "lin_token_123",
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.companyId },
+        "comp-1",
+      );
+
+      // ctx.issues.list returns empty (dedup-by-originId check passes).
+      // ctx.issues.create returns an issue with a known identifier.
+      // ctx.issues.update is a no-op (the status-update branch may fire).
+      vi.spyOn(harness.ctx.issues, "list").mockResolvedValue([] as never);
+      vi.spyOn(harness.ctx.issues, "create").mockResolvedValue({
+        id: "pcp-iss-1",
+        identifier: "LUC-1001",
+      } as never);
+      vi.spyOn(harness.ctx.issues, "update").mockResolvedValue(undefined as never);
+
+      const { attachmentLinkURL } = await import("../src/linear.js");
+      (attachmentLinkURL as ReturnType<typeof vi.fn>).mockClear();
+
+      await harness.performAction(ACTION_KEYS.importIssue, { linearRef: "LUC-1" });
+
+      expect(attachmentLinkURL).toHaveBeenCalledOnce();
+      const callArg = (attachmentLinkURL as ReturnType<typeof vi.fn>).mock.calls[0]![2];
+      expect(callArg).toMatchObject({
+        issueId: "lin-iss-1",
+        url: "https://paperclip.test/issues/LUC-1001",
+        title: "Paperclip mirror: LUC-1001",
+      });
+    });
+
+    it("skips the back-link when paperclipBaseUrl is not configured", async () => {
+      // Default harness from outer beforeEach has no paperclipBaseUrl.
+      // companyId must be set so the action reaches the back-link block —
+      // otherwise the test trivially passes via getCompanyId's early return.
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthToken },
+        "lin_token_123",
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.companyId },
+        "comp-1",
+      );
+      vi.spyOn(harness.ctx.issues, "list").mockResolvedValue([] as never);
+      vi.spyOn(harness.ctx.issues, "create").mockResolvedValue({
+        id: "pcp-iss-1",
+        identifier: "LUC-1002",
+      } as never);
+      vi.spyOn(harness.ctx.issues, "update").mockResolvedValue(undefined as never);
+
+      const { attachmentLinkURL } = await import("../src/linear.js");
+      (attachmentLinkURL as ReturnType<typeof vi.fn>).mockClear();
+
+      await harness.performAction(ACTION_KEYS.importIssue, { linearRef: "LUC-1" });
+
+      expect(attachmentLinkURL).not.toHaveBeenCalled();
+    });
+
+    it("fails the import loudly when attachmentLinkURL throws and linearBacklinkBestEffort is false (default)", async () => {
+      harness = createTestHarness({
+        manifest,
+        config: {
+          linearClientId: "client-id-123",
+          linearClientSecret: "client-secret-456",
+          teamId: "team-1",
+          syncComments: true,
+          syncDirection: "bidirectional",
+          paperclipBaseUrl: "https://paperclip.test",
+          // linearBacklinkBestEffort omitted -> defaults to false
+        },
+      });
+      await plugin.definition.setup(harness.ctx);
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthToken },
+        "lin_token_123",
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.companyId },
+        "comp-1",
+      );
+      vi.spyOn(harness.ctx.issues, "list").mockResolvedValue([] as never);
+      vi.spyOn(harness.ctx.issues, "create").mockResolvedValue({
+        id: "pcp-iss-1",
+        identifier: "LUC-1003",
+      } as never);
+      vi.spyOn(harness.ctx.issues, "update").mockResolvedValue(undefined as never);
+
+      const { attachmentLinkURL } = await import("../src/linear.js");
+      (attachmentLinkURL as ReturnType<typeof vi.fn>).mockClear();
+      (attachmentLinkURL as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new Error("Linear 500: attachmentLinkURL failed"),
+      );
+
+      await expect(
+        harness.performAction(ACTION_KEYS.importIssue, { linearRef: "LUC-1" }),
+      ).rejects.toThrow(/Linear 500: attachmentLinkURL failed/);
+    });
+
+    it("swallows attachmentLinkURL errors and emits warn when linearBacklinkBestEffort is true", async () => {
+      harness = createTestHarness({
+        manifest,
+        config: {
+          linearClientId: "client-id-123",
+          linearClientSecret: "client-secret-456",
+          teamId: "team-1",
+          syncComments: true,
+          syncDirection: "bidirectional",
+          paperclipBaseUrl: "https://paperclip.test",
+          linearBacklinkBestEffort: true,
+        },
+      });
+      await plugin.definition.setup(harness.ctx);
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthToken },
+        "lin_token_123",
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.companyId },
+        "comp-1",
+      );
+      vi.spyOn(harness.ctx.issues, "list").mockResolvedValue([] as never);
+      vi.spyOn(harness.ctx.issues, "create").mockResolvedValue({
+        id: "pcp-iss-1",
+        identifier: "LUC-1004",
+      } as never);
+      vi.spyOn(harness.ctx.issues, "update").mockResolvedValue(undefined as never);
+
+      const { attachmentLinkURL } = await import("../src/linear.js");
+      (attachmentLinkURL as ReturnType<typeof vi.fn>).mockClear();
+      (attachmentLinkURL as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new Error("Linear 503: temporarily unavailable"),
+      );
+
+      const result = await harness.performAction<{ imported: boolean }>(
+        ACTION_KEYS.importIssue,
+        { linearRef: "LUC-1" },
+      );
+
+      expect(result.imported).toBe(true);
+      const warnLogs = harness.logs.filter(
+        (l) => l.level === "warn" && l.message.includes("Failed to add Paperclip back-link"),
+      );
+      expect(warnLogs.length).toBeGreaterThan(0);
+    });
+
+    it("emits warn and skips the back-link when created.identifier is null", async () => {
+      harness = createTestHarness({
+        manifest,
+        config: {
+          linearClientId: "client-id-123",
+          linearClientSecret: "client-secret-456",
+          teamId: "team-1",
+          syncComments: true,
+          syncDirection: "bidirectional",
+          paperclipBaseUrl: "https://paperclip.test",
+          linearBacklinkBestEffort: true,
+        },
+      });
+      await plugin.definition.setup(harness.ctx);
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthToken },
+        "lin_token_123",
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.companyId },
+        "comp-1",
+      );
+      vi.spyOn(harness.ctx.issues, "list").mockResolvedValue([] as never);
+      vi.spyOn(harness.ctx.issues, "create").mockResolvedValue({
+        id: "pcp-iss-null",
+        identifier: null,
+      } as never);
+      vi.spyOn(harness.ctx.issues, "update").mockResolvedValue(undefined as never);
+
+      const { attachmentLinkURL } = await import("../src/linear.js");
+      (attachmentLinkURL as ReturnType<typeof vi.fn>).mockClear();
+
+      await harness.performAction(ACTION_KEYS.importIssue, { linearRef: "LUC-1" });
+
+      expect(attachmentLinkURL).not.toHaveBeenCalled();
+      const warnLogs = harness.logs.filter(
+        (l) => l.level === "warn" && l.message.includes("null identifier"),
+      );
+      expect(warnLogs.length).toBeGreaterThan(0);
+    });
+
+    it("normalizes a trailing slash on paperclipBaseUrl to produce a single-slash URL", async () => {
+      harness = createTestHarness({
+        manifest,
+        config: {
+          linearClientId: "client-id-123",
+          linearClientSecret: "client-secret-456",
+          teamId: "team-1",
+          syncComments: true,
+          syncDirection: "bidirectional",
+          paperclipBaseUrl: "https://paperclip.test/",
+          linearBacklinkBestEffort: true,
+        },
+      });
+      await plugin.definition.setup(harness.ctx);
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthToken },
+        "lin_token_123",
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.companyId },
+        "comp-1",
+      );
+      vi.spyOn(harness.ctx.issues, "list").mockResolvedValue([] as never);
+      vi.spyOn(harness.ctx.issues, "create").mockResolvedValue({
+        id: "pcp-iss-1",
+        identifier: "LUC-1005",
+      } as never);
+      vi.spyOn(harness.ctx.issues, "update").mockResolvedValue(undefined as never);
+
+      const { attachmentLinkURL } = await import("../src/linear.js");
+      (attachmentLinkURL as ReturnType<typeof vi.fn>).mockClear();
+
+      await harness.performAction(ACTION_KEYS.importIssue, { linearRef: "LUC-1" });
+
+      const callArg = (attachmentLinkURL as ReturnType<typeof vi.fn>).mock.calls[0]![2];
+      expect(callArg.url).toBe("https://paperclip.test/issues/LUC-1005");
     });
   });
 

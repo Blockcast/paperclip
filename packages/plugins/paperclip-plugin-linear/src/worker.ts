@@ -735,6 +735,41 @@ const plugin = definePlugin({
         syncDirection: "bidirectional",
       });
 
+      // Add a Linear attachment pointing back at the Paperclip mirror so
+      // operators viewing the Linear ticket can one-click into Paperclip.
+      // URL shape `/issues/<identifier>` per markdown.ts:7. Behavior gated by
+      // `linearBacklinkBestEffort` config — see manifest for semantics. No
+      // echo-loop guard needed: registerWebhook in linear.ts subscribes to
+      // {Issue, Comment, IssueLabel, Project} only, not Attachment events.
+      const config = await ctx.config.get();
+      const paperclipBaseUrl = (config.paperclipBaseUrl as string | undefined)?.trim();
+      const backLinkBestEffort = config.linearBacklinkBestEffort === true;
+      if (created.identifier && paperclipBaseUrl) {
+        const paperclipUrl = `${paperclipBaseUrl.replace(/\/$/, "")}/issues/${created.identifier}`;
+        try {
+          await linear.attachmentLinkURL(ctx.http.fetch.bind(ctx.http), token, {
+            issueId: linearIssue.id,
+            url: paperclipUrl,
+            title: `Paperclip mirror: ${created.identifier}`,
+          });
+        } catch (err) {
+          if (backLinkBestEffort) {
+            ctx.logger.warn("Failed to add Paperclip back-link to Linear issue", {
+              identifier: linearIssue.identifier,
+              paperclipIdentifier: created.identifier,
+              error: String(err),
+            });
+          } else {
+            throw err;
+          }
+        }
+      } else if (!created.identifier) {
+        ctx.logger.warn("Skipped Paperclip back-link: created issue has null identifier", {
+          linearIdentifier: linearIssue.identifier,
+          paperclipIssueId: created.id,
+        });
+      }
+
       return {
         ok: true,
         imported: true,

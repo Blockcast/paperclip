@@ -112,6 +112,19 @@ const manifest: PaperclipPluginManifestV1 = {
         enum: ["bidirectional", "linear-to-paperclip", "paperclip-to-linear"],
         default: DEFAULT_CONFIG.syncDirection,
       },
+      paperclipBaseUrl: {
+        type: "string",
+        title: "Paperclip base URL",
+        description:
+          "Public base URL of this Paperclip instance (no trailing slash). Used to build Linear back-link attachments pointing at the Paperclip mirror after import.",
+      },
+      linearBacklinkBestEffort: {
+        type: "boolean",
+        title: "Linear back-link: best-effort",
+        description:
+          "Controls how Linear `attachmentLinkURL` failures during import are handled. `false` (default) is the safer choice — failures propagate and fail the import loudly, so silent breakage surfaces immediately. Set to `true` to log-and-continue once you trust the back-link path.",
+        default: false,
+      },
     },
   },
   jobs: [

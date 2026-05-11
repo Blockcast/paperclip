@@ -345,6 +345,39 @@ export async function createIssue(
   return data.issueCreate.issue;
 }
 
+// Create a "link" attachment on a Linear issue.
+//
+// Dedup note: Linear's `attachmentLinkURL` is observed (not contractually
+// guaranteed) to return the existing attachment if (issueId, url) already
+// exists; we still expect callers to handle the duplicate-URL error class
+// rather than rely on silent no-op. See Linear docs:
+// https://developers.linear.app/docs/graphql/working-with-the-graphql-api/attachments
+export async function attachmentLinkURL(
+  fetch: LinearFetch,
+  token: string,
+  input: {
+    issueId: string;
+    url: string;
+    title: string;
+  },
+): Promise<{ success: boolean; attachmentId: string | null }> {
+  const data = await gql<{
+    attachmentLinkURL: { success: boolean; attachment: { id: string } | null };
+  }>(fetch, token, `
+    mutation AttachmentLinkURL($issueId: String!, $url: String!, $title: String!) {
+      attachmentLinkURL(issueId: $issueId, url: $url, title: $title) {
+        success
+        attachment { id }
+      }
+    }
+  `, input);
+
+  return {
+    success: data.attachmentLinkURL.success,
+    attachmentId: data.attachmentLinkURL.attachment?.id ?? null,
+  };
+}
+
 export async function updateIssue(
   fetch: LinearFetch,
   token: string,
