@@ -72,6 +72,18 @@ export const issues = pgTable(
     // issue_comments insert. Used by inboxVisibleForUserCondition to make the
     // archive predicate sargable.
     lastActivityAt: timestamp("last_activity_at", { withTimezone: true }).notNull().defaultNow(),
+    // Last verdict from the artifact-evidence gate (BLO-4461). Written by
+    // services/issues.ts on transitions to in_review. Phase 1 is warn-only:
+    // verdict is recorded but never blocks the PATCH. Phase 2 (BLO-4828)
+    // flips block verdicts to 422 unprocessable. Null until the issue
+    // transitions to in_review under the gate.
+    lastEvidenceVerdict: jsonb("last_evidence_verdict").$type<{
+      verdict: "pass" | "warn" | "block";
+      missing: string[];
+      evidenceFound: string[];
+      unlabeledFallback: boolean;
+      evaluatedAt: string;
+    }>(),
   },
   (table) => ({
     companyStatusIdx: index("issues_company_status_idx").on(table.companyId, table.status),

@@ -24,6 +24,7 @@ import {
   issueDocuments,
   issueReadStates,
   issueThreadInteractions,
+  issueWorkProducts,
   issues,
   labels,
   linearIssueLinks,
@@ -57,6 +58,7 @@ import {
   issueTreeControlService,
   type ActiveIssueTreePauseHoldGate,
 } from "./issue-tree-control.js";
+import { runEvidenceGate, type EvidenceFetchResult } from "./evidence-gate-wiring.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -687,6 +689,49 @@ async function withIssueLabels(dbOrTx: any, rows: IssueRow[]): Promise<IssueWith
       labelIds: issueLabels.map((label) => label.id),
     };
   });
+}
+
+/**
+ * Evidence-gate fetcher (BLO-4824 / BLO-4461). Loads the data the pure
+ * evaluator needs: issue labels, the 10 most-recent comments, and any
+ * work_products. Caller supplies the description (already on the existing
+ * row in the PATCH handler, no need to re-select).
+ */
+async function fetchEvidenceForIssue(
+  dbOrTx: any,
+  issueId: string,
+  description: string | null,
+): Promise<EvidenceFetchResult> {
+  const [recentComments, workProductRows, labelsByIssueId] = await Promise.all([
+    dbOrTx
+      .select({
+        body: issueComments.body,
+        authorAgentId: issueComments.authorAgentId,
+        authorUserId: issueComments.authorUserId,
+        createdAt: issueComments.createdAt,
+      })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId))
+      .orderBy(desc(issueComments.createdAt))
+      .limit(10),
+    dbOrTx
+      .select({
+        type: issueWorkProducts.type,
+        metadata: issueWorkProducts.metadata,
+        status: issueWorkProducts.status,
+      })
+      .from(issueWorkProducts)
+      .where(eq(issueWorkProducts.issueId, issueId)),
+    labelMapForIssues(dbOrTx, [issueId]),
+  ]);
+
+  const issueLabels = labelsByIssueId.get(issueId) ?? [];
+  return {
+    description,
+    labels: issueLabels.map((l: { name: string }) => ({ name: l.name })),
+    comments: recentComments as EvidenceFetchResult["comments"],
+    workProducts: workProductRows as EvidenceFetchResult["workProducts"],
+  };
 }
 
 const ACTIVE_RUN_STATUSES = ["queued", "running"];
@@ -1430,6 +1475,10 @@ const issueListSelect = {
   createdAt: issues.createdAt,
   updatedAt: issues.updatedAt,
   lastActivityAt: issues.lastActivityAt,
+  // Evidence-gate verdict (BLO-4824). Returned but typically not rendered
+  // in the list view — useful for sorting/filtering issues that have a
+  // recorded verdict.
+  lastEvidenceVerdict: issues.lastEvidenceVerdict,
 };
 
 function withActiveRuns(
@@ -3307,6 +3356,44 @@ export function issueService(db: Db) {
       }
 
       applyStatusSideEffects(issueData.status, patch);
+
+      // Phase-1 warn-only evidence gate (BLO-4824 / BLO-4461). Records the
+      // gate's verdict but never throws — Phase 2 (BLO-4828) will flip
+      // `block` to a 422. Errors during evaluation are swallowed so a
+      // misbehaving gate can't break the PATCH; production runs surface
+      // them via the warn log.
+      if (
+        issueData.status === "in_review" &&
+        existing.status !== "in_review"
+      ) {
+        try {
+          const verdict = await runEvidenceGate(
+            (issueId) => fetchEvidenceForIssue(dbOrTx, issueId, existing.description),
+            id,
+          );
+          patch.lastEvidenceVerdict = verdict;
+          logger.info(
+            {
+              issueId: id,
+              companyId: existing.companyId,
+              verdict: verdict.verdict,
+              missing: verdict.missing,
+              evidenceFound: verdict.evidenceFound,
+              unlabeledFallback: verdict.unlabeledFallback,
+            },
+            `evidence-gate: ${verdict.verdict} on in_review transition`,
+          );
+        } catch (err) {
+          logger.warn(
+            {
+              issueId: id,
+              err: err instanceof Error ? err.message : String(err),
+            },
+            "evidence-gate: evaluation failed; proceeding without verdict",
+          );
+        }
+      }
+
       if (issueData.status && issueData.status !== "done") {
         patch.completedAt = null;
       }
