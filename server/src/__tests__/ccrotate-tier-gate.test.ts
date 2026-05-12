@@ -96,6 +96,35 @@ describe("evaluateTierCacheSnapshot", () => {
     expect(result.usableAccount).toBe("b@x.com");
   });
 
+  it("treats Codex near_limit accounts as usable (≤10% left is still quota)", () => {
+    // BLO-4474: codex producer labels accounts with ≤10% remaining as
+    // "near_limit". Those accounts still have hours of quota and must rotate.
+    const result = evaluateTierCacheSnapshot(
+      "codex",
+      snapshot([
+        { email: "a@x.com", serviceTier: "exhausted", reset7d: 1777651200 },
+        { email: "b@x.com", serviceTier: "near_limit" },
+      ]),
+      now,
+    );
+    expect(result.allow).toBe(true);
+    expect(result.usableAccount).toBe("b@x.com");
+  });
+
+  it("does NOT treat Claude near_limit as usable (Claude has hard 7d cap)", () => {
+    // Asymmetry vs codex: claude's 7d window is hard-enforced. A "near_limit"
+    // claude account (if ever produced) would be one heartbeat from 401s. Keep
+    // it out of the usable set even though codex now allows it.
+    const result = evaluateTierCacheSnapshot(
+      "claude",
+      snapshot([
+        { email: "a@x.com", serviceTier: "near_limit", reset5h: 1777680600 },
+      ]),
+      now,
+    );
+    expect(result.allow).toBe(false);
+  });
+
   it("denies and reports earliest reset across 5h and 7d for Claude when no base account", () => {
     // now = 2026-04-29T00:00:00Z, epoch ~ 1777680000
     const earliest5h = 1777680000 + 600; // 10 minutes from now

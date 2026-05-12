@@ -33,6 +33,7 @@ export interface CcrotateTierCacheAccount {
   email: string;
   status?: string | null;
   serviceTier?: string | null;
+  response?: string | null;
   rateLimits?: {
     reset5h?: number | null;
     reset7d?: number | null;
@@ -100,9 +101,14 @@ export interface CcrotateGateCheckInput {
   now: Date;
 }
 
+// Codex "near_limit" means ≤10% quota left on either 5h or 7d window — still
+// usable until leftPercent hits 0. Codex doesn't enforce a hard cap the way
+// Claude's 7d does; the producer label is informational, not a stop sign.
+// Treating near_limit as unusable starved the codex pool down to 1 account
+// even when 3 others had hours of quota left (BLO-4474).
 const USABLE_TIERS: Record<CcrotateTarget, ReadonlySet<string>> = {
   claude: new Set(["base"]),
-  codex: new Set(["available"]),
+  codex: new Set(["available", "near_limit"]),
 };
 
 const DEFAULT_CACHE_TTL_MS = 30_000;
