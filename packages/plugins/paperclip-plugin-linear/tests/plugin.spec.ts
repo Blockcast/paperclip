@@ -1271,6 +1271,73 @@ describe("paperclip-plugin-linear", () => {
       expect(syncModule.createLink).toHaveBeenCalled();
     });
 
+    it("BLO-3780: writes Paperclip back-link on webhook-driven creation", async () => {
+      // PR-130 (Blockcast/paperclip#130) wired the back-link write into the
+      // polling import path only. The webhook handler creates the mirror
+      // (Issue.create event) but originally did not call attachmentLinkURL —
+      // so every fresh Linear ticket that hit the webhook path got no
+      // auto back-link. This test pins the BLO-3780 fix: same shared
+      // writePaperclipBackLink helper is invoked from the webhook path with
+      // the same URL/title shape as the polling tests above.
+      harness = createTestHarness({
+        manifest,
+        config: {
+          linearClientId: "client-id-123",
+          linearClientSecret: "client-secret-456",
+          teamId: "team-1",
+          syncComments: true,
+          syncDirection: "bidirectional",
+          paperclipBaseUrl: "https://paperclip.test",
+          // best-effort=true to avoid throwing if the mocked Linear fetch
+          // returns something unexpected — assertion is on the call itself.
+          linearBacklinkBestEffort: true,
+        },
+      });
+      await plugin.definition.setup(harness.ctx);
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthToken },
+        "lin_token_123",
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.companyId },
+        "comp-1",
+      );
+      vi.spyOn(harness.ctx.issues, "create").mockResolvedValue({
+        id: "pcp-iss-wh-1",
+        identifier: "LUC-W100",
+      } as never);
+      vi.spyOn(harness.ctx.issues, "update").mockResolvedValue(undefined as never);
+
+      const { attachmentLinkURL } = await import("../src/linear.js");
+      (attachmentLinkURL as ReturnType<typeof vi.fn>).mockClear();
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Issue",
+          action: "create",
+          data: {
+            id: "lin-wh-1",
+            identifier: "LUC-W1",
+            title: "Webhook create",
+            description: "test",
+            priority: 3,
+            state: { type: "started", name: "In Progress" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+      });
+
+      expect(attachmentLinkURL).toHaveBeenCalledOnce();
+      const callArg = (attachmentLinkURL as ReturnType<typeof vi.fn>).mock.calls[0]![2];
+      expect(callArg).toMatchObject({
+        issueId: "lin-wh-1",
+        url: "https://paperclip.test/issues/LUC-W100",
+        title: "Paperclip mirror: LUC-W100",
+      });
+    });
+
     it("skips duplicate webhook for the same Linear issue ID", async () => {
       await harness.ctx.state.set(
         { scopeKind: "instance", stateKey: STATE_KEYS.companyId },

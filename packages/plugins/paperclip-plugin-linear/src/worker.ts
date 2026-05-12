@@ -85,6 +85,58 @@ async function resolveToken(ctx: PluginContext): Promise<string> {
   throw new Error("Not connected to Linear. Use the settings page to connect via OAuth.");
 }
 
+// Write a "Paperclip mirror: <id>" link attachment back to a Linear issue.
+//
+// Shared between the polling-import action and the webhook-create handler so
+// both paths produce the same back-link with the same dedup semantics. URL
+// shape `/issues/<identifier>` per markdown.ts:7. Behavior gated by config:
+//   - paperclipBaseUrl empty             → silent no-op
+//   - paperclipIdentifier null           → warn + no-op (e.g. mirror created
+//                                          with null projectId)
+//   - linearBacklinkBestEffort = true    → warn-and-swallow on write failure
+//   - default (false, strict rollout)    → re-throw so the caller fails loudly
+//
+// No echo-loop guard needed: registerWebhook in linear.ts subscribes to
+// {Issue, Comment, IssueLabel, Project} only, not Attachment events.
+async function writePaperclipBackLink(
+  ctx: PluginContext,
+  token: string,
+  linearIssueId: string,
+  linearIdentifier: string | null,
+  paperclipIdentifier: string | null,
+  paperclipIssueId: string,
+): Promise<void> {
+  if (!paperclipIdentifier) {
+    ctx.logger.warn("Skipped Paperclip back-link: created issue has null identifier", {
+      linearIdentifier,
+      paperclipIssueId,
+    });
+    return;
+  }
+  const config = await ctx.config.get();
+  const paperclipBaseUrl = (config.paperclipBaseUrl as string | undefined)?.trim();
+  if (!paperclipBaseUrl) return;
+  const backLinkBestEffort = config.linearBacklinkBestEffort === true;
+  const paperclipUrl = `${paperclipBaseUrl.replace(/\/$/, "")}/issues/${paperclipIdentifier}`;
+  try {
+    await linear.attachmentLinkURL(ctx.http.fetch.bind(ctx.http), token, {
+      issueId: linearIssueId,
+      url: paperclipUrl,
+      title: `Paperclip mirror: ${paperclipIdentifier}`,
+    });
+  } catch (err) {
+    if (backLinkBestEffort) {
+      ctx.logger.warn("Failed to add Paperclip back-link to Linear issue", {
+        identifier: linearIdentifier,
+        paperclipIdentifier,
+        error: String(err),
+      });
+    } else {
+      throw err;
+    }
+  }
+}
+
 async function getTeamId(ctx: PluginContext): Promise<string> {
   // Try state first (set during OAuth)
   const stored = await ctx.state.get({
@@ -736,40 +788,17 @@ const plugin = definePlugin({
         syncDirection: "bidirectional",
       });
 
-      // Add a Linear attachment pointing back at the Paperclip mirror so
-      // operators viewing the Linear ticket can one-click into Paperclip.
-      // URL shape `/issues/<identifier>` per markdown.ts:7. Behavior gated by
-      // `linearBacklinkBestEffort` config — see manifest for semantics. No
-      // echo-loop guard needed: registerWebhook in linear.ts subscribes to
-      // {Issue, Comment, IssueLabel, Project} only, not Attachment events.
-      const config = await ctx.config.get();
-      const paperclipBaseUrl = (config.paperclipBaseUrl as string | undefined)?.trim();
-      const backLinkBestEffort = config.linearBacklinkBestEffort === true;
-      if (created.identifier && paperclipBaseUrl) {
-        const paperclipUrl = `${paperclipBaseUrl.replace(/\/$/, "")}/issues/${created.identifier}`;
-        try {
-          await linear.attachmentLinkURL(ctx.http.fetch.bind(ctx.http), token, {
-            issueId: linearIssue.id,
-            url: paperclipUrl,
-            title: `Paperclip mirror: ${created.identifier}`,
-          });
-        } catch (err) {
-          if (backLinkBestEffort) {
-            ctx.logger.warn("Failed to add Paperclip back-link to Linear issue", {
-              identifier: linearIssue.identifier,
-              paperclipIdentifier: created.identifier,
-              error: String(err),
-            });
-          } else {
-            throw err;
-          }
-        }
-      } else if (!created.identifier) {
-        ctx.logger.warn("Skipped Paperclip back-link: created issue has null identifier", {
-          linearIdentifier: linearIssue.identifier,
-          paperclipIssueId: created.id,
-        });
-      }
+      // Back-link write — shared helper so the polling-import path here and
+      // the Issue/create webhook handler emit the same attachment shape with
+      // the same dedup + best-effort semantics. See writePaperclipBackLink.
+      await writePaperclipBackLink(
+        ctx,
+        token,
+        linearIssue.id,
+        linearIssue.identifier,
+        created.identifier,
+        created.id,
+      );
 
       return {
         ok: true,
@@ -1537,6 +1566,29 @@ async function handleWebhookEvent(
         });
 
         ctx.logger.info(`Webhook created issue from Linear: ${identifier}`);
+
+        // Back-link write — shared helper with the polling-import path. The
+        // helper itself respects linearBacklinkBestEffort for strict-rollout
+        // semantics. Wrapped in a local try/catch here because the webhook
+        // must return 200 to Linear fast: even a strict-mode back-link
+        // failure shouldn't make Linear retry the whole Issue.create webhook
+        // (the Paperclip mirror was created successfully — that work is
+        // committed). Surfacing the failure via warn is enough.
+        try {
+          const linearToken = await resolveToken(ctx);
+          await writePaperclipBackLink(
+            ctx,
+            linearToken,
+            linearIssueId,
+            identifier ?? null,
+            created.identifier ?? null,
+            created.id,
+          );
+        } catch (err) {
+          ctx.logger.warn(
+            `Webhook back-link write failed for ${identifier ?? linearIssueId}: ${err}`,
+          );
+        }
       } catch (err) {
         ctx.logger.warn(`Webhook failed to create issue: ${err}`);
       } finally {
