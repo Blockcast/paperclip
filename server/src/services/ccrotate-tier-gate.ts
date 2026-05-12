@@ -73,6 +73,13 @@ export interface CcrotateTierGateOptions {
   cacheTtlMs?: number;
   /** Grace period appended to the earliest reset epoch when computing resumeAt. */
   graceMs?: number;
+  /**
+   * Hard cap on how long a per-agent deferral memo can suppress re-evaluation.
+   * The memo's `expiresAt` is clamped to `min(resumeAt, now + maxDeferralMs)`
+   * so a far-future resumeAt cannot make the gate skip the same agent for
+   * hours. Defaults to 15 min.
+   */
+  maxDeferralMs?: number;
 }
 
 export interface CcrotateGateAllowResult {
@@ -101,18 +108,32 @@ export interface CcrotateGateCheckInput {
   now: Date;
 }
 
+// Claude "extra" = base quota exceeded but the account is on paid overage with
+// real capacity (visible as `🟢 usable now` in `ccrotate when`). ccrotate's own
+// `/api/ccrotate/status` lists `extra`-tier accounts under `usableNow`.
+// Excluding extra-tier accounts caused the 2026-05-12 multi-hour UXDesigner
+// outage where 6 accounts were usableNow but the gate only matched "base"
+// → fell into the deny path → cached the deferral with a 28h resumeAt
+// (BLO-4975). Treat extra exactly like base for usability.
+//
 // Codex "near_limit" means ≤10% quota left on either 5h or 7d window — still
 // usable until leftPercent hits 0. Codex doesn't enforce a hard cap the way
 // Claude's 7d does; the producer label is informational, not a stop sign.
 // Treating near_limit as unusable starved the codex pool down to 1 account
 // even when 3 others had hours of quota left (BLO-4474).
 const USABLE_TIERS: Record<CcrotateTarget, ReadonlySet<string>> = {
-  claude: new Set(["base"]),
+  claude: new Set(["base", "extra"]),
   codex: new Set(["available", "near_limit"]),
 };
 
 const DEFAULT_CACHE_TTL_MS = 30_000;
 const DEFAULT_GRACE_MS = 120_000;
+// Cap on how long a single deferral memo can suppress re-evaluation. Even if
+// the cache says no account resets for 28h, we should re-read every
+// MAX_DEFERRAL_MS so a fresh `refresh-one`, a new switch, or an account
+// moving back to usable gets picked up promptly. Without this, a far-future
+// resumeAt locked the same agent into a 28h skip (BLO-4975).
+const DEFAULT_MAX_DEFERRAL_MS = 15 * 60_000;
 
 /**
  * Maps a paperclip agent adapter type to the ccrotate target whose tier-cache
@@ -228,6 +249,7 @@ interface DeferralEntry {
 export function createCcrotateTierGate(opts: CcrotateTierGateOptions): CcrotateTierGate {
   const cacheTtlMs = opts.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
   const graceMs = opts.graceMs ?? DEFAULT_GRACE_MS;
+  const maxDeferralMs = opts.maxDeferralMs ?? DEFAULT_MAX_DEFERRAL_MS;
 
   const cache = new Map<CcrotateTarget, CacheEntry>();
   const deferrals = new Map<string, DeferralEntry>();
@@ -331,10 +353,17 @@ export function createCcrotateTierGate(opts: CcrotateTierGateOptions): CcrotateT
       const resumeAtMs =
         evaluation.resumeAt === null ? null : evaluation.resumeAt.getTime() + graceMs;
 
-      // Memoize so we don't re-log on every tick. Keep the memo at least until
-      // the resume time we just computed — after that the next tick re-reads
-      // the cache.
-      const expiresAt = resumeAtMs ?? nowMs + cacheTtlMs;
+      // Memoize so we don't re-log on every tick. We expire the memo at the
+      // earlier of the cache-claimed resume time and `now + maxDeferralMs`.
+      // The cap is what lets the gate notice when ccrotate fixes things faster
+      // than the cache predicted — e.g. an out-of-band `ccrotate switch` flips
+      // active to a usable account, or `refresh-one` updates a tier. Without
+      // the cap, a far-future resumeAt would lock the agent into a multi-hour
+      // skip even after the pool recovered (BLO-4975).
+      const cap = nowMs + maxDeferralMs;
+      const expiresAt = resumeAtMs === null
+        ? nowMs + cacheTtlMs
+        : Math.min(resumeAtMs, cap);
       deferrals.set(key, { resumeAt: resumeAtMs, expiresAt });
 
       opts.log.info(

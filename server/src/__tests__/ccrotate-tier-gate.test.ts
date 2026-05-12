@@ -111,6 +111,24 @@ describe("evaluateTierCacheSnapshot", () => {
     expect(result.usableAccount).toBe("b@x.com");
   });
 
+  it("treats Claude extra tier as usable (paid overage with capacity)", () => {
+    // BLO-4975: ccrotate marks paid-overage accounts as `serviceTier: "extra"`
+    // and reports them as `usableNow` — they have real capacity until
+    // reset5h/reset7d hits 0%. The gate must mirror that or it will defer
+    // dispatch even when usable accounts exist (the 2026-05-12 4h45m
+    // UXDesigner outage).
+    const result = evaluateTierCacheSnapshot(
+      "claude",
+      snapshot([
+        { email: "a@x.com", serviceTier: "exhausted", reset7d: 1777651200 },
+        { email: "b@x.com", serviceTier: "extra" },
+      ]),
+      now,
+    );
+    expect(result.allow).toBe(true);
+    expect(result.usableAccount).toBe("b@x.com");
+  });
+
   it("does NOT treat Claude near_limit as usable (Claude has hard 7d cap)", () => {
     // Asymmetry vs codex: claude's 7d window is hard-enforced. A "near_limit"
     // claude account (if ever produced) would be one heartbeat from 401s. Keep
@@ -125,14 +143,14 @@ describe("evaluateTierCacheSnapshot", () => {
     expect(result.allow).toBe(false);
   });
 
-  it("denies and reports earliest reset across 5h and 7d for Claude when no base account", () => {
+  it("denies and reports earliest reset across 5h and 7d for Claude when no usable account", () => {
     // now = 2026-04-29T00:00:00Z, epoch ~ 1777680000
     const earliest5h = 1777680000 + 600; // 10 minutes from now
     const otherReset = 1777680000 + 7200; // 2 hours from now
     const result = evaluateTierCacheSnapshot(
       "claude",
       snapshot([
-        { email: "a@x.com", serviceTier: "extra", reset5h: earliest5h, reset7d: otherReset },
+        { email: "a@x.com", serviceTier: "exhausted", reset5h: earliest5h, reset7d: otherReset },
         { email: "b@x.com", serviceTier: "exhausted", reset7d: otherReset + 3600 },
       ]),
       now,
@@ -159,7 +177,7 @@ describe("evaluateTierCacheSnapshot", () => {
     const result = evaluateTierCacheSnapshot(
       "claude",
       snapshot([
-        { email: "a@x.com", serviceTier: "extra", reset5h: past, reset7d: future },
+        { email: "a@x.com", serviceTier: "exhausted", reset5h: past, reset7d: future },
       ]),
       now,
     );
@@ -239,7 +257,7 @@ describe("evaluateTierCacheSnapshot", () => {
           {
             email: "exhausted@x.com",
             status: "success",
-            serviceTier: "extra",
+            serviceTier: "exhausted",
             rateLimits: { reset5h: now.getTime() / 1000 + 600 },
           },
           {
@@ -325,7 +343,7 @@ describe("createCcrotateTierGate", () => {
     const reset = Math.floor(now.getTime() / 1000) + 600;
     const readCache = vi.fn().mockResolvedValue(
       snapshot([
-        { email: "a@x.com", serviceTier: "extra", reset5h: reset },
+        { email: "a@x.com", serviceTier: "exhausted", reset5h: reset },
       ]),
     );
     const info = vi.fn();
@@ -354,7 +372,7 @@ describe("createCcrotateTierGate", () => {
     const now0 = new Date("2026-04-29T00:00:00.000Z");
     const reset = Math.floor(now0.getTime() / 1000) + 600;
     const readCache = vi.fn().mockResolvedValue(
-      snapshot([{ email: "a@x.com", serviceTier: "extra", reset5h: reset }]),
+      snapshot([{ email: "a@x.com", serviceTier: "exhausted", reset5h: reset }]),
     );
     const gate = createCcrotateTierGate({
       readCache,
@@ -392,7 +410,7 @@ describe("createCcrotateTierGate", () => {
       .mockImplementation((target: "claude" | "codex") =>
         Promise.resolve(
           target === "claude"
-            ? snapshot([{ email: "c@x.com", serviceTier: "extra", reset5h: reset }])
+            ? snapshot([{ email: "c@x.com", serviceTier: "exhausted", reset5h: reset }])
             : snapshot([{ email: "x@x.com", serviceTier: "available" }]),
         ),
       );
@@ -419,7 +437,7 @@ describe("createCcrotateTierGate", () => {
   it("clears the deferral memo once a usable account reappears", async () => {
     const now0 = new Date("2026-04-29T00:00:00.000Z");
     const reset = Math.floor(now0.getTime() / 1000) + 600;
-    const denySnapshot = snapshot([{ email: "a@x.com", serviceTier: "extra", reset5h: reset }]);
+    const denySnapshot = snapshot([{ email: "a@x.com", serviceTier: "exhausted", reset5h: reset }]);
     const allowSnapshot = snapshot([{ email: "a@x.com", serviceTier: "base" }]);
     const readCache = vi
       .fn()
@@ -452,7 +470,7 @@ describe("createCcrotateTierGate", () => {
     const now0 = new Date("2026-04-29T00:00:00.000Z");
     const reset = Math.floor(now0.getTime() / 1000) + 600;
     const readCache = vi.fn().mockResolvedValue(
-      snapshot([{ email: "a@x.com", serviceTier: "extra", reset5h: reset }]),
+      snapshot([{ email: "a@x.com", serviceTier: "exhausted", reset5h: reset }]),
     );
     const info = vi.fn();
     const gate = createCcrotateTierGate({
@@ -472,6 +490,54 @@ describe("createCcrotateTierGate", () => {
     // Different agent should log its own deferral
     await gate.checkAdapter({ adapterType: "claude_local", agentId: "a2", now: now0 });
     expect(info).toHaveBeenCalledTimes(2);
+  });
+
+  it("caps the deferral memo at maxDeferralMs even when resumeAt is far in the future", async () => {
+    // BLO-4975: in the 2026-05-12 incident the scheduler memoized a 28h
+    // deferral and stopped re-reading the cache. The pool recovered hours
+    // before the memo expired, but the gate kept returning deny. With the
+    // cap, the memo expires after maxDeferralMs (default 15 min, override
+    // here for fast test) so a recovered pool gets picked up within that
+    // window.
+    const now0 = new Date("2026-04-29T00:00:00.000Z");
+    const farFutureReset = Math.floor(now0.getTime() / 1000) + 28 * 60 * 60; // 28h out
+    const denySnapshot = snapshot([
+      { email: "stuck@x.com", serviceTier: "exhausted", reset7d: farFutureReset },
+    ]);
+    const allowSnapshot = snapshot([{ email: "recovered@x.com", serviceTier: "base" }]);
+    const readCache = vi
+      .fn()
+      .mockResolvedValueOnce(denySnapshot)
+      .mockResolvedValueOnce(allowSnapshot);
+    const info = vi.fn();
+    const gate = createCcrotateTierGate({
+      readCache,
+      log: { info, warn: vi.fn() },
+      cacheTtlMs: 30_000,
+      maxDeferralMs: 60_000, // 1 minute cap for the test
+    });
+
+    const denied = await gate.checkAdapter({
+      adapterType: "claude_local",
+      agentId: "a1",
+      now: now0,
+    });
+    expect(denied.allow).toBe(false);
+    // The returned resumeAt still reflects the cache's far-future claim (for
+    // diagnostic logging) — only the in-memory expiry is capped.
+    if (!denied.allow) {
+      expect(denied.resumeAt!.getTime()).toBe(farFutureReset * 1000 + 120_000);
+    }
+
+    // Just past the cap — gate must re-read the cache and pick up recovery.
+    const afterCap = new Date(now0.getTime() + 61_000);
+    const allowed = await gate.checkAdapter({
+      adapterType: "claude_local",
+      agentId: "a1",
+      now: afterCap,
+    });
+    expect(allowed.allow).toBe(true);
+    expect(readCache).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -565,7 +631,7 @@ describe("createCcrotateTierGate switcher integration", () => {
   it("does not call switcher on the deny path", async () => {
     const reset = Math.floor(now.getTime() / 1000) + 600;
     const readCache = vi.fn().mockResolvedValue(
-      snapshot([{ email: "a@x.com", serviceTier: "extra", reset5h: reset }]),
+      snapshot([{ email: "a@x.com", serviceTier: "exhausted", reset5h: reset }]),
     );
     const switchTo = vi.fn();
     const gate = createCcrotateTierGate({
