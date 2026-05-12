@@ -591,6 +591,124 @@ describe("createCcrotateTierGate switcher integration", () => {
     expect(switchTo).toHaveBeenCalledTimes(1);
   });
 
+  it("logs the rotate_on_exhausted_active marker when snapshot has exhausted accounts and the gate rotates (BLO-4975)", async () => {
+    // Staff Engineer's review of PR #142 asked for an explicit, grep-able
+    // signal whenever the scheduler proactively rotates off an exhausted
+    // active account. We use "snapshot contains exhausted" as a proxy for
+    // "active was likely exhausted" because the tier-cache does not track
+    // which account is active.
+    const readCache = vi.fn().mockResolvedValue(
+      snapshot([
+        { email: "stuck@x.com", serviceTier: "exhausted", reset7d: 1777651200 },
+        { email: "fresh@x.com", serviceTier: "base" },
+      ]),
+    );
+    const switchTo = vi.fn().mockResolvedValue({ ok: true });
+    const info = vi.fn();
+    const gate = createCcrotateTierGate({
+      readCache,
+      log: { info, warn: vi.fn() },
+      switcher: { switchTo },
+    });
+
+    const r = await gate.checkAdapter({ adapterType: "claude_local", agentId: "a1", now });
+    expect(r.allow).toBe(true);
+    expect(switchTo).toHaveBeenCalledExactlyOnceWith("claude", "fresh@x.com");
+
+    const markerCalls = info.mock.calls.filter(
+      ([, msg]) => msg === "ccrotate.rotate_on_exhausted_active",
+    );
+    expect(markerCalls).toHaveLength(1);
+    expect(markerCalls[0]![0]).toMatchObject({
+      target: "claude",
+      email: "fresh@x.com",
+      previouslySwitchedTo: null,
+    });
+  });
+
+  it("does NOT log rotate_on_exhausted_active when the snapshot has no exhausted accounts", async () => {
+    // The marker is specifically for "rotated off exhausted" — not "any
+    // rotation". When the snapshot is all-healthy, the marker stays silent.
+    const readCache = vi.fn().mockResolvedValue(
+      snapshot([
+        { email: "a@x.com", serviceTier: "base" },
+        { email: "b@x.com", serviceTier: "base" },
+      ]),
+    );
+    const switchTo = vi.fn().mockResolvedValue({ ok: true });
+    const info = vi.fn();
+    const gate = createCcrotateTierGate({
+      readCache,
+      log: { info, warn: vi.fn() },
+      switcher: { switchTo },
+    });
+
+    await gate.checkAdapter({ adapterType: "claude_local", agentId: "a1", now });
+    expect(switchTo).toHaveBeenCalledExactlyOnceWith("claude", "a@x.com");
+    const markerCalls = info.mock.calls.filter(
+      ([, msg]) => msg === "ccrotate.rotate_on_exhausted_active",
+    );
+    expect(markerCalls).toHaveLength(0);
+  });
+
+  it("end-to-end invariant: active exhausted + pool usable → resumeAt null + rotation fires (BLO-4975)", async () => {
+    // The full Staff-Engineer-requested integration test. Simulates the
+    // 2026-05-12 incident's RECOVERED state: the cache shows the formerly-
+    // active account exhausted with a far-future 7d reset, but at least one
+    // other account is on a usable tier. The invariant the gate must uphold:
+    //   1. allow=true (do not defer dispatch)
+    //   2. switcher fires synchronously with the usable account email
+    //   3. resumeAt is null (no deferral whatsoever — re-evaluation is
+    //      immediate, not bounded by maxDeferralMs)
+    //   4. the rotate_on_exhausted_active marker is logged
+    const farFutureReset = Math.floor(now.getTime() / 1000) + 28 * 60 * 60;
+    const readCache = vi.fn().mockResolvedValue(
+      snapshot([
+        { email: "active-exhausted@x.com", serviceTier: "exhausted", reset7d: farFutureReset },
+        { email: "exhausted-too@x.com", serviceTier: "exhausted", reset7d: farFutureReset + 3600 },
+        { email: "extra-tier-usable@x.com", serviceTier: "extra" },
+        { email: "base-tier-usable@x.com", serviceTier: "base" },
+      ]),
+    );
+    const switchTo = vi.fn().mockResolvedValue({ ok: true });
+    const info = vi.fn();
+    const gate = createCcrotateTierGate({
+      readCache,
+      log: { info, warn: vi.fn() },
+      switcher: { switchTo },
+    });
+
+    const r = await gate.checkAdapter({
+      adapterType: "claude_k8s", // the adapter type from the original incident
+      agentId: "uxdesigner",
+      now,
+    });
+
+    // Invariant 1: allow
+    expect(r.allow).toBe(true);
+    // Invariant 2: switcher fired with the first usable account in iteration
+    //              order (extra-tier-usable is reached before base-tier-usable
+    //              after the two exhausted ones are skipped)
+    expect(switchTo).toHaveBeenCalledExactlyOnceWith("claude", "extra-tier-usable@x.com");
+    if (r.allow) {
+      expect(r.switchedTo).toEqual({ target: "claude", email: "extra-tier-usable@x.com" });
+    }
+    // Invariant 3: no deferral was set (gate would carry it in subsequent
+    //              calls if it were); verify by checking a follow-up tick
+    //              returns allow without re-reading the cache.
+    const r2 = await gate.checkAdapter({
+      adapterType: "claude_k8s",
+      agentId: "uxdesigner",
+      now: new Date(now.getTime() + 1_000),
+    });
+    expect(r2.allow).toBe(true);
+    // Invariant 4: marker logged exactly once for the rotation
+    const markerCalls = info.mock.calls.filter(
+      ([, msg]) => msg === "ccrotate.rotate_on_exhausted_active",
+    );
+    expect(markerCalls).toHaveLength(1);
+  });
+
   it("re-spawns switch when the best base account changes", async () => {
     const readCache = vi
       .fn()

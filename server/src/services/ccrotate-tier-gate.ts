@@ -331,6 +331,34 @@ export function createCcrotateTierGate(opts: CcrotateTierGateOptions): CcrotateT
         deferrals.delete(key);
         const email = evaluation.usableAccount;
         if (email && opts.switcher && lastSwitchedEmail.get(target) !== email) {
+          // BLO-4975 invariant: when the snapshot shows at least one
+          // exhausted account AND we are switching to a different one,
+          // this rotation IS the "rotate-on-exhausted-active" case Staff
+          // Engineer asked us to surface explicitly. Log a deterministic
+          // marker before firing the switch so production has a grep-able
+          // signal of when the scheduler proactively corrected a stuck
+          // active pointer (vs. the rotation happening through some other
+          // path like quotaExhaustedHook or refresh-one).
+          //
+          // We use snapshot-has-exhausted as a proxy for "active is
+          // exhausted" because the tier-cache does not record which
+          // account is currently active. In practice the two coincide:
+          // if the pool has any exhausted account, the gate is either
+          // about to rotate off it or has just rotated off it. False
+          // positives are harmless — the marker is observational.
+          const snapshotHasExhausted = snapshot.accounts.some(
+            (acc) => acc.status === "success" && acc.serviceTier === "exhausted",
+          );
+          if (snapshotHasExhausted) {
+            opts.log.info(
+              {
+                target,
+                email,
+                previouslySwitchedTo: lastSwitchedEmail.get(target) ?? null,
+              },
+              "ccrotate.rotate_on_exhausted_active",
+            );
+          }
           const result = await opts.switcher.switchTo(target, email);
           if (result.ok) {
             lastSwitchedEmail.set(target, email);
