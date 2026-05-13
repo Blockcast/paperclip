@@ -45,7 +45,7 @@ interface ExhaustedEntry {
   resumesInSec: number;
 }
 
-interface TargetStatus {
+export interface TargetStatus {
   active: string | null;
   usableNow: string[];
   stale: string[];
@@ -88,7 +88,7 @@ function parseDurationToSeconds(s: string): number {
   return total;
 }
 
-function parseWhenOutput(out: string): TargetStatus {
+export function parseWhenOutput(out: string): TargetStatus {
   const status = emptyStatus();
   for (const rawLine of out.split("\n")) {
     const line = rawLine.trim();
@@ -98,7 +98,12 @@ function parseWhenOutput(out: string): TargetStatus {
     if (!emailMatch) continue;
     const email = emailMatch[1];
     if (line.includes("★")) status.active = email;
-    if (/usable now\b/.test(line)) {
+    // BLO-4938: codex `near_limit` accounts are still rotation candidates
+    // per ccrotate 1.1.1-kkroo.12 (BLO-4474), but the `ccrotate when` row
+    // ends in `in <duration>` (the next reset). Without this guard, near_limit
+    // lines fall through to the `in <duration>` branch and get mis-routed to
+    // `exhausted`. Check the tier label before the reset hint.
+    if (/usable now\b/.test(line) || /\bnear_limit\b/.test(line)) {
       status.usableNow.push(email);
     } else if (/\bstale\b/.test(line)) {
       status.stale.push(email);
