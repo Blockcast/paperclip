@@ -618,6 +618,7 @@ export function AdapterManager() {
                     supportsSkills: false,
                     supportsLocalAgentJwt: false,
                     requiresMaterializedRuntimeSkills: false,
+                    supportsModelProfiles: false,
                   },
                 }}
                 canRemove={false}

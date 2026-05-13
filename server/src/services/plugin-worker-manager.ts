@@ -1013,7 +1013,7 @@ export function createPluginWorkerHandle(
     params: HostToWorkerMethods[M][0],
     timeoutMs?: number,
   ): Promise<HostToWorkerMethods[M][1]> {
-    return new Promise<HostToWorkerMethods[M][1]>((resolve, reject) => {
+    const rpcPromise = new Promise<HostToWorkerMethods[M][1]>((resolve, reject) => {
       if (!childProcess?.stdin?.writable) {
         reject(
           new Error(
@@ -1083,6 +1083,14 @@ export function createPluginWorkerHandle(
         );
       }
     });
+
+    // Some call sites hand these promises across async boundaries before
+    // attaching their own handlers. Mark the promise as handled here so a
+    // worker-side JSON-RPC error can fail the caller without killing the host
+    // process via an unhandled rejection.
+    void rpcPromise.catch(() => undefined);
+
+    return rpcPromise;
   }
 
   // -----------------------------------------------------------------------

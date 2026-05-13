@@ -111,6 +111,7 @@ function createIssue(overrides: Partial<Issue> = {}): Issue {
     labelIds: [],
     currentExecutionWorkspace: null,
     ...overrides,
+    workMode: overrides.workMode ?? "standard",
   };
 }
 

@@ -120,20 +120,6 @@ export const heartbeatPolicySchema = z
     }
   });
 
-const runtimeConfigSchema = z.record(z.unknown()).superRefine((value, ctx) => {
-  const heartbeatValue = value.heartbeat;
-  if (heartbeatValue === undefined) return;
-  const parsed = heartbeatPolicySchema.safeParse(heartbeatValue);
-  if (parsed.success) return;
-  for (const issue of parsed.error.issues) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: issue.message,
-      path: ["heartbeat", ...issue.path],
-    });
-  }
-});
-
 export const agentInstructionsBundleModeSchema = z.enum(["managed", "external"]);
 
 export const updateAgentInstructionsBundleSchema = z.object({
@@ -173,6 +159,31 @@ export const createAgentInstructionsBundleSchema = z.object({
   }),
 });
 
+const agentModelProfileConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  label: z.string().trim().min(1).optional(),
+  adapterConfig: adapterConfigSchema,
+}).strict();
+
+export const agentRuntimeConfigSchema = z.object({
+  modelProfiles: z.object({
+    cheap: agentModelProfileConfigSchema.optional(),
+  }).strict().optional(),
+}).catchall(z.unknown()).superRefine((value, ctx) => {
+  // kkroo: validate optional heartbeat policy if present
+  const heartbeatValue = (value as Record<string, unknown>).heartbeat;
+  if (heartbeatValue === undefined) return;
+  const parsed = heartbeatPolicySchema.safeParse(heartbeatValue);
+  if (parsed.success) return;
+  for (const issue of parsed.error.issues) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: issue.message,
+      path: ["heartbeat", ...issue.path],
+    });
+  }
+});
+
 export const createAgentSchema = z.object({
   name: z.string().min(1),
   role: z.enum(AGENT_ROLES).optional().default("general"),
@@ -185,7 +196,7 @@ export const createAgentSchema = z.object({
   adapterConfig: adapterConfigSchema.optional().default({}),
   instructionsBundle: createAgentInstructionsBundleSchema.optional(),
   defaultEnvironmentId: z.string().uuid().optional().nullable(),
-  runtimeConfig: runtimeConfigSchema.optional().default({}),
+  runtimeConfig: agentRuntimeConfigSchema.optional().default({}),
   budgetMonthlyCents: z.number().int().nonnegative().optional().default(0),
   permissions: agentPermissionsSchema.optional(),
   metadata: z.record(z.unknown()).optional().nullable(),
@@ -255,10 +266,12 @@ export type ResetAgentSession = z.infer<typeof resetAgentSessionSchema>;
 export const testAdapterEnvironmentSchema = z.object({
   adapterConfig: adapterConfigSchema.optional().default({}),
   /**
-   * Environment id the agent runs against. When provided and the environment
-   * resolves to a remote driver (SSH/sandbox), the adapter's testEnvironment
-   * impl probes that target instead of the local host — needed because the
-   * pod has no per-user codex/claude credentials.
+   * Optional environment to run the adapter test inside. When omitted, the
+   * test runs against the local Paperclip host. When provided and the
+   * environment is non-local (SSH/sandbox), the test probes are executed
+   * inside that environment so the result reflects real agent execution.
+   * (For the k8s-vendored deploy, the pod has no per-user codex/claude
+   * credentials, so a non-null environmentId is effectively required.)
    */
   environmentId: z.string().uuid().nullable().optional(),
 });
