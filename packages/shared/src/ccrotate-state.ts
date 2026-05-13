@@ -115,6 +115,31 @@ function tierCacheFilename(target: TierCacheTarget): string {
 }
 
 /**
+ * Refresh window for trusting existing utilization data when deciding
+ * whether a runtime quota burn looks like a real cap hit. If the cache
+ * was probed within this window and shows both 5h and 7d well below
+ * cap, the burn is likely non-cap (overage credits out, transient
+ * concurrent limit, content filter) and we should NOT flip the account
+ * out of rotation.
+ */
+const UTILIZATION_FRESHNESS_MS = 30 * 60 * 1000;
+
+/**
+ * Threshold below which an existing utilization% counts as "well below cap".
+ * Matches the gate in ccrotate's account-table.js#isUsableNow.
+ */
+const NOT_AT_CAP_PCT = 95;
+
+export interface MarkAccountExhaustedResult {
+  skipped: boolean;
+  reason?: string;
+  email?: string;
+  utilization5h?: number | null;
+  utilization7d?: number | null;
+  snapshotAgeMs?: number;
+}
+
+/**
  * Atomically mark an account as `serviceTier: 'exhausted'` in the shared
  * tier-cache for `target`. Captures runtime quota-failure events observed
  * by the orchestrator (paperclip-server) — the reset epoch comes from the
@@ -126,6 +151,15 @@ function tierCacheFilename(target: TierCacheTarget): string {
  * by Anthropic's per-org Usage API rate limit, so tier-cache stays "unknown"
  * while the runtime is observing the same burns and dropping the data on
  * the floor. Pool spirals into a retry storm. Real incident 2026-05-08.
+ *
+ * Guard against false positives: if the cache entry has FRESH utilization
+ * data showing both rolling windows below 95%, the burn is likely NOT from
+ * a real cap (overage credits out, transient concurrent limit, content
+ * filter). In that case we skip the write and return `{skipped: true}` so
+ * the caller can log/instrument. Real incident 2026-05-13:
+ * `ramadan@blockcast.net` (5h:6% 7d:1%) and `omar.ramadan93@blockcast.net`
+ * (5h:87% 7d:53%) both flipped to 'exhausted' by this writeback path,
+ * collapsing the pool to 1 viable account.
  */
 export async function markAccountExhausted(
   profilesDir: string,
@@ -136,13 +170,13 @@ export async function markAccountExhausted(
     reset7d?: number | null;
     response?: string | null;
   } = {},
-): Promise<void> {
+): Promise<MarkAccountExhaustedResult> {
   const target = fields.target ?? "claude";
   const reset5h = fields.reset5h ?? null;
   const reset7d = fields.reset7d ?? null;
   const response = fields.response ?? null;
 
-  await withCcrotateLock(profilesDir, () => {
+  return await withCcrotateLock(profilesDir, () => {
     const tierCachePath = path.join(profilesDir, tierCacheFilename(target));
 
     let cache: TierCache = { updatedAt: null, accounts: [] };
@@ -158,6 +192,31 @@ export async function markAccountExhausted(
     }
 
     const existing = cache.accounts.find((a) => a.email === email);
+
+    // Guard: only mark exhausted when we DON'T have fresh evidence the
+    // account is well below cap. Stale data or at-cap utilization both
+    // fall through to the write path.
+    const existingRl = existing?.rateLimits ?? {};
+    const u5h = (existingRl as { utilization5h?: number | null }).utilization5h;
+    const u7d = (existingRl as { utilization7d?: number | null }).utilization7d;
+    const snapshotAtStr = (existingRl as { snapshotCapturedAt?: string | null }).snapshotCapturedAt;
+    const snapshotAt = snapshotAtStr ? Date.parse(snapshotAtStr) : NaN;
+    const dataAgeMs = Number.isFinite(snapshotAt) ? Date.now() - snapshotAt : Infinity;
+    const utilizationIsFreshAndLow =
+      dataAgeMs <= UTILIZATION_FRESHNESS_MS &&
+      typeof u5h === "number" && u5h < NOT_AT_CAP_PCT &&
+      typeof u7d === "number" && u7d < NOT_AT_CAP_PCT;
+    if (utilizationIsFreshAndLow) {
+      return {
+        skipped: true,
+        reason: "utilization below cap on fresh data",
+        email,
+        utilization5h: u5h,
+        utilization7d: u7d,
+        snapshotAgeMs: dataAgeMs,
+      } satisfies MarkAccountExhaustedResult;
+    }
+
     const others = cache.accounts.filter((a) => a.email !== email);
     const resetEpoch = reset5h ?? reset7d;
     const fallbackResp = resetEpoch
@@ -185,5 +244,6 @@ export async function markAccountExhausted(
     const tmp = `${tierCachePath}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(next, null, 2), "utf8");
     fs.renameSync(tmp, tierCachePath);
+    return { skipped: false, email } satisfies MarkAccountExhaustedResult;
   });
 }

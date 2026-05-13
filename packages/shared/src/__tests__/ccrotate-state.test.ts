@@ -137,4 +137,98 @@ describe("markAccountExhausted", () => {
     expect(cache.accounts[0].response).toContain("quota exhausted");
     expect(cache.accounts[0].response).toContain(new Date(reset * 1000).toISOString());
   });
+
+  it("refuses to mark exhausted when fresh utilization shows both windows below cap", async () => {
+    // Regression: paperclip-server's quota-writeback fires on any 429-like
+    // outcome, including overage-credits-out and transient concurrent-limit
+    // rejections. If the existing cache says utilization is well below cap
+    // and the snapshot is fresh, the burn isn't from a real cap — don't park
+    // a usable account behind a wait. Real incident 2026-05-13:
+    // ramadan@blockcast.net at 5h:6% 7d:1% flipped to exhausted.
+    fs.writeFileSync(
+      path.join(workDir, "tier-cache.json"),
+      JSON.stringify({
+        updatedAt: new Date().toISOString(),
+        accounts: [
+          {
+            email: "usable@example.com",
+            status: "success",
+            serviceTier: "base",
+            response: "base (5h:6% 7d:1%)",
+            rateLimits: {
+              utilization5h: 6,
+              utilization7d: 1,
+              snapshotCapturedAt: new Date().toISOString(),
+            },
+          },
+        ],
+      }),
+    );
+
+    const result = await markAccountExhausted(workDir, "usable@example.com", { reset5h: 12345 });
+
+    expect(result).toMatchObject({ skipped: true, reason: "utilization below cap on fresh data" });
+
+    // Cache entry untouched.
+    const cache = readTierCache();
+    expect(cache.accounts[0].serviceTier).toBe("base");
+    expect(cache.accounts[0].rateLimits.reset5h).toBeUndefined();
+  });
+
+  it("still marks exhausted when utilization data is stale (>30min) even if percentages are low", async () => {
+    // The freshness guard must not lock out legitimate burns when the cache
+    // snapshot is older than the freshness window. Otherwise a long-running
+    // pool with stale probes would suppress real exhaustion.
+    const stale = new Date(Date.now() - 60 * 60 * 1000).toISOString(); // 1h old
+    fs.writeFileSync(
+      path.join(workDir, "tier-cache.json"),
+      JSON.stringify({
+        updatedAt: stale,
+        accounts: [
+          {
+            email: "stale@example.com",
+            status: "success",
+            serviceTier: "base",
+            rateLimits: { utilization5h: 6, utilization7d: 1, snapshotCapturedAt: stale },
+          },
+        ],
+      }),
+    );
+
+    const reset = Math.floor(Date.now() / 1000) + 1800;
+    const result = await markAccountExhausted(workDir, "stale@example.com", { reset5h: reset });
+
+    expect(result).toMatchObject({ skipped: false });
+    const cache = readTierCache();
+    expect(cache.accounts[0].serviceTier).toBe("exhausted");
+    expect(cache.accounts[0].rateLimits.reset5h).toBe(reset);
+  });
+
+  it("still marks exhausted when utilization is at-or-above cap on fresh data", async () => {
+    // Guard must not shadow a real cap hit. If utilization is at/above 95%
+    // the burn is consistent with a real cap and we should mark exhausted.
+    fs.writeFileSync(
+      path.join(workDir, "tier-cache.json"),
+      JSON.stringify({
+        updatedAt: new Date().toISOString(),
+        accounts: [
+          {
+            email: "real-cap@example.com",
+            status: "success",
+            serviceTier: "base",
+            rateLimits: {
+              utilization5h: 5,
+              utilization7d: 99,
+              snapshotCapturedAt: new Date().toISOString(),
+            },
+          },
+        ],
+      }),
+    );
+
+    const result = await markAccountExhausted(workDir, "real-cap@example.com", { reset7d: 7777777 });
+    expect(result).toMatchObject({ skipped: false });
+    const cache = readTierCache();
+    expect(cache.accounts[0].serviceTier).toBe("exhausted");
+  });
 });
