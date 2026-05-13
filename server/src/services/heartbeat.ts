@@ -6701,7 +6701,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         const deferredPayload = parseObject(deferred.payload);
         const deferredContextSeed = parseObject(deferredPayload[DEFERRED_WAKE_CONTEXT_KEY]);
-        const activePauseHold = await treeControlSvc.getActivePauseHoldGate(issue.companyId, issue.id);
+        // Pass tx so the gate lookup reuses the txn's connection instead of taking another from the pool while holding FOR UPDATE locks (BLO-3855).
+        const activePauseHold = await treeControlSvc.getActivePauseHoldGate(issue.companyId, issue.id, tx);
         const treeHoldInteractionWake = activePauseHold && await isVerifiedIssueTreeControlInteractionWake(tx, {
           companyId: issue.companyId,
           issueId: issue.id,
@@ -6888,7 +6889,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { kind: "released" as const };
       }
 
-      if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
+      if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc, tx)) {
         return { kind: "released" as const };
       }
 
