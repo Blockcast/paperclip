@@ -84,6 +84,7 @@ import {
   buildWorkspaceReadyComment,
   cleanupExecutionWorkspaceArtifacts,
   ensureRuntimeServicesForRun,
+  ensurePersistedExecutionWorkspaceAvailable,
   persistAdapterManagedRuntimeServices,
   realizeExecutionWorkspace,
   releaseRuntimeServicesForRun,
@@ -691,6 +692,19 @@ async function ensureManagedProjectWorkspace(input: {
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     throw new Error(`Failed to prepare managed checkout for "${input.repoUrl}" at "${cwd}": ${reason}`);
+  }
+}
+
+async function isGitCheckoutDir(cwd: string): Promise<boolean> {
+  try {
+    await execFile("git", ["rev-parse", "--is-inside-work-tree"], {
+      cwd,
+      env: sanitizeRuntimeServiceBaseEnv(process.env),
+      timeout: 5_000,
+    });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -3476,13 +3490,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       for (const workspace of projectWorkspaceRows) {
         let projectCwd = readNonEmptyString(workspace.cwd);
+        const workspaceRepoUrl = readNonEmptyString(workspace.repoUrl);
         let managedWorkspaceWarning: string | null = null;
         if (!projectCwd || projectCwd === REPO_ONLY_CWD_SENTINEL) {
           try {
             const managedWorkspace = await ensureManagedProjectWorkspace({
               companyId: agent.companyId,
               projectId: workspaceProjectId ?? resolvedProjectId ?? workspace.projectId,
-              repoUrl: readNonEmptyString(workspace.repoUrl),
+              repoUrl: workspaceRepoUrl,
             });
             projectCwd = managedWorkspace.cwd;
             managedWorkspaceWarning = managedWorkspace.warning;
@@ -3499,6 +3514,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .then((stats) => stats.isDirectory())
           .catch(() => false);
         if (projectCwdExists) {
+          if (workspaceRepoUrl && !await isGitCheckoutDir(projectCwd)) {
+            try {
+              const managedWorkspace = await ensureManagedProjectWorkspace({
+                companyId: agent.companyId,
+                projectId: workspaceProjectId ?? resolvedProjectId ?? workspace.projectId,
+                repoUrl: workspaceRepoUrl,
+              });
+              const managedCheckoutIsGit = await isGitCheckoutDir(managedWorkspace.cwd);
+              if (managedCheckoutIsGit) {
+                return {
+                  cwd: managedWorkspace.cwd,
+                  source: "project_primary" as const,
+                  projectId: resolvedProjectId,
+                  workspaceId: workspace.id,
+                  repoUrl: workspace.repoUrl,
+                  repoRef: workspace.repoRef,
+                  workspaceHints,
+                  warnings: [
+                    preferredWorkspaceWarning,
+                    `Configured project workspace path "${projectCwd}" is not a git checkout. Rebinding to managed checkout "${managedWorkspace.cwd}".`,
+                    managedWorkspace.warning,
+                  ].filter((value): value is string => Boolean(value)),
+                };
+              }
+            } catch (error) {
+              if (preferredWorkspace?.id === workspace.id) {
+                preferredWorkspaceWarning = error instanceof Error ? error.message : String(error);
+              }
+            }
+            if (preferredWorkspace?.id === workspace.id) {
+              preferredWorkspaceWarning =
+                `Selected project workspace path "${projectCwd}" is not a git checkout.`;
+            }
+            missingProjectCwds.push(projectCwd);
+            continue;
+          }
           return {
             cwd: projectCwd,
             source: "project_primary" as const,
@@ -7113,9 +7164,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       repoRef: resolvedWorkspace.repoRef,
     } satisfies ExecutionWorkspaceInput;
     const reusedExecutionWorkspace = shouldReuseExisting && existingExecutionWorkspace
-      ? buildRealizedExecutionWorkspaceFromPersisted({
+      ? await ensurePersistedExecutionWorkspaceAvailable({
           base: executionWorkspaceBase,
-          workspace: existingExecutionWorkspace,
+          workspace: {
+            mode: existingExecutionWorkspace.mode,
+            strategyType: existingExecutionWorkspace.strategyType,
+            cwd: existingExecutionWorkspace.cwd,
+            providerRef: existingExecutionWorkspace.providerRef,
+            projectId: existingExecutionWorkspace.projectId,
+            projectWorkspaceId: existingExecutionWorkspace.projectWorkspaceId,
+            repoUrl: existingExecutionWorkspace.repoUrl,
+            baseRef: existingExecutionWorkspace.baseRef,
+            branchName: existingExecutionWorkspace.branchName,
+            config: {
+              provisionCommand: existingExecutionWorkspace.config?.provisionCommand ?? null,
+            },
+          },
+          issue: issueRef,
+          agent: {
+            id: agent.id,
+            name: agent.name,
+            companyId: agent.companyId,
+          },
+          recorder: workspaceOperationRecorder,
         })
       : null;
     const executionWorkspace = reusedExecutionWorkspace ?? await realizeExecutionWorkspace({

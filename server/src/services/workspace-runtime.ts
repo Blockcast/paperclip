@@ -1209,6 +1209,22 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   const provisionCommand = asString(input.workspace.config?.provisionCommand, "").trim();
 
   if (strategy !== "git_worktree") {
+    if (
+      input.workspace.mode === "shared_workspace"
+      && realized.repoUrl
+      && cwd !== input.base.baseCwd
+      && await directoryExists(cwd)
+      && !await isGitCheckout(cwd)
+      && await isGitCheckout(input.base.baseCwd)
+    ) {
+      return {
+        ...realized,
+        cwd: input.base.baseCwd,
+        warnings: [
+          `Execution workspace path "${cwd}" is not a git checkout. Rebinding to project workspace "${input.base.baseCwd}".`,
+        ],
+      };
+    }
     return realized;
   }
   if (await directoryExists(cwd)) {

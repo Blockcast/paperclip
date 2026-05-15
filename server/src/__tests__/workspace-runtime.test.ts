@@ -1745,6 +1745,46 @@ describe("realizeExecutionWorkspace", () => {
     await expect(fs.readFile(path.join(initial.cwd, ".paperclip-restored-state"), "utf8")).resolves.toBe("reprovisioned\n");
   }, 15_000);
 
+  it("rebinds shared project_primary workspaces to the managed checkout when persisted cwd is not a git repo", async () => {
+    const repoRoot = await createTempRepo();
+    const staleWorkspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-shared-stale-"));
+    await fs.writeFile(path.join(staleWorkspacePath, "not-a-repo.txt"), "stale\n", "utf8");
+
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: "https://github.com/paperclipai/paperclip.git",
+        repoRef: "main",
+      },
+      workspace: {
+        mode: "shared_workspace",
+        strategyType: "project_primary",
+        cwd: staleWorkspacePath,
+        providerRef: null,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: "https://github.com/paperclipai/paperclip.git",
+        baseRef: "main",
+        branchName: null,
+      },
+      issue: null,
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(restored).not.toBeNull();
+    expect(restored?.cwd).toBe(repoRoot);
+    expect(restored?.warnings).toContain(
+      `Execution workspace path "${staleWorkspacePath}" is not a git checkout. Rebinding to project workspace "${repoRoot}".`,
+    );
+  });
+
   it("auto-detects the default branch when baseRef is not configured", async () => {
     // Create a repo with "master" as default branch (not "main")
     const repoRoot = await createTempRepo("master");
