@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { handleRunFinished } from "../handlers.js";
+import type { GbrainCallable } from "../pages.js";
 
 function makeEvent(overrides: Partial<{ payload: Record<string, unknown>; companyId: string }> = {}) {
   return {
@@ -21,12 +22,12 @@ function makeEvent(overrides: Partial<{ payload: Record<string, unknown>; compan
 describe("handleRunFinished", () => {
   it("ensures issue page, agent page, worked_on link, then timeline entry", async () => {
     const calls: Array<[string, Record<string, unknown>]> = [];
-    const client = {
+    const client: GbrainCallable = {
       call: vi.fn(async (tool: string, args: Record<string, unknown>) => {
         calls.push([tool, args]);
         if (tool === "get_page") return null;
         return { ok: true };
-      }),
+      }) as GbrainCallable["call"],
     };
 
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };

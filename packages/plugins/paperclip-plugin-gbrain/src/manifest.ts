@@ -21,10 +21,7 @@ const manifest: PaperclipPluginManifestV1 = {
   entrypoints: {
     worker: "./dist/worker.js",
   },
-  eventSubscriptions: [
-    { event: "agent.run.finished" },
-  ],
-  configSchema: {
+  instanceConfigSchema: {
     type: "object",
     properties: {
       gbrainMcpUrl: {
