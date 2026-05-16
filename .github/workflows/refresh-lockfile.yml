@@ -7,7 +7,9 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: refresh-lockfile-master
+  # Per-ref so the ARC shadow test branch doesn't queue behind a stuck
+  # master run on the legacy self-hosted runners. Revert before merging.
+  group: refresh-lockfile-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
