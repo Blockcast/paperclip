@@ -12,7 +12,10 @@ concurrency:
 
 jobs:
   refresh:
-    runs-on: self-hosted
+    # ARC shadow test (omar/arc-shadow-test): targets gha-runner-scale-set
+    # arc-default in arc-runners ns instead of the legacy VM runners.
+    # Revert to self-hosted before merging — Phase A is shadow only.
+    runs-on: arc-default
     timeout-minutes: 10
     permissions:
       contents: write
