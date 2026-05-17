@@ -2307,17 +2307,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain(`Recovery issue: [${recovery.identifier}]`);
   });
 
-  // BLO-1498: when an in-progress run fails with a non-retryable code like
-  // `workspace_import_conflict`, the recovery sweep must escalate to `blocked`
-  // on the FIRST failure. The previous behavior queued another continuation,
-  // which would re-hit the same precondition and produce a 5+ cycle loop.
-  it("blocks stranded in-progress work immediately on a non-retryable workspace_import_conflict (no retry burnt)", async () => {
+  // BLO-1498/BLO-5691: when an in-progress run fails with a non-retryable
+  // workspace precondition, the recovery sweep must escalate to `blocked` on
+  // the FIRST failure. Retrying would re-hit the same precondition and produce
+  // another doomed run.
+  it.each(["workspace_import_conflict", "workspace_repo_mismatch"])(
+    "blocks stranded in-progress work immediately on non-retryable %s (no retry burnt)",
+    async (runErrorCode) => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
       // Crucially: no retryReason, so didAutomaticRecoveryFail() is FALSE.
       // The non-retryable errorCode is what must trigger escalation.
-      runErrorCode: "workspace_import_conflict",
+      runErrorCode,
       runError: "Workspace import into /srv/paperclip/workspace hit 1 path conflict: release-eng-tmp/magma-blo-1475/orc8r/cloud/go/serde/doc.go",
     });
     const heartbeat = heartbeatService(db);
@@ -2348,18 +2350,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("non-retryable code `workspace_import_conflict`");
+    expect(comments[0]?.body).toContain(`non-retryable code \`${runErrorCode}\``);
     expect(comments[0]?.body).toContain("Retrying would re-hit the same environment precondition");
   });
 
   // BLO-1498: same non-retryable rule applies to assigned `todo` work that
   // failed in dispatch. We must not burn the single dispatch retry against a
   // precondition that won't change.
-  it("blocks assigned todo work immediately on a non-retryable workspace_import_conflict (no retry burnt)", async () => {
+  it.each(["workspace_import_conflict", "workspace_repo_mismatch"])(
+    "blocks assigned todo work immediately on non-retryable %s (no retry burnt)",
+    async (runErrorCode) => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "todo",
       runStatus: "failed",
-      runErrorCode: "workspace_import_conflict",
+      runErrorCode,
       runError: "Workspace import into /srv/paperclip/workspace hit 1 path conflict",
     });
     const heartbeat = heartbeatService(db);
@@ -2383,7 +2387,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("non-retryable code `workspace_import_conflict`");
+    expect(comments[0]?.body).toContain(`non-retryable code \`${runErrorCode}\``);
   });
 
   it("redacts error-code-only stranded recovery failures in issue copy", async () => {
