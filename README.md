@@ -456,3 +456,4 @@ MIT &copy; 2026 Paperclip
   <sub>Open source under MIT. Built for people who want to run companies, not babysit agents.</sub>
 </p>
 
+test(throwaway): active-verify Ally PR-review trigger at 2026-05-17T22:18:53Z
