@@ -221,7 +221,11 @@ export function createCcrotateServeVerifier(
         // transport — fall through to next attempt if budget remains
       }
     }
-    // Exhausted retries with transport errors. Bump breaker.
+    // Exhausted retries with transport errors. Bump breaker. Burst-poison
+    // amplification (multiple callers re-probing during a ccrotate-serve
+    // incident) is bounded by `cbThreshold` consecutive errors opening
+    // the circuit — see review thread on PR #51 for the negative-memo
+    // alternative considered and rejected.
     onTransportError();
     throw lastErr!;
   }

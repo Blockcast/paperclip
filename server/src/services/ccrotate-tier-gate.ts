@@ -520,10 +520,13 @@ export function createCcrotateTierGate(opts: CcrotateTierGateOptions): CcrotateT
           // false positives. Random sidesteps the sort question; memo +
           // write-through in the verifier amortize across agents in the
           // same heartbeat tick.
-          const picked =
-            exhaustedCandidates[
-              Math.floor(Math.random() * exhaustedCandidates.length)
-            ];
+          // Non-null asserted: `exhaustedCandidates.length > 0` is checked
+          // above, so the random-index access is provably safe. The
+          // assertion appeases `noUncheckedIndexedAccess` without adding
+          // an unreachable branch.
+          const picked = exhaustedCandidates[
+            Math.floor(Math.random() * exhaustedCandidates.length)
+          ]!;
           try {
             const result = await opts.verifier.probeOne(target, picked.email);
             // T4: invalidate the in-process tier-cache regardless of the
