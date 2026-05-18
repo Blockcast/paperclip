@@ -118,16 +118,22 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
   }, 30_000);
 
   // scanSilentActiveRuns -> enqueueWakeup -> startNextQueuedRunForAgent
-  // fires `void executeRun(...)` background work that the test never awaits
-  // (heartbeat.ts ~line 7304). PR #55 added cancelActiveRunsForCleanup +
-  // single-confirm waitForHeartbeatIdle, but verify_canary run 26014448824
-  // still deadlocked on TRUNCATE for 3 tests — the postRun lifecycle hook
-  // (heartbeat.ts:6568) continues writes after status update because it
-  // doesn't observe the cancellation flag. Mirrors the proven pattern in
-  // heartbeat-stale-queue-invalidation.test.ts: reset the mock so any
-  // in-flight resolution returns the inert default, clear runningProcesses
-  // defensively, cancel active runs, then triple-confirm idle (3×50ms
-  // consecutive idle reads) + 50ms settle before TRUNCATE.
+  // fires `void executeRun(...)` background work that the test never awaits.
+  // PR #55 added cancel+poll; PR #62 added mockReset + runningProcesses.clear
+  // + triple-confirm idle; both narrowed but didn't close the race. Run
+  // 26017480089 still deadlocked 5 tests because executeRun's finally block
+  // (releaseEnvironmentLeasesForRun, runLifecycleHook, startNextQueuedRunForAgent)
+  // can hold open transactions even after heartbeat_runs.status flips to
+  // cancelled — invisible to the row-status poll. The proper fix is to make
+  // that finally block cancellation-aware, but it touches multiple downstream
+  // code paths (lease release, runtime services, next-queued-run dispatch)
+  // and warrants a separate refactor.
+  //
+  // Test-side closure: before TRUNCATE, terminate any backends in
+  // 'idle in transaction' state on this test database. The embedded postgres
+  // is per-suite so the blast radius is contained — only this test's
+  // background executeRun connections get killed. Wrapped in a deadlock-retry
+  // loop as defense-in-depth for transactions still in 'active' state.
   afterEach(async () => {
     mockAdapterExecute.mockReset();
     mockAdapterExecute.mockImplementation(async () => ({
@@ -156,7 +162,30 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
-    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+
+    // Kill backends in 'idle in transaction' state on this test DB to
+    // release any locks held by background executeRun finally blocks.
+    await db.execute(sql.raw(`
+      SELECT pg_terminate_backend(pid)
+      FROM pg_stat_activity
+      WHERE datname = current_database()
+        AND state = 'idle in transaction'
+        AND pid <> pg_backend_pid()
+    `)).catch(() => undefined);
+
+    // Retry TRUNCATE on deadlock (40P01) — postgres deadlock detection
+    // kills one transaction; if it's ours we retry, if it's the rogue
+    // background txn we succeed on the next attempt.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+        break;
+      } catch (err) {
+        const code = (err as { code?: string } | null)?.code;
+        if (code !== "40P01" || attempt === 2) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    }
   }, 30_000);
 
   afterAll(async () => {
