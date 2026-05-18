@@ -62,17 +62,6 @@ vi.mock("../adapters/index.ts", async () => {
   };
 });
 
-async function waitForHeartbeatIdle(db: ReturnType<typeof createDb>, timeoutMs = 5_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const runs = await db
-      .select({ status: heartbeatRuns.status })
-      .from(heartbeatRuns);
-    if (!runs.some((run) => run.status === "queued" || run.status === "running")) return;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-}
-
 async function cancelActiveRunsForCleanup(db: ReturnType<typeof createDb>, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
