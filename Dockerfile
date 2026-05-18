@@ -87,7 +87,7 @@ WORKDIR /vendor
 # every image build.
 ARG CCROTATE_REF=2729a0cc3612bc179d0eb925876a8a903961a6df
 ARG CLAUDE_K8S_REF=ab6930171693c9a561e9032b8997eefe40150b5b
-ARG OPENCODE_K8S_REF=e24435ac87a36a13cd3192a4966274e99aa5f140
+ARG OPENCODE_K8S_REF=eeee66c9e5f0ac9b2b85b0211e3c0c2007356bdd
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
