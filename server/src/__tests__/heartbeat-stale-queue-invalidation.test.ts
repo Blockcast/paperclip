@@ -142,7 +142,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-stale-queue-");
     db = createDb(tempDb.connectionString);
-    heartbeat = heartbeatService(db);
+    heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
     await ensureIssueRelationsTable(db);
   });
 
