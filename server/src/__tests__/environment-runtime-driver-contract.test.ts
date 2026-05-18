@@ -10,7 +10,6 @@ import {
   getSshEnvLabSupport,
   startSshEnvLabFixture,
   stopSshEnvLabFixture,
-  type SshEnvironmentConfig,
 } from "@paperclipai/adapter-utils/ssh";
 import {
   agents,
@@ -23,7 +22,7 @@ import {
   environments,
   heartbeatRuns,
 } from "@paperclipai/db";
-import type { Environment } from "@paperclipai/shared";
+import type { Environment, SshEnvironmentConfig } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -60,7 +59,7 @@ describeEmbeddedPostgres("environment runtime driver contract", () => {
 
   beforeAll(async () => {
     const started = await startEmbeddedPostgresTestDatabase("environment-runtime-contract");
-    stopDb = started.stop;
+    stopDb = started.cleanup;
     db = createDb(started.connectionString);
   });
 

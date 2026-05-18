@@ -23,6 +23,7 @@ import {
   heartbeatRuns,
   plugins,
 } from "@paperclipai/db";
+import type { Environment, EnvironmentDriver, EnvironmentStatus } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -115,7 +116,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
 
   beforeAll(async () => {
     const started = await startEmbeddedPostgresTestDatabase("environment-runtime");
-    stopDb = started.stop;
+    stopDb = started.cleanup;
     db = createDb(started.connectionString);
     runtime = environmentRuntimeService(db);
   });
@@ -142,9 +143,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
   });
 
   async function seedEnvironment(input: {
-    driver?: string;
+    driver?: EnvironmentDriver;
     name?: string;
-    status?: "active" | "disabled";
+    status?: EnvironmentStatus;
     config?: Record<string, unknown>;
   } = {}) {
     const companyId = randomUUID();
@@ -365,7 +366,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const { companyId, environment, runId } = await seedEnvironment({
       driver: "ssh",
       name: "Fixture SSH",
-      config: sshConfig,
+      config: sshConfig as unknown as Record<string, unknown>,
     });
     try {
       const acquired = await runtime.acquireRunLease({
@@ -455,7 +456,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const { companyId, environment, runId } = await seedEnvironment({
       driver: "ssh",
       name: "Fixture SSH 503",
-      config: sshConfig,
+      config: sshConfig as unknown as Record<string, unknown>,
     });
     try {
       const acquired = await runtime.acquireRunLease({
@@ -554,7 +555,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const { companyId, environment, runId } = await seedEnvironment({
       driver: "ssh",
       name: "Fixture SSH Cache",
-      config: sshConfig,
+      config: sshConfig as unknown as Record<string, unknown>,
     });
     try {
       // First acquire: cachedUrl wins (first in declared order) and is
@@ -649,7 +650,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       timeoutMs: 1234,
       reuseLease: false,
     };
-    const environment = {
+    const environment: Environment = {
       ...baseEnvironment,
       name: "Fake Plugin Sandbox",
       driver: "sandbox",
@@ -785,7 +786,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       timeoutMs: 1234,
       reuseLease: false,
     };
-    const environment = {
+    const environment: Environment = {
       ...baseEnvironment,
       name: "Secure Plugin Sandbox",
       driver: "sandbox",
@@ -934,7 +935,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       timeoutMs: 1234,
       reuseLease: true,
     };
-    const environment = {
+    const environment: Environment = {
       ...baseEnvironment,
       name: "Reusable Plugin Sandbox",
       driver: "sandbox",
