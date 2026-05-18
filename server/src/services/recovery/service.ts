@@ -204,6 +204,21 @@ const NON_RETRYABLE_RUN_ERROR_CODES = new Set<string>([
   "workspace_import_conflict",
 ]);
 
+// BLO-5681: structural startup failures where retrying via a recovery wrapper
+// would inherit the same wedged-session / wedged-context state and produce
+// zero-token retry loops. We still escalate the source to `blocked` (operator
+// needs to act — truncate the session DB, raise the context budget, or fix
+// the adapter pre-model startup path) but we suppress the recovery wrapper.
+// Witnessed on the BLO-5378/5399/5628/3218 family during the BLO-5679
+// `/compact`-overflow incident: each recovery shim re-failed identically
+// within minutes, burning provider quota on agent re-wakes that had no chance
+// of producing forward progress until the wedge was resolved.
+const STRUCTURAL_STARTUP_FAILURE_ERROR_CODES = new Set<string>([
+  "context_overflow",
+  "context_length_exceeded",
+  "startup_error_pre_model",
+]);
+
 function isNonRetryableTerminalRun(latestRun: LatestIssueRun) {
   if (!latestRun) return false;
   if (
@@ -215,6 +230,12 @@ function isNonRetryableTerminalRun(latestRun: LatestIssueRun) {
   }
   const errorCode = readNonEmptyString(latestRun.errorCode);
   return Boolean(errorCode && NON_RETRYABLE_RUN_ERROR_CODES.has(errorCode));
+}
+
+function isStructuralStartupFailure(latestRun: LatestIssueRun) {
+  if (!latestRun) return false;
+  const errorCode = readNonEmptyString(latestRun.errorCode);
+  return Boolean(errorCode && STRUCTURAL_STARTUP_FAILURE_ERROR_CODES.has(errorCode));
 }
 
 function buildNonRetryableEscalationComment(input: {
@@ -2145,11 +2166,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .limit(1);
       if (!fresh) return null;
 
-      const recoveryIssue = await ensureStrandedIssueRecoveryIssue({
-        issue: fresh,
-        previousStatus: input.previousStatus,
-        latestRun: input.latestRun,
-      });
+      // BLO-5681: gate recovery-wrapper creation on the latest run's failure
+      // family. Structural startup failures (context_overflow,
+      // context_length_exceeded, startup_error_pre_model) would inherit the
+      // same wedged session in a wrapper-driven retry and produce zero-token
+      // re-failures. Escalate to `blocked` without spawning a wrapper.
+      const suppressRecoveryWrapper = isStructuralStartupFailure(input.latestRun);
+      const recoveryIssue = suppressRecoveryWrapper
+        ? null
+        : await ensureStrandedIssueRecoveryIssue({
+          issue: fresh,
+          previousStatus: input.previousStatus,
+          latestRun: input.latestRun,
+        });
       const blockerIds = await existingUnresolvedBlockerIssueIds(fresh.companyId, fresh.id);
       if (
         recoveryIssue &&
@@ -2174,6 +2203,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           "",
           `- Recovery issue: ${issueUiLink({ identifier: recoveryIssue.identifier, id: recoveryIssue.id }, prefix)}`,
           "- Next action: the recovery owner should either restore a live execution path or record the manual resolution, then mark the recovery issue done.",
+        ].join("\n")
+        : suppressRecoveryWrapper
+        ? [
+          "",
+          `- Latest run: ${input.latestRun ? runUiLink({ id: input.latestRun.id, agentId: input.latestRun.agentId }, prefix) : "none"}`,
+          `- Failure family: \`${readNonEmptyString(input.latestRun?.errorCode) ?? "structural_startup_failure"}\` (structural startup failure)`,
+          "- Recovery issue: none created. A `stranded_issue_recovery` wrapper would inherit the same wedged session/context state and re-fail with zero tokens — burning provider quota without forward progress.",
+          "- Next action: a board operator should resolve the underlying wedge (e.g. truncate the oversized session DB, raise the model context budget, or fix the adapter pre-model startup path), then return the source to `todo` for re-dispatch on a fresh session.",
         ].join("\n")
         : [
           "",

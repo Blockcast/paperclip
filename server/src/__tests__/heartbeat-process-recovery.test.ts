@@ -2386,6 +2386,65 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("non-retryable code `workspace_import_conflict`");
   });
 
+  // BLO-5681: when an in-progress run fails with a structural startup-failure
+  // code (context_overflow / context_length_exceeded / startup_error_pre_model),
+  // the recovery sweep must escalate `blocked` WITHOUT creating a recovery
+  // wrapper. A recovery wrapper would inherit the same wedged session state
+  // and produce zero-token retry loops (witnessed on BLO-5378/5399/5628/3218
+  // → recovery shims BLO-5621/5673/etc. all re-failing identically).
+  it("blocks stranded in-progress work on context_overflow without creating a recovery wrapper", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "context_overflow",
+      runError: "context window exhausted before any model call",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    // No `stranded_issue_recovery` wrapper should be created for this family.
+    // The wrapper would inherit the same wedged session and burn provider
+    // quota on identical zero-token failures.
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(recoveryIssues).toHaveLength(0);
+
+    // No continuation wake should be queued — retrying would re-hit the same
+    // wedged session state.
+    const wakeRows = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeRows.some((row) => row.reason === "issue_continuation_needed")).toBe(false);
+
+    // The escalation comment must surface the structural failure family and
+    // explain why no recovery wrapper was created, so the operator can
+    // intervene (e.g. truncate the wedged session DB).
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("context_overflow");
+    expect(comments[0]?.body).toContain("Recovery issue: none created");
+
+    // Sanity: latestRun reference is preserved (helps board operator).
+    expect(comments[0]?.body).toContain(runId.slice(0, 8));
+  });
+
   it("redacts error-code-only stranded recovery failures in issue copy", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
