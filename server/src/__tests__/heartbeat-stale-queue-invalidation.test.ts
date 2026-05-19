@@ -135,17 +135,34 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     await ensureIssueRelationsTable(db);
   });
 
-  // Mirrors heartbeat-active-run-output-watchdog.test.ts (PR #61). Single-
-  // confirm waitForHeartbeatIdle + pg_terminate_backend + 3-retry (PR #72)
-  // was insufficient — verify_canary observed on PR #91 still hit 40P01 on
-  // TRUNCATE. cancelActiveRunsForCleanup flips heartbeatRuns to 'cancelled'
-  // but the postRun lifecycle hook (heartbeat.ts:6568) keeps writing to
-  // activity_log/issues/heartbeatRunEvents AFTER the status update because
-  // it doesn't observe the cancellation flag. Those writes land in 'active'
-  // backend state which `state = 'idle in transaction'` can't kill, and
-  // deadlock with TRUNCATE's AccessExclusiveLock. The 3-consecutive idle
-  // confirmation (3×50ms) + 50ms settle lets the lifecycle hook drain
-  // before TRUNCATE — proven on watchdog across the same load profile.
+  // Layered cleanup for the v513-saga TRUNCATE deadlock.
+  //
+  // PR #72 (single-confirm idle + `state = 'idle in transaction'` kill +
+  // 3-retry) was insufficient — saw 40P01 on PR #91's verify.
+  // First attempt of PR #92 (watchdog-style 3-confirm + 50ms settle, no
+  // kill, no retry) was ALSO insufficient — saw 40P01 again. The watchdog
+  // pattern works for watchdog only because watchdog uses
+  // `skipQueuedRunDispatch: true` on every test (dispatcher dead). This
+  // file deliberately keeps the dispatcher alive (it's the SUT for
+  // queued→succeeded transitions), so postRun lifecycle hooks
+  // (heartbeat.ts:6568, ~7304) can invoke startNextQueuedRunForAgent
+  // fire-and-forget AFTER cancelActiveRunsForCleanup runs. The
+  // dispatcher's `SELECT ... FOR UPDATE` then holds RowShareLock that
+  // deadlocks with TRUNCATE's AccessExclusiveLock chain.
+  //
+  // Four layers:
+  //   1. cancelActiveRunsForCleanup     — drop queued/running rows so
+  //      future dispatcher polls find nothing to claim.
+  //   2. 3-consecutive idle (3×50ms) + 50ms settle — let in-flight
+  //      lifecycle-hook chains drain naturally (PR #92 v1).
+  //   3. pg_cancel_backend on 'active' non-self backends — cancel any
+  //      straggler dispatcher poll mid-`SELECT FOR UPDATE` WITHOUT
+  //      terminating the connection (pg_terminate_backend broke
+  //      postgres-js's pool init query — 57P01 cascade on next test).
+  //      PR #72's `idle in transaction` filter for pg_terminate stays
+  //      for stuck-in-tx remnants.
+  //   4. TRUNCATE with 3-retry on 40P01 — if a fresh dispatcher poll
+  //      opens in the race window after cancel, retry covers it.
   afterEach(async () => {
     mockAdapterExecute.mockReset();
     mockAdapterExecute.mockImplementation(async () => ({
@@ -175,7 +192,30 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
-    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+    await db.execute(sql.raw(`
+      SELECT pg_cancel_backend(pid)
+      FROM pg_stat_activity
+      WHERE datname = current_database()
+        AND state = 'active'
+        AND pid <> pg_backend_pid()
+    `)).catch(() => undefined);
+    await db.execute(sql.raw(`
+      SELECT pg_terminate_backend(pid)
+      FROM pg_stat_activity
+      WHERE datname = current_database()
+        AND state = 'idle in transaction'
+        AND pid <> pg_backend_pid()
+    `)).catch(() => undefined);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+        break;
+      } catch (err) {
+        const code = (err as { code?: string } | null)?.code;
+        if (code !== "40P01" || attempt === 2) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    }
   });
 
   afterAll(async () => {
