@@ -88,13 +88,18 @@ function forwardRequestHeaders(headers: IncomingHttpHeaders): Headers {
   // The `host` header is stripped above so fetch addresses the worker
   // Service correctly. But the worker tier runs the private-hostname guard,
   // which would reject the internal Service name. Pin x-forwarded-host to
-  // the original request's hostname (already validated by the API tier's
-  // own guard before this handler ran) so the worker guard accepts it.
-  if (!out.has("x-forwarded-host")) {
-    const originalHost = headers["host"];
-    if (typeof originalHost === "string" && originalHost) {
-      out.set("x-forwarded-host", originalHost);
-    }
+  // the exact hostname the API tier's own guard already validated for this
+  // request (it reads x-forwarded-host first, then host) so the worker
+  // guard accepts the same value — and collapses any client-supplied
+  // multi-value list to that single trusted hostname.
+  const forwardedHost = Array.isArray(headers["x-forwarded-host"])
+    ? headers["x-forwarded-host"][0]
+    : headers["x-forwarded-host"];
+  const validatedHost = (forwardedHost ?? headers["host"])?.split(",")[0]?.trim();
+  if (validatedHost) {
+    out.set("x-forwarded-host", validatedHost);
+  } else {
+    out.delete("x-forwarded-host");
   }
   return out;
 }
@@ -115,24 +120,31 @@ function createWorkerProxyHandler(
     const targetUrl = `${workersInternalUrl}${req.originalUrl}`;
     const controller = new AbortController();
 
+    // Set when the downstream client goes away before we finished
+    // responding. Distinguishes an expected teardown (no need to log or
+    // reply) from a real worker-tier failure (must log + 502).
+    let clientDisconnected = false;
+    res.on("close", () => {
+      if (!res.writableFinished) clientDisconnected = true;
+      controller.abort();
+    });
+
     // Non-streaming requests get a hard timeout; streaming (SSE) requests
     // stay open until the client disconnects.
     const timeout = streaming
       ? undefined
       : setTimeout(() => controller.abort(), PROXY_REQUEST_TIMEOUT_MS);
-    // If the downstream client goes away, stop waiting on the worker.
-    res.on("close", () => controller.abort());
-
-    const headers = forwardRequestHeaders(req.headers);
-    let body: string | undefined;
-    if (hasRequestBody(req)) {
-      // express.json() already parsed the body; re-serialize as JSON. Every
-      // allowlisted mutating route is a JSON endpoint.
-      body = JSON.stringify(req.body ?? {});
-      headers.set("content-type", "application/json");
-    }
 
     try {
+      const headers = forwardRequestHeaders(req.headers);
+      let body: string | undefined;
+      if (hasRequestBody(req)) {
+        // express.json() already parsed the body; re-serialize as JSON.
+        // Every allowlisted mutating route is a JSON endpoint.
+        body = JSON.stringify(req.body ?? {});
+        headers.set("content-type", "application/json");
+      }
+
       const upstream = await fetch(targetUrl, {
         method: req.method,
         headers,
@@ -140,6 +152,15 @@ function createWorkerProxyHandler(
         redirect: "manual",
         signal: controller.signal,
       });
+
+      if (upstream.status >= 500) {
+        // The worker tier reached us but failed the operation. Forward it
+        // verbatim, but log so the failure is visible from API-tier logs.
+        logger.warn(
+          { targetUrl, method: req.method, status: upstream.status },
+          "worker-tier proxy: worker tier returned a server error",
+        );
+      }
 
       res.status(upstream.status);
       for (const [name, value] of upstream.headers.entries()) {
@@ -161,17 +182,21 @@ function createWorkerProxyHandler(
         res.end();
       }
     } catch (err) {
-      if (controller.signal.aborted && res.writableEnded) return;
+      // Client left before we finished — expected, nothing to report.
+      if (clientDisconnected) return;
       logger.error(
         { err, targetUrl, method: req.method },
-        "worker-tier proxy: failed to reach worker tier",
+        "worker-tier proxy: failed to relay request to worker tier",
       );
       if (!res.headersSent) {
         res
           .status(502)
           .json({ error: "Worker tier unreachable — plugin operation could not be completed." });
       } else {
-        res.end();
+        // Headers already flushed: the response is now a truncated stream.
+        // Destroy the socket so the client sees a broken connection rather
+        // than a clean end it would mistake for a complete response.
+        res.destroy(err instanceof Error ? err : undefined);
       }
     } finally {
       if (timeout) clearTimeout(timeout);

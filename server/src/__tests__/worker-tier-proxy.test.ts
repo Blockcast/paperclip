@@ -169,6 +169,37 @@ describe("registerWorkerTierProxyRoutes", () => {
     expect(captured?.headers["x-forwarded-host"]).toBe("paperclip.blockcast.net");
   });
 
+  it("rewrites the host header away from the original public hostname", async () => {
+    let captured: CapturedRequest | undefined;
+    worker = await startWorkerStub((req) => {
+      captured = req;
+      return { status: 200, body: "{}" };
+    });
+    const app = buildApp(worker.url);
+
+    await request(app)
+      .post("/api/plugins/ccrotate/enable")
+      .set("host", "paperclip.blockcast.net")
+      .send({});
+
+    // fetch addresses the worker Service, so the worker sees its own host —
+    // never the original public hostname (which it would forward verbatim).
+    expect(captured?.headers.host).not.toBe("paperclip.blockcast.net");
+  });
+
+  it("forwards a worker-tier 5xx verbatim to the client", async () => {
+    worker = await startWorkerStub(() => ({
+      status: 503,
+      body: JSON.stringify({ error: "plugin worker crashed" }),
+    }));
+    const app = buildApp(worker.url);
+
+    const res = await request(app).post("/api/plugins/ccrotate/enable").send({});
+
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({ error: "plugin worker crashed" });
+  });
+
   it("returns 502 when the worker tier is unreachable", async () => {
     // Port 1 is privileged and never listening — fetch fails fast.
     const app = buildApp("http://127.0.0.1:1");
