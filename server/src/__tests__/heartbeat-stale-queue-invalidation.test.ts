@@ -75,17 +75,6 @@ async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 3_000) {
   return fn();
 }
 
-async function waitForHeartbeatIdle(db: ReturnType<typeof createDb>, timeoutMs = 5_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const runs = await db
-      .select({ status: heartbeatRuns.status })
-      .from(heartbeatRuns);
-    if (!runs.some((run) => run.status === "queued" || run.status === "running")) return;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-}
-
 async function cancelActiveRunsForCleanup(db: ReturnType<typeof createDb>, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -146,11 +135,17 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     await ensureIssueRelationsTable(db);
   });
 
-  // Mirrors heartbeat-active-run-output-watchdog.test.ts (PR #55). The naive
-  // idle-poll variant still races fire-and-forget executeRun work scheduled by
-  // postRun lifecycle hooks (heartbeat.ts:6568); cancelling active runs first
-  // forces those callbacks to observe the terminal state and exit before
-  // TRUNCATE takes its AccessExclusiveLock on "companies".
+  // Mirrors heartbeat-active-run-output-watchdog.test.ts (PR #61). Single-
+  // confirm waitForHeartbeatIdle + pg_terminate_backend + 3-retry (PR #72)
+  // was insufficient — verify_canary observed on PR #91 still hit 40P01 on
+  // TRUNCATE. cancelActiveRunsForCleanup flips heartbeatRuns to 'cancelled'
+  // but the postRun lifecycle hook (heartbeat.ts:6568) keeps writing to
+  // activity_log/issues/heartbeatRunEvents AFTER the status update because
+  // it doesn't observe the cancellation flag. Those writes land in 'active'
+  // backend state which `state = 'idle in transaction'` can't kill, and
+  // deadlock with TRUNCATE's AccessExclusiveLock. The 3-consecutive idle
+  // confirmation (3×50ms) + 50ms settle lets the lifecycle hook drain
+  // before TRUNCATE — proven on watchdog across the same load profile.
   afterEach(async () => {
     mockAdapterExecute.mockReset();
     mockAdapterExecute.mockImplementation(async () => ({
@@ -165,30 +160,22 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     }));
     runningProcesses.clear();
     await cancelActiveRunsForCleanup(db, 5_000);
-    await waitForHeartbeatIdle(db, 5_000);
-    // The stale-queue tests need the dispatcher (verify queued → succeeded
-    // transitions), so we can't use skipQueuedRunDispatch. Terminate any
-    // backends in 'idle in transaction' before TRUNCATE — these are the
-    // fire-and-forget postRun lifecycle hook connections the row-status
-    // idle poll is blind to. Embedded postgres is per-suite, contained.
-    // Retry on 40P01 (deadlock) as defense-in-depth.
-    await db.execute(sql.raw(`
-      SELECT pg_terminate_backend(pid)
-      FROM pg_stat_activity
-      WHERE datname = current_database()
-        AND state = 'idle in transaction'
-        AND pid <> pg_backend_pid()
-    `)).catch(() => undefined);
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
-        break;
-      } catch (err) {
-        const code = (err as { code?: string } | null)?.code;
-        if (code !== "40P01" || attempt === 2) throw err;
-        await new Promise((resolve) => setTimeout(resolve, 200));
+    let idlePolls = 0;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const runs = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns);
+      const hasActiveRun = runs.some((run) => run.status === "queued" || run.status === "running");
+      if (!hasActiveRun) {
+        idlePolls += 1;
+        if (idlePolls >= 3) break;
+      } else {
+        idlePolls = 0;
       }
+      await new Promise((resolve) => setTimeout(resolve, 50));
     }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
   });
 
   afterAll(async () => {
