@@ -117,7 +117,6 @@ async function readSourceAgentsMd(): Promise<string> {
   const sourcePath = path.resolve(
     scriptDir,
     "..",
-    "src",
     "onboarding-assets",
     "default",
     "AGENTS.md",

@@ -75,7 +75,7 @@ describe("backfillAgentBundles (BLO-6151 R2 rollout)", () => {
       { id: "a2", name: "AgentTwo", role: "default" },
     ];
     const { backfillAgentBundles } = await import(
-      "../../scripts/backfill-agent-bundle.js"
+      "../scripts/backfill-agent-bundle.js"
     );
 
     const results = await backfillAgentBundles(
@@ -98,7 +98,7 @@ describe("backfillAgentBundles (BLO-6151 R2 rollout)", () => {
       { id: "a1", name: "AgentOne", role: "default" },
     ];
     const { backfillAgentBundles } = await import(
-      "../../scripts/backfill-agent-bundle.js"
+      "../scripts/backfill-agent-bundle.js"
     );
 
     const first = await backfillAgentBundles(responseFor.listAgents, "x");
@@ -115,7 +115,7 @@ describe("backfillAgentBundles (BLO-6151 R2 rollout)", () => {
     ];
     responseFor.upsertShouldFailFor.add("a2");
     const { backfillAgentBundles } = await import(
-      "../../scripts/backfill-agent-bundle.js"
+      "../scripts/backfill-agent-bundle.js"
     );
 
     const results = await backfillAgentBundles(responseFor.listAgents, "x");
@@ -132,7 +132,7 @@ describe("backfillAgentBundles (BLO-6151 R2 rollout)", () => {
       { id: "a1", name: "AgentOne", role: "default" },
     ];
     const { backfillAgentBundles } = await import(
-      "../../scripts/backfill-agent-bundle.js"
+      "../scripts/backfill-agent-bundle.js"
     );
 
     const results = await backfillAgentBundles(responseFor.listAgents, "x");
@@ -154,7 +154,7 @@ describe("backfillAgentBundles (BLO-6151 R2 rollout)", () => {
     ];
     responseFor.bundleByAgentId["a1"] = { mode: "external" };
     const { backfillAgentBundles } = await import(
-      "../../scripts/backfill-agent-bundle.js"
+      "../scripts/backfill-agent-bundle.js"
     );
 
     const results = await backfillAgentBundles(responseFor.listAgents, "x");
