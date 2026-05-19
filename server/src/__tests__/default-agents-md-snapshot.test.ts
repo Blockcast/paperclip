@@ -24,6 +24,18 @@ describe("default/AGENTS.md pre-flight section (BLO-6151)", () => {
     expect(agentsMd).not.toMatch(/"metadata"\s*:\s*\{/);
   });
 
+  it("uses identical sentinel token in step 6 filter and step 7a body (catches split)", async () => {
+    const bundle = await loadDefaultAgentInstructionsBundle("default");
+    const agentsMd = bundle["AGENTS.md"];
+
+    // The step-6 compare filter and the step-7a comment body MUST share the
+    // exact same `[gstack-preflight]` prefix. If they drift, the CALM path
+    // breaks silently because step 6 stops recognizing the agent's own
+    // marker comments.
+    expect(agentsMd).toContain("body does NOT start with `[gstack-preflight]`");
+    expect(agentsMd).toContain('"[gstack-preflight] frame stable since');
+  });
+
   it("includes the two SWEEP_CLASS reasons in the inclusion list", async () => {
     const bundle = await loadDefaultAgentInstructionsBundle("default");
     const agentsMd = bundle["AGENTS.md"];

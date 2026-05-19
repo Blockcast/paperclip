@@ -24,7 +24,7 @@ then run the short-circuit protocol below. For ANY other wake reason (`issue_ass
 3. `GET /api/issues/{issueId}/comments?limit=5&order=desc`. Keep the list.
 
 4. `mcp__gbrain__get_page` with slug `paperclip/decisions/{companyId}/{agent.id}/{issueIdentifier}`.
-   - 404 → fall through to "Fall-through write protocol".
+   - 404 → fall through to "Fall-through write protocol" below, then proceed to Execution Contract.
    - hit → continue.
 
 5. **Schema defense.** If frame missing ANY of `issueLastActivityAt`, `updatedAt`, `status`, `blockedByIssueIds`, OR any field fails to parse, treat as 404 → fall through.
