@@ -189,7 +189,7 @@ persistence:
 # Rollback: flip api.enabled back to false + helm upgrade. Service selector
 # reverts; Deployment is reaped; StatefulSet stays.
 api:
-  enabled: false
+  enabled: true
   replicas: 2
   maxSurge: 1
   maxUnavailable: 0
