@@ -316,6 +316,7 @@ function PoolTable({
   onMutated: () => void;
 }) {
   const [busyEmail, setBusyEmail] = useState<string | null>(null);
+  const [refreshingEmail, setRefreshingEmail] = useState<string | null>(null);
   const [sessionFormEmail, setSessionFormEmail] = useState<string | null>(null);
   const [rowError, setRowError] = useState<{ email: string; msg: string } | null>(null);
 
@@ -334,6 +335,20 @@ function PoolTable({
       setRowError({ email, msg: e?.message ?? String(e) });
     } finally {
       setBusyEmail(null);
+    }
+  }
+
+  async function doRefreshOne(email: string) {
+    if (!companyId) return;
+    setRefreshingEmail(email);
+    setRowError(null);
+    try {
+      await postJson("/refresh-one", { companyId, email, target });
+      onMutated();
+    } catch (e: any) {
+      setRowError({ email, msg: e?.message ?? String(e) });
+    } finally {
+      setRefreshingEmail(null);
     }
   }
 
@@ -357,6 +372,7 @@ function PoolTable({
         {accounts.map((row) => {
           const { color, label } = tierDot(row);
           const isBusy = busyEmail === row.email;
+          const isRefreshing = refreshingEmail === row.email;
           const isSessionFormOpen = sessionFormEmail === row.email;
           return (
             <>
@@ -387,6 +403,16 @@ function PoolTable({
                       {isBusy ? "switching…" : "switch"}
                     </button>
                   )}
+                  {/* v0.7.0: per-row refresh-one button */}
+                  <button
+                    type="button"
+                    style={{ ...smallBtnStyle, marginLeft: "4px" }}
+                    disabled={isRefreshing || !companyId}
+                    onClick={() => doRefreshOne(row.email)}
+                    title="Force a re-probe of this account now (bypasses freshness-loop cadence)"
+                  >
+                    {isRefreshing ? "↻…" : "↻"}
+                  </button>
                   {/* F-UI-2: per-row sessionKey paste (claude only) */}
                   {target === "claude" && (
                     <button
