@@ -491,6 +491,51 @@ async function handleBulkClearTiers(input: PluginApiRequestInput): Promise<Plugi
   };
 }
 
+async function handleRefreshOne(input: PluginApiRequestInput): Promise<PluginApiResponse> {
+  // Force a single-account re-probe via `ccrotate refresh-one <email>`. The
+  // freshness-loop already probes accounts on its own cadence, but per-token
+  // cooldowns can stretch wall-clock time to hours; this gives the operator
+  // a one-click override when they need an account re-classified now.
+  //
+  // 60s timeout: refresh-one can take 30-50s on slow accounts (Anthropic
+  // Usage-API + Claude/Codex tokens) — covers worst-case without leaving the
+  // request hung.
+  const body = (input.body ?? {}) as { email?: unknown; target?: unknown };
+  const email = typeof body.email === "string" ? body.email.trim() : "";
+  const target = typeof body.target === "string" ? body.target.trim() : "claude";
+  if (!email || !email.includes("@")) {
+    return { status: 400, body: { error: "email (with @) required" } };
+  }
+  if (target !== "claude" && target !== "codex") {
+    return { status: 400, body: { error: "target must be 'claude' or 'codex'" } };
+  }
+  const result = await runProcess(
+    "ccrotate",
+    ["--target", target, "refresh-one", email],
+    60_000,
+  );
+  if (result.code !== 0) {
+    return {
+      status: 502,
+      body: {
+        ok: false,
+        error:
+          result.stderr.trim() ||
+          result.stdout.trim() ||
+          `ccrotate refresh-one exit ${result.code}`,
+      },
+    };
+  }
+  // Truncate stdout — refresh-one can emit a few lines of probe detail and
+  // the UI only needs the tail for confirmation/debug.
+  const combined = (result.stdout + result.stderr).trim();
+  const output = combined.length > 200 ? `…${combined.slice(-200)}` : combined;
+  return {
+    status: 200,
+    body: { ok: true, email, target, output },
+  };
+}
+
 async function handleImport(input: PluginApiRequestInput): Promise<PluginApiResponse> {
   if (!ctxRef) return { status: 503, body: { error: "plugin not initialized" } };
   const body = (input.body ?? {}) as { blob?: unknown };
@@ -600,6 +645,8 @@ const plugin: PaperclipPlugin = definePlugin({
           return await handleSetSession(input);
         case "clear-stale-tiers":
           return await handleBulkClearTiers(input);
+        case "refresh-one":
+          return await handleRefreshOne(input);
         default:
           return { status: 404, body: { error: `unknown routeKey: ${input.routeKey}` } };
       }
