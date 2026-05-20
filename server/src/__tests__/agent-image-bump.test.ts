@@ -192,4 +192,16 @@ describeEmbeddedPostgres("isAgentInFlight", () => {
     ]);
     await expect(isAgentInFlight(db, agent.id)).resolves.toBe(false);
   });
+
+  it("returns false when agent has no heartbeat runs and k8s client unavailable", async () => {
+    // Exercises the k8s-confirm fallback path: zero DB rows means we fall
+    // through to hasActiveJobForAgent, which in the test environment (no
+    // KUBERNETES_SERVICE_HOST) returns false. Together: false || false === false.
+    // This guards against regressions in the AGENT_ID_LABEL constant — if it
+    // ever stops matching prod label names, the k8s lookup silently returns
+    // no Jobs, and this test stays green. The real guard is integration:
+    // production verification that the label string matches kubectl output.
+    const { agent } = await createTestAgent(db);
+    await expect(isAgentInFlight(db, agent.id)).resolves.toBe(false);
+  });
 });

@@ -129,7 +129,10 @@ export async function deleteAgentJobsForRun(runId: string): Promise<number | nul
   }
 }
 
-const AGENT_ID_LABEL = "paperclip.io/agentId";
+// Verified against production Job pod labels (kubectl get pods -l app.kubernetes.io/managed-by=paperclip)
+// and adapter sources at paperclip-adapter-{claude,opencode}-k8s/src/server/job-manifest.ts
+// which set "paperclip.io/agent-id" (hyphen) on every agent Job.
+const AGENT_ID_LABEL = "paperclip.io/agent-id";
 
 /**
  * Returns true when there is at least one active (not yet completed) Job for
