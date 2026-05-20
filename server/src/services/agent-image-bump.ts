@@ -1,6 +1,7 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents } from "@paperclipai/db";
+import { agents, heartbeatRuns } from "@paperclipai/db";
+import { hasActiveJobForAgent } from "./k8s-job-liveness.js";
 
 export const ELIGIBLE_ADAPTER_TYPES = ["claude_k8s", "opencode_k8s"] as const;
 
@@ -34,4 +35,21 @@ export async function selectEligibleAgentsForImageBump(
         sql`${agents.adapterConfig} ->> 'image' != ${targetImage}`,
       ),
     );
+}
+
+const IN_FLIGHT_RUN_STATUSES = ["queued", "running"] as const;
+
+export async function isAgentInFlight(db: Db, agentId: string): Promise<boolean> {
+  const [dbHit] = await db
+    .select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.agentId, agentId),
+        inArray(heartbeatRuns.status, [...IN_FLIGHT_RUN_STATUSES]),
+      ),
+    )
+    .limit(1);
+  if (dbHit) return true;
+  return hasActiveJobForAgent(agentId);
 }

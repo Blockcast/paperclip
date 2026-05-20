@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
+import { sql } from "drizzle-orm";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { selectEligibleAgentsForImageBump } from "../services/agent-image-bump.js";
+import { selectEligibleAgentsForImageBump, isAgentInFlight } from "../services/agent-image-bump.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -121,5 +122,74 @@ describeEmbeddedPostgres("selectEligibleAgentsForImageBump", () => {
     for (const excludedId of excludedIds) {
       expect(resultIds).not.toContain(excludedId);
     }
+  });
+});
+
+describeEmbeddedPostgres("isAgentInFlight", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-agent-in-flight-");
+    db = createDb(tempDb.connectionString);
+  });
+
+  afterEach(async () => {
+    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function createTestAgent(db: ReturnType<typeof createDb>) {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "InFlightTest Co",
+      issuePrefix: `IF${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const [agent] = await db
+      .insert(agents)
+      .values({
+        companyId,
+        name: "InFlightTestAgent",
+        adapterType: "claude_k8s",
+        adapterConfig: { image: "harbor.example/a:old" },
+        runtimeConfig: {},
+        permissions: {},
+      })
+      .returning();
+    return { companyId, agent: agent! };
+  }
+
+  it("returns true when agent has a running heartbeat run", async () => {
+    const { companyId, agent } = await createTestAgent(db);
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: agent.id,
+      status: "running",
+    });
+    await expect(isAgentInFlight(db, agent.id)).resolves.toBe(true);
+  });
+
+  it("returns true when agent has a queued heartbeat run", async () => {
+    const { companyId, agent } = await createTestAgent(db);
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: agent.id,
+      status: "queued",
+    });
+    await expect(isAgentInFlight(db, agent.id)).resolves.toBe(true);
+  });
+
+  it("returns false when agent only has terminal runs", async () => {
+    const { companyId, agent } = await createTestAgent(db);
+    await db.insert(heartbeatRuns).values([
+      { companyId, agentId: agent.id, status: "succeeded" },
+      { companyId, agentId: agent.id, status: "failed" },
+    ]);
+    await expect(isAgentInFlight(db, agent.id)).resolves.toBe(false);
   });
 });
