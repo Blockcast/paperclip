@@ -125,6 +125,14 @@ const manifest: PaperclipPluginManifestV1 = {
       capability: "api.routes.register",
       companyResolution: { from: "body", key: "companyId" },
     },
+    {
+      routeKey: "clear-stale-tiers",
+      method: "POST",
+      path: "/clear-stale-tiers",
+      auth: "board",
+      capability: "api.routes.register",
+      companyResolution: { from: "body", key: "companyId" },
+    },
   ],
 };
 
