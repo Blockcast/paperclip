@@ -1268,6 +1268,7 @@ export function issueRoutes(
     req: Request,
     res: Response,
     issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null },
+    options: { allowSameAssigneeRunMismatchComment?: boolean } = {},
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -1306,6 +1307,10 @@ export function issueRoutes(
       return false;
     }
     if (issue.status !== "in_progress") {
+      return true;
+    }
+    if (options.allowSameAssigneeRunMismatchComment) {
+      if (!requireAgentRunId(req, res)) return false;
       return true;
     }
     const runId = requireAgentRunId(req, res);
@@ -4954,7 +4959,7 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    if (!(await assertAgentIssueMutationAllowed(req, res, issue, { allowSameAssigneeRunMismatchComment: true }))) return;
     if (!assertStructuredCommentFieldsAllowed(req, res, {
       presentation: req.body.presentation,
       metadata: req.body.metadata,
