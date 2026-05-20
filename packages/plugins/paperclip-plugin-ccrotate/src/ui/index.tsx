@@ -538,9 +538,34 @@ export function CcrotateSettingsPage({ context }: PluginSettingsPageProps) {
   const companyId = context.companyId ?? null;
   const [persisted, setPersisted] = useState<{ blob?: string; capturedAt?: string } | null>(null);
   const [importBlob, setImportBlob] = useState("");
-  const [busy, setBusy] = useState<"idle" | "loading" | "saving" | "importing">("loading");
+  const [busy, setBusy] = useState<"idle" | "loading" | "saving" | "importing" | "clearing">("loading");
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [clearResult, setClearResult] = useState<{ cleared: number; emails: string[]; refreshError?: string } | null>(null);
+
+  async function handleBulkClear() {
+    if (!companyId) return;
+    // Confirm without count (simpler than a prefetch — server returns the
+    // actual count in the response anyway, so the operator sees what fired).
+    if (!confirm("Clear all 'extra' tier labels from the Claude tier-cache? The next per-account probe will re-classify each account.")) {
+      return;
+    }
+    setBusy("clearing");
+    setError(null);
+    setSuccess(null);
+    setClearResult(null);
+    try {
+      const r = await postJson<{ ok: boolean; cleared: number; emails: string[]; refreshError?: string }>(
+        "/clear-stale-tiers",
+        { companyId, target: "claude" },
+      );
+      setClearResult({ cleared: r.cleared, emails: r.emails, refreshError: r.refreshError });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("idle");
+    }
+  }
 
   useEffect(() => {
     if (!companyId) return;
@@ -629,6 +654,59 @@ export function CcrotateSettingsPage({ context }: PluginSettingsPageProps) {
             disabled={busy === "importing" || !importBlob.trim() || !companyId}
           >
             {busy === "importing" ? "importing…" : "Import"}
+          </button>
+        </div>
+      </div>
+
+      <div style={cardStyle}>
+        <div style={headerRowStyle}>
+          <h3 style={headerTitleStyle}>Bulk-clear stale tier labels</h3>
+        </div>
+        <div style={subtleStyle}>
+          Removes 'extra' tier labels from tier-cache; next per-account
+          probe re-classifies. Use after PR #55-style classifier changes
+          to drop pre-fix entries without waiting hours for the
+          freshness-loop to re-probe each account.
+        </div>
+        {clearResult && (
+          <div
+            style={{
+              marginTop: "12px",
+              padding: "10px",
+              borderRadius: "6px",
+              background: "var(--input, #18181b)",
+              border: "1px solid var(--border, #27272a)",
+              fontSize: "12px",
+              fontFamily: "ui-monospace, SFMono-Regular, monospace",
+            }}
+          >
+            <div>
+              Cleared {clearResult.cleared} account
+              {clearResult.cleared === 1 ? "" : "s"}
+              {clearResult.emails.length > 0 ? ":" : "."}
+            </div>
+            {clearResult.emails.length > 0 && (
+              <ul style={{ margin: "6px 0 0", paddingLeft: "20px" }}>
+                {clearResult.emails.map((e) => (
+                  <li key={e}>{e}</li>
+                ))}
+              </ul>
+            )}
+            {clearResult.refreshError && (
+              <div style={{ marginTop: "6px", color: "#eab308" }}>
+                refresh kick failed: {clearResult.refreshError} (freshness-loop will re-probe on its own cadence)
+              </div>
+            )}
+          </div>
+        )}
+        <div style={{ marginTop: "12px", display: "flex", justifyContent: "flex-end" }}>
+          <button
+            type="button"
+            style={secondaryBtnStyle}
+            onClick={handleBulkClear}
+            disabled={busy === "clearing" || !companyId}
+          >
+            {busy === "clearing" ? "clearing…" : "Clear stale tier=extra labels"}
           </button>
         </div>
       </div>
