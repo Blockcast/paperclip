@@ -1002,41 +1002,61 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       ? priorReviews.map((review) => `- ${review.identifier ?? review.id}: ${review.status}, updated ${review.updatedAt.toISOString()}`).join("\n")
       : "- no prior review rows available in the sampled lookback";
 
-    const escalation = await issuesSvc.create(input.sourceIssue.companyId, {
-      title: `[user-cover] productivity-review escalation: ${input.sourceIssue.identifier ?? input.sourceIssue.title} — ${input.priorReviewCount} prior reviews in ${lookbackDays}d`,
-      description: [
-        `Productivity review hit the repeat-review cap for ${input.sourceIssue.identifier ?? input.sourceIssue.id}.`,
-        "",
-        `- Source status: ${input.sourceIssue.status}`,
-        `- Source assignee agent: ${input.sourceIssue.assigneeAgentId ?? "none"}`,
-        `- Prior review count: ${input.priorReviewCount} prior resolved productivity reviews in ${lookbackDays}d`,
-        `- Latest source activity: ${input.sourceIssue.lastActivityAt?.toISOString?.() ?? input.sourceIssue.updatedAt.toISOString()}`,
-        `- Source started at: ${input.sourceIssue.startedAt?.toISOString?.() ?? "unknown"}`,
-        `- Source monitor next check: ${input.sourceIssue.monitorNextCheckAt?.toISOString?.() ?? "none"}`,
-        "",
-        "## Recent wrapper verdicts",
-        "",
-        priorReviewLines,
-        "",
-        "## User direction needed",
-        "",
-        "Please choose one explicit direction: cancel / hand off / decompose / let it run with the opt-out flag.",
-      ].join("\n"),
-      status: "todo",
-      priority: "high",
-      parentId: input.sourceIssue.id,
-      projectId: input.sourceIssue.projectId,
-      goalId: input.sourceIssue.goalId,
-      billingCode: input.sourceIssue.billingCode,
-      assigneeAgentId: null,
-      assigneeUserId: ownerUserId,
-      originKind: RECOVERY_ORIGIN_KINDS.productivityReviewEscalation,
-      originId: input.sourceIssue.id,
-      originFingerprint: productivityReviewEscalationFingerprint(input.sourceIssue.id),
-      requestDepth: clampIssueRequestDepth(input.sourceIssue.requestDepth + 1),
-    });
+    let escalation: Awaited<ReturnType<typeof issuesSvc.create>>;
+    try {
+      escalation = await issuesSvc.create(input.sourceIssue.companyId, {
+        title: `[user-cover] productivity-review escalation: ${input.sourceIssue.identifier ?? input.sourceIssue.title} — ${input.priorReviewCount} prior reviews in ${lookbackDays}d`,
+        description: [
+          `Productivity review hit the repeat-review cap for ${input.sourceIssue.identifier ?? input.sourceIssue.id}.`,
+          "",
+          `- Source status: ${input.sourceIssue.status}`,
+          `- Source assignee agent: ${input.sourceIssue.assigneeAgentId ?? "none"}`,
+          `- Prior review count: ${input.priorReviewCount} prior resolved productivity reviews in ${lookbackDays}d`,
+          `- Latest source activity: ${input.sourceIssue.lastActivityAt?.toISOString?.() ?? input.sourceIssue.updatedAt.toISOString()}`,
+          `- Source started at: ${input.sourceIssue.startedAt?.toISOString?.() ?? "unknown"}`,
+          `- Source monitor next check: ${input.sourceIssue.monitorNextCheckAt?.toISOString?.() ?? "none"}`,
+          "",
+          "## Recent wrapper verdicts",
+          "",
+          priorReviewLines,
+          "",
+          "## User direction needed",
+          "",
+          "Please choose one explicit direction: cancel / hand off / decompose / let it run with the opt-out flag.",
+        ].join("\n"),
+        status: "todo",
+        priority: "high",
+        parentId: input.sourceIssue.id,
+        projectId: input.sourceIssue.projectId,
+        goalId: input.sourceIssue.goalId,
+        billingCode: input.sourceIssue.billingCode,
+        assigneeAgentId: null,
+        assigneeUserId: ownerUserId,
+        originKind: RECOVERY_ORIGIN_KINDS.productivityReviewEscalation,
+        originId: input.sourceIssue.id,
+        originFingerprint: productivityReviewEscalationFingerprint(input.sourceIssue.id),
+        requestDepth: clampIssueRequestDepth(input.sourceIssue.requestDepth + 1),
+      });
+    } catch (error) {
+      const maybe = error as { code?: string; constraint?: string; message?: string };
+      const uniqueConflict = maybe.code === "23505" &&
+        (
+          maybe.constraint === "issues_active_productivity_review_escalation_uq" ||
+          typeof maybe.message === "string" && maybe.message.includes("issues_active_productivity_review_escalation_uq")
+        );
+      if (!uniqueConflict) throw error;
+      const raced = await findOpenProductivityReviewEscalation(input.sourceIssue.companyId, input.sourceIssue.id);
+      if (!raced) throw error;
+      return { kind: "existing" as const, escalationIssueId: raced.id };
+    }
 
-    if (["todo", "in_progress", "in_review", "blocked"].includes(input.sourceIssue.status)) {
+    const currentSource = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(and(eq(issues.companyId, input.sourceIssue.companyId), eq(issues.id, input.sourceIssue.id)))
+      .then((rows) => rows[0] ?? null);
+
+    if (currentSource && ["todo", "in_progress", "in_review", "blocked"].includes(currentSource.status)) {
       const existingBlockers = await db
         .select({ blockerIssueId: issueRelations.issueId })
         .from(issueRelations)
@@ -1125,24 +1145,6 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         result.snoozed += 1;
         continue;
       }
-      const priorReviewCount = await countResolvedProductivityReviews(
-        candidate.companyId,
-        candidate.id,
-        thresholds.escalationLookbackMs,
-        now,
-      );
-      if (priorReviewCount >= thresholds.escalationThreshold) {
-        const outcome = await createProductivityReviewEscalation({
-          sourceIssue: candidate,
-          priorReviewCount,
-          thresholds,
-          now,
-        });
-        if (outcome.kind === "existing") result.existing += 1;
-        else result.escalated += 1;
-        result.reviewIssueIds.push(outcome.escalationIssueId);
-        continue;
-      }
       const sourceAgent = await getAgent(candidate.assigneeAgentId);
       if (!sourceAgent || sourceAgent.companyId !== candidate.companyId) {
         result.skipped += 1;
@@ -1164,6 +1166,24 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         prefixCache.set(candidate.companyId, prefix);
       }
       try {
+        const priorReviewCount = await countResolvedProductivityReviews(
+          candidate.companyId,
+          candidate.id,
+          thresholds.escalationLookbackMs,
+          now,
+        );
+        if (priorReviewCount >= thresholds.escalationThreshold) {
+          const outcome = await createProductivityReviewEscalation({
+            sourceIssue: candidate,
+            priorReviewCount,
+            thresholds,
+            now,
+          });
+          if (outcome.kind === "existing") result.existing += 1;
+          else result.escalated += 1;
+          result.reviewIssueIds.push(outcome.escalationIssueId);
+          continue;
+        }
         const outcome = await createOrUpdateReview(evidence, { prefix });
         if (outcome.kind === "created") result.created += 1;
         else if (outcome.kind === "updated") result.updated += 1;

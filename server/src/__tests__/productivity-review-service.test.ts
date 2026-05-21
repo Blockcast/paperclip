@@ -755,6 +755,91 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviewEscalations(seeded.companyId)).toHaveLength(1);
   });
 
+  it("does not escalate repeat-review history when the source has no current trigger", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: now,
+    });
+    await insertResolvedProductivityReviews({
+      companyId: seeded.companyId,
+      sourceIssueId: seeded.issueId,
+      issuePrefix: seeded.issuePrefix,
+      count: 3,
+      now,
+      ageMs: 8 * 60 * 60 * 1000,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.escalated).toBe(0);
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(await listProductivityReviewEscalations(seeded.companyId)).toHaveLength(0);
+    const [source] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    expect(source?.status).toBe("in_progress");
+  });
+
+  it("accounts for escalation failures per candidate without aborting reconciliation", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const chronic = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await insertResolvedProductivityReviews({
+      companyId: chronic.companyId,
+      sourceIssueId: chronic.issueId,
+      issuePrefix: chronic.issuePrefix,
+      count: 3,
+      now,
+      ageMs: 8 * 60 * 60 * 1000,
+    });
+    const normal = await seedAssignedIssue();
+    await insertRuns({
+      companyId: normal.companyId,
+      agentId: normal.coderId,
+      issueId: normal.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    await db.execute(sql.raw(`
+      create function fail_productivity_review_escalation_insert()
+      returns trigger
+      language plpgsql
+      as $$
+      begin
+        if new.origin_kind = 'productivity_review_escalation' then
+          raise exception 'forced productivity review escalation failure';
+        end if;
+        return new;
+      end;
+      $$;
+      create trigger fail_productivity_review_escalation_insert_trigger
+      before insert on issues
+      for each row execute function fail_productivity_review_escalation_insert();
+    `));
+
+    try {
+      const result = await productivityReviewService(db).reconcileProductivityReviews({ now });
+
+      expect(result.failed).toBe(1);
+      expect(result.failedIssueIds).toContain(chronic.issueId);
+      expect(result.created).toBe(1);
+      const reviews = await listProductivityReviews(normal.companyId);
+      expect(reviews).toHaveLength(1);
+      expect(await listProductivityReviewEscalations(chronic.companyId)).toHaveLength(0);
+    } finally {
+      await db.execute(sql.raw(`
+        drop trigger if exists fail_productivity_review_escalation_insert_trigger on issues;
+        drop function if exists fail_productivity_review_escalation_insert();
+      `));
+    }
+  });
+
   it("does not flip terminal source issues while escalating repeat reviews", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
