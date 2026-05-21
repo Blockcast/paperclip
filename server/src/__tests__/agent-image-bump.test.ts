@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { selectEligibleAgentsForImageBump, isAgentInFlight } from "../services/agent-image-bump.js";
+import { selectEligibleAgentsForImageBump, isAgentInFlight, applyImageBumpToAgent } from "../services/agent-image-bump.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -203,5 +203,115 @@ describeEmbeddedPostgres("isAgentInFlight", () => {
     // production verification that the label string matches kubectl output.
     const { agent } = await createTestAgent(db);
     await expect(isAgentInFlight(db, agent.id)).resolves.toBe(false);
+  });
+});
+
+describeEmbeddedPostgres("applyImageBumpToAgent", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-apply-image-bump-");
+    db = createDb(tempDb.connectionString);
+  });
+
+  afterEach(async () => {
+    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function createCompanyAndAgent(opts: {
+    image: string;
+    extraConfig?: Record<string, unknown>;
+  }) {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "ApplyBumpTest Co",
+      issuePrefix: `AB${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const [agent] = await db
+      .insert(agents)
+      .values({
+        companyId,
+        name: "ApplyBumpTestAgent",
+        adapterType: "claude_k8s",
+        adapterConfig: { image: opts.image, ...(opts.extraConfig ?? {}) },
+        runtimeConfig: {},
+        permissions: {},
+      })
+      .returning();
+    return { companyId, agent: agent! };
+  }
+
+  it("PATCHes the image immediately when the agent is idle", async () => {
+    const { agent } = await createCompanyAndAgent({
+      image: "harbor.example/a:old",
+      extraConfig: { model: "claude-opus" },
+    });
+
+    const result = await applyImageBumpToAgent(db, {
+      agentId: agent.id,
+      targetImage: "harbor.example/a:new",
+      source: "ci:test",
+    });
+
+    expect(result).toEqual({ outcome: "bumped", agentId: agent.id });
+
+    const [refetched] = await db.select().from(agents).where(eq(agents.id, agent.id));
+    const cfg = refetched!.adapterConfig as Record<string, unknown>;
+    expect(cfg.image).toBe("harbor.example/a:new");
+    expect(cfg.model).toBe("claude-opus"); // siblings preserved
+    expect(refetched!.pendingImageBump).toBeNull();
+  });
+
+  it("sets pending_image_bump and skips PATCH when the agent is in-flight", async () => {
+    const { companyId, agent } = await createCompanyAndAgent({ image: "harbor.example/a:old" });
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: agent.id,
+      status: "running",
+    });
+
+    const result = await applyImageBumpToAgent(db, {
+      agentId: agent.id,
+      targetImage: "harbor.example/a:new",
+      source: "ci:test",
+    });
+
+    expect(result).toEqual({ outcome: "skipped", agentId: agent.id });
+
+    const [refetched] = await db.select().from(agents).where(eq(agents.id, agent.id));
+    expect((refetched!.adapterConfig as Record<string, unknown>).image).toBe(
+      "harbor.example/a:old",
+    );
+    expect(refetched!.pendingImageBump).toBe("harbor.example/a:new");
+  });
+
+  it("overwrites a stale pending_image_bump with the newer target", async () => {
+    const { companyId, agent } = await createCompanyAndAgent({ image: "harbor.example/a:old" });
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: agent.id,
+      status: "running",
+    });
+
+    await applyImageBumpToAgent(db, {
+      agentId: agent.id,
+      targetImage: "harbor.example/a:X",
+      source: "ci:first",
+    });
+    await applyImageBumpToAgent(db, {
+      agentId: agent.id,
+      targetImage: "harbor.example/a:Y",
+      source: "ci:second",
+    });
+
+    const [refetched] = await db.select().from(agents).where(eq(agents.id, agent.id));
+    expect(refetched!.pendingImageBump).toBe("harbor.example/a:Y");
   });
 });
