@@ -19,7 +19,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { issueService } from "../services/issues.js";
-import { buildIssueGraphLivenessIncidentKey } from "../services/recovery/origins.js";
+import { buildIssueGraphLivenessIncidentKey, RECOVERY_ORIGIN_KINDS } from "../services/recovery/origins.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -651,13 +651,22 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       title: "Recovery issue",
       status: "todo",
       assigneeAgentId: agentId,
-      originKind: "harness_liveness_escalation",
+      originKind: RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation,
       originId: buildIssueGraphLivenessIncidentKey({
         companyId,
         issueId: sourceId,
         state: "blocked_by_unassigned_issue",
         blockerIssueId: leafId,
       }),
+    });
+    const productivityReviewId = await insertIssue({
+      companyId,
+      identifier: "BID-5",
+      title: "Productivity review issue",
+      status: "todo",
+      assigneeAgentId: agentId,
+      originKind: RECOVERY_ORIGIN_KINDS.issueProductivityReview,
+      originId: sourceId,
     });
     const handoffId = await insertIssue({
       companyId,
@@ -686,6 +695,12 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       sourceIssue: { id: sourceId },
       leafIssue: { id: leafId },
       recoveryIssue: { id: recoveryId },
+    });
+    expect(byId.get(productivityReviewId)?.blockedInboxAttention).toMatchObject({
+      state: "recovery_open",
+      reason: "open_recovery_issue",
+      sourceIssue: { id: sourceId },
+      recoveryIssue: { id: productivityReviewId },
     });
     expect(byId.get(handoffId)?.blockedInboxAttention).toMatchObject({
       state: "missing_disposition",

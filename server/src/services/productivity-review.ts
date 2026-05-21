@@ -92,6 +92,11 @@ type EnqueueWakeup = (
   },
 ) => Promise<unknown | null>;
 
+type ProductivityReviewServiceDeps = {
+  enqueueWakeup?: EnqueueWakeup;
+  beforeCreateOrUpdateReview?: (evidence: ProductivityReviewEvidence) => Promise<void> | void;
+};
+
 function productivityReviewFingerprint(sourceIssueId: string) {
   return `productivity-review:${sourceIssueId}`;
 }
@@ -131,6 +136,23 @@ function truncateInline(value: string | null | undefined, max = 260) {
 
 function readPositiveInteger(value: number, fallback: number) {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+function isActiveProductivityReviewUniqueConflict(error: unknown) {
+  let current: unknown = error;
+  while (current && typeof current === "object") {
+    const maybe = current as { code?: string; constraint?: string; message?: string; cause?: unknown };
+    if (
+      maybe.code === "23505" &&
+      (maybe.constraint === "issues_active_productivity_review_uq" ||
+        typeof maybe.message === "string" && maybe.message.includes("issues_active_productivity_review_uq"))
+    ) {
+      return true;
+    }
+    if (!maybe.cause || maybe.cause === current) return false;
+    current = maybe.cause;
+  }
+  return false;
 }
 
 function coerceDate(value: Date | string | null | undefined) {
@@ -200,7 +222,7 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
   return "Long active duration";
 }
 
-export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: EnqueueWakeup }) {
+export function productivityReviewService(db: Db, deps?: ProductivityReviewServiceDeps) {
   const issuesSvc = issueService(db);
   const budgets = budgetService(db);
 
@@ -218,6 +240,28 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       .from(agents)
       .where(eq(agents.id, agentId))
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function isSourceStillReviewable(sourceIssue: IssueRow, sourceAgentId: string) {
+    const current = await db
+      .select({
+        status: issues.status,
+        hiddenAt: issues.hiddenAt,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        originKind: issues.originKind,
+      })
+      .from(issues)
+      .where(and(eq(issues.companyId, sourceIssue.companyId), eq(issues.id, sourceIssue.id)))
+      .then((rows) => rows[0] ?? null);
+    return Boolean(
+      current &&
+        !current.hiddenAt &&
+        !current.assigneeUserId &&
+        current.assigneeAgentId === sourceAgentId &&
+        ["todo", "in_progress"].includes(current.status) &&
+        current.originKind !== PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+    );
   }
 
   function isAgentInvokable(agent: AgentRow | null | undefined) {
@@ -698,13 +742,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         requestDepth: clampIssueRequestDepth(evidence.sourceIssue.requestDepth + 1),
       });
     } catch (error) {
-      const maybe = error as { code?: string; constraint?: string; message?: string };
-      const uniqueConflict = maybe.code === "23505" &&
-        (
-          maybe.constraint === "issues_active_productivity_review_uq" ||
-          typeof maybe.message === "string" && maybe.message.includes("issues_active_productivity_review_uq")
-        );
-      if (!uniqueConflict) throw error;
+      if (!isActiveProductivityReviewUniqueConflict(error)) throw error;
       const raced = await findOpenProductivityReview(evidence.sourceIssue.companyId, evidence.sourceIssue.id);
       if (!raced) throw error;
       return { kind: "existing" as const, reviewIssueId: raced.id };
@@ -824,6 +862,11 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         prefixCache.set(candidate.companyId, prefix);
       }
       try {
+        await deps?.beforeCreateOrUpdateReview?.(evidence);
+        if (!await isSourceStillReviewable(candidate, sourceAgent.id)) {
+          result.skipped += 1;
+          continue;
+        }
         const outcome = await createOrUpdateReview(evidence, { prefix, thresholds });
         if (outcome.kind === "created") result.created += 1;
         else if (outcome.kind === "updated") result.updated += 1;

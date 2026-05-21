@@ -421,6 +421,114 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
+  it("does not create a repeat review from history alone when no current trigger exists", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "todo" });
+    await db.insert(issues).values(
+      [8, 9, 10].map((hoursAgo, index) => {
+        const createdAt = new Date(now.getTime() - hoursAgo * 60 * 60 * 1000);
+        return {
+          id: randomUUID(),
+          companyId: seeded.companyId,
+          title: `Completed productivity review ${index + 1}`,
+          status: "done",
+          priority: "high",
+          originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+          originId: seeded.issueId,
+          originFingerprint: `productivity-review:${seeded.issueId}`,
+          parentId: seeded.issueId,
+          issueNumber: index + 2,
+          identifier: `${seeded.issuePrefix}-${index + 2}`,
+          createdAt,
+          updatedAt: createdAt,
+        };
+      }),
+    );
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(3);
+  });
+
+  it("isolates one candidate's review failure and continues reconciling other candidates", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const bad = await seedAssignedIssue();
+    const good = await seedAssignedIssue();
+    for (const seeded of [bad, good]) {
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+    }
+
+    const result = await productivityReviewService(db, {
+      beforeCreateOrUpdateReview(evidence) {
+        if (evidence.sourceIssue.id === bad.issueId) throw new Error("synthetic review failure");
+      },
+    }).reconcileProductivityReviews({ now });
+
+    expect(result.failed).toBe(1);
+    expect(result.failedIssueIds).toEqual([bad.issueId]);
+    expect(result.created).toBe(1);
+    expect(await listProductivityReviews(bad.companyId)).toHaveLength(0);
+    expect(await listProductivityReviews(good.companyId)).toHaveLength(1);
+  });
+
+  it("deduplicates concurrent productivity review creation for the same source", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const [first, second] = await Promise.all([
+      productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId }),
+      productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId }),
+    ]);
+
+    expect(first.created + second.created).toBe(1);
+    expect(first.failed + second.failed).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(1);
+  });
+
+  it("skips review creation when the source becomes terminal after evidence collection", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const result = await productivityReviewService(db, {
+      async beforeCreateOrUpdateReview(evidence) {
+        if (evidence.sourceIssue.id === seeded.issueId) {
+          await db.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.issueId));
+        }
+      },
+    }).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+    const [source] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    expect(source?.status).toBe("done");
+  });
+
   it("skips productivity-review descendants so reviews cannot recursively spawn reviews", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
