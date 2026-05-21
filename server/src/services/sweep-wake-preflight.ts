@@ -1,4 +1,4 @@
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, companies, issueComments, issueRelations, issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -7,10 +7,13 @@ import type { ServerGbrainClient } from "./gbrain-client-factory.js";
 export type SweepWakePreflightVerdict =
   | "skip"
   | "missing_or_invalid_frame"
+  | "identity_mismatch"
   | "new_activity"
   | "new_comment"
   | "status_changed"
   | "blocked_by_changed"
+  | "blocker_resolved"
+  | "raced_after_decision"
   | "soft_ttl_refresh"
   | "gbrain_error"
   | "feature_disabled";
@@ -39,11 +42,25 @@ export interface SweepWakeIssueSnapshot {
   status: string;
   lastActivityAt: Date;
   blockedByIssueIds: string[];
+  /**
+   * The most recent `completedAt` across this issue's blockers, or `null` when there are
+   * no blockers (or no blocker has completedAt set). Used to detect the
+   * `issue_blockers_resolved_sweep` case where the dependent's own activity has not
+   * changed, but blockers have transitioned to `done` since the frame was written.
+   */
+  blockersResolvedSince: Date | null;
 }
 
 export interface SweepWakeCommentSnapshot {
   body: string;
   createdAt: Date;
+}
+
+export interface SweepWakeFrameIdentity {
+  companyId: string;
+  agentId: string;
+  issueId: string;
+  issueIdentifier: string;
 }
 
 export type SweepWakeFrameDecision =
@@ -175,13 +192,32 @@ export function compareSweepWakeFrame(input: {
   frame: unknown;
   issue: SweepWakeIssueSnapshot;
   recentComments: SweepWakeCommentSnapshot[];
+  expectedIdentity: SweepWakeFrameIdentity;
 }): SweepWakeFrameDecision {
   const frame = isValidSweepWakeFrame(input.frame) ? input.frame : null;
   if (!frame) return { skip: false, verdict: "missing_or_invalid_frame" };
+  // Fail-open if the gbrain page identity does not match the DB context for the
+  // company/agent/issue we are about to wake. A stale or cross-wired frame must not be
+  // allowed to suppress a wake for a different identity tuple.
+  const ident = input.expectedIdentity;
+  if (
+    frame.companyId !== ident.companyId ||
+    frame.agentId !== ident.agentId ||
+    frame.issueId !== ident.issueId ||
+    frame.issueIdentifier !== ident.issueIdentifier
+  ) {
+    return { skip: false, verdict: "identity_mismatch", frame };
+  }
   if (input.issue.lastActivityAt > new Date(frame.issueLastActivityAt)) {
     return { skip: false, verdict: "new_activity", frame };
   }
   const frameUpdatedAt = new Date(frame.updatedAt);
+  // Blocker transitions to `done` do not bump the dependent's own lastActivityAt; check
+  // the max completedAt across blockers explicitly so `issue_blockers_resolved_sweep`
+  // wakes are not silently suppressed.
+  if (input.issue.blockersResolvedSince && input.issue.blockersResolvedSince > frameUpdatedAt) {
+    return { skip: false, verdict: "blocker_resolved", frame };
+  }
   const hasNewNonMarkerComment = input.recentComments.some(
     (comment) => comment.createdAt > frameUpdatedAt && !comment.body.startsWith(SERVER_PREFLIGHT_MARKER_PREFIX),
   );
@@ -237,6 +273,20 @@ async function listIssueBlockerIds(db: Db, issueId: string) {
   return rows.map((row) => row.blockerIssueId);
 }
 
+async function maxBlockerCompletedAt(
+  db: Db,
+  blockerIssueIds: string[],
+  companyId: string,
+): Promise<Date | null> {
+  if (blockerIssueIds.length === 0) return null;
+  const row = await db
+    .select({ maxCompletedAt: sql<Date | null>`max(${issues.completedAt})` })
+    .from(issues)
+    .where(and(inArray(issues.id, blockerIssueIds), eq(issues.companyId, companyId)))
+    .then((rows) => rows[0] ?? null);
+  return row?.maxCompletedAt ?? null;
+}
+
 async function getIssueSnapshot(db: Db, issueId: string, companyId: string): Promise<SweepWakeIssueSnapshot | null> {
   const issue = await db
     .select({
@@ -250,7 +300,9 @@ async function getIssueSnapshot(db: Db, issueId: string, companyId: string): Pro
     .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
     .then((rows) => rows[0] ?? null);
   if (!issue) return null;
-  return { ...issue, blockedByIssueIds: await listIssueBlockerIds(db, issue.id) };
+  const blockedByIssueIds = await listIssueBlockerIds(db, issue.id);
+  const blockersResolvedSince = await maxBlockerCompletedAt(db, blockedByIssueIds, companyId);
+  return { ...issue, blockedByIssueIds, blockersResolvedSince };
 }
 
 async function listRecentComments(db: Db, issueId: string, companyId: string) {
@@ -276,14 +328,91 @@ function currentMinuteBucket(now = new Date()) {
   return new Date(Math.floor(now.getTime() / 60_000) * 60_000).toISOString();
 }
 
+export type SweepWakeRaceReason =
+  | "issue_vanished"
+  | "activity_advanced"
+  | "status_changed"
+  | "new_non_marker_comment";
+
+export type PreflightMarkerResult =
+  | { kind: "posted"; createdAt: Date }
+  | { kind: "raced"; reason: SweepWakeRaceReason };
+
+/**
+ * Re-reads issue/comment state under the advisory lock and flags a race when anything
+ * material moved between the caller's snapshot (passed in as `input.previousIssue`)
+ * and the lock acquisition. Returning `raced: true` causes the caller to fall open and
+ * skip both the marker insert and the gbrain frame rewrite.
+ *
+ * Without this re-check, a non-marker activity (comment, status change, lastActivityAt
+ * bump) that lands between `runSweepWakePreflight`'s read and the lock acquisition can
+ * be silently overwritten by the frame rewrite, suppressing the next sweep.
+ */
+export interface RaceCheckInputs {
+  previousIssue: { lastActivityAt: Date; status: string };
+  currentIssue: { lastActivityAt: Date; status: string } | null;
+  frameIssueLastActivityAt: Date;
+  hasNewNonMarkerCommentSinceFrame: boolean;
+}
+
+export function detectSweepWakeRace(
+  input: RaceCheckInputs,
+): { raced: true; reason: SweepWakeRaceReason } | { raced: false } {
+  if (!input.currentIssue) return { raced: true, reason: "issue_vanished" };
+  if (input.currentIssue.lastActivityAt > input.frameIssueLastActivityAt) {
+    return { raced: true, reason: "activity_advanced" };
+  }
+  if (input.currentIssue.lastActivityAt > input.previousIssue.lastActivityAt) {
+    return { raced: true, reason: "activity_advanced" };
+  }
+  if (input.currentIssue.status !== input.previousIssue.status) {
+    return { raced: true, reason: "status_changed" };
+  }
+  if (input.hasNewNonMarkerCommentSinceFrame) return { raced: true, reason: "new_non_marker_comment" };
+  return { raced: false };
+}
+
 async function postPreflightMarker(db: Db, input: {
   issue: SweepWakeIssueSnapshot;
   frame: SweepWakeFrame;
   now?: Date;
-}) {
+}): Promise<PreflightMarkerResult> {
   const bucket = currentMinuteBucket(input.now);
-  return db.transaction(async (tx) => {
+  return db.transaction(async (tx): Promise<PreflightMarkerResult> => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${input.issue.id}))`);
+
+    // Re-read under the lock so that any activity, status change, or non-marker comment
+    // that landed between the initial snapshot and the lock acquisition forces a
+    // fail-open. Otherwise we would silently overwrite that signal when we rewrite the
+    // gbrain frame.
+    const currentIssue = await tx
+      .select({ lastActivityAt: issues.lastActivityAt, status: issues.status })
+      .from(issues)
+      .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId)))
+      .then((rows) => rows[0] ?? null);
+
+    const frameUpdatedAtDate = new Date(input.frame.updatedAt);
+    const racedRows = await tx
+      .select({ body: issueComments.body, createdAt: issueComments.createdAt })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.issueId, input.issue.id),
+        eq(issueComments.companyId, input.issue.companyId),
+        gt(issueComments.createdAt, frameUpdatedAtDate),
+      ))
+      .limit(50);
+    const hasNewNonMarkerCommentSinceFrame = racedRows.some(
+      (row) => !row.body.startsWith(SERVER_PREFLIGHT_MARKER_PREFIX),
+    );
+
+    const race = detectSweepWakeRace({
+      previousIssue: { lastActivityAt: input.issue.lastActivityAt, status: input.issue.status },
+      currentIssue,
+      frameIssueLastActivityAt: new Date(input.frame.issueLastActivityAt),
+      hasNewNonMarkerCommentSinceFrame,
+    });
+    if (race.raced) return { kind: "raced", reason: race.reason };
+
     const metadata = {
       kind: "gstack-preflight",
       source: SERVER_PREFLIGHT_SOURCE,
@@ -302,7 +431,7 @@ async function postPreflightMarker(db: Db, input: {
       ))
       .limit(1)
       .then((rows) => rows[0] ?? null);
-    if (existing) return existing.createdAt;
+    if (existing) return { kind: "posted", createdAt: existing.createdAt };
 
     const inserted = await tx
       .insert(issueComments)
@@ -315,7 +444,7 @@ async function postPreflightMarker(db: Db, input: {
       })
       .returning({ createdAt: issueComments.createdAt })
       .then((rows) => rows[0]);
-    return inserted.createdAt;
+    return { kind: "posted", createdAt: inserted.createdAt };
   });
 }
 
@@ -337,13 +466,19 @@ export async function runSweepWakePreflight(input: {
     agentId: input.agent.id,
     issueIdentifier: issue.identifier,
   });
+  const expectedIdentity: SweepWakeFrameIdentity = {
+    companyId: input.agent.companyId,
+    agentId: input.agent.id,
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+  };
   try {
     const [page, comments] = await Promise.all([
       input.gbrain.call("get_page", { slug }),
       listRecentComments(input.db, issue.id, issue.companyId),
     ]);
     const frame = parseSweepWakeFramePage(page);
-    const decision = compareSweepWakeFrame({ frame, issue, recentComments: comments });
+    const decision = compareSweepWakeFrame({ frame, issue, recentComments: comments, expectedIdentity });
     if (!decision.skip) {
       log.info({ verdict: decision.verdict, issueId: issue.id, agentId: input.agent.id }, "sweep_wake_preflight.decision");
       return decision;
@@ -356,10 +491,19 @@ export async function runSweepWakePreflight(input: {
       });
       return { skip: false as const, verdict: "soft_ttl_refresh" as const, frame: decision.frame };
     }
-    const postCommentActivityAt = await postPreflightMarker(input.db, { issue, frame: decision.frame });
+    const markerResult = await postPreflightMarker(input.db, { issue, frame: decision.frame });
+    if (markerResult.kind === "raced") {
+      // State moved under the lock — fall open without writing a marker or rewriting
+      // the frame. Next sweep will see the new activity and follow the normal path.
+      log.info(
+        { verdict: "raced_after_decision", reason: markerResult.reason, issueId: issue.id, agentId: input.agent.id },
+        "sweep_wake_preflight.decision",
+      );
+      return { skip: false as const, verdict: "raced_after_decision" as const, frame: decision.frame };
+    }
     const updatedFrame: SweepWakeFrame = {
       ...decision.frame,
-      issueLastActivityAt: postCommentActivityAt.toISOString(),
+      issueLastActivityAt: markerResult.createdAt.toISOString(),
       updatedAt: new Date().toISOString(),
       consecutiveSkips: decision.frame.consecutiveSkips + 1,
     };
