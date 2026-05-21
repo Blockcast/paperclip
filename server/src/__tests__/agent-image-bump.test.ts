@@ -6,7 +6,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { selectEligibleAgentsForImageBump, isAgentInFlight, applyImageBumpToAgent } from "../services/agent-image-bump.js";
+import { selectEligibleAgentsForImageBump, isAgentInFlight, applyImageBumpToAgent, bumpAgentImagesForCompany, processPendingImageBumpForAgent } from "../services/agent-image-bump.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -313,5 +313,186 @@ describeEmbeddedPostgres("applyImageBumpToAgent", () => {
 
     const [refetched] = await db.select().from(agents).where(eq(agents.id, agent.id));
     expect(refetched!.pendingImageBump).toBe("harbor.example/a:Y");
+  });
+});
+
+describeEmbeddedPostgres("bumpAgentImagesForCompany", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-bump-company-");
+    db = createDb(tempDb.connectionString);
+  });
+
+  afterEach(async () => {
+    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("returns {bumped, skipped, unchanged} for a mixed agent fleet", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "BatchBumpTest Co",
+      issuePrefix: `BB${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    // idleEligible: claude_k8s, old image, no in-flight runs -> should be bumped
+    const [idleEligible] = await db
+      .insert(agents)
+      .values({
+        companyId,
+        name: "IdleEligible",
+        adapterType: "claude_k8s",
+        adapterConfig: { image: "harbor.example/a:old" },
+        runtimeConfig: {},
+        permissions: {},
+      })
+      .returning();
+
+    // busyEligible: opencode_k8s, old image, has a running heartbeat_run -> should be skipped
+    const [busyEligible] = await db
+      .insert(agents)
+      .values({
+        companyId,
+        name: "BusyEligible",
+        adapterType: "opencode_k8s",
+        adapterConfig: { image: "harbor.example/a:old" },
+        runtimeConfig: {},
+        permissions: {},
+      })
+      .returning();
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: busyEligible!.id,
+      status: "running",
+    });
+
+    // alreadyOnTarget: claude_k8s, already at new image -> should be unchanged
+    const [alreadyOnTarget] = await db
+      .insert(agents)
+      .values({
+        companyId,
+        name: "AlreadyOnTarget",
+        adapterType: "claude_k8s",
+        adapterConfig: { image: "harbor.example/a:new" },
+        runtimeConfig: {},
+        permissions: {},
+      })
+      .returning();
+
+    const summary = await bumpAgentImagesForCompany(db, {
+      companyId,
+      targetImage: "harbor.example/a:new",
+      source: "ci:test-batch",
+    });
+
+    expect(summary.bumped).toContain(idleEligible!.id);
+    expect(summary.skipped).toContain(busyEligible!.id);
+    expect(summary.unchanged).toContain(alreadyOnTarget!.id);
+    expect(summary.bumped).not.toContain(busyEligible!.id);
+    expect(summary.bumped).not.toContain(alreadyOnTarget!.id);
+    expect(summary.skipped).not.toContain(idleEligible!.id);
+    expect(summary.unchanged).not.toContain(idleEligible!.id);
+  });
+});
+
+describeEmbeddedPostgres("processPendingImageBumpForAgent", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-process-pending-");
+    db = createDb(tempDb.connectionString);
+  });
+
+  afterEach(async () => {
+    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function createCompanyAndAgent(opts: {
+    image: string;
+    pending?: string | null;
+  }) {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "ProcessPendingTest Co",
+      issuePrefix: `PP${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const [agent] = await db
+      .insert(agents)
+      .values({
+        companyId,
+        name: "ProcessPendingTestAgent",
+        adapterType: "claude_k8s",
+        adapterConfig: { image: opts.image },
+        runtimeConfig: {},
+        permissions: {},
+        pendingImageBump: opts.pending ?? null,
+      })
+      .returning();
+    return { companyId, agent: agent! };
+  }
+
+  it("PATCHes and clears pending_image_bump when agent is now idle", async () => {
+    const { agent } = await createCompanyAndAgent({
+      image: "harbor.example/a:old",
+      pending: "harbor.example/a:new",
+    });
+
+    await processPendingImageBumpForAgent(db, agent.id);
+
+    const [refetched] = await db.select().from(agents).where(eq(agents.id, agent.id));
+    expect((refetched!.adapterConfig as Record<string, unknown>).image).toBe(
+      "harbor.example/a:new",
+    );
+    expect(refetched!.pendingImageBump).toBeNull();
+  });
+
+  it("is a no-op when pending_image_bump is unset", async () => {
+    const { agent } = await createCompanyAndAgent({
+      image: "harbor.example/a:old",
+      pending: null,
+    });
+
+    await processPendingImageBumpForAgent(db, agent.id);
+
+    const [refetched] = await db.select().from(agents).where(eq(agents.id, agent.id));
+    expect((refetched!.adapterConfig as Record<string, unknown>).image).toBe(
+      "harbor.example/a:old",
+    );
+    expect(refetched!.pendingImageBump).toBeNull();
+  });
+
+  it("keeps pending_image_bump set when another run is in-flight (self-healing)", async () => {
+    const { companyId, agent } = await createCompanyAndAgent({
+      image: "harbor.example/a:old",
+      pending: "harbor.example/a:new",
+    });
+    // Simulate a run that was already queued when the original bump was deferred
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: agent.id,
+      status: "queued",
+    });
+
+    await processPendingImageBumpForAgent(db, agent.id);
+
+    const [refetched] = await db.select().from(agents).where(eq(agents.id, agent.id));
+    expect((refetched!.adapterConfig as Record<string, unknown>).image).toBe(
+      "harbor.example/a:old",
+    );
+    expect(refetched!.pendingImageBump).toBe("harbor.example/a:new");
   });
 });

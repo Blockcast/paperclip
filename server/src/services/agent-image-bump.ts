@@ -130,3 +130,91 @@ async function patchAgentImage(
 
   logger.info({ agentId, targetImage, source }, "agent image PATCHed");
 }
+
+export interface BumpBatchSummary {
+  bumped: string[];
+  skipped: string[];
+  unchanged: string[];
+}
+
+/**
+ * Bump every eligible agent in `companyId` to `targetImage`.
+ *
+ * Returns a per-bucket summary so callers (the admin route, CI logs, etc.)
+ * can report exactly which agents took the bump, which were deferred, and
+ * which were already on the target image.
+ */
+export async function bumpAgentImagesForCompany(
+  db: Db,
+  args: { companyId: string; targetImage: string; source: string },
+): Promise<BumpBatchSummary> {
+  // Identify already-on-target agents BEFORE the eligibility filter strips
+  // them, so the response can call them out explicitly.
+  const unchangedRows = await db
+    .select({ id: agents.id })
+    .from(agents)
+    .where(
+      and(
+        eq(agents.companyId, args.companyId),
+        inArray(agents.adapterType, [...ELIGIBLE_ADAPTER_TYPES]),
+        sql`${agents.adapterConfig} ->> 'image' = ${args.targetImage}`,
+      ),
+    );
+
+  const candidates = await selectEligibleAgentsForImageBump(db, {
+    companyId: args.companyId,
+    targetImage: args.targetImage,
+  });
+
+  const bumped: string[] = [];
+  const skipped: string[] = [];
+
+  for (const candidate of candidates) {
+    const result = await applyImageBumpToAgent(db, {
+      agentId: candidate.id,
+      targetImage: args.targetImage,
+      source: args.source,
+    });
+    if (result.outcome === "bumped") bumped.push(result.agentId);
+    else skipped.push(result.agentId);
+  }
+
+  return { bumped, skipped, unchanged: unchangedRows.map((r) => r.id) };
+}
+
+/**
+ * Retry the pending image bump for an agent if it's set + the agent is now idle.
+ *
+ * Called by the heartbeat run-completion hook (Task 7). Safe to call
+ * unconditionally on every terminal-status transition — short-circuits when
+ * there's nothing pending, and re-defers when another run snuck in between
+ * the original skip and now (self-healing — gets retried on the next
+ * completion).
+ */
+export async function processPendingImageBumpForAgent(
+  db: Db,
+  agentId: string,
+): Promise<void> {
+  const [row] = await db
+    .select({ pending: agents.pendingImageBump, adapterConfig: agents.adapterConfig })
+    .from(agents)
+    .where(eq(agents.id, agentId));
+
+  if (!row || !row.pending) return;
+
+  // If the agent's current image already matches the pending target, just
+  // clear the column. Happens if the same image was applied via another
+  // path (operator PATCH) between the original skip and the retry.
+  const currentImage = (row.adapterConfig as Record<string, unknown>).image;
+  if (currentImage === row.pending) {
+    await db.update(agents).set({ pendingImageBump: null }).where(eq(agents.id, agentId));
+    return;
+  }
+
+  if (await isAgentInFlight(db, agentId)) {
+    logger.info({ agentId }, "pending image bump deferred; another run is in-flight");
+    return;
+  }
+
+  await patchAgentImage(db, agentId, row.pending, "auto-retry-on-completion");
+}
