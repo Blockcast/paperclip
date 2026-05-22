@@ -2229,6 +2229,8 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
   afterEach(async () => {
     await db.delete(issueComments);
     await db.delete(issueThreadInteractions);
+    await db.delete(issueApprovals);
+    await db.delete(approvals);
     await db.delete(issueRelations);
     await db.delete(issueInboxArchives);
     await db.delete(activityLog);
