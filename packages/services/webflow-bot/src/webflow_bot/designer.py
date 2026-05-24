@@ -12,10 +12,15 @@ shape verified 2026-05-07/08 on lisa-blockcast.design.webflow.com.
 
 from __future__ import annotations
 
-from playwright.sync_api import Page
+from typing import TYPE_CHECKING
 
 from . import state
 from .config import SITE_URL
+
+if TYPE_CHECKING:
+    # Playwright imported only for type hints — keeps designer importable
+    # in unit-test CI that skips the Docker layer.
+    from playwright.sync_api import Page
 
 
 def is_on_designer(page: Page) -> bool:

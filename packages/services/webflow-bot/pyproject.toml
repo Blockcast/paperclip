@@ -38,6 +38,11 @@ where = ["src"]
 testpaths = ["tests"]
 addopts = "-ra"
 filterwarnings = ["error"]
+# Add src/ to sys.path so `from webflow_bot import …` works without an
+# editable install. CI's test step only `pip install pytest` etc. — it
+# doesn't `pip install -e .` because that would pull in the
+# Camoufox+Playwright runtime stack which the Docker layer owns.
+pythonpath = ["src"]
 
 [tool.ruff]
 line-length = 100

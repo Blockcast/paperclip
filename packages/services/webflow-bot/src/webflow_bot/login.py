@@ -10,12 +10,17 @@ SSO churn — see memory: figma_bot_ccrotate_workspace_sso_invalidation).
 from __future__ import annotations
 
 import time
-
-from playwright.sync_api import BrowserContext, Page
-from playwright.sync_api import TimeoutError as PWTimeout
+from typing import TYPE_CHECKING
 
 from . import state
 from .config import DASHBOARD_URL, EMAIL, PASSWORD, STATE_FILE
+
+if TYPE_CHECKING:
+    # Type-only imports keep login.py importable without playwright. The
+    # `PWTimeout` exception class is used in an `except` block at runtime
+    # below — that's lazy-imported inside `is_logged_in` so module-level
+    # import still succeeds without playwright present.
+    from playwright.sync_api import BrowserContext, Page
 
 
 def do_login(context: BrowserContext) -> None:
@@ -110,6 +115,10 @@ def is_logged_in(page: Page) -> bool:
     except Exception as e:
         state.log("session probe: cookie inspect failed:", e)
         # fall through to URL-based check
+    # Lazy-import PWTimeout so login.py is importable without playwright
+    # installed (unit-test CI gate).
+    from playwright.sync_api import TimeoutError as PWTimeout  # noqa: PLC0415
+
     try:
         page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=60_000)
         page.wait_for_timeout(2_500)

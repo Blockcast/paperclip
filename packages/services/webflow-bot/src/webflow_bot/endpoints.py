@@ -11,11 +11,14 @@ Webflow Designer's own DOM context, which is the entire point of the bot.
 
 from __future__ import annotations
 
-from typing import Any
-
-from playwright.sync_api import Page
+from typing import TYPE_CHECKING, Any
 
 from . import page_ops
+
+if TYPE_CHECKING:
+    # Playwright imported only for type hints — keeps endpoints.py
+    # importable in unit-test CI that skips the Docker layer.
+    from playwright.sync_api import Page
 
 
 def ep_screenshot(page: Page, body: dict) -> tuple[bytes, str]:

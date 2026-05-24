@@ -8,9 +8,12 @@ mocked Page, though Camoufox/Playwright stubs are non-trivial.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from playwright.sync_api import Page
+if TYPE_CHECKING:
+    # Playwright imported only for type hints — keeps page_ops importable
+    # in unit-test CI that skips the Docker layer.
+    from playwright.sync_api import Page
 
 
 def run_in_page(page: Page, code: str) -> Any:

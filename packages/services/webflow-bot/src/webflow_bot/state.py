@@ -18,9 +18,14 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from playwright.sync_api import BrowserContext, Page
+if TYPE_CHECKING:
+    # TYPE_CHECKING guard lets `import state` succeed without Playwright
+    # installed (e.g., in unit tests / lint CI that skip the Docker build).
+    # Runtime modules that actually create / drive Pages import playwright
+    # at their own top level — this module only USES Page as a type hint.
+    from playwright.sync_api import BrowserContext, Page
 
 # Single-threaded reentrant lock guarding all Page operations.
 page_lock: threading.RLock = threading.RLock()
