@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "webflow-bot"
+version = "0.1.0"
+description = "Long-running Camoufox session that holds an authenticated Webflow Designer + Bridge App for paperclip agents to drive."
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Blockcast" }]
+dependencies = [
+  # Pinned to match the versions installed in the Dockerfile (which is the
+  # source of truth for runtime). Listed here so editors / type checkers
+  # resolve the imports during local dev.
+  "camoufox[geoip]==0.4.11",
+  "playwright==1.59.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=4.0",
+  "ruff>=0.4",
+  "mypy>=1.10",
+]
+
+[project.scripts]
+webflow-bot = "webflow_bot.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# E = pycodestyle errors, F = pyflakes, I = isort, UP = pyupgrade
+select = ["E", "F", "I", "UP", "B"]
+# E501: line-too-long handled by the formatter; allow up to 110 in extracted
+# code that originated as a yaml block scalar with awkward wraps.
+# F401: unused-import — there's one stray `import re` left over from the
+# extraction. Cleaning it touches the verbatim-from-ConfigMap source; defer
+# until the modular split (see README "History").
+# B904: missing `raise ... from err` chaining — pre-existed in the ConfigMap
+# source; treating as style not behavior, defer with F401.
+ignore = ["E501", "F401", "B904", "I001"]
+
+[tool.ruff.lint.per-file-ignores]
+# The single-file extract preserves the source verbatim from the ConfigMap.
+# A follow-up commit on this branch will split it into modules; until then,
+# silence the lint rules that would require reordering imports or otherwise
+# touching the extracted layout.
+"src/webflow_bot/__main__.py" = ["E501", "F401", "B904", "I001", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+# Camoufox / Playwright don't ship type stubs for every surface.
+ignore_missing_imports = true
