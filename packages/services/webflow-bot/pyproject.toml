@@ -46,21 +46,12 @@ target-version = "py310"
 [tool.ruff.lint]
 # E = pycodestyle errors, F = pyflakes, I = isort, UP = pyupgrade
 select = ["E", "F", "I", "UP", "B"]
-# E501: line-too-long handled by the formatter; allow up to 110 in extracted
-# code that originated as a yaml block scalar with awkward wraps.
-# F401: unused-import — there's one stray `import re` left over from the
-# extraction. Cleaning it touches the verbatim-from-ConfigMap source; defer
-# until the modular split (see README "History").
-# B904: missing `raise ... from err` chaining — pre-existed in the ConfigMap
-# source; treating as style not behavior, defer with F401.
-ignore = ["E501", "F401", "B904", "I001"]
-
-[tool.ruff.lint.per-file-ignores]
-# The single-file extract preserves the source verbatim from the ConfigMap.
-# A follow-up commit on this branch will split it into modules; until then,
-# silence the lint rules that would require reordering imports or otherwise
-# touching the extracted layout.
-"src/webflow_bot/__main__.py" = ["E501", "F401", "B904", "I001", "UP"]
+# E501: line-too-long handled by the formatter; long lines mainly land in
+# embedded JS strings inside page.evaluate() calls.
+# B904: missing `raise ... from err` chaining — the underlying exception is
+# already serialized into the RuntimeError message, so `from None`-style
+# suppression is the right intent. Leave noisy.
+ignore = ["E501", "B904"]
 
 [tool.mypy]
 python_version = "3.10"
