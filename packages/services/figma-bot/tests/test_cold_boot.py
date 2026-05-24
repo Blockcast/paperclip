@@ -63,14 +63,14 @@ def _find_while_true_index(stmts: list[ast.stmt]) -> int:
 
 def test_main_has_default_identity_bootstrap(main_func_ast: ast.FunctionDef) -> None:
     """Before the main-loop's `while True:`, main() MUST call
-    `_set_active_target(default, ...)` so the first iteration has a target.
-    Without this call, `_get_active_target()` returns None forever and the
+    `state.set_active_target(default, ...)` so the first iteration has a target.
+    Without this call, `state.get_active_target()` returns None forever and the
     loop deadlocks on `/lease/acquire`."""
     while_idx = _find_while_true_index(main_func_ast.body)
     pre_loop_stmts = main_func_ast.body[:while_idx]
     src = ast.unparse(ast.Module(body=pre_loop_stmts, type_ignores=[]))
-    assert "_set_active_target(" in src, (
-        "main() is missing the cold-boot bootstrap — `_set_active_target(...)` "
+    assert "set_active_target(" in src, (
+        "main() is missing the cold-boot bootstrap — `set_active_target(...)` "
         "must be called BEFORE `while True:` so the first loop iteration has "
         "a non-None target. See BLO-6870 PR 2."
     )
@@ -137,8 +137,8 @@ def test_old_chickens_and_eggs_unique(main_source: str) -> None:
     tests above — if a future edit accidentally re-introduces the
     chicken-and-egg by deleting the bootstrap, this test fails with a
     clear message."""
-    assert "_set_active_target(default" in main_source, (
-        "The cold-boot bootstrap (`_set_active_target(default, …)` before "
+    assert "set_active_target(default" in main_source, (
+        "The cold-boot bootstrap (`state.set_active_target(default, …)` before "
         "`while True:`) appears to have been removed. This is the BLO-6870 "
         "fix — its removal would re-introduce the v0.3 chicken-and-egg "
         "production deadlock (every first /lease/acquire returns 503 "
