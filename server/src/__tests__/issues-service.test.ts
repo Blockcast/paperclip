@@ -2285,6 +2285,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(workspaceOperations);
+    await db.delete(heartbeatRuns);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
@@ -2754,6 +2755,85 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     await expect(
       svc.checkout(blockedId, assigneeAgentId, ["todo", "blocked"], null),
     ).rejects.toMatchObject({ status: 422 });
+  });
+
+  it("lets a same-agent retry adopt the previous run ownership lock", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const previousRunId = randomUUID();
+    const retryRunId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: assigneeAgentId,
+        companyId,
+        name: "QA Engineer",
+        role: "qa",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherAgentId,
+        companyId,
+        name: "Other Agent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: previousRunId,
+        companyId,
+        agentId: assigneeAgentId,
+        status: "running",
+        invocationSource: "automation",
+        contextSnapshot: { issueId },
+      },
+      {
+        id: retryRunId,
+        companyId,
+        agentId: assigneeAgentId,
+        status: "running",
+        invocationSource: "automation",
+        retryOfRunId: previousRunId,
+        contextSnapshot: { issueId, retryOfRunId: previousRunId },
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Monitor issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId,
+      checkoutRunId: previousRunId,
+      executionRunId: previousRunId,
+      executionAgentNameKey: "qa engineer",
+      executionLockedAt: new Date(),
+    });
+
+    await expect(svc.assertCheckoutOwner(issueId, assigneeAgentId, retryRunId)).resolves.toMatchObject({
+      checkoutRunId: retryRunId,
+      executionRunId: retryRunId,
+      adoptedFromRunId: previousRunId,
+    });
+
+    await expect(svc.assertCheckoutOwner(issueId, otherAgentId, randomUUID())).rejects.toMatchObject({ status: 409 });
   });
 
   it("wakes parents only when all direct children are terminal", async () => {
