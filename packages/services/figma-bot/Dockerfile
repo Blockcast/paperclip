@@ -18,7 +18,19 @@ COPY packages/services/figma-bot/src /app/figma-bot/src
 # entrypoint. --no-deps because Camoufox + Playwright are already pinned
 # in the base image; pyproject.toml lists them for tooling (mypy/ruff)
 # but the runtime versions live in webflow-bot's Dockerfile.
-RUN pip install --no-cache-dir --no-deps -e /app/figma-bot
+#
+# Notes:
+#   * No `-e` (editable). The source is already copied into the image,
+#     so editable mode buys nothing and would require the build backend
+#     to implement PEP 660's `build_editable` hook.
+#   * Upgrade pip+setuptools first. The playwright base image inherited
+#     via webflow-bot still has Ubuntu jammy's setuptools 59.6 (which
+#     predates PEP 621's `[project]` table), and pip's build-isolation
+#     does not reliably upgrade when the system setuptools provides the
+#     backend. Without the upgrade, this install silently produces an
+#     `UNKNOWN-0.0.0` wheel with no package content.
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+ && pip install --no-cache-dir --no-deps /app/figma-bot
 
 # The bot is launched by the wrapper command in the Deployment manifest
 # (xvfb + x11vnc + websockify orchestration is a manifest concern, not
