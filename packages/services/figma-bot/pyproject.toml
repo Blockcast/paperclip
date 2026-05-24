@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "figma-bot"
+version = "0.3.1"
+description = "Multi-identity Camoufox session that holds authenticated Figma Designer pages for paperclip agents to drive."
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Blockcast" }]
+dependencies = [
+  # Pinned to match the versions installed in webflow-bot's Dockerfile
+  # (which is the runtime base image figma-bot inherits from).
+  "camoufox[geoip]==0.4.11",
+  "playwright==1.59.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=4.0",
+  "ruff>=0.4",
+  "mypy>=1.10",
+]
+
+[project.scripts]
+figma-bot = "figma_bot.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = ["error"]
+# Add src/ to sys.path so `from figma_bot import …` works without an
+# editable install. See webflow-bot/pyproject.toml for the rationale.
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# E501: line-too-long handled by the formatter; long lines mainly land
+# in embedded JS strings inside page.evaluate() calls.
+# B904: deliberate suppression of exception chaining where the underlying
+# exception is already serialized into the RuntimeError message.
+# F401: figma-bot is the verbatim extract from the ConfigMap; one stray
+# `import re` is present in the source. Removing it touches the verbatim
+# layout. Defer until the modular-split follow-up commit on this branch.
+# I001: same — preserves the original import order for diffability with
+# the ConfigMap source.
+ignore = ["E501", "B904", "F401", "I001"]
+
+[tool.ruff.lint.per-file-ignores]
+# The single-file extract preserves the source verbatim from the cluster
+# ConfigMap. A follow-up will split it into modules matching the
+# webflow-bot pattern (state.py, control_plane.py, etc.) — until then,
+# silence the lint rules that would require touching the extracted layout.
+"src/figma_bot/__main__.py" = ["E501", "F401", "B904", "I001", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+ignore_missing_imports = true
