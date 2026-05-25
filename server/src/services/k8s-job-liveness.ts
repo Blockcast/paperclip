@@ -101,7 +101,10 @@ export function classifyAgentJobRunStatus(job: k8s.V1Job): AgentJobRunStatus {
   }
 
   const completeCondition = conditions.find((condition) => condition.type === "Complete");
-  if (conditionIsTrue(completeCondition) || (job.status?.succeeded ?? 0) > 0) {
+  const active = job.status?.active ?? 0;
+  const succeeded = job.status?.succeeded ?? 0;
+  const expectedCompletions = job.spec?.completions ?? 1;
+  if (conditionIsTrue(completeCondition) || (active <= 0 && succeeded >= expectedCompletions)) {
     return {
       phase: "succeeded",
       reason: completeCondition?.reason ?? "Complete",
