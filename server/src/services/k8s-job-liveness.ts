@@ -109,16 +109,6 @@ export function classifyAgentJobRunStatus(job: k8s.V1Job): AgentJobRunStatus {
     };
   }
 
-  const active = job.status?.active ?? 0;
-  const failed = job.status?.failed ?? 0;
-  if (active <= 0 && failed > 0) {
-    return {
-      phase: "failed",
-      reason: "Failed",
-      message: null,
-    };
-  }
-
   return { phase: "active", reason: null, message: null };
 }
 
