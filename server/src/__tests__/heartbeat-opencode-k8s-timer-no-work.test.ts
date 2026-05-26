@@ -141,6 +141,22 @@ describeEmbeddedPostgres("opencode_k8s timer no-work suppression", () => {
       reason: "no_in_flight_work",
       status: "skipped",
     });
+
+    const agent = await db
+      .select({ lastHeartbeatAt: agents.lastHeartbeatAt })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0]);
+    expect(agent?.lastHeartbeatAt?.toISOString()).toBe(now.toISOString());
+
+    const immediateRetry = await heartbeat.tickTimers(new Date("2026-05-25T20:30:10.000Z"));
+    expect(immediateRetry).toMatchObject({ checked: 1, enqueued: 0, skipped: 0 });
+
+    const wakeupsAfterImmediateRetry = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeupsAfterImmediateRetry).toHaveLength(1);
   });
 
   it("queues opencode_k8s timer ticks when the agent has assigned live work", async () => {

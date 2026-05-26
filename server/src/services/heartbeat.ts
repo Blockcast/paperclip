@@ -11446,8 +11446,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           status: "skipped",
           requestedByActorType: "system",
           requestedByActorId: "heartbeat_scheduler",
-          finishedAt: new Date(),
+          finishedAt: now,
         });
+
+        await db
+          .update(agents)
+          .set({ lastHeartbeatAt: now, updatedAt: now })
+          .where(eq(agents.id, agent.id));
       };
 
       const opencodeK8sAgentIds = allAgents
