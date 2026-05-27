@@ -297,6 +297,13 @@ function readTransientRecoveryContractFromRun(
     : null;
 }
 
+function isPrReviewRetryContext(contextSnapshot: Record<string, unknown>) {
+  const reviewKind = readNonEmptyString(contextSnapshot.reviewKind);
+  if (reviewKind === "pr_review") return true;
+  const taskKey = readNonEmptyString(contextSnapshot.taskKey);
+  return taskKey?.startsWith("pr_review:") === true;
+}
+
 function mergeAdapterRecoveryMetadata(input: {
   resultJson: Record<string, unknown> | null | undefined;
   errorFamily?: string | null;
@@ -6693,7 +6700,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
-      const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
+      const contextSnapshot = parseObject(run.contextSnapshot);
+      const shouldRetry =
+        tracksLocalChild &&
+        (!!run.processPid || !!run.processGroupId) &&
+        (run.processLossRetryCount ?? 0) < 1 &&
+        isPrReviewRetryContext(contextSnapshot);
       const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
