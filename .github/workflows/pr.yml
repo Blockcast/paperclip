@@ -318,10 +318,33 @@ jobs:
             libcairo2 libasound2t64 \
             fonts-liberation fonts-noto-color-emoji
 
+      - name: Diagnose runner pre-install state
+        if: steps.playwright_cache.outputs.cache-hit != 'true'
+        run: |
+          echo "::group::disk free"
+          df -h /home/runner /tmp
+          echo "::endgroup::"
+          echo "::group::cache dir before install"
+          mkdir -p ~/.cache/ms-playwright
+          ls -la ~/.cache/ms-playwright/ || true
+          echo "::endgroup::"
+          echo "::group::playwright binary location"
+          ls -la node_modules/.bin/playwright || true
+          which node
+          node --version
+          echo "::endgroup::"
+
+      # Use `pnpm exec` (matches the rest of the workflow's pnpm-based
+      # execution) instead of `npx`, which can take an odd dependency
+      # resolution path in pnpm-style monorepos. Add `DEBUG=pw:install` so
+      # the next regression surfaces with concrete signal instead of 8
+      # minutes of silence.
       - name: Install Playwright browser
         if: steps.playwright_cache.outputs.cache-hit != 'true'
-        timeout-minutes: 8
-        run: npx playwright install chromium
+        timeout-minutes: 6
+        env:
+          DEBUG: pw:install
+        run: pnpm exec playwright install chromium
 
       - name: Generate Paperclip config
         run: |
