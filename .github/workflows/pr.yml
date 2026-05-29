@@ -271,10 +271,17 @@ jobs:
         with:
           version: 9.15.4
 
+      # Pinned to Node 22 LTS instead of the workflow-default 24 because
+      # `playwright install`'s ZIP extraction step hangs indefinitely on
+      # Node 24 with @playwright/test 1.58.2 (verified via DEBUG=pw:install:
+      # download succeeds in 1s, extraction never finishes). Self-hosted
+      # runners pre-extracted the binary and so masked this for months.
+      # Node 22 is LTS through April 2027 and is the recommended baseline
+      # for Playwright 1.58.x.
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 22
           cache: pnpm
 
       - name: Install dependencies
