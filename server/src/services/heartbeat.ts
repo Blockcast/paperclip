@@ -1272,6 +1272,20 @@ export interface ModelProfileApplication {
   adapterConfig: Record<string, unknown> | null;
 }
 
+/**
+ * Typed signal returned by {@link resolveWorkspaceForRun} when an issue
+ * explicitly targets a non-primary project workspace that the resolver could
+ * not realize. Carrying this on the result (instead of silently rebinding to
+ * the project-primary source) lets the caller fail loud rather than run the
+ * agent against the wrong repository. See BLO-8188 / BLO-8154.
+ */
+export type PreferredWorkspaceRealizationFailure = {
+  kind: "preferred_project_workspace_unrealizable";
+  preferredProjectWorkspaceId: string;
+  primaryProjectWorkspaceId: string | null;
+  reason: string;
+};
+
 export type ResolvedWorkspaceForRun = {
   cwd: string;
   source: "project_primary" | "task_session" | "agent_home";
@@ -1286,11 +1300,57 @@ export type ResolvedWorkspaceForRun = {
     repoRef: string | null;
   }>;
   warnings: string[];
+  /**
+   * Echo of the project workspace the issue explicitly targeted, when one was
+   * requested. Present for observability even on success.
+   */
+  preferredProjectWorkspaceId?: string | null;
+  /**
+   * Set when the run explicitly targeted a non-primary project workspace that
+   * could not be realized. When present, the caller MUST NOT execute on the
+   * returned `cwd` — it is a placeholder. Callers fail the run loud instead.
+   */
+  realizationFailure?: PreferredWorkspaceRealizationFailure | null;
 };
 
 type ProjectWorkspaceCandidate = {
   id: string;
 };
+
+/**
+ * Decide whether an explicitly-targeted project workspace selection should
+ * fail loud. Pure so it can be unit-tested independently of the filesystem +
+ * DB side effects in {@link resolveWorkspaceForRun}.
+ *
+ * Fail-loud fires only when the issue targets a *non-primary* workspace and
+ * that preferred workspace could not be realized. Targeting the primary
+ * workspace (or no explicit target) preserves the legacy fallback behavior so
+ * existing runs are unaffected (BLO-8188 AC#3).
+ */
+export function evaluatePreferredProjectWorkspaceRealization(input: {
+  preferredProjectWorkspaceId: string | null | undefined;
+  primaryProjectWorkspaceId: string | null | undefined;
+  preferredWorkspaceRealized: boolean;
+  reason: string | null | undefined;
+}): PreferredWorkspaceRealizationFailure | null {
+  const preferredProjectWorkspaceId = input.preferredProjectWorkspaceId ?? null;
+  const primaryProjectWorkspaceId = input.primaryProjectWorkspaceId ?? null;
+  // No explicit target, or the target is the project-primary workspace: legacy
+  // behavior (silent fallback is acceptable for the primary source).
+  if (!preferredProjectWorkspaceId || preferredProjectWorkspaceId === primaryProjectWorkspaceId) {
+    return null;
+  }
+  // Preferred non-primary workspace was realized — nothing to fail on.
+  if (input.preferredWorkspaceRealized) return null;
+  return {
+    kind: "preferred_project_workspace_unrealizable",
+    preferredProjectWorkspaceId,
+    primaryProjectWorkspaceId,
+    reason:
+      input.reason?.trim() ||
+      `Selected project workspace "${preferredProjectWorkspaceId}" could not be realized for this run.`,
+  };
+}
 
 export function prioritizeProjectWorkspaceCandidatesForRun<T extends ProjectWorkspaceCandidate>(
   rows: T[],
@@ -4197,7 +4257,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         preferredWorkspaceWarning =
           `Selected project workspace "${preferredProjectWorkspaceId}" is not available on this project.`;
       }
-      for (const workspace of projectWorkspaceRows) {
+      // The project-primary workspace is the one flagged `isPrimary` (falling
+      // back to the earliest-created row for legacy projects that predate the
+      // flag). When an issue explicitly targets a *different* (non-primary)
+      // workspace, we must not silently rebind to the primary if the target
+      // cannot be realized — restrict realization to the preferred workspace
+      // only so failure is surfaced rather than masked. See BLO-8188 / BLO-8154.
+      const primaryProjectWorkspaceId =
+        unorderedProjectWorkspaceRows.find((workspace) => workspace.isPrimary)?.id ??
+        unorderedProjectWorkspaceRows[0]?.id ??
+        null;
+      const targetsNonPrimaryPreferred =
+        Boolean(preferredProjectWorkspaceId) &&
+        preferredProjectWorkspaceId !== primaryProjectWorkspaceId;
+      const realizationCandidates = targetsNonPrimaryPreferred
+        ? projectWorkspaceRows.filter((workspace) => workspace.id === preferredProjectWorkspaceId)
+        : projectWorkspaceRows;
+      for (const workspace of realizationCandidates) {
         let projectCwd = readNonEmptyString(workspace.cwd);
         let managedWorkspaceWarning: string | null = null;
         if (!projectCwd || projectCwd === REPO_ONLY_CWD_SENTINEL) {
@@ -4233,6 +4309,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             warnings: [preferredWorkspaceWarning, managedWorkspaceWarning].filter(
               (value): value is string => Boolean(value),
             ),
+            preferredProjectWorkspaceId,
           };
         }
         if (preferredWorkspace?.id === workspace.id) {
@@ -4240,6 +4317,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             `Selected project workspace path "${projectCwd}" is not available yet.`;
         }
         missingProjectCwds.push(projectCwd);
+      }
+
+      // Reaching here means the (restricted, when non-primary) candidate set
+      // never yielded a usable cwd. If the issue explicitly targeted a
+      // non-primary workspace, fail loud instead of silently rebinding to the
+      // project-primary source. The caller aborts the run on this signal; the
+      // returned cwd below is a placeholder and must not be executed against.
+      const realizationFailure = evaluatePreferredProjectWorkspaceRealization({
+        preferredProjectWorkspaceId,
+        primaryProjectWorkspaceId,
+        preferredWorkspaceRealized: false,
+        reason: preferredWorkspaceWarning,
+      });
+      if (realizationFailure) {
+        return {
+          cwd: resolveDefaultAgentWorkspaceDir(agent.id),
+          source: "project_primary" as const,
+          projectId: resolvedProjectId,
+          workspaceId: preferredProjectWorkspaceId,
+          repoUrl: null,
+          repoRef: null,
+          workspaceHints,
+          warnings: [realizationFailure.reason],
+          preferredProjectWorkspaceId,
+          realizationFailure,
+        };
       }
 
       const fallbackCwd = resolveDefaultAgentWorkspaceDir(agent.id);
@@ -4270,6 +4373,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         repoRef: projectWorkspaceRows[0]?.repoRef ?? null,
         workspaceHints,
         warnings,
+        preferredProjectWorkspaceId,
       };
     }
 
@@ -8588,6 +8692,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       previousSessionParams,
       { useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default" },
     );
+    // Fail loud when the run explicitly targeted a non-primary project
+    // workspace that could not be realized. Aborting here — before any
+    // execution-workspace row is realized or persisted — guarantees we never
+    // silently rebind to the project-primary source (e.g. running a
+    // trafficcontrol-targeted issue against paperclip.git). The structured
+    // error code is non-retryable, so the recovery sweep escalates to
+    // `blocked` instead of re-dispatching a doomed continuation. BLO-8188.
+    if (resolvedWorkspace.realizationFailure) {
+      const failure = resolvedWorkspace.realizationFailure;
+      throw new EnvironmentRunError(
+        "preferred_workspace_unrealizable",
+        `Refusing to run: issue targets non-primary project workspace ` +
+          `"${failure.preferredProjectWorkspaceId}" but it could not be realized ` +
+          `(${failure.reason}). Not falling back to project-primary workspace ` +
+          `"${failure.primaryProjectWorkspaceId ?? "unknown"}".`,
+      );
+    }
     const issueRef = issueContext
       ? {
           id: issueContext.id,

@@ -7,6 +7,7 @@ import {
   buildRealizedExecutionWorkspaceFromPersisted,
   buildExplicitResumeSessionOverride,
   deriveTaskKeyWithHeartbeatFallback,
+  evaluatePreferredProjectWorkspaceRealization,
   extractWakeCommentIds,
   formatRuntimeWorkspaceWarningLog,
   mergeExecutionWorkspaceMetadataForPersistence,
@@ -523,6 +524,88 @@ describe("prioritizeProjectWorkspaceCandidatesForRun", () => {
     expect(
       prioritizeProjectWorkspaceCandidatesForRun(rows, "workspace-9").map((row) => row.id),
     ).toEqual(["workspace-1", "workspace-2"]);
+  });
+});
+
+describe("evaluatePreferredProjectWorkspaceRealization", () => {
+  it("fails loud when an unrealized non-primary workspace is explicitly targeted", () => {
+    // Mirrors BLO-8154: issue targets the trafficcontrol workspace but only the
+    // paperclip primary checkout exists on disk, so realization cannot satisfy it.
+    const failure = evaluatePreferredProjectWorkspaceRealization({
+      preferredProjectWorkspaceId: "trafficcontrol-ws",
+      primaryProjectWorkspaceId: "paperclip-primary-ws",
+      preferredWorkspaceRealized: false,
+      reason: `Selected project workspace path "/managed/trafficcontrol" is not available yet.`,
+    });
+
+    expect(failure).toEqual({
+      kind: "preferred_project_workspace_unrealizable",
+      preferredProjectWorkspaceId: "trafficcontrol-ws",
+      primaryProjectWorkspaceId: "paperclip-primary-ws",
+      reason: `Selected project workspace path "/managed/trafficcontrol" is not available yet.`,
+    });
+  });
+
+  it("supplies a default reason when none is provided", () => {
+    const failure = evaluatePreferredProjectWorkspaceRealization({
+      preferredProjectWorkspaceId: "trafficcontrol-ws",
+      primaryProjectWorkspaceId: "paperclip-primary-ws",
+      preferredWorkspaceRealized: false,
+      reason: null,
+    });
+
+    expect(failure?.reason).toBe(
+      `Selected project workspace "trafficcontrol-ws" could not be realized for this run.`,
+    );
+  });
+
+  it("does not fail when the targeted non-primary workspace was realized", () => {
+    expect(
+      evaluatePreferredProjectWorkspaceRealization({
+        preferredProjectWorkspaceId: "trafficcontrol-ws",
+        primaryProjectWorkspaceId: "paperclip-primary-ws",
+        preferredWorkspaceRealized: true,
+        reason: null,
+      }),
+    ).toBeNull();
+  });
+
+  it("preserves legacy fallback behavior when the target is the project-primary workspace", () => {
+    // AC#3: requests that do not target a non-primary source are unaffected,
+    // even when realization falls back.
+    expect(
+      evaluatePreferredProjectWorkspaceRealization({
+        preferredProjectWorkspaceId: "paperclip-primary-ws",
+        primaryProjectWorkspaceId: "paperclip-primary-ws",
+        preferredWorkspaceRealized: false,
+        reason: "fallback path used",
+      }),
+    ).toBeNull();
+  });
+
+  it("preserves legacy fallback behavior when no workspace is explicitly targeted", () => {
+    expect(
+      evaluatePreferredProjectWorkspaceRealization({
+        preferredProjectWorkspaceId: null,
+        primaryProjectWorkspaceId: "paperclip-primary-ws",
+        preferredWorkspaceRealized: false,
+        reason: "fallback path used",
+      }),
+    ).toBeNull();
+  });
+
+  it("fails loud when the targeted workspace does not belong to the project at all", () => {
+    // preferred id absent from the project's workspace rows → primary differs →
+    // still a non-primary target that cannot be realized.
+    const failure = evaluatePreferredProjectWorkspaceRealization({
+      preferredProjectWorkspaceId: "ghost-ws",
+      primaryProjectWorkspaceId: "paperclip-primary-ws",
+      preferredWorkspaceRealized: false,
+      reason: `Selected project workspace "ghost-ws" is not available on this project.`,
+    });
+
+    expect(failure?.kind).toBe("preferred_project_workspace_unrealizable");
+    expect(failure?.preferredProjectWorkspaceId).toBe("ghost-ws");
   });
 });
 
