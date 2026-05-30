@@ -281,7 +281,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .then((rows) => rows[0] ?? null);
   }
 
-  async function isSourceStillReviewable(sourceIssue: IssueRow, sourceAgentId: string) {
+  async function evaluateSourceReviewability(sourceIssue: IssueRow, sourceAgentId: string) {
     const current = await db
       .select({
         status: issues.status,
@@ -293,7 +293,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .from(issues)
       .where(and(eq(issues.companyId, sourceIssue.companyId), eq(issues.id, sourceIssue.id)))
       .then((rows) => rows[0] ?? null);
-    return Boolean(
+    const status = current?.status ?? null;
+    const reviewable = Boolean(
       current &&
         !current.hiddenAt &&
         !current.assigneeUserId &&
@@ -301,6 +302,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         ["todo", "in_progress"].includes(current.status) &&
         current.originKind !== PRODUCTIVITY_REVIEW_ORIGIN_KIND,
     );
+    // BLO-6243: a source that has reached a terminal status (done/cancelled) — including via
+    // a race between candidate selection and this recheck — is a post-terminal sweep artifact,
+    // not a work-stoppage signal. Surface it distinctly so the caller can suppress + audit it.
+    const terminal = status === "done" || status === "cancelled";
+    return { reviewable, terminal, status };
   }
 
   function isAgentInvokable(agent: AgentRow | null | undefined) {
@@ -1128,6 +1134,32 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     return { kind: "created" as const, escalationIssueId: escalation.id };
   }
 
+  // BLO-6243: record a suppressed terminal-source review as an audit-only decision. No review
+  // issue is created and no wake comment is enqueued — this is purely an attributable trace so
+  // the suppression is observable rather than an indistinguishable generic skip.
+  async function recordTerminalSourceSuppression(
+    evidence: ProductivityReviewEvidence,
+    sourceStatus: string | null,
+  ) {
+    await logActivity(db, {
+      companyId: evidence.sourceIssue.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_suppressed",
+      entityType: "issue",
+      entityId: evidence.sourceIssue.id,
+      agentId: evidence.sourceAgent.id,
+      details: {
+        source: "productivity_review.reconcile",
+        decision: "suppress_terminal_source",
+        sourceIssueId: evidence.sourceIssue.id,
+        sourceStatus,
+        trigger: evidence.trigger,
+        noCommentStreak: evidence.noCommentStreak,
+      },
+    });
+  }
+
   async function reconcileProductivityReviews(opts?: {
     now?: Date;
     companyId?: string;
@@ -1162,6 +1194,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       monitorScheduledSuppressed: 0,
       closedSuppressedMonitorReviews: 0,
       skipped: 0,
+      suppressedTerminalSource: 0,
       failed: 0,
       reviewIssueIds: [] as string[],
       failedIssueIds: [] as string[],
@@ -1231,8 +1264,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       }
       try {
         await deps?.beforeCreateOrUpdateReview?.(evidence);
-        if (!await isSourceStillReviewable(candidate, sourceAgent.id)) {
-          result.skipped += 1;
+        const reviewability = await evaluateSourceReviewability(candidate, sourceAgent.id);
+        if (!reviewability.reviewable) {
+          if (reviewability.terminal) {
+            await recordTerminalSourceSuppression(evidence, reviewability.status);
+            result.suppressedTerminalSource += 1;
+          } else {
+            result.skipped += 1;
+          }
           continue;
         }
         const outcome = await createOrUpdateReview(evidence, { prefix, thresholds });
