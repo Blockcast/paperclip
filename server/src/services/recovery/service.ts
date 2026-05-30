@@ -67,6 +67,19 @@ const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "ti
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
+// Cooldown after a stale-run evaluation issue closes (done/cancelled) before
+// another can be re-opened for the SAME still-silent run. The active-run
+// uniqueness index (issues_active_stale_run_evaluation_uq) prevents
+// *concurrent* duplicates, but the moment the review is marked done the index
+// no longer applies, so the next sweep — finding no open evaluation while the
+// run is still `running` and still silent — files a fresh near-identical
+// review. BLO-8252 observed this on run 53c4974e: closing the review just
+// re-spawned it on the next sweep, adding operator noise with no new triage
+// signal. The cooldown suppresses re-opening unless *fresh run output appears*
+// after the close (a real state change worth a new review). Mirrors the
+// stranded-issue-recovery cooldown. The window is configurable per-scan via
+// `scanSilentActiveRuns({ cooldownMs })`; this is the default.
+export const ACTIVE_RUN_OUTPUT_EVALUATION_REOPEN_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
@@ -1014,6 +1027,47 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return row ?? null;
   }
 
+  // BLO-8252: most-recently-closed (done/cancelled) stale-run evaluation for
+  // this run whose close landed inside the cooldown window (updatedAt > cutoff).
+  // Used to suppress re-opening a fresh duplicate review for a run that is
+  // still silent after an operator already triaged-and-closed one. Mirrors
+  // findRecentClosedStrandedIssueRecoveryIssue.
+  async function findRecentClosedStaleRunEvaluation(companyId: string, runId: string, cutoff: Date) {
+    const [row] = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        status: issues.status,
+        updatedAt: issues.updatedAt,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND),
+          eq(issues.originId, runId),
+          isNull(issues.hiddenAt),
+          inArray(issues.status, ["done", "cancelled"]),
+          gt(issues.updatedAt, cutoff),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt))
+      .limit(1);
+    return row ?? null;
+  }
+
+  // "Fresh run activity" for the cooldown exception means the run emitted new
+  // output strictly after the prior evaluation was closed. A resumed-then-
+  // re-stalled run is genuinely new triage signal, so it is allowed through
+  // the cooldown. (A run that produced output within the last suspicion window
+  // would not even be a scan candidate, so this only matters once it re-stalls.)
+  function runHadFreshOutputSince(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "lastOutputAt">,
+    closedAt: Date,
+  ) {
+    return Boolean(run.lastOutputAt && run.lastOutputAt.getTime() > closedAt.getTime());
+  }
+
   // PCL-2571 (2026-05-25 RCA): when an active run is silent past the
   // suspicion threshold and the detector files a `stale_active_run_evaluation`
   // review, but moments later the heartbeat reaper finalizes the run to
@@ -1789,6 +1843,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   async function createOrUpdateStaleRunEvaluation(input: {
     run: typeof heartbeatRuns.$inferSelect;
     now: Date;
+    cooldownMs?: number;
   }) {
     const runningAgent = await getAgent(input.run.agentId);
     if (!runningAgent || runningAgent.companyId !== input.run.companyId) return { kind: "skipped" as const };
@@ -1875,6 +1930,41 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       return { kind: "existing" as const, evaluationIssueId: existing.id };
     }
 
+    // BLO-8252 AC#3: no open evaluation exists, so we are on the create path.
+    // Before filing a fresh review, honor the post-close cooldown: if a prior
+    // evaluation for THIS run closed within the window and the run has produced
+    // no fresh output since, suppress the duplicate. The closed issue itself is
+    // the recorded disposition that gates re-open. Fresh output after the close
+    // is a real state change and is allowed through.
+    const cooldownMs = input.cooldownMs ?? ACTIVE_RUN_OUTPUT_EVALUATION_REOPEN_COOLDOWN_MS;
+    const recentlyClosed = await findRecentClosedStaleRunEvaluation(
+      input.run.companyId,
+      input.run.id,
+      new Date(input.now.getTime() - cooldownMs),
+    );
+    if (recentlyClosed && !runHadFreshOutputSince(input.run, recentlyClosed.updatedAt)) {
+      await logActivity(db, {
+        companyId: input.run.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: input.run.agentId,
+        runId: input.run.id,
+        action: "heartbeat.output_stale_reopen_suppressed",
+        entityType: "heartbeat_run",
+        entityId: input.run.id,
+        details: {
+          source: "recovery.scan_silent_active_runs",
+          recentEvaluationIssueId: recentlyClosed.id,
+          recentEvaluationIdentifier: recentlyClosed.identifier,
+          recentEvaluationStatus: recentlyClosed.status,
+          recentEvaluationClosedAt: recentlyClosed.updatedAt.toISOString(),
+          cooldownMs,
+          lastOutputAt: input.run.lastOutputAt?.toISOString() ?? null,
+        },
+      });
+      return { kind: "cooldown_suppressed" as const, evaluationIssueId: recentlyClosed.id };
+    }
+
     const ownerAgentId = await resolveStaleRunOwnerAgentId({ run: input.run, runningAgent, sourceIssue });
     const description = buildStaleRunEvaluationDescription({
       run: input.run,
@@ -1959,7 +2049,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { kind: "created" as const, evaluationIssueId: evaluation.id };
   }
 
-  async function scanSilentActiveRuns(opts?: { now?: Date; companyId?: string }) {
+  async function scanSilentActiveRuns(opts?: { now?: Date; companyId?: string; cooldownMs?: number }) {
     const now = opts?.now ?? new Date();
     const suspicionBefore = new Date(now.getTime() - ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS);
     const candidates = await db
@@ -1982,6 +2072,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       escalated: 0,
       folded: 0,
       snoozed: 0,
+      cooldownSuppressed: 0,
       skipped: 0,
       evaluationIssueIds: [] as string[],
     };
@@ -1991,11 +2082,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         result.snoozed += 1;
         continue;
       }
-      const outcome = await createOrUpdateStaleRunEvaluation({ run, now });
+      const outcome = await createOrUpdateStaleRunEvaluation({ run, now, cooldownMs: opts?.cooldownMs });
       if (outcome.kind === "created") result.created += 1;
       else if (outcome.kind === "existing") result.existing += 1;
       else if (outcome.kind === "escalated") result.escalated += 1;
       else if (outcome.kind === "folded") result.folded += 1;
+      else if (outcome.kind === "cooldown_suppressed") result.cooldownSuppressed += 1;
       else result.skipped += 1;
       if ("evaluationIssueId" in outcome && outcome.evaluationIssueId) {
         result.evaluationIssueIds.push(outcome.evaluationIssueId);

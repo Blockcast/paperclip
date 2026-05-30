@@ -22,6 +22,7 @@ import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-stat
 import {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
+  ACTIVE_RUN_OUTPUT_EVALUATION_REOPEN_COOLDOWN_MS,
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
   heartbeatService,
 } from "../services/heartbeat.js";
@@ -809,5 +810,103 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       createdByRunId: randomUUID(),
     });
     expect(decision.createdByRunId).toBe(managerRunId);
+  });
+
+  it("suppresses re-opening a closed stale-run evaluation within the cooldown and re-creates after it expires", async () => {
+    // BLO-8252: closing a stale-run review must not immediately re-spawn a
+    // near-identical review on the next sweep while the run is still silent.
+    const cooldownMs = 60 * 60 * 1000; // 1h, test-local window
+    const createdAt = new Date("2026-04-23T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now: createdAt,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+
+    // First sweep files exactly one review.
+    const first = await heartbeat.scanSilentActiveRuns({ now: createdAt, companyId, cooldownMs });
+    expect(first.created).toBe(1);
+    const evaluationId = first.evaluationIssueIds[0];
+    expect(evaluationId).toBeTruthy();
+
+    // Operator triages and closes the review. The cooldown keys off the
+    // issue's updatedAt, so record the close time there explicitly.
+    const closedAt = new Date(createdAt.getTime() + 5 * 60 * 1000);
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: closedAt, updatedAt: closedAt })
+      .where(eq(issues.id, evaluationId));
+
+    // A sweep inside the cooldown window must NOT open a new review and must
+    // point back at the already-closed disposition.
+    const insideCooldown = new Date(closedAt.getTime() + 20 * 60 * 1000);
+    const suppressed = await heartbeat.scanSilentActiveRuns({ now: insideCooldown, companyId, cooldownMs });
+    expect(suppressed.created).toBe(0);
+    expect(suppressed.cooldownSuppressed).toBe(1);
+    expect(suppressed.evaluationIssueIds).toEqual([evaluationId]);
+
+    const afterSuppressed = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(afterSuppressed).toHaveLength(1);
+    expect(afterSuppressed[0]?.status).toBe("done");
+
+    // After the cooldown elapses, a still-silent run earns a fresh review.
+    const afterCooldown = new Date(closedAt.getTime() + cooldownMs + 60_000);
+    const reopened = await heartbeat.scanSilentActiveRuns({ now: afterCooldown, companyId, cooldownMs });
+    expect(reopened.created).toBe(1);
+    expect(reopened.cooldownSuppressed).toBe(0);
+
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(2);
+    const open = evaluations.filter((row) => !["done", "cancelled"].includes(row.status));
+    expect(open).toHaveLength(1);
+    expect(open[0]?.id).not.toBe(evaluationId);
+    expect(open[0]?.originId).toBe(runId);
+  });
+
+  it("re-opens within the cooldown when the run emits fresh output after the prior evaluation closed", async () => {
+    // BLO-8252: fresh run activity after the close is real new triage signal,
+    // so it bypasses the cooldown even though the window has not elapsed.
+    const cooldownMs = 6 * 60 * 60 * 1000; // 6h window
+    const createdAt = new Date("2026-04-24T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now: createdAt,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+
+    const first = await heartbeat.scanSilentActiveRuns({ now: createdAt, companyId, cooldownMs });
+    expect(first.created).toBe(1);
+    const evaluationId = first.evaluationIssueIds[0];
+    expect(evaluationId).toBeTruthy();
+
+    const closedAt = new Date(createdAt.getTime() + 5 * 60 * 1000);
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: closedAt, updatedAt: closedAt })
+      .where(eq(issues.id, evaluationId));
+
+    // The run resumes briefly (fresh output strictly after the close) then
+    // re-stalls. Place the output far enough in the past that the run is still
+    // a silent-scan candidate at sweep time.
+    const freshOutputAt = new Date(closedAt.getTime() + 10 * 60 * 1000);
+    await db.update(heartbeatRuns).set({ lastOutputAt: freshOutputAt }).where(eq(heartbeatRuns.id, runId));
+
+    const sweepNow = new Date(freshOutputAt.getTime() + ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000);
+    const reopened = await heartbeat.scanSilentActiveRuns({ now: sweepNow, companyId, cooldownMs });
+    expect(reopened.cooldownSuppressed).toBe(0);
+    expect(reopened.created).toBe(1);
+
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(2);
+    const open = evaluations.filter((row) => !["done", "cancelled"].includes(row.status));
+    expect(open).toHaveLength(1);
+    expect(open[0]?.id).not.toBe(evaluationId);
   });
 });
