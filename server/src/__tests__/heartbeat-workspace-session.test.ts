@@ -8,6 +8,8 @@ import {
   buildExplicitResumeSessionOverride,
   deriveTaskKeyWithHeartbeatFallback,
   evaluatePreferredProjectWorkspaceRealization,
+  isNonPrimaryWorkspaceTarget,
+  resolveProjectPrimaryWorkspaceId,
   extractWakeCommentIds,
   formatRuntimeWorkspaceWarningLog,
   mergeExecutionWorkspaceMetadataForPersistence,
@@ -17,10 +19,12 @@ import {
   resolveRuntimeSessionParamsForWorkspace,
   stripWorkspaceRuntimeFromExecutionRunConfig,
   shouldResetTaskSessionForWake,
-  type ResolvedWorkspaceForRun,
+  type ResolvedWorkspaceForRunSuccess,
 } from "../services/heartbeat.js";
 
-function buildResolvedWorkspace(overrides: Partial<ResolvedWorkspaceForRun> = {}): ResolvedWorkspaceForRun {
+function buildResolvedWorkspace(
+  overrides: Partial<ResolvedWorkspaceForRunSuccess> = {},
+): ResolvedWorkspaceForRunSuccess {
   return {
     cwd: "/tmp/project",
     source: "project_primary",
@@ -527,6 +531,113 @@ describe("prioritizeProjectWorkspaceCandidatesForRun", () => {
   });
 });
 
+describe("resolveProjectPrimaryWorkspaceId", () => {
+  it("prefers the isPrimary-flagged row over creation order", () => {
+    expect(
+      resolveProjectPrimaryWorkspaceId([
+        { id: "ws-old", isPrimary: false },
+        { id: "ws-flagged", isPrimary: true },
+      ]),
+    ).toBe("ws-flagged");
+  });
+
+  it("falls back to the earliest-created row when no row is flagged (legacy)", () => {
+    expect(
+      resolveProjectPrimaryWorkspaceId([{ id: "ws-old" }, { id: "ws-new" }]),
+    ).toBe("ws-old");
+  });
+
+  it("returns null when the project has no workspaces", () => {
+    expect(resolveProjectPrimaryWorkspaceId([])).toBeNull();
+  });
+});
+
+describe("isNonPrimaryWorkspaceTarget", () => {
+  const flaggedRows = [
+    { id: "paperclip-primary-ws", isPrimary: true },
+    { id: "trafficcontrol-ws", isPrimary: false },
+  ];
+
+  it("is true when targeting a non-primary flagged row", () => {
+    expect(
+      isNonPrimaryWorkspaceTarget({
+        preferredProjectWorkspaceId: "trafficcontrol-ws",
+        rowsInCreationOrder: flaggedRows,
+      }),
+    ).toBe(true);
+  });
+
+  it("is false when targeting the flagged primary row", () => {
+    expect(
+      isNonPrimaryWorkspaceTarget({
+        preferredProjectWorkspaceId: "paperclip-primary-ws",
+        rowsInCreationOrder: flaggedRows,
+      }),
+    ).toBe(false);
+  });
+
+  it("is false when no explicit target is requested", () => {
+    expect(
+      isNonPrimaryWorkspaceTarget({
+        preferredProjectWorkspaceId: null,
+        rowsInCreationOrder: flaggedRows,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not false-fail a second isPrimary row when a project has multiple primaries", () => {
+    // Edge (a): defensive — a malformed project with two isPrimary rows must not
+    // fail loud when an issue legitimately targets the second flagged row.
+    expect(
+      isNonPrimaryWorkspaceTarget({
+        preferredProjectWorkspaceId: "ws-primary-b",
+        rowsInCreationOrder: [
+          { id: "ws-primary-a", isPrimary: true },
+          { id: "ws-primary-b", isPrimary: true },
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it("treats the earliest-created row as primary in a legacy project (no isPrimary flag)", () => {
+    // Edge (b): legacy projects predate the flag; the earliest-created row is the
+    // de-facto primary, so targeting it is NOT non-primary (AC#3 unchanged).
+    expect(
+      isNonPrimaryWorkspaceTarget({
+        preferredProjectWorkspaceId: "ws-old",
+        rowsInCreationOrder: [{ id: "ws-old" }, { id: "ws-new" }],
+      }),
+    ).toBe(false);
+  });
+
+  it("is true for a non-earliest legacy row that is explicitly targeted", () => {
+    // The preferred row is present but is NOT row[0] in a legacy project.
+    expect(
+      isNonPrimaryWorkspaceTarget({
+        preferredProjectWorkspaceId: "ws-new",
+        rowsInCreationOrder: [{ id: "ws-old" }, { id: "ws-new" }],
+      }),
+    ).toBe(true);
+  });
+
+  it("is true when the targeted workspace is not among the project rows (zero-rows / ghost)", () => {
+    // Closes the bypass: a target that resolves to no backing row cannot be the
+    // project primary, so it is non-primary and must fail loud.
+    expect(
+      isNonPrimaryWorkspaceTarget({
+        preferredProjectWorkspaceId: "ghost-ws",
+        rowsInCreationOrder: [],
+      }),
+    ).toBe(true);
+    expect(
+      isNonPrimaryWorkspaceTarget({
+        preferredProjectWorkspaceId: "ghost-ws",
+        rowsInCreationOrder: [{ id: "paperclip-primary-ws", isPrimary: true }],
+      }),
+    ).toBe(true);
+  });
+});
+
 describe("evaluatePreferredProjectWorkspaceRealization", () => {
   it("fails loud when an unrealized non-primary workspace is explicitly targeted", () => {
     // Mirrors BLO-8154: issue targets the trafficcontrol workspace but only the
@@ -534,6 +645,7 @@ describe("evaluatePreferredProjectWorkspaceRealization", () => {
     const failure = evaluatePreferredProjectWorkspaceRealization({
       preferredProjectWorkspaceId: "trafficcontrol-ws",
       primaryProjectWorkspaceId: "paperclip-primary-ws",
+      targetsNonPrimary: true,
       preferredWorkspaceRealized: false,
       reason: `Selected project workspace path "/managed/trafficcontrol" is not available yet.`,
     });
@@ -550,6 +662,7 @@ describe("evaluatePreferredProjectWorkspaceRealization", () => {
     const failure = evaluatePreferredProjectWorkspaceRealization({
       preferredProjectWorkspaceId: "trafficcontrol-ws",
       primaryProjectWorkspaceId: "paperclip-primary-ws",
+      targetsNonPrimary: true,
       preferredWorkspaceRealized: false,
       reason: null,
     });
@@ -564,6 +677,7 @@ describe("evaluatePreferredProjectWorkspaceRealization", () => {
       evaluatePreferredProjectWorkspaceRealization({
         preferredProjectWorkspaceId: "trafficcontrol-ws",
         primaryProjectWorkspaceId: "paperclip-primary-ws",
+        targetsNonPrimary: true,
         preferredWorkspaceRealized: true,
         reason: null,
       }),
@@ -577,6 +691,7 @@ describe("evaluatePreferredProjectWorkspaceRealization", () => {
       evaluatePreferredProjectWorkspaceRealization({
         preferredProjectWorkspaceId: "paperclip-primary-ws",
         primaryProjectWorkspaceId: "paperclip-primary-ws",
+        targetsNonPrimary: false,
         preferredWorkspaceRealized: false,
         reason: "fallback path used",
       }),
@@ -588,24 +703,11 @@ describe("evaluatePreferredProjectWorkspaceRealization", () => {
       evaluatePreferredProjectWorkspaceRealization({
         preferredProjectWorkspaceId: null,
         primaryProjectWorkspaceId: "paperclip-primary-ws",
+        targetsNonPrimary: false,
         preferredWorkspaceRealized: false,
         reason: "fallback path used",
       }),
     ).toBeNull();
-  });
-
-  it("fails loud when the targeted workspace does not belong to the project at all", () => {
-    // preferred id absent from the project's workspace rows → primary differs →
-    // still a non-primary target that cannot be realized.
-    const failure = evaluatePreferredProjectWorkspaceRealization({
-      preferredProjectWorkspaceId: "ghost-ws",
-      primaryProjectWorkspaceId: "paperclip-primary-ws",
-      preferredWorkspaceRealized: false,
-      reason: `Selected project workspace "ghost-ws" is not available on this project.`,
-    });
-
-    expect(failure?.kind).toBe("preferred_project_workspace_unrealizable");
-    expect(failure?.preferredProjectWorkspaceId).toBe("ghost-ws");
   });
 });
 
