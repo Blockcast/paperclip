@@ -5,7 +5,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-type SshEnvironmentConfig = Record<string, unknown>;  // TODO: re-import once exported
+import {
+  buildSshEnvLabFixtureConfig,
+  getSshEnvLabSupport,
+  startSshEnvLabFixture,
+  stopSshEnvLabFixture,
+  type SshConnectionConfig,
+} from "@paperclipai/adapter-utils/ssh";
 import {
   agents,
   companies,
@@ -35,10 +41,10 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-interface RuntimeContractCase {
+interface RuntimeContractCase<C extends object = Record<string, unknown>> {
   name: string;
   driver: string;
-  config: Record<string, unknown>;
+  config: C;
   setup?: () => Promise<() => Promise<void>>;
   expectLease: (lease: {
     providerLeaseId: string | null;
@@ -200,13 +206,15 @@ describeEmbeddedPostgres("environment runtime driver contract", () => {
     return `http://127.0.0.1:${address.port}`;
   }
 
-  async function runContract(testCase: RuntimeContractCase) {
+  async function runContract<C extends object>(testCase: RuntimeContractCase<C>) {
     const cleanup = await testCase.setup?.();
     try {
       const runtime = environmentRuntimeService(db);
+      // seedEnvironment serialises config to JSON, so widen the concrete shape
+      // (e.g. SshConnectionConfig) to the schema-level Record<string, unknown>.
       const { companyId, environment, issueId, runId } = await seedEnvironment({
         driver: testCase.driver,
-        config: testCase.config,
+        config: testCase.config as unknown as Record<string, unknown>,
       });
 
       const acquired = await runtime.acquireRunLease({
@@ -318,10 +326,10 @@ describeEmbeddedPostgres("environment runtime driver contract", () => {
     const previousCandidates = process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON;
     process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = JSON.stringify([runtimeApiUrl]);
 
-    await runContract({
+    await runContract<SshConnectionConfig>({
       name: "ssh",
       driver: "ssh",
-      config: sshConfig as SshEnvironmentConfig as unknown as Record<string, unknown>,
+      config: sshConfig,
       expectLease: (lease) => {
         expect(lease.providerLeaseId).toContain(`ssh://${sshConfig.username}@${sshConfig.host}:${sshConfig.port}`);
         expect(lease.metadata).toMatchObject({
