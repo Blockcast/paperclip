@@ -5,13 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import {
-  buildSshEnvLabFixtureConfig,
-  getSshEnvLabSupport,
-  startSshEnvLabFixture,
-  stopSshEnvLabFixture,
-  type SshEnvironmentConfig,
-} from "@paperclipai/adapter-utils/ssh";
+type SshEnvironmentConfig = Record<string, unknown>;  // TODO: re-import once exported
 import {
   agents,
   companies,
@@ -60,7 +54,7 @@ describeEmbeddedPostgres("environment runtime driver contract", () => {
 
   beforeAll(async () => {
     const started = await startEmbeddedPostgresTestDatabase("environment-runtime-contract");
-    stopDb = started.stop;
+    stopDb = started.cleanup;
     db = createDb(started.connectionString);
   });
 
