@@ -202,15 +202,30 @@ ENV PATH=/home/node/.npm-global/bin:$PATH
 # so it resolves on the LAN cache without needing Docker Hub credentials in this repo.
 # Reproducibility trade-off accepted (owner note on BLO-8717: ":stable tracks latest;
 # pin @sha256 only if you want reproducible agent-image builds").
+# Runtime codec libs the copied ffmpeg binary is dynamically linked against.
+# The agent base is now Debian *trixie* (13), but ffmpeg-publisher's runtime
+# stage is bookworm-slim (12), so the binary's DT_NEEDED records reference
+# bookworm sonames. Most sonames are stable across the two releases and apt
+# resolves them on trixie (libx264.so.164, libaom.so.3, libopus.so.0, …), but
+# two bumped: libx265 went .so.199→.so.215 and libvpx went .so.7→.so.9 in
+# trixie. Installing trixie's newer sonames would NOT satisfy the binary, which
+# needs libx265.so.199 / libvpx.so.7 specifically — so those two are vendored
+# verbatim from the publisher image below instead of apt-installed. libnuma1 is
+# an x265 runtime dep and must be present for libx265.so.199 to load.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-       libx264-164 libx265-199 libvpx7 libaom3 libopus0 \
+       libx264-164 libaom3 libopus0 libnuma1 \
        libfreetype6 libharfbuzz0b libfontconfig1 libgomp1 libssl3 \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=registry.blockcast.net/blockcast/pim-multicast-gateway/ffmpeg-publisher:stable \
      /usr/local/bin/ffmpeg  /usr/local/bin/ffmpeg
 COPY --from=registry.blockcast.net/blockcast/pim-multicast-gateway/ffmpeg-publisher:stable \
      /usr/local/bin/ffprobe /usr/local/bin/ffprobe
+# Vendor the two bookworm-soname codec libs trixie can't provide (see above).
+COPY --from=registry.blockcast.net/blockcast/pim-multicast-gateway/ffmpeg-publisher:stable \
+     /usr/lib/x86_64-linux-gnu/libx265.so.* /usr/lib/x86_64-linux-gnu/
+COPY --from=registry.blockcast.net/blockcast/pim-multicast-gateway/ffmpeg-publisher:stable \
+     /usr/lib/x86_64-linux-gnu/libvpx.so.*  /usr/lib/x86_64-linux-gnu/
 RUN ffmpeg -hide_banner -muxers 2>&1 | grep -qE '(^|[[:space:]])moq_mmt([[:space:]]|$)' \
   || (echo 'ERROR: moq_mmt muxer missing from copied ffmpeg' && exit 1)
 
