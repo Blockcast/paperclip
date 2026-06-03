@@ -72,7 +72,7 @@ import { pluginRegistryService } from "./services/plugin-registry.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
 import { createCachedViteHtmlRenderer } from "./vite-html-renderer.js";
-import { DEFAULT_JSON_BODY_LIMIT, PORTABLE_JSON_BODY_LIMIT } from "./http/body-limits.js";
+import { registerBodyParsers } from "./http/body-parsers.js";
 import { COMPANY_IMPORT_API_PATH } from "./routes/company-import-paths.js";
 
 type UiMode = "none" | "static" | "vite-dev";
@@ -262,18 +262,11 @@ export async function createApp(
   },
 ) {
   const app = express();
-  const captureRawBody = (req: express.Request, _res: express.Response, buf: Buffer) => {
-    (req as unknown as { rawBody: Buffer }).rawBody = buf;
-  };
 
-  app.use(COMPANY_IMPORT_API_PATH, express.json({
-    limit: PORTABLE_JSON_BODY_LIMIT,
-    verify: captureRawBody,
-  }));
-  app.use(express.json({
-    limit: DEFAULT_JSON_BODY_LIMIT,
-    verify: captureRawBody,
-  }));
+  // Inbound body parsing + raw-body capture for HMAC verification. Includes the
+  // urlencoded parser required by Slack interactivity / slash commands
+  // (`application/x-www-form-urlencoded`); see registerBodyParsers (BLO-8857).
+  registerBodyParsers(app, { companyImportPath: COMPANY_IMPORT_API_PATH });
 
   // Prometheus exposition (BLO-8328). Mounted ahead of httpLogger and
   // actorMiddleware: scrapes are unauthenticated (access is gated at the

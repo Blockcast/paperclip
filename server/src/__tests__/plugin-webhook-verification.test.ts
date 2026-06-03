@@ -1,6 +1,11 @@
+import { createHmac } from "node:crypto";
+
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { registerBodyParsers } from "../http/body-parsers.js";
+import { COMPANY_IMPORT_API_PATH } from "../routes/company-import-paths.js";
 
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -37,12 +42,39 @@ function readyPluginWithSlackEvents() {
     status: "ready",
     manifestJson: {
       capabilities: ["webhooks.receive"],
-      webhooks: [{ endpointKey: "slack-events" }],
+      // Both Events API and interactivity endpoints are declared so the
+      // webhook route accepts deliveries on either key.
+      webhooks: [
+        { endpointKey: "slack-events" },
+        { endpointKey: "slack-interactivity" },
+      ],
     },
   });
 }
 
-async function createApp() {
+/**
+ * Minimal chainable Drizzle stub: supports the
+ * `insert().values().returning()` and `update().set().where()` chains the
+ * webhook route uses to record the delivery. Returning a real delivery id lets
+ * the route proceed past the DB write and reach the worker dispatch, so tests
+ * can assert on the forwarded `handleWebhook` payload.
+ */
+function deliveryRecordingDbStub() {
+  return {
+    insert: () => ({
+      values: () => ({
+        returning: async () => [{ id: "delivery-test-1" }],
+      }),
+    }),
+    update: () => ({
+      set: () => ({
+        where: async () => undefined,
+      }),
+    }),
+  } as never;
+}
+
+async function createApp(db: unknown = {}) {
   const [{ pluginRoutes }, { errorHandler }] = await Promise.all([
     import("../routes/plugins.js"),
     import("../middleware/index.js"),
@@ -55,7 +87,11 @@ async function createApp() {
   const webhookDeps = { workerManager } as never;
 
   const app = express();
-  app.use(express.json({ verify: (req, _res, buf) => { (req as { rawBody?: Buffer }).rawBody = buf; } }));
+  // Use the real production body-parser registration so this test guards the
+  // actual wiring — in particular that `application/x-www-form-urlencoded`
+  // requests (Slack interactivity / slash commands) capture `req.rawBody` and
+  // populate `req.body`. See registerBodyParsers (BLO-8857).
+  registerBodyParsers(app, { companyImportPath: COMPANY_IMPORT_API_PATH });
   app.use((req, _res, next) => {
     (req as unknown as { actor: unknown }).actor = {
       type: "board",
@@ -67,7 +103,7 @@ async function createApp() {
     next();
   });
   app.use("/api", pluginRoutes(
-    {} as never,
+    db as never,
     { installPlugin: vi.fn() } as never,
     undefined,
     webhookDeps,
@@ -77,6 +113,17 @@ async function createApp() {
   app.use(errorHandler);
 
   return { app, workerManager };
+}
+
+// Mirrors verifySlackSignature() in the Slack plugin worker
+// (packages/plugins/paperclip-plugin-slack/src/worker.ts): the base string is
+// `v0:<timestamp>:<rawBody>` and the signature is `v0=<hmac-sha256-hex>`.
+const SLACK_SIGNING_SECRET = "test-slack-signing-secret";
+function slackSignature(timestamp: string, rawBody: string): string {
+  const hmac = createHmac("sha256", SLACK_SIGNING_SECRET)
+    .update(`v0:${timestamp}:${rawBody}`)
+    .digest("hex");
+  return `v0=${hmac}`;
 }
 
 describe("plugin webhook url_verification handshake", () => {
@@ -114,5 +161,91 @@ describe("plugin webhook url_verification handshake", () => {
       expect.objectContaining({ parsedBody: expect.objectContaining({ type: "url_verification" }) }),
     );
     expect(res.status).not.toBe(200);
+  }, 20_000);
+});
+
+describe("plugin webhook raw-body capture for HMAC verification", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("forwards exact raw bytes + parsed payload for form-urlencoded Slack interactivity (BLO-8857)", async () => {
+    readyPluginWithSlackEvents();
+    const { app, workerManager } = await createApp(deliveryRecordingDbStub());
+
+    // A Block Kit Approve button click: Slack POSTs
+    // `application/x-www-form-urlencoded` with a single `payload` field whose
+    // value is the URL-encoded JSON interaction payload.
+    const interactionPayload = {
+      type: "block_actions",
+      user: { id: "U123APPROVER" },
+      response_url: "https://hooks.slack.test/actions/xyz",
+      actions: [{ action_id: "approval_approve", value: "approval-42" }],
+    };
+    const rawBody = `payload=${encodeURIComponent(JSON.stringify(interactionPayload))}`;
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const signature = slackSignature(timestamp, rawBody);
+
+    const res = await request(app)
+      .post(`/api/plugins/${PLUGIN_ID}/webhooks/slack-interactivity`)
+      .set("Content-Type", "application/x-www-form-urlencoded")
+      .set("X-Slack-Request-Timestamp", timestamp)
+      .set("X-Slack-Signature", signature)
+      .send(rawBody);
+
+    expect(res.status).toBe(200);
+    expect(workerManager.call).toHaveBeenCalledTimes(1);
+
+    const [pluginIdArg, methodArg, payloadArg] = workerManager.call.mock.calls[0];
+    expect(pluginIdArg).toBe(PLUGIN_ID);
+    expect(methodArg).toBe("handleWebhook");
+
+    // (1) The exact signed bytes are forwarded — NOT an empty string. Before the
+    // urlencoded parser was registered, `rawBody` was `""` here, so the worker
+    // computed the HMAC over an empty body and rejected with `hmac_mismatch`.
+    expect(payloadArg.rawBody).toBe(rawBody);
+    expect(payloadArg.rawBody.length).toBeGreaterThan(0);
+
+    // (2) The form field is parsed so the worker can read `body.payload`.
+    expect(payloadArg.parsedBody).toEqual({
+      payload: JSON.stringify(interactionPayload),
+    });
+
+    // (3) Raw-body HMAC validation passes: recomputing the Slack v0 signature
+    // over the forwarded rawBody reproduces the signature header, which is
+    // exactly what the worker's verifySlackSignature() checks.
+    expect(slackSignature(timestamp, payloadArg.rawBody)).toBe(signature);
+  }, 20_000);
+
+  it("forwards exact JSON raw bytes for Slack Events API webhooks (regression)", async () => {
+    readyPluginWithSlackEvents();
+    const { app, workerManager } = await createApp(deliveryRecordingDbStub());
+
+    // Exact JSON bytes Slack signs — sent verbatim so re-serialization can't
+    // mask a raw-body drift. (No spaces, to match a typical compact payload.)
+    const rawBody =
+      '{"type":"event_callback","event":{"type":"app_mention","text":"hi"}}';
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const signature = slackSignature(timestamp, rawBody);
+
+    const res = await request(app)
+      .post(`/api/plugins/${PLUGIN_ID}/webhooks/slack-events`)
+      .set("Content-Type", "application/json")
+      .set("X-Slack-Request-Timestamp", timestamp)
+      .set("X-Slack-Signature", signature)
+      .send(rawBody);
+
+    expect(res.status).toBe(200);
+    expect(workerManager.call).toHaveBeenCalledTimes(1);
+
+    const [, , payloadArg] = workerManager.call.mock.calls[0];
+    // Exact JSON bytes preserved and the JSON body parsed unchanged.
+    expect(payloadArg.rawBody).toBe(rawBody);
+    expect(payloadArg.parsedBody).toEqual({
+      type: "event_callback",
+      event: { type: "app_mention", text: "hi" },
+    });
+    // JSON raw-body HMAC still validates against the original bytes.
+    expect(slackSignature(timestamp, payloadArg.rawBody)).toBe(signature);
   }, 20_000);
 });
