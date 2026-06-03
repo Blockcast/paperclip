@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, jsonb, integer, index } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, jsonb, integer, bigserial, index } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 
 /**
@@ -16,6 +16,8 @@ export const pluginEventOutbox = pgTable(
   "plugin_event_outbox",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    /** Monotonic insertion order — drives deterministic FIFO delivery. */
+    seq: bigserial("seq", { mode: "number" }).notNull(),
     /** The PluginEvent.eventId (for tracing; not unique). */
     eventId: uuid("event_id").notNull(),
     companyId: uuid("company_id")
@@ -33,9 +35,9 @@ export const pluginEventOutbox = pgTable(
     processedAt: timestamp("processed_at", { withTimezone: true }),
   },
   (table) => ({
-    statusCreatedIdx: index("plugin_event_outbox_status_created_idx").on(
+    statusSeqIdx: index("plugin_event_outbox_status_seq_idx").on(
       table.status,
-      table.createdAt,
+      table.seq,
     ),
   }),
 );

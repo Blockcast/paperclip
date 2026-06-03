@@ -5,6 +5,7 @@
 -- duplicate-object errors, so IF NOT EXISTS + the FK guard make this re-apply-safe.
 CREATE TABLE IF NOT EXISTS "plugin_event_outbox" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+  "seq" bigserial NOT NULL,
   "event_id" uuid NOT NULL,
   "company_id" uuid NOT NULL,
   "event_type" text NOT NULL,
@@ -23,5 +24,5 @@ DO $$ BEGIN
 EXCEPTION
   WHEN duplicate_object THEN null;
 END $$;--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS "plugin_event_outbox_status_created_idx"
-  ON "plugin_event_outbox" USING btree ("status", "created_at");
+CREATE INDEX IF NOT EXISTS "plugin_event_outbox_status_seq_idx"
+  ON "plugin_event_outbox" USING btree ("status", "seq");

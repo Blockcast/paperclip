@@ -51,7 +51,7 @@ export async function pollOnce(db: Db, bus: PluginEventBus): Promise<number> {
           .select({ id: pluginEventOutbox.id })
           .from(pluginEventOutbox)
           .where(eq(pluginEventOutbox.status, "queued"))
-          .orderBy(asc(pluginEventOutbox.createdAt), asc(pluginEventOutbox.id))
+          .orderBy(asc(pluginEventOutbox.seq))
           .limit(CLAIM_BATCH),
       ),
     )
@@ -59,11 +59,8 @@ export async function pollOnce(db: Db, bus: PluginEventBus): Promise<number> {
 
   if (claimed.length === 0) return 0;
 
-  // RETURNING order is unspecified — restore creation order before emitting.
-  claimed.sort((a, b) => {
-    const t = a.createdAt.getTime() - b.createdAt.getTime();
-    return t !== 0 ? t : a.id.localeCompare(b.id);
-  });
+  // RETURNING order is unspecified — restore insertion order (seq) before emitting.
+  claimed.sort((a, b) => a.seq - b.seq);
 
   // Emit sequentially so per-company ordering (created before decided) holds.
   for (const row of claimed) {
