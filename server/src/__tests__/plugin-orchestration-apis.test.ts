@@ -15,6 +15,7 @@ import {
   heartbeatRuns,
   issueRelations,
   issues,
+  pluginEventOutbox,
   pluginManagedResources,
   plugins,
   projects,
@@ -75,6 +76,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     await db.delete(projects);
     await db.delete(plugins);
     await db.delete(agents);
+    await db.delete(pluginEventOutbox);
     await db.delete(companies);
   });
 
