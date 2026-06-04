@@ -1,6 +1,11 @@
 # Migrate the bot identity `blockcast-ci-packages` → `ally`
 
-**Decision (2026-06-04):** full new app — the fleet bot truly becomes `ally[bot]`.
+**Decision (2026-06-04):** full new app — the fleet bot becomes `allyblockcast[bot]`.
+(The global `ally` app slug was already taken, so the app is named `allyblockcast`;
+its bot login is therefore `allyblockcast[bot]`. Operators still trigger reviews
+with the `@ally` text alias — parsed from the comment body in
+`github-webhook.ts`, independent of the bot's GitHub handle; `@allyblockcast`
+works too.)
 
 ## What this bot actually is (read first)
 
