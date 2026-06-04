@@ -64,6 +64,37 @@ function buildAgent(adapterType: string, runtimeConfig: Record<string, unknown> 
   } as unknown as typeof agents.$inferSelect;
 }
 
+describe("k8s adapters default to session rotation (BLO-8827)", () => {
+  // opencode_k8s / claude_k8s sessions re-inflate to 220-290k raw input tokens
+  // per wake; the lossy /compact gate can't hold and they eventually overflow
+  // the model window (and drove 8Gi OOMs). They had NO ADAPTER_SESSION_MANAGEMENT
+  // entry and aren't legacy-sessioned, so rotation was disabled by default.
+  // Default them to rotation-enabled with a raw-input ceiling under the smallest
+  // mainstream window (claude 200k) so the session rotates to a fresh one before
+  // it overflows.
+  it("enables rotation with a 150k raw-input ceiling for opencode_k8s by default", () => {
+    const policy = parseSessionCompactionPolicy(buildAgent("opencode_k8s"));
+    expect(policy.enabled).toBe(true);
+    expect(policy.maxRawInputTokens).toBe(150_000);
+  });
+
+  it("enables rotation with a 150k raw-input ceiling for claude_k8s by default", () => {
+    const policy = parseSessionCompactionPolicy(buildAgent("claude_k8s"));
+    expect(policy.enabled).toBe(true);
+    expect(policy.maxRawInputTokens).toBe(150_000);
+  });
+
+  it("still honors a per-agent runtimeConfig override for the k8s adapters", () => {
+    const policy = parseSessionCompactionPolicy(
+      buildAgent("opencode_k8s", {
+        heartbeat: { sessionCompaction: { maxRawInputTokens: 180_000 } },
+      }),
+    );
+    expect(policy.enabled).toBe(true);
+    expect(policy.maxRawInputTokens).toBe(180_000);
+  });
+});
+
 describe("resolveRuntimeSessionParamsForWorkspace", () => {
   it("migrates fallback workspace sessions to project workspace when project cwd becomes available", () => {
     const agentId = "agent-123";
