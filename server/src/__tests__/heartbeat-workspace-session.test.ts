@@ -72,26 +72,45 @@ describe("k8s adapters default to session rotation (BLO-8827)", () => {
   // Default them to rotation-enabled with a raw-input ceiling under the smallest
   // mainstream window (claude 200k) so the session rotates to a fresh one before
   // it overflows.
-  it("enables rotation with a 150k raw-input ceiling for opencode_k8s by default", () => {
-    const policy = parseSessionCompactionPolicy(buildAgent("opencode_k8s"));
-    expect(policy.enabled).toBe(true);
-    expect(policy.maxRawInputTokens).toBe(150_000);
+  const K8S_DEFAULT = {
+    enabled: true,
+    maxSessionRuns: 200,
+    maxRawInputTokens: 150_000,
+    maxSessionAgeHours: 72,
+  };
+
+  // Full toEqual (not just enabled+maxRawInputTokens) so a fat-fingered
+  // secondary trigger (maxSessionRuns/maxSessionAgeHours) can't silently
+  // disable two of the three rotation paths without failing a test.
+  it("defaults opencode_k8s to rotation with the full k8s policy", () => {
+    expect(parseSessionCompactionPolicy(buildAgent("opencode_k8s"))).toEqual(K8S_DEFAULT);
   });
 
-  it("enables rotation with a 150k raw-input ceiling for claude_k8s by default", () => {
-    const policy = parseSessionCompactionPolicy(buildAgent("claude_k8s"));
-    expect(policy.enabled).toBe(true);
-    expect(policy.maxRawInputTokens).toBe(150_000);
+  it("defaults claude_k8s to rotation with the full k8s policy", () => {
+    expect(parseSessionCompactionPolicy(buildAgent("claude_k8s"))).toEqual(K8S_DEFAULT);
   });
 
-  it("still honors a per-agent runtimeConfig override for the k8s adapters", () => {
+  it("honors a per-agent maxRawInputTokens override and merges the rest from the k8s default", () => {
     const policy = parseSessionCompactionPolicy(
       buildAgent("opencode_k8s", {
         heartbeat: { sessionCompaction: { maxRawInputTokens: 180_000 } },
       }),
     );
-    expect(policy.enabled).toBe(true);
-    expect(policy.maxRawInputTokens).toBe(180_000);
+    // Partial override: only maxRawInputTokens changes; the other fields still
+    // come from K8S_AGENT_SESSION_POLICY (proves merge, not replace).
+    expect(policy).toEqual({ ...K8S_DEFAULT, maxRawInputTokens: 180_000 });
+  });
+
+  it("honors a per-agent enabled:false override to disable rotation for a k8s agent", () => {
+    // The advertised escape hatch: an operator can turn rotation OFF for a
+    // specific k8s agent. evaluateSessionCompaction short-circuits on
+    // !policy.enabled, so this genuinely disables it.
+    const policy = parseSessionCompactionPolicy(
+      buildAgent("claude_k8s", {
+        heartbeat: { sessionCompaction: { enabled: false } },
+      }),
+    );
+    expect(policy).toEqual({ ...K8S_DEFAULT, enabled: false });
   });
 });
 

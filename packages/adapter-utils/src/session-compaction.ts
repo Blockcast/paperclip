@@ -41,11 +41,15 @@ const ADAPTER_MANAGED_SESSION_POLICY: SessionCompactionPolicy = {
 // tool outputs), so the session's raw input re-inflates to 220-290k tokens
 // faster than the adapter's lossy `/compact` can shrink it (BLO-8827 / BLO-5679
 // "compaction not holding"). Without rotation the session climbs until it
-// overflows the model window (and the giant in-heap payload drove 8Gi OOMs).
-// Rotate to a fresh session + handoff once raw input crosses 150k — under the
-// smallest mainstream window we run (claude 200k; gpt-5.5 is larger) — so
-// context stays bounded. Tunable per-agent via
-// runtimeConfig.heartbeat.sessionCompaction.
+// overflows the model window (and the giant in-heap payload drove agent-pod
+// OOMs). Rotate to a fresh session + handoff once raw input crosses 150k —
+// under the smallest mainstream window we run (claude 200k; gpt-5.5 is larger).
+// The ceiling gates NON-cached raw input (evaluateSessionCompaction reads
+// rawInputTokens, which excludes cached reads), checked per completed wake — so
+// it bounds the session's growth ACROSS wakes (each fresh after the prior wake
+// crossed 150k). It does not hard-cap a single wake whose own growth blows past
+// the window; if that's still observed the levers are a lower ceiling and
+// maxSessionRuns. Tunable per-agent via runtimeConfig.heartbeat.sessionCompaction.
 const K8S_AGENT_SESSION_POLICY: SessionCompactionPolicy = {
   enabled: true,
   maxSessionRuns: 200,
