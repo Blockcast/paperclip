@@ -70,7 +70,12 @@ import {
   type AgentJobRunStatus,
 } from "./k8s-job-liveness.js";
 import { processPendingImageBumpForAgent } from "./agent-image-bump.js";
-import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
+import {
+  assertExecutionAdapterLoaded,
+  getServerAdapter,
+  listAdapterModelProfiles,
+  runningProcesses,
+} from "../adapters/index.js";
 import type {
   AdapterExecutionResult,
   AdapterInvocationMeta,
@@ -10040,6 +10045,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
 
       const adapter = getServerAdapter(agent.adapterType);
+      // Hardening: getServerAdapter() silently substitutes the built-in
+      // `process` adapter when `agent.adapterType` is not registered in THIS
+      // process (e.g. a run dispatched on the API tier, which does not load the
+      // bundled k8s adapters — the workers tier owns that lifecycle). Executing
+      // the process adapter launches no agent pod and fails deep inside with the
+      // misleading "Process adapter missing command". Fail loudly + accurately
+      // here so run recovery re-dispatches instead of mis-executing.
+      assertExecutionAdapterLoaded(agent.adapterType, adapter);
       const authToken = adapter.supportsLocalAgentJwt
         ? createLocalAgentJwt(agent.id, agent.companyId, agent.adapterType, run.id)
         : null;

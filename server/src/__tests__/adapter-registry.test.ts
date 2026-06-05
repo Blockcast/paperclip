@@ -33,9 +33,11 @@ vi.mock("hermes-paperclip-adapter/server", () => ({
 }));
 
 import {
+  assertExecutionAdapterLoaded,
   detectAdapterModel,
   findActiveServerAdapter,
   findServerAdapter,
+  getServerAdapter,
   listAdapterModels,
   listAdapterModelProfiles,
   registerServerAdapter,
@@ -123,6 +125,30 @@ describe("server adapter registry", () => {
     expect(() => requireServerAdapter("external_test")).toThrow(
       "Unknown adapter type: external_test",
     );
+  });
+
+  it("assertExecutionAdapterLoaded throws when a run would mis-resolve to the process fallback", () => {
+    // Unregistered type: getServerAdapter falls back to the built-in `process`
+    // adapter. The execution guard must refuse rather than launch the wrong
+    // adapter (the BLO-9089/Failure-B "Process adapter missing command" bug).
+    expect(findServerAdapter("external_test")).toBeNull();
+    const resolved = getServerAdapter("external_test");
+    expect(resolved.type).toBe("process");
+    expect(() => assertExecutionAdapterLoaded("external_test", resolved)).toThrow(
+      /Adapter "external_test" is not loaded in this process/,
+    );
+  });
+
+  it("assertExecutionAdapterLoaded is a no-op when the resolved adapter matches the request", () => {
+    registerServerAdapter(externalAdapter);
+    expect(() =>
+      assertExecutionAdapterLoaded("external_test", getServerAdapter("external_test")),
+    ).not.toThrow();
+    // A legitimately process-typed agent resolves to the process adapter and
+    // must NOT be rejected.
+    expect(() =>
+      assertExecutionAdapterLoaded("process", getServerAdapter("process")),
+    ).not.toThrow();
   });
 
   it("allows external plugin to override a built-in adapter type", () => {

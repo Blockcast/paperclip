@@ -1,5 +1,6 @@
 export {
   getServerAdapter,
+  assertExecutionAdapterLoaded,
   listAdapterModels,
   refreshAdapterModels,
   listServerAdapters,

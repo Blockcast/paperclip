@@ -656,6 +656,45 @@ export function getServerAdapter(type: string): ServerAdapterModule {
   return findActiveServerAdapter(type) ?? processAdapter;
 }
 
+/**
+ * Guard for the run-EXECUTION path.
+ *
+ * `getServerAdapter` intentionally falls back to the built-in `process`
+ * adapter for an unregistered type — fine for non-execution lookups (e.g.
+ * `sessionCodec`). But executing the `process` adapter in place of a requested
+ * external adapter (e.g. `claude_k8s` / `opencode_k8s`) is never correct: it
+ * launches no agent pod and dies inside the process adapter with the
+ * misleading "Process adapter missing command".
+ *
+ * That mis-resolution happens when a run is dispatched on a process that did
+ * not load the adapter — e.g. the API tier, which skips bundled-adapter load
+ * (the workers tier owns the adapter-plugin lifecycle; see server/src/index.ts).
+ * Throwing here surfaces the real registry/tier gap with an actionable message
+ * and lets run recovery re-dispatch, instead of silently mis-executing on the
+ * process adapter.
+ *
+ * Pass the requested adapter type and the adapter `getServerAdapter` returned
+ * for it. A no-op when the resolved adapter actually matches the request
+ * (including legitimate `process`-typed agents).
+ */
+export function assertExecutionAdapterLoaded(
+  requestedType: string,
+  resolved: ServerAdapterModule,
+): void {
+  if (resolved.type === requestedType) return;
+  const loaded = listServerAdapters()
+    .map((a) => a.type)
+    .sort()
+    .join(", ");
+  throw new Error(
+    `Adapter "${requestedType}" is not loaded in this process (run resolution fell back to ` +
+      `"${resolved.type}"). Refusing to execute the run on the fallback process adapter. ` +
+      `Loaded adapters: [${loaded}]. This run was likely dispatched on a tier that does not ` +
+      `own the adapter-plugin lifecycle (the API tier skips bundled-adapter load — the workers ` +
+      `tier owns it); recovery should re-dispatch it there.`,
+  );
+}
+
 export async function listAdapterModels(type: string): Promise<{ id: string; label: string }[]> {
   const adapter = findActiveServerAdapter(type);
   if (!adapter) return [];
