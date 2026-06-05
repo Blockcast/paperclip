@@ -616,6 +616,53 @@ const plugin = definePlugin({
       return await runFullSync(ctx);
     });
 
+    // One-time bounded backfill: write the Paperclip back-link attachment for
+    // already-mirrored issues that predate paperclipBaseUrl. Idempotent (Linear
+    // dedupes the attachment by URL), bounded per run, and resumable via an
+    // offset cursor in instance state.
+    ctx.actions.register(ACTION_KEYS.backfillBackLinks, async (params: any) => {
+      const { companyId } = params as { companyId: string };
+
+      const config = await ctx.config.get();
+      if (!(config.paperclipBaseUrl as string | undefined)?.trim()) {
+        return { backfilled: 0, done: true, note: "paperclipBaseUrl not set; nothing to do" };
+      }
+      const token = await resolveToken(ctx);
+      const maxPerRun = Math.max(1, Number((params as { maxPerRun?: number })?.maxPerRun ?? 100));
+      const pageSize = Math.min(25, maxPerRun);
+
+      const cursorKey = { scopeKind: "instance" as const, stateKey: "backfill-backlink-offset" };
+      let offset = Number((await ctx.state.get(cursorKey)) ?? 0) || 0;
+
+      let backfilled = 0;
+      let done = false;
+      while (backfilled < maxPerRun) {
+        const page = await ctx.issues.list({
+          companyId,
+          originKindPrefix: ORIGIN_KIND_SELF,
+          limit: Math.min(pageSize, maxPerRun - backfilled),
+          offset,
+        });
+        if (page.length === 0) { offset = 0; done = true; break; } // swept clean -> reset cursor
+
+        for (const issue of page) {
+          offset++; // advance over every scanned issue, linked or not
+          const link = await sync.getLink(ctx, issue.id);
+          if (!link) continue;
+          await writePaperclipBackLink(
+            ctx, token, link.linearIssueId, link.linearIdentifier,
+            issue.identifier ?? null, issue.id, issue.title ?? null,
+          );
+          backfilled++;
+          if (backfilled >= maxPerRun) break;
+        }
+        await ctx.state.set(cursorKey, offset);
+        await new Promise((r) => setTimeout(r, 250)); // backoff between pages (Linear rate limits)
+      }
+      await ctx.state.set(cursorKey, offset);
+      return { backfilled, offset, done };
+    });
+
     /** Link a Paperclip issue to a Linear issue (UI counterpart of the link tool). */
     ctx.actions.register(ACTION_KEYS.linkIssue, async (params: any) => {
       const { paperclipIssueId, linearRef, replaceExisting } = params as {

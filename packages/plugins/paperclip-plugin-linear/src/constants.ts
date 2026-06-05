@@ -57,6 +57,7 @@ export const ACTION_KEYS = {
   linkIssue: "link-issue",
   unlinkIssue: "unlink-issue",
   importIssue: "import-issue",
+  backfillBackLinks: "backfill-backlinks",
 } as const;
 
 export const DATA_KEYS = {

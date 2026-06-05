@@ -1741,6 +1741,163 @@ describe("paperclip-plugin-linear", () => {
   });
 
   // -----------------------------------------------------------------------
+  // backfill-backlinks action
+  // -----------------------------------------------------------------------
+
+  describe("backfill-backlinks action", () => {
+    it("pages mirrors and writes one back-link per linked issue, then completes", async () => {
+      harness = createTestHarness({
+        manifest,
+        config: {
+          linearClientId: "client-id-123",
+          linearClientSecret: "client-secret-456",
+          teamId: "team-1",
+          syncComments: true,
+          syncDirection: "bidirectional",
+          paperclipBaseUrl: "https://paperclip.test",
+          linearBacklinkBestEffort: true,
+        },
+      });
+      await plugin.definition.setup(harness.ctx);
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthToken },
+        "lin_token_123",
+      );
+
+      // Two mirrored issues on first page, empty array on second (sweep done).
+      vi.spyOn(harness.ctx.issues, "list")
+        .mockResolvedValueOnce([
+          { id: "pcp-1", identifier: "BLO-1", title: "Issue one" },
+          { id: "pcp-2", identifier: "BLO-2", title: "Issue two" },
+        ] as never)
+        .mockResolvedValueOnce([] as never);
+
+      // Both issues have links in sync state.
+      syncModule.getLink
+        .mockResolvedValueOnce({
+          paperclipIssueId: "pcp-1",
+          paperclipCompanyId: "comp-1",
+          linearIssueId: "lin-1",
+          linearIdentifier: "LIN-1",
+          linearUrl: "https://linear.app/t/LIN-1",
+          syncDirection: "bidirectional",
+          lastSyncAt: new Date().toISOString(),
+          lastLinearStateType: "started",
+          lastCommentSyncAt: null,
+        })
+        .mockResolvedValueOnce({
+          paperclipIssueId: "pcp-2",
+          paperclipCompanyId: "comp-1",
+          linearIssueId: "lin-2",
+          linearIdentifier: "LIN-2",
+          linearUrl: "https://linear.app/t/LIN-2",
+          syncDirection: "bidirectional",
+          lastSyncAt: new Date().toISOString(),
+          lastLinearStateType: "started",
+          lastCommentSyncAt: null,
+        });
+
+      const { attachmentLinkURL } = await import("../src/linear.js");
+      (attachmentLinkURL as ReturnType<typeof vi.fn>).mockClear();
+
+      const result = await harness.performAction<{ backfilled: number; done: boolean }>(
+        ACTION_KEYS.backfillBackLinks,
+        { companyId: "comp-1" },
+      );
+
+      expect(result.backfilled).toBe(2);
+      expect(attachmentLinkURL).toHaveBeenCalledTimes(2);
+
+      const calls = (attachmentLinkURL as ReturnType<typeof vi.fn>).mock.calls;
+      expect(calls[0]![2]).toMatchObject({ url: "https://paperclip.test/issues/BLO-1" });
+      expect(calls[1]![2]).toMatchObject({ url: "https://paperclip.test/issues/BLO-2" });
+    });
+
+    it("bounded + resumable: respects maxPerRun=1 and advances the offset cursor", async () => {
+      harness = createTestHarness({
+        manifest,
+        config: {
+          linearClientId: "client-id-123",
+          linearClientSecret: "client-secret-456",
+          teamId: "team-1",
+          syncComments: true,
+          syncDirection: "bidirectional",
+          paperclipBaseUrl: "https://paperclip.test",
+          linearBacklinkBestEffort: true,
+        },
+      });
+      await plugin.definition.setup(harness.ctx);
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthToken },
+        "lin_token_123",
+      );
+
+      // Seed a non-zero starting offset to confirm resumability.
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: "backfill-backlink-offset" },
+        5,
+      );
+
+      // Return one issue; the loop should stop after writing its back-link.
+      vi.spyOn(harness.ctx.issues, "list").mockResolvedValueOnce([
+        { id: "pcp-3", identifier: "BLO-3", title: "Issue three" },
+      ] as never);
+
+      syncModule.getLink.mockResolvedValueOnce({
+        paperclipIssueId: "pcp-3",
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-3",
+        linearIdentifier: "LIN-3",
+        linearUrl: "https://linear.app/t/LIN-3",
+        syncDirection: "bidirectional",
+        lastSyncAt: new Date().toISOString(),
+        lastLinearStateType: "started",
+        lastCommentSyncAt: null,
+      });
+
+      const { attachmentLinkURL } = await import("../src/linear.js");
+      (attachmentLinkURL as ReturnType<typeof vi.fn>).mockClear();
+
+      const result = await harness.performAction<{ backfilled: number; offset: number }>(
+        ACTION_KEYS.backfillBackLinks,
+        { companyId: "comp-1", maxPerRun: 1 },
+      );
+
+      // Exactly one back-link written.
+      expect(result.backfilled).toBe(1);
+      expect(attachmentLinkURL).toHaveBeenCalledTimes(1);
+
+      // Offset advanced from 5 to 6 (started at 5, scanned 1 issue).
+      expect(result.offset).toBe(6);
+      // Persisted cursor matches returned offset.
+      expect(
+        harness.getState({ scopeKind: "instance", stateKey: "backfill-backlink-offset" }),
+      ).toBe(6);
+    });
+
+    it("returns immediately with done=true when paperclipBaseUrl is not configured", async () => {
+      // Default harness (outer beforeEach) has no paperclipBaseUrl.
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthToken },
+        "lin_token_123",
+      );
+
+      const { attachmentLinkURL } = await import("../src/linear.js");
+      (attachmentLinkURL as ReturnType<typeof vi.fn>).mockClear();
+
+      const result = await harness.performAction<{ backfilled: number; done: boolean; note: string }>(
+        ACTION_KEYS.backfillBackLinks,
+        { companyId: "comp-1" },
+      );
+
+      expect(result.backfilled).toBe(0);
+      expect(result.done).toBe(true);
+      expect(result.note).toContain("paperclipBaseUrl not set");
+      expect(attachmentLinkURL).not.toHaveBeenCalled();
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // BLO-2350: webhook-imported Linear issues must inherit projectId
   // -----------------------------------------------------------------------
 
