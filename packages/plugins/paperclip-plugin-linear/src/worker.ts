@@ -987,10 +987,13 @@ const plugin = definePlugin({
         const bestEffort = config.linearBacklinkBestEffort === true;
         try {
           const res = await linear.markDuplicate(fetch, token, dupeIssue.id, keeperIssue.id);
+          const content = res.alreadyRelated
+            ? `${dupe.identifier} already a duplicate of ${keeper.identifier}`
+            : res.success
+              ? `Marked ${dupe.identifier} as duplicate of ${keeper.identifier}`
+              : `Warning: Linear reported the duplicate relation was not created (success=false) for ${dupe.identifier} → ${keeper.identifier}`;
           return {
-            content: res.alreadyRelated
-              ? `${dupe.identifier} already a duplicate of ${keeper.identifier}`
-              : `Marked ${dupe.identifier} as duplicate of ${keeper.identifier}`,
+            content,
             data: { ...res, dupe: dupe.identifier, keeper: keeper.identifier },
           };
         } catch (err) {
