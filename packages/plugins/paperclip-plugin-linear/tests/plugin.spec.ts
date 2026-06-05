@@ -78,6 +78,7 @@ vi.mock("../src/linear.js", () => ({
   updateIssue: vi.fn().mockResolvedValue({}),
   updateProject: vi.fn().mockResolvedValue({}),
   getWorkflowStates: vi.fn().mockResolvedValue([]),
+  markDuplicate: vi.fn().mockResolvedValue({ success: true, issueRelationId: null, alreadyRelated: false }),
 }));
 
 const syncModule = vi.hoisted(() => ({
@@ -1873,6 +1874,81 @@ describe("paperclip-plugin-linear", () => {
           (l) => l.level === "warn" && l.message.includes("no projectId resolved"),
         ),
       ).toBe(true);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Tool: mark-duplicate
+  // -----------------------------------------------------------------------
+
+  describe("tool: mark-duplicate", () => {
+    it("happy path: marks dupe as duplicate of keeper", async () => {
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthToken },
+        "lin_token_123",
+      );
+
+      const { getIssueByIdentifier, markDuplicate, parseLinearIssueRef } = await import("../src/linear.js");
+
+      (parseLinearIssueRef as ReturnType<typeof vi.fn>).mockImplementation((ref: string) => {
+        if (ref === "BLO-1184") return { identifier: "BLO-1184" };
+        if (ref === "BLO-2167") return { identifier: "BLO-2167" };
+        return null;
+      });
+
+      (getIssueByIdentifier as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({ id: "lin-dupe", identifier: "BLO-1184", title: "Dupe", state: { type: "cancelled" }, url: "https://linear.app/t/BLO-1184" })
+        .mockResolvedValueOnce({ id: "lin-keep", identifier: "BLO-2167", title: "Keeper", state: { type: "started" }, url: "https://linear.app/t/BLO-2167" });
+
+      (markDuplicate as ReturnType<typeof vi.fn>).mockResolvedValue({
+        success: true,
+        issueRelationId: "rel-1",
+        alreadyRelated: false,
+      });
+
+      const result = await harness.executeTool(TOOL_NAMES.markDuplicate, {
+        dupeRef: "BLO-1184",
+        keeperRef: "BLO-2167",
+      });
+
+      expect(markDuplicate).toHaveBeenCalledWith(
+        expect.any(Function),
+        "lin_token_123",
+        "lin-dupe",
+        "lin-keep",
+      );
+      expect(result.content).toContain("Marked BLO-1184 as duplicate of BLO-2167");
+      expect((result.data as any).success).toBe(true);
+      expect((result.data as any).dupe).toBe("BLO-1184");
+      expect((result.data as any).keeper).toBe("BLO-2167");
+    });
+
+    it("unresolved ref: returns error and does not call markDuplicate when dupe not found", async () => {
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthToken },
+        "lin_token_123",
+      );
+
+      const { getIssueByIdentifier, markDuplicate, parseLinearIssueRef } = await import("../src/linear.js");
+
+      (parseLinearIssueRef as ReturnType<typeof vi.fn>).mockImplementation((ref: string) => {
+        if (ref === "BLO-9999") return { identifier: "BLO-9999" };
+        if (ref === "BLO-2167") return { identifier: "BLO-2167" };
+        return null;
+      });
+
+      // dupe lookup returns null (not found)
+      (getIssueByIdentifier as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
+
+      (markDuplicate as ReturnType<typeof vi.fn>).mockClear();
+
+      const result = await harness.executeTool(TOOL_NAMES.markDuplicate, {
+        dupeRef: "BLO-9999",
+        keeperRef: "BLO-2167",
+      });
+
+      expect((result.data as any).error).toBeTruthy();
+      expect(markDuplicate).not.toHaveBeenCalled();
     });
   });
 });

@@ -919,6 +919,43 @@ const plugin = definePlugin({
       },
     );
 
+    ctx.tools.register(
+      TOOL_NAMES.markDuplicate,
+      { displayName: "Mark Linear Duplicate", description: "Mark one Linear issue as a native duplicate of another", parametersSchema: { type: "object", properties: { dupeRef: { type: "string", description: "Linear identifier/URL of the duplicate issue" }, keeperRef: { type: "string", description: "Linear identifier/URL of the keeper issue" } }, required: ["dupeRef", "keeperRef"] } },
+      async (params) => {
+        const { dupeRef, keeperRef } = params as { dupeRef: string; keeperRef: string };
+        const dupe = linear.parseLinearIssueRef(dupeRef);
+        const keeper = linear.parseLinearIssueRef(keeperRef);
+        if (!dupe || !keeper) {
+          return { content: "Error: invalid ref", data: { error: "Could not parse dupe/keeper Linear reference" } };
+        }
+        const token = await resolveToken(ctx);
+        const fetch = ctx.http.fetch.bind(ctx.http);
+        const dupeIssue = await linear.getIssueByIdentifier(fetch, token, dupe.identifier);
+        const keeperIssue = await linear.getIssueByIdentifier(fetch, token, keeper.identifier);
+        if (!dupeIssue) return { content: "Error: dupe not found", data: { error: `${dupe.identifier} not found` } };
+        if (!keeperIssue) return { content: "Error: keeper not found", data: { error: `${keeper.identifier} not found` } };
+
+        const config = await ctx.config.get();
+        const bestEffort = config.linearBacklinkBestEffort === true;
+        try {
+          const res = await linear.markDuplicate(fetch, token, dupeIssue.id, keeperIssue.id);
+          return {
+            content: res.alreadyRelated
+              ? `${dupe.identifier} already a duplicate of ${keeper.identifier}`
+              : `Marked ${dupe.identifier} as duplicate of ${keeper.identifier}`,
+            data: { ...res, dupe: dupe.identifier, keeper: keeper.identifier },
+          };
+        } catch (err) {
+          if (bestEffort) {
+            ctx.logger.warn("markDuplicate failed (best-effort)", { dupe: dupe.identifier, keeper: keeper.identifier, error: String(err) });
+            return { content: "Warning: mark duplicate failed (best-effort)", data: { error: String(err), dupe: dupe.identifier, keeper: keeper.identifier } };
+          }
+          throw err;
+        }
+      },
+    );
+
     // -----------------------------------------------------------------------
     // Events: bidirectional sync
     // -----------------------------------------------------------------------

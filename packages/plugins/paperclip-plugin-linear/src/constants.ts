@@ -22,6 +22,7 @@ export const TOOL_NAMES = {
   link: "link-linear-issue",
   unlink: "unlink-linear-issue",
   create: "create-linear-issue",
+  markDuplicate: "mark-duplicate",
 } as const;
 
 export const WEBHOOK_KEYS = {
