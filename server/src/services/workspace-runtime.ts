@@ -1198,8 +1198,9 @@ export async function realizeExecutionWorkspace(input: {
   // already carries {{issue.identifier}}; this guarantees it even when a custom
   // branchTemplate omits it. sanitizeBranchName preserves case, so the uppercase
   // BLO- form the webhook extractor requires survives.
-  const sanitizedIssueIdentifier = input.issue?.identifier
-    ? sanitizeBranchName(input.issue.identifier)
+  const issueIdentifierForBranch = input.issue?.identifier ?? null;
+  const sanitizedIssueIdentifier = issueIdentifierForBranch
+    ? sanitizeBranchName(issueIdentifierForBranch)
     : null;
   const branchName =
     sanitizedIssueIdentifier && !baseBranchName.includes(sanitizedIssueIdentifier)
