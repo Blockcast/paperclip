@@ -1951,4 +1951,82 @@ describe("paperclip-plugin-linear", () => {
       expect(markDuplicate).not.toHaveBeenCalled();
     });
   });
+
+  // -----------------------------------------------------------------------
+  // webhook Issue.update: Paperclip back-link
+  // -----------------------------------------------------------------------
+
+  describe("webhook Issue.update: Paperclip back-link", () => {
+    it("fires attachmentLinkURL on update when paperclipBaseUrl is set and the issue is linked", async () => {
+      // Build a fresh harness with paperclipBaseUrl so the back-link path triggers.
+      harness = createTestHarness({
+        manifest,
+        config: {
+          linearClientId: "client-id-123",
+          linearClientSecret: "client-secret-456",
+          teamId: "team-1",
+          syncComments: true,
+          syncDirection: "bidirectional",
+          paperclipBaseUrl: "https://paperclip.test",
+          linearBacklinkBestEffort: true,
+        },
+      });
+      await plugin.definition.setup(harness.ctx);
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthToken },
+        "lin_token_123",
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.companyId },
+        "comp-1",
+      );
+
+      // Seed an existing link so getLinkByLinear resolves for this update event.
+      syncModule.getLinkByLinear.mockResolvedValueOnce({
+        paperclipIssueId: "pcp-iss-1",
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-update-bl-1",
+        linearIdentifier: "LUC-200",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-200",
+        syncDirection: "bidirectional",
+        lastLinearStateType: "started",
+      });
+
+      // Mock ctx.issues.get to return the Paperclip mirror's identifier + title.
+      vi.spyOn(harness.ctx.issues, "get").mockResolvedValue({
+        id: "pcp-iss-1",
+        identifier: "LUC-1001",
+        title: "Test issue",
+      } as never);
+
+      // Stub update so the extra-fields patch branch doesn't throw.
+      vi.spyOn(harness.ctx.issues, "update").mockResolvedValue(undefined as never);
+
+      // syncFromLinear is already a no-op mock; nothing extra needed.
+
+      const { attachmentLinkURL } = await import("../src/linear.js");
+      (attachmentLinkURL as ReturnType<typeof vi.fn>).mockClear();
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Issue",
+          action: "update",
+          data: {
+            id: "lin-update-bl-1",
+            identifier: "LUC-200",
+            title: "Updated title",
+            state: { type: "started", name: "In Progress" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+        requestId: "test-webhook-update-backlink",
+      });
+
+      expect(attachmentLinkURL).toHaveBeenCalledOnce();
+      const callArg = (attachmentLinkURL as ReturnType<typeof vi.fn>).mock.calls[0]![2];
+      expect(callArg.url).toBe("https://paperclip.test/issues/LUC-1001");
+    });
+  });
 });

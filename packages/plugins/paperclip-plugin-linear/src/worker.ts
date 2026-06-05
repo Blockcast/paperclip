@@ -1405,6 +1405,27 @@ async function handleWebhookEvent(
 
       ctx.logger.info(`Webhook synced issue update: ${link.linearIdentifier}`);
 
+      // Backfill the Paperclip back-link on the update path too: idempotent
+      // (Linear dedupes the attachment by URL) and best-effort by config. Covers
+      // mirrors that predate paperclipBaseUrl or were only ever updated. Wrapped
+      // in try/catch like the create path so a strict-mode back-link failure
+      // doesn't make Linear retry the whole webhook (the sync already committed).
+      try {
+        const pcIssue = await ctx.issues.get(link.paperclipIssueId, link.paperclipCompanyId);
+        const linearToken = await resolveToken(ctx);
+        await writePaperclipBackLink(
+          ctx,
+          linearToken,
+          linearIssueId,
+          link.linearIdentifier,
+          pcIssue?.identifier ?? null,
+          link.paperclipIssueId,
+          pcIssue?.title ?? null,
+        );
+      } catch (err) {
+        ctx.logger.warn(`Webhook update back-link write failed for ${link.linearIdentifier}: ${err}`);
+      }
+
     } else if (action === "create") {
       const config = await ctx.config.get();
       if (config.disableLinearOriginatedCreates !== false) {
