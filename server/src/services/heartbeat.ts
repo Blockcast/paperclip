@@ -291,6 +291,10 @@ const RATE_LIMIT_HEARTBEAT_RETRY_MAX_ATTEMPTS = 12;
 // claimed by the `scheduledRetryAt <= now` sweep — silently stranded. A short
 // poll interval lets the sweep re-check capacity soon. PEN-382.
 export const CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS = 5 * 60 * 1000;
+export const CCROTATE_CAPACITY_RETRY_REASON = "ccrotate_capacity";
+// Backstop so a pool that never recovers eventually stops re-deferring and
+// surfaces for operator attention instead of looping forever. PEN-382.
+export const CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS = 24;
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -6344,6 +6348,85 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    // A ccrotate capacity defer must re-check the gate at promotion time: if the
+    // pool is still exhausted, re-defer with backoff instead of promoting a run
+    // that would dispatch and immediately 429. PEN-382.
+    if (dueRun.scheduledRetryReason === CCROTATE_CAPACITY_RETRY_REASON) {
+      const capacity = await ccrotateGate.checkAdapter({
+        adapterType: agent.adapterType,
+        agentId: dueRun.agentId,
+        now,
+      });
+      if (!capacity.allow) {
+        const nextAttempt = (dueRun.scheduledRetryAttempt ?? 0) + 1;
+        if (nextAttempt > CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS) {
+          // The pool never recovered within the retry budget. Terminate the
+          // scheduled retry so it surfaces for operator attention instead of
+          // looping forever.
+          const exhausted = await db
+            .update(heartbeatRuns)
+            .set({
+              status: "cancelled",
+              finishedAt: now,
+              error: `ccrotate capacity retry exhausted after ${dueRun.scheduledRetryAttempt ?? 0} attempts; pool did not recover`,
+              errorCode: "rate_limit_exhausted",
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(heartbeatRuns.id, dueRun.id),
+                eq(heartbeatRuns.status, "scheduled_retry"),
+                lte(heartbeatRuns.scheduledRetryAt, now),
+              ),
+            )
+            .returning()
+            .then((rows) => rows[0] ?? null);
+          if (exhausted) {
+            await appendRunEvent(exhausted, await nextRunEventSeq(exhausted.id), {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "warn",
+              message: "ccrotate capacity retry exhausted; pool did not recover within the retry budget",
+              payload: {
+                scheduledRetryAttempt: dueRun.scheduledRetryAttempt ?? 0,
+                maxAttempts: CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS,
+                ccrotateTarget: capacity.target,
+              },
+            });
+          }
+          return { outcome: "not_promoted", run: exhausted };
+        }
+        const nextDueAt =
+          capacity.resumeAt ?? new Date(now.getTime() + CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS);
+        const rescheduled = await db
+          .update(heartbeatRuns)
+          .set({ scheduledRetryAttempt: nextAttempt, scheduledRetryAt: nextDueAt, updatedAt: now })
+          .where(
+            and(
+              eq(heartbeatRuns.id, dueRun.id),
+              eq(heartbeatRuns.status, "scheduled_retry"),
+              lte(heartbeatRuns.scheduledRetryAt, now),
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (rescheduled) {
+          await appendRunEvent(rescheduled, await nextRunEventSeq(rescheduled.id), {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "info",
+            message: "ccrotate capacity still exhausted at promotion; re-deferred with backoff",
+            payload: {
+              scheduledRetryAttempt: nextAttempt,
+              scheduledRetryAt: nextDueAt.toISOString(),
+              ccrotateTarget: capacity.target,
+            },
+          });
+        }
+        return { outcome: "not_promoted", run: rescheduled };
+      }
+    }
+
     const promoted = await db
       .update(heartbeatRuns)
       .set({
@@ -11413,7 +11496,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           triggerDetail,
           status: "scheduled_retry",
           scheduledRetryAt,
-          scheduledRetryReason: "ccrotate_capacity",
+          scheduledRetryReason: CCROTATE_CAPACITY_RETRY_REASON,
           scheduledRetryAttempt: 0,
           errorCode: "rate_limit_exhausted",
           resultJson: {

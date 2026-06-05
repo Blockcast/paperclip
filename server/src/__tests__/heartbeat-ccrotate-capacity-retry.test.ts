@@ -12,7 +12,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { heartbeatService } from "../services/heartbeat.js";
+import { CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS, heartbeatService } from "../services/heartbeat.js";
 import type {
   CcrotateGateCheckInput,
   CcrotateGateResult,
@@ -63,6 +63,16 @@ function denyingGate(resumeAt: Date | null): CcrotateTierGate {
   return {
     async checkAdapter(_input: CcrotateGateCheckInput): Promise<CcrotateGateResult> {
       return { allow: false, target: "claude", reason: "ccrotate.no_usable_account", resumeAt };
+    },
+    _resetForTesting() {},
+  };
+}
+
+/** Deterministic gate that always allows (pool recovered). */
+function allowingGate(): CcrotateTierGate {
+  return {
+    async checkAdapter(_input: CcrotateGateCheckInput): Promise<CcrotateGateResult> {
+      return { allow: true };
     },
     _resetForTesting() {},
   };
@@ -170,22 +180,26 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     expect(retryRun!.scheduledRetryAt!.getTime()).toBeGreaterThan(before);
   });
 
-  it("promotes the scheduled capacity retry when it becomes due", async () => {
+  it("promotes the scheduled capacity retry when due and capacity has returned", async () => {
     const { agentId } = await seedAgent();
     const resumeAt = new Date("2026-04-20T03:02:00.000Z");
-    const heartbeat = heartbeatService(db, {
+    // Defer with an exhausted gate to create the scheduled_retry row...
+    const deferring = heartbeatService(db, {
       ccrotateGate: denyingGate(resumeAt),
       skipQueuedRunDispatch: true,
     });
+    await deferring.wakeup(agentId, { source: "assignment", triggerDetail: "system" });
 
-    await heartbeat.wakeup(agentId, { source: "assignment", triggerDetail: "system" });
-
-    // Before due: still parked as scheduled_retry.
-    const early = await heartbeat.promoteDueScheduledRetries(new Date("2026-04-20T03:01:59.000Z"));
+    // Before due: still parked.
+    const early = await deferring.promoteDueScheduledRetries(new Date("2026-04-20T03:01:59.000Z"));
     expect(early.promoted).toBe(0);
 
-    // At/after due: the existing sweep claims and promotes it to the queued pool.
-    const promotion = await heartbeat.promoteDueScheduledRetries(resumeAt);
+    // Due + capacity recovered: a fresh instance whose gate now allows promotes it.
+    const recovered = heartbeatService(db, {
+      ccrotateGate: allowingGate(),
+      skipQueuedRunDispatch: true,
+    });
+    const promotion = await recovered.promoteDueScheduledRetries(resumeAt);
     expect(promotion.promoted).toBe(1);
 
     const promoted = await db
@@ -194,5 +208,76 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
       .where(eq(heartbeatRuns.agentId, agentId))
       .then((rows) => rows[0] ?? null);
     expect(promoted?.status).toBe("queued");
+  });
+
+  it("re-defers with backoff instead of promoting when capacity is still exhausted at promotion", async () => {
+    const { agentId } = await seedAgent();
+    const resumeAt = new Date("2026-04-20T03:02:00.000Z");
+    const nextResumeAt = new Date("2026-04-20T03:30:00.000Z");
+    // Same instance keeps denying — at promotion the re-gate must re-defer,
+    // not dispatch a run that would immediately 429.
+    const heartbeat = heartbeatService(db, {
+      ccrotateGate: denyingGate(nextResumeAt),
+      skipQueuedRunDispatch: true,
+    });
+
+    // Seed the scheduled_retry row directly via a deferring wake.
+    const seeding = heartbeatService(db, {
+      ccrotateGate: denyingGate(resumeAt),
+      skipQueuedRunDispatch: true,
+    });
+    await seeding.wakeup(agentId, { source: "assignment", triggerDetail: "system" });
+
+    const promotion = await heartbeat.promoteDueScheduledRetries(resumeAt);
+    expect(promotion.promoted).toBe(0);
+
+    const row = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(row?.status, "still exhausted → stays parked as scheduled_retry").toBe("scheduled_retry");
+    expect(row?.scheduledRetryAttempt, "attempt is bumped on re-defer").toBe(1);
+    expect(
+      row!.scheduledRetryAt!.getTime(),
+      "scheduledRetryAt is pushed to the new resumeAt",
+    ).toBe(nextResumeAt.getTime());
+  });
+
+  it("stops re-deferring and terminates once the retry cap is reached", async () => {
+    const { companyId, agentId } = await seedAgent();
+    const runId = randomUUID();
+    const due = new Date("2026-04-20T03:02:00.000Z");
+    // A capacity retry that has already exhausted its attempts budget.
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "scheduled_retry",
+      scheduledRetryReason: "ccrotate_capacity",
+      scheduledRetryAt: due,
+      scheduledRetryAttempt: CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS,
+      errorCode: "rate_limit_exhausted",
+      resultJson: { errorFamily: "rate_limit_exhausted" },
+      contextSnapshot: { wakeSource: "assignment" },
+    });
+
+    const heartbeat = heartbeatService(db, {
+      ccrotateGate: denyingGate(new Date("2026-04-20T09:00:00.000Z")),
+      skipQueuedRunDispatch: true,
+    });
+    const promotion = await heartbeat.promoteDueScheduledRetries(due);
+    expect(promotion.promoted).toBe(0);
+
+    const row = await db
+      .select({ status: heartbeatRuns.status, finishedAt: heartbeatRuns.finishedAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(row?.status, "exhausted capacity retry must terminate, not stay scheduled_retry").not.toBe(
+      "scheduled_retry",
+    );
+    expect(row?.finishedAt, "terminated run is finished").not.toBeNull();
   });
 });
