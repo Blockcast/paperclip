@@ -4405,8 +4405,60 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return Math.max(1, Math.floor(asNumber(raw, fallback)));
   }
 
+  // Surface a pool that never recovered within the ccrotate auto-retry budget
+  // (PEN-382). Coalesced per (company, ccrotate target): a pool outage exhausts
+  // many agents' retries at once, so the escalation is keyed on the target —
+  // one open issue per pool, not one per cancelled run.
+  async function escalateCcrotateCapacityExhausted(input: {
+    companyId: string;
+    ccrotateTarget: string;
+    agentId: string;
+    agentName: string | null;
+    runId: string;
+    attempts: number;
+  }): Promise<{ kind: "created" | "coalesced"; issueId: string }> {
+    const originId = input.ccrotateTarget;
+    const existing = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.companyId),
+          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.ccrotateCapacityExhausted),
+          eq(issues.originId, originId),
+          isNull(issues.hiddenAt),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (existing) return { kind: "coalesced", issueId: existing.id };
+
+    const agentLabel = input.agentName
+      ? `${input.agentName} (${input.agentId})`
+      : input.agentId;
+    const created = await issuesSvc.create(input.companyId, {
+      title: `ccrotate pool exhausted — ${input.ccrotateTarget}`,
+      description: [
+        `The ccrotate capacity pool **${input.ccrotateTarget}** did not recover within the auto-retry budget.`,
+        "",
+        `- Agent: ${agentLabel}`,
+        `- Cancelled run: ${input.runId}`,
+        `- Retry attempts before giving up: ${input.attempts}`,
+        "",
+        "Agent runs are deferring and then cancelling because no account in this pool has usable capacity and none reported a future reset within the retry window. This usually needs a ccrotate token refresh / capacity top-up rather than agent action. This issue is coalesced per pool, so it represents the whole outage rather than a single run — mark it done once the pool recovers.",
+      ].join("\n"),
+      status: "todo",
+      priority: "high",
+      originKind: RECOVERY_ORIGIN_KINDS.ccrotateCapacityExhausted,
+      originId,
+    });
+    return { kind: "created", issueId: created.id };
+  }
+
   return {
     buildRunOutputSilence,
+    escalateCcrotateCapacityExhausted,
     escalateStrandedRecoveryIssueInPlace,
     escalateStrandedAssignedIssue,
     recordWatchdogDecision,

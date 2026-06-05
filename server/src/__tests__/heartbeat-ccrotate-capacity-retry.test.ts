@@ -7,6 +7,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -279,5 +280,70 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
       "scheduled_retry",
     );
     expect(row?.finishedAt, "terminated run is finished").not.toBeNull();
+
+    // Exhaustion files one operator-visible escalation issue for the stuck pool.
+    const escalations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "ccrotate_capacity_exhausted")));
+    expect(escalations.length, "exhaustion files exactly one escalation issue").toBe(1);
+    expect(escalations[0]?.originId, "escalation is keyed on the ccrotate target").toBe("claude");
+    expect(escalations[0]?.priority).toBe("high");
+    expect(escalations[0]?.status).toBe("todo");
+  });
+
+  it("coalesces escalation to one issue per pool when multiple agents exhaust the same target", async () => {
+    const { companyId, agentId: agentA } = await seedAgent();
+    const due = new Date("2026-04-20T03:02:00.000Z");
+    const heartbeat = heartbeatService(db, {
+      ccrotateGate: denyingGate(new Date("2026-04-20T09:00:00.000Z")),
+      skipQueuedRunDispatch: true,
+    });
+
+    const insertExhaustedRetry = async (agentId: string) =>
+      db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "scheduled_retry",
+        scheduledRetryReason: "ccrotate_capacity",
+        scheduledRetryAt: due,
+        scheduledRetryAttempt: CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS,
+        errorCode: "rate_limit_exhausted",
+        resultJson: { errorFamily: "rate_limit_exhausted" },
+        contextSnapshot: { wakeSource: "assignment" },
+      });
+
+    // First agent exhausts → first escalation.
+    await insertExhaustedRetry(agentA);
+    await heartbeat.promoteDueScheduledRetries(due);
+
+    // A second agent in the SAME company exhausts the SAME pool → must coalesce
+    // onto the existing open escalation, not spam a duplicate.
+    const agentB = randomUUID();
+    await db.insert(agents).values({
+      id: agentB,
+      companyId,
+      name: "ClaudeCoderB",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await insertExhaustedRetry(agentB);
+    await heartbeat.promoteDueScheduledRetries(due);
+
+    const escalations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "ccrotate_capacity_exhausted")));
+    expect(
+      escalations.length,
+      "both agents exhausting the same pool yield ONE coalesced escalation",
+    ).toBe(1);
+    expect(escalations[0]?.originId).toBe("claude");
   });
 });
