@@ -285,6 +285,12 @@ const RATE_LIMIT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 // actually ran (and re-failed). Practical ceiling: 12 = ~18min of accumulated
 // post-gate retries before we give up and require operator intervention.
 const RATE_LIMIT_HEARTBEAT_RETRY_MAX_ATTEMPTS = 12;
+// Fallback delay for a ccrotate capacity defer when the gate can't derive a
+// `resumeAt` (e.g. no future reset epoch in the tier cache). Without this the
+// scheduled-retry row would carry a null `scheduledRetryAt` and never be
+// claimed by the `scheduledRetryAt <= now` sweep — silently stranded. A short
+// poll interval lets the sweep re-check capacity soon. PEN-382.
+export const CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS = 5 * 60 * 1000;
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -11390,22 +11396,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         now: new Date(),
       });
       if (!gateResult.allow) {
-        await db.insert(agentWakeupRequests).values({
+        // Capacity exhausted. Instead of dropping the wake as terminal
+        // `skipped` (which left `resumeAt` decorative and required a human
+        // re-ping), persist it as a `scheduled_retry` heartbeat run so the
+        // existing scheduled-retry sweep (`promoteDueScheduledRetries`)
+        // re-fires it when capacity returns. Tagging it `rate_limit_exhausted`
+        // + `retryNotBefore = resumeAt` makes the existing bounded-retry
+        // backoff honor `resumeAt` as the retry floor. PEN-382.
+        const resumeAtIso = gateResult.resumeAt ? gateResult.resumeAt.toISOString() : null;
+        const scheduledRetryAt =
+          gateResult.resumeAt ?? new Date(Date.now() + CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS);
+        await db.insert(heartbeatRuns).values({
           companyId: agent.companyId,
           agentId,
-          source,
+          invocationSource: source,
           triggerDetail,
-          reason: gateResult.reason,
-          payload: {
-            ...(payload ?? {}),
+          status: "scheduled_retry",
+          scheduledRetryAt,
+          scheduledRetryReason: "ccrotate_capacity",
+          scheduledRetryAttempt: 0,
+          errorCode: "rate_limit_exhausted",
+          resultJson: {
+            errorFamily: "rate_limit_exhausted",
+            ...(resumeAtIso ? { retryNotBefore: resumeAtIso, transientRetryNotBefore: resumeAtIso } : {}),
             ccrotateTarget: gateResult.target,
-            ccrotateResumeAt: gateResult.resumeAt ? gateResult.resumeAt.toISOString() : null,
+            ccrotateReason: gateResult.reason,
           },
-          status: "skipped",
-          requestedByActorType: opts.requestedByActorType ?? null,
-          requestedByActorId: opts.requestedByActorId ?? null,
-          idempotencyKey: opts.idempotencyKey ?? null,
-          finishedAt: new Date(),
+          contextSnapshot: {
+            ...enrichedContextSnapshot,
+            wakeSource: source,
+            wakeTriggerDetail: triggerDetail,
+            ccrotateTarget: gateResult.target,
+            ...(resumeAtIso ? { ccrotateResumeAt: resumeAtIso } : {}),
+          },
         });
         return null;
       }
