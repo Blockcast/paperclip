@@ -346,4 +346,48 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     ).toBe(1);
     expect(escalations[0]?.originId).toBe("claude");
   });
+
+  it("enforces one open escalation per pool at the DB level (partial unique index)", async () => {
+    // The sequential coalescing above is only safe because the SELECT sees the
+    // prior INSERT; concurrent sweeps could both miss and both insert. The
+    // partial unique index is what makes the guarantee real, so assert it
+    // directly. PEN-382 (Ally review #307).
+    const { companyId } = await seedAgent();
+    const base = {
+      companyId,
+      title: "ccrotate pool exhausted — claude",
+      originKind: "ccrotate_capacity_exhausted",
+      originId: "claude",
+    };
+
+    // First open escalation inserts fine.
+    await db.insert(issues).values({ id: randomUUID(), status: "todo", ...base });
+
+    // A second OPEN escalation for the same pool is rejected by the index —
+    // this is the concurrent-race case the app-level SELECT can't cover.
+    // drizzle wraps the driver error, so unwrap to assert the real pg cause.
+    let dupError: unknown;
+    try {
+      await db.insert(issues).values({ id: randomUUID(), status: "in_progress", ...base });
+    } catch (error) {
+      dupError = error;
+    }
+    expect(dupError, "second open duplicate must be rejected by the unique index").toBeDefined();
+    const cause = ((dupError as { cause?: unknown })?.cause ?? dupError) as {
+      code?: string;
+      constraint?: string;
+      constraint_name?: string;
+    };
+    expect(cause.code, "rejection is a unique-violation (23505)").toBe("23505");
+    expect(
+      cause.constraint ?? cause.constraint_name ?? "",
+      "violated index is the ccrotate-exhaustion partial unique index",
+    ).toBe("issues_active_ccrotate_capacity_exhaustion_uq");
+
+    // A done duplicate is allowed — the index is partial (excludes done/cancelled),
+    // so a fresh outage after recovery can open a new escalation.
+    await expect(
+      db.insert(issues).values({ id: randomUUID(), status: "done", ...base }),
+    ).resolves.toBeDefined();
+  });
 });
