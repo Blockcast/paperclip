@@ -75,6 +75,7 @@ const ALL_SHAPES: readonly EvidenceShape[] = [
   "ci-green",
   "e2e-script",
   "e2e-run",
+  "migration-output",
 ] as const;
 
 /**
@@ -292,6 +293,28 @@ function detectE2eScript(
   return false;
 }
 
+function detectMigrationOutput(text: string): boolean {
+  // EXPLAIN / EXPLAIN ANALYZE plan output.
+  if (/\b(?:Seq|Index|Bitmap Heap|Hash|Merge|Nested Loop)\s+(?:Scan|Join)\b/i.test(text)) return true;
+  if (/\bcost=[\d.]+\.\.[\d.]+\s+rows=\d+/i.test(text)) return true;
+  // psql row-count line: "(N rows)" or "(1 row)".
+  if (/\(\d+\s+rows?\)/i.test(text)) return true;
+  // Migration runner banners.
+  if (/Applied\s+\d+\s+migration/i.test(text)) return true;
+  if (/No pending migrations/i.test(text)) return true;
+  if (/\d+\s+migration(?:s)?\s+applied/i.test(text)) return true;
+  // Drizzle-kit output: "✓ done" or "drizzle-kit: ..." lines.
+  if (/drizzle-kit[\s\S]{0,80}(?:push|migrate|generate)/i.test(text)) return true;
+  // Alembic: "Running upgrade" / "INFO [alembic.runtime".
+  if (/INFO\s+\[alembic\.runtime/i.test(text)) return true;
+  // Flyway / Liquibase banners.
+  if (/Flyway\s+(?:Community|Pro|Teams)\s+Edition/i.test(text)) return true;
+  if (/Liquibase\s+Community/i.test(text)) return true;
+  // Generic "ALTER TABLE / CREATE INDEX / DROP COLUMN" in a code block.
+  if (/```[\s\S]*?\b(?:ALTER TABLE|CREATE (?:UNIQUE )?INDEX|ADD COLUMN|DROP COLUMN)\b[\s\S]*?```/i.test(text)) return true;
+  return false;
+}
+
 function detectE2eRun(
   workProducts: EvidenceWorkProductLite[],
   text: string,
@@ -327,6 +350,7 @@ function detectAll(input: {
     "ci-green": detectCiGreen(text),
     "e2e-script": detectE2eScript(text, workProducts),
     "e2e-run": detectE2eRun(workProducts, text),
+    "migration-output": detectMigrationOutput(text),
   };
   const found = ALL_SHAPES.filter((s) => detections[s]);
   return { detections, found };
