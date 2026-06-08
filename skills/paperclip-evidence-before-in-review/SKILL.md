@@ -38,6 +38,7 @@ Look at the `labels` array. The label name(s) tell you which evidence shapes the
 | `infra` | `kubectl-state` + `probe-output` |
 | `cms-data-op` | `url-probe` |
 | `pr` | `pr-link` |
+| `db-migration`, `migration` | `migration-output` |
 | (no label or unrecognized) | `checklist:done-when` (weak default — verdict will be `warn`, not `block`) |
 
 Multiple labels union their required sets. A `frontend + pr` issue needs all of `screenshot:1440x900`, `screenshot:390x844`, `checklist:done-when`, `pr-link`.
@@ -136,6 +137,27 @@ $ curl https://www.blockcast.network/blog/making-traffic-federation-easier | gre
 
 A full GitHub PR URL: `https://github.com/Blockcast/paperclip/pull/N`. Not "see PR" or "PR opened".
 
+#### `migration-output`
+
+Paste the migration runner's output banner. The gate accepts any of:
+
+- **drizzle-kit** (`drizzle-kit push`, `drizzle-kit migrate`, `drizzle-kit generate`): lines containing `Applied N migrations` / `No pending migrations` / `N migrations applied`
+- **Alembic**: `INFO  [alembic.runtime.migration]` lines
+- **Flyway/Liquibase**: `Flyway … successful` / `Liquibase … ran successfully`
+- **EXPLAIN ANALYZE plan output**: `Seq Scan`, `cost=…`, or `(N rows)` lines co-occurring within ~500 chars of a migration runner signal
+
+```
+Applying migration 0042_add_evidence_verdict.sql
+Applied 1 migration in 0.21s
+
+No pending migrations.
+```
+
+**Common mistakes:**
+- Pasting only "migration ran successfully" with no runner output — gate needs the banner.
+- EXPLAIN output alone without the migration runner context — gate requires the runner signal co-occurrence.
+- Mentioning "ran migration" in prose without pasting the actual output.
+
 ### 4. Only THEN transition to in_review
 
 After all required shapes are in your closing comment, PATCH the issue:
@@ -168,4 +190,4 @@ These have all happened on real issues and the gate exists to catch them:
 - Label registry: `server/src/services/evidence-shapes.ts`
 - Wiring: `server/src/services/evidence-gate-wiring.ts`
 - Schema: `issues.last_evidence_verdict` (jsonb, nullable)
-- Tracking: BLO-4461 (parent), BLO-4829 (evaluator), BLO-4824 (wiring), BLO-4828 (Phase-2 enforce)
+- Tracking: BLO-4461 (parent), BLO-4829 (evaluator), BLO-4824 (wiring), BLO-4828 (Phase-2 enforce), BLO-9472 (db-migration/migration labels + migration-output shape)
