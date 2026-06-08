@@ -698,8 +698,10 @@ describe("evaluateEvidence — db-migration label", () => {
     expect(result.verdict).toBe("pass");
   });
 
-  it("passes when a psql row-count line is present", () => {
+  it("passes when a psql row-count line is paired with migration runner output", () => {
     const body = [
+      "Applied 1 migration successfully.",
+      "",
       "Post-migration row count check:",
       "```sql",
       "SELECT COUNT(*) FROM issue_events;",
@@ -719,6 +721,43 @@ describe("evaluateEvidence — db-migration label", () => {
       registry: DEFAULT_EVIDENCE_REGISTRY,
     });
     expect(result.verdict).toBe("pass");
+  });
+
+  it("blocks when agent comment contains only a SELECT row-count with no migration runner output", () => {
+    const result = evaluateEvidence({
+      issue: {
+        description: "## Done when\n- migration applied",
+        labels: [{ name: "db-migration" }],
+      },
+      comments: [
+        agentComment("Verified table exists.\n\nSELECT COUNT(*) FROM foo;\n(7 rows)"),
+      ],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.verdict).toBe("block");
+    expect(result.missing).toEqual(["migration-output"]);
+  });
+
+  it("blocks when agent only pastes raw migration SQL", () => {
+    const body = [
+      "Migration file content:",
+      "```sql",
+      "ALTER TABLE issues ADD COLUMN last_evidence_verdict jsonb;",
+      "CREATE INDEX issue_events_issue_id_idx ON issue_events(issue_id);",
+      "```",
+    ].join("\n");
+    const result = evaluateEvidence({
+      issue: {
+        description: "## Done when\n- migration applied",
+        labels: [{ name: "db-migration" }],
+      },
+      comments: [agentComment(body)],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.verdict).toBe("block");
+    expect(result.missing).toEqual(["migration-output"]);
   });
 
   it("blocks when agent only claims the migration ran with no observable output", () => {
