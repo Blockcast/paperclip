@@ -73,6 +73,50 @@ describe("syncFromLinear", () => {
     expect(harness.getState({
       scopeKind: "instance",
       stateKey: `${STATE_KEYS.linkPrefix}pc-1`,
+    })).toMatchObject({ lastLinearStateType: "unstarted" });
+  });
+
+  it("retries a skipped in_progress sync when the Linear assignee later maps", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.seed({
+      issues: [
+        {
+          id: "pc-1",
+          companyId: "comp-1",
+          title: "Paperclip title",
+          status: "todo",
+          priority: "low",
+          assigneeAgentId: null,
+          assigneeUserId: null,
+        } as never,
+      ],
+    });
+
+    await syncFromLinear(harness.ctx, makeLink(), makeLinearIssue());
+    const skippedLink = harness.getState({
+      scopeKind: "instance",
+      stateKey: `${STATE_KEYS.linkPrefix}pc-1`,
+    }) as IssueLink;
+    vi.spyOn(harness.ctx.users, "findByEmail").mockResolvedValue({
+      id: "user-1",
+      email: "alice@example.com",
+      name: "Alice",
+    });
+
+    await syncFromLinear(
+      harness.ctx,
+      skippedLink,
+      makeLinearIssue({ assignee: { name: "Alice", email: "alice@example.com" } }),
+    );
+
+    const issue = await harness.ctx.issues.get("pc-1", "comp-1");
+    expect(issue).toMatchObject({
+      assigneeUserId: "user-1",
+      status: "in_progress",
+    });
+    expect(harness.getState({
+      scopeKind: "instance",
+      stateKey: `${STATE_KEYS.linkPrefix}pc-1`,
     })).toMatchObject({ lastLinearStateType: "started" });
   });
 

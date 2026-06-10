@@ -203,6 +203,7 @@ export async function syncFromLinear(
       if (assigneeUserId) {
         patch.assigneeUserId = assigneeUserId;
         patch.status = status;
+        link.lastLinearStateType = newStateType;
       } else {
         ctx.logger.info(
           `Skipped in_progress status sync for ${linearIssue.identifier}: Linear assignee is not mapped to a Paperclip user`,
@@ -210,8 +211,8 @@ export async function syncFromLinear(
       }
     } else {
       patch.status = status;
+      link.lastLinearStateType = newStateType;
     }
-    link.lastLinearStateType = newStateType;
     linkNeedsUpdate = true;
   }
 
