@@ -179,6 +179,31 @@ describe("mcp gateway lifecycle compatibility", () => {
     expect(upstream.methods).toEqual(["initialize", "notifications/initialized", "tools/list"]);
   });
 
+  it("bootstraps unknown tools/call requests that mention initialize in params", async () => {
+    const upstream = await createStrictMcpUpstream();
+    const gateway = await createGateway(upstream.url);
+
+    const toolsCall = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "x",
+          arguments: {
+            note: "initialize",
+          },
+        },
+      }),
+    });
+
+    expect(toolsCall.status).toBe(200);
+    expect(toolsCall.headers.get(MCP_SESSION_HEADER)).toBeTruthy();
+    expect(upstream.methods).toEqual(["initialize", "notifications/initialized", "tools/call"]);
+  });
+
   it("replays initialize and initialized before retrying a missing upstream session", async () => {
     const upstream = await createStrictMcpUpstream();
     const gateway = await createGateway(upstream.url);

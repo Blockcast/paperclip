@@ -181,17 +181,18 @@ export function buildInitializedNotificationPayload(): Buffer {
 
 /**
  * MCP `initialize` requests are JSON-RPC messages with `method:"initialize"`.
- * We need to recognize them in the request body so we can cache the
- * payload for replay. The body is JSON; we don't strictly parse for
- * efficiency, but check for the substring as a coarse signal — the
- * gateway forwards even when we can't classify, only the cache
- * decision is affected.
+ * We need to recognize them in the request body so we can decide whether
+ * a request can be forwarded as the first upstream lifecycle message.
  */
 export function looksLikeInitializeRequest(bodyText: string): boolean {
   if (bodyText.length === 0) return false;
-  // Cheap substring check — actual content-type validation happens
-  // when we try to parse for the response sessionId.
-  return bodyText.includes('"method"') && bodyText.includes('"initialize"');
+  try {
+    const message = JSON.parse(bodyText) as unknown;
+    if (!message || typeof message !== "object" || Array.isArray(message)) return false;
+    return (message as { method?: unknown }).method === "initialize";
+  } catch {
+    return false;
+  }
 }
 
 /**

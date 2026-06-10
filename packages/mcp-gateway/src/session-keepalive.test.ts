@@ -98,6 +98,14 @@ describe("looksLikeInitializeRequest", () => {
     expect(looksLikeInitializeRequest('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}')).toBe(false);
   });
 
+  it("does not match initialize strings outside the top-level method", () => {
+    expect(
+      looksLikeInitializeRequest(
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{"note":"initialize"}}}',
+      ),
+    ).toBe(false);
+  });
+
   it("returns false for empty body", () => {
     expect(looksLikeInitializeRequest("")).toBe(false);
   });
