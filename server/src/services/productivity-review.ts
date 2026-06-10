@@ -1216,6 +1216,21 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         result.optedOut += 1;
         continue;
       }
+      const sourceAgent = await getAgent(candidate.assigneeAgentId);
+      if (!sourceAgent || sourceAgent.companyId !== candidate.companyId) {
+        result.skipped += 1;
+        continue;
+      }
+      const evidence = await collectEvidence(candidate, sourceAgent, thresholds, now);
+      if (!evidence) {
+        result.skipped += 1;
+        continue;
+      }
+      if (isMonitorScheduledSuppression(evidence)) {
+        await recordMonitorScheduledSuppression(evidence);
+        result.monitorScheduledSuppressed += 1;
+        continue;
+      }
       if (await findRecentResolvedProductivityReview(candidate.companyId, candidate.id, thresholds, now)) {
         result.snoozed += 1;
         continue;
@@ -1240,21 +1255,6 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       }
       if (await hasRepeatedTerminalReviewsInBackoff(candidate.companyId, candidate.id, now)) {
         result.snoozed += 1;
-        continue;
-      }
-      const sourceAgent = await getAgent(candidate.assigneeAgentId);
-      if (!sourceAgent || sourceAgent.companyId !== candidate.companyId) {
-        result.skipped += 1;
-        continue;
-      }
-      const evidence = await collectEvidence(candidate, sourceAgent, thresholds, now);
-      if (!evidence) {
-        result.skipped += 1;
-        continue;
-      }
-      if (isMonitorScheduledSuppression(evidence)) {
-        await recordMonitorScheduledSuppression(evidence);
-        result.monitorScheduledSuppressed += 1;
         continue;
       }
       let prefix = prefixCache.get(candidate.companyId);
