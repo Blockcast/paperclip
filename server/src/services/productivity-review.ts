@@ -1274,7 +1274,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           }
           continue;
         }
-        const outcome = await createOrUpdateReview(evidence, { prefix, thresholds });
+        const outcome = await createOrUpdateReview(evidence, { prefix });
         if (outcome.kind === "created") result.created += 1;
         else if (outcome.kind === "updated") result.updated += 1;
         else if (outcome.kind === "skipped") result.skipped += 1;

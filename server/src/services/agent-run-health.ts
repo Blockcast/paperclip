@@ -75,6 +75,10 @@ export function evaluateAgentRunHealth(
     nowMs = Date.now(),
   } = options;
 
+  if (runs.length === 0) {
+    return { isStarved: false, signals: [] };
+  }
+
   const runningRun = runs.find((r) => r.status === "running");
   const hasRunning = runningRun !== undefined;
 
@@ -113,4 +117,3 @@ export function evaluateAgentRunHealth(
 
   return { isStarved, signals };
 }
-
