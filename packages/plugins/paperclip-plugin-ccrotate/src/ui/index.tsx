@@ -550,6 +550,14 @@ function PoolTable({
                 <td style={tdStyle}>{row.availability || "—"}</td>
                 <td style={tdStyle}>{row.apiLimit || "unknown"}</td>
                 <td style={{ ...tdStyle, textAlign: "right", whiteSpace: "nowrap" }}>
+                  {/* codex force-relogin for stale/unhealthy rows */}
+                  {target === "codex" && (row.isStale || !row.isHealthy) && (
+                    <button type="button" style={smallBtnStyle} disabled={isBusy || !companyId}
+                      onClick={() => doCodexRelogin(row.email)}
+                      title="Trigger codex device-auth relogin (auto-completes via Gmail forwarding)">
+                      {busy[row.email] === "relogin" ? "relogging…" : "↺ relogin"}
+                    </button>
+                  )}
                   {/* F-UI-1: switch button per row */}
                   {target === "claude" && !row.isActive && (
                     <button
