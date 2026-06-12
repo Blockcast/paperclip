@@ -26,6 +26,7 @@ import {
   issueThreadInteractions,
   issueWorkProducts,
   projects,
+  workspaceOperations,
 } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import {
@@ -534,6 +535,7 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     await db.delete(agents);
     await db.delete(projects);
     await db.delete(companySkills);
+    await db.delete(workspaceOperations);
     await db.delete(companies);
   });
 
