@@ -1599,6 +1599,17 @@ export function compactRunLogChunk(chunk: string, maxChars = MAX_PERSISTED_LOG_C
   return `${normalized.slice(0, headChars)}${marker}${normalized.slice(normalized.length - tailChars)}`;
 }
 
+const SYNTHETIC_KEEPALIVE_RUN_LOG_LINE_RE =
+  /^\[paperclip\] keepalive\b.*\bjob\b.*\brunning \(\d+s since last output\)$/;
+
+export function isSyntheticNonProgressRunLogChunk(chunk: string) {
+  const lines = chunk
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.length > 0 && lines.every((line) => SYNTHETIC_KEEPALIVE_RUN_LOG_LINE_RE.test(line));
+}
+
 function normalizeHeartbeatIntervalSec(value: unknown, fallback: number) {
   const parsed = Math.floor(asNumber(value, fallback));
   if (!Number.isFinite(parsed)) return fallback;
@@ -11226,8 +11237,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const sanitizedChunk = compactRunLogChunk(
           redactCurrentUserText(chunk, currentUserRedactionOptions),
         );
-        if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
-        if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
+        const countsAsRunProgress = !isSyntheticNonProgressRunLogChunk(sanitizedChunk);
+        if (countsAsRunProgress && stream === "stdout") {
+          stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
+        }
+        if (countsAsRunProgress && stream === "stderr") {
+          stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
+        }
         const ts = new Date().toISOString();
 
         let appendedBytes = 0;
@@ -11239,14 +11255,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
           persistedLogBytes += appendedBytes;
         }
-        outputSeq += 1;
-        outputProgressState.pending = {
-          at: new Date(ts),
-          seq: outputSeq,
-          stream,
-          bytes: persistedLogBytes,
-        };
-        await flushOutputProgress();
+        if (countsAsRunProgress) {
+          outputSeq += 1;
+          outputProgressState.pending = {
+            at: new Date(ts),
+            seq: outputSeq,
+            stream,
+            bytes: persistedLogBytes,
+          };
+          await flushOutputProgress();
+        }
 
         const payloadChunk =
           sanitizedChunk.length > MAX_LIVE_LOG_CHUNK_BYTES

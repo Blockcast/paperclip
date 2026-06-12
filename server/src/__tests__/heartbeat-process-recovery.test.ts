@@ -41,7 +41,10 @@ const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn<
-    (ctx: { runId: string }) => Promise<{
+    (ctx: {
+      runId: string;
+      onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+    }) => Promise<{
       exitCode: number;
       signal: string | null;
       timedOut: boolean;
@@ -1908,6 +1911,37 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(0);
+  });
+
+  it("does not treat synthetic k8s keepalive chunks as run output progress", async () => {
+    mockAdapterExecute.mockImplementationOnce(async (ctx) => {
+      await ctx.onLog?.(
+        "stdout",
+        "[paperclip] keepalive — job ac-agent-123 running (713s since last output)\n",
+      );
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Completed after a synthetic keepalive.",
+        provider: "test",
+        model: "test-model",
+        resultJson: { result: "done" },
+      };
+    });
+
+    const { runId } = await seedQueuedIssueRunFixture();
+
+    await heartbeat.resumeQueuedRuns();
+    const settledRun = await waitForRunToSettle(heartbeat, runId);
+
+    expect(settledRun?.status).toBe("succeeded");
+    expect(settledRun?.logBytes ?? 0).toBeGreaterThan(0);
+    expect(settledRun?.lastOutputAt).toBeNull();
+    expect(settledRun?.lastOutputSeq).toBe(0);
+    expect(settledRun?.lastOutputStream).toBeNull();
+    expect(settledRun?.stdoutExcerpt ?? "").toBe("");
   });
 
   it("schedules a bounded retry for codex transient upstream failures instead of blocking the issue immediately", async () => {
