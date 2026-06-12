@@ -62,12 +62,35 @@ async function waitFor(condition: () => boolean | Promise<boolean>, timeoutMs = 
   throw new Error("Timed out waiting for condition");
 }
 
+async function deleteDocuments(db: Db) {
+  await db.delete(issueDocuments);
+  await db.delete(documentRevisions);
+  await db.delete(documents);
+}
+
 async function deleteHeartbeatRunsAfterActivityLogDrains(db: Db) {
   let lastError: unknown = null;
   for (let attempt = 0; attempt < 10; attempt += 1) {
     await db.delete(activityLog);
+    await deleteDocuments(db);
     try {
       await db.delete(heartbeatRuns);
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  throw lastError;
+}
+
+async function deleteCompaniesAfterSideEffectsDrain(db: Db) {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await deleteDocuments(db);
+    await db.delete(workspaceOperations);
+    try {
+      await db.delete(companies);
       return;
     } catch (error) {
       lastError = error;
@@ -521,9 +544,7 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     await db.delete(issueApprovals);
     await db.delete(approvals);
     await db.delete(issueWorkProducts);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
+    await deleteDocuments(db);
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(activityLog);
@@ -535,8 +556,7 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     await db.delete(agents);
     await db.delete(projects);
     await db.delete(companySkills);
-    await db.delete(workspaceOperations);
-    await db.delete(companies);
+    await deleteCompaniesAfterSideEffectsDrain(db);
   });
 
   afterAll(async () => {
