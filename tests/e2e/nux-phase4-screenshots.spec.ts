@@ -10,10 +10,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  *
  * Boots a throwaway local_trusted instance (see playwright.config.ts webServer)
  * and captures screenshots of every surface integrated by NUX Phases 1–3:
- *   - "Build a new team" step 1 (team name) + step 2 (mission)
- *   - Team-lead hire step (capsule wizard, PAP-125)
- *   - Onboarding front door (path picker)
- *   - "Add agents to your org" growth intake
+ *   - Company setup
+ *   - Team-lead hire step
+ *   - Workspace link
+ *   - Team review
+ *   - Launch task
  *   - Conference Room (BoardChat) shell + composer + activity feed
  *   - Artifacts page
  *
@@ -40,7 +41,7 @@ async function openWizard(page: import("@playwright/test").Page) {
 }
 
 test.describe("NUX Phase 4 visual QA", () => {
-  test("captures every integrated surface", async ({ page }) => {
+  test("captures every integrated surface", async ({ page, baseURL }) => {
     // New-NUX surfaces are flag-gated default-OFF (PAP-136/137/138): turn the
     // experimental flag on for this throwaway instance before driving them.
     const flagRes = await page.request.patch("/api/instance/settings/experimental", {
@@ -55,38 +56,62 @@ test.describe("NUX Phase 4 visual QA", () => {
     page.on("pageerror", (err) => consoleErrors.push("PAGEERROR: " + err.message));
 
     const baseUrl =
-      "http://127.0.0.1:" + (process.env.PAPERCLIP_E2E_PORT ?? "3199");
+      baseURL ?? "http://127.0.0.1:" + (process.env.PAPERCLIP_E2E_PORT ?? "3199");
 
-    // ── Section A: create-team path (name → mission → hire) ───────────────
+    await page.route("**/test-environment", (route) =>
+      route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ status: "pass", checks: [] }),
+      }),
+    );
+
+    await page.route("**/agent-hires", async (route) => {
+      const req = route.request();
+      const body = JSON.parse(req.postData() || "{}");
+      const auth = req.headers().authorization;
+      const real = await fetch(new URL(req.url(), baseUrl).toString(), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(auth ? { Authorization: auth } : {}),
+        },
+        body: JSON.stringify({
+          name: body.name,
+          role: body.role,
+          adapterType: "http",
+          adapterConfig: { url: "http://127.0.0.1:1/dead" },
+          runtimeConfig: { heartbeat: { enabled: false } },
+        }),
+      });
+      await route.fulfill({
+        status: real.status,
+        contentType: "application/json",
+        body: await real.text(),
+      });
+    });
+
+    // ── Section A: onboarding wizard ──────────────────────────────────────
     await openWizard(page);
-    // Front door shows when the wizard doesn't open directly on the create
-    // path (e.g. another spec already created a company on this instance).
-    const createCard = page.getByRole("button", { name: /Build a new team/ });
-    if (await createCard.count()) {
-      await createCard.first().click();
-    }
     await expect(
-      page.getByRole("heading", { name: "Name your team" }),
+      page.getByRole("heading", { name: "Set up your company" }),
     ).toBeVisible({ timeout: 15_000 });
     await page.getByPlaceholder("Acme Corp").fill("QA Robotics");
-    await page.screenshot({ path: shot("02-create-name.png") });
+    await page
+      .getByPlaceholder("What is this company trying to achieve?")
+      .fill("Build affordable home robots that handle household chores.");
+    await page.screenshot({ path: shot("01-company-setup.png") });
 
     await page.getByRole("button", { name: /^Next/ }).click();
     await expect(
-      page.getByRole("heading", { name: "Define your mission" }),
-    ).toBeVisible({ timeout: 10_000 });
-    await page
-      .getByPlaceholder("What is your team trying to achieve?")
-      .fill("Build affordable home robots that handle household chores.");
-    await page.screenshot({ path: shot("03-create-mission.png") });
+      page.getByRole("heading", { name: "Create your first agent" }),
+    ).toBeVisible({ timeout: 15_000 });
+    await page.screenshot({ path: shot("02-create-agent.png") });
 
-    // Step 2 advances via "Confirm mission" (creates the company + goal);
-    // step 3 is the team-lead naming step of the capsule wizard.
-    await page.getByRole("button", { name: /Confirm mission/ }).click();
-    await page.waitForSelector('input[placeholder="Chief of staff"]', {
-      timeout: 30_000,
-    });
-    await page.screenshot({ path: shot("04-hire-team-lead.png") });
+    await page.getByRole("button", { name: /^Next/ }).click();
+    await expect(
+      page.getByRole("heading", { name: "Link a workspace" }),
+    ).toBeVisible({ timeout: 30_000 });
+    await page.screenshot({ path: shot("03-link-workspace.png") });
 
     // The company just created anchors the route-scoped sections below.
     const companiesRes = await page.request.get(`${baseUrl}/api/companies`);
@@ -98,36 +123,24 @@ test.describe("NUX Phase 4 visual QA", () => {
     expect(qaCompany, "wizard should have created QA Robotics").toBeTruthy();
     const prefix: string = qaCompany.issuePrefix;
 
-    // ── Section B: front door + growth intake ─────────────────────────────
-    await page.evaluate(() => window.localStorage.clear());
-    await openWizard(page);
-    // Reach the full-screen front door (step 0): either it shows directly or
-    // "← Back to start" returns to it from the create step.
-    if (!(await page.getByRole("heading", { name: "Welcome to Paperclip" }).count())) {
-      await page.getByRole("button", { name: /Back to start/ }).click();
-    }
+    await page.getByRole("button", { name: "Skip" }).click();
     await expect(
-      page.getByRole("heading", { name: "Welcome to Paperclip" }),
+      page.getByRole("heading", { name: "Review your team" }),
     ).toBeVisible({ timeout: 10_000 });
-    await expect(
-      page.getByRole("heading", { name: "Build a new team" }),
-    ).toBeVisible();
-    await expect(
-      page.getByRole("heading", { name: "Add agents to your org" }),
-    ).toBeVisible();
-    await page.screenshot({ path: shot("01-front-door.png") });
+    await page.screenshot({ path: shot("04-review-team.png") });
 
-    await page.getByRole("button", { name: /Add agents to your org/ }).click();
-    // The grow path shares step 1 (team name) before its step-2 intake.
-    await expect(
-      page.getByRole("heading", { name: "Name your team" }),
-    ).toBeVisible({ timeout: 10_000 });
-    await page.getByPlaceholder("Acme Corp").fill("QA Robotics Grow");
     await page.getByRole("button", { name: /^Next/ }).click();
     await expect(
-      page.getByRole("heading", { name: /Tell us about your team/ }),
+      page.getByRole("heading", { name: "Launch with a task" }),
     ).toBeVisible({ timeout: 10_000 });
-    await page.screenshot({ path: shot("05-growth-intake.png") });
+    const taskTitleInput = page.getByPlaceholder(
+      "e.g. Review the codebase and create a roadmap",
+    );
+    await taskTitleInput.clear();
+    await taskTitleInput.fill("Create the first robotics launch plan");
+    await page.screenshot({ path: shot("05-launch-task.png") });
+
+    await page.getByRole("button", { name: "Close" }).click();
 
     // ── Section C: Conference Room (BoardChat) ────────────────────────────
     // Visit the company dashboard first so CompanyContext selects the company
@@ -153,11 +166,11 @@ test.describe("NUX Phase 4 visual QA", () => {
     await page.screenshot({ path: shot("07-artifacts.png") });
 
     for (const f of [
-      "01-front-door.png",
-      "02-create-name.png",
-      "03-create-mission.png",
-      "04-hire-team-lead.png",
-      "05-growth-intake.png",
+      "01-company-setup.png",
+      "02-create-agent.png",
+      "03-link-workspace.png",
+      "04-review-team.png",
+      "05-launch-task.png",
       "06-board-chat.png",
       "07-artifacts.png",
     ]) {

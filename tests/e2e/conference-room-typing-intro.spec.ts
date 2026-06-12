@@ -83,29 +83,37 @@ test.describe("Conference Room typing intro after onboarding wizard", () => {
     const frontDoor = page.getByText("Build a new team");
     if (await frontDoor.count()) await frontDoor.first().click();
 
-    // Step 1: team name.
+    // Step 1: company setup. Mission now lives on the first step.
     await page.getByPlaceholder("Acme Corp").fill(COMPANY_NAME);
-    await page.getByRole("button", { name: /^Next/ }).click();
-
-    // Step 2: mission (direct path default).
     await page
-      .getByPlaceholder("What is your team trying to achieve?")
+      .getByPlaceholder("What is this company trying to achieve?")
       .fill(MISSION);
-    await page.getByRole("button", { name: /Confirm mission/ }).click();
-
-    // Step 3: lead name (prefilled) → Next.
-    await page.waitForSelector('input[placeholder="Chief of staff"]', {
-      timeout: 15_000,
-    });
     await page.getByRole("button", { name: /^Next/ }).click();
 
-    // Step 4: adapter (claude_local default); heartbeat is intercepted.
-    await page.getByRole("button", { name: /Give it a heartbeat/ }).click();
+    // Step 2: agent (prefilled) -> Next creates the inert CEO via the route
+    // above after the adapter probe is intercepted.
+    await expect(
+      page.locator("h3", { hasText: "Create your first agent" }),
+    ).toBeVisible({ timeout: 15_000 });
+    await expect(page.locator('input[placeholder="CEO"]')).toHaveValue("CEO");
+    await page.getByRole("button", { name: /^Next/ }).click();
 
-    // Step 5: review → Get started hands off to the Conference Room.
-    const getStarted = page.getByRole("button", { name: /Get started/ });
-    await getStarted.waitFor({ timeout: 20_000 });
-    await getStarted.click();
+    await expect(
+      page.locator("h3", { hasText: "Link a workspace" }),
+    ).toBeVisible({ timeout: 20_000 });
+
+    const companiesRes = await page.request.get("/api/companies");
+    expect(companiesRes.ok()).toBe(true);
+    const companies = await companiesRes.json();
+    const company = companies.find(
+      (candidate: { name: string }) => candidate.name === COMPANY_NAME,
+    );
+    expect(company).toBeTruthy();
+    const prefix: string = company.issuePrefix ?? company.id;
+
+    await page.getByRole("button", { name: "Close" }).click();
+    await page.goto(`/${prefix}/board-chat`);
+    await expect(page).toHaveURL(new RegExp(`/${prefix}/board-chat`));
 
     // Dots-first: the typing bubble must be on screen before the welcome.
     const dots = page.locator(".typing-dots");

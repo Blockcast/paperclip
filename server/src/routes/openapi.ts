@@ -99,6 +99,7 @@ import {
   createOpenClawInvitePromptSchema,
   claimJoinRequestApiKeySchema,
   createCliAuthChallengeSchema,
+  createServiceAccountBoardTokenSchema,
   resolveCliAuthChallengeSchema,
   createBoardApiKeySchema,
   updateCompanyMemberSchema,
@@ -520,8 +521,10 @@ const PUBLIC_OPERATIONS = new Set([
   "GET /api/invites/{token}/skills/index",
   "GET /api/invites/{token}/skills/{skillName}",
   "GET /api/invites/{token}/test-resolution",
+  "GET /api/auth/linear/callback",
   "POST /api/invites/{token}/accept",
   "POST /api/join-requests/{requestId}/claim-api-key",
+  "POST /api/webhooks/github/",
 ]);
 
 const BOARD_ONLY_PREFIXES = [
@@ -583,7 +586,9 @@ const BOARD_ONLY_OPERATIONS = new Set([
 const INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/companies",
   "POST /api/plugins/install",
+  "POST /api/instance/reset",
   "POST /api/instance/database-backups",
+  "POST /api/service-account-tokens",
   "POST /api/admin/users/{userId}/promote-instance-admin",
   "POST /api/admin/users/{userId}/demote-instance-admin",
   "PUT /api/admin/users/{userId}/company-access",
@@ -630,12 +635,14 @@ const CREATED_OPERATIONS = new Set([
   "POST /api/admin/users/{userId}/promote-instance-admin",
   "POST /api/plugins/install",
   "POST /api/instance/database-backups",
+  "POST /api/service-account-tokens",
 ]);
 
 const ACCEPTED_OPERATIONS = new Set([
   "POST /api/companies/import",
   "POST /api/health/dev-server/restart",
   "POST /api/invites/{token}/accept",
+  "POST /api/metrics/claude-k8s/concurrent-run-blocked",
 ]);
 
 const FORBIDDEN_RESPONSE = {
@@ -4102,6 +4109,28 @@ registerCurrentRoute({
   summary: "Revoke a board API key",
 });
 
+registerCurrentRoute({
+  method: "post",
+  path: "/api/service-account-tokens",
+  tags: ["access"],
+  summary: "Create a service-account board token",
+  body: createServiceAccountBoardTokenSchema,
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/admin/agents/bump-agent-image",
+  tags: ["agents"],
+  summary: "Bump Kubernetes agent container images",
+  body: z.object({
+    companyId: z.string().uuid(),
+    image: z.string().min(1),
+    source: z.string().optional(),
+    buildSha: z.string().optional(),
+  }),
+});
+
 for (const route of [
   ["get", "/api/companies/import/jobs/{jobId}", "Get company import job status"],
   ["get", "/api/companies/{companyId}/search", "Search company data"],
@@ -4120,6 +4149,70 @@ registerCurrentRoute({
   path: "/api/issues/{id}/cost-summary",
   tags: ["costs"],
   summary: "Get issue cost summary",
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/issues/{id}/efficiency",
+  tags: ["issues"],
+  summary: "Get issue efficiency metrics",
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/efficiency/adapter-rollup",
+  tags: ["issues"],
+  summary: "Get adapter efficiency rollup",
+  query: z.object({
+    from: z.string().optional(),
+    to: z.string().optional(),
+  }),
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/instance/reset",
+  tags: ["instance"],
+  summary: "Reset the instance by deleting all companies",
+});
+
+for (const route of [
+  ["get", "/api/ccrotate/status", "Get ccrotate pool status"],
+  ["post", "/api/metrics/claude-k8s/concurrent-run-blocked", "Record a Claude Kubernetes concurrent-run block metric"],
+  ["post", "/api/workspace/scan", "Scan a local workspace"],
+  ["post", "/api/workspace/browse", "Browse local workspace directories"],
+] as const) {
+  registerCurrentRoute({
+    method: route[0],
+    path: route[1],
+    tags: ["operations"],
+    summary: route[2],
+  });
+}
+
+for (const route of [
+  ["get", "/api/auth/linear/start", "Start Linear OAuth"],
+  ["get", "/api/auth/linear/callback", "Handle Linear OAuth callback"],
+  ["get", "/api/auth/linear/status", "Get Linear connection status"],
+  ["post", "/api/auth/linear/import", "Import Linear issues"],
+  ["post", "/api/auth/linear/sync", "Sync Linear issues"],
+  ["post", "/api/auth/linear/configure", "Configure Linear integration"],
+  ["post", "/api/auth/linear/disconnect", "Disconnect Linear integration"],
+  ["post", "/api/auth/linear/webhook", "Receive Linear webhook"],
+] as const) {
+  registerCurrentRoute({
+    method: route[0],
+    path: route[1],
+    tags: ["integrations"],
+    summary: route[2],
+  });
+}
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/webhooks/github/",
+  tags: ["integrations"],
+  summary: "Receive GitHub webhook",
 });
 
 for (const route of [

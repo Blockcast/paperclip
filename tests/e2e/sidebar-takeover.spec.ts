@@ -21,8 +21,8 @@ import { test, expect, request as pwRequest, type APIRequestContext } from "@pla
  * is delegated to the QA child issue.
  */
 
-const PORT = Number(process.env.PAPERCLIP_E2E_PORT ?? 3199);
-const BASE_URL = `http://127.0.0.1:${PORT}`;
+const FALLBACK_PORT = Number(process.env.PAPERCLIP_E2E_PORT ?? 3199);
+const FALLBACK_BASE_URL = `http://127.0.0.1:${FALLBACK_PORT}`;
 const COMPANY_NAME_PREFIX = "E2E-SidebarTakeover";
 const COLLAPSED_STORAGE_KEY = "paperclip.sidebar.collapsed";
 
@@ -33,12 +33,12 @@ const COLLAPSED_STORAGE_KEY = "paperclip.sidebar.collapsed";
 const APP_SIDEBAR_EXPANDED_MARKER = "Open search";
 
 async function createCompany(board: APIRequestContext): Promise<{ id: string; prefix: string }> {
-  const healthRes = await board.get(`${BASE_URL}/api/health`);
+  const healthRes = await board.get("/api/health");
   expect(healthRes.ok()).toBe(true);
   const health = await healthRes.json();
   expect(health.deploymentMode).toBe("local_trusted");
 
-  const companyRes = await board.post(`${BASE_URL}/api/companies`, {
+  const companyRes = await board.post("/api/companies", {
     data: { name: `${COMPANY_NAME_PREFIX}-${Date.now()}` },
   });
   if (!companyRes.ok()) {
@@ -53,18 +53,20 @@ async function createCompany(board: APIRequestContext): Promise<{ id: string; pr
 
 test.describe("Sidebar takeover (collapse + secondary pane)", () => {
   let board: APIRequestContext;
+  let baseUrl: string;
   let companyId: string;
   let prefix: string;
 
-  test.beforeAll(async () => {
-    board = await pwRequest.newContext({ baseURL: BASE_URL });
+  test.beforeAll(async ({ baseURL }) => {
+    baseUrl = baseURL ?? FALLBACK_BASE_URL;
+    board = await pwRequest.newContext({ baseURL: baseUrl });
     const company = await createCompany(board);
     companyId = company.id;
     prefix = company.prefix;
   });
 
   test.afterAll(async () => {
-    await board.delete(`${BASE_URL}/api/companies/${companyId}`).catch(() => {});
+    await board.delete(`/api/companies/${companyId}`).catch(() => {});
     await board.dispose();
   });
 
@@ -77,7 +79,7 @@ test.describe("Sidebar takeover (collapse + secondary pane)", () => {
   });
 
   test("collapses the app sidebar to its rail and shows the settings sidebar beside it", async ({ page }) => {
-    await page.goto(`/${prefix}/company/settings`);
+    await page.goto(`${baseUrl}/${prefix}/company/settings`);
 
     // The contextual (secondary) pane is present...
     const secondary = page.locator("[data-secondary-sidebar]");
@@ -102,7 +104,7 @@ test.describe("Sidebar takeover (collapse + secondary pane)", () => {
     // SidebarNavItem children read the *global* collapsed state and used to
     // render icon-only (label `w-0 text-transparent`), making the settings nav
     // unreadable in the default takeover state. The pane must force full labels.
-    await page.goto(`/${prefix}/company/settings`);
+    await page.goto(`${baseUrl}/${prefix}/company/settings`);
 
     const secondary = page.locator("[data-secondary-sidebar]");
     await expect(secondary).toBeVisible();
@@ -130,7 +132,7 @@ test.describe("Sidebar takeover (collapse + secondary pane)", () => {
       { key: COLLAPSED_STORAGE_KEY },
     );
 
-    await page.goto(`/${prefix}/company/settings`);
+    await page.goto(`${baseUrl}/${prefix}/company/settings`);
 
     // Secondary pane still shows on the takeover route.
     await expect(page.locator("[data-secondary-sidebar]")).toBeVisible();
@@ -138,7 +140,7 @@ test.describe("Sidebar takeover (collapse + secondary pane)", () => {
     // The app sidebar is hard-collapsed despite the stored expanded pin.
     await expect(page.getByLabel(APP_SIDEBAR_EXPANDED_MARKER)).toHaveCount(0);
 
-    await page.goto(`/${prefix}/dashboard`);
+    await page.goto(`${baseUrl}/${prefix}/dashboard`);
 
     // Leaving the takeover route clears the force and restores the user's
     // persisted expanded pin.
@@ -147,12 +149,12 @@ test.describe("Sidebar takeover (collapse + secondary pane)", () => {
   });
 
   test("leaving the takeover route removes the secondary pane and restores the sidebar", async ({ page }) => {
-    await page.goto(`/${prefix}/company/settings`);
+    await page.goto(`${baseUrl}/${prefix}/company/settings`);
     await expect(page.locator("[data-secondary-sidebar]")).toBeVisible();
     await expect(page.getByLabel(APP_SIDEBAR_EXPANDED_MARKER)).toHaveCount(0);
 
     // Navigate to a plain (non-takeover) route.
-    await page.goto(`/${prefix}/dashboard`);
+    await page.goto(`${baseUrl}/${prefix}/dashboard`);
 
     // No secondary pane, and the app sidebar is no longer force-collapsed.
     await expect(page.locator("[data-secondary-sidebar]")).toHaveCount(0);
