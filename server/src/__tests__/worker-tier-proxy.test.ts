@@ -417,6 +417,28 @@ describe("registerWorkerTierProxyRoutes", () => {
     }
   });
 
+  it("bounds SSE bridge startup retries when the worker tier stays unreachable", async () => {
+    const previousBudget = process.env.PAPERCLIP_WORKER_PROXY_STREAM_STARTUP_RETRY_BUDGET_MS;
+    process.env.PAPERCLIP_WORKER_PROXY_STREAM_STARTUP_RETRY_BUDGET_MS = "25";
+    const port = await getFreePort();
+    const app = buildApp(`http://127.0.0.1:${port}`);
+
+    try {
+      const res = await request(app)
+        .get("/api/plugins/ccrotate/bridge/stream/pool")
+        .timeout({ response: 2_000, deadline: 2_000 });
+
+      expect(res.status).toBe(502);
+      expect(res.body.error).toMatch(/worker tier unreachable/i);
+    } finally {
+      if (previousBudget === undefined) {
+        delete process.env.PAPERCLIP_WORKER_PROXY_STREAM_STARTUP_RETRY_BUDGET_MS;
+      } else {
+        process.env.PAPERCLIP_WORKER_PROXY_STREAM_STARTUP_RETRY_BUDGET_MS = previousBudget;
+      }
+    }
+  });
+
   it("covers exactly the worker-dependent plugin routes", () => {
     // Guard against accidental scope creep / drops in the allowlist.
     expect(WORKER_DEPENDENT_PLUGIN_ROUTES.map((r) => `${r.method} ${r.path}`))
