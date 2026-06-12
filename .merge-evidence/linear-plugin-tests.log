@@ -1,0 +1,20 @@
+
+> @kkroo/paperclip-plugin-linear@0.9.3 test /home/oramadan/src/paperclip/paperclip-merge-upstream/packages/plugins/paperclip-plugin-linear
+> vitest run --config ./vitest.config.ts
+
+
+ RUN  v3.2.4 /home/oramadan/src/paperclip/paperclip-merge-upstream/packages/plugins/paperclip-plugin-linear
+
+ ✓ tests/parse-ref.spec.ts (12 tests) 8ms
+ ✓ tests/linear.spec.ts (13 tests) 20ms
+ ✓ tests/initiative-mapping.spec.ts (9 tests) 9ms
+ ✓ tests/status-mapping.spec.ts (18 tests) 12ms
+ ✓ tests/markdown.spec.ts (20 tests) 19ms
+ ✓ tests/sync.spec.ts (17 tests) 29ms
+ ✓ tests/plugin.spec.ts (102 tests) 901ms
+
+ Test Files  7 passed (7)
+      Tests  191 passed (191)
+   Start at  02:49:51
+   Duration  3.69s (transform 2.55s, setup 0ms, collect 6.03s, tests 998ms, environment 2ms, prepare 2.31s)
+
