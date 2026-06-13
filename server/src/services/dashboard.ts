@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, gte, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, approvals, companies, costEvents, heartbeatRuns, issues } from "@paperclipai/db";
 import { ISSUE_PRIORITIES, ISSUE_STATUSES, type IssuePriority, type IssueStatus } from "@paperclipai/shared";
@@ -6,6 +6,21 @@ import type { DashboardIssueActivityDay, DashboardRecentIssue } from "@paperclip
 import { logger } from "../middleware/logger.js";
 import { notFound } from "../errors.js";
 import { budgetService } from "./budgets.js";
+import {
+  computeAgentScorecards,
+  MIN_SAMPLE_DONE,
+  MIN_SAMPLE_RUNS,
+  MIN_SAMPLE_REVIEWS,
+  type AgentScorecardInput,
+  type AgentRunCounts,
+  type AgentReviewCounts,
+} from "./agent-scorecards.js";
+
+const DASHBOARD_SCORECARD_DEFAULT_WINDOW_DAYS = 30;
+const DASHBOARD_SCORECARD_MAX_WINDOW_DAYS = 365;
+// Agent statuses excluded from the staffing scorecard roster (no longer
+// staffable / not yet hired).
+const SCORECARD_EXCLUDED_AGENT_STATUSES = ["terminated", "pending_approval"];
 
 const DASHBOARD_RUN_ACTIVITY_DAYS = 14;
 const DASHBOARD_ISSUE_ACTIVITY_DAYS = 14;
@@ -300,8 +315,137 @@ export function dashboardService(db: Db) {
     };
   }
 
+  // Agent scorecard feed for the monthly staffing routine (BLO-10275). Runs
+  // four grouped-by-agent aggregates over the window and merges them through
+  // the pure `computeAgentScorecards` helper (unit-tested separately). Relies
+  // on the cost_events (company, agent, occurred), issues (company, assignee,
+  // status), and heartbeat_runs (company, agent, started) indexes.
+  async function agentScorecards(companyId: string, options?: { windowDays?: number }) {
+    const company = await db
+      .select({ id: companies.id })
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .then((rows) => rows[0] ?? null);
+    if (!company) throw notFound("Company not found");
+
+    const windowDays = Math.min(
+      Math.max(1, Math.floor(options?.windowDays ?? DASHBOARD_SCORECARD_DEFAULT_WINDOW_DAYS)),
+      DASHBOARD_SCORECARD_MAX_WINDOW_DAYS,
+    );
+    const now = new Date();
+    const windowStart = new Date(now.getTime() - windowDays * 24 * 60 * 60 * 1000);
+    const windowStartIso = windowStart.toISOString();
+
+    const verdictExpr = sql<string>`${issues.lastEvidenceVerdict} ->> 'verdict'`;
+    const [agentRows, doneRows, costRows, runRows, reviewRows] = await Promise.all([
+      db
+        .select({ id: agents.id, name: agents.name, status: agents.status })
+        .from(agents)
+        .where(
+          and(
+            eq(agents.companyId, companyId),
+            notInArray(agents.status, SCORECARD_EXCLUDED_AGENT_STATUSES),
+          ),
+        ),
+      db
+        .select({ agentId: issues.assigneeAgentId, count: sql<number>`count(*)::int` })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, companyId),
+            eq(issues.status, "done"),
+            gte(issues.completedAt, windowStart),
+          ),
+        )
+        .groupBy(issues.assigneeAgentId),
+      db
+        .select({
+          agentId: costEvents.agentId,
+          costCents: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::double precision`,
+        })
+        .from(costEvents)
+        .where(and(eq(costEvents.companyId, companyId), gte(costEvents.occurredAt, windowStart)))
+        .groupBy(costEvents.agentId),
+      db
+        .select({
+          agentId: heartbeatRuns.agentId,
+          status: heartbeatRuns.status,
+          count: sql<number>`count(*)::int`,
+        })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, companyId), gte(heartbeatRuns.createdAt, windowStart)))
+        .groupBy(heartbeatRuns.agentId, heartbeatRuns.status),
+      db
+        .select({ agentId: issues.assigneeAgentId, verdict: verdictExpr, count: sql<number>`count(*)::int` })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, companyId),
+            sql`${issues.lastEvidenceVerdict} is not null`,
+            sql`(${issues.lastEvidenceVerdict} ->> 'evaluatedAt') >= ${windowStartIso}`,
+          ),
+        )
+        .groupBy(issues.assigneeAgentId, verdictExpr),
+    ]);
+
+    const doneByAgent = new Map<string, number>();
+    for (const row of doneRows) {
+      if (row.agentId) doneByAgent.set(row.agentId, Number(row.count));
+    }
+    const costByAgent = new Map<string, number>();
+    for (const row of costRows) {
+      if (row.agentId) costByAgent.set(row.agentId, Number(row.costCents));
+    }
+    const runsByAgent = new Map<string, AgentRunCounts>();
+    for (const row of runRows) {
+      if (!row.agentId) continue;
+      const bucket =
+        runsByAgent.get(row.agentId) ??
+        ({ succeeded: 0, failed: 0, timedOut: 0, cancelled: 0 } satisfies AgentRunCounts);
+      const count = Number(row.count);
+      if (row.status === "succeeded") bucket.succeeded += count;
+      else if (row.status === "failed") bucket.failed += count;
+      else if (row.status === "timed_out") bucket.timedOut += count;
+      else if (row.status === "cancelled") bucket.cancelled += count;
+      // queued / running / scheduled_retry are non-terminal — ignored.
+      runsByAgent.set(row.agentId, bucket);
+    }
+    const reviewsByAgent = new Map<string, AgentReviewCounts>();
+    for (const row of reviewRows) {
+      if (!row.agentId) continue;
+      const bucket =
+        reviewsByAgent.get(row.agentId) ?? ({ pass: 0, warn: 0, block: 0 } satisfies AgentReviewCounts);
+      const count = Number(row.count);
+      if (row.verdict === "pass") bucket.pass += count;
+      else if (row.verdict === "warn") bucket.warn += count;
+      else if (row.verdict === "block") bucket.block += count;
+      reviewsByAgent.set(row.agentId, bucket);
+    }
+
+    const inputs: AgentScorecardInput[] = agentRows.map((agent) => ({
+      agentId: agent.id,
+      agentName: agent.name,
+      status: agent.status as AgentScorecardInput["status"],
+      doneIssues: doneByAgent.get(agent.id) ?? 0,
+      costCents: costByAgent.get(agent.id) ?? 0,
+      runs: runsByAgent.get(agent.id) ?? { succeeded: 0, failed: 0, timedOut: 0, cancelled: 0 },
+      reviews: reviewsByAgent.get(agent.id) ?? { pass: 0, warn: 0, block: 0 },
+    }));
+
+    return computeAgentScorecards(inputs, {
+      windowDays,
+      windowStart: windowStartIso,
+      windowEnd: now.toISOString(),
+      generatedAt: now.toISOString(),
+      minSampleDone: MIN_SAMPLE_DONE,
+      minSampleRuns: MIN_SAMPLE_RUNS,
+      minSampleReviews: MIN_SAMPLE_REVIEWS,
+    });
+  }
+
   return {
     core,
     summary,
+    agentScorecards,
   };
 }
