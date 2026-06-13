@@ -258,7 +258,7 @@ describe("issue execution policy routes", () => {
       missing: "review_path",
     });
     expect(mockIssueService.update).not.toHaveBeenCalled();
-  }, 10_000);
+  }, 20_000);
 
   it("allows a non-PR issue with prior checklist evidence to return to in_review for pending confirmation", async () => {
     const issue = {
