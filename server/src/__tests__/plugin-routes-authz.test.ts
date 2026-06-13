@@ -103,6 +103,7 @@ const agentA = "44444444-4444-4444-8444-444444444444";
 const runA = "55555555-5555-4555-8555-555555555555";
 const projectA = "66666666-6666-4666-8666-666666666666";
 const pluginId = "11111111-1111-4111-8111-111111111111";
+const pluginActionRpcTimeoutMs = 15 * 60 * 1_000;
 
 function boardActor(overrides: Record<string, unknown> = {}) {
   return {
@@ -353,7 +354,7 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(mockLifecycle.unload).toHaveBeenCalledWith(pluginId, true);
   }, 20_000);
 
-  it("rejects plugin config saves that contain secret refs even for instance admins", async () => {
+  it("accepts plugin config saves that contain secret refs (runtime resolves them)", async () => {
     readyPlugin();
 
     const { app } = await createApp({
@@ -372,9 +373,11 @@ describe.sequential("plugin install and upgrade authz", () => {
         },
       });
 
-    expect(res.status).toBe(422);
-    expect(res.body.error).toMatch(/secret references are disabled/i);
-    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+    // Secret-ref validity is checked at runtime by plugin-secrets-handler,
+    // not at save time. Saves succeed; an invalid ref would fail at
+    // ctx.secrets.resolve() in the plugin worker.
+    expect(res.status).toBe(200);
+    expect(mockRegistry.upsertConfig).toHaveBeenCalled();
   }, 20_000);
 
   it("allows instance admins to upgrade plugins", async () => {
@@ -402,7 +405,7 @@ describe.sequential("plugin install and upgrade authz", () => {
       .send({ version: "1.1.0" });
 
     expect(res.status).toBe(200);
-    expect(mockLifecycle.upgrade).toHaveBeenCalledWith(pluginId, "1.1.0");
+    expect(mockLifecycle.upgrade).toHaveBeenCalledWith(pluginId, "1.1.0", { force: false });
   }, 20_000);
 });
 
@@ -742,7 +745,7 @@ describe.sequential("plugin tool and bridge authz", () => {
         companyId: null,
       },
       renderEnvironment: null,
-    });
+    }, pluginActionRpcTimeoutMs);
   });
 
   it("passes authenticated actor context and overrides spoofed company scope for plugin actions", async () => {
@@ -779,7 +782,7 @@ describe.sequential("plugin tool and bridge authz", () => {
         companyId: companyA,
       },
       renderEnvironment: null,
-    });
+    }, pluginActionRpcTimeoutMs);
   });
 
   it("uses null for board actor userId when no authenticated user id is present", async () => {
@@ -796,13 +799,18 @@ describe.sequential("plugin tool and bridge authz", () => {
       .send({ companyId: companyA });
 
     expect(res.status).toBe(200);
-    expect(call).toHaveBeenCalledWith(pluginId, "performAction", expect.objectContaining({
-      actorContext: expect.objectContaining({
-        type: "user",
-        userId: null,
-        companyId: companyA,
+    expect(call).toHaveBeenCalledWith(
+      pluginId,
+      "performAction",
+      expect.objectContaining({
+        actorContext: expect.objectContaining({
+          type: "user",
+          userId: null,
+          companyId: companyA,
+        }),
       }),
-    }));
+      pluginActionRpcTimeoutMs,
+    );
   });
 
   it("allows agent-scoped plugin actions with authenticated actor context", async () => {
@@ -839,7 +847,7 @@ describe.sequential("plugin tool and bridge authz", () => {
         companyId: companyA,
       },
       renderEnvironment: null,
-    });
+    }, pluginActionRpcTimeoutMs);
 
     call.mockClear();
     const legacyRes = await request(app)
@@ -868,7 +876,7 @@ describe.sequential("plugin tool and bridge authz", () => {
         companyId: companyA,
       },
       renderEnvironment: null,
-    });
+    }, pluginActionRpcTimeoutMs);
   });
 
   it("rejects agent plugin actions outside the authenticated company scope", async () => {
