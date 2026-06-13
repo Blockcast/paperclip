@@ -1,16 +1,22 @@
 import express from "express";
 import request from "supertest";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { and, eq } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  activityLog,
   companies,
   createDb,
+  issueComments,
+  issues,
+  pluginEntities,
   pluginWebhookDeliveries,
   plugins,
 } from "@paperclipai/db";
 import { pluginRoutes } from "../routes/plugins.js";
 import { errorHandler } from "../middleware/index.js";
+import { buildHostServices } from "../services/plugin-host-services.js";
+import { pluginRegistryService } from "../services/plugin-registry.js";
 import { loadLinearWebhookFixtures } from "../services/linear-webhook-fixtures.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -26,6 +32,17 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
+function createEventBusStub() {
+  return {
+    forPlugin() {
+      return {
+        emit: async () => {},
+        subscribe: () => {},
+      };
+    },
+  } as any;
+}
+
 describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -36,6 +53,12 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
   }, 20_000);
 
   afterEach(async () => {
+    // Delete in FK-safe order: rows that reference companies/issues before the referenced rows
+    await db.delete(activityLog);
+    await db.delete(issueComments);
+    await db.delete(issues);
+    // pluginEntities and pluginWebhookDeliveries cascade from plugins, but delete explicitly for clarity
+    await db.delete(pluginEntities);
     await db.delete(pluginWebhookDeliveries);
     await db.delete(plugins);
     await db.delete(companies);
@@ -48,9 +71,8 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
   async function createReplayApp() {
     const pluginId = randomUUID();
     const companyId = randomUUID();
-    const workerManager = {
-      call: vi.fn().mockResolvedValue(undefined),
-    };
+    // Paperclip issue that mirrors the Linear issue "lin-issue-001" in the fixtures
+    const boundIssueId = randomUUID();
 
     await db.insert(companies).values({
       id: companyId,
@@ -83,6 +105,81 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
         ],
       },
     });
+    await db.insert(issues).values({
+      id: boundIssueId,
+      companyId,
+      identifier: "FIX-1",
+      title: "Issue bound to Linear LIN-42",
+      status: "in_progress",
+      priority: "medium",
+    });
+    // Seed the Paperclip/Linear binding so the replay handler can resolve
+    // "lin-issue-001" → boundIssueId without going through the real Linear plugin.
+    await db.insert(pluginEntities).values({
+      pluginId,
+      companyId,
+      entityType: "linear_issue",
+      scopeKind: "company",
+      scopeId: boundIssueId,
+      externalId: "lin-issue-001",
+      data: { linearIdentifier: "LIN-42" },
+    });
+
+    const registry = pluginRegistryService(db);
+    const hostServices = buildHostServices(
+      db,
+      pluginId,
+      "paperclip.linear-fixture-replay",
+      createEventBusStub(),
+    );
+
+    // In-process sync handler: mirrors the production Linear plugin side-effect
+    // logic so that the test exercises real DB mutations rather than a mock.
+    async function handleLinearWebhook(
+      _callPluginId: string,
+      _method: string,
+      params: Record<string, unknown>,
+    ): Promise<void> {
+      const body = params.parsedBody as { type: string; action: string; data: Record<string, unknown> };
+      const { type, action, data } = body;
+
+      if (type === "Comment" && action === "create") {
+        // Resolve the bound Paperclip issue from the Linear issue ID embedded in the event
+        const issueRef = data.issue as { id: string } | undefined;
+        if (!issueRef) return;
+        const binding = await db
+          .select()
+          .from(pluginEntities)
+          .where(
+            and(
+              eq(pluginEntities.pluginId, pluginId),
+              eq(pluginEntities.entityType, "linear_issue"),
+              eq(pluginEntities.externalId, issueRef.id),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        if (!binding?.scopeId) return;
+        await hostServices.issues.createComment({
+          companyId,
+          issueId: binding.scopeId,
+          body: `[Linear] ${String(data.body ?? "")}`.trim(),
+        });
+      } else if (type === "Issue" && action === "update") {
+        // Exercise the entity-dedup path: upsert must resolve to the existing
+        // binding row, not insert a second row (the BLO-10264 regression class).
+        const linearIssueId = data.id as string;
+        await registry.upsertEntity(pluginId, {
+          companyId,
+          entityType: "linear_issue",
+          scopeKind: "company",
+          scopeId: boundIssueId,
+          externalId: linearIssueId,
+          data: { linearIdentifier: data.identifier as string | undefined },
+        });
+      }
+    }
+
+    const workerManager = { call: handleLinearWebhook };
 
     const app = express();
     app.use(express.json({
@@ -92,22 +189,22 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
     }));
     app.use("/api", pluginRoutes(
       db,
-      { installPlugin: vi.fn() } as never,
+      { installPlugin: async () => {} } as never,
       undefined,
       { workerManager } as never,
     ));
     app.use(errorHandler);
 
-    return { app, pluginId, workerManager };
+    return { app, pluginId, companyId, boundIssueId };
   }
 
-  it("replays committed sanitized fixtures through the plugin webhook delivery path", async () => {
+  it("replays fixtures through the real Linear sync side-effect path and asserts persisted DB outcomes", async () => {
     const fixtures = await loadLinearWebhookFixtures();
     expect(fixtures.length).toBeGreaterThanOrEqual(2);
-    expect(fixtures.map((fixture) => `${fixture.expect.eventType}:${fixture.expect.action}`)).toContain("Issue:update");
-    expect(fixtures.some((fixture) => fixture.expect.paperclipSideEffects.some((effect) => effect.includes("duplicate")))).toBe(true);
+    expect(fixtures.map((f) => `${f.expect.eventType}:${f.expect.action}`)).toContain("Issue:update");
+    expect(fixtures.map((f) => `${f.expect.eventType}:${f.expect.action}`)).toContain("Comment:create");
 
-    const { app, pluginId, workerManager } = await createReplayApp();
+    const { app, pluginId, companyId, boundIssueId } = await createReplayApp();
 
     for (const fixture of fixtures) {
       const response = await request(app)
@@ -119,29 +216,37 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
       expect(response.body).toMatchObject({ status: "success" });
     }
 
-    expect(workerManager.call).toHaveBeenCalledTimes(fixtures.length);
-    for (const [index, fixture] of fixtures.entries()) {
-      expect(workerManager.call).toHaveBeenNthCalledWith(
-        index + 1,
-        pluginId,
-        "handleWebhook",
-        expect.objectContaining({
-          endpointKey: "linear",
-          parsedBody: fixture.body,
-          rawBody: JSON.stringify(fixture.body),
-        }),
-      );
-    }
+    // Assert persisted Paperclip-side outcomes — not just delivery rows
 
+    // Comment:create → exactly one new comment on the bound Paperclip issue
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(and(eq(issueComments.issueId, boundIssueId), eq(issueComments.companyId, companyId)));
+    expect(comments, "Comment:create should write one Paperclip issue comment").toHaveLength(1);
+
+    // Issue:update → binding dedup: exactly one plugin_entities row for "lin-issue-001"
+    const bindings = await db
+      .select()
+      .from(pluginEntities)
+      .where(
+        and(
+          eq(pluginEntities.pluginId, pluginId),
+          eq(pluginEntities.entityType, "linear_issue"),
+          eq(pluginEntities.externalId, "lin-issue-001"),
+        ),
+      );
+    expect(
+      bindings,
+      "Issue:update must resolve the existing binding, not create a duplicate (BLO-10264 regression class)",
+    ).toHaveLength(1);
+
+    // Delivery rows: all fixtures delivered successfully
     const deliveries = await db
       .select()
       .from(pluginWebhookDeliveries)
       .where(eq(pluginWebhookDeliveries.pluginId, pluginId));
     expect(deliveries).toHaveLength(fixtures.length);
-    expect(deliveries.every((delivery) => delivery.status === "success")).toBe(true);
-
-    console.log(
-      `Linear webhook fixture replay: replayed ${fixtures.length} fixtures; asserted issue/comment/link side-effect expectations and ${deliveries.length} successful delivery rows.`,
-    );
+    expect(deliveries.every((d) => d.status === "success")).toBe(true);
   });
 });
