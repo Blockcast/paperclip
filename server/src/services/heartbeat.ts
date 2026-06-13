@@ -343,6 +343,14 @@ const CAPACITY_BLOCKED_HEARTBEAT_RETRY_REASON = "capacity_blocked";
 const CAPACITY_BLOCKED_HEARTBEAT_RETRY_WAKE_REASON = "capacity_blocked_retry";
 export const CAPACITY_BLOCKED_HEARTBEAT_RETRY_DELAY_MS = 90 * 1000;
 export const CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS = 20;
+export const DEP_BLOCKED_RETRY_REASON = "dependency_blocked";
+export const DEP_BLOCKED_BASE_DELAY_MS = 5 * 60 * 1000;
+export const DEP_BLOCKED_MAX_DELAY_MS = 60 * 60 * 1000;
+export const DEP_BLOCKED_MAX_RETRY_ATTEMPTS = 72;
+
+function depBlockedRetryDelayMs(attempt: number): number {
+  return Math.min(DEP_BLOCKED_BASE_DELAY_MS * Math.pow(2, attempt), DEP_BLOCKED_MAX_DELAY_MS);
+}
 const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 // Keep this in sync with local adapters that require a git workspace before launch.
@@ -7159,6 +7167,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ) {
         // Preserve legacy transient retry behavior for runs that only carry a
         // loose task context rather than a persisted issue row.
+      } else if (
+        gate.errorCode === "issue_dependencies_blocked" &&
+        dueRun.scheduledRetryReason === DEP_BLOCKED_RETRY_REASON
+      ) {
+        // Re-defer logic handled in the dep-blocked block below instead of cancelling.
       } else {
         const cancelled = await cancelScheduledRetryForGate(dueRun, gate, now);
         return cancelled
@@ -7270,6 +7283,81 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
         }
         return { outcome: "not_promoted", run: rescheduled };
+      }
+    }
+
+    // A dep-blocked defer must re-check dependency readiness at promotion time.
+    // If still blocked → re-defer with exponential backoff. If resolved → fall
+    // through to normal promotion so the run becomes queued and runs.
+    if (dueRun.scheduledRetryReason === DEP_BLOCKED_RETRY_REASON) {
+      const depIssueId = readNonEmptyString(parseObject(dueRun.contextSnapshot).issueId);
+      if (depIssueId) {
+        const readiness = (await issuesSvc.listDependencyReadiness(dueRun.companyId, [depIssueId])).get(depIssueId);
+        if (readiness && !readiness.isDependencyReady) {
+          const nextAttempt = (dueRun.scheduledRetryAttempt ?? 0) + 1;
+          if (nextAttempt > DEP_BLOCKED_MAX_RETRY_ATTEMPTS) {
+            const exhausted = await db
+              .update(heartbeatRuns)
+              .set({
+                status: "cancelled",
+                finishedAt: now,
+                error: `dependency-blocked retry exhausted after ${dueRun.scheduledRetryAttempt ?? 0} attempts; blockers never resolved`,
+                errorCode: "issue_dependencies_blocked",
+                updatedAt: now,
+              })
+              .where(
+                and(
+                  eq(heartbeatRuns.id, dueRun.id),
+                  eq(heartbeatRuns.status, "scheduled_retry"),
+                  lte(heartbeatRuns.scheduledRetryAt, now),
+                ),
+              )
+              .returning()
+              .then((rows) => rows[0] ?? null);
+            if (exhausted) {
+              await appendRunEvent(exhausted, await nextRunEventSeq(exhausted.id), {
+                eventType: "lifecycle",
+                stream: "system",
+                level: "warn",
+                message: "dependency-blocked retry exhausted; blockers never resolved within the retry budget",
+                payload: {
+                  scheduledRetryAttempt: dueRun.scheduledRetryAttempt ?? 0,
+                  maxAttempts: DEP_BLOCKED_MAX_RETRY_ATTEMPTS,
+                  unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+                },
+              });
+            }
+            return { outcome: "not_promoted", run: exhausted };
+          }
+          const nextDueAt = new Date(now.getTime() + depBlockedRetryDelayMs(nextAttempt));
+          const rescheduled = await db
+            .update(heartbeatRuns)
+            .set({ scheduledRetryAttempt: nextAttempt, scheduledRetryAt: nextDueAt, updatedAt: now })
+            .where(
+              and(
+                eq(heartbeatRuns.id, dueRun.id),
+                eq(heartbeatRuns.status, "scheduled_retry"),
+                lte(heartbeatRuns.scheduledRetryAt, now),
+              ),
+            )
+            .returning()
+            .then((rows) => rows[0] ?? null);
+          if (rescheduled) {
+            await appendRunEvent(rescheduled, await nextRunEventSeq(rescheduled.id), {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "info",
+              message: "dependencies still blocked at promotion; re-deferred with backoff",
+              payload: {
+                scheduledRetryAttempt: nextAttempt,
+                scheduledRetryAt: nextDueAt.toISOString(),
+                unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+              },
+            });
+          }
+          return { outcome: "not_promoted", run: rescheduled };
+        }
+        // Dependencies resolved — fall through to promote the run.
       }
     }
 
@@ -13233,11 +13321,132 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
 
+        // If there is an existing dep-blocked scheduled_retry whose blocker set no longer
+        // matches the current blockers, cancel it so we create a fresh one below.
+        if (
+          activeExecutionRun &&
+          activeExecutionRun.scheduledRetryReason === DEP_BLOCKED_RETRY_REASON &&
+          dependencyReadiness &&
+          !dependencyReadiness.isDependencyReady
+        ) {
+          const storedBlockerIds: unknown[] = Array.isArray(
+            parseObject(activeExecutionRun.contextSnapshot).unresolvedBlockerIssueIds,
+          )
+            ? (parseObject(activeExecutionRun.contextSnapshot).unresolvedBlockerIssueIds as unknown[])
+            : [];
+          const currentBlockerIds = dependencyReadiness.unresolvedBlockerIssueIds ?? [];
+          const storedSet = new Set(storedBlockerIds.map(String));
+          const currentSet = new Set(currentBlockerIds.map(String));
+          const setsMatch =
+            storedSet.size === currentSet.size && [...storedSet].every((id) => currentSet.has(id));
+          if (!setsMatch) {
+            const now = new Date();
+            const cancelled = await tx
+              .update(heartbeatRuns)
+              .set({
+                status: "cancelled",
+                finishedAt: now,
+                error: "Cancelled because the dependency blocker set changed before the scheduled retry became due",
+                errorCode: "dep_blockers_changed",
+                updatedAt: now,
+              })
+              .where(
+                and(
+                  eq(heartbeatRuns.id, activeExecutionRun.id),
+                  eq(heartbeatRuns.status, "scheduled_retry"),
+                ),
+              )
+              .returning()
+              .then((rows) => rows[0] ?? null);
+            if (cancelled) {
+              if (activeExecutionRun.wakeupRequestId) {
+                await tx
+                  .update(agentWakeupRequests)
+                  .set({
+                    status: "cancelled",
+                    finishedAt: now,
+                    error: "Cancelled because the dependency blocker set changed",
+                    updatedAt: now,
+                  })
+                  .where(eq(agentWakeupRequests.id, activeExecutionRun.wakeupRequestId));
+              }
+              await tx
+                .update(issues)
+                .set({
+                  executionRunId: null,
+                  executionAgentNameKey: null,
+                  executionLockedAt: null,
+                  updatedAt: now,
+                })
+                .where(
+                  and(
+                    eq(issues.id, issue.id),
+                    eq(issues.executionRunId, activeExecutionRun.id),
+                  ),
+                );
+              activeExecutionRun = null;
+            }
+          }
+        }
+
         if (!activeExecutionRun && dependencyReadiness && !dependencyReadiness.isDependencyReady && !blockedInteractionWake) {
-          return {
-            kind: "dependency_blocked" as const,
+          const now = new Date();
+          const scheduledRetryAt = new Date(now.getTime() + DEP_BLOCKED_BASE_DELAY_MS);
+          const depBlockedSnapshot = {
+            ...enrichedContextSnapshot,
             unresolvedBlockerIssueIds: dependencyReadiness.unresolvedBlockerIssueIds,
+            unresolvedBlockerCount: dependencyReadiness.unresolvedBlockerCount,
           };
+          const wakeupRequest = await tx
+            .insert(agentWakeupRequests)
+            .values({
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "issue_dependencies_blocked",
+              payload: {
+                ...(payload ?? {}),
+                issueId,
+                unresolvedBlockerIssueIds: dependencyReadiness.unresolvedBlockerIssueIds,
+              },
+              status: "scheduled",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+            })
+            .returning()
+            .then((rows) => rows[0]);
+          const scheduledRun = await tx
+            .insert(heartbeatRuns)
+            .values({
+              companyId: agent.companyId,
+              agentId,
+              invocationSource: source,
+              triggerDetail,
+              status: "scheduled_retry",
+              scheduledRetryAt,
+              scheduledRetryAttempt: 0,
+              scheduledRetryReason: DEP_BLOCKED_RETRY_REASON,
+              wakeupRequestId: wakeupRequest.id,
+              contextSnapshot: depBlockedSnapshot,
+            })
+            .returning()
+            .then((rows) => rows[0]);
+          await tx
+            .update(agentWakeupRequests)
+            .set({ runId: scheduledRun.id, updatedAt: now })
+            .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+          await tx
+            .update(issues)
+            .set({
+              executionRunId: scheduledRun.id,
+              executionAgentNameKey: agentNameKey,
+              executionLockedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(issues.id, issue.id));
+          return { kind: "dep_blocked_scheduled" as const, run: scheduledRun };
         }
 
         if (activeExecutionRun) {
@@ -13417,33 +13626,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { kind: "queued" as const, run: newRun };
       });
 
-      if (outcome.kind === "dependency_blocked") {
-        const preflight = await runSweepWakePreflight({
-          db,
-          gbrain: sweepWakePreflightGbrain,
-          agent,
-          issueId,
-        });
-        await db.insert(agentWakeupRequests).values({
-          companyId: agent.companyId,
-          agentId,
-          source,
-          triggerDetail,
-          reason: preflight.skip ? "server_side_sweep_preflight" : "issue_dependencies_blocked",
-          payload: {
-            ...(payload ?? {}),
-            issueId,
-            unresolvedBlockerIssueIds: outcome.unresolvedBlockerIssueIds,
-          },
-          status: "skipped",
-          requestedByActorType: opts.requestedByActorType ?? null,
-          requestedByActorId: opts.requestedByActorId ?? null,
-          idempotencyKey: opts.idempotencyKey ?? null,
-          finishedAt: new Date(),
-        });
-        return null;
-      }
-      if (outcome.kind === "deferred" || outcome.kind === "skipped") return null;
+      if (outcome.kind === "deferred" || outcome.kind === "skipped" || outcome.kind === "dep_blocked_scheduled") return null;
       if (outcome.kind === "coalesced") {
         await startNextQueuedRunForAgent(agent.id);
         return outcome.run;
