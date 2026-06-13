@@ -18,6 +18,7 @@ const mockIssueService = vi.hoisted(() => ({
   getAttachmentById: vi.fn(),
   getByIdentifier: vi.fn(),
   getById: vi.fn(),
+  getDependencyReadiness: vi.fn(),
   getRelationSummaries: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
   list: vi.fn(),
@@ -200,6 +201,38 @@ function makeAgent(id: string, overrides: Record<string, unknown> = {}) {
   };
 }
 
+function makeRecoveryAction(overrides: Record<string, unknown> = {}) {
+  return {
+    id: recoveryActionId,
+    companyId,
+    sourceIssueId: issueId,
+    recoveryIssueId: null,
+    kind: "stranded_assigned_issue",
+    status: "active",
+    ownerType: "agent",
+    ownerAgentId: peerAgentId,
+    ownerUserId: null,
+    previousOwnerAgentId: ownerAgentId,
+    returnOwnerAgentId: ownerAgentId,
+    cause: "stranded_assigned_issue",
+    fingerprint: "source-scoped:test",
+    evidence: {},
+    nextAction: "Restore a live execution path.",
+    wakePolicy: null,
+    monitorPolicy: null,
+    attemptCount: 1,
+    maxAttempts: null,
+    timeoutAt: null,
+    lastAttemptAt: new Date("2026-05-13T18:00:00.000Z"),
+    outcome: null,
+    resolutionNote: null,
+    resolvedAt: null,
+    createdAt: new Date("2026-05-13T17:55:00.000Z"),
+    updatedAt: new Date("2026-05-13T17:55:00.000Z"),
+    ...overrides,
+  };
+}
+
 function createRunContextDb(
   contextSnapshot: Record<string, unknown> = {},
   runAgentOrRows: string | Record<string, unknown>[] = ownerAgentId,
@@ -344,6 +377,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.getAttachmentById.mockReset();
     mockIssueService.getByIdentifier.mockReset();
     mockIssueService.getById.mockReset();
+    mockIssueService.getDependencyReadiness.mockReset();
     mockIssueService.getRelationSummaries.mockReset();
     mockIssueService.list.mockReset();
     mockIssueService.getWakeableParentAfterChildCompletion.mockReset();
@@ -418,6 +452,10 @@ describe("agent issue mutation checkout ownership", () => {
     mockCompanyService.getById.mockResolvedValue({ id: companyId, issuePrefix: "PAP" });
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockIssueService.getByIdentifier.mockResolvedValue(null);
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      unresolvedBlockerCount: 0,
+      unresolvedBlockerIssueIds: [],
+    });
     mockIssueService.list.mockResolvedValue([makeIssue()]);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({
@@ -584,6 +622,43 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).toHaveBeenCalled();
+  });
+
+  it("allows a source-scoped recovery owner to clear a stale blocked source issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }));
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction() as never);
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "todo",
+        blockedByIssueIds: [],
+        comment: "Restoring the original owner after stale recovery block cleared.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        status: "todo",
+        blockedByIssueIds: [],
+        actorAgentId: peerAgentId,
+      }),
+    );
+  });
+
+  it("does not let a source-scoped recovery owner edit normal issue content", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction() as never);
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Unauthorized content edit" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("allows the checked-out owner with the matching run id to patch and update documents", async () => {
