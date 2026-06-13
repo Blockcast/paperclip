@@ -270,6 +270,77 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(mockLifecycle.load).toHaveBeenCalledWith(pluginId);
   }, 20_000);
 
+  it("rejects force=true without isLocalPath=true", async () => {
+    const { app, loader } = await createApp(
+      {
+        type: "board",
+        userId: "admin-1",
+        source: "session",
+        isInstanceAdmin: true,
+        companyIds: [],
+      },
+      { installPlugin: vi.fn() },
+    );
+
+    const res = await request(app)
+      .post("/api/plugins/install")
+      .send({ packageName: "paperclip-plugin-example", force: true });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/force/i);
+    expect(loader.installPlugin).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("threads force=true with isLocalPath=true to loader and skips lifecycle.load", async () => {
+    const pluginId = "22222222-2222-4222-8222-222222222222";
+    const pluginKey = "paperclip.example";
+    const discovered = { manifest: { id: pluginKey } };
+
+    mockRegistry.getByKey.mockResolvedValue({
+      id: pluginId,
+      pluginKey,
+      packageName: "/app/packages/plugins/example",
+      version: "1.0.0",
+      status: "ready",
+    });
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey,
+      packageName: "/app/packages/plugins/example",
+      version: "1.0.0",
+      status: "ready",
+    });
+
+    const installPlugin = vi.fn().mockResolvedValue(discovered);
+    const { app } = await createApp(
+      {
+        type: "board",
+        userId: "admin-1",
+        source: "session",
+        isInstanceAdmin: true,
+        companyIds: [],
+      },
+      { installPlugin },
+    );
+
+    const res = await request(app)
+      .post("/api/plugins/install")
+      .send({
+        packageName: "/app/packages/plugins/example",
+        isLocalPath: true,
+        force: true,
+      });
+
+    expect(res.status).toBe(200);
+    expect(installPlugin).toHaveBeenCalledWith({
+      localPath: "/app/packages/plugins/example",
+      force: true,
+    });
+    // Skipping lifecycle.load avoids restarting an in-flight worker; the
+    // updated package_name/path takes effect on the next worker (re)start.
+    expect(mockLifecycle.load).not.toHaveBeenCalled();
+  }, 20_000);
+
   it("rejects plugin upgrades for non-admin board users", async () => {
     const pluginId = "11111111-1111-4111-8111-111111111111";
     const { app } = await createApp({
@@ -533,6 +604,66 @@ describe.sequential("plugin local folder routes", () => {
 describe.sequential("plugin tool and bridge authz", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("allows board tool execution without a runContext", async () => {
+    const executeTool = vi.fn().mockResolvedValue({ content: "ok" });
+    const { app } = await createApp(boardActor(), {}, {
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(() => ({ name: "paperclip.example:search" })),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({
+        tool: "paperclip.example:search",
+        parameters: { q: "test" },
+      });
+
+    expect(res.status).toBe(200);
+    expect(executeTool).toHaveBeenCalledWith(
+      "paperclip.example:search",
+      { q: "test" },
+      {},
+    );
+  });
+
+  it("allows board tool execution with MCP-style company-only runContext", async () => {
+    const executeTool = vi.fn().mockResolvedValue({ content: "ok" });
+    const { app } = await createApp(boardActor(), {}, {
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(() => ({ name: "paperclip.example:search" })),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({
+        tool: "paperclip.example:search",
+        parameters: { q: "test" },
+        runContext: {
+          agentId: null,
+          runId: null,
+          companyId: companyA,
+          projectId: null,
+        },
+      });
+
+    expect(res.status).toBe(200);
+    expect(executeTool).toHaveBeenCalledWith(
+      "paperclip.example:search",
+      { q: "test" },
+      { companyId: companyA },
+    );
   });
 
   it("rejects tool execution when the board user cannot access runContext.companyId", async () => {

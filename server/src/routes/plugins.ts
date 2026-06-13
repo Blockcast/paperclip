@@ -874,9 +874,19 @@ export function pluginRoutes(
   /**
    * GET /api/plugins/alerts/plugin-health
    *
-   * Alertmanager-facing plugin health route. It pages only for active plugin
-   * rows in `error` state; ready, disabled, and paused-ish lifecycle states are
-   * suppressed by the status filter.
+   * Polling endpoint for paging integrations (Prometheus JSON exporter,
+   * Alertmanager webhook receiver, or direct on-call script). Returns only
+   * plugins in `error` state; ready, disabled, and paused plugins are
+   * suppressed by the `listByStatus("error")` filter.
+   *
+   * Paging integration path: configure a Prometheus JSON exporter or
+   * Alertmanager receiver to poll this route with a board token on a
+   * 1–5 minute interval. When `status == "firing"` the `alerts[]` array
+   * carries `pluginId`, `pluginKey`, `severity: "page"`, and `lastError`
+   * in a shape compatible with Alertmanager label routing.
+   *
+   * @see doc/plugins/PLUGIN_HEALTH_ALERT_RUNBOOK.md for full integration
+   *   steps, Alertmanager rule examples, and on-call response procedures.
    */
   router.get("/plugins/alerts/plugin-health", async (req, res) => {
     assertBoardOrgAccess(req);
