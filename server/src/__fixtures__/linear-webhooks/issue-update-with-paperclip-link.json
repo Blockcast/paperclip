@@ -1,0 +1,43 @@
+{
+  "name": "issue-update-with-paperclip-link",
+  "description": "Linear Issue update carrying a Paperclip backlink; covers the recent bidirectional link-sync regression class.",
+  "headers": {
+    "content-type": "application/json",
+    "linear-event": "Issue",
+    "linear-signature": "[redacted]"
+  },
+  "body": {
+    "type": "Issue",
+    "action": "update",
+    "organizationId": "lin-org-sanitized",
+    "webhookId": "lin-webhook-sanitized",
+    "createdAt": "2026-06-13T00:00:00.000Z",
+    "data": {
+      "id": "lin-issue-001",
+      "identifier": "LIN-42",
+      "title": "[redacted]",
+      "description": "[redacted]",
+      "url": "[redacted]",
+      "team": {
+        "id": "lin-team-001",
+        "key": "LIN",
+        "name": "[redacted]"
+      },
+      "state": {
+        "id": "lin-state-001",
+        "name": "[redacted]"
+      }
+    },
+    "updatedFrom": {
+      "description": "[redacted]"
+    }
+  },
+  "expect": {
+    "eventType": "Issue",
+    "action": "update",
+    "paperclipSideEffects": [
+      "resolves existing Paperclip/Linear binding instead of creating a duplicate",
+      "preserves Paperclip backlink when Linear description changes"
+    ]
+  }
+}
