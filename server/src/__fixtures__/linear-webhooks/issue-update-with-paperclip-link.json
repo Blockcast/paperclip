@@ -15,21 +15,21 @@
     "data": {
       "id": "lin-issue-001",
       "identifier": "LIN-42",
-      "title": "[redacted]",
-      "description": "[redacted]",
+      "title": "[sanitized-title]",
+      "description": "See linked Paperclip issue: https://app.paperclip.test/BLO/issues/FIX-1",
       "url": "[redacted]",
       "team": {
         "id": "lin-team-001",
         "key": "LIN",
-        "name": "[redacted]"
+        "name": "[sanitized-team]"
       },
       "state": {
         "id": "lin-state-001",
-        "name": "[redacted]"
+        "name": "[sanitized-state]"
       }
     },
     "updatedFrom": {
-      "description": "[redacted]"
+      "description": "No Paperclip link yet."
     }
   },
   "expect": {
@@ -37,7 +37,7 @@
     "action": "update",
     "paperclipSideEffects": [
       "resolves existing Paperclip/Linear binding instead of creating a duplicate",
-      "preserves Paperclip backlink when Linear description changes"
+      "parses Paperclip backlink from Linear description and persists a paperclip_issue_link entity"
     ]
   }
 }
