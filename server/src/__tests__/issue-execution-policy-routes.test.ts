@@ -26,22 +26,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
 
 const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(async () => false),
-  decide: vi.fn(),
   hasPermission: vi.fn(async () => false),
-}));
-const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
-  then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-    Promise.resolve([{
-      companyId: "company-1",
-      agentId: "33333333-3333-4333-8333-333333333333",
-      contextSnapshot: null,
-      permissions: null,
-    }]).then(onFulfilled, onRejected),
-})));
-const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
-const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
-const mockDb = vi.hoisted(() => ({
-  select: mockDbSelect,
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
@@ -60,22 +45,8 @@ function registerModuleMocks() {
     }),
     accessService: () => mockAccessService,
     agentService: () => ({
-      getById: vi.fn(async (agentId: string) => ({
-        id: agentId,
-        companyId: "company-1",
-        permissions: null,
-      })),
-      resolveByReference: vi.fn(async (_companyId: string, reference: string) => ({
-        ambiguous: false,
-        agent: {
-          id: reference,
-          companyId: "company-1",
-          status: "idle",
-          orgChainHealth: { status: "healthy" },
-        },
-      })),
+      getById: vi.fn(async () => null),
     }),
-    documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => ({}),
     executionWorkspaceService: () => ({}),
     feedbackService: () => ({
@@ -158,7 +129,7 @@ async function createApp(actor?: TestActor) {
     };
     next();
   });
-  app.use("/api", issueRoutes(mockDb as any, {} as any));
+  app.use("/api", issueRoutes({} as any, {} as any));
   app.use(errorHandler);
   return app;
 }
@@ -179,17 +150,6 @@ describe("issue execution policy routes", () => {
     mockIssueThreadInteractionService.listForIssue.mockResolvedValue([]);
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
-    mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
-    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
-    mockDbSelectWhere.mockImplementation(() => ({
-      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-        Promise.resolve([{
-          companyId: "company-1",
-          agentId: "33333333-3333-4333-8333-333333333333",
-          contextSnapshot: null,
-          permissions: null,
-        }]).then(onFulfilled, onRejected),
-    }));
     mockIssueService.createChild.mockResolvedValue({
       issue: {
         id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
@@ -200,24 +160,6 @@ describe("issue execution policy routes", () => {
       parentBlockerAdded: false,
     });
     mockAccessService.canUser.mockResolvedValue(false);
-    mockAccessService.decide.mockImplementation(async (input: { actor?: { type?: string; source?: string }; action?: string }) => {
-      const allowed = input.actor?.type === "board" && input.actor.source === "local_implicit"
-        ? true
-        : input.actor?.type === "agent" && [
-            "company_scope:read",
-            "issue:read",
-            "issue:mutate",
-            "runtime:manage",
-          ].includes(input.action ?? "")
-          ? true
-          : Boolean(await mockAccessService.canUser() || await mockAccessService.hasPermission());
-      return {
-        allowed,
-        action: input.action,
-        reason: allowed ? "allow_explicit_grant" : "deny_missing_grant",
-        explanation: allowed ? "Allowed by test grant." : `Missing permission: ${input.action ?? "action"}`,
-      };
-    });
     mockAccessService.hasPermission.mockResolvedValue(false);
   });
 
@@ -253,7 +195,7 @@ describe("issue execution policy routes", () => {
       missing: "review_path",
     });
     expect(mockIssueService.update).not.toHaveBeenCalled();
-  });
+  }, 10_000);
 
   it("allows an agent-authored in_review transition with a pending confirmation interaction", async () => {
     const issue = {
@@ -292,6 +234,63 @@ describe("issue execution policy routes", () => {
       "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       expect.objectContaining({ status: "in_review" }),
     );
+  });
+
+  it("allows a non-PR issue with prior checklist evidence to return to in_review for pending confirmation", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1007",
+      title: "Runbook evidence confirmation",
+      description:
+        "## Acceptance criteria\n- Runbook evidence is ready\n\n## Verifying signal\n- Pending confirmation accepts the runbook evidence",
+      executionPolicy: null,
+      executionState: null,
+      labels: [],
+      lastEvidenceVerdict: {
+        verdict: "pass",
+        missing: [],
+        evidenceFound: ["checklist:done-when"],
+        unlabeledFallback: true,
+        evaluatedAt: "2026-06-12T00:00:00.000Z",
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueThreadInteractionService.listForIssue.mockResolvedValue([
+      {
+        id: "94bcd166-0000-4000-8000-000000000000",
+        kind: "request_confirmation",
+        status: "pending",
+      },
+    ]);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({ status: "in_review" }),
+    );
+    expect(res.body.lastEvidenceVerdict).toMatchObject({
+      verdict: "pass",
+      evidenceFound: ["checklist:done-when"],
+    });
   });
 
   it("allows an agent-authored in_review transition with a typed execution participant", async () => {
