@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { agents, companies, costEvents, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import {
@@ -454,6 +455,7 @@ describeEmbeddedPostgres("dashboard service", () => {
         unlabeledFallback: false,
         evaluatedAt,
       },
+      lastEvidenceVerdictEvaluatedAt: new Date(evaluatedAt),
     });
 
     // Cost for the work is recorded against the worker (cost_events.agent_id).
@@ -553,5 +555,92 @@ describeEmbeddedPostgres("dashboard service", () => {
     expect(a.failedRuns).toBe(2); // failed + timed_out
     expect(a.cancelledRuns).toBe(1);
     expect(a.failureRate).toBe(0.5); // 2 / 4
+  });
+
+  it("uses the materialized verdict timestamp index for review scorecards", async () => {
+    const companyId = randomUUID();
+    await seedCompany(companyId);
+    const agentId = randomUUID();
+    await db.insert(agents).values([agentRow(companyId, agentId, "Reviewer")]);
+    const inWindow = utcDay(-2);
+    const outOfWindow = utcDay(-60);
+
+    await db.insert(issues).values([
+      {
+        id: randomUUID(),
+        companyId,
+        title: "Recent evidence",
+        status: "in_review",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        createdAt: inWindow,
+        updatedAt: inWindow,
+        lastActivityAt: inWindow,
+        lastEvidenceVerdict: {
+          verdict: "pass",
+          missing: [],
+          evidenceFound: ["test-output"],
+          unlabeledFallback: false,
+          evaluatedAt: inWindow.toISOString(),
+        },
+        lastEvidenceVerdictEvaluatedAt: inWindow,
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        title: "Old evidence",
+        status: "in_review",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        createdAt: outOfWindow,
+        updatedAt: outOfWindow,
+        lastActivityAt: outOfWindow,
+        lastEvidenceVerdict: {
+          verdict: "block",
+          missing: ["test-output"],
+          evidenceFound: [],
+          unlabeledFallback: false,
+          evaluatedAt: outOfWindow.toISOString(),
+        },
+        lastEvidenceVerdictEvaluatedAt: outOfWindow,
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        title: "Malformed legacy evidence timestamp",
+        status: "in_review",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        createdAt: inWindow,
+        updatedAt: inWindow,
+        lastActivityAt: inWindow,
+        lastEvidenceVerdict: {
+          verdict: "warn",
+          missing: [],
+          evidenceFound: [],
+          unlabeledFallback: true,
+          evaluatedAt: "not-a-date",
+        },
+        lastEvidenceVerdictEvaluatedAt: null,
+      },
+    ]);
+
+    const result = await dashboardService(db).agentScorecards(companyId);
+    const scorecard = result.agents.find((x) => x.agentId === agentId)!;
+    expect(scorecard.reviewedIssues).toBe(1);
+    expect(scorecard.passedReviews).toBe(1);
+    expect(scorecard.reviewPassRate).toBe(1);
+
+    await db.execute(sql.raw("SET enable_seqscan = off"));
+    const planRows = await db.execute(sql`
+      EXPLAIN SELECT count(*)
+      FROM issues
+      WHERE company_id = ${companyId}
+        AND last_evidence_verdict IS NOT NULL
+        AND last_evidence_verdict_evaluated_at >= ${result.windowStart}::timestamp with time zone
+    `);
+    await db.execute(sql.raw("SET enable_seqscan = on"));
+    const plan = planRows.map((row) => String((row as { "QUERY PLAN": unknown })["QUERY PLAN"])).join("\n");
+    expect(plan).toContain("issues_company_evidence_verdict_evaluated_idx");
   });
 });

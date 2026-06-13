@@ -330,7 +330,8 @@ export function dashboardService(db: Db) {
   // that never entered a review stage. See `implementerAgentExpr` below.
   //
   // Relies on the cost_events (company, agent, occurred), issues
-  // (company, status) and heartbeat_runs (company, agent, started) indexes.
+  // (company, status), issues (company, last_evidence_verdict_evaluated_at),
+  // and heartbeat_runs (company, agent, started) indexes.
   async function agentScorecards(companyId: string, options?: { windowDays?: number }) {
     const company = await db
       .select({ id: companies.id })
@@ -421,7 +422,7 @@ export function dashboardService(db: Db) {
           and(
             eq(issues.companyId, companyId),
             sql`${issues.lastEvidenceVerdict} is not null`,
-            sql`(${issues.lastEvidenceVerdict} ->> 'evaluatedAt') >= ${windowStartIso}`,
+            gte(issues.lastEvidenceVerdictEvaluatedAt, windowStart),
           ),
         )
         .groupBy(implementerAgentExpr, verdictExpr),
