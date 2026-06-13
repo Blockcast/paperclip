@@ -5016,10 +5016,23 @@ export function issueRoutes(
     const updateReferenceSummaryBefore = titleOrDescriptionChanged
       ? await issueReferencesSvc.listIssueReferenceSummary(existing.id)
       : null;
+    const scopedRecoveryOwnerRestoreNeedsDependencyReadiness =
+      allowScopedRecoveryOwnerSourceMutation &&
+      isBlocked &&
+      (updateFields.status === "todo" ||
+        reopenRequested === true ||
+        resumeRequested === true ||
+        Array.isArray(req.body.blockedByIssueIds));
+    const blockedIssueReadiness =
+      isBlocked && (effectiveMoveToTodoRequested || scopedRecoveryOwnerRestoreNeedsDependencyReadiness)
+        ? await svc.getDependencyReadiness(existing.id)
+        : null;
     const hasUnresolvedFirstClassBlockers =
-      isBlocked && effectiveMoveToTodoRequested
-        ? (await svc.getDependencyReadiness(existing.id)).unresolvedBlockerCount > 0
-        : false;
+      (blockedIssueReadiness?.unresolvedBlockerCount ?? 0) > 0;
+    if (scopedRecoveryOwnerRestoreNeedsDependencyReadiness && hasUnresolvedFirstClassBlockers) {
+      res.status(409).json({ error: "Issue recovery restore blocked by unresolved blockers" });
+      return;
+    }
     if (resumeRequested === true && isBlocked && hasUnresolvedFirstClassBlockers) {
       res.status(409).json({ error: "Issue follow-up blocked by unresolved blockers" });
       return;

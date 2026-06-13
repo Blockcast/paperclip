@@ -649,6 +649,28 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
+  it("rejects source-scoped recovery owner blocker clearing when blockers remain unresolved", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }));
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction() as never);
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      unresolvedBlockerCount: 1,
+      unresolvedBlockerIssueIds: ["99999999-9999-4999-8999-999999999999"],
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "todo",
+        blockedByIssueIds: [],
+        comment: "Attempting to clear an active blocker.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toBe("Issue recovery restore blocked by unresolved blockers");
+    expect(mockIssueService.getDependencyReadiness).toHaveBeenCalledWith(issueId);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("allows a source-scoped recovery owner to return assignment without tasks:assign", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: input.action === "issue:read" || input.action === "issue:mutate",
