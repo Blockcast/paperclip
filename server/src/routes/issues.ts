@@ -5189,9 +5189,13 @@ export function issueRoutes(
       typeof nextAssigneeUserId === "string" &&
       !!existing.createdByUserId &&
       nextAssigneeUserId === existing.createdByUserId;
+    const isScopedRecoveryOwnerReturnAssignment =
+      allowScopedRecoveryOwnerSourceMutation &&
+      req.actor.type === "agent" &&
+      req.body.assigneeAgentId !== undefined;
 
     if (assigneeWillChange && !transition.workflowControlledAssignment) {
-      if (!isAgentReturningIssueToCreator) {
+      if (!isAgentReturningIssueToCreator && !isScopedRecoveryOwnerReturnAssignment) {
         await assertCanAssignTasks(req, existing.companyId, {
           issueId: existing.id,
           projectId: await resolveAssignmentProjectId({

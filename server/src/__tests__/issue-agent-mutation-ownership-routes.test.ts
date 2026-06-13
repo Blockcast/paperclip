@@ -7,6 +7,7 @@ const issueId = "11111111-1111-4111-8111-111111111111";
 const companyId = "22222222-2222-4222-8222-222222222222";
 const ownerAgentId = "33333333-3333-4333-8333-333333333333";
 const peerAgentId = "44444444-4444-4444-8444-444444444444";
+const staleAgentId = "66666666-1111-4666-8666-666666666666";
 const ownerRunId = "55555555-5555-4555-8555-555555555555";
 const recoveryActionId = "77777777-7777-4777-8777-777777777777";
 
@@ -646,6 +647,52 @@ describe("agent issue mutation checkout ownership", () => {
         actorAgentId: peerAgentId,
       }),
     );
+  });
+
+  it("allows a source-scoped recovery owner to return assignment without tasks:assign", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read" || input.action === "issue:mutate",
+      action: input.action,
+      reason: input.action === "tasks:assign" ? "deny_policy_restricted" : "allow_test_default",
+      explanation: input.action === "tasks:assign"
+        ? "Recovery owner does not have broad assignment permission."
+        : "Allowed by test default.",
+    }));
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: staleAgentId }));
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction({
+      previousOwnerAgentId: ownerAgentId,
+      returnOwnerAgentId: ownerAgentId,
+    }) as never);
+    mockAgentService.resolveByReference.mockResolvedValue({
+      ambiguous: false,
+      agent: makeAgent(ownerAgentId),
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "todo",
+        blockedByIssueIds: [],
+        assigneeAgentId: ownerAgentId,
+        assigneeUserId: null,
+        comment: "Returning the recovered issue to its previous owner.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        status: "todo",
+        blockedByIssueIds: [],
+        assigneeAgentId: ownerAgentId,
+        assigneeUserId: null,
+        actorAgentId: peerAgentId,
+      }),
+    );
+    expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({
+      action: "tasks:assign",
+    }));
   });
 
   it("does not let a source-scoped recovery owner edit normal issue content", async () => {
