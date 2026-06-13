@@ -544,6 +544,11 @@ function withRecoveryActionsOnRelationSummaries(
 }
 
 const ACTIVE_REVIEW_APPROVAL_STATUSES = new Set(["pending", "revision_requested"]);
+const REVIEW_PATH_INTERACTION_KINDS = new Set(["ask_user_questions", "request_confirmation", "suggest_tasks"]);
+
+function isPendingIssueThreadInteractionReviewPath(interaction: { kind: string; status: string }) {
+  return interaction.status === "pending" && REVIEW_PATH_INTERACTION_KINDS.has(interaction.kind);
+}
 
 const INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE =
   "invalid_issue_disposition: Agent-authored updates that move an issue to in_review must include a real review path. " +
@@ -1595,7 +1600,7 @@ export function issueRoutes(
     })) return;
 
     const interactions = await issueThreadInteractionService(db).listForIssue(input.existing.id);
-    if (interactions.some((interaction) => interaction.status === "pending")) return;
+    if (interactions.some(isPendingIssueThreadInteractionReviewPath)) return;
 
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(input.existing.id);
     if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) return;
