@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, isNull, notInArray, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, approvals, companies, costEvents, heartbeatRuns, issues } from "@paperclipai/db";
 import { ISSUE_PRIORITIES, ISSUE_STATUSES, type IssuePriority, type IssueStatus } from "@paperclipai/shared";
@@ -11,6 +11,7 @@ import {
   MIN_SAMPLE_DONE,
   MIN_SAMPLE_RUNS,
   MIN_SAMPLE_REVIEWS,
+  TERMINAL_RUN_STATUSES,
   type AgentScorecardInput,
   type AgentRunCounts,
   type AgentReviewCounts,
@@ -317,9 +318,19 @@ export function dashboardService(db: Db) {
 
   // Agent scorecard feed for the monthly staffing routine (BLO-10275). Runs
   // four grouped-by-agent aggregates over the window and merges them through
-  // the pure `computeAgentScorecards` helper (unit-tested separately). Relies
-  // on the cost_events (company, agent, occurred), issues (company, assignee,
-  // status), and heartbeat_runs (company, agent, started) indexes.
+  // the pure `computeAgentScorecards` helper (unit-tested separately).
+  //
+  // Attribution: issue-derived signals (done count, review verdict) are
+  // credited to the IMPLEMENTER, not the live `issues.assignee_agent_id`.
+  // Execution-policy review/approval stages reassign the issue to the
+  // reviewer/approver while it is in review and can leave it assigned there
+  // at `done`, so grouping by the current assignee would credit the reviewer.
+  // `executionState.returnAssignee` is the immutable principal the work
+  // returns to; we prefer it and fall back to the assignee only for issues
+  // that never entered a review stage. See `implementerAgentExpr` below.
+  //
+  // Relies on the cost_events (company, agent, occurred), issues
+  // (company, status) and heartbeat_runs (company, agent, started) indexes.
   async function agentScorecards(companyId: string, options?: { windowDays?: number }) {
     const company = await db
       .select({ id: companies.id })
@@ -337,6 +348,19 @@ export function dashboardService(db: Db) {
     const windowStartIso = windowStart.toISOString();
 
     const verdictExpr = sql<string>`${issues.lastEvidenceVerdict} ->> 'verdict'`;
+    // Immutable implementer: prefer executionState.returnAssignee when it
+    // names an agent (the worker the review path returns to), else the current
+    // assignee (issues with no execution policy never get a returnAssignee).
+    // Cast assignee_agent_id to text so the COALESCE branches share a type and
+    // match the text agent ids the JSONB path yields.
+    const implementerAgentExpr = sql<string | null>`coalesce(
+      case
+        when ${issues.executionState} #>> '{returnAssignee,type}' = 'agent'
+          then ${issues.executionState} #>> '{returnAssignee,agentId}'
+        else null
+      end,
+      ${issues.assigneeAgentId}::text
+    )`;
     const [agentRows, doneRows, costRows, runRows, reviewRows] = await Promise.all([
       db
         .select({ id: agents.id, name: agents.name, status: agents.status })
@@ -348,7 +372,7 @@ export function dashboardService(db: Db) {
           ),
         ),
       db
-        .select({ agentId: issues.assigneeAgentId, count: sql<number>`count(*)::int` })
+        .select({ agentId: implementerAgentExpr, count: sql<number>`count(*)::int` })
         .from(issues)
         .where(
           and(
@@ -357,7 +381,7 @@ export function dashboardService(db: Db) {
             gte(issues.completedAt, windowStart),
           ),
         )
-        .groupBy(issues.assigneeAgentId),
+        .groupBy(implementerAgentExpr),
       db
         .select({
           agentId: costEvents.agentId,
@@ -373,10 +397,25 @@ export function dashboardService(db: Db) {
           count: sql<number>`count(*)::int`,
         })
         .from(heartbeatRuns)
-        .where(and(eq(heartbeatRuns.companyId, companyId), gte(heartbeatRuns.createdAt, windowStart)))
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            // Terminal statuses only, filtered in SQL so non-terminal rows
+            // (queued / running / scheduled_retry) are never grouped just to be
+            // discarded in TS. Windowed on started_at — the time column carried
+            // by the (company_id, agent_id, started_at) index — rather than
+            // created_at, whose only composite index sits behind liveness_state
+            // and so can't serve this scan as run history grows. A run cancelled
+            // while still queued has a null started_at and drops out here, which
+            // is correct: no execution happened and cancelled runs sit outside
+            // the failure-rate denominator anyway.
+            inArray(heartbeatRuns.status, TERMINAL_RUN_STATUSES),
+            gte(heartbeatRuns.startedAt, windowStart),
+          ),
+        )
         .groupBy(heartbeatRuns.agentId, heartbeatRuns.status),
       db
-        .select({ agentId: issues.assigneeAgentId, verdict: verdictExpr, count: sql<number>`count(*)::int` })
+        .select({ agentId: implementerAgentExpr, verdict: verdictExpr, count: sql<number>`count(*)::int` })
         .from(issues)
         .where(
           and(
@@ -385,7 +424,7 @@ export function dashboardService(db: Db) {
             sql`(${issues.lastEvidenceVerdict} ->> 'evaluatedAt') >= ${windowStartIso}`,
           ),
         )
-        .groupBy(issues.assigneeAgentId, verdictExpr),
+        .groupBy(implementerAgentExpr, verdictExpr),
     ]);
 
     const doneByAgent = new Map<string, number>();
@@ -407,7 +446,7 @@ export function dashboardService(db: Db) {
       else if (row.status === "failed") bucket.failed += count;
       else if (row.status === "timed_out") bucket.timedOut += count;
       else if (row.status === "cancelled") bucket.cancelled += count;
-      // queued / running / scheduled_retry are non-terminal — ignored.
+      // Non-terminal statuses are already excluded by the SQL where-clause.
       runsByAgent.set(row.agentId, bucket);
     }
     const reviewsByAgent = new Map<string, AgentReviewCounts>();
