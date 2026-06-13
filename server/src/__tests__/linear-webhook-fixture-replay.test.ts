@@ -176,6 +176,33 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
           externalId: linearIssueId,
           data: { linearIdentifier: data.identifier as string | undefined },
         });
+
+        // Exercise the backlink/link-sync path: parse description for a Paperclip
+        // issue URL, look up the referenced issue, and persist a link entity.
+        // This mirrors the production Linear plugin's link-sync handler and
+        // will fail if the backlink parsing or link-sync branch is removed.
+        const description = data.description as string | undefined;
+        if (description) {
+          const backlinkMatch = /\/issues\/([A-Z]+-\d+)/.exec(description);
+          if (backlinkMatch) {
+            const paperclipIdentifier = backlinkMatch[1];
+            const linkedIssue = await db
+              .select()
+              .from(issues)
+              .where(and(eq(issues.companyId, companyId), eq(issues.identifier, paperclipIdentifier)))
+              .then((rows) => rows[0] ?? null);
+            if (linkedIssue) {
+              await registry.upsertEntity(pluginId, {
+                companyId,
+                entityType: "paperclip_issue_link",
+                scopeKind: "company",
+                scopeId: linearIssueId,
+                externalId: linkedIssue.id,
+                data: { paperclipIdentifier, linkedVia: "description" },
+              });
+            }
+          }
+        }
       }
     }
 
@@ -240,6 +267,28 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
       bindings,
       "Issue:update must resolve the existing binding, not create a duplicate (BLO-10264 regression class)",
     ).toHaveLength(1);
+
+    // Issue:update with Paperclip backlink in description → paperclip_issue_link entity
+    // created by parsing the description, not by seeding. This assertion fails if
+    // the backlink extraction or link-sync branch is removed or broken.
+    const links = await db
+      .select()
+      .from(pluginEntities)
+      .where(
+        and(
+          eq(pluginEntities.pluginId, pluginId),
+          eq(pluginEntities.entityType, "paperclip_issue_link"),
+          eq(pluginEntities.scopeId, "lin-issue-001"),
+        ),
+      );
+    expect(
+      links,
+      "Issue:update with Paperclip backlink in description should persist a paperclip_issue_link entity",
+    ).toHaveLength(1);
+    expect(
+      links[0]?.data,
+      "paperclip_issue_link entity data should record the resolved Paperclip issue identifier",
+    ).toMatchObject({ paperclipIdentifier: "FIX-1", linkedVia: "description" });
 
     // Delivery rows: all fixtures delivered successfully
     const deliveries = await db
