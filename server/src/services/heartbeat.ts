@@ -13321,6 +13321,59 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
 
+        if (
+          blockedInteractionWake &&
+          activeExecutionRun &&
+          activeExecutionRun.scheduledRetryReason === DEP_BLOCKED_RETRY_REASON
+        ) {
+          const now = new Date();
+          const cancelled = await tx
+            .update(heartbeatRuns)
+            .set({
+              status: "cancelled",
+              finishedAt: now,
+              error: "Cancelled because an interaction wake must run while dependencies remain blocked",
+              errorCode: "dep_blocked_interaction_wake",
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(heartbeatRuns.id, activeExecutionRun.id),
+                eq(heartbeatRuns.status, "scheduled_retry"),
+              ),
+            )
+            .returning()
+            .then((rows) => rows[0] ?? null);
+          if (cancelled) {
+            if (activeExecutionRun.wakeupRequestId) {
+              await tx
+                .update(agentWakeupRequests)
+                .set({
+                  status: "cancelled",
+                  finishedAt: now,
+                  error: "Cancelled because an interaction wake must run while dependencies remain blocked",
+                  updatedAt: now,
+                })
+                .where(eq(agentWakeupRequests.id, activeExecutionRun.wakeupRequestId));
+            }
+            await tx
+              .update(issues)
+              .set({
+                executionRunId: null,
+                executionAgentNameKey: null,
+                executionLockedAt: null,
+                updatedAt: now,
+              })
+              .where(
+                and(
+                  eq(issues.id, issue.id),
+                  eq(issues.executionRunId, activeExecutionRun.id),
+                ),
+              );
+            activeExecutionRun = null;
+          }
+        }
+
         // If there is an existing dep-blocked scheduled_retry whose blocker set no longer
         // matches the current blockers, cancel it so we create a fresh one below.
         if (
