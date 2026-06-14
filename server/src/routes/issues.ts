@@ -1872,15 +1872,18 @@ export function issueRoutes(
     if (options.allowScopedRecoveryOwnerSourceMutation) {
       return true;
     }
+    const isActiveRecoveryActionOwner = async () => {
+      if (!options.allowRecoveryActionOwner || req.actor.companyId !== issue.companyId) return false;
+      const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+      return activeRecoveryAction?.ownerAgentId === actorAgentId;
+    };
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
     if (!boundaryDecision.allowed) {
-      if (options.allowRecoveryActionOwner && req.actor.companyId === issue.companyId) {
-        const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
-        if (activeRecoveryAction?.ownerAgentId === actorAgentId) return true;
-      }
+      if (await isActiveRecoveryActionOwner()) return true;
       res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
       return false;
     }
+    if (await isActiveRecoveryActionOwner()) return true;
     if (issue.assigneeAgentId === null) {
       return true;
     }
