@@ -284,7 +284,12 @@ export interface HostServices {
     pause(params: WorkerToHostMethods["agents.pause"][0]): Promise<WorkerToHostMethods["agents.pause"][1]>;
     resume(params: WorkerToHostMethods["agents.resume"][0]): Promise<WorkerToHostMethods["agents.resume"][1]>;
     invoke(params: WorkerToHostMethods["agents.invoke"][0]): Promise<WorkerToHostMethods["agents.invoke"][1]>;
-    updateAdapterOverrides(params: WorkerToHostMethods["agents.updateAdapterOverrides"][0]): Promise<WorkerToHostMethods["agents.updateAdapterOverrides"][1]>;
+    /**
+     * Optional: hosts that support plugin-driven agent adapter overrides implement
+     * this. When absent, the gated dispatch throws a clear "not implemented" error
+     * (the protocol method + capability still exist so the surface is forward-compatible).
+     */
+    updateAdapterOverrides?(params: WorkerToHostMethods["agents.updateAdapterOverrides"][0]): Promise<WorkerToHostMethods["agents.updateAdapterOverrides"][1]>;
     managedGet(params: WorkerToHostMethods["agents.managed.get"][0]): Promise<WorkerToHostMethods["agents.managed.get"][1]>;
     managedReconcile(params: WorkerToHostMethods["agents.managed.reconcile"][0]): Promise<WorkerToHostMethods["agents.managed.reconcile"][1]>;
     managedReset(params: WorkerToHostMethods["agents.managed.reset"][0]): Promise<WorkerToHostMethods["agents.managed.reset"][1]>;
@@ -999,6 +1004,9 @@ export function createHostClientHandlers(
       return services.agents.invoke(params);
     }),
     "agents.updateAdapterOverrides": gated("agents.updateAdapterOverrides", async (params) => {
+      if (!services.agents.updateAdapterOverrides) {
+        throw new Error("Host does not implement agents.updateAdapterOverrides");
+      }
       return services.agents.updateAdapterOverrides(params);
     }),
     "agents.managed.get": gated("agents.managed.get", async (params) => {
