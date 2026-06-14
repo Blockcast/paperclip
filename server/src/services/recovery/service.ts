@@ -2861,7 +2861,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   function isWaitingOnReviewContinuationRun(latestRun: LatestIssueRun) {
-    return latestRun?.errorCode === "issue_continuation_waiting_on_review";
+    const context = parseObject(latestRun?.contextSnapshot);
+    return latestRun?.status === "cancelled" &&
+      readNonEmptyString(context.retryReason) === "issue_continuation_needed" &&
+      latestRun.errorCode === "issue_continuation_waiting_on_review";
   }
 
   function hasActiveMonitorPath(issue: typeof issues.$inferSelect) {

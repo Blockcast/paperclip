@@ -4409,5 +4409,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const recoveryWakeups = await getRecoveryWakeups(agentId);
       expect(recoveryWakeups).toHaveLength(0);
     });
+
+    it("does not park non-continuation failures with the review-waiting error code", async () => {
+      const { issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "failed",
+        runErrorCode: "issue_continuation_waiting_on_review",
+      });
+      await db.update(issues)
+        .set({ monitorNextCheckAt: new Date(Date.now() + 60_000) })
+        .where(eq(issues.id, issueId));
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.reviewWaitingParked).toBe(0);
+
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue?.status).not.toBe("in_review");
+    });
   });
 });
