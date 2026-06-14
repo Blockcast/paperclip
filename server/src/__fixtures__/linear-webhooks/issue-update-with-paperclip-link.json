@@ -1,6 +1,6 @@
 {
   "name": "issue-update-with-paperclip-link",
-  "description": "Linear Issue update carrying a Paperclip backlink; covers the recent bidirectional link-sync regression class.",
+  "description": "Linear Issue update for an existing Paperclip mirror; covers the production syncFromLinear + Paperclip backlink branch.",
   "headers": {
     "content-type": "application/json",
     "linear-event": "Issue",
@@ -37,7 +37,7 @@
     "action": "update",
     "paperclipSideEffects": [
       "resolves existing Paperclip/Linear binding instead of creating a duplicate",
-      "parses Paperclip backlink from Linear description and persists a paperclip_issue_link entity"
+      "writes the Paperclip mirror backlink through Linear attachmentCreate"
     ]
   }
 }

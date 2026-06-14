@@ -2,7 +2,8 @@ import express from "express";
 import request from "supertest";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import {
   activityLog,
   companies,
@@ -18,6 +19,10 @@ import { errorHandler } from "../middleware/index.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import { pluginRegistryService } from "../services/plugin-registry.js";
 import { loadLinearWebhookFixtures } from "../services/linear-webhook-fixtures.js";
+import linearPlugin from "../../../packages/plugins/paperclip-plugin-linear/src/worker.js";
+import linearManifest from "../../../packages/plugins/paperclip-plugin-linear/src/manifest.js";
+import * as linearSync from "../../../packages/plugins/paperclip-plugin-linear/src/sync.js";
+import { STATE_KEYS } from "../../../packages/plugins/paperclip-plugin-linear/src/constants.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -192,32 +197,6 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
           data: { linearIdentifier: data.identifier as string | undefined },
         });
 
-        // Exercise the backlink/link-sync path: parse description for a Paperclip
-        // issue URL, look up the referenced issue, and persist a link entity.
-        // This mirrors the production Linear plugin's link-sync handler and
-        // will fail if the backlink parsing or link-sync branch is removed.
-        const description = data.description as string | undefined;
-        if (description) {
-          const backlinkMatch = /\/issues\/([A-Z]+-\d+)/.exec(description);
-          if (backlinkMatch) {
-            const paperclipIdentifier = backlinkMatch[1];
-            const linkedIssue = await db
-              .select()
-              .from(issues)
-              .where(and(eq(issues.companyId, companyId), eq(issues.identifier, paperclipIdentifier)))
-              .then((rows) => rows[0] ?? null);
-            if (linkedIssue) {
-              await registry.upsertEntity(pluginId, {
-                companyId,
-                entityType: "paperclip_issue_link",
-                scopeKind: "company",
-                scopeId: linearIssueId,
-                externalId: linkedIssue.id,
-                data: { paperclipIdentifier, linkedVia: "description" },
-              });
-            }
-          }
-        }
       }
     }
 
@@ -298,28 +277,6 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
       "Issue:update must resolve the existing binding, not create a duplicate (BLO-10264 regression class)",
     ).toHaveLength(1);
 
-    // Issue:update with Paperclip backlink in description → paperclip_issue_link entity
-    // created by parsing the description, not by seeding. This assertion fails if
-    // the backlink extraction or link-sync branch is removed or broken.
-    const links = await db
-      .select()
-      .from(pluginEntities)
-      .where(
-        and(
-          eq(pluginEntities.pluginId, pluginId),
-          eq(pluginEntities.entityType, "paperclip_issue_link"),
-          eq(pluginEntities.scopeId, "lin-issue-001"),
-        ),
-      );
-    expect(
-      links,
-      "Issue:update with Paperclip backlink in description should persist a paperclip_issue_link entity",
-    ).toHaveLength(1);
-    expect(
-      links[0]?.data,
-      "paperclip_issue_link entity data should record the resolved Paperclip issue identifier",
-    ).toMatchObject({ paperclipIdentifier: "FIX-1", linkedVia: "description" });
-
     // Delivery rows: all fixtures delivered successfully
     const deliveries = await db
       .select()
@@ -327,5 +284,139 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
       .where(eq(pluginWebhookDeliveries.pluginId, pluginId));
     expect(deliveries).toHaveLength(fixtures.length + 1);
     expect(deliveries.every((d) => d.status === "success")).toBe(true);
+  });
+});
+
+describe("Linear webhook fixture production contract", () => {
+  it("replays the issue-update fixture through the real Linear plugin backlink path", async () => {
+    const fixtures = await loadLinearWebhookFixtures();
+    const fixture = fixtures.find((candidate) => candidate.name === "issue-update-with-paperclip-link");
+    expect(fixture, "issue-update-with-paperclip-link fixture should exist").toBeDefined();
+
+    const companyId = "company-fixture";
+    const issue = {
+      id: "issue-fixture",
+      companyId,
+      projectId: null,
+      projectWorkspaceId: null,
+      goalId: null,
+      parentId: null,
+      title: "Issue bound to Linear LIN-42",
+      description: null,
+      status: "in_progress",
+      workMode: "standard",
+      priority: "medium",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      checkoutRunId: null,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      issueNumber: 1,
+      identifier: "FIX-1",
+      originKind: "manual",
+      originId: null,
+      originRunId: null,
+      requestDepth: 0,
+      billingCode: null,
+      assigneeAdapterOverrides: null,
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+      executionWorkspaceSettings: null,
+      startedAt: null,
+      completedAt: null,
+      cancelledAt: null,
+      hiddenAt: null,
+      createdAt: new Date("2026-06-13T00:00:00.000Z"),
+      updatedAt: new Date("2026-06-13T00:00:00.000Z"),
+    } as never;
+
+    const harness = createTestHarness({
+      manifest: linearManifest,
+      config: {
+        teamId: "team-fixture",
+        syncComments: true,
+        syncDirection: "bidirectional",
+        paperclipBaseUrl: "https://paperclip.test",
+        linearBacklinkBestEffort: false,
+      },
+    });
+    harness.seed({
+      companies: [
+        {
+          id: companyId,
+          name: "Fixture Replay Co",
+          issuePrefix: "FIX",
+          requireBoardApprovalForNewAgents: false,
+        } as never,
+      ],
+      issues: [issue],
+    });
+    await linearPlugin.definition.setup(harness.ctx);
+    await harness.ctx.state.set({ scopeKind: "instance", stateKey: STATE_KEYS.oauthToken }, "lin_token_fixture");
+    await harness.ctx.state.set({ scopeKind: "instance", stateKey: STATE_KEYS.companyId }, companyId);
+    await linearSync.createLink(harness.ctx, {
+      paperclipIssueId: "issue-fixture",
+      paperclipCompanyId: companyId,
+      linearIssueId: "lin-issue-001",
+      linearIdentifier: "LIN-42",
+      linearUrl: "https://linear.app/blockcast/issue/LIN-42",
+      linearStateType: "backlog",
+      syncDirection: "bidirectional",
+    });
+
+    const linearRequests: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const fetchSpy = vi.spyOn(harness.ctx.http, "fetch").mockImplementation(async (url, init) => {
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : {};
+      linearRequests.push({ url: String(url), body });
+      return new Response(JSON.stringify({
+        data: {
+          attachmentCreate: {
+            success: true,
+            attachment: { id: "att-fixture" },
+          },
+        },
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    try {
+      await linearPlugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: fixture!.body,
+        headers: {},
+        rawBody: JSON.stringify(fixture!.body),
+        requestId: "fixture-issue-update-production",
+      });
+    } finally {
+      fetchSpy.mockRestore();
+    }
+
+    const syncedIssue = await harness.ctx.issues.get("issue-fixture", companyId);
+    expect(syncedIssue, "Issue:update should resolve the existing Paperclip/Linear link").toBeDefined();
+    expect(syncedIssue?.title, "Issue:update should execute production syncFromLinear").toBe("[sanitized-title]");
+
+    const attachmentRequest = linearRequests.find((requestRecord) =>
+      typeof requestRecord.body.query === "string" &&
+      requestRecord.body.query.includes("mutation AttachmentCreate")
+    );
+    expect(attachmentRequest, "Issue:update should call Linear attachmentCreate via production writePaperclipBackLink").toBeDefined();
+    expect(attachmentRequest?.url).toBe("https://api.linear.app/graphql");
+    expect((attachmentRequest?.body.variables as any)?.input).toMatchObject({
+      issueId: "lin-issue-001",
+      url: "https://paperclip.test/FIX/issues/FIX-1",
+      title: "Paperclip mirror: FIX-1",
+      groupBySource: true,
+      metadata: {
+        source: "paperclip",
+        paperclipIssueId: "issue-fixture",
+        paperclipIdentifier: "FIX-1",
+        linearIdentifier: "LIN-42",
+      },
+    });
   });
 });
