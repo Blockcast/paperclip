@@ -22,7 +22,7 @@ const SECRET_HEADER_NAMES = new Set([
   "x-signature",
 ]);
 
-const SENSITIVE_KEY_RE = /(token|secret|signature|authorization|cookie|email|avatar|url|name|displayName|description|body|content|text)$/i;
+const SENSITIVE_KEY_RE = /(token|secret|signature|authorization|cookie|email|avatar|url|name|displayName|title|summary|description|body|content|text)$/i;
 
 export function sanitizeLinearWebhookValue(value: unknown): unknown {
   if (Array.isArray(value)) {

@@ -159,10 +159,25 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
           )
           .then((rows) => rows[0] ?? null);
         if (!binding?.scopeId) return;
+
+        const commentBody = typeof data.body === "string" ? data.body : "";
+        if (!commentBody || commentBody.includes("[synced from Paperclip]")) return;
+
+        const linearCommentId = typeof data.id === "string" ? data.id : null;
+        const sentinelPrefix = linearCommentId ? `<!-- linear-comment-id: ${linearCommentId} -->\n` : "";
+        if (linearCommentId) {
+          const existingComments = await db
+            .select()
+            .from(issueComments)
+            .where(and(eq(issueComments.issueId, binding.scopeId), eq(issueComments.companyId, companyId)));
+          const sentinel = `<!-- linear-comment-id: ${linearCommentId} -->`;
+          if (existingComments.some((comment) => comment.body.includes(sentinel))) return;
+        }
+
         await hostServices.issues.createComment({
           companyId,
           issueId: binding.scopeId,
-          body: `[Linear] ${String(data.body ?? "")}`.trim(),
+          body: `${sentinelPrefix}[Linear] ${commentBody}`.trim(),
         });
       } else if (type === "Issue" && action === "update") {
         // Exercise the entity-dedup path: upsert must resolve to the existing
@@ -243,14 +258,29 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
       expect(response.body).toMatchObject({ status: "success" });
     }
 
+    const commentFixture = fixtures.find((fixture) => fixture.name === "comment-create");
+    expect(commentFixture, "comment-create fixture should exist for retry idempotency coverage").toBeDefined();
+    const retryResponse = await request(app)
+      .post("/api/plugins/paperclip.linear-fixture-replay/webhooks/linear")
+      .set(commentFixture!.headers)
+      .send(commentFixture!.body);
+
+    expect(retryResponse.status, "duplicate Comment:create fixture should replay successfully").toBe(200);
+    expect(retryResponse.body).toMatchObject({ status: "success" });
+
     // Assert persisted Paperclip-side outcomes — not just delivery rows
 
-    // Comment:create → exactly one new comment on the bound Paperclip issue
+    // Comment:create → exactly one new comment on the bound Paperclip issue.
+    // The sync-marker fixture and duplicate replay must both be suppressed.
     const comments = await db
       .select()
       .from(issueComments)
       .where(and(eq(issueComments.issueId, boundIssueId), eq(issueComments.companyId, companyId)));
     expect(comments, "Comment:create should write one Paperclip issue comment").toHaveLength(1);
+    expect(
+      comments[0]?.body,
+      "bridged comments should carry the Linear comment sentinel used for retry idempotency",
+    ).toContain("<!-- linear-comment-id: lin-comment-001 -->");
 
     // Issue:update → binding dedup: exactly one plugin_entities row for "lin-issue-001"
     const bindings = await db
@@ -295,7 +325,7 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
       .select()
       .from(pluginWebhookDeliveries)
       .where(eq(pluginWebhookDeliveries.pluginId, pluginId));
-    expect(deliveries).toHaveLength(fixtures.length);
+    expect(deliveries).toHaveLength(fixtures.length + 1);
     expect(deliveries.every((d) => d.status === "success")).toBe(true);
   });
 });
