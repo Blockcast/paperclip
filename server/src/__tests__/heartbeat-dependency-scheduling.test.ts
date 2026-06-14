@@ -25,6 +25,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { DEP_BLOCKED_RETRY_REASON, heartbeatService } from "../services/heartbeat.js";
+import { getDepBlockedMetric, resetDepBlockedMetrics } from "../services/dep-blocked-metrics.js";
 import {
   composeSweepWakeFramePage,
   sweepWakeFrameSlug,
@@ -159,6 +160,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       resultJson: { exitCode: 0 },
     }));
     runningProcesses.clear();
+    resetDepBlockedMetrics();
     await cleanupHeartbeatTestState(db, heartbeat);
   });
 
@@ -1463,5 +1465,114 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       issueId: blockedIssueId,
       unresolvedBlockerIssueIds: [blockerBId],
     });
+    expect(getDepBlockedMetric("dep_blocked_reset")).toBe(1);
+    expect(getDepBlockedMetric("dep_blocked_scheduled")).toBe(2);
+  });
+
+  it("runs immediately when the final blocker resolves while a dep-blocked retry exists", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerId = randomUUID();
+    const blockedIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Blocker", status: "in_progress", priority: "high" },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+
+    const deferredWake = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: blockedIssueId },
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_assigned" },
+    });
+    expect(deferredWake).toBeNull();
+
+    const depBlockedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          eq(heartbeatRuns.scheduledRetryReason, DEP_BLOCKED_RETRY_REASON),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    expect(depBlockedRun).not.toBeNull();
+
+    await db
+      .update(issues)
+      .set({ status: "done", updatedAt: new Date() })
+      .where(eq(issues.id, blockerId));
+
+    const resolvedWake = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: { issueId: blockedIssueId, resolvedBlockerIssueId: blockerId },
+      contextSnapshot: {
+        issueId: blockedIssueId,
+        wakeReason: "issue_blockers_resolved",
+        resolvedBlockerIssueId: blockerId,
+      },
+    });
+    expect(resolvedWake).not.toBeNull();
+    expect(resolvedWake?.status).toBe("queued");
+
+    const staleRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, depBlockedRun!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(staleRun?.status).toBe("cancelled");
+
+    const staleWakeupRequest = depBlockedRun?.wakeupRequestId
+      ? await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, depBlockedRun.wakeupRequestId))
+        .then((rows) => rows[0] ?? null)
+      : null;
+    expect(staleWakeupRequest?.status).toBe("cancelled");
+
+    const issueLock = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, blockedIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issueLock?.executionRunId).toBe(resolvedWake?.id);
+    expect(getDepBlockedMetric("dep_blocked_reset")).toBe(1);
   });
 });

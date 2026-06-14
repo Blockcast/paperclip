@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   CONCURRENT_RUN_BLOCKED_METRIC,
+  DEP_BLOCKED_WAKEUP_METRIC,
   HEARTBEAT_RUN_FAILED_METRIC,
   KNOWN_BLOCKED_REASONS,
   KNOWN_INVOCATION_SOURCES,
@@ -212,6 +213,16 @@ describe("dep-blocked metrics counters", () => {
     expect(snap.dep_blocked_coalesced).toBe(1);
     expect(snap.dep_blocked_reset).toBe(1);
     expect(snap.dep_blocked_promoted).toBe(0);
+  });
+
+  it("renders dep-blocked counters in Prometheus output", async () => {
+    incrementDepBlockedMetric("dep_blocked_scheduled");
+    incrementDepBlockedMetric("dep_blocked_coalesced");
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${DEP_BLOCKED_WAKEUP_METRIC} counter`);
+    expect(body).toContain(`${DEP_BLOCKED_WAKEUP_METRIC}{outcome="dep_blocked_scheduled"} 1`);
+    expect(body).toContain(`${DEP_BLOCKED_WAKEUP_METRIC}{outcome="dep_blocked_coalesced"} 1`);
   });
 
   it("snapshot returns a copy that does not mutate on further increments", () => {

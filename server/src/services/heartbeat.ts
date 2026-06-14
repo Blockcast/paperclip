@@ -86,6 +86,7 @@ import type {
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
+import { incrementDepBlockedMetric } from "./dep-blocked-metrics.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
@@ -7315,6 +7316,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .returning()
               .then((rows) => rows[0] ?? null);
             if (exhausted) {
+              incrementDepBlockedMetric("dep_blocked_exhausted");
               await appendRunEvent(exhausted, await nextRunEventSeq(exhausted.id), {
                 eventType: "lifecycle",
                 stream: "system",
@@ -7326,13 +7328,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
                 },
               });
+              if (exhausted.wakeupRequestId) {
+                await db
+                  .update(agentWakeupRequests)
+                  .set({
+                    status: "cancelled",
+                    finishedAt: now,
+                    error: "Cancelled because dependency-blocked retry exhausted",
+                    updatedAt: now,
+                  })
+                  .where(eq(agentWakeupRequests.id, exhausted.wakeupRequestId));
+              }
+              await db
+                .update(issues)
+                .set({
+                  executionRunId: null,
+                  executionAgentNameKey: null,
+                  executionLockedAt: null,
+                  updatedAt: now,
+                })
+                .where(and(eq(issues.id, depIssueId), eq(issues.executionRunId, exhausted.id)));
             }
             return { outcome: "not_promoted", run: exhausted };
           }
           const nextDueAt = new Date(now.getTime() + depBlockedRetryDelayMs(nextAttempt));
+          const nextContextSnapshot = {
+            ...parseObject(dueRun.contextSnapshot),
+            unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+            unresolvedBlockerCount: readiness.unresolvedBlockerCount,
+          };
           const rescheduled = await db
             .update(heartbeatRuns)
-            .set({ scheduledRetryAttempt: nextAttempt, scheduledRetryAt: nextDueAt, updatedAt: now })
+            .set({
+              contextSnapshot: nextContextSnapshot,
+              scheduledRetryAttempt: nextAttempt,
+              scheduledRetryAt: nextDueAt,
+              updatedAt: now,
+            })
             .where(
               and(
                 eq(heartbeatRuns.id, dueRun.id),
@@ -7343,6 +7375,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .returning()
             .then((rows) => rows[0] ?? null);
           if (rescheduled) {
+            incrementDepBlockedMetric("dep_blocked_redeferred");
             await appendRunEvent(rescheduled, await nextRunEventSeq(rescheduled.id), {
               eventType: "lifecycle",
               stream: "system",
@@ -7377,6 +7410,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .returning()
       .then((rows) => rows[0] ?? null);
     if (!promoted) return { outcome: "not_promoted", run: null };
+
+    if (promoted.scheduledRetryReason === DEP_BLOCKED_RETRY_REASON) {
+      incrementDepBlockedMetric("dep_blocked_promoted");
+    }
 
     await appendRunEvent(promoted, await nextRunEventSeq(promoted.id), {
       eventType: "lifecycle",
@@ -13321,6 +13358,77 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
 
+        const cancelDepBlockedScheduledRetry = async (
+          scheduledRun: typeof heartbeatRuns.$inferSelect,
+          reason: string,
+          errorCode: string,
+          eventMessage: string,
+          payload: Record<string, unknown>,
+        ) => {
+          const now = new Date();
+          const cancelled = await tx
+            .update(heartbeatRuns)
+            .set({
+              status: "cancelled",
+              finishedAt: now,
+              error: reason,
+              errorCode,
+              updatedAt: now,
+            })
+            .where(and(eq(heartbeatRuns.id, scheduledRun.id), eq(heartbeatRuns.status, "scheduled_retry")))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+
+          if (!cancelled) return false;
+
+          incrementDepBlockedMetric("dep_blocked_reset");
+
+          if (scheduledRun.wakeupRequestId) {
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "cancelled",
+                finishedAt: now,
+                error: reason,
+                updatedAt: now,
+              })
+              .where(eq(agentWakeupRequests.id, scheduledRun.wakeupRequestId));
+          }
+          await tx
+            .update(issues)
+            .set({
+              executionRunId: null,
+              executionAgentNameKey: null,
+              executionLockedAt: null,
+              updatedAt: now,
+            })
+            .where(and(eq(issues.id, issue.id), eq(issues.executionRunId, scheduledRun.id)));
+
+          const [eventSeq] = await tx
+            .select({ maxSeq: sql<number | null>`max(${heartbeatRunEvents.seq})` })
+            .from(heartbeatRunEvents)
+            .where(eq(heartbeatRunEvents.runId, cancelled.id));
+
+          await tx.insert(heartbeatRunEvents).values({
+            companyId: cancelled.companyId,
+            runId: cancelled.id,
+            agentId: cancelled.agentId,
+            seq: Number(eventSeq?.maxSeq ?? 0) + 1,
+            eventType: "lifecycle",
+            stream: "system",
+            level: "info",
+            message: eventMessage,
+            payload: {
+              issueId: issue.id,
+              scheduledRetryAttempt: cancelled.scheduledRetryAttempt,
+              scheduledRetryAt: cancelled.scheduledRetryAt ? new Date(cancelled.scheduledRetryAt).toISOString() : null,
+              ...payload,
+            },
+          });
+
+          return true;
+        };
+
         if (
           blockedInteractionWake &&
           activeExecutionRun &&
@@ -13374,6 +13482,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
 
+        if (
+          activeExecutionRun &&
+          activeExecutionRun.scheduledRetryReason === DEP_BLOCKED_RETRY_REASON &&
+          dependencyReadiness?.isDependencyReady
+        ) {
+          const cancelled = await cancelDepBlockedScheduledRetry(
+            activeExecutionRun,
+            "Cancelled because dependencies resolved before the scheduled retry became due",
+            "dep_blockers_resolved",
+            "Dependency-blocked scheduled retry cancelled because blockers resolved before it became due",
+            { unresolvedBlockerIssueIds: [] },
+          );
+          if (cancelled) {
+            activeExecutionRun = null;
+          }
+        }
+
         // If there is an existing dep-blocked scheduled_retry whose blocker set no longer
         // matches the current blockers, cancel it so we create a fresh one below.
         if (
@@ -13393,50 +13518,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const setsMatch =
             storedSet.size === currentSet.size && [...storedSet].every((id) => currentSet.has(id));
           if (!setsMatch) {
-            const now = new Date();
-            const cancelled = await tx
-              .update(heartbeatRuns)
-              .set({
-                status: "cancelled",
-                finishedAt: now,
-                error: "Cancelled because the dependency blocker set changed before the scheduled retry became due",
-                errorCode: "dep_blockers_changed",
-                updatedAt: now,
-              })
-              .where(
-                and(
-                  eq(heartbeatRuns.id, activeExecutionRun.id),
-                  eq(heartbeatRuns.status, "scheduled_retry"),
-                ),
-              )
-              .returning()
-              .then((rows) => rows[0] ?? null);
+            const cancelled = await cancelDepBlockedScheduledRetry(
+              activeExecutionRun,
+              "Cancelled because the dependency blocker set changed before the scheduled retry became due",
+              "dep_blockers_changed",
+              "Dependency-blocked scheduled retry cancelled because the blocker set changed before it became due",
+              {
+                previousUnresolvedBlockerIssueIds: [...storedSet],
+                currentUnresolvedBlockerIssueIds: currentBlockerIds,
+              },
+            );
             if (cancelled) {
-              if (activeExecutionRun.wakeupRequestId) {
-                await tx
-                  .update(agentWakeupRequests)
-                  .set({
-                    status: "cancelled",
-                    finishedAt: now,
-                    error: "Cancelled because the dependency blocker set changed",
-                    updatedAt: now,
-                  })
-                  .where(eq(agentWakeupRequests.id, activeExecutionRun.wakeupRequestId));
-              }
-              await tx
-                .update(issues)
-                .set({
-                  executionRunId: null,
-                  executionAgentNameKey: null,
-                  executionLockedAt: null,
-                  updatedAt: now,
-                })
-                .where(
-                  and(
-                    eq(issues.id, issue.id),
-                    eq(issues.executionRunId, activeExecutionRun.id),
-                  ),
-                );
               activeExecutionRun = null;
             }
           }
@@ -13499,6 +13591,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               updatedAt: now,
             })
             .where(eq(issues.id, issue.id));
+          incrementDepBlockedMetric("dep_blocked_scheduled");
           return { kind: "dep_blocked_scheduled" as const, run: scheduledRun };
         }
 
@@ -13564,6 +13657,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               runId: mergedRun.id,
               finishedAt: new Date(),
             });
+
+            if (activeExecutionRun.scheduledRetryReason === DEP_BLOCKED_RETRY_REASON) {
+              incrementDepBlockedMetric("dep_blocked_coalesced");
+            }
 
             return { kind: "coalesced" as const, run: mergedRun };
           }
