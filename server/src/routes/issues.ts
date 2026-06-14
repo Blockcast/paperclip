@@ -1860,6 +1860,7 @@ export function issueRoutes(
     options: {
       allowBlockedCorrection?: boolean;
       allowScopedRecoveryOwnerSourceMutation?: boolean;
+      allowRecoveryActionOwner?: boolean;
     } = {},
   ) {
     if (req.actor.type !== "agent") return true;
@@ -1873,6 +1874,10 @@ export function issueRoutes(
     }
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
     if (!boundaryDecision.allowed) {
+      if (options.allowRecoveryActionOwner && req.actor.companyId === issue.companyId) {
+        const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+        if (activeRecoveryAction?.ownerAgentId === actorAgentId) return true;
+      }
       res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
       return false;
     }
@@ -3067,7 +3072,7 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, existing.companyId);
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    if (!(await assertAgentIssueMutationAllowed(req, res, existing, { allowRecoveryActionOwner: true }))) return;
     const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id);
     if (
       !(await assertRecoveryActionAuthority(
