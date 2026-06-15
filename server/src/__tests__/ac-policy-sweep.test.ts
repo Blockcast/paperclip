@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { partitionAcPolicyCancelCandidates, type AcPolicyCancelCandidate } from "../services/ac-policy-sweep.js";
+import {
+  formatAcPolicyCancelDashboardSections,
+  partitionAcPolicyCancelCandidates,
+  planAcPolicyAutoCancelBatch,
+  type AcPolicyCancelCandidate,
+} from "../services/ac-policy-sweep.js";
 
 describe("AC-policy auto-cancel candidate partitioning", () => {
   it("keeps only stale agent-owned work in auto-cancel-safe from a mixed candidate fixture", () => {
@@ -68,5 +73,98 @@ describe("AC-policy auto-cancel candidate partitioning", () => {
     expect(partitioned.needsHumanTriage.find((issue) => issue.id === "active-blocker")?.triageReasons).toEqual([
       "active_blocker_for_non_terminal_parent",
     ]);
+  });
+
+  it("does not triage candidates that only block terminal parent work", () => {
+    const candidates: AcPolicyCancelCandidate[] = [
+      {
+        id: "terminal-parent-blocker",
+        identifier: "BLO-6",
+        title: "Old proof task blocking completed parent",
+        status: "todo",
+        assigneeAgentId: "agent-1",
+        blocks: [{ id: "parent-1", identifier: "BLO-7", status: "done" }],
+      },
+    ];
+
+    const partitioned = partitionAcPolicyCancelCandidates(candidates);
+
+    expect(partitioned.autoCancelSafe.map((issue) => issue.id)).toEqual(["terminal-parent-blocker"]);
+    expect(partitioned.needsHumanTriage).toEqual([]);
+  });
+
+  it("triages blockers with missing parent status instead of destructively cancelling unknown dependency work", () => {
+    const candidates: AcPolicyCancelCandidate[] = [
+      {
+        id: "unknown-parent-status",
+        identifier: "BLO-8",
+        title: "Old proof task with partial relation data",
+        status: "todo",
+        assigneeAgentId: "agent-1",
+        blocks: [{ id: "parent-1", identifier: "BLO-9" }],
+      },
+    ];
+
+    const partitioned = partitionAcPolicyCancelCandidates(candidates);
+
+    expect(partitioned.autoCancelSafe).toEqual([]);
+    expect(partitioned.needsHumanTriage[0]?.triageReasons).toEqual(["active_blocker_for_non_terminal_parent"]);
+  });
+
+  it("applies the destructive safety cap only to auto-cancel-safe candidates", () => {
+    const candidates: AcPolicyCancelCandidate[] = [
+      {
+        id: "safe-1",
+        identifier: "BLO-10",
+        title: "Stale task one",
+        status: "todo",
+        assigneeAgentId: "agent-1",
+      },
+      {
+        id: "safe-2",
+        identifier: "BLO-11",
+        title: "Stale task two",
+        status: "todo",
+        assigneeAgentId: "agent-1",
+      },
+      {
+        id: "triage-1",
+        identifier: "BLO-12",
+        title: "Board ask",
+        status: "todo",
+        assigneeUserId: "user-1",
+      },
+    ];
+
+    const plan = planAcPolicyAutoCancelBatch(candidates, 1);
+
+    expect(plan.cancelPaused).toBe(true);
+    expect(plan.autoCancelBatch).toEqual([]);
+    expect(plan.autoCancelSafe.map((issue) => issue.id)).toEqual(["safe-1", "safe-2"]);
+    expect(plan.needsHumanTriage.map((issue) => issue.id)).toEqual(["triage-1"]);
+  });
+
+  it("formats dashboard output with separate safe and triage sections", () => {
+    const candidates: AcPolicyCancelCandidate[] = [
+      {
+        id: "safe-1",
+        identifier: "BLO-13",
+        title: "Stale task",
+        status: "todo",
+        assigneeAgentId: "agent-1",
+      },
+      {
+        id: "triage-1",
+        identifier: "BLO-14",
+        title: "Board ask",
+        status: "todo",
+        assigneeUserId: "user-1",
+      },
+    ];
+
+    expect(formatAcPolicyCancelDashboardSections(candidates)).toContain("### Auto-cancel-safe candidates (1)");
+    expect(formatAcPolicyCancelDashboardSections(candidates)).toContain("- BLO-13 (safe-1) - Stale task");
+    expect(formatAcPolicyCancelDashboardSections(candidates)).toContain("### Needs-human-triage candidates (1)");
+    expect(formatAcPolicyCancelDashboardSections(candidates)).toContain("- BLO-14 (triage-1) - Board ask (user_assigned)");
   });
 });

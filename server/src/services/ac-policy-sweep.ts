@@ -5,6 +5,8 @@ const PRODUCTIVITY_REVIEW_ORIGIN_KINDS = new Set([
   "productivity_review_escalation",
 ]);
 
+export const DEFAULT_AC_POLICY_CANCEL_SAFETY_CAP = 25;
+
 export type AcPolicyIssueRef = {
   id: string;
   identifier?: string | null;
@@ -48,7 +50,7 @@ export function classifyAcPolicyCancelCandidate(
 
   const activeBlockedParents = (candidate.blocks ?? []).filter((parent) => {
     const status = parent.status ?? null;
-    return status !== null && !TERMINAL_STATUSES.has(status);
+    return status === null || !TERMINAL_STATUSES.has(status);
   });
   if (activeBlockedParents.length > 0) {
     reasons.push("active_blocker_for_non_terminal_parent");
@@ -72,4 +74,55 @@ export function partitionAcPolicyCancelCandidates(candidates: AcPolicyCancelCand
   }
 
   return { autoCancelSafe, needsHumanTriage };
+}
+
+export function planAcPolicyAutoCancelBatch(
+  candidates: AcPolicyCancelCandidate[],
+  safetyCap = DEFAULT_AC_POLICY_CANCEL_SAFETY_CAP,
+) {
+  const partitioned = partitionAcPolicyCancelCandidates(candidates);
+  const cancelPaused = partitioned.autoCancelSafe.length > safetyCap;
+
+  return {
+    ...partitioned,
+    safetyCap,
+    cancelPaused,
+    autoCancelBatch: cancelPaused ? [] : partitioned.autoCancelSafe,
+  };
+}
+
+function formatIssueRef(issue: AcPolicyCancelCandidate) {
+  return issue.identifier ? `${issue.identifier} (${issue.id})` : issue.id;
+}
+
+export function formatAcPolicyCancelDashboardSections(candidates: AcPolicyCancelCandidate[]) {
+  const plan = planAcPolicyAutoCancelBatch(candidates);
+  const lines: string[] = [`### Auto-cancel-safe candidates (${plan.autoCancelSafe.length})`];
+
+  if (plan.cancelPaused) {
+    lines.push(
+      `Cancellation paused: ${plan.autoCancelSafe.length} safe candidates exceeds safety cap ${plan.safetyCap}.`,
+    );
+  }
+
+  if (plan.autoCancelSafe.length === 0) {
+    lines.push("- None");
+  } else {
+    for (const candidate of plan.autoCancelSafe) {
+      lines.push(`- ${formatIssueRef(candidate)} - ${candidate.title}`);
+    }
+  }
+
+  lines.push("", `### Needs-human-triage candidates (${plan.needsHumanTriage.length})`);
+  if (plan.needsHumanTriage.length === 0) {
+    lines.push("- None");
+  } else {
+    for (const candidate of plan.needsHumanTriage) {
+      lines.push(
+        `- ${formatIssueRef(candidate)} - ${candidate.title} (${candidate.triageReasons.join(", ")})`,
+      );
+    }
+  }
+
+  return lines.join("\n");
 }
