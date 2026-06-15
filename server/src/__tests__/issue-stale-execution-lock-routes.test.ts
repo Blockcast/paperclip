@@ -307,6 +307,104 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     });
   });
 
+  it("allows a same-agent active issue-scoped run to adopt mismatched live run ownership", async () => {
+    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns({
+      staleRunStatus: "running",
+    });
+    const issueId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Routine close from active scoped run",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: failedRunId,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.status).toBe("done");
+
+    const row = await db
+      .select({
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "done",
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+  });
+
+  it("lets an active issue-scoped routine publish a sweep comment then close its run issue", async () => {
+    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns({
+      staleRunStatus: "running",
+    });
+    const routineIssueId = randomUUID();
+    const sweepTargetIssueId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId: routineIssueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
+    await db.insert(issues).values([
+      {
+        id: routineIssueId,
+        companyId,
+        title: "Agent health & stalled-issue check",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        checkoutRunId: failedRunId,
+        executionRunId: failedRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      },
+      {
+        id: sweepTargetIssueId,
+        companyId,
+        title: "[Sweep] Agent health & stalled-issue alerts",
+        status: "done",
+        priority: "medium",
+        assigneeAgentId: agentId,
+      },
+    ]);
+
+    const app = createApp(agentActor(companyId, agentId, currentRunId));
+    const commentRes = await request(app)
+      .post(`/api/issues/${sweepTargetIssueId}/comments`)
+      .send({ body: "sweep complete" });
+    expect(commentRes.status, JSON.stringify(commentRes.body)).toBe(201);
+
+    const closeRes = await request(app)
+      .patch(`/api/issues/${routineIssueId}`)
+      .send({ status: "done" });
+    expect(closeRes.status, JSON.stringify(closeRes.body)).toBe(200);
+    expect(closeRes.body.status).toBe("done");
+
+    const comment = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sweepTargetIssueId))
+      .then((rows) => rows[0]);
+    expect(comment?.body).toBe("sweep complete");
+  });
+
   it("keeps live different-run ownership protected", async () => {
     const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns({
       staleRunStatus: "running",
