@@ -38,7 +38,7 @@ export function classifyAcPolicyCancelCandidate(
     reasons.push("user_assigned");
   }
 
-  if (!candidate.assigneeAgentId && candidate.createdByUserId) {
+  if (candidate.createdByUserId) {
     reasons.push("user_owned_protected");
   }
 

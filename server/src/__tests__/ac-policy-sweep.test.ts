@@ -93,6 +93,25 @@ describe("AC-policy auto-cancel candidate partitioning", () => {
     expect(partitioned.needsHumanTriage).toEqual([]);
   });
 
+  it("triages user-created board asks even when currently assigned to an agent", () => {
+    const candidates: AcPolicyCancelCandidate[] = [
+      {
+        id: "user-created-agent-assigned",
+        identifier: "BLO-15",
+        title: "Board ask assigned to CTO",
+        status: "todo",
+        assigneeAgentId: "agent-1",
+        assigneeUserId: null,
+        createdByUserId: "user-1",
+      },
+    ];
+
+    const partitioned = partitionAcPolicyCancelCandidates(candidates);
+
+    expect(partitioned.autoCancelSafe).toEqual([]);
+    expect(partitioned.needsHumanTriage[0]?.triageReasons).toEqual(["user_owned_protected"]);
+  });
+
   it("triages blockers with missing parent status instead of destructively cancelling unknown dependency work", () => {
     const candidates: AcPolicyCancelCandidate[] = [
       {
