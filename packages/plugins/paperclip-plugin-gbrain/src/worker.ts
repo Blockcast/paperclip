@@ -95,11 +95,7 @@ const plugin = definePlugin({
       // If OAuth is loaded, missing agent entries are a provisioning gap.
       // Preserve the auth boundary by failing before any anonymous call.
       return new GbrainClient({
-        url: resolveGbrainUrlForAgent({
-          configuredUrl: gbrainUrl,
-          oauthLoaded: oauth !== null,
-          hasAgentClient: false,
-        }),
+        url: resolveGbrainUrlForAgent(gbrainUrl),
         authProvider: oauth ? () => oauth.getToken(agentId) : undefined,
       });
     }
