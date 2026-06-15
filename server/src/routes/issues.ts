@@ -686,7 +686,11 @@ async function assertCanManageIssueMonitor(
   accessSvc: ReturnType<typeof accessService>,
   req: Request,
   companyId: string,
-  assigneeAgentId: string | null,
+  issue: {
+    assigneeAgentId?: string | null;
+    checkoutRunId?: string | null;
+    executionRunId?: string | null;
+  },
   monitorChanged: boolean,
 ) {
   if (!monitorChanged) return;
@@ -699,8 +703,19 @@ async function assertCanManageIssueMonitor(
   if (!runtimeDecision.allowed) {
     throw forbidden(runtimeDecision.explanation);
   }
-  if (req.actor.type === "agent" && req.actor.agentId && req.actor.agentId === assigneeAgentId) return;
+  if (req.actor.type === "agent" && req.actor.agentId && req.actor.agentId === issue.assigneeAgentId) return;
+  if (req.actor.type === "agent" && req.actor.agentId && isCurrentIssueExecutionRun(req, issue)) return;
   throw forbidden("Only the assignee agent or a board user can manage issue monitors");
+}
+
+function isCurrentIssueExecutionRun(
+  req: Request,
+  issue: { checkoutRunId?: string | null; executionRunId?: string | null },
+) {
+  if (req.actor.type !== "agent") return false;
+  const runId = req.actor.runId;
+  if (!runId) return false;
+  return issue.checkoutRunId === runId || issue.executionRunId === runId;
 }
 
 function summarizeIssueMonitor(
@@ -1855,6 +1870,8 @@ export function issueRoutes(
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
       executionState?: unknown;
     },
     options: {
@@ -1870,6 +1887,9 @@ export function issueRoutes(
       return false;
     }
     if (options.allowScopedRecoveryOwnerSourceMutation) {
+      return true;
+    }
+    if (isCurrentIssueExecutionRun(req, issue)) {
       return true;
     }
     const isActiveRecoveryActionOwner = async () => {
@@ -4485,7 +4505,13 @@ export function issueRoutes(
       normalizeIssueExecutionPolicy(createBody.executionPolicy),
       actor.actorType,
     );
-    await assertCanManageIssueMonitor(access, req, companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
+    await assertCanManageIssueMonitor(
+      access,
+      req,
+      companyId,
+      { assigneeAgentId: createBody.assigneeAgentId ?? null },
+      Boolean(executionPolicy?.monitor),
+    );
     const issueId = randomUUID();
     const sourceTrust = await sourceTrustForActorWrite({
       id: issueId,
@@ -4605,7 +4631,13 @@ export function issueRoutes(
       normalizeIssueExecutionPolicy(createBody.executionPolicy),
       actor.actorType,
     );
-    await assertCanManageIssueMonitor(access, req, parent.companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
+    await assertCanManageIssueMonitor(
+      access,
+      req,
+      parent.companyId,
+      { assigneeAgentId: createBody.assigneeAgentId ?? null },
+      Boolean(executionPolicy?.monitor),
+    );
     const issueId = randomUUID();
     const sourceTrust = await sourceTrustForActorWrite({
       id: issueId,
@@ -4734,7 +4766,13 @@ export function issueRoutes(
         normalizeIssueExecutionPolicy(child.executionPolicy),
         actor.actorType,
       );
-      await assertCanManageIssueMonitor(access, req, sourceIssue.companyId, child.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
+      await assertCanManageIssueMonitor(
+        access,
+        req,
+        sourceIssue.companyId,
+        { assigneeAgentId: child.assigneeAgentId ?? null },
+        Boolean(executionPolicy?.monitor),
+      );
       const childIssueId = randomUUID();
       const sourceTrust = await sourceTrustForActorWrite({
         id: childIssueId,
@@ -4854,7 +4892,7 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    await assertCanManageIssueMonitor(access, req, issue.companyId, issue.assigneeAgentId, true);
+    await assertCanManageIssueMonitor(access, req, issue.companyId, issue, true);
 
     const actor = getActorInfo(req);
     await heartbeat.triggerIssueMonitor(issue.id, {
@@ -5151,7 +5189,7 @@ export function issueRoutes(
       access,
       req,
       existing.companyId,
-      existing.assigneeAgentId,
+      existing,
       req.body.executionPolicy !== undefined && monitorChanged,
     );
 
@@ -5165,6 +5203,10 @@ export function issueRoutes(
         assigneeUserId:
           req.body.assigneeUserId === undefined ? undefined : (req.body.assigneeUserId as string | null),
       },
+      effectiveMonitorAssigneeAgentId:
+        req.actor.type === "agent" && isCurrentIssueExecutionRun(req, existing)
+          ? req.actor.agentId ?? null
+          : null,
       actor: {
         agentId: actor.agentId ?? null,
         userId: actor.actorType === "user" ? actor.actorId : null,
@@ -5224,9 +5266,18 @@ export function issueRoutes(
       allowScopedRecoveryOwnerSourceMutation &&
       req.actor.type === "agent" &&
       req.body.assigneeAgentId !== undefined;
+    const isCurrentRunMonitorAssigneeRestore =
+      req.actor.type === "agent" &&
+      isCurrentIssueExecutionRun(req, existing) &&
+      existing.assigneeAgentId === null &&
+      nextAssigneeAgentId === req.actor.agentId &&
+      nextAssigneeUserId === null &&
+      req.body.assigneeAgentId === undefined &&
+      req.body.assigneeUserId === undefined &&
+      nextExecutionPolicy?.monitor;
 
     if (assigneeWillChange && !transition.workflowControlledAssignment) {
-      if (!isAgentReturningIssueToCreator && !isScopedRecoveryOwnerReturnAssignment) {
+      if (!isAgentReturningIssueToCreator && !isScopedRecoveryOwnerReturnAssignment && !isCurrentRunMonitorAssigneeRestore) {
         await assertCanAssignTasks(req, existing.companyId, {
           issueId: existing.id,
           projectId: await resolveAssignmentProjectId({
