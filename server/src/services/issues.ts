@@ -4020,14 +4020,47 @@ export function issueService(db: Db) {
     return context.issueId === input.issueId || context.taskId === input.issueId;
   }
 
+  async function isActorRunNewerThanIssueOwners(input: {
+    companyId: string;
+    actorRunId: string;
+    ownerRunIds: string[];
+  }) {
+    const ownerRunIds = [...new Set(input.ownerRunIds.filter((id) => id && id !== input.actorRunId))];
+    if (ownerRunIds.length === 0) return true;
+
+    const rows = await db
+      .select({ id: heartbeatRuns.id, createdAt: heartbeatRuns.createdAt })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          inArray(heartbeatRuns.id, [input.actorRunId, ...ownerRunIds]),
+        ),
+      );
+    const createdAtByRunId = new Map(rows.map((row) => [row.id, row.createdAt.getTime()]));
+    const actorCreatedAt = createdAtByRunId.get(input.actorRunId);
+    if (actorCreatedAt == null) return false;
+
+    return ownerRunIds.every((ownerRunId) => {
+      const ownerCreatedAt = createdAtByRunId.get(ownerRunId);
+      return ownerCreatedAt == null || actorCreatedAt > ownerCreatedAt;
+    });
+  }
+
   async function adoptActiveActorIssueRun(input: {
     issueId: string;
     companyId: string;
     actorAgentId: string;
     actorRunId: string;
     expectedCheckoutRunId: string | null;
+    expectedExecutionRunId: string | null;
   }) {
     if (!(await isActiveActorRunForIssue(input))) return null;
+    if (!(await isActorRunNewerThanIssueOwners({
+      companyId: input.companyId,
+      actorRunId: input.actorRunId,
+      ownerRunIds: [input.expectedCheckoutRunId, input.expectedExecutionRunId].filter((id): id is string => Boolean(id)),
+    }))) return null;
 
     const now = new Date();
     return db
@@ -4047,6 +4080,9 @@ export function issueService(db: Db) {
           input.expectedCheckoutRunId
             ? eq(issues.checkoutRunId, input.expectedCheckoutRunId)
             : isNull(issues.checkoutRunId),
+          input.expectedExecutionRunId
+            ? eq(issues.executionRunId, input.expectedExecutionRunId)
+            : undefined,
         ),
       )
       .returning({
@@ -6767,6 +6803,7 @@ export function issueService(db: Db) {
           actorAgentId,
           actorRunId,
           expectedCheckoutRunId: null,
+          expectedExecutionRunId: current.executionRunId,
         });
 
         if (activeActorRun) {
@@ -6791,6 +6828,7 @@ export function issueService(db: Db) {
           actorAgentId,
           actorRunId,
           expectedCheckoutRunId: null,
+          expectedExecutionRunId: current.executionRunId,
         });
 
         if (activeActorRun) {
@@ -6828,6 +6866,7 @@ export function issueService(db: Db) {
           actorAgentId,
           actorRunId,
           expectedCheckoutRunId: current.checkoutRunId,
+          expectedExecutionRunId: current.executionRunId,
         });
 
         if (activeActorRun) {

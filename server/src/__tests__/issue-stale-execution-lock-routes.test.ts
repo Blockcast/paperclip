@@ -74,6 +74,8 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     const failedRunId = randomUUID();
     const currentRunId = randomUUID();
     const staleRunStatus = options.staleRunStatus ?? "failed";
+    const staleRunCreatedAt = new Date("2026-01-01T00:00:00.000Z");
+    const currentRunCreatedAt = new Date("2026-01-01T00:01:00.000Z");
 
     await db.insert(companies).values({
       id: companyId,
@@ -100,6 +102,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         status: staleRunStatus,
         invocationSource: "manual",
         finishedAt: new Date(),
+        createdAt: staleRunCreatedAt,
       },
       {
         id: currentRunId,
@@ -108,6 +111,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         status: "running",
         invocationSource: "manual",
         startedAt: new Date(),
+        createdAt: currentRunCreatedAt,
       },
     ]);
 
@@ -349,6 +353,58 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       status: "done",
       checkoutRunId: null,
       executionRunId: null,
+    });
+  });
+
+  it("rejects stale output after a newer active issue-scoped run adopts ownership", async () => {
+    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns({
+      staleRunStatus: "running",
+    });
+    const issueId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(inArray(heartbeatRuns.id, [failedRunId, currentRunId]));
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Active run adoption race",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: failedRunId,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const newerRunRes = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "claimed by newer run" });
+
+    expect(newerRunRes.status, JSON.stringify(newerRunRes.body)).toBe(200);
+    expect(newerRunRes.body.title).toBe("claimed by newer run");
+
+    const staleRunRes = await request(createApp(agentActor(companyId, agentId, failedRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "older stale output" });
+
+    expect(staleRunRes.status, JSON.stringify(staleRunRes.body)).toBe(409);
+    expect(staleRunRes.body.error).toBe("Issue run ownership conflict");
+
+    const row = await db
+      .select({
+        title: issues.title,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      title: "claimed by newer run",
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
     });
   });
 
