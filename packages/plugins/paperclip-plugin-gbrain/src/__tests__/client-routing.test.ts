@@ -1,8 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { resolveGbrainUrlForAgent } from "../client-routing.js";
-import {
-  DEFAULT_GBRAIN_MCP_URL,
-} from "../manifest.js";
+import { DEFAULT_GBRAIN_MCP_URL } from "../manifest.js";
 
 describe("resolveGbrainUrlForAgent", () => {
   it("keeps agents with OAuth clients on the configured URL", () => {
