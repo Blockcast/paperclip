@@ -9,6 +9,10 @@ import type { PluginContext, Issue } from "@paperclipai/plugin-sdk";
 type IssueStatus = Issue["status"];
 import { STATE_KEYS } from "./constants.js";
 import * as linear from "./linear.js";
+import {
+  absolutizePaperclipMarkdownLinks,
+  stripPaperclipProjectBacklink,
+} from "./markdown.js";
 
 export interface IssueLink {
   paperclipIssueId: string;
@@ -195,6 +199,7 @@ export interface SyncChanges {
   description?: string;
   estimate?: number | null;
   dueDate?: string | null;
+  projectId?: string | null;
 }
 
 export async function syncToLinear(
@@ -203,6 +208,7 @@ export async function syncToLinear(
   changes: SyncChanges,
   token: string,
   teamId: string,
+  paperclipLinkOptions?: { baseUrl: string | null; companyPrefix?: string | null },
 ): Promise<void> {
   if (link.syncDirection === "linear-to-paperclip") return;
 
@@ -245,7 +251,11 @@ export async function syncToLinear(
 
   // Description → Linear description
   if (changes.description !== undefined) {
-    linearUpdate.description = changes.description ?? "";
+    linearUpdate.description = absolutizePaperclipMarkdownLinks(
+      changes.description ?? "",
+      paperclipLinkOptions?.baseUrl ?? null,
+      paperclipLinkOptions?.companyPrefix ?? null,
+    );
     synced.push("description");
   }
 
@@ -259,6 +269,32 @@ export async function syncToLinear(
   if (changes.dueDate !== undefined) {
     linearUpdate.dueDate = changes.dueDate;
     synced.push(`dueDate:${changes.dueDate ?? "none"}`);
+  }
+
+  // Paperclip project move → Linear project move
+  if (changes.projectId !== undefined) {
+    const targetPaperclipProjectId = typeof changes.projectId === "string"
+      ? changes.projectId.trim()
+      : "";
+
+    if (!targetPaperclipProjectId) {
+      linearUpdate.projectId = null;
+      synced.push("project:none");
+    } else {
+      const projectLink = await getProjectLink(ctx, targetPaperclipProjectId);
+      if (!projectLink) {
+        ctx.logger.warn(
+          `Skipping Linear project move for ${link.linearIdentifier}: Paperclip project ${targetPaperclipProjectId} is not linked to Linear`,
+        );
+      } else if (projectLink.paperclipCompanyId !== link.paperclipCompanyId) {
+        ctx.logger.warn(
+          `Skipping Linear project move for ${link.linearIdentifier}: target project belongs to another company`,
+        );
+      } else {
+        linearUpdate.projectId = projectLink.linearProjectId;
+        synced.push(`project:${projectLink.linearProjectName ?? projectLink.linearProjectId}`);
+      }
+    }
   }
 
   if (Object.keys(linearUpdate).length === 0) return;
@@ -283,7 +319,10 @@ export interface ProjectLink {
   syncDirection: "bidirectional" | "linear-to-paperclip" | "paperclip-to-linear";
   lastSyncAt: string;
   lastLinearState: string;
+  lastLinearDescription?: string | null;
 }
+
+export type ProjectDriftSyncResult = "updated" | "unchanged" | "unavailable" | "failed";
 
 function projectLinkStateKey(paperclipProjectId: string): string {
   return `${STATE_KEYS.projectLinkPrefix}${paperclipProjectId}`;
@@ -337,6 +376,7 @@ export async function createProjectLink(
     syncDirection: params.syncDirection,
     lastSyncAt: new Date().toISOString(),
     lastLinearState: params.linearState,
+    lastLinearDescription: null,
   };
 
   await ctx.state.set(
@@ -407,8 +447,8 @@ export async function syncProjectFromLinear(
   ctx: PluginContext,
   link: ProjectLink,
   linearProject: { id: string; name: string; description: string | null; state: string },
-): Promise<void> {
-  if (link.syncDirection === "paperclip-to-linear") return;
+): Promise<ProjectDriftSyncResult> {
+  if (link.syncDirection === "paperclip-to-linear") return "unchanged";
 
   const patch: Record<string, unknown> = {};
 
@@ -418,7 +458,12 @@ export async function syncProjectFromLinear(
   }
 
   if (linearProject.description !== undefined) {
-    patch.description = linearProject.description ?? undefined;
+    const linearDescription = stripPaperclipProjectBacklink(linearProject.description) ?? null;
+    const hasSeenDescription = Object.prototype.hasOwnProperty.call(link, "lastLinearDescription");
+    if (!hasSeenDescription || linearDescription !== (link.lastLinearDescription ?? null)) {
+      patch.description = linearDescription ?? undefined;
+      link.lastLinearDescription = linearDescription;
+    }
   }
 
   const newState = linearProject.state?.toLowerCase() ?? link.lastLinearState;
@@ -427,7 +472,7 @@ export async function syncProjectFromLinear(
     link.lastLinearState = newState;
   }
 
-  if (Object.keys(patch).length === 0) return;
+  if (Object.keys(patch).length === 0) return "unchanged";
 
   // Try the typed client first; fall back to ctx.rpc.call (newer SDK escape
   // hatch) so this works on plugin installs whose pinned SDK predates the
@@ -451,13 +496,13 @@ export async function syncProjectFromLinear(
         `Skipping project drift for ${link.linearProjectName ?? link.paperclipProjectId}: ` +
           `installed plugin SDK exposes neither ctx.projects.update nor ctx.rpc.call.`,
       );
-      return;
+      return "unavailable";
     }
   } catch (err) {
     ctx.logger.warn(
       `Failed to sync Linear project drift to Paperclip: ${err}`,
     );
-    return;
+    return "failed";
   }
 
   await updateProjectLink(ctx, link);
@@ -465,6 +510,7 @@ export async function syncProjectFromLinear(
   ctx.logger.info(
     `Synced Linear project -> Paperclip (${Object.keys(patch).join(", ")})`,
   );
+  return "updated";
 }
 
 export async function syncProjectToLinear(
@@ -472,6 +518,7 @@ export async function syncProjectToLinear(
   link: ProjectLink,
   changes: { name?: string; description?: string; status?: string },
   token: string,
+  paperclipLinkOptions?: { baseUrl: string | null; companyPrefix?: string | null },
 ): Promise<void> {
   if (link.syncDirection === "linear-to-paperclip") return;
 
@@ -491,7 +538,11 @@ export async function syncProjectToLinear(
   }
 
   if (changes.description !== undefined) {
-    linearUpdate.description = changes.description ?? "";
+    linearUpdate.description = absolutizePaperclipMarkdownLinks(
+      changes.description ?? "",
+      paperclipLinkOptions?.baseUrl ?? null,
+      paperclipLinkOptions?.companyPrefix ?? null,
+    );
     synced.push("description");
   }
 
@@ -638,14 +689,20 @@ export async function bridgeCommentToLinear(
   token: string,
   commentBody: string,
   authorName: string,
+  paperclipLinkOptions?: { baseUrl: string | null; companyPrefix?: string | null },
 ): Promise<void> {
   if (link.syncDirection === "linear-to-paperclip") return;
   if (commentBody.includes("[synced from Linear]")) return;
+  const safeBody = absolutizePaperclipMarkdownLinks(
+    commentBody,
+    paperclipLinkOptions?.baseUrl ?? null,
+    paperclipLinkOptions?.companyPrefix ?? null,
+  );
 
   await linear.createComment(
     ctx.http.fetch.bind(ctx.http),
     token,
     link.linearIssueId,
-    `**${authorName}** [synced from Paperclip]:\n\n${commentBody}`,
+    `**${authorName}** [synced from Paperclip]:\n\n${safeBody}`,
   );
 }

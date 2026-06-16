@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   SessionStore,
   isSessionNotFoundResponse,
+  isSessionInitializationErrorResponse,
   looksLikeInitializeRequest,
   extractUpstreamSessionId,
   MCP_SESSION_HEADER,
@@ -86,6 +87,27 @@ describe("isSessionNotFoundResponse", () => {
   it("does not match unrelated 404s", () => {
     expect(isSessionNotFoundResponse(404, '{"error":"Method not found"}')).toBe(false);
     expect(isSessionNotFoundResponse(500, '{"error":"Session not found"}')).toBe(false);
+  });
+});
+
+describe("isSessionInitializationErrorResponse", () => {
+  it("matches kubernetes-mcp-server's initialization race response", () => {
+    expect(
+      isSessionInitializationErrorResponse(
+        400,
+        '{"error":"method \\"tools/call\\" is invalid during session initialization"}',
+      ),
+    ).toBe(true);
+  });
+
+  it("does not match successful or unrelated error responses", () => {
+    expect(
+      isSessionInitializationErrorResponse(
+        200,
+        '{"error":"method \\"tools/call\\" is invalid during session initialization"}',
+      ),
+    ).toBe(false);
+    expect(isSessionInitializationErrorResponse(400, '{"error":"Method not found"}')).toBe(false);
   });
 });
 

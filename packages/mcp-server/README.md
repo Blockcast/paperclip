@@ -38,6 +38,7 @@ Read tools:
 - `paperclipGetAgent`
 - `paperclipListIssues`
 - `paperclipGetIssue`
+- `paperclip_search_issues`
 - `paperclipGetHeartbeatContext`
 - `paperclipListComments`
 - `paperclipGetComment`
@@ -58,6 +59,10 @@ Read tools:
 
 Write tools:
 
+- `paperclipCreateProject`
+- `paperclipUpdateProject`
+- `paperclipCreateGoal`
+- `paperclipUpdateGoal`
 - `paperclipCreateIssue`
 - `paperclipUpdateIssue`
 - `paperclipCheckoutIssue`

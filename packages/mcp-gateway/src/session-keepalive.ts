@@ -143,6 +143,19 @@ export function isSessionNotFoundResponse(statusCode: number, bodyText: string):
   return lower.includes("session not found") || lower.includes("session expired");
 }
 
+/**
+ * Detect upstream sessions that exist but have not completed the MCP
+ * initialized notification handshake. containers/kubernetes-mcp-server returns
+ * this when a client races a `tools/*` request ahead of
+ * `notifications/initialized`; replaying initialize + initialized gives the
+ * caller a clean upstream session without surfacing a sticky client error.
+ */
+export function isSessionInitializationErrorResponse(statusCode: number, bodyText: string): boolean {
+  if (statusCode < 400) return false;
+  const lower = bodyText.toLowerCase();
+  return lower.includes("invalid during session initialization");
+}
+
 export const MCP_SESSION_HEADER = "mcp-session-id";
 
 export const DEFAULT_MCP_PROTOCOL_VERSION = "2024-11-05";

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { markDuplicate } from "../src/linear.js";
+import { ensureProjectLink, markDuplicate } from "../src/linear.js";
 
 // gql() (linear.ts:222) calls fetch(LINEAR_API, {..., body: JSON.stringify({query, variables})}),
 // checks res.ok, then res.json() -> { data, errors }. Mock that contract.
@@ -52,5 +52,87 @@ describe("markDuplicate", () => {
     ]);
     const res = await markDuplicate(fetch, "tok", "dupe-id", "keeper-id");
     expect(res).toEqual({ success: true, issueRelationId: null, alreadyRelated: true });
+  });
+});
+
+describe("ensureProjectLink", () => {
+  it("creates a Linear project link when no existing Paperclip link is present", async () => {
+    const fetch = mockFetch([
+      { data: { project: { externalLinks: { nodes: [] } } } },
+      {
+        data: {
+          entityExternalLinkCreate: {
+            success: true,
+            entityExternalLink: {
+              id: "plink-1",
+              url: "https://paperclip.blockcast.net/BLO/projects/sync",
+              label: "Paperclip project",
+            },
+          },
+        },
+      },
+    ]);
+
+    const res = await ensureProjectLink(fetch, "tok", {
+      projectId: "lin-proj-1",
+      url: "https://paperclip.blockcast.net/BLO/projects/sync",
+      label: "Paperclip project",
+    });
+
+    expect(res.created).toBe(true);
+    const mutationBody = JSON.parse((fetch as ReturnType<typeof vi.fn>).mock.calls[1][1].body);
+    expect(mutationBody.variables.input).toEqual({
+      projectId: "lin-proj-1",
+      url: "https://paperclip.blockcast.net/BLO/projects/sync",
+      label: "Paperclip project",
+    });
+  });
+
+  it("updates an existing Paperclip project link when the URL changed", async () => {
+    const fetch = mockFetch([
+      {
+        data: {
+          project: {
+            externalLinks: {
+              nodes: [
+                {
+                  id: "plink-1",
+                  url: "https://paperclip.blockcast.net/BLO/projects/old",
+                  label: "Paperclip project",
+                },
+              ],
+            },
+          },
+        },
+      },
+      {
+        data: {
+          entityExternalLinkUpdate: {
+            success: true,
+            entityExternalLink: {
+              id: "plink-1",
+              url: "https://paperclip.blockcast.net/BLO/projects/new",
+              label: "Paperclip project",
+            },
+          },
+        },
+      },
+    ]);
+
+    const res = await ensureProjectLink(fetch, "tok", {
+      projectId: "lin-proj-1",
+      url: "https://paperclip.blockcast.net/BLO/projects/new",
+      label: "Paperclip project",
+    });
+
+    expect(res.updated).toBe(true);
+    const mutationBody = JSON.parse((fetch as ReturnType<typeof vi.fn>).mock.calls[1][1].body);
+    expect(mutationBody.variables).toEqual({
+      id: "plink-1",
+      input: {
+        url: "https://paperclip.blockcast.net/BLO/projects/new",
+        label: "Paperclip project",
+      },
+    });
   });
 });

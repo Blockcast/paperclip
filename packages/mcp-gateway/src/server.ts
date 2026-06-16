@@ -21,6 +21,7 @@ import {
   MCP_SESSION_HEADER,
   SessionStore,
   isSessionNotFoundResponse,
+  isSessionInitializationErrorResponse,
   looksLikeInitializeRequest,
   extractUpstreamSessionId,
   buildDefaultInitializePayload,
@@ -215,7 +216,10 @@ async function handleRequest(
     if (record) {
       const result = await forward(matched.upstreamUrl, req.method ?? "POST", req.headers, body, record.upstreamSessionId);
       const text = result.body.toString("utf8");
-      if (isSessionNotFoundResponse(result.status, text)) {
+      if (
+        isSessionNotFoundResponse(result.status, text)
+        || isSessionInitializationErrorResponse(result.status, text)
+      ) {
         // Replay path: re-issue the cached initialize, get a fresh upstream id, retry.
         if (!record.initializePayload) {
           // No cached initialize — can't recover. Pass the failure through.

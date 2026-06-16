@@ -38,13 +38,13 @@ describe("paperclip MCP tools", () => {
 
     const tool = getTool("paperclipUpdateIssue");
     await tool.execute({
-      issueId: "PAP-1135",
+      issueId: "44444444-4444-4444-8444-444444444444",
       status: "done",
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(String(url)).toBe("http://localhost:3100/api/issues/PAP-1135");
+    expect(String(url)).toBe("http://localhost:3100/api/issues/44444444-4444-4444-8444-444444444444");
     expect(init.method).toBe("PATCH");
     expect((init.headers as Record<string, string>)["Authorization"]).toBe("Bearer token-123");
     expect((init.headers as Record<string, string>)["X-Paperclip-Run-Id"]).toBe(
@@ -60,7 +60,7 @@ describe("paperclip MCP tools", () => {
 
     const tool = getTool("paperclipUpdateIssue");
     await tool.execute({
-      issueId: "PAP-1135",
+      issueId: "44444444-4444-4444-8444-444444444444",
       status: "in_progress",
       comment: "Changes requested: add a regression test.",
     });
@@ -70,6 +70,32 @@ describe("paperclip MCP tools", () => {
       status: "in_progress",
       comment: "Changes requested: add a regression test.",
     });
+  });
+
+  it("passes projectId through issue updates and scopes identifier writes by company prefix", async () => {
+    const penId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const projectId = "44444444-4444-4444-8444-444444444444";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(mockJsonResponse([{ id: penId, issuePrefix: "PEN" }]))
+      .mockResolvedValueOnce(mockJsonResponse({ id: "PEN-503", projectId }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipUpdateIssue");
+    await tool.execute({
+      issueId: "PEN-503",
+      projectId,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [companiesUrl] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(companiesUrl)).toBe("http://localhost:3100/api/companies");
+
+    const [patchUrl, patchInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(String(patchUrl)).toBe("http://localhost:3100/api/issues/PEN-503");
+    expect(patchInit.method).toBe("PATCH");
+    expect((patchInit.headers as Record<string, string>)["X-Paperclip-Company"]).toBe(penId);
+    expect(JSON.parse(String(patchInit.body))).toEqual({ projectId });
   });
 
   it("uses default company id for company-scoped list tools", async () => {
@@ -87,6 +113,26 @@ describe("paperclip MCP tools", () => {
       "http://localhost:3100/api/companies/11111111-1111-1111-1111-111111111111/issues",
     );
     expect(response.content[0]?.text).toContain("issue-1");
+  });
+
+  it("maps paperclip_search_issues query to issue text search", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse([{ id: "issue-1", title: "CDN+ M0 rollout" }]),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclip_search_issues");
+    const response = await tool.execute({
+      query: "CDN+ M0",
+      status: "todo,in_progress,blocked",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/companies/11111111-1111-1111-1111-111111111111/issues?status=todo%2Cin_progress%2Cblocked&q=CDN%2B+M0",
+    );
+    expect(response.content[0]?.text).toContain("CDN+ M0 rollout");
   });
 
   it("uses default agent id for checkout requests", async () => {
@@ -130,6 +176,118 @@ describe("paperclip MCP tools", () => {
       priority: "medium",
       assigneeAgentId: "22222222-2222-2222-2222-222222222222",
       requestDepth: 0,
+    });
+  });
+
+  it("creates projects in the default company", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "project-1", name: "Gate fixes" }, 201),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipCreateProject");
+    await tool.execute({
+      name: "Gate fixes",
+      description: "Track gate issues that need project assignment.",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/companies/11111111-1111-1111-1111-111111111111/projects",
+    );
+    expect(init.method).toBe("POST");
+    expect((init.headers as Record<string, string>)["X-Paperclip-Company"]).toBe(
+      "11111111-1111-1111-1111-111111111111",
+    );
+    expect(JSON.parse(String(init.body))).toEqual({
+      name: "Gate fixes",
+      description: "Track gate issues that need project assignment.",
+      status: "backlog",
+    });
+  });
+
+  it("updates projects without leaking tool-only ids into the patch body", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "44444444-4444-4444-8444-444444444444", status: "in_progress" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipUpdateProject");
+    await tool.execute({
+      projectId: "44444444-4444-4444-8444-444444444444",
+      status: "in_progress",
+      targetDate: "2026-06-30",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe("http://localhost:3100/api/projects/44444444-4444-4444-8444-444444444444");
+    expect(init.method).toBe("PATCH");
+    expect((init.headers as Record<string, string>)["X-Paperclip-Company"]).toBe(
+      "11111111-1111-1111-1111-111111111111",
+    );
+    expect(JSON.parse(String(init.body))).toEqual({
+      status: "in_progress",
+      targetDate: "2026-06-30",
+    });
+  });
+
+  it("creates goals in the default company", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "55555555-5555-4555-8555-555555555555", title: "Linear parity" }, 201),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipCreateGoal");
+    await tool.execute({
+      title: "Linear parity",
+      description: "Expose goal tooling through MCP.",
+      level: "company",
+      status: "active",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/companies/11111111-1111-1111-1111-111111111111/goals",
+    );
+    expect(init.method).toBe("POST");
+    expect((init.headers as Record<string, string>)["X-Paperclip-Company"]).toBe(
+      "11111111-1111-1111-1111-111111111111",
+    );
+    expect(JSON.parse(String(init.body))).toEqual({
+      title: "Linear parity",
+      description: "Expose goal tooling through MCP.",
+      level: "company",
+      status: "active",
+    });
+  });
+
+  it("updates goals without leaking tool-only ids into the patch body", async () => {
+    const goalId = "55555555-5555-4555-8555-555555555555";
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: goalId, status: "active" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipUpdateGoal");
+    await tool.execute({
+      goalId,
+      status: "active",
+      targetDate: "2026-06-30",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(`http://localhost:3100/api/goals/${goalId}`);
+    expect(init.method).toBe("PATCH");
+    expect((init.headers as Record<string, string>)["X-Paperclip-Company"]).toBe(
+      "11111111-1111-1111-1111-111111111111",
+    );
+    expect(JSON.parse(String(init.body))).toEqual({
+      status: "active",
+      targetDate: "2026-06-30",
     });
   });
 

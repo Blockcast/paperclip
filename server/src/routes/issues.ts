@@ -883,6 +883,7 @@ export function issueRoutes(
   const routinesSvc = routineService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
+  type ActiveIssueRecoveryAction = Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>>;
   const issueTreeControlFactory = Object.prototype.hasOwnProperty.call(
     serviceIndex,
     "issueTreeControlService",
@@ -1388,6 +1389,7 @@ export function issueRoutes(
     req: Request,
     res: Response,
     issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null },
+    opts: { allowScopedRecoveryOwnerSourceMutation?: boolean } = {},
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -1400,6 +1402,9 @@ export function issueRoutes(
     }
     if (issue.assigneeAgentId !== actorAgentId) {
       if (await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)) {
+        return true;
+      }
+      if (opts.allowScopedRecoveryOwnerSourceMutation) {
         return true;
       }
       if (issue.status === "in_progress") {
@@ -1450,6 +1455,58 @@ export function issueRoutes(
       });
     }
     return true;
+  }
+
+  function isScopedRecoveryOwnerRestorePatch(
+    req: Request,
+    issue: { id: string; assigneeAgentId: string | null },
+    activeRecoveryAction: ActiveIssueRecoveryAction,
+    body: Record<string, unknown>,
+  ) {
+    if (req.actor.type !== "agent") return false;
+    const actorAgentId = req.actor.agentId;
+    if (!actorAgentId || !activeRecoveryAction) return false;
+    if (activeRecoveryAction.sourceIssueId !== issue.id) return false;
+    if (activeRecoveryAction.ownerAgentId !== actorAgentId) return false;
+
+    const allowedKeys = new Set([
+      "assigneeAgentId",
+      "assigneeUserId",
+      "blockedByIssueIds",
+      "comment",
+      "interrupt",
+      "reopen",
+      "resume",
+      "status",
+    ]);
+    const keys = Object.keys(body).filter((key) => body[key] !== undefined);
+    if (!keys.length || keys.some((key) => !allowedKeys.has(key))) return false;
+
+    if (body.status !== undefined && body.status !== "todo") return false;
+    if (body.blockedByIssueIds !== undefined) {
+      if (!Array.isArray(body.blockedByIssueIds) || body.blockedByIssueIds.length !== 0) return false;
+    }
+    if (body.assigneeUserId !== undefined && body.assigneeUserId !== null) return false;
+    if (body.interrupt !== undefined && body.interrupt !== false) return false;
+
+    if (body.assigneeAgentId !== undefined) {
+      if (typeof body.assigneeAgentId !== "string") return false;
+      const allowedReturnOwners = new Set([
+        issue.assigneeAgentId,
+        activeRecoveryAction.previousOwnerAgentId,
+        activeRecoveryAction.returnOwnerAgentId,
+      ].filter((id): id is string => typeof id === "string" && id.length > 0));
+      if (!allowedReturnOwners.has(body.assigneeAgentId)) return false;
+    }
+
+    return (
+      body.status !== undefined ||
+      body.reopen === true ||
+      body.resume === true ||
+      body.blockedByIssueIds !== undefined ||
+      body.assigneeAgentId !== undefined ||
+      body.assigneeUserId !== undefined
+    );
   }
 
   function assertAgentIssueCommentAllowed(
@@ -3970,7 +4027,29 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, existing.companyId);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    let activeRecoveryActionForPatch: ActiveIssueRecoveryAction | undefined;
+    if (
+      req.actor.type === "agent" &&
+      req.actor.agentId &&
+      existing.assigneeAgentId &&
+      existing.assigneeAgentId !== req.actor.agentId
+    ) {
+      activeRecoveryActionForPatch = await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id);
+    }
+    const allowScopedRecoveryOwnerSourceMutation = activeRecoveryActionForPatch
+      ? isScopedRecoveryOwnerRestorePatch(
+        req,
+        existing,
+        activeRecoveryActionForPatch,
+        req.body as Record<string, unknown>,
+      )
+      : false;
+    if (!(await assertAgentIssueMutationAllowed(
+      req,
+      res,
+      existing,
+      { allowScopedRecoveryOwnerSourceMutation },
+    ))) return;
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);
@@ -4016,7 +4095,9 @@ export function issueRoutes(
       req.body.executionPolicy !== undefined ||
       explicitMoveToTodoRequested;
     const activeRecoveryActionBeforeUpdate = recoveryRelevantSourceMutationRequested
-      ? await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id)
+      ? activeRecoveryActionForPatch !== undefined
+        ? activeRecoveryActionForPatch
+        : await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id)
       : null;
     if (
       recoveryRelevantSourceMutationRequested &&

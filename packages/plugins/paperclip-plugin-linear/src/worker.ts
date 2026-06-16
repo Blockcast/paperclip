@@ -24,12 +24,20 @@ import {
   DATA_KEYS,
   STATE_KEYS,
   LINEAR_OAUTH,
+  DEFAULT_CONFIG,
   GOALS_LINEAR_PROJECT_NAME,
   ORIGIN_KIND_SELF,
 } from "./constants.js";
 import * as linear from "./linear.js";
 import * as sync from "./sync.js";
-import { extractLinearWorkspaceSlug, linkifyBareLinearIssueRefs } from "./markdown.js";
+import {
+  absolutePaperclipHref,
+  absolutizePaperclipMarkdownLinks,
+  appendPaperclipProjectBacklink,
+  extractLinearWorkspaceSlug,
+  linkifyBareLinearIssueRefs,
+  normalizePaperclipBaseUrl,
+} from "./markdown.js";
 
 function verifyLinearSignature(secret: string, rawBody: string, headerSig: string | string[] | undefined): boolean {
   const provided = Array.isArray(headerSig) ? headerSig[0] : headerSig;
@@ -85,12 +93,186 @@ async function resolveToken(ctx: PluginContext): Promise<string> {
   throw new Error("Not connected to Linear. Use the settings page to connect via OAuth.");
 }
 
+async function resolvePaperclipBaseUrl(ctx: PluginContext): Promise<string | null> {
+  const config = await ctx.config.get();
+  return normalizePaperclipBaseUrl(
+    (config.paperclipBaseUrl as string | undefined) ?? DEFAULT_CONFIG.paperclipBaseUrl,
+  );
+}
+
+async function resolveCompanyPrefix(
+  ctx: PluginContext,
+  companyId: string | null | undefined,
+  fallbackIdentifier?: string | null,
+): Promise<string | null> {
+  if (companyId) {
+    try {
+      const company = await ctx.companies.get(companyId);
+      const prefix = company?.issuePrefix?.trim();
+      if (prefix) return prefix;
+    } catch {
+      // Older SDKs may not expose companies.get; fall through to identifier.
+    }
+  }
+
+  const inferred = fallbackIdentifier?.match(/^([A-Z][A-Z0-9]*)-/i)?.[1];
+  return inferred ? inferred.toUpperCase() : null;
+}
+
+async function paperclipLinkOptionsForCompany(
+  ctx: PluginContext,
+  companyId: string | null | undefined,
+  fallbackIdentifier?: string | null,
+): Promise<{ baseUrl: string | null; companyPrefix: string | null }> {
+  const [baseUrl, companyPrefix] = await Promise.all([
+    resolvePaperclipBaseUrl(ctx),
+    resolveCompanyPrefix(ctx, companyId, fallbackIdentifier),
+  ]);
+  return { baseUrl, companyPrefix };
+}
+
+async function buildPaperclipIssueUrl(
+  ctx: PluginContext,
+  companyId: string | null | undefined,
+  issueIdentifier: string,
+): Promise<string | null> {
+  const { baseUrl, companyPrefix } = await paperclipLinkOptionsForCompany(ctx, companyId, issueIdentifier);
+  if (!baseUrl) return null;
+  return absolutePaperclipHref(`/issues/${encodeURIComponent(issueIdentifier)}`, baseUrl, companyPrefix);
+}
+
+async function buildPaperclipProjectUrl(
+  ctx: PluginContext,
+  companyId: string,
+  project: { id: string; urlKey?: string | null; name?: string | null },
+): Promise<string | null> {
+  const { baseUrl, companyPrefix } = await paperclipLinkOptionsForCompany(ctx, companyId);
+  if (!baseUrl) return null;
+  const projectRef = project.urlKey?.trim() || project.id;
+  return absolutePaperclipHref(`/projects/${encodeURIComponent(projectRef)}`, baseUrl, companyPrefix);
+}
+
+async function getPaperclipProjectForLink(
+  ctx: PluginContext,
+  link: sync.ProjectLink,
+): Promise<{ id: string; name?: string | null; description?: string | null; urlKey?: string | null } | null> {
+  try {
+    return await ctx.projects.get(
+      link.paperclipProjectId,
+      link.paperclipCompanyId,
+    ) as { id: string; name?: string | null; description?: string | null; urlKey?: string | null } | null;
+  } catch {
+    return null;
+  }
+}
+
+async function getProjectById(
+  ctx: PluginContext,
+  projectId: string | null | undefined,
+  companyId: string | null | undefined,
+): Promise<{ id: string; name?: string | null; status?: string | null; urlKey?: string | null } | null> {
+  if (!projectId || !companyId) return null;
+  try {
+    return await ctx.projects.get(
+      projectId,
+      companyId,
+    ) as { id: string; name?: string | null; status?: string | null; urlKey?: string | null } | null;
+  } catch {
+    return null;
+  }
+}
+
+async function summarizePaperclipIssue(
+  ctx: PluginContext,
+  issue: Record<string, unknown> | null | undefined,
+  companyId: string | null | undefined,
+) {
+  if (!issue) return null;
+  const identifier = typeof issue.identifier === "string" ? issue.identifier : null;
+  const effectiveCompanyId = typeof issue.companyId === "string" ? issue.companyId : companyId;
+  return {
+    id: typeof issue.id === "string" ? issue.id : null,
+    companyId: effectiveCompanyId ?? null,
+    identifier,
+    title: typeof issue.title === "string" ? issue.title : null,
+    status: typeof issue.status === "string" ? issue.status : null,
+    projectId: typeof issue.projectId === "string" ? issue.projectId : null,
+    url: identifier ? await buildPaperclipIssueUrl(ctx, effectiveCompanyId, identifier) : null,
+  };
+}
+
+async function summarizePaperclipProject(
+  ctx: PluginContext,
+  project: { id: string; name?: string | null; status?: string | null; urlKey?: string | null } | null | undefined,
+  companyId: string | null | undefined,
+) {
+  if (!project || !companyId) return null;
+  return {
+    id: project.id,
+    name: project.name ?? null,
+    status: project.status ?? null,
+    urlKey: project.urlKey ?? null,
+    url: await buildPaperclipProjectUrl(ctx, companyId, project),
+  };
+}
+
+type AdoptablePaperclipProject = {
+  id: string;
+  name?: string | null;
+  description?: string | null;
+  status?: string | null;
+  urlKey?: string | null;
+};
+
+function normalizeProjectName(value: string | null | undefined): string {
+  return (value ?? "").trim().toLowerCase();
+}
+
+function projectUrlKeyCandidate(value: string): string {
+  return normalizeProjectName(value)
+    .replace(/['"]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+async function findAdoptablePaperclipProject(
+  ctx: PluginContext,
+  companyId: string,
+  linearProjectId: string,
+  linearProjectName: string,
+): Promise<{ project: AdoptablePaperclipProject | null; conflict: boolean }> {
+  const normalizedName = normalizeProjectName(linearProjectName);
+  if (!normalizedName) return { project: null, conflict: false };
+
+  try {
+    const projects = await ctx.projects.list({ companyId, limit: 500 }) as AdoptablePaperclipProject[];
+    const urlKey = projectUrlKeyCandidate(linearProjectName);
+    const candidate = projects.find((project) => normalizeProjectName(project.name) === normalizedName)
+      ?? projects.find((project) => normalizeProjectName(project.urlKey) === urlKey)
+      ?? null;
+    if (!candidate) return { project: null, conflict: false };
+
+    const existingLink = await sync.getProjectLink(ctx, candidate.id);
+    if (existingLink && existingLink.linearProjectId !== linearProjectId) {
+      ctx.logger.warn(
+        `Linear project ${linearProjectName} matched Paperclip project ${candidate.id}, but that project is already linked to Linear project ${existingLink.linearProjectId}; skipping duplicate project create`,
+      );
+      return { project: null, conflict: true };
+    }
+
+    return { project: candidate, conflict: false };
+  } catch (err) {
+    ctx.logger.warn(`Failed to search for an adoptable Paperclip project for Linear project ${linearProjectName}: ${err}`);
+    return { project: null, conflict: false };
+  }
+}
+
 // Write a "Paperclip mirror: <id>" link attachment back to a Linear issue.
 //
 // Shared between the polling-import action and the webhook-create handler so
-// both paths produce the same back-link with the same dedup semantics. URL
-// shape `/issues/<identifier>` per markdown.ts:7. Behavior gated by config:
-//   - paperclipBaseUrl empty             → silent no-op
+// both paths produce the same back-link with the same dedup semantics. Behavior
+// gated by config:
+//   - paperclipBaseUrl invalid/empty     → silent no-op
 //   - paperclipIdentifier null           → warn + no-op (e.g. mirror created
 //                                          with null projectId)
 //   - linearBacklinkBestEffort = true    → warn-and-swallow on write failure
@@ -106,6 +288,7 @@ async function writePaperclipBackLink(
   paperclipIdentifier: string | null,
   paperclipIssueId: string,
   paperclipTitle?: string | null,
+  paperclipCompanyId?: string | null,
 ): Promise<void> {
   if (!paperclipIdentifier) {
     ctx.logger.warn("Skipped Paperclip back-link: created issue has null identifier", {
@@ -115,10 +298,9 @@ async function writePaperclipBackLink(
     return;
   }
   const config = await ctx.config.get();
-  const paperclipBaseUrl = (config.paperclipBaseUrl as string | undefined)?.trim();
-  if (!paperclipBaseUrl) return;
   const backLinkBestEffort = config.linearBacklinkBestEffort === true;
-  const paperclipUrl = `${paperclipBaseUrl.replace(/\/$/, "")}/issues/${paperclipIdentifier}`;
+  const paperclipUrl = await buildPaperclipIssueUrl(ctx, paperclipCompanyId, paperclipIdentifier);
+  if (!paperclipUrl) return;
   const title = paperclipTitle?.trim() ?? "";
   try {
     await linear.attachmentLinkURL(ctx.http.fetch.bind(ctx.http), token, {
@@ -148,6 +330,64 @@ async function writePaperclipBackLink(
       });
     } else {
       throw err;
+    }
+  }
+}
+
+async function writePaperclipProjectBackLink(
+  ctx: PluginContext,
+  token: string,
+  link: sync.ProjectLink,
+  paperclipProject?: { id: string; name?: string | null; description?: string | null; urlKey?: string | null } | null,
+): Promise<void> {
+  const project = paperclipProject ?? await getPaperclipProjectForLink(ctx, link);
+  const paperclipUrl = await buildPaperclipProjectUrl(
+    ctx,
+    link.paperclipCompanyId,
+    project ?? { id: link.paperclipProjectId },
+  );
+  if (!paperclipUrl) return;
+
+  const config = await ctx.config.get();
+  const bestEffort = config.linearBacklinkBestEffort === true;
+  const label = "Paperclip project";
+  try {
+    await linear.ensureProjectLink(ctx.http.fetch.bind(ctx.http), token, {
+      projectId: link.linearProjectId,
+      url: paperclipUrl,
+      label,
+    });
+    return;
+  } catch (err) {
+    const { baseUrl, companyPrefix } = await paperclipLinkOptionsForCompany(ctx, link.paperclipCompanyId);
+    const fallbackDescription = appendPaperclipProjectBacklink(
+      absolutizePaperclipMarkdownLinks(
+        project?.description ?? "",
+        baseUrl,
+        companyPrefix,
+      ),
+      paperclipUrl,
+    );
+    try {
+      await linear.updateProject(ctx.http.fetch.bind(ctx.http), token, link.linearProjectId, {
+        description: fallbackDescription,
+      });
+      ctx.logger.warn("Linear project link API unavailable; wrote Paperclip backlink into project description", {
+        linearProjectId: link.linearProjectId,
+        paperclipProjectId: link.paperclipProjectId,
+        error: String(err),
+      });
+    } catch (fallbackErr) {
+      if (bestEffort) {
+        ctx.logger.warn("Failed to add Paperclip back-link to Linear project", {
+          linearProjectId: link.linearProjectId,
+          paperclipProjectId: link.paperclipProjectId,
+          error: String(fallbackErr),
+          originalError: String(err),
+        });
+      } else {
+        throw fallbackErr;
+      }
     }
   }
 }
@@ -623,8 +863,7 @@ const plugin = definePlugin({
     ctx.actions.register(ACTION_KEYS.backfillBackLinks, async (params: any) => {
       const { companyId } = params as { companyId: string };
 
-      const config = await ctx.config.get();
-      if (!(config.paperclipBaseUrl as string | undefined)?.trim()) {
+      if (!(await resolvePaperclipBaseUrl(ctx))) {
         return { backfilled: 0, done: true, note: "paperclipBaseUrl not set; nothing to do" };
       }
       const token = await resolveToken(ctx);
@@ -652,6 +891,7 @@ const plugin = definePlugin({
           await writePaperclipBackLink(
             ctx, token, link.linearIssueId, link.linearIdentifier,
             issue.identifier ?? null, issue.id, issue.title ?? null,
+            link.paperclipCompanyId,
           );
           backfilled++;
           if (backfilled >= maxPerRun) break;
@@ -711,6 +951,22 @@ const plugin = definePlugin({
         linearStateType: linearIssue.state.type,
         syncDirection,
       });
+
+      try {
+        const paperclipIssue = await ctx.issues.get(paperclipIssueId, companyId);
+        await writePaperclipBackLink(
+          ctx,
+          token,
+          linearIssue.id,
+          linearIssue.identifier,
+          paperclipIssue?.identifier ?? null,
+          paperclipIssueId,
+          paperclipIssue?.title ?? linearIssue.title,
+          companyId,
+        );
+      } catch (err) {
+        ctx.logger.warn(`Failed to write Paperclip back-link after manual link: ${err}`);
+      }
 
       return {
         ok: true,
@@ -801,6 +1057,25 @@ const plugin = definePlugin({
             await ctx.issues.update(existing.id, { assigneeUserId: userId }, companyId);
           }
         }
+        const link = await sync.createLink(ctx, {
+          paperclipIssueId: existing.id,
+          paperclipCompanyId: companyId,
+          linearIssueId: linearIssue.id,
+          linearIdentifier: linearIssue.identifier,
+          linearUrl: linearIssue.url,
+          linearStateType: linearIssue.state.type,
+          syncDirection: "bidirectional",
+        });
+        await writePaperclipBackLink(
+          ctx,
+          token,
+          link.linearIssueId,
+          link.linearIdentifier,
+          existing.identifier ?? null,
+          existing.id,
+          existing.title ?? null,
+          companyId,
+        );
         return {
           ok: true,
           imported: false,
@@ -865,6 +1140,7 @@ const plugin = definePlugin({
         created.identifier,
         created.id,
         linearIssue.title,
+        companyId,
       );
 
       return {
@@ -908,16 +1184,536 @@ const plugin = definePlugin({
     ctx.tools.register(
       TOOL_NAMES.create,
       { displayName: "Create Linear Issue", description: "Create a new issue in Linear", parametersSchema: { type: "object", properties: { title: { type: "string" }, description: { type: "string" }, teamId: { type: "string" } }, required: ["title"] } },
-      async (params: any) => {
+      async (params: any, runCtx) => {
         const { title, description, teamId: paramTeamId } = params as { title: string; description?: string; teamId?: string };
         const token = await resolveToken(ctx);
         const teamId = paramTeamId || await getTeamId(ctx).catch(() => "");
         if (!teamId) return { content: "Error: no team ID", data: { error: "No team ID specified" } };
+        const paperclipLinkOptions = await paperclipLinkOptionsForCompany(ctx, runCtx.companyId);
 
-        const issue = await linear.createIssue(ctx.http.fetch.bind(ctx.http), token, { title, description, teamId });
+        const issue = await linear.createIssue(ctx.http.fetch.bind(ctx.http), token, {
+          title,
+          description: description
+            ? absolutizePaperclipMarkdownLinks(
+                description,
+                paperclipLinkOptions.baseUrl,
+                paperclipLinkOptions.companyPrefix,
+              )
+            : undefined,
+          teamId,
+        });
         return {
           content: `Created ${issue.identifier}: ${issue.title}`,
           data: { identifier: issue.identifier, title: issue.title, url: issue.url },
+        };
+      },
+    );
+
+    ctx.tools.register(
+      TOOL_NAMES.resolveBinding,
+      {
+        displayName: "Resolve Linear Binding",
+        description: "Resolve a Linear issue to its Paperclip mirror and project binding",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            linearRef: {
+              type: "string",
+              description: "Linear issue identifier (e.g. BLO-123) or URL",
+            },
+          },
+          required: ["linearRef"],
+        },
+      },
+      async (params: any, runCtx) => {
+        const { linearRef } = params as { linearRef?: string };
+        const ref = linear.parseLinearIssueRef(linearRef ?? "");
+        if (!ref) {
+          return {
+            content: "Error: invalid ref",
+            data: {
+              linked: false,
+              syncState: "missing",
+              foundPaperclipMirror: false,
+              error: "Could not parse Linear issue reference",
+            },
+          };
+        }
+
+        const token = await resolveToken(ctx);
+        const linearIssue = await linear.getIssueByIdentifier(
+          ctx.http.fetch.bind(ctx.http),
+          token,
+          ref.identifier,
+        );
+        if (!linearIssue) {
+          return {
+            content: `Error: ${ref.identifier} not found`,
+            data: {
+              linked: false,
+              syncState: "missing",
+              foundPaperclipMirror: false,
+              linear: { identifier: ref.identifier },
+              error: `${ref.identifier} not found in Linear`,
+            },
+          };
+        }
+
+        const storedCompanyId = await getCompanyId(ctx);
+        const link = await sync.getLinkByLinear(ctx, linearIssue.id);
+        const companyCandidates = [
+          link?.paperclipCompanyId,
+          runCtx.companyId,
+          storedCompanyId,
+        ].filter((value): value is string => typeof value === "string" && value.length > 0)
+          .filter((value, index, values) => values.indexOf(value) === index);
+
+        let paperclipIssue: Record<string, unknown> | null = null;
+        if (link) {
+          try {
+            paperclipIssue = await ctx.issues.get(
+              link.paperclipIssueId,
+              link.paperclipCompanyId,
+            ) as Record<string, unknown> | null;
+          } catch {
+            paperclipIssue = null;
+          }
+        }
+
+        if (!paperclipIssue) {
+          for (const companyId of companyCandidates) {
+            try {
+              const candidate = await ctx.issues.getByLinearIssueId({
+                linearIssueId: linearIssue.id,
+                companyId,
+              });
+              if (candidate) {
+                paperclipIssue = candidate as unknown as Record<string, unknown>;
+                break;
+              }
+            } catch {
+              // Host fallback may not be available in older runtimes.
+            }
+          }
+        }
+
+        if (!paperclipIssue) {
+          for (const companyId of companyCandidates) {
+            try {
+              const mirrors = await ctx.issues.list({
+                companyId,
+                originKind: ORIGIN_KIND_SELF,
+                originId: linearIssue.id,
+                limit: 1,
+              });
+              if (mirrors[0]) {
+                paperclipIssue = mirrors[0] as unknown as Record<string, unknown>;
+                break;
+              }
+            } catch {
+              // Keep resolver best-effort; the primary binding row is above.
+            }
+          }
+        }
+
+        const issueCompanyId = typeof paperclipIssue?.companyId === "string"
+          ? paperclipIssue.companyId
+          : link?.paperclipCompanyId ?? companyCandidates[0] ?? null;
+        const paperclipIssueSummary = await summarizePaperclipIssue(
+          ctx,
+          paperclipIssue,
+          issueCompanyId,
+        );
+
+        let projectLink: sync.ProjectLink | null = null;
+        if (linearIssue.project?.id) {
+          projectLink = await sync.getProjectLinkByLinear(ctx, linearIssue.project.id);
+        }
+
+        const paperclipProject = await getProjectById(
+          ctx,
+          paperclipIssueSummary?.projectId ?? projectLink?.paperclipProjectId ?? null,
+          paperclipIssueSummary?.companyId ?? projectLink?.paperclipCompanyId ?? issueCompanyId,
+        );
+        const paperclipProjectSummary = await summarizePaperclipProject(
+          ctx,
+          paperclipProject,
+          paperclipIssueSummary?.companyId ?? projectLink?.paperclipCompanyId ?? issueCompanyId,
+        );
+
+        const warning = !link && paperclipIssueSummary
+          ? "Paperclip mirror was found through the host link/origin fallback, but plugin sync state is missing."
+          : null;
+        const content = link && paperclipIssueSummary?.identifier
+          ? `Linear ${linearIssue.identifier} is linked to Paperclip ${paperclipIssueSummary.identifier}`
+          : link
+            ? `Linear ${linearIssue.identifier} has a sync link, but the Paperclip issue was not readable`
+            : paperclipIssueSummary?.identifier
+              ? `Linear ${linearIssue.identifier} has no plugin sync binding, but maps to Paperclip ${paperclipIssueSummary.identifier}`
+              : `No Paperclip sync binding found for Linear ${linearIssue.identifier}`;
+
+        return {
+          content,
+          data: {
+            linked: Boolean(link),
+            syncState: link ? "linked" : "missing",
+            foundPaperclipMirror: Boolean(paperclipIssueSummary),
+            warning,
+            linear: {
+              id: linearIssue.id,
+              identifier: linearIssue.identifier,
+              title: linearIssue.title,
+              url: linearIssue.url,
+              state: linearIssue.state,
+              project: linearIssue.project
+                ? {
+                    id: linearIssue.project.id,
+                    name: linearIssue.project.name,
+                    state: linearIssue.project.state,
+                  }
+                : null,
+            },
+            paperclip: {
+              issue: paperclipIssueSummary,
+              project: paperclipProjectSummary,
+            },
+            projectLink: projectLink
+              ? {
+                  linearProjectId: projectLink.linearProjectId,
+                  linearProjectName: projectLink.linearProjectName,
+                  paperclipProjectId: projectLink.paperclipProjectId,
+                  paperclipCompanyId: projectLink.paperclipCompanyId,
+                  syncDirection: projectLink.syncDirection,
+                  lastSyncAt: projectLink.lastSyncAt,
+                }
+              : null,
+            issueLink: link
+              ? {
+                  linearIssueId: link.linearIssueId,
+                  linearIdentifier: link.linearIdentifier,
+                  paperclipIssueId: link.paperclipIssueId,
+                  paperclipCompanyId: link.paperclipCompanyId,
+                  syncDirection: link.syncDirection,
+                  lastSyncAt: link.lastSyncAt,
+                }
+              : null,
+          },
+        };
+      },
+    );
+
+    ctx.tools.register(
+      TOOL_NAMES.setBinding,
+      {
+        displayName: "Set Linear Binding",
+        description: "Repair or create Paperclip/Linear issue and project sync bindings",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            linearRef: { type: "string" },
+            paperclipIssueId: { type: "string" },
+            linearProjectId: { type: "string" },
+            linearProjectName: { type: "string" },
+            paperclipProjectId: { type: "string" },
+            replaceExisting: { type: "boolean" },
+            linkProjectFromIssue: { type: "boolean" },
+            syncDirection: {
+              type: "string",
+              enum: ["bidirectional", "linear-to-paperclip", "paperclip-to-linear"],
+            },
+          },
+        },
+      },
+      async (params: any, runCtx) => {
+        const {
+          linearRef,
+          paperclipIssueId,
+          linearProjectId,
+          linearProjectName,
+          paperclipProjectId,
+          replaceExisting = false,
+          linkProjectFromIssue = true,
+          syncDirection,
+        } = params as {
+          linearRef?: string;
+          paperclipIssueId?: string;
+          linearProjectId?: string;
+          linearProjectName?: string;
+          paperclipProjectId?: string;
+          replaceExisting?: boolean;
+          linkProjectFromIssue?: boolean;
+          syncDirection?: string;
+        };
+
+        const wantsIssueBinding = Boolean(linearRef || paperclipIssueId);
+        const wantsProjectBinding = Boolean(linearProjectId || paperclipProjectId);
+        if (!wantsIssueBinding && !wantsProjectBinding) {
+          return {
+            content: "Error: no binding target supplied",
+            data: {
+              ok: false,
+              error: "Supply either linearRef + paperclipIssueId, or linearProjectId + paperclipProjectId.",
+            },
+          };
+        }
+        if (wantsIssueBinding && (!linearRef || !paperclipIssueId)) {
+          return {
+            content: "Error: incomplete issue binding",
+            data: {
+              ok: false,
+              error: "Issue binding requires both linearRef and paperclipIssueId.",
+            },
+          };
+        }
+        if (wantsProjectBinding && (!linearProjectId || !paperclipProjectId)) {
+          return {
+            content: "Error: incomplete project binding",
+            data: {
+              ok: false,
+              error: "Project binding requires both linearProjectId and paperclipProjectId.",
+            },
+          };
+        }
+        if (
+          syncDirection
+          && !["bidirectional", "linear-to-paperclip", "paperclip-to-linear"].includes(syncDirection)
+        ) {
+          return {
+            content: "Error: invalid syncDirection",
+            data: { ok: false, error: "Invalid syncDirection." },
+          };
+        }
+
+        const companyId = runCtx.companyId || await getCompanyId(ctx);
+        if (!companyId) {
+          return {
+            content: "Error: company id is not configured",
+            data: { ok: false, error: "Company id is not configured for this plugin." },
+          };
+        }
+
+        const config = await ctx.config.get();
+        const effectiveSyncDirection = (
+          syncDirection
+          || (config.syncDirection as string | undefined)
+          || "bidirectional"
+        ) as sync.IssueLink["syncDirection"];
+        const token = await resolveToken(ctx);
+        const warnings: string[] = [];
+
+        let linearIssue: linear.LinearIssue | null = null;
+        let paperclipIssue: Record<string, unknown> | null = null;
+        let issueLink: sync.IssueLink | null = null;
+        let projectLink: sync.ProjectLink | null = null;
+
+        if (wantsIssueBinding) {
+          const ref = linear.parseLinearIssueRef(linearRef ?? "");
+          if (!ref) {
+            return {
+              content: "Error: invalid ref",
+              data: { ok: false, error: "Could not parse Linear issue reference." },
+            };
+          }
+
+          linearIssue = await linear.getIssueByIdentifier(
+            ctx.http.fetch.bind(ctx.http),
+            token,
+            ref.identifier,
+          );
+          if (!linearIssue) {
+            return {
+              content: `Error: ${ref.identifier} not found`,
+              data: { ok: false, error: `${ref.identifier} not found in Linear.` },
+            };
+          }
+
+          const issue = await ctx.issues.get(paperclipIssueId!, companyId);
+          if (!issue) {
+            return {
+              content: "Error: Paperclip issue not found",
+              data: {
+                ok: false,
+                error: `Paperclip issue ${paperclipIssueId} was not found in company ${companyId}.`,
+              },
+            };
+          }
+          paperclipIssue = issue as unknown as Record<string, unknown>;
+
+          const existingByPaperclip = await sync.getLink(ctx, paperclipIssueId!);
+          const existingByLinear = await sync.getLinkByLinear(ctx, linearIssue.id);
+          const paperclipConflict = existingByPaperclip && existingByPaperclip.linearIssueId !== linearIssue.id;
+          const linearConflict = existingByLinear && existingByLinear.paperclipIssueId !== paperclipIssueId;
+          if ((paperclipConflict || linearConflict) && !replaceExisting) {
+            return {
+              content: "Error: conflicting issue binding exists",
+              data: {
+                ok: false,
+                error: "Conflicting issue binding exists. Pass replaceExisting=true to repair it.",
+                existingByPaperclip,
+                existingByLinear,
+              },
+            };
+          }
+
+          if (replaceExisting) {
+            const removeIssueIds = [
+              existingByPaperclip?.paperclipIssueId,
+              existingByLinear?.paperclipIssueId,
+            ].filter((value): value is string => typeof value === "string" && value.length > 0)
+              .filter((value, index, values) => values.indexOf(value) === index);
+            for (const id of removeIssueIds) {
+              await sync.removeLink(ctx, id);
+            }
+          }
+
+          issueLink = await sync.createLink(ctx, {
+            paperclipIssueId: paperclipIssueId!,
+            paperclipCompanyId: companyId,
+            linearIssueId: linearIssue.id,
+            linearIdentifier: linearIssue.identifier,
+            linearUrl: linearIssue.url,
+            linearStateType: linearIssue.state.type,
+            syncDirection: effectiveSyncDirection,
+          });
+
+          try {
+            await writePaperclipBackLink(
+              ctx,
+              token,
+              linearIssue.id,
+              linearIssue.identifier,
+              typeof paperclipIssue.identifier === "string" ? paperclipIssue.identifier : null,
+              paperclipIssueId!,
+              typeof paperclipIssue.title === "string" ? paperclipIssue.title : linearIssue.title,
+              companyId,
+            );
+          } catch (err) {
+            const message = `Failed to write Linear issue backlink: ${err}`;
+            warnings.push(message);
+            ctx.logger.warn(message);
+          }
+        }
+
+        let targetPaperclipProjectId = paperclipProjectId;
+        let targetLinearProjectId = linearProjectId;
+        let targetLinearProjectName = linearProjectName;
+        let targetLinearProjectState = "planned";
+        const inferredProjectFromIssue = Boolean(
+          !wantsProjectBinding
+          && linkProjectFromIssue
+          && linearIssue?.project?.id
+          && typeof paperclipIssue?.projectId === "string"
+          && paperclipIssue.projectId.length > 0,
+        );
+
+        if (inferredProjectFromIssue) {
+          targetPaperclipProjectId = paperclipIssue!.projectId as string;
+          targetLinearProjectId = linearIssue!.project!.id;
+          targetLinearProjectName = linearIssue!.project!.name;
+          targetLinearProjectState = linearIssue!.project!.state || "planned";
+        } else if (wantsProjectBinding) {
+          targetLinearProjectState = "planned";
+        }
+
+        if (targetPaperclipProjectId && targetLinearProjectId) {
+          const paperclipProject = await getProjectById(ctx, targetPaperclipProjectId, companyId);
+          if (!paperclipProject) {
+            return {
+              content: "Error: Paperclip project not found",
+              data: {
+                ok: false,
+                error: `Paperclip project ${targetPaperclipProjectId} was not found in company ${companyId}.`,
+              },
+            };
+          }
+
+          const existingByPaperclipProject = await sync.getProjectLink(ctx, targetPaperclipProjectId);
+          const existingByLinearProject = await sync.getProjectLinkByLinear(ctx, targetLinearProjectId);
+          const paperclipProjectConflict = existingByPaperclipProject
+            && existingByPaperclipProject.linearProjectId !== targetLinearProjectId;
+          const linearProjectConflict = existingByLinearProject
+            && existingByLinearProject.paperclipProjectId !== targetPaperclipProjectId;
+          if ((paperclipProjectConflict || linearProjectConflict) && !replaceExisting) {
+            return {
+              content: "Error: conflicting project binding exists",
+              data: {
+                ok: false,
+                error: "Conflicting project binding exists. Pass replaceExisting=true to repair it.",
+                existingByPaperclipProject,
+                existingByLinearProject,
+              },
+            };
+          }
+
+          if (replaceExisting) {
+            const removeProjectIds = [
+              existingByPaperclipProject?.paperclipProjectId,
+              existingByLinearProject?.paperclipProjectId,
+            ].filter((value): value is string => typeof value === "string" && value.length > 0)
+              .filter((value, index, values) => values.indexOf(value) === index);
+            for (const id of removeProjectIds) {
+              await sync.removeProjectLink(ctx, id);
+            }
+          }
+
+          projectLink = await sync.createProjectLink(ctx, {
+            paperclipProjectId: targetPaperclipProjectId,
+            paperclipCompanyId: companyId,
+            linearProjectId: targetLinearProjectId,
+            linearProjectName: targetLinearProjectName?.trim() || paperclipProject.name || targetLinearProjectId,
+            linearState: targetLinearProjectState,
+            syncDirection: effectiveSyncDirection,
+          });
+
+          try {
+            await writePaperclipProjectBackLink(ctx, token, projectLink, paperclipProject);
+          } catch (err) {
+            const message = `Failed to write Linear project backlink: ${err}`;
+            warnings.push(message);
+            ctx.logger.warn(message);
+          }
+        }
+
+        const issueSummary = await summarizePaperclipIssue(ctx, paperclipIssue, companyId);
+        const projectSummary = await summarizePaperclipProject(
+          ctx,
+          projectLink ? await getProjectById(ctx, projectLink.paperclipProjectId, companyId) : null,
+          companyId,
+        );
+        const parts = [
+          issueLink ? `issue ${issueLink.linearIdentifier} -> ${issueSummary?.identifier ?? issueLink.paperclipIssueId}` : null,
+          projectLink ? `project ${projectLink.linearProjectName} -> ${projectSummary?.name ?? projectLink.paperclipProjectId}` : null,
+        ].filter((part): part is string => Boolean(part));
+
+        return {
+          content: `Set Linear binding: ${parts.join("; ")}`,
+          data: {
+            ok: true,
+            issueLinked: Boolean(issueLink),
+            projectLinked: Boolean(projectLink),
+            warnings,
+            issueLink,
+            projectLink,
+            linear: linearIssue
+              ? {
+                  id: linearIssue.id,
+                  identifier: linearIssue.identifier,
+                  title: linearIssue.title,
+                  url: linearIssue.url,
+                  project: linearIssue.project
+                    ? {
+                        id: linearIssue.project.id,
+                        name: linearIssue.project.name,
+                        state: linearIssue.project.state,
+                      }
+                    : null,
+                }
+              : null,
+            paperclip: {
+              issue: issueSummary,
+              project: projectSummary,
+            },
+          },
         };
       },
     );
@@ -948,6 +1744,22 @@ const plugin = definePlugin({
           linearIssueId: linearIssue.id, linearIdentifier: linearIssue.identifier,
           linearUrl: linearIssue.url, linearStateType: linearIssue.state.type, syncDirection,
         });
+
+        try {
+          const paperclipIssue = await ctx.issues.get(issueId, companyId);
+          await writePaperclipBackLink(
+            ctx,
+            token,
+            linearIssue.id,
+            linearIssue.identifier,
+            paperclipIssue?.identifier ?? null,
+            issueId,
+            paperclipIssue?.title ?? linearIssue.title,
+            companyId,
+          );
+        } catch (err) {
+          ctx.logger.warn(`Failed to write Paperclip back-link after link tool: ${err}`);
+        }
 
         return {
           content: `Linked to ${linearIssue.identifier}`,
@@ -1028,13 +1840,30 @@ const plugin = definePlugin({
       if (payload?.description !== undefined) changes.description = payload.description as string;
       if (payload?.estimate !== undefined) changes.estimate = payload.estimate as number | null;
       if (payload?.dueDate !== undefined) changes.dueDate = payload.dueDate as string | null;
+      const patch = payload?.patch as Record<string, unknown> | undefined;
+      const hasProjectIdChange =
+        Object.prototype.hasOwnProperty.call(payload ?? {}, "projectId") ||
+        Object.prototype.hasOwnProperty.call(patch ?? {}, "projectId");
+      const projectIdChange = Object.prototype.hasOwnProperty.call(payload ?? {}, "projectId")
+        ? payload?.projectId
+        : patch?.projectId;
+      if (hasProjectIdChange && (typeof projectIdChange === "string" || projectIdChange === null)) {
+        changes.projectId = projectIdChange;
+      }
 
       if (Object.keys(changes).length === 0) return;
 
       try {
         const token = await resolveToken(ctx);
         const teamId = await getTeamId(ctx);
-        await sync.syncToLinear(ctx, link, changes, token, teamId);
+        await sync.syncToLinear(
+          ctx,
+          link,
+          changes,
+          token,
+          teamId,
+          await paperclipLinkOptionsForCompany(ctx, link.paperclipCompanyId),
+        );
       } catch (err) {
         ctx.logger.error("Failed to sync to Linear", { error: String(err) });
       }
@@ -1103,7 +1932,14 @@ const plugin = definePlugin({
         const teamId = await getTeamId(ctx);
 
         const title = (payload?.title as string) ?? "Untitled";
-        const description = payload?.description as string | undefined;
+        const paperclipLinkOptions = await paperclipLinkOptionsForCompany(ctx, companyId, payload?.identifier as string | undefined);
+        const description = payload?.description
+          ? absolutizePaperclipMarkdownLinks(
+              payload.description as string,
+              paperclipLinkOptions.baseUrl,
+              paperclipLinkOptions.companyPrefix,
+            )
+          : undefined;
         const priority = payload?.priority as string | undefined;
 
         const priorityMap: Record<string, number> = {
@@ -1130,6 +1966,17 @@ const plugin = definePlugin({
           linearStateType: linearIssue.state.type,
           syncDirection: syncDirection as sync.IssueLink["syncDirection"],
         });
+
+        await writePaperclipBackLink(
+          ctx,
+          token,
+          linearIssue.id,
+          linearIssue.identifier,
+          (payload?.identifier as string | undefined) ?? null,
+          issueId,
+          title,
+          companyId,
+        );
 
         await ctx.activity.log({
           companyId,
@@ -1160,7 +2007,14 @@ const plugin = definePlugin({
         const token = await resolveToken(ctx);
         const teamId = await getTeamId(ctx);
         const name = (payload?.name as string) ?? "Untitled";
-        const description = payload?.description as string | undefined;
+        const paperclipLinkOptions = await paperclipLinkOptionsForCompany(ctx, companyId);
+        const description = payload?.description
+          ? absolutizePaperclipMarkdownLinks(
+              payload.description as string,
+              paperclipLinkOptions.baseUrl,
+              paperclipLinkOptions.companyPrefix,
+            )
+          : undefined;
         const status = (payload?.status as string) ?? "backlog";
 
         const linearState = sync.paperclipProjectStateToLinear(status);
@@ -1168,13 +2022,19 @@ const plugin = definePlugin({
           name, description, teamIds: [teamId], state: linearState,
         });
 
-        await sync.createProjectLink(ctx, {
+        const link = await sync.createProjectLink(ctx, {
           paperclipProjectId: projectId,
           paperclipCompanyId: companyId,
           linearProjectId: created.id,
           linearProjectName: created.name,
           linearState,
           syncDirection: "bidirectional",
+        });
+
+        await writePaperclipProjectBackLink(ctx, token, link, {
+          id: projectId,
+          name,
+          description,
         });
 
         await ctx.activity.log({
@@ -1208,7 +2068,15 @@ const plugin = definePlugin({
 
       try {
         const token = await resolveToken(ctx);
-        await sync.syncProjectToLinear(ctx, link, changes, token);
+        const project = await getPaperclipProjectForLink(ctx, link);
+        await sync.syncProjectToLinear(
+          ctx,
+          link,
+          changes,
+          token,
+          await paperclipLinkOptionsForCompany(ctx, link.paperclipCompanyId),
+        );
+        await writePaperclipProjectBackLink(ctx, token, link, project);
       } catch (err) {
         ctx.logger.error(`Failed to sync project to Linear: ${err}`);
       }
@@ -1274,7 +2142,14 @@ const plugin = definePlugin({
 
       try {
         const token = await resolveToken(ctx);
-        await sync.bridgeCommentToLinear(ctx, link, token, body, authorName);
+        await sync.bridgeCommentToLinear(
+          ctx,
+          link,
+          token,
+          body,
+          authorName,
+          await paperclipLinkOptionsForCompany(ctx, link.paperclipCompanyId),
+        );
       } catch (err) {
         ctx.logger.error("Failed to bridge comment to Linear", { error: String(err) });
       }
@@ -1471,6 +2346,7 @@ async function handleWebhookEvent(
           pcIssue?.identifier ?? null,
           link.paperclipIssueId,
           pcIssue?.title ?? null,
+          link.paperclipCompanyId,
         );
       } catch (err) {
         ctx.logger.warn(`Webhook update back-link write failed for ${link.linearIdentifier}: ${err}`);
@@ -1721,6 +2597,7 @@ async function handleWebhookEvent(
             created.identifier ?? null,
             created.id,
             (data.title as string | null | undefined) ?? null,
+            companyId,
           );
         } catch (err) {
           ctx.logger.warn(
@@ -1835,31 +2712,44 @@ async function handleWebhookEvent(
       const status = sync.linearProjectStateToPaperclip(state);
 
       try {
-        const created = await (ctx.projects as any).create({
+        const adoption = await findAdoptablePaperclipProject(ctx, companyId, linearProjectId, name);
+        if (adoption.conflict) return;
+        const adoptedProject = adoption.project;
+        const project = adoptedProject ?? (await (ctx.projects as any).create({
           companyId,
           name,
           description: (data.description as string) ?? undefined,
           status,
-        });
+        }) as AdoptablePaperclipProject);
 
-        await sync.createProjectLink(ctx, {
-          paperclipProjectId: created.id,
+        const link = await sync.createProjectLink(ctx, {
+          paperclipProjectId: project.id,
           paperclipCompanyId: companyId,
           linearProjectId,
           linearProjectName: name,
           linearState: state,
           syncDirection: "bidirectional",
         });
+        if (adoptedProject) {
+          await sync.syncProjectFromLinear(ctx, link, {
+            id: linearProjectId,
+            name,
+            description: (data.description as string | null) ?? null,
+            state,
+          });
+        }
+        const token = await resolveToken(ctx);
+        await writePaperclipProjectBackLink(ctx, token, link, project);
 
         await ctx.activity.log({
           companyId,
           message: `project.synced_from_linear`,
           entityType: "project",
-          entityId: created.id,
-          metadata: { source: "linear", projectName: name, action: "created" },
+          entityId: project.id,
+          metadata: { source: "linear", projectName: name, action: adoptedProject ? "adopted" : "created" },
         });
 
-        ctx.logger.info(`Webhook created project from Linear: ${name}`);
+        ctx.logger.info(`${adoptedProject ? "Webhook adopted existing Paperclip project for Linear project" : "Webhook created project from Linear"}: ${name}`);
       } catch (err) {
         ctx.logger.warn(`Webhook failed to create project: ${err}`);
       }
@@ -2156,8 +3046,10 @@ async function runImport(ctx: PluginContext): Promise<{
   const linearProjects = await linear.listProjects(fetch, token, teamId);
   const existingProjects = await ctx.projects.list({ companyId });
   const projectMap = new Map<string, string>(); // project name → Paperclip project ID
+  const paperclipProjectById = new Map<string, { id: string; name?: string | null; description?: string | null; urlKey?: string | null }>();
   for (const ep of existingProjects) {
     projectMap.set(ep.name, ep.id);
+    paperclipProjectById.set(ep.id, ep);
   }
 
   const linearStatusMap: Record<string, string> = {
@@ -2180,6 +3072,7 @@ async function runImport(ctx: PluginContext): Promise<{
           targetDate: lp.targetDate ?? undefined,
         });
         projectMap.set(lp.name, created.id);
+        paperclipProjectById.set(created.id, created);
         ctx.logger.info(`Created project: ${lp.name}`);
       } catch (err) {
         ctx.logger.warn(`Failed to create project ${lp.name}: ${err}`);
@@ -2190,9 +3083,8 @@ async function runImport(ctx: PluginContext): Promise<{
     const paperclipProjectId = projectMap.get(lp.name);
     if (paperclipProjectId) {
       const existingLink = await sync.getProjectLink(ctx, paperclipProjectId);
-      if (!existingLink) {
-        try {
-          await sync.createProjectLink(ctx, {
+      try {
+        const link = existingLink ?? await sync.createProjectLink(ctx, {
             paperclipProjectId,
             paperclipCompanyId: companyId,
             linearProjectId: lp.id,
@@ -2200,9 +3092,9 @@ async function runImport(ctx: PluginContext): Promise<{
             linearState: lp.state?.toLowerCase() ?? "planned",
             syncDirection: "bidirectional",
           });
-        } catch (err) {
-          ctx.logger.warn(`Failed to create project link for ${lp.name}: ${err}`);
-        }
+        await writePaperclipProjectBackLink(ctx, token, link, paperclipProjectById.get(paperclipProjectId) ?? null);
+      } catch (err) {
+        ctx.logger.warn(`Failed to create project link/back-link for ${lp.name}: ${err}`);
       }
     }
   }
@@ -2212,14 +3104,21 @@ async function runImport(ctx: PluginContext): Promise<{
     if (!linearProjects.some((lp) => lp.name === ep.name)) {
       try {
         const linearState = sync.paperclipProjectStateToLinear(ep.status ?? "backlog");
+        const paperclipLinkOptions = await paperclipLinkOptionsForCompany(ctx, companyId);
         const created = await linear.createProject(fetch, token, {
           name: ep.name,
-          description: ep.description ?? undefined,
+          description: ep.description
+            ? absolutizePaperclipMarkdownLinks(
+                ep.description,
+                paperclipLinkOptions.baseUrl,
+                paperclipLinkOptions.companyPrefix,
+              )
+            : undefined,
           teamIds: [teamId],
           state: linearState,
         });
 
-        await sync.createProjectLink(ctx, {
+        const link = await sync.createProjectLink(ctx, {
           paperclipProjectId: ep.id,
           paperclipCompanyId: companyId,
           linearProjectId: created.id,
@@ -2227,6 +3126,7 @@ async function runImport(ctx: PluginContext): Promise<{
           linearState,
           syncDirection: "bidirectional",
         });
+        await writePaperclipProjectBackLink(ctx, token, link, ep);
         ctx.logger.info(`Pushed Paperclip project to Linear: ${ep.name}`);
       } catch (err) {
         ctx.logger.warn(`Failed to push project ${ep.name} to Linear: ${err}`);
@@ -2328,6 +3228,25 @@ async function runImport(ctx: PluginContext): Promise<{
               await ctx.issues.update(existing.id, { assigneeUserId: userId }, companyId);
             }
           }
+          const link = await sync.createLink(ctx, {
+            paperclipIssueId: existing.id,
+            paperclipCompanyId: companyId,
+            linearIssueId: linearIssue.id,
+            linearIdentifier: linearIssue.identifier,
+            linearUrl: linearIssue.url,
+            linearStateType: linearIssue.state.type,
+            syncDirection: "bidirectional",
+          });
+          await writePaperclipBackLink(
+            ctx,
+            token,
+            link.linearIssueId,
+            link.linearIdentifier,
+            existing.identifier ?? null,
+            existing.id,
+            existing.title ?? null,
+            companyId,
+          );
           skipped++;
           continue;
         }
@@ -2356,7 +3275,7 @@ async function runImport(ctx: PluginContext): Promise<{
           }, companyId);
         }
 
-        await sync.createLink(ctx, {
+        const link = await sync.createLink(ctx, {
           paperclipIssueId: created.id,
           paperclipCompanyId: companyId,
           linearIssueId: linearIssue.id,
@@ -2365,6 +3284,17 @@ async function runImport(ctx: PluginContext): Promise<{
           linearStateType: linearIssue.state.type,
           syncDirection: "bidirectional",
         });
+
+        await writePaperclipBackLink(
+          ctx,
+          token,
+          link.linearIssueId,
+          link.linearIdentifier,
+          created.identifier ?? null,
+          created.id,
+          linearIssue.title,
+          companyId,
+        );
 
         imported++;
         ctx.logger.info(`Imported ${linearIssue.identifier}: ${linearIssue.title}`);
@@ -2479,6 +3409,9 @@ async function runFullSync(ctx: PluginContext): Promise<{
       if (projResult.skippedCreate > 0) {
         sdkSkipNotes.push(`${projResult.skippedCreate} create skipped (no projects.create)`);
       }
+      if (projResult.skippedOtherCompany > 0) {
+        sdkSkipNotes.push(`${projResult.skippedOtherCompany} skipped (other company)`);
+      }
       const skipSuffix = sdkSkipNotes.length > 0 ? `, ${sdkSkipNotes.join(", ")}` : "";
       ctx.logger.info(
         `Project sync: ${projResult.synced} synced, ${projResult.created} created, ${projResult.errors} errors${skipSuffix}`,
@@ -2506,25 +3439,18 @@ async function runProjectSync(
   companyId: string,
   teamId: string,
   token: string,
-): Promise<{ synced: number; created: number; errors: number; skippedDrift: number; skippedCreate: number }> {
+): Promise<{ synced: number; created: number; errors: number; skippedDrift: number; skippedCreate: number; skippedOtherCompany: number }> {
   const fetch = ctx.http.fetch.bind(ctx.http);
   const linearProjects = await linear.listProjects(fetch, token, teamId);
 
-  // ctx.projects.create / .update were added after the published SDK that
-  // most plugin installs pin to. Try the typed client first; if it's missing
-  // fall back to the generic ctx.rpc.call escape hatch (newer SDKs only).
-  // If neither is available, degrade gracefully — log skipped counts instead
-  // of throwing per-project.
+  // ctx.projects.create was added after the published SDK that many plugin
+  // installs pin to. Try the typed client first; if it's missing fall back to
+  // the generic ctx.rpc.call escape hatch (newer SDKs only). Project update
+  // support is detected inside syncProjectFromLinear so it can return a
+  // precise result for accounting.
   const rpcCall = (ctx as any).rpc?.call as
     | (<T>(method: string, params?: unknown) => Promise<T>)
     | undefined;
-  const projectsUpdate = typeof (ctx.projects as any)?.update === "function"
-    ? (id: string, patch: Record<string, unknown>, companyId: string) =>
-        (ctx.projects as any).update(id, patch, companyId)
-    : rpcCall
-      ? (id: string, patch: Record<string, unknown>, companyId: string) =>
-          rpcCall("projects.update", { projectId: id, patch, companyId })
-      : null;
   const projectsCreate = typeof (ctx.projects as any)?.create === "function"
     ? (input: { companyId: string; name: string; description?: string; status?: string }) =>
         (ctx.projects as any).create(input)
@@ -2532,7 +3458,6 @@ async function runProjectSync(
       ? (input: { companyId: string; name: string; description?: string; status?: string }) =>
           rpcCall<{ id: string }>("projects.create", input)
       : null;
-  const supportsUpdate = projectsUpdate !== null;
   const supportsCreate = projectsCreate !== null;
 
   let synced = 0;
@@ -2540,6 +3465,7 @@ async function runProjectSync(
   let errors = 0;
   let skippedDrift = 0;
   let skippedCreate = 0;
+  let skippedOtherCompany = 0;
 
   for (const lp of linearProjects) {
     // Don't mirror the goal-bridge project back — it's Paperclip-managed and
@@ -2549,51 +3475,96 @@ async function runProjectSync(
     try {
       const existing = await sync.getProjectLinkByLinear(ctx, lp.id);
       if (existing) {
-        if (!supportsUpdate) {
-          skippedDrift++;
+        if (existing.paperclipCompanyId !== companyId) {
+          skippedOtherCompany++;
           continue;
         }
-        await sync.syncProjectFromLinear(ctx, existing, {
+        const driftResult = await sync.syncProjectFromLinear(ctx, existing, {
           id: lp.id,
           name: lp.name,
           description: lp.description ?? null,
           state: lp.state,
         });
+        if (driftResult === "unavailable") {
+          skippedDrift++;
+        } else if (driftResult === "failed") {
+          errors++;
+          continue;
+        }
+        await writePaperclipProjectBackLink(ctx, token, existing);
         synced++;
         continue;
       }
 
       if (!supportsCreate) {
-        skippedCreate++;
+        const adoption = await findAdoptablePaperclipProject(ctx, companyId, lp.id, lp.name);
+        if (adoption.conflict) {
+          skippedCreate++;
+          continue;
+        }
+        if (!adoption.project) {
+          skippedCreate++;
+          continue;
+        }
+
+        const link = await sync.createProjectLink(ctx, {
+          paperclipProjectId: adoption.project.id,
+          paperclipCompanyId: companyId,
+          linearProjectId: lp.id,
+          linearProjectName: lp.name,
+          linearState: lp.state ?? "planned",
+          syncDirection: "bidirectional",
+        });
+        await sync.syncProjectFromLinear(ctx, link, {
+          id: lp.id,
+          name: lp.name,
+          description: lp.description ?? null,
+          state: lp.state,
+        });
+        await writePaperclipProjectBackLink(ctx, token, link, adoption.project);
+        synced++;
         continue;
       }
 
-      // New Linear project we haven't seen — create the Paperclip mirror
-      // (matches the create-webhook behavior so the catch-up path is
-      // symmetric with live events).
       const status = sync.linearProjectStateToPaperclip(lp.state?.toLowerCase() ?? "planned");
-      const createdProj = await projectsCreate!({
+      const adoption = await findAdoptablePaperclipProject(ctx, companyId, lp.id, lp.name);
+      if (adoption.conflict) {
+        skippedCreate++;
+        continue;
+      }
+      const project = adoption.project ?? (await projectsCreate!({
         companyId,
         name: lp.name,
         description: lp.description ?? undefined,
         status,
-      });
-      await sync.createProjectLink(ctx, {
-        paperclipProjectId: createdProj.id,
+      }) as AdoptablePaperclipProject);
+      const link = await sync.createProjectLink(ctx, {
+        paperclipProjectId: project.id,
         paperclipCompanyId: companyId,
         linearProjectId: lp.id,
         linearProjectName: lp.name,
         linearState: lp.state ?? "planned",
         syncDirection: "bidirectional",
       });
-      created++;
+      if (adoption.project) {
+        await sync.syncProjectFromLinear(ctx, link, {
+          id: lp.id,
+          name: lp.name,
+          description: lp.description ?? null,
+          state: lp.state,
+        });
+        synced++;
+      } else {
+        created++;
+      }
+      await writePaperclipProjectBackLink(ctx, token, link, project);
     } catch (err) {
       ctx.logger.warn(`Project sync failed for ${lp.name}: ${err}`);
       errors++;
     }
   }
 
-  return { synced, created, errors, skippedDrift, skippedCreate };
+  return { synced, created, errors, skippedDrift, skippedCreate, skippedOtherCompany };
 }
 
 // ---------------------------------------------------------------------------
@@ -2631,6 +3602,12 @@ async function pushGoalToLinear(
   const token = await resolveToken(ctx);
   const fetch = ctx.http.fetch.bind(ctx.http);
   const existing = await sync.getGoalLink(ctx, goalId);
+  const paperclipLinkOptions = await paperclipLinkOptionsForCompany(ctx, companyId);
+  const safeGoalDescription = () => absolutizePaperclipMarkdownLinks(
+    goalDescription(goal),
+    paperclipLinkOptions.baseUrl,
+    paperclipLinkOptions.companyPrefix,
+  );
 
   // Probe initiative support (cached after first call)
   const initiativesSupported = await ctx.state.get({
@@ -2644,7 +3621,7 @@ async function pushGoalToLinear(
       try {
         const initiative = await linear.createInitiative(fetch, token, {
           name: goal.title,
-          description: goalDescription(goal),
+          description: safeGoalDescription(),
           targetDate: goal.targetDate ?? undefined,
         });
         // Cache that initiatives are supported
@@ -2685,7 +3662,7 @@ async function pushGoalToLinear(
 
     const created = await linear.createIssue(fetch, token, {
       title: goal.title,
-      description: goalDescription(goal),
+      description: safeGoalDescription(),
       teamId,
     });
     const followUp: Record<string, unknown> = { projectId: linearProjectId };
@@ -2721,7 +3698,7 @@ async function pushGoalToLinear(
     try {
       const initiative = await linear.createInitiative(fetch, token, {
         name: goal.title,
-        description: goalDescription(goal),
+        description: safeGoalDescription(),
         targetDate: goal.targetDate ?? undefined,
       });
 
@@ -2759,7 +3736,7 @@ async function pushGoalToLinear(
         if (cancelledStateId) {
           await linear.updateIssue(fetch, token, oldLinearIssueId, {
             stateId: cancelledStateId,
-            description: `[Migrated to Linear Initiative ${initiative.id}]\n\n${goalDescription(goal)}`,
+            description: `[Migrated to Linear Initiative ${initiative.id}]\n\n${safeGoalDescription()}`,
           });
           ctx.logger.info(`Archived orphaned Linear issue ${oldLinearIssueId} after initiative migration`);
         } else {
@@ -2789,7 +3766,7 @@ async function pushGoalToLinear(
     update.targetDate = goal.targetDate ?? null;
   }
   if (goal.level !== existing.lastLevel) {
-    update.description = goalDescription(goal);
+    update.description = safeGoalDescription();
   }
 
   if (Object.keys(update).length === 0) {

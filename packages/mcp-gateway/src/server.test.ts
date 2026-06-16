@@ -9,6 +9,7 @@ interface StrictMcpUpstream {
   url: string;
   methods: string[];
   clearSessions: () => void;
+  markSessionsUninitialized: () => void;
   close: () => Promise<void>;
 }
 
@@ -97,6 +98,11 @@ async function createStrictMcpUpstream(): Promise<StrictMcpUpstream> {
     url,
     methods,
     clearSessions: () => sessions.clear(),
+    markSessionsUninitialized: () => {
+      for (const session of sessions.values()) {
+        session.initialized = false;
+      }
+    },
     close: () => closeServer(server),
   };
 }
@@ -179,6 +185,21 @@ describe("mcp gateway lifecycle compatibility", () => {
     expect(upstream.methods).toEqual(["initialize", "notifications/initialized", "tools/list"]);
   });
 
+  it("does not forward requests for unknown client sessions before upstream initialization", async () => {
+    const upstream = await createStrictMcpUpstream();
+    const gateway = await createGateway(upstream.url);
+
+    const templatesList = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders("stale-client-session"),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "resources/templates/list", params: {} }),
+    });
+
+    expect(templatesList.status).toBe(200);
+    expect(templatesList.headers.get(MCP_SESSION_HEADER)).toBe("stale-client-session");
+    expect(upstream.methods).toEqual(["initialize", "notifications/initialized", "resources/templates/list"]);
+  });
+
   it("replays initialize and initialized before retrying a missing upstream session", async () => {
     const upstream = await createStrictMcpUpstream();
     const gateway = await createGateway(upstream.url);
@@ -212,6 +233,47 @@ describe("mcp gateway lifecycle compatibility", () => {
       "initialize",
       "notifications/initialized",
       "tools/list",
+    ]);
+  });
+
+  it("replays initialize and initialized before retrying a session-initialization race", async () => {
+    const upstream = await createStrictMcpUpstream();
+    const gateway = await createGateway(upstream.url);
+
+    const initialize = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "0" } },
+      }),
+    });
+    const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
+    expect(clientSessionId).toBeTruthy();
+
+    upstream.markSessionsUninitialized();
+    const toolsCall = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(clientSessionId ?? undefined),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "pods_list_in_namespace", arguments: { namespace: "paperclip" } },
+      }),
+    });
+
+    expect(toolsCall.status).toBe(200);
+    expect(toolsCall.headers.get(MCP_SESSION_HEADER)).toBe(clientSessionId);
+    expect(upstream.methods).toEqual([
+      "initialize",
+      "notifications/initialized",
+      "tools/call",
+      "initialize",
+      "notifications/initialized",
+      "tools/call",
     ]);
   });
 });

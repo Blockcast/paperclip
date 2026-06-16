@@ -4,10 +4,14 @@ import {
   askUserQuestionsPayloadSchema,
   checkoutIssueSchema,
   createApprovalSchema,
+  createGoalSchema,
   createIssueInputSchema,
+  createProjectSchema,
   issueThreadInteractionContinuationPolicySchema,
+  updateProjectSchema,
   requestConfirmationPayloadSchema,
   suggestTasksPayloadSchema,
+  updateGoalSchema,
   updateIssueSchema,
   upsertIssueDocumentSchema,
   linkIssueApprovalSchema,
@@ -78,6 +82,10 @@ const listIssuesSchema = z.object({
   q: z.string().optional(),
 });
 
+const searchIssuesSchema = listIssuesSchema.omit({ q: true }).extend({
+  query: z.string().trim().min(1),
+});
+
 const listCommentsSchema = z.object({
   issueId: issueIdSchema,
   after: z.string().uuid().optional(),
@@ -99,9 +107,27 @@ const createIssueToolSchema = z.object({
   companyId: companyIdOptional,
 }).merge(createIssueInputSchema);
 
+const createProjectToolSchema = z.object({
+  companyId: companyIdOptional,
+}).merge(createProjectSchema);
+
+const createGoalToolSchema = z.object({
+  companyId: companyIdOptional,
+}).merge(createGoalSchema);
+
 const updateIssueToolSchema = z.object({
   issueId: issueIdSchema,
 }).merge(updateIssueSchema);
+
+const updateProjectToolSchema = z.object({
+  projectId: projectIdSchema,
+  companyId: companyIdOptional,
+}).merge(updateProjectSchema);
+
+const updateGoalToolSchema = z.object({
+  goalId: goalIdSchema,
+  companyId: companyIdOptional,
+}).merge(updateGoalSchema);
 
 const checkoutIssueToolSchema = z.object({
   issueId: issueIdSchema,
@@ -223,6 +249,21 @@ async function getIssueWorkspaceRuntime(client: PaperclipApiClient, issueId: str
   };
 }
 
+type ListIssuesInput = z.infer<typeof listIssuesSchema>;
+
+async function listIssues(client: PaperclipApiClient, input: ListIssuesInput) {
+  const companyId = await client.resolveCompany({ override: input.companyId });
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(input)) {
+    if (key === "companyId" || value === undefined || value === null) continue;
+    params.set(key, String(value));
+  }
+  const qs = params.toString();
+  return client.requestJson("GET", `/companies/${companyId}/issues${qs ? `?${qs}` : ""}`, {
+    companyId,
+  });
+}
+
 export function createToolDefinitions(client: PaperclipApiClient): ToolDefinition[] {
   return [
     makeTool(
@@ -262,18 +303,13 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       "paperclipListIssues",
       "List issues for a company with optional filters",
       listIssuesSchema,
-      async (input) => {
-        const companyId = await client.resolveCompany({ override: input.companyId });
-        const params = new URLSearchParams();
-        for (const [key, value] of Object.entries(input)) {
-          if (key === "companyId" || value === undefined || value === null) continue;
-          params.set(key, String(value));
-        }
-        const qs = params.toString();
-        return client.requestJson("GET", `/companies/${companyId}/issues${qs ? `?${qs}` : ""}`, {
-          companyId,
-        });
-      },
+      async (input) => listIssues(client, input),
+    ),
+    makeTool(
+      "paperclip_search_issues",
+      "Search Paperclip issues by text. Compatibility alias for clients that ask for paperclip_search_issues; prefer paperclipListIssues with q when choosing tools directly.",
+      searchIssuesSchema,
+      async ({ query, ...input }) => listIssues(client, { ...input, q: query }),
     ),
     makeTool(
       "paperclipGetIssue",
@@ -364,6 +400,30 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       },
     ),
     makeTool(
+      "paperclipCreateProject",
+      "Create a project in a company",
+      createProjectToolSchema,
+      async ({ companyId, ...body }) => {
+        const resolved = await client.resolveCompany({ override: companyId });
+        return client.requestJson("POST", `/companies/${resolved}/projects`, {
+          body,
+          companyId: resolved,
+        });
+      },
+    ),
+    makeTool(
+      "paperclipUpdateProject",
+      "Patch a project by id",
+      updateProjectToolSchema,
+      async ({ projectId, companyId, ...body }) => {
+        const resolved = await client.resolveCompany({ override: companyId });
+        return client.requestJson("PATCH", `/projects/${encodeURIComponent(projectId)}`, {
+          body,
+          companyId: resolved,
+        });
+      },
+    ),
+    makeTool(
       "paperclipGetIssueWorkspaceRuntime",
       "Get the current execution workspace and runtime services for an issue, including service URLs",
       z.object({ issueId: issueIdSchema }),
@@ -414,7 +474,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipListGoals",
-      "List goals in a company",
+      "List goals in a company. Use paperclipListProjects for projects.",
       z.object({ companyId: companyIdOptional }),
       async ({ companyId }) => {
         const resolved = await client.resolveCompany({ override: companyId });
@@ -426,6 +486,30 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       "Get a goal by id",
       z.object({ goalId: goalIdSchema }),
       async ({ goalId }) => client.requestJson("GET", `/goals/${encodeURIComponent(goalId)}`),
+    ),
+    makeTool(
+      "paperclipCreateGoal",
+      "Create a strategic goal in a company",
+      createGoalToolSchema,
+      async ({ companyId, ...body }) => {
+        const resolved = await client.resolveCompany({ override: companyId });
+        return client.requestJson("POST", `/companies/${resolved}/goals`, {
+          body,
+          companyId: resolved,
+        });
+      },
+    ),
+    makeTool(
+      "paperclipUpdateGoal",
+      "Patch a goal by id",
+      updateGoalToolSchema,
+      async ({ goalId, companyId, ...body }) => {
+        const resolved = await client.resolveCompany({ override: companyId });
+        return client.requestJson("PATCH", `/goals/${encodeURIComponent(goalId)}`, {
+          body,
+          companyId: resolved,
+        });
+      },
     ),
     makeTool(
       "paperclipListApprovals",
@@ -482,8 +566,13 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       "paperclipUpdateIssue",
       "Patch an issue, optionally including a comment. Include comment with status changes when approving or requesting changes in a review/approval stage; include resume=true when intentionally requesting follow-up on resumable closed work",
       updateIssueToolSchema,
-      async ({ issueId, ...body }) =>
-        client.requestJson("PATCH", `/issues/${encodeURIComponent(issueId)}`, { body }),
+      async ({ issueId, ...body }) => {
+        const companyId = await client.resolveCompany({ issueId });
+        return client.requestJson("PATCH", `/issues/${encodeURIComponent(issueId)}`, {
+          body,
+          companyId,
+        });
+      },
     ),
     makeTool(
       "paperclipCheckoutIssue",

@@ -83,10 +83,10 @@ spec:
         - name: gateway
           # Pin to a specific build. Bump after `kubectl apply -f ...` +
           # `kubectl set image` proves the new image healthy across all
-          # routes. Latest verified rollout: 2026-06-08 (sha-f6d6483
-          # completes upstream MCP initialization after gateway-created
-          # or replayed initialize sessions).
-          image: harbor.blockcast.net/paperclip-mcp-gateway/paperclip-mcp-gateway:sha-f6d6483
+          # routes. Latest verified rollout: 2026-06-09 (BLO-7636
+          # retries upstream "invalid during session initialization"
+          # responses with a fresh initialize + initialized handshake).
+          image: harbor.blockcast.net/paperclip-mcp-gateway/paperclip-mcp-gateway@sha256:82acecae431e1d665fd3f97a34091a90c11f81a5d42ee0525f232461ee2c6c92
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  absolutePaperclipHref,
+  absolutizePaperclipMarkdownLinks,
+  appendPaperclipProjectBacklink,
   extractLinearWorkspaceSlug,
   linkifyBareLinearIssueRefs,
+  stripPaperclipProjectBacklink,
 } from "../src/markdown.js";
 
 describe("extractLinearWorkspaceSlug", () => {
@@ -142,5 +146,47 @@ describe("linkifyBareLinearIssueRefs", () => {
 
   it("returns empty body unchanged", () => {
     expect(linkifyBareLinearIssueRefs("", "blockcast")).toBe("");
+  });
+});
+
+describe("Paperclip outbound links", () => {
+  it("turns relative issue and project links into company-prefixed absolute URLs", () => {
+    expect(
+      absolutizePaperclipMarkdownLinks(
+        "See [BLO-9596](/BLO/issues/BLO-9596) and [project](/projects/control-plane).",
+        "https://paperclip.blockcast.net/",
+        "BLO",
+      ),
+    ).toBe(
+      "See [BLO-9596](https://paperclip.blockcast.net/BLO/issues/BLO-9596) and " +
+        "[project](https://paperclip.blockcast.net/BLO/projects/control-plane).",
+    );
+  });
+
+  it("leaves non-Paperclip and already-absolute links alone", () => {
+    const github = "https://github.com/Blockcast/paperclip/pull/1";
+    expect(absolutePaperclipHref(github, "https://paperclip.blockcast.net", "BLO")).toBe(github);
+    expect(
+      absolutePaperclipHref(
+        "/BLO/issues/BLO-9596",
+        "https://paperclip.blockcast.net",
+        "BLO",
+      ),
+    ).toBe("https://paperclip.blockcast.net/BLO/issues/BLO-9596");
+  });
+
+  it("appends and strips the managed project backlink idempotently", () => {
+    const linked = appendPaperclipProjectBacklink(
+      "Project body",
+      "https://paperclip.blockcast.net/BLO/projects/sync",
+    );
+    expect(linked).toContain("[Open Paperclip project](https://paperclip.blockcast.net/BLO/projects/sync)");
+    expect(
+      appendPaperclipProjectBacklink(
+        linked,
+        "https://paperclip.blockcast.net/BLO/projects/sync",
+      ),
+    ).toBe(linked);
+    expect(stripPaperclipProjectBacklink(linked)).toBe("Project body");
   });
 });
