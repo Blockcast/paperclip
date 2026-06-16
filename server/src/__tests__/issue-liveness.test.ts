@@ -579,3 +579,4 @@ describe("issue graph liveness classifier", () => {
     expect(findings).toEqual([]);
   });
 });
+
