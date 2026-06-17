@@ -117,7 +117,15 @@ WORKDIR /vendor
 # corresponding local Claude JSONL session exists. Paperclip runtime UUIDs
 # without a Claude session file now start fresh instead of failing with
 # "No conversation found with session ID".
-ARG CLAUDE_K8S_REF=af5df8448e02f3b152ddb0d8e40c558d371a0ebd
+# Bumped 2026-06-17 to f79ab9a (master tip): BLO-10699 — redirect Chrome's
+# BrowserMetrics spool off the shared CephFS HOME to the per-pod /runtime-cache
+# emptyDir (PR #8), so the agent-browser designer tool's headless Chrome can no
+# longer leak *.pma buffers onto /paperclip and wall the fleet with EDQUOT.
+# af5df84's "only --resume when the JSONL session exists" guard was pinned
+# directly off an unmerged branch and was NOT on master; PR #9 ported it onto
+# master (cherry-pick), so f79ab9a carries BOTH the --resume guard and the
+# BrowserMetrics fix (verified present + 371 tests green). No --resume regress.
+ARG CLAUDE_K8S_REF=f79ab9a485006f1b4d31ffff063ab44198a5fe98
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
