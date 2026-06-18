@@ -436,6 +436,7 @@ export type {
   ProjectCodebase,
   ProjectCodebaseOrigin,
   ProjectGoalRef,
+  LinearProjectLink,
   ProjectManagedByPlugin,
   ProjectWorkspace,
   CompanySearchHighlight,
