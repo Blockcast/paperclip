@@ -65,6 +65,8 @@ function createIssue(index: number, status: IssueStatus): Issue {
     myLastTouchAt: null,
     lastExternalCommentAt: null,
     lastActivityAt: null,
+    milestoneId: null,
+    targetDate: null,
     isUnreadForMe: false,
   };
 }

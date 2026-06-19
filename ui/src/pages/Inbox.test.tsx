@@ -185,6 +185,8 @@ function createIssue(overrides: Partial<Issue> = {}): Issue {
     lastExternalCommentAt: null,
     lastActivityAt: new Date("2026-03-11T00:00:00.000Z"),
     isUnreadForMe: false,
+    milestoneId: null,
+    targetDate: null,
     ...overrides,
     workMode: overrides.workMode ?? "standard",
   };

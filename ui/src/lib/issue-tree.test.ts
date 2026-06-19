@@ -43,6 +43,8 @@ function makeIssue(id: string, parentId: string | null = null): Issue {
     labelIds: [],
     myLastTouchAt: null,
     lastExternalCommentAt: null,
+    milestoneId: null,
+    targetDate: null,
     isUnreadForMe: false,
   };
 }

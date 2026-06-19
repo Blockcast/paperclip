@@ -120,6 +120,8 @@ function createIssue(overrides: Partial<Issue> = {}): Issue {
     labels: [],
     labelIds: [],
     currentExecutionWorkspace: null,
+    milestoneId: null,
+    targetDate: null,
     ...overrides,
     workMode: overrides.workMode ?? "standard",
   };

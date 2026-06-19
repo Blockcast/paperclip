@@ -16,4 +16,4 @@ CREATE INDEX "milestones_company_project_idx" ON "milestones" USING btree ("comp
 ALTER TABLE "issues" ADD COLUMN "milestone_id" uuid;--> statement-breakpoint
 ALTER TABLE "issues" ADD COLUMN "target_date" date;--> statement-breakpoint
 ALTER TABLE "issues" ADD CONSTRAINT "issues_milestone_id_fkey" FOREIGN KEY ("milestone_id") REFERENCES "milestones"("id") ON DELETE set null;--> statement-breakpoint
-CREATE INDEX "issues_company_milestone_idx" ON "issues" USING btree ("company_id","milestone_id");
+CREATE INDEX "issues_company_milestone_idx" ON "issues" USING btree ("company_id","milestone_id") WHERE (milestone_id IS NOT NULL);

@@ -756,6 +756,8 @@ export function createIssue(overrides: Partial<Issue> = {}): Issue {
     lastExternalCommentAt: recent(70),
     lastActivityAt: recent(3),
     isUnreadForMe: true,
+    milestoneId: null,
+    targetDate: null,
     createdAt: recent(90),
     updatedAt: recent(3),
     ...overrides,

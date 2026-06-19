@@ -114,6 +114,8 @@ describe("issueDetailBreadcrumb", () => {
       lastExternalCommentAt: null,
       lastActivityAt: null,
       isUnreadForMe: false,
+      milestoneId: null,
+      targetDate: null,
       createdAt: new Date(),
       updatedAt: new Date(),
       ...overrides,
