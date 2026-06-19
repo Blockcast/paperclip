@@ -4340,5 +4340,72 @@ describe("paperclip-plugin-linear", () => {
       expect(result.membershipBackfilled).toBe(0);
       expect(update).not.toHaveBeenCalled();
     });
+
+    it("paginates across multiple pages and stamps issues on each page", async () => {
+      await seedReconcileEnv(harness);
+      const { listProjectIssuesWithMilestone, listProjectMilestones } = await import("../src/linear.js");
+      (listProjectMilestones as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      // Page 1: hasNextPage=true
+      (listProjectIssuesWithMilestone as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        issues: [{ id: "lin-iss-p1", identifier: "LUC-P1", projectMilestone: { id: "lin-ms-1", name: "M1" } }],
+        hasNextPage: true,
+        endCursor: "cursor-1",
+      });
+      // Page 2: hasNextPage=false
+      (listProjectIssuesWithMilestone as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        issues: [{ id: "lin-iss-p2", identifier: "LUC-P2", projectMilestone: { id: "lin-ms-1", name: "M1" } }],
+        hasNextPage: false,
+        endCursor: null,
+      });
+
+      syncModule.getMilestoneLinkByLinear.mockResolvedValue({
+        paperclipMilestoneId: "pc-ms-1",
+        paperclipCompanyId: "comp-reconcile",
+        paperclipProjectId: "pc-proj-A",
+        linearMilestoneId: "lin-ms-1",
+        linearMilestoneName: "M1",
+      });
+
+      syncModule.getLinkByLinear
+        .mockResolvedValueOnce({
+          paperclipIssueId: "pc-iss-p1",
+          paperclipCompanyId: "comp-reconcile",
+          linearIssueId: "lin-iss-p1",
+          linearIdentifier: "LUC-P1",
+          linearUrl: "https://linear.app/t/LUC-P1",
+          syncDirection: "bidirectional",
+          lastSyncAt: "2020-01-01T00:00:00.000Z",
+          lastLinearStateType: "unstarted",
+          lastCommentSyncAt: null,
+        })
+        .mockResolvedValueOnce({
+          paperclipIssueId: "pc-iss-p2",
+          paperclipCompanyId: "comp-reconcile",
+          linearIssueId: "lin-iss-p2",
+          linearIdentifier: "LUC-P2",
+          linearUrl: "https://linear.app/t/LUC-P2",
+          syncDirection: "bidirectional",
+          lastSyncAt: "2020-01-01T00:00:00.000Z",
+          lastLinearStateType: "unstarted",
+          lastCommentSyncAt: null,
+        });
+
+      harness.seed({
+        issues: [
+          { id: "pc-iss-p1", companyId: "comp-reconcile", title: "P1", status: "todo", priority: "low", milestoneId: null, assigneeAgentId: null, assigneeUserId: null } as never,
+          { id: "pc-iss-p2", companyId: "comp-reconcile", title: "P2", status: "todo", priority: "low", milestoneId: null, assigneeAgentId: null, assigneeUserId: null } as never,
+        ],
+      });
+
+      const result = await harness.performAction<{ membershipBackfilled: number }>(
+        ACTION_KEYS.reconcileMilestones,
+        { companyId: "comp-reconcile" },
+      );
+
+      expect(result.membershipBackfilled).toBe(2);
+      // Verify cursor was passed on second call
+      expect(listProjectIssuesWithMilestone).toHaveBeenCalledTimes(2);
+      expect((listProjectIssuesWithMilestone as ReturnType<typeof vi.fn>).mock.calls[1][3]).toBe("cursor-1");
+    });
   });
 });
