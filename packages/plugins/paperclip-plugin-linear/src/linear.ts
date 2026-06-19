@@ -1213,7 +1213,7 @@ export async function listProjectIssuesWithMilestone(
         nodes: Array<{ id: string; identifier: string; projectMilestone: { id: string; name: string } | null }>;
         pageInfo: { hasNextPage: boolean; endCursor: string | null };
       };
-    };
+    } | null;
   }>(fetch, token, `
     query ListProjectIssuesWithMilestone($projectId: String!, $after: String) {
       project(id: $projectId) {
