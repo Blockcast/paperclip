@@ -1229,6 +1229,9 @@ export async function listProjectIssuesWithMilestone(
     }
   `, { projectId, after: cursor ?? null });
 
+  if (!data.project) {
+    return { issues: [], hasNextPage: false, endCursor: null };
+  }
   const issues = data.project.issues.nodes.filter(
     (n): n is LinearIssueWithMilestone => n.projectMilestone !== null && n.projectMilestone !== undefined,
   );

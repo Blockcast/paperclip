@@ -1313,7 +1313,7 @@ const plugin = definePlugin({
               );
               membershipBackfilled++;
             }
-            if (!hasNextPage) break;
+            if (!hasNextPage || !endCursor) break;
             cursor = endCursor;
             await new Promise((r) => setTimeout(r, 150));
           }
