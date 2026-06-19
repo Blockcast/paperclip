@@ -190,8 +190,6 @@ function createIssue(overrides: Partial<Issue> = {}): Issue {
     lastExternalCommentAt: null,
     lastActivityAt: null,
     isUnreadForMe: false,
-    milestoneId: null,
-    targetDate: null,
     ...overrides,
     workMode: overrides.workMode ?? "standard",
   };

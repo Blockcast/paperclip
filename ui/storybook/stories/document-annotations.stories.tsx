@@ -281,8 +281,6 @@ function makeIntegratedIssue(): Issue {
     ],
     legacyPlanDocument: null,
     planDocument: integratedDoc,
-    milestoneId: null,
-    targetDate: null,
     createdAt: new Date("2026-05-10T00:00:00Z"),
     updatedAt: new Date("2026-05-12T10:01:00Z"),
   };

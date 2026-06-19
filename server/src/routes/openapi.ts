@@ -26,9 +26,6 @@ import {
   upsertIssueDocumentSchema,
   restoreIssueDocumentRevisionSchema,
   upsertIssueFeedbackVoteSchema,
-  // Milestone
-  createMilestoneSchema,
-  updateMilestoneSchema,
   // Project
   createProjectSchema,
   updateProjectSchema,
@@ -4638,59 +4635,6 @@ for (const route of [
     ...(route[0] === "post" || route[0] === "put" ? { body: pluginLocalFolderRequestSchema } : {}),
   });
 }
-
-// ─── Milestones ───────────────────────────────────────────────────────────────
-
-registry.registerPath({
-  method: "get",
-  path: "/api/companies/{companyId}/milestones",
-  tags: ["milestones"],
-  summary: "List milestones in a company",
-  request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
-});
-
-registry.registerPath({
-  method: "post",
-  path: "/api/companies/{companyId}/milestones",
-  tags: ["milestones"],
-  summary: "Create a milestone",
-  request: {
-    params: z.object({ companyId: z.string() }),
-    body: jsonBody(createMilestoneSchema),
-  },
-  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized },
-});
-
-registry.registerPath({
-  method: "get",
-  path: "/api/milestones/{id}",
-  tags: ["milestones"],
-  summary: "Get a milestone",
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
-});
-
-registry.registerPath({
-  method: "patch",
-  path: "/api/milestones/{id}",
-  tags: ["milestones"],
-  summary: "Update a milestone",
-  request: {
-    params: z.object({ id: z.string() }),
-    body: jsonBody(updateMilestoneSchema),
-  },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
-});
-
-registry.registerPath({
-  method: "delete",
-  path: "/api/milestones/{id}",
-  tags: ["milestones"],
-  summary: "Delete a milestone",
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
-});
 
 // ─── Spec builder ─────────────────────────────────────────────────────────────
 
