@@ -1293,11 +1293,13 @@ const plugin = definePlugin({
               }
               const issueLink = await sync.getLinkByLinear(ctx, li.id);
               if (!issueLink) {
+                ctx.logger.debug(`reconcile-milestones phase 1.5: skipping ${li.identifier} — no PC issue link`);
                 membershipSkipped++;
                 continue;
               }
               const pcIssue = await ctx.issues.get(issueLink.paperclipIssueId, companyId);
               if (!pcIssue) {
+                ctx.logger.debug(`reconcile-milestones phase 1.5: skipping ${li.identifier} — PC issue ${issueLink.paperclipIssueId} not found`);
                 membershipSkipped++;
                 continue;
               }
