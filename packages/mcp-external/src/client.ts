@@ -1,6 +1,23 @@
 import type { PaperclipExternalConfig } from "./config.js";
 import { currentBearer } from "./auth-context.js";
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isUuid(value: string): boolean {
+  return UUID_RE.test(value);
+}
+
+/**
+ * Human-readable issue identifiers carry a company prefix, e.g. `PEN-307`.
+ * Returns the uppercased prefix (`PEN`) or null for bare UUIDs / unprefixed ids.
+ */
+export function issuePrefixFromIdentifier(issueId: string): string | null {
+  const trimmed = issueId.trim();
+  if (!trimmed || isUuid(trimmed)) return null;
+  const match = /^([A-Za-z][A-Za-z0-9]*)-\d+$/.exec(trimmed);
+  return match ? match[1].toUpperCase() : null;
+}
+
 export class PaperclipApiError extends Error {
   readonly status: number;
   readonly method: string;
@@ -78,6 +95,50 @@ export class PaperclipApiClient {
       this.companyCacheByBearer.set(key, cached);
     }
     return cached;
+  }
+
+  /**
+   * Synchronous resolution for callers that already hold a company UUID (or
+   * rely solely on the default). Does NOT resolve prefixes — use
+   * {@link resolveCompany} for per-request overrides that may be a prefix.
+   */
+  resolveCompanyId(companyId?: string | null): string {
+    const resolved = companyId?.trim() || this.config.companyId;
+    if (!resolved) {
+      throw new Error("companyId is required because PAPERCLIP_COMPANY_ID is not set");
+    }
+    return resolved;
+  }
+
+  /**
+   * Resolve a per-request company override to a company UUID.
+   *
+   * Precedence: explicit `override` (UUID or issue-prefix like "PEN") →
+   * `issueId` prefix (e.g. "PEN-307" → "PEN") → default PAPERCLIP_COMPANY_ID.
+   * Prefix resolution lists the companies the auth token is a member of
+   * (GET /companies) and matches on `issuePrefix`. It does not bypass authz.
+   */
+  async resolveCompany(input: { override?: string | null; issueId?: string | null } = {}): Promise<string> {
+    const explicit = input.override?.trim();
+    const derived = input.issueId ? issuePrefixFromIdentifier(input.issueId) : null;
+    const requested = explicit || derived;
+    if (!requested) {
+      return this.resolveCompanyId();
+    }
+    if (isUuid(requested)) {
+      return requested;
+    }
+    const prefix = requested.toUpperCase();
+    const companies = await this.listCompanies();
+    const match = companies.find(
+      (company) => (company.issuePrefix ?? "").trim().toUpperCase() === prefix,
+    );
+    if (!match) {
+      throw new Error(
+        `No accessible company with prefix "${prefix}". The auth token must be a member of that company (board/user token required for cross-company access).`,
+      );
+    }
+    return match.id;
   }
 
   async requestJson<T>(method: string, path: string, options: JsonRequestOptions = {}): Promise<T> {
