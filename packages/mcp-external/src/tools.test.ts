@@ -366,3 +366,49 @@ describe("projects", () => {
     });
   });
 });
+
+describe("goals", () => {
+  it("list_goals GETs the company goals path", async () => {
+    const client = okClient([]);
+    await tool(client, "list_goals").execute({}, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("GET", "/companies/co-default/goals", { companyId: "co-default" });
+  });
+
+  it("create_goal POSTs title (+ optional description)", async () => {
+    const client = okClient({ id: "g-1" });
+    await tool(client, "create_goal").execute({ title: "Grow", description: "why" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("POST", "/companies/co-default/goals", {
+      body: { title: "Grow", description: "why" },
+      companyId: "co-default",
+    });
+  });
+
+  it("create_goal omits description when empty", async () => {
+    const client = okClient({ id: "g-2" });
+    await tool(client, "create_goal").execute({ title: "Solo" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("POST", "/companies/co-default/goals", {
+      body: { title: "Solo" },
+      companyId: "co-default",
+    });
+  });
+
+  it("update_goal PATCHes /goals/<id> with provided fields, no company scoping", async () => {
+    const client = okClient({ id: "g-1" });
+    await tool(client, "update_goal").execute({ goal_id: "g-1", title: "New" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("PATCH", "/goals/g-1", { body: { title: "New" } });
+    expect(client.resolveCompany).not.toHaveBeenCalled();
+  });
+
+  it("update_goal errors when no fields provided", async () => {
+    const client = okClient();
+    const res = await tool(client, "update_goal").execute({ goal_id: "g-1" }, {} as any);
+    expect(JSON.parse(res.content[0].text).message).toMatch(/No fields to update/);
+    expect(client.requestJson).not.toHaveBeenCalled();
+  });
+
+  it("update_goal sends description alone", async () => {
+    const client = okClient({ id: "g-1" });
+    await tool(client, "update_goal").execute({ goal_id: "g-1", description: "new desc" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("PATCH", "/goals/g-1", { body: { description: "new desc" } });
+  });
+});

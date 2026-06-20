@@ -369,5 +369,55 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
         });
       },
     },
+    {
+      name: "list_goals",
+      description: "List all strategic goals for a company.",
+      schema: z.object({
+        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+      }),
+      execute: async (args) =>
+        runTool(async () => {
+          const company = await client.resolveCompany({ override: args.company_id as string | undefined });
+          return client.requestJson("GET", `/companies/${encodeURIComponent(company)}/goals`, { companyId: company });
+        }),
+    },
+    {
+      name: "create_goal",
+      description: "Create a new strategic goal for a company.",
+      schema: z.object({
+        title: z.string().describe("Goal title."),
+        description: z.string().default("").describe("Extended context/success criteria (Markdown)."),
+        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+      }),
+      execute: async (args) =>
+        runTool(async () => {
+          const company = await client.resolveCompany({ override: args.company_id as string | undefined });
+          const body: Record<string, unknown> = { title: String(args.title) };
+          if (args.description) body.description = String(args.description);
+          return client.requestJson("POST", `/companies/${encodeURIComponent(company)}/goals`, { body, companyId: company });
+        }),
+    },
+    {
+      name: "update_goal",
+      description: "Update an existing goal's title or description.",
+      schema: z.object({
+        goal_id: z.string().describe("Goal UUID."),
+        title: z.string().default("").describe("New title. Empty to keep."),
+        description: z.string().default("").describe("New description. Empty to keep."),
+      }),
+      execute: async (args) => {
+        const body: Record<string, unknown> = {};
+        // Python parity (server.py update_goal): title/description are truthy-only —
+        // empty values are OMITTED (keep), NOT cleared. Unlike update_project, this
+        // endpoint has no null-clear. Do not "align" with update_project's nullable
+        // pattern; that would diverge from the external reference.
+        if (args.title) body.title = String(args.title);
+        if (args.description) body.description = String(args.description);
+        if (Object.keys(body).length === 0) {
+          return errorResult("No fields to update. Provide at least one of: title, description.");
+        }
+        return runTool(() => client.requestJson("PATCH", `/goals/${encodeURIComponent(String(args.goal_id))}`, { body }));
+      },
+    },
   ];
 }
