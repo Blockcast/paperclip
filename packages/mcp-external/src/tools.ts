@@ -220,5 +220,49 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
         });
       },
     },
+    // NOTE: faithfully mirrors the Python external server, which sends a bodyless
+    // POST /issues/<id>/checkout. The current backend's checkoutIssueSchema requires
+    // agentId + expectedStatuses, so this 400s against current master — a pre-existing
+    // bug in the Python external surface (an external USER bearer has no agent identity:
+    // GET /agents/me -> 401). Fixing it needs an external-checkout design decision
+    // (which agent does a user check out as?), tracked as a cutover follow-up — not a
+    // wave-1 port change. release_issue mirrors the same bodyless shape.
+    {
+      name: "checkout_issue",
+      description:
+        "Atomically assign an issue to the current agent and mark it in_progress. 409 = owned by another agent; do NOT retry.",
+      schema: z.object({ issue_id: z.string().describe("Issue UUID or identifier to check out.") }),
+      execute: async (args) =>
+        runTool(() => client.requestJson("POST", `/issues/${encodeURIComponent(String(args.issue_id))}/checkout`)),
+    },
+    {
+      name: "release_issue",
+      description: "Release an issue: unassign it and revert it to its previous state. Inverse of checkout_issue.",
+      schema: z.object({ issue_id: z.string().describe("Issue UUID or identifier to release.") }),
+      execute: async (args) =>
+        runTool(() => client.requestJson("POST", `/issues/${encodeURIComponent(String(args.issue_id))}/release`)),
+    },
+    {
+      name: "delete_issue",
+      description: "Permanently delete an issue. This action cannot be undone.",
+      schema: z.object({ issue_id: z.string().describe("Issue UUID or identifier to delete.") }),
+      execute: async (args) =>
+        runTool(() => client.requestJson("DELETE", `/issues/${encodeURIComponent(String(args.issue_id))}`)),
+    },
+    {
+      name: "comment_on_issue",
+      description: "Add a comment to an issue (supports Markdown).",
+      schema: z.object({
+        issue_id: z.string().describe("Issue UUID or identifier."),
+        body: z.string().describe("Comment text. Markdown supported."),
+        reopen: z.boolean().default(false).describe("Reopen the issue when posting (only if currently closed)."),
+      }),
+      execute: async (args) =>
+        runTool(() => {
+          const payload: Record<string, unknown> = { body: String(args.body) };
+          if (args.reopen === true) payload.reopen = true;
+          return client.requestJson("POST", `/issues/${encodeURIComponent(String(args.issue_id))}/comments`, { body: payload });
+        }),
+    },
   ];
 }

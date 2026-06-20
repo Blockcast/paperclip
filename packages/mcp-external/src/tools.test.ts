@@ -255,3 +255,43 @@ describe("update_issue", () => {
     expect(client.requestJson).not.toHaveBeenCalled();
   });
 });
+
+describe("issue lifecycle", () => {
+  it("checkout_issue POSTs /issues/<id>/checkout", async () => {
+    const client = okClient(null);
+    const res = await tool(client, "checkout_issue").execute({ issue_id: "PEN-1" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("POST", "/issues/PEN-1/checkout");
+    expect(JSON.parse(res.content[0].text)).toEqual({ ok: true });
+    expect(client.resolveCompany).not.toHaveBeenCalled();
+  });
+
+  it("release_issue POSTs /issues/<id>/release", async () => {
+    const client = okClient(null);
+    const res = await tool(client, "release_issue").execute({ issue_id: "PEN-1" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("POST", "/issues/PEN-1/release");
+    expect(JSON.parse(res.content[0].text)).toEqual({ ok: true });
+    expect(client.resolveCompany).not.toHaveBeenCalled();
+  });
+
+  it("delete_issue DELETEs /issues/<id>", async () => {
+    const client = okClient(null);
+    const res = await tool(client, "delete_issue").execute({ issue_id: "PEN-1" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("DELETE", "/issues/PEN-1");
+    expect(JSON.parse(res.content[0].text)).toEqual({ ok: true });
+    expect(client.resolveCompany).not.toHaveBeenCalled();
+  });
+
+  it("comment_on_issue POSTs the body, omitting reopen when false", async () => {
+    const client = okClient({ id: "c-1" });
+    await tool(client, "comment_on_issue").execute({ issue_id: "PEN-1", body: "hi" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("POST", "/issues/PEN-1/comments", { body: { body: "hi" } });
+    expect(client.resolveCompany).not.toHaveBeenCalled();
+  });
+
+  it("comment_on_issue includes reopen when true", async () => {
+    const client = okClient({ id: "c-1" });
+    await tool(client, "comment_on_issue").execute({ issue_id: "PEN-1", body: "hi", reopen: true }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("POST", "/issues/PEN-1/comments", { body: { body: "hi", reopen: true } });
+    expect(client.resolveCompany).not.toHaveBeenCalled();
+  });
+});
