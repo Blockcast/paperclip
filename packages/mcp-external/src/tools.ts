@@ -426,5 +426,25 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
         return runTool(() => client.requestJson("PATCH", `/goals/${encodeURIComponent(String(args.goal_id))}`, { body }));
       },
     },
+    {
+      name: "list_agents",
+      description: "List all agents in a company with their name, role, status, and config.",
+      schema: z.object({
+        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+      }),
+      execute: async (args) =>
+        runTool(async () => {
+          const company = await client.resolveCompany({ override: args.company_id as string | undefined });
+          return client.requestJson("GET", `/companies/${encodeURIComponent(company)}/agents`, { companyId: company });
+        }),
+    },
+    {
+      name: "invoke_agent_heartbeat",
+      description:
+        "Manually trigger an immediate heartbeat (work cycle) for an agent. Use to wake an idle agent, force it to pick up assignments, or run it off-schedule.",
+      schema: z.object({ agent_id: z.string().describe("UUID of the agent to trigger.") }),
+      execute: async (args) =>
+        runTool(() => client.requestJson("POST", `/agents/${encodeURIComponent(String(args.agent_id))}/heartbeat/invoke`)),
+    },
   ];
 }

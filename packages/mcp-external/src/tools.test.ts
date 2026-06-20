@@ -467,3 +467,19 @@ describe("goals", () => {
     expect(client.requestJson).toHaveBeenCalledWith("PATCH", "/goals/g-1", { body: { description: "new desc" } });
   });
 });
+
+describe("agents (wave 2)", () => {
+  it("list_agents GETs the company agents path", async () => {
+    const client = okClient([]);
+    await tool(client, "list_agents").execute({}, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("GET", "/companies/co-default/agents", { companyId: "co-default" });
+  });
+
+  it("invoke_agent_heartbeat POSTs /agents/<id>/heartbeat/invoke with no body and no company", async () => {
+    const client = okClient(null);
+    const res = await tool(client, "invoke_agent_heartbeat").execute({ agent_id: "ag-1" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("POST", "/agents/ag-1/heartbeat/invoke");
+    expect(client.resolveCompany).not.toHaveBeenCalled();
+    expect(JSON.parse(res.content[0].text)).toEqual({ ok: true });
+  });
+});
