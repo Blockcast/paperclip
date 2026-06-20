@@ -295,3 +295,74 @@ describe("issue lifecycle", () => {
     expect(client.resolveCompany).not.toHaveBeenCalled();
   });
 });
+
+describe("projects", () => {
+  it("list_projects GETs the company projects path", async () => {
+    const client = okClient([]);
+    await tool(client, "list_projects").execute({}, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("GET", "/companies/co-default/projects", { companyId: "co-default" });
+  });
+
+  it("get_project GETs /projects/<id> with companyId query + header", async () => {
+    const client = okClient({ id: "pr-1" });
+    await tool(client, "get_project").execute({ project_id: "pr-1" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("GET", "/projects/pr-1", {
+      query: { companyId: "co-default" },
+      companyId: "co-default",
+    });
+  });
+
+  it("create_project POSTs camelCase body with status default backlog", async () => {
+    const client = okClient({ id: "pr-2" });
+    await tool(client, "create_project").execute(
+      { name: "P", description: "d", goal_ids: ["g-1"], lead_agent_id: "ag-1", target_date: "2026-09-01", color: "#fff" },
+      {} as any,
+    );
+    expect(client.requestJson).toHaveBeenCalledWith("POST", "/companies/co-default/projects", {
+      body: { name: "P", status: "backlog", description: "d", goalIds: ["g-1"], leadAgentId: "ag-1", targetDate: "2026-09-01", color: "#fff" },
+      companyId: "co-default",
+    });
+  });
+
+  it("create_project rejects an invalid status", async () => {
+    const client = okClient();
+    const res = await tool(client, "create_project").execute({ name: "P", status: "bogus" }, {} as any);
+    expect(JSON.parse(res.content[0].text).isError).toBe(true);
+    expect(client.requestJson).not.toHaveBeenCalled();
+  });
+
+  it("update_project clears a field with empty string (null) and keeps omitted", async () => {
+    const client = okClient({ id: "pr-1" });
+    await tool(client, "update_project").execute({ project_id: "pr-1", description: "", name: "New" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("PATCH", "/projects/pr-1", {
+      body: { name: "New", description: null },
+      companyId: "co-default",
+    });
+  });
+
+  it("update_project errors when no fields provided", async () => {
+    const client = okClient();
+    const res = await tool(client, "update_project").execute({ project_id: "pr-1" }, {} as any);
+    expect(JSON.parse(res.content[0].text).message).toMatch(/No fields to update/);
+    expect(client.requestJson).not.toHaveBeenCalled();
+  });
+
+  it("update_project resolves an explicit company_id override", async () => {
+    const client = okClient({ id: "pr-1" });
+    await tool(client, "update_project").execute({ project_id: "pr-1", name: "X", company_id: "PEN" }, {} as any);
+    expect(client.resolveCompany).toHaveBeenCalledWith({ override: "PEN" });
+    expect(client.requestJson).toHaveBeenCalledWith("PATCH", "/projects/pr-1", {
+      body: { name: "X" },
+      companyId: "PEN",
+    });
+  });
+
+  it("create_project includes deprecated goalId when goal_id is set", async () => {
+    const client = okClient({ id: "pr-3" });
+    await tool(client, "create_project").execute({ name: "P", goal_id: "g-legacy" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("POST", "/companies/co-default/projects", {
+      body: { name: "P", status: "backlog", goalId: "g-legacy" },
+      companyId: "co-default",
+    });
+  });
+});

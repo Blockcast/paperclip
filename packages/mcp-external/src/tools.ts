@@ -54,6 +54,7 @@ function clampLimit(limit: unknown, max: number): number {
 
 const ISSUE_STATUSES = new Set(["todo", "in_progress", "blocked", "done", "cancelled"]);
 const ISSUE_PRIORITIES = new Set(["urgent", "high", "medium", "low"]);
+const PROJECT_STATUSES = new Set(["backlog", "planned", "in_progress", "completed", "cancelled"]);
 
 export function createToolDefinitions(client: PaperclipApiClient): ToolDefinition[] {
 
@@ -263,6 +264,110 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
           if (args.reopen === true) payload.reopen = true;
           return client.requestJson("POST", `/issues/${encodeURIComponent(String(args.issue_id))}/comments`, { body: payload });
         }),
+    },
+    {
+      name: "list_projects",
+      description: "List projects in a company.",
+      schema: z.object({
+        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+      }),
+      execute: async (args) =>
+        runTool(async () => {
+          const company = await client.resolveCompany({ override: args.company_id as string | undefined });
+          return client.requestJson("GET", `/companies/${encodeURIComponent(company)}/projects`, { companyId: company });
+        }),
+    },
+    {
+      name: "get_project",
+      description: "Get a project by UUID or company-scoped short reference.",
+      schema: z.object({
+        project_id: z.string().describe("Project UUID or company-scoped project reference."),
+        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+      }),
+      execute: async (args) =>
+        runTool(async () => {
+          const company = await client.resolveCompany({ override: args.company_id as string | undefined });
+          return client.requestJson("GET", `/projects/${encodeURIComponent(String(args.project_id))}`, {
+            query: { companyId: company },
+            companyId: company,
+          });
+        }),
+    },
+    {
+      name: "create_project",
+      description: "Create a project in a company.",
+      schema: z.object({
+        name: z.string().describe("Project name."),
+        description: z.string().default("").describe("Project description. Empty for none."),
+        status: z.string().default("backlog").describe("backlog, planned, in_progress, completed, cancelled. Default: backlog."),
+        goal_id: z.string().default("").describe("Deprecated default goal UUID. Prefer goal_ids."),
+        goal_ids: z.array(z.string()).nullable().optional().describe("Goal UUIDs to link."),
+        lead_agent_id: z.string().default("").describe("Lead agent UUID. Empty for none."),
+        target_date: z.string().default("").describe("Target date string. Empty for none."),
+        color: z.string().default("").describe("Project color. Empty for default."),
+        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+      }),
+      execute: async (args) => {
+        // Python parity (server.py create_project): empty status defaults to "backlog"
+        // (mirrors `status or "backlog"`); only a NON-empty invalid status errors. The
+        // `|| "backlog"` is load-bearing — do not simplify to `?? "backlog"` alone, which
+        // would error on empty status instead of defaulting it.
+        const status = String((args.status as string | undefined) ?? "backlog") || "backlog";
+        if (!PROJECT_STATUSES.has(status)) {
+          return errorResult(`Invalid status '${status}'. Allowed: backlog, cancelled, completed, in_progress, planned.`);
+        }
+        return runTool(async () => {
+          const company = await client.resolveCompany({ override: args.company_id as string | undefined });
+          const body: Record<string, unknown> = { name: String(args.name), status };
+          if (args.description) body.description = String(args.description);
+          if (args.goal_id) body.goalId = String(args.goal_id);
+          if (args.goal_ids != null) body.goalIds = args.goal_ids;
+          if (args.lead_agent_id) body.leadAgentId = String(args.lead_agent_id);
+          if (args.target_date) body.targetDate = String(args.target_date);
+          if (args.color) body.color = String(args.color);
+          return client.requestJson("POST", `/companies/${encodeURIComponent(company)}/projects`, { body, companyId: company });
+        });
+      },
+    },
+    {
+      name: "update_project",
+      description: "Update a project. Only fields you provide are changed.",
+      schema: z.object({
+        project_id: z.string().describe("Project UUID or company-scoped project reference."),
+        name: z.string().default("").describe("New name. Empty to keep."),
+        description: z.string().nullable().optional().describe("New description, or empty string to clear. Omit to keep."),
+        status: z.string().default("").describe("backlog, planned, in_progress, completed, cancelled. Empty to keep."),
+        goal_id: z.string().nullable().optional().describe("Deprecated default goal UUID, or empty string to clear."),
+        goal_ids: z.array(z.string()).nullable().optional().describe("Full set of linked goal UUIDs."),
+        lead_agent_id: z.string().nullable().optional().describe("New lead agent UUID, or empty string to clear."),
+        target_date: z.string().nullable().optional().describe("New target date, or empty string to clear."),
+        color: z.string().nullable().optional().describe("New project color, or empty string to clear."),
+        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+      }),
+      execute: async (args) => {
+        const status = String((args.status as string | undefined) ?? "");
+        if (status && !PROJECT_STATUSES.has(status)) {
+          return errorResult(`Invalid status '${status}'. Allowed: backlog, cancelled, completed, in_progress, planned.`);
+        }
+        const body: Record<string, unknown> = {};
+        if (args.name) body.name = String(args.name);
+        if (args.description !== undefined && args.description !== null) body.description = String(args.description) || null;
+        if (status) body.status = status;
+        if (args.goal_id !== undefined && args.goal_id !== null) body.goalId = String(args.goal_id) || null;
+        if (args.goal_ids != null) body.goalIds = args.goal_ids;
+        if (args.lead_agent_id !== undefined && args.lead_agent_id !== null) body.leadAgentId = String(args.lead_agent_id) || null;
+        if (args.target_date !== undefined && args.target_date !== null) body.targetDate = String(args.target_date) || null;
+        if (args.color !== undefined && args.color !== null) body.color = String(args.color) || null;
+        if (Object.keys(body).length === 0) {
+          return errorResult(
+            "No fields to update. Provide at least one of: name, description, status, goal_id, goal_ids, lead_agent_id, target_date, color.",
+          );
+        }
+        return runTool(async () => {
+          const company = await client.resolveCompany({ override: args.company_id as string | undefined });
+          return client.requestJson("PATCH", `/projects/${encodeURIComponent(String(args.project_id))}`, { body, companyId: company });
+        });
+      },
     },
   ];
 }
