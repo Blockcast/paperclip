@@ -5,7 +5,6 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { createHttpServer } from "./http.js";
-import { normalizeApiUrl } from "./config.js";
 
 let upstream: Server; // mock Paperclip REST API
 let mcp: Server;      // our external MCP server
@@ -26,7 +25,7 @@ beforeAll(async () => {
   const upstreamPort = (upstream.address() as AddressInfo).port;
 
   mcp = createHttpServer({
-    apiUrl: normalizeApiUrl(`http://127.0.0.1:${upstreamPort}`), // → .../api
+    apiUrl: `http://127.0.0.1:${upstreamPort}`, // factory normalizes → .../api
     apiKey: null,
     companyId: null,
   });

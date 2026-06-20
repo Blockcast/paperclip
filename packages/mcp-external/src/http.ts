@@ -4,21 +4,28 @@ import { randomUUID } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { createMcpServer } from "./server.js";
-import { readConfigFromEnv, type PaperclipExternalConfig } from "./config.js";
+import { readConfigFromEnv, normalizeApiUrl, type PaperclipExternalConfig } from "./config.js";
 import { runWithBearer } from "./auth-context.js";
 
 const HOST = process.env.MCP_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.MCP_PORT ?? "9011");
 const MCP_PATH = "/mcp";
 
-async function readBody(req: IncomingMessage): Promise<unknown> {
+async function readBody(req: IncomingMessage, maxBytes = 1_048_576): Promise<unknown> {
   const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
+  let total = 0;
+  for await (const c of req) {
+    const buf = c as Buffer;
+    total += buf.byteLength;
+    if (total > maxBytes) throw Object.assign(new Error("Request body too large"), { status: 413 });
+    chunks.push(buf);
+  }
   if (chunks.length === 0) return undefined;
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
 export function createHttpServer(config: PaperclipExternalConfig = readConfigFromEnv()) {
+  config = { ...config, apiUrl: normalizeApiUrl(config.apiUrl) };
   // One transport per active session id (stateful streamable-HTTP).
   const transports = new Map<string, StreamableHTTPServerTransport>();
 
@@ -59,10 +66,12 @@ export function createHttpServer(config: PaperclipExternalConfig = readConfigFro
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void handle(req, res).catch((err) => {
       console.error("mcp-external request error:", err);
-      if (!res.headersSent) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32603, message: "internal error" }, id: null }));
-      }
+      if (res.headersSent) return;
+      const status: number = (err && typeof err === "object" && "status" in err && typeof (err as any).status === "number") ? (err as any).status : 500;
+      const code = status === 413 ? -32000 : err instanceof SyntaxError ? -32700 : -32603;
+      const message = status === 413 ? "Request body too large" : err instanceof SyntaxError ? "Parse error" : "internal error";
+      res.writeHead(status === 500 && err instanceof SyntaxError ? 400 : status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id: null }));
     });
   });
 }
