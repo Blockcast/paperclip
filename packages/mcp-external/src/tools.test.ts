@@ -7,6 +7,20 @@ function clientReturning(body: unknown) {
   return { requestJson: vi.fn(async () => body) } as any;
 }
 
+// NOTE: these tests call tool.execute(args) directly, bypassing the MCP SDK's
+// Zod parse. So an absent optional arrives as `undefined`, not its schema
+// default (e.g. company_id default "") — resolveCompany handles both identically
+// (see client.test.ts resolveCompany suite). Assertions reflect the direct-call path.
+function okClient(body: unknown = { ok: "data" }) {
+  return {
+    requestJson: vi.fn(async () => body),
+    resolveCompany: vi.fn(async (i: { override?: string | null } = {}) => i.override?.trim() || "co-default"),
+  } as any;
+}
+function tool(client: any, name: string) {
+  return createToolDefinitions(client).find((t) => t.name === name)!;
+}
+
 describe("get_agent tool", () => {
   it("is registered as snake_case get_agent", () => {
     const tools = createToolDefinitions(clientReturning({}));
@@ -89,5 +103,51 @@ describe("runTool (via get_agent)", () => {
     } as any;
     const tool = createToolDefinitions(client).find((t) => t.name === "get_agent")!;
     await expect(tool.execute({ agent_id: "me" }, {} as any)).rejects.toThrow("company not found");
+  });
+});
+
+describe("list_issues", () => {
+  it("GETs the company issues path with default status/limit and resolved company", async () => {
+    const client = okClient([]);
+    await tool(client, "list_issues").execute({}, {} as any);
+    expect(client.resolveCompany).toHaveBeenCalledWith({ override: undefined });
+    expect(client.requestJson).toHaveBeenCalledWith("GET", "/companies/co-default/issues", {
+      query: { status: "todo,in_progress", limit: 50 },
+      companyId: "co-default",
+    });
+  });
+
+  it("passes filters and clamps limit to 200", async () => {
+    const client = okClient([]);
+    await tool(client, "list_issues").execute(
+      { status: "done", assignee_agent_id: "ag-1", project_id: "pr-1", label: "bug", q: "crash", limit: 9999, company_id: "PEN" },
+      {} as any,
+    );
+    expect(client.resolveCompany).toHaveBeenCalledWith({ override: "PEN" });
+    expect(client.requestJson).toHaveBeenCalledWith("GET", "/companies/PEN/issues", {
+      query: { status: "done", limit: 200, assigneeAgentId: "ag-1", projectId: "pr-1", label: "bug", q: "crash" },
+      companyId: "PEN",
+    });
+  });
+});
+
+describe("get_issue", () => {
+  it("GETs /issues/<id> with no company scoping", async () => {
+    const client = okClient({ id: "PEN-1" });
+    await tool(client, "get_issue").execute({ issue_id: "PEN-1" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("GET", "/issues/PEN-1");
+    expect(client.resolveCompany).not.toHaveBeenCalled();
+  });
+});
+
+describe("paperclip_search_issues", () => {
+  it("is registered and forwards query as q to the issues path", async () => {
+    const client = okClient([]);
+    await tool(client, "paperclip_search_issues").execute({ query: "crash", limit: 10 }, {} as any);
+    expect(client.resolveCompany).toHaveBeenCalledWith({ override: undefined });
+    expect(client.requestJson).toHaveBeenCalledWith("GET", "/companies/co-default/issues", {
+      query: { status: "todo,in_progress", limit: 10, q: "crash" },
+      companyId: "co-default",
+    });
   });
 });

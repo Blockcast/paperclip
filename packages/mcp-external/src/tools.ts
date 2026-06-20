@@ -47,6 +47,11 @@ async function runTool(
   }
 }
 
+function clampLimit(limit: unknown, max: number): number {
+  const n = typeof limit === "number" && Number.isFinite(limit) ? Math.trunc(limit) : 50;
+  return Math.max(1, Math.min(n, max));
+}
+
 export function createToolDefinitions(client: PaperclipApiClient): ToolDefinition[] {
   const getAgentSchema = z.object({
     agent_id: z
@@ -54,6 +59,19 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       .default("me")
       .describe('Agent UUID, or the literal "me" for the currently authenticated agent.'),
   });
+
+  async function runListIssues(args: Record<string, unknown>) {
+    const company = await client.resolveCompany({ override: args.company_id as string | undefined });
+    const query: Record<string, string | number | undefined> = {
+      status: String((args.status as string | undefined) ?? "todo,in_progress"),
+      limit: clampLimit(args.limit, 200),
+    };
+    if (args.assignee_agent_id) query.assigneeAgentId = String(args.assignee_agent_id);
+    if (args.project_id) query.projectId = String(args.project_id);
+    if (args.label) query.label = String(args.label);
+    if (args.q) query.q = String(args.q);
+    return client.requestJson("GET", `/companies/${encodeURIComponent(company)}/issues`, { query, companyId: company });
+  }
 
   return [
     {
@@ -66,6 +84,50 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
           const path = agentId.toLowerCase() === "me" ? "/agents/me" : `/agents/${encodeURIComponent(agentId)}`;
           return client.requestJson("GET", path);
         }),
+    },
+    {
+      name: "list_issues",
+      description: "List issues (tasks) in a company.",
+      schema: z.object({
+        status: z.string().default("todo,in_progress").describe(
+          "Comma-separated statuses: todo, in_progress, blocked, done, cancelled. Default: todo,in_progress",
+        ),
+        assignee_agent_id: z.string().default("").describe("Filter by assignee agent UUID. Empty for all."),
+        project_id: z.string().default("").describe("Filter by project UUID. Empty for all."),
+        label: z.string().default("").describe("Filter by label name. Empty to skip."),
+        q: z.string().default("").describe("Full-text query. Empty to skip."),
+        limit: z.number().int().default(50).describe("Max results (1-200). Default: 50."),
+        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+      }),
+      execute: async (args) => runTool(() => runListIssues(args)),
+    },
+    {
+      name: "paperclip_search_issues",
+      description:
+        "Search Paperclip issues by text. Compatibility alias for list_issues(q=...).",
+      schema: z.object({
+        query: z.string().describe("Full-text issue search query."),
+        status: z.string().default("todo,in_progress").describe(
+          "Comma-separated statuses: todo, in_progress, blocked, done, cancelled. Default: todo,in_progress",
+        ),
+        assignee_agent_id: z.string().default("").describe("Filter by assignee agent UUID. Empty for all."),
+        project_id: z.string().default("").describe("Filter by project UUID. Empty for all."),
+        label: z.string().default("").describe("Filter by label name. Empty to skip."),
+        limit: z.number().int().default(50).describe("Max results (1-200). Default: 50."),
+        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+      }),
+      execute: async (args) =>
+        runTool(() => runListIssues({ ...args, q: args.query })),
+    },
+    {
+      name: "get_issue",
+      description:
+        "Get the full details of a single Paperclip issue by UUID or key (e.g. PEN-307). Resolves cross-company server-side.",
+      schema: z.object({
+        issue_id: z.string().describe('Issue UUID or human-readable key (e.g. "CY-42"). Pass through verbatim.'),
+      }),
+      execute: async (args) =>
+        runTool(() => client.requestJson("GET", `/issues/${encodeURIComponent(String(args.issue_id))}`)),
     },
   ];
 }
