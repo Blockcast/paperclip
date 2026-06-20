@@ -70,9 +70,11 @@ export class PaperclipApiClient {
   constructor(private readonly config: PaperclipExternalConfig) {}
 
   /**
-   * Resolve the Authorization header value for this request.
-   * Precedence mirrors the Python server (_headers): inbound per-request bearer
-   * > baked fallback key. Throws if neither exists.
+   * Resolve the Authorization header value for this request. Precedence mirrors
+   * the Python server's _headers for the tiers this server implements: inbound
+   * per-request bearer > baked PAPERCLIP_API_KEY. (Python also has a third
+   * session-token/Cookie tier; intentionally omitted — this config has no
+   * session token.) Throws if neither exists.
    */
   private authorization(): string {
     const inbound = currentBearer();

@@ -11,7 +11,7 @@ server acts **as the calling user** (multi-tenant). Falls back to a baked
 > release_issue, delete_issue, comment_on_issue, paperclip_search_issues,
 > list_projects, get_project, create_project, update_project, list_goals,
 > create_goal, update_goal). Remaining tools (agents list / heartbeat,
-> approvals, dashboard, cost, activity) land in Wave 2 (SPEC §5). Not the
+> approvals, dashboard, cost, activity) land in Wave 2. Not the
 > canonical external server until tool parity + cutover complete.
 
 > Known limitation (parity-faithful): `checkout_issue` / `release_issue` mirror
@@ -40,6 +40,6 @@ server acts **as the calling user** (multi-tenant). Falls back to a baked
 ## Auth model
 
 Per request: inbound `Authorization` (verbatim) > `Bearer ${PAPERCLIP_API_KEY}` >
-error. Mirrors the Python server's `_headers` precedence. The bearer is carried
+error. Mirrors the Python server's `_headers` precedence, minus its baked session-token (Cookie) tier. The bearer is carried
 through an `AsyncLocalStorage` (`auth-context.ts`) so concurrent sessions never
 cross identities.

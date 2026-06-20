@@ -19,8 +19,14 @@ const CONFLICT_MESSAGE =
   "Conflict (409): resource is already checked out or owned by another agent. Do not retry this request.";
 
 /** Python `_err` parity: a non-throwing error payload the MCP client reads as data. */
+interface ErrorPayload {
+  isError: true;
+  message: string;
+  status?: number;
+}
+
 function errorResult(message: string, status?: number) {
-  const payload: Record<string, unknown> = { isError: true, message };
+  const payload: ErrorPayload = { isError: true, message };
   if (status !== undefined) payload.status = status;
   return textResult(payload);
 }
@@ -29,7 +35,8 @@ function errorResult(message: string, status?: number) {
  * Run a tool's API work and convert the canonical Python server's result/error
  * shapes: empty/204 -> { ok: true }; 409 -> do-not-retry payload; other API
  * errors -> { isError, status, message }. Non-API errors (e.g. company
- * resolution) propagate unchanged.
+ * resolution) are re-thrown; the MCP SDK converts them to an isError tool
+ * result carrying the error message (not a separate protocol-error channel).
  */
 async function runTool(
   fn: () => Promise<unknown>,
@@ -203,7 +210,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
         if (status) body.status = status;
         if (args.assignee_agent_id) body.assigneeAgentId = String(args.assignee_agent_id);
         if (priority) body.priority = priority;
-        // project_id omitted (undefined) → don't send; "" → send null to clear; non-empty → send as-is
+        // project_id omitted (undefined) or explicit null → don't send (keep); "" → send null to clear; non-empty → send as-is
         if (args.project_id !== undefined && args.project_id !== null) {
           body.projectId = String(args.project_id) || null;
         }

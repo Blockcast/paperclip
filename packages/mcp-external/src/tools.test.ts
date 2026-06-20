@@ -104,6 +104,31 @@ describe("runTool (via get_agent)", () => {
     const tool = createToolDefinitions(client).find((t) => t.name === "get_agent")!;
     await expect(tool.execute({ agent_id: "me" }, {} as any)).rejects.toThrow("company not found");
   });
+
+  it("serializes a non-string (object) API error body into the message", async () => {
+    const client = {
+      requestJson: vi.fn(async () => {
+        throw new PaperclipApiError({ status: 422, method: "GET", path: "/issues/X-1", body: { error: "nope" }, message: "x" });
+      }),
+    } as any;
+    const tool0 = createToolDefinitions(client).find((t) => t.name === "get_issue")!;
+    const res = await tool0.execute({ issue_id: "X-1" }, {} as any);
+    const payload = JSON.parse(res.content[0].text);
+    expect(payload.status).toBe(422);
+    expect(payload.message).toContain('{"error":"nope"}');
+  });
+
+  it("truncates a long API error body to 400 chars", async () => {
+    const client = {
+      requestJson: vi.fn(async () => {
+        throw new PaperclipApiError({ status: 500, method: "GET", path: "/issues/X-1", body: "z".repeat(500), message: "x" });
+      }),
+    } as any;
+    const tool0 = createToolDefinitions(client).find((t) => t.name === "get_issue")!;
+    const res = await tool0.execute({ issue_id: "X-1" }, {} as any);
+    const payload = JSON.parse(res.content[0].text);
+    expect(payload.message).toBe(`HTTP 500 from Paperclip API: ${"z".repeat(400)}`);
+  });
 });
 
 describe("list_issues", () => {
@@ -127,6 +152,27 @@ describe("list_issues", () => {
     expect(client.requestJson).toHaveBeenCalledWith("GET", "/companies/PEN/issues", {
       query: { status: "done", limit: 200, assigneeAgentId: "ag-1", projectId: "pr-1", label: "bug", q: "crash" },
       companyId: "PEN",
+    });
+  });
+
+  it("clamps limit to a floor of 1, truncates floats, and falls back to 50 on non-finite", async () => {
+    const c0 = okClient([]);
+    await tool(c0, "list_issues").execute({ limit: 0 }, {} as any);
+    expect(c0.requestJson).toHaveBeenCalledWith("GET", "/companies/co-default/issues", {
+      query: { status: "todo,in_progress", limit: 1 },
+      companyId: "co-default",
+    });
+    const cf = okClient([]);
+    await tool(cf, "list_issues").execute({ limit: 7.9 }, {} as any);
+    expect(cf.requestJson).toHaveBeenCalledWith("GET", "/companies/co-default/issues", {
+      query: { status: "todo,in_progress", limit: 7 },
+      companyId: "co-default",
+    });
+    const cn = okClient([]);
+    await tool(cn, "list_issues").execute({ limit: Number.NaN }, {} as any);
+    expect(cn.requestJson).toHaveBeenCalledWith("GET", "/companies/co-default/issues", {
+      query: { status: "todo,in_progress", limit: 50 },
+      companyId: "co-default",
     });
   });
 });
@@ -362,6 +408,15 @@ describe("projects", () => {
     await tool(client, "create_project").execute({ name: "P", goal_id: "g-legacy" }, {} as any);
     expect(client.requestJson).toHaveBeenCalledWith("POST", "/companies/co-default/projects", {
       body: { name: "P", status: "backlog", goalId: "g-legacy" },
+      companyId: "co-default",
+    });
+  });
+
+  it("create_project defaults an empty status to backlog (not an error)", async () => {
+    const client = okClient({ id: "pr-9" });
+    await tool(client, "create_project").execute({ name: "P", status: "" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("POST", "/companies/co-default/projects", {
+      body: { name: "P", status: "backlog" },
       companyId: "co-default",
     });
   });
