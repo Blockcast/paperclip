@@ -52,7 +52,11 @@ function clampLimit(limit: unknown, max: number): number {
   return Math.max(1, Math.min(n, max));
 }
 
+const ISSUE_STATUSES = new Set(["todo", "in_progress", "blocked", "done", "cancelled"]);
+const ISSUE_PRIORITIES = new Set(["urgent", "high", "medium", "low"]);
+
 export function createToolDefinitions(client: PaperclipApiClient): ToolDefinition[] {
+
   const getAgentSchema = z.object({
     agent_id: z
       .string()
@@ -128,6 +132,93 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       }),
       execute: async (args) =>
         runTool(() => client.requestJson("GET", `/issues/${encodeURIComponent(String(args.issue_id))}`)),
+    },
+    {
+      name: "create_issue",
+      description: "Create a new Paperclip issue (task) and optionally assign it to an agent.",
+      schema: z.object({
+        title: z.string().describe("Short, imperative task title."),
+        description: z.string().default("").describe("Full instructions/context (Markdown)."),
+        assignee_agent_id: z.string().default("").describe("Assignee agent UUID. Empty to leave unassigned."),
+        project_id: z.string().default("").describe("Project UUID. Empty for none."),
+        parent_issue_id: z.string().default("").describe("Parent issue UUID for a subtask. Empty for top-level."),
+        priority: z.string().default("medium").describe("urgent, high, medium, or low. Default: medium."),
+        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+        blocked_by_issue_ids: z
+          .array(z.string())
+          .nullable()
+          .optional()
+          .describe("UUIDs of issues that block this one. Same company only."),
+      }),
+      execute: async (args) =>
+        runTool(async () => {
+          const company = await client.resolveCompany({ override: args.company_id as string | undefined });
+          const body: Record<string, unknown> = {
+            title: String(args.title),
+            priority: String((args.priority as string | undefined) ?? "medium"),
+          };
+          if (args.description) body.description = String(args.description);
+          if (args.assignee_agent_id) body.assigneeAgentId = String(args.assignee_agent_id);
+          if (args.project_id) body.projectId = String(args.project_id);
+          if (args.parent_issue_id) body.parentIssueId = String(args.parent_issue_id);
+          if (args.blocked_by_issue_ids != null) body.blockedByIssueIds = args.blocked_by_issue_ids;
+          return client.requestJson("POST", `/companies/${encodeURIComponent(company)}/issues`, { body, companyId: company });
+        }),
+    },
+    {
+      name: "update_issue",
+      description: "Update an existing issue. Only fields you provide are changed.",
+      schema: z.object({
+        issue_id: z.string().describe('Issue UUID or identifier (e.g. "CY-42").'),
+        title: z.string().default("").describe("New title. Empty to keep."),
+        description: z.string().default("").describe("New description (Markdown). Empty to keep."),
+        status: z.string().default("").describe("todo, in_progress, blocked, done, or cancelled. Empty to keep."),
+        assignee_agent_id: z.string().default("").describe("New assignee agent UUID. Empty to keep."),
+        priority: z.string().default("").describe("urgent, high, medium, or low. Empty to keep."),
+        project_id: z
+          .string()
+          .nullable()
+          .optional()
+          .describe("New project UUID, or empty string to clear. Omit to keep."),
+        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty to rely on issue-key routing."),
+        blocked_by_issue_ids: z
+          .array(z.string())
+          .nullable()
+          .optional()
+          .describe("COMPLETE desired blocker set (replaces existing); [] clears; omit to keep."),
+      }),
+      execute: async (args) => {
+        const status = String((args.status as string | undefined) ?? "");
+        if (status && !ISSUE_STATUSES.has(status)) {
+          return errorResult(`Invalid status '${status}'. Allowed: todo, in_progress, blocked, done, cancelled.`);
+        }
+        const priority = String((args.priority as string | undefined) ?? "");
+        if (priority && !ISSUE_PRIORITIES.has(priority)) {
+          return errorResult(`Invalid priority '${priority}'. Allowed: urgent, high, medium, low.`);
+        }
+        const body: Record<string, unknown> = {};
+        if (args.title) body.title = String(args.title);
+        if (args.description) body.description = String(args.description);
+        if (status) body.status = status;
+        if (args.assignee_agent_id) body.assigneeAgentId = String(args.assignee_agent_id);
+        if (priority) body.priority = priority;
+        // project_id omitted (undefined) → don't send; "" → send null to clear; non-empty → send as-is
+        if (args.project_id !== undefined && args.project_id !== null) {
+          body.projectId = String(args.project_id) || null;
+        }
+        // blocked_by_issue_ids omitted (undefined) or null → don't send; [] or [...] → send (replaces existing)
+        if (args.blocked_by_issue_ids != null) body.blockedByIssueIds = args.blocked_by_issue_ids;
+        if (Object.keys(body).length === 0) {
+          return errorResult(
+            "No fields to update. Provide at least one of: title, description, status, assignee_agent_id, priority, project_id, blocked_by_issue_ids.",
+          );
+        }
+        const override = (args.company_id as string | undefined)?.trim();
+        return runTool(async () => {
+          const companyId = override ? await client.resolveCompany({ override }) : null;
+          return client.requestJson("PATCH", `/issues/${encodeURIComponent(String(args.issue_id))}`, { body, companyId });
+        });
+      },
     },
   ];
 }

@@ -151,3 +151,107 @@ describe("paperclip_search_issues", () => {
     });
   });
 });
+
+describe("create_issue", () => {
+  it("POSTs to the company issues path with camelCase body + blocked_by_issue_ids", async () => {
+    const client = okClient({ id: "PEN-2" });
+    await tool(client, "create_issue").execute(
+      {
+        title: "Do thing",
+        description: "details",
+        assignee_agent_id: "ag-1",
+        project_id: "pr-1",
+        parent_issue_id: "PEN-1",
+        priority: "high",
+        company_id: "PEN",
+        blocked_by_issue_ids: ["PEN-9"],
+      },
+      {} as any,
+    );
+    expect(client.resolveCompany).toHaveBeenCalledWith({ override: "PEN" });
+    expect(client.requestJson).toHaveBeenCalledWith("POST", "/companies/PEN/issues", {
+      body: {
+        title: "Do thing",
+        priority: "high",
+        description: "details",
+        assigneeAgentId: "ag-1",
+        projectId: "pr-1",
+        parentIssueId: "PEN-1",
+        blockedByIssueIds: ["PEN-9"],
+      },
+      companyId: "PEN",
+    });
+  });
+
+  it("defaults priority to medium and omits empty optionals", async () => {
+    const client = okClient({ id: "PEN-3" });
+    await tool(client, "create_issue").execute({ title: "Bare" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("POST", "/companies/co-default/issues", {
+      body: { title: "Bare", priority: "medium" },
+      companyId: "co-default",
+    });
+  });
+
+  it("sends blockedByIssueIds: [] when blocked_by_issue_ids is []", async () => {
+    const client = okClient({ id: "PEN-4" });
+    await tool(client, "create_issue").execute({ title: "T", blocked_by_issue_ids: [] }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("POST", "/companies/co-default/issues", {
+      body: { title: "T", priority: "medium", blockedByIssueIds: [] },
+      companyId: "co-default",
+    });
+  });
+});
+
+describe("update_issue", () => {
+  it("PATCHes /issues/<id> with only provided fields (camelCase)", async () => {
+    const client = okClient({ id: "PEN-1" });
+    await tool(client, "update_issue").execute(
+      { issue_id: "PEN-1", title: "New", status: "in_progress", blocked_by_issue_ids: [] },
+      {} as any,
+    );
+    expect(client.requestJson).toHaveBeenCalledWith("PATCH", "/issues/PEN-1", {
+      body: { title: "New", status: "in_progress", blockedByIssueIds: [] },
+      companyId: null,
+    });
+  });
+
+  it("clears the project when project_id is an empty string (projectId: null)", async () => {
+    const client = okClient({ id: "PEN-1" });
+    await tool(client, "update_issue").execute({ issue_id: "PEN-1", project_id: "" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("PATCH", "/issues/PEN-1", {
+      body: { projectId: null },
+      companyId: null,
+    });
+  });
+
+  it("resolves an explicit company_id override to the header", async () => {
+    const client = okClient({ id: "PEN-1" });
+    await tool(client, "update_issue").execute({ issue_id: "PEN-1", title: "x", company_id: "PEN" }, {} as any);
+    expect(client.resolveCompany).toHaveBeenCalledWith({ override: "PEN" });
+    expect(client.requestJson).toHaveBeenCalledWith("PATCH", "/issues/PEN-1", {
+      body: { title: "x" },
+      companyId: "PEN",
+    });
+  });
+
+  it("returns { isError } for an invalid status without calling the API", async () => {
+    const client = okClient();
+    const res = await tool(client, "update_issue").execute({ issue_id: "PEN-1", status: "bogus" }, {} as any);
+    expect(JSON.parse(res.content[0].text).isError).toBe(true);
+    expect(client.requestJson).not.toHaveBeenCalled();
+  });
+
+  it("returns { isError } for an invalid priority without calling the API", async () => {
+    const client = okClient();
+    const res = await tool(client, "update_issue").execute({ issue_id: "PEN-1", priority: "bogus" }, {} as any);
+    expect(JSON.parse(res.content[0].text).isError).toBe(true);
+    expect(client.requestJson).not.toHaveBeenCalled();
+  });
+
+  it("returns { isError } when no fields are provided", async () => {
+    const client = okClient();
+    const res = await tool(client, "update_issue").execute({ issue_id: "PEN-1" }, {} as any);
+    expect(JSON.parse(res.content[0].text).message).toMatch(/No fields to update/);
+    expect(client.requestJson).not.toHaveBeenCalled();
+  });
+});
