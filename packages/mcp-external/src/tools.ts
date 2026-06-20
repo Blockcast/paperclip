@@ -521,5 +521,50 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
         );
       },
     },
+    {
+      name: "get_dashboard",
+      description:
+        "Get a high-level health summary for a company: agent count, open/in-progress/blocked issue counts, stale tasks, recent activity, current-period cost totals.",
+      schema: z.object({
+        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+      }),
+      execute: async (args) =>
+        runTool(async () => {
+          const company = await client.resolveCompany({ override: args.company_id as string | undefined });
+          return client.requestJson("GET", `/companies/${encodeURIComponent(company)}/dashboard`, { companyId: company });
+        }),
+    },
+    {
+      name: "get_cost_summary",
+      description:
+        "Get aggregate token usage and spend for a company this billing period (total spend, remaining budget, per-agent breakdown).",
+      schema: z.object({
+        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+      }),
+      execute: async (args) =>
+        runTool(async () => {
+          const company = await client.resolveCompany({ override: args.company_id as string | undefined });
+          return client.requestJson("GET", `/companies/${encodeURIComponent(company)}/costs/summary`, { companyId: company });
+        }),
+    },
+    {
+      name: "list_activity",
+      description: "Retrieve the audit trail of recent actions in a company.",
+      schema: z.object({
+        agent_id: z.string().default("").describe("Filter to a specific agent UUID. Empty for all."),
+        limit: z.number().int().default(20).describe("Max entries (1-100). Default: 20."),
+        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+      }),
+      execute: async (args) =>
+        runTool(async () => {
+          const company = await client.resolveCompany({ override: args.company_id as string | undefined });
+          // Python list_activity defaults limit=20 (clampLimit's generic fallback is 50) and clamps to 100.
+          const query: Record<string, string | number | undefined> = {
+            limit: clampLimit((args.limit as number | undefined) ?? 20, 100),
+          };
+          if (args.agent_id) query.agentId = String(args.agent_id);
+          return client.requestJson("GET", `/companies/${encodeURIComponent(company)}/activity`, { query, companyId: company });
+        }),
+    },
   ];
 }

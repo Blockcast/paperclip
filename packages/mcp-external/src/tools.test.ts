@@ -542,3 +542,35 @@ describe("approvals (wave 2)", () => {
     expect(c2.requestJson).toHaveBeenCalledWith("POST", "/approvals/ap-1/request-revision", { body: { comment: "please fix X" } });
   });
 });
+
+describe("monitoring (wave 2)", () => {
+  it("get_dashboard GETs the company dashboard path", async () => {
+    const client = okClient({ ok: true });
+    await tool(client, "get_dashboard").execute({}, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("GET", "/companies/co-default/dashboard", { companyId: "co-default" });
+  });
+
+  it("get_cost_summary GETs the company costs/summary path", async () => {
+    const client = okClient({ ok: true });
+    await tool(client, "get_cost_summary").execute({ company_id: "PEN" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("GET", "/companies/PEN/costs/summary", { companyId: "PEN" });
+  });
+
+  it("list_activity GETs company activity with default limit 20", async () => {
+    const client = okClient([]);
+    await tool(client, "list_activity").execute({}, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("GET", "/companies/co-default/activity", {
+      query: { limit: 20 },
+      companyId: "co-default",
+    });
+  });
+
+  it("list_activity clamps limit to 100 and adds agentId filter", async () => {
+    const client = okClient([]);
+    await tool(client, "list_activity").execute({ limit: 9999, agent_id: "ag-1" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("GET", "/companies/co-default/activity", {
+      query: { limit: 100, agentId: "ag-1" },
+      companyId: "co-default",
+    });
+  });
+});
