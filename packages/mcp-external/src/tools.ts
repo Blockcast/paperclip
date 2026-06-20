@@ -29,8 +29,8 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       description: "Get details for a specific agent, or the currently authenticated agent.",
       schema: getAgentSchema,
       execute: async (args) => {
-        const agentId = String((args.agent_id as string | undefined) ?? "me").trim();
-        const path = agentId.toLowerCase() === "me" ? "/agents/me" : `/agents/${agentId}`;
+        const agentId = String((args.agent_id as string | undefined) ?? "me").trim() || "me";
+        const path = agentId.toLowerCase() === "me" ? "/agents/me" : `/agents/${encodeURIComponent(agentId)}`;
         const data = await client.requestJson("GET", path);
         return textResult(data);
       },

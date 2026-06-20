@@ -27,4 +27,18 @@ describe("get_agent tool", () => {
     await tool.execute({ agent_id: "abc" }, {} as any);
     expect(client.requestJson).toHaveBeenCalledWith("GET", "/agents/abc");
   });
+
+  it("treats empty/whitespace agent_id as 'me'", async () => {
+    const client = clientReturning({ id: "x" });
+    const tool = createToolDefinitions(client).find((t) => t.name === "get_agent")!;
+    await tool.execute({ agent_id: "   " }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("GET", "/agents/me");
+  });
+
+  it("URL-encodes a non-'me' agent_id path segment", async () => {
+    const client = clientReturning({ id: "x" });
+    const tool = createToolDefinitions(client).find((t) => t.name === "get_agent")!;
+    await tool.execute({ agent_id: "a/b c" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("GET", "/agents/a%2Fb%20c");
+  });
 });

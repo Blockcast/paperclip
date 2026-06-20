@@ -25,6 +25,8 @@ async function readBody(req: IncomingMessage, maxBytes = 1_048_576): Promise<unk
 }
 
 export function createHttpServer(config: PaperclipExternalConfig = readConfigFromEnv()) {
+  // Idempotent: readConfigFromEnv() already normalizes, but direct/programmatic
+  // callers (tests) may pass an unnormalized apiUrl — normalize here too.
   config = { ...config, apiUrl: normalizeApiUrl(config.apiUrl) };
   // One transport per active session id (stateful streamable-HTTP).
   const transports = new Map<string, StreamableHTTPServerTransport>();
