@@ -20,6 +20,8 @@ export interface JsonRequestOptions {
   /** Request body. Omit (undefined) for no body; `null` is sent as JSON `null`. */
   body?: unknown;
   companyId?: string | null;
+  /** Query params appended to the URL. undefined/null/empty-string values are skipped. */
+  query?: Record<string, string | number | boolean | null | undefined>;
 }
 
 interface CompanyListEntry {
@@ -83,6 +85,12 @@ export class PaperclipApiClient {
       throw new Error(`API path must start with "/": ${path}`);
     }
     const url = new URL(path.slice(1), `${this.config.apiUrl}/`);
+    if (options.query) {
+      for (const [key, value] of Object.entries(options.query)) {
+        if (value === undefined || value === null || value === "") continue;
+        url.searchParams.set(key, String(value));
+      }
+    }
     const headers: Record<string, string> = {
       Authorization: this.authorization(),
       Accept: "application/json",

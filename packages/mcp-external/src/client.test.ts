@@ -66,3 +66,26 @@ describe("PaperclipApiClient auth precedence", () => {
     expect(seenAuth).toEqual(["Bearer A", "Bearer B"]);
   });
 });
+
+describe("PaperclipApiClient query params", () => {
+  it("serializes query values onto the URL, skipping empty/null/undefined", async () => {
+    const seenUrls: string[] = [];
+    mockFetchOnce((url) => {
+      seenUrls.push(url);
+      return new Response("{}", { status: 200 });
+    });
+    const client = new PaperclipApiClient({ ...cfg, apiKey: "baked" });
+    await client.requestJson("GET", "/companies/co-1/issues", {
+      query: { status: "todo,in_progress", limit: 50, offset: 0, includeArchived: false, projectId: "", assigneeAgentId: undefined, label: null },
+    });
+    const url = new URL(seenUrls[0]);
+    expect(url.pathname).toBe("/api/companies/co-1/issues");
+    expect(url.searchParams.get("status")).toBe("todo,in_progress");
+    expect(url.searchParams.get("limit")).toBe("50");
+    expect(url.searchParams.get("offset")).toBe("0");
+    expect(url.searchParams.get("includeArchived")).toBe("false");
+    expect(url.searchParams.has("projectId")).toBe(false);
+    expect(url.searchParams.has("assigneeAgentId")).toBe(false);
+    expect(url.searchParams.has("label")).toBe(false);
+  });
+});
