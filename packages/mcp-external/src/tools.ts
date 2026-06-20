@@ -62,6 +62,7 @@ function clampLimit(limit: unknown, max: number): number {
 const ISSUE_STATUSES = new Set(["todo", "in_progress", "blocked", "done", "cancelled"]);
 const ISSUE_PRIORITIES = new Set(["urgent", "high", "medium", "low"]);
 const PROJECT_STATUSES = new Set(["backlog", "planned", "in_progress", "completed", "cancelled"]);
+const APPROVAL_STATUSES = new Set(["pending", "approved", "rejected", "revision_requested"]);
 
 export function createToolDefinitions(client: PaperclipApiClient): ToolDefinition[] {
 
@@ -445,6 +446,80 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       schema: z.object({ agent_id: z.string().describe("UUID of the agent to trigger.") }),
       execute: async (args) =>
         runTool(() => client.requestJson("POST", `/agents/${encodeURIComponent(String(args.agent_id))}/heartbeat/invoke`)),
+    },
+    {
+      name: "list_approvals",
+      description: "List approval requests in a company.",
+      schema: z.object({
+        status: z.string().default("pending").describe(
+          "pending, approved, rejected, or revision_requested. Default: pending.",
+        ),
+        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+      }),
+      execute: async (args) => {
+        // Python parity (server.py list_approvals:750-752): validates `if status not in allowed`
+        // with NO `if status and` guard — so empty "" ERRORS; omitted defaults to "pending".
+        // Use `??` only (NOT `|| "pending"`, which would wrongly rescue "").
+        const status = String((args.status as string | undefined) ?? "pending");
+        if (!APPROVAL_STATUSES.has(status)) {
+          return errorResult(`Invalid status '${status}'. Allowed: approved, pending, rejected, revision_requested.`);
+        }
+        return runTool(async () => {
+          const company = await client.resolveCompany({ override: args.company_id as string | undefined });
+          return client.requestJson("GET", `/companies/${encodeURIComponent(company)}/approvals`, { query: { status }, companyId: company });
+        });
+      },
+    },
+    {
+      name: "approve",
+      description: "Approve a pending approval request.",
+      schema: z.object({
+        approval_id: z.string().describe("Approval UUID."),
+        comment: z.string().default("").describe("Optional approval note to attach."),
+      }),
+      execute: async (args) =>
+        runTool(() => {
+          // Python parity (server.py:765-768): always sends a body object (even {}). Do NOT
+          // make this bodyless — contrast with checkout_issue which is truly bodyless.
+          const body: Record<string, unknown> = {};
+          if (args.comment) body.comment = String(args.comment);
+          return client.requestJson("POST", `/approvals/${encodeURIComponent(String(args.approval_id))}/approve`, { body });
+        }),
+    },
+    {
+      name: "reject",
+      description: "Reject a pending approval request.",
+      schema: z.object({
+        approval_id: z.string().describe("Approval UUID."),
+        comment: z.string().default("").describe("Reason for rejection — strongly recommended so the agent understands why."),
+      }),
+      execute: async (args) =>
+        runTool(() => {
+          // Python parity (server.py:779-782): always sends a body object (even {}).
+          const body: Record<string, unknown> = {};
+          if (args.comment) body.comment = String(args.comment);
+          return client.requestJson("POST", `/approvals/${encodeURIComponent(String(args.approval_id))}/reject`, { body });
+        }),
+    },
+    {
+      name: "request_approval_revision",
+      description:
+        "Request a revision on a pending approval without fully rejecting it. The submitting agent receives the comment and can resubmit.",
+      schema: z.object({
+        approval_id: z.string().describe("Approval UUID."),
+        comment: z.string().describe("Required. Specific feedback describing what must change before approval."),
+      }),
+      execute: async (args) => {
+        // Python parity (server.py:795-796): `if not comment.strip(): return _err(...)`.
+        // Comment has NO schema default — required field, must be non-blank.
+        const comment = String((args.comment as string | undefined) ?? "");
+        if (!comment.trim()) {
+          return errorResult("A comment is required when requesting a revision.");
+        }
+        return runTool(() =>
+          client.requestJson("POST", `/approvals/${encodeURIComponent(String(args.approval_id))}/request-revision`, { body: { comment } }),
+        );
+      },
     },
   ];
 }

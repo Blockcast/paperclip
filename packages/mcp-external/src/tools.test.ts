@@ -483,3 +483,62 @@ describe("agents (wave 2)", () => {
     expect(JSON.parse(res.content[0].text)).toEqual({ ok: true });
   });
 });
+
+describe("approvals (wave 2)", () => {
+  it("list_approvals GETs company approvals with default status pending", async () => {
+    const client = okClient([]);
+    await tool(client, "list_approvals").execute({}, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("GET", "/companies/co-default/approvals", {
+      query: { status: "pending" },
+      companyId: "co-default",
+    });
+  });
+
+  it("list_approvals forwards a valid status filter", async () => {
+    const client = okClient([]);
+    await tool(client, "list_approvals").execute({ status: "approved", company_id: "PEN" }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("GET", "/companies/PEN/approvals", {
+      query: { status: "approved" },
+      companyId: "PEN",
+    });
+  });
+
+  it("list_approvals errors on an invalid status (incl. empty string) without calling the API", async () => {
+    const c1 = okClient();
+    const r1 = await tool(c1, "list_approvals").execute({ status: "bogus" }, {} as any);
+    expect(JSON.parse(r1.content[0].text).isError).toBe(true);
+    expect(c1.requestJson).not.toHaveBeenCalled();
+    const c2 = okClient();
+    const r2 = await tool(c2, "list_approvals").execute({ status: "" }, {} as any);
+    expect(JSON.parse(r2.content[0].text).isError).toBe(true);
+    expect(c2.requestJson).not.toHaveBeenCalled();
+  });
+
+  it("approve POSTs an empty body object when no comment, and includes comment when given", async () => {
+    const c1 = okClient(null);
+    await tool(c1, "approve").execute({ approval_id: "ap-1" }, {} as any);
+    expect(c1.requestJson).toHaveBeenCalledWith("POST", "/approvals/ap-1/approve", { body: {} });
+    const c2 = okClient(null);
+    await tool(c2, "approve").execute({ approval_id: "ap-1", comment: "ok by me" }, {} as any);
+    expect(c2.requestJson).toHaveBeenCalledWith("POST", "/approvals/ap-1/approve", { body: { comment: "ok by me" } });
+  });
+
+  it("reject POSTs the comment (empty body object when none)", async () => {
+    const c1 = okClient(null);
+    await tool(c1, "reject").execute({ approval_id: "ap-1", comment: "nope" }, {} as any);
+    expect(c1.requestJson).toHaveBeenCalledWith("POST", "/approvals/ap-1/reject", { body: { comment: "nope" } });
+    const c2 = okClient(null);
+    await tool(c2, "reject").execute({ approval_id: "ap-1" }, {} as any);
+    expect(c2.requestJson).toHaveBeenCalledWith("POST", "/approvals/ap-1/reject", { body: {} });
+  });
+
+  it("request_approval_revision requires a non-blank comment", async () => {
+    const c1 = okClient();
+    const r1 = await tool(c1, "request_approval_revision").execute({ approval_id: "ap-1", comment: "   " }, {} as any);
+    expect(JSON.parse(r1.content[0].text).message).toMatch(/comment is required/i);
+    expect(c1.requestJson).not.toHaveBeenCalled();
+    const c2 = okClient(null);
+    await tool(c2, "request_approval_revision").execute({ approval_id: "ap-1", comment: "please fix X" }, {} as any);
+    expect(c2.requestJson).toHaveBeenCalledWith("POST", "/approvals/ap-1/request-revision", { body: { comment: "please fix X" } });
+  });
+});
