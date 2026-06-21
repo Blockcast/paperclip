@@ -4501,5 +4501,59 @@ describe("paperclip-plugin-linear", () => {
       expect(listIssuesByMilestone).toHaveBeenCalledTimes(2);
       expect((listIssuesByMilestone as ReturnType<typeof vi.fn>).mock.calls[1][3]).toBe("cursor-1");
     });
+
+    it("skips update and increments membershipSkipped when PC issue is in a different project than the milestone link", async () => {
+      await seedReconcileEnv(harness);
+      // Milestone link declares pc-proj-A as its project
+      await seedMilestoneLink(harness, { pcMilestoneId: "pc-ms-x", linearMilestoneId: "lin-ms-x", name: "MX", pcProjectId: "pc-proj-A" });
+
+      const { listIssuesByMilestone, listProjectMilestones } = await import("../src/linear.js");
+      (listProjectMilestones as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (listIssuesByMilestone as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        issues: [{ id: "lin-iss-x", identifier: "LUC-X" }],
+        hasNextPage: false,
+        endCursor: null,
+      });
+
+      syncModule.getLinkByLinear.mockResolvedValueOnce({
+        paperclipIssueId: "pc-iss-x",
+        paperclipCompanyId: "comp-reconcile",
+        linearIssueId: "lin-iss-x",
+        linearIdentifier: "LUC-X",
+        linearUrl: "https://linear.app/t/LUC-X",
+        syncDirection: "bidirectional",
+        lastSyncAt: "2020-01-01T00:00:00.000Z",
+        lastLinearStateType: "unstarted",
+        lastCommentSyncAt: null,
+      });
+
+      // PC issue belongs to pc-proj-B — mismatches the milestone link's pc-proj-A
+      harness.seed({
+        issues: [
+          {
+            id: "pc-iss-x",
+            companyId: "comp-reconcile",
+            projectId: "pc-proj-B",
+            title: "Cross-project issue",
+            status: "todo",
+            priority: "low",
+            milestoneId: null,
+            assigneeAgentId: null,
+            assigneeUserId: null,
+          } as never,
+        ],
+      });
+
+      const update = vi.spyOn(harness.ctx.issues, "update");
+
+      const result = await harness.performAction<{ membershipBackfilled: number; membershipSkipped: number }>(
+        ACTION_KEYS.reconcileMilestones,
+        { companyId: "comp-reconcile" },
+      );
+
+      expect(result.membershipBackfilled).toBe(0);
+      expect(result.membershipSkipped).toBeGreaterThanOrEqual(1);
+      expect(update).not.toHaveBeenCalled();
+    });
   });
 });
