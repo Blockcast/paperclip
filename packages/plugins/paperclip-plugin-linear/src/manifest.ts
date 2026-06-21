@@ -314,7 +314,7 @@ const manifest: PaperclipPluginManifestV1 = {
       name: TOOL_NAMES.link,
       displayName: "Link Linear Issue",
       description:
-        "Link a Linear issue to the current Paperclip issue for bidirectional sync.",
+        "Link a Linear issue to an existing Paperclip issue for bidirectional sync.",
       parametersSchema: {
         type: "object",
         properties: {
@@ -322,8 +322,12 @@ const manifest: PaperclipPluginManifestV1 = {
             type: "string",
             description: "Linear issue identifier (e.g. LUC-123) or URL",
           },
+          paperclipIssueId: {
+            type: "string",
+            description: "Paperclip issue UUID to bind to the Linear issue.",
+          },
         },
-        required: ["linearRef"],
+        required: ["linearRef", "paperclipIssueId"],
       },
     },
     {
