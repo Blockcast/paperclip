@@ -1259,6 +1259,12 @@ const plugin = definePlugin({
       let membershipBackfilled = 0;
       let membershipSkipped = 0;
       let milestoneLinkOffset = 0;
+      const hostLinkFallbackAvailable = typeof ctx.issues.getByLinearIssueId === "function";
+      if (!hostLinkFallbackAvailable) {
+        ctx.logger.warn(
+          `reconcile-milestones phase 1.5: ctx.issues.getByLinearIssueId unavailable — host-link fallback disabled; host-linked issues without a plugin-state reverse key will be skipped`,
+        );
+      }
       // eslint-disable-next-line no-constant-condition
       while (true) {
         const page = await ctx.state.list({
@@ -1284,7 +1290,7 @@ const plugin = definePlugin({
               );
             for (const li of linearIssues) {
               let issueLink = await sync.getLinkByLinear(ctx, li.id);
-              if (!issueLink && typeof ctx.issues.getByLinearIssueId === "function") {
+              if (!issueLink && hostLinkFallbackAvailable) {
                 // Fallback: the host allocator path writes only the DB linear_issue_links row,
                 // not the plugin state reverse key. Similarly, broken pre-BLO-11247 runs of
                 // link-linear-issue overwrote the reverse key with "undefined". Recover via
@@ -1292,7 +1298,9 @@ const plugin = definePlugin({
                 const hostLinked = await ctx.issues.getByLinearIssueId({ linearIssueId: li.id, companyId });
                 if (hostLinked) {
                   const forwardLink = await sync.getLink(ctx, hostLinked.id);
-                  if (forwardLink && forwardLink.linearIssueId === li.id) {
+                  if (forwardLink && forwardLink.linearIssueId === li.id && forwardLink.paperclipIssueId === hostLinked.id) {
+                    // Reverse key repair is project-independent; the cross-project guard below
+                    // governs milestone stamping only.
                     await sync.repairReverseLink(ctx, forwardLink);
                     issueLink = forwardLink;
                     ctx.logger.debug(
