@@ -1283,7 +1283,24 @@ const plugin = definePlugin({
                 ctx.http.fetch.bind(ctx.http), token, entry.value.linearMilestoneId, cursor ?? undefined,
               );
             for (const li of linearIssues) {
-              const issueLink = await sync.getLinkByLinear(ctx, li.id);
+              let issueLink = await sync.getLinkByLinear(ctx, li.id);
+              if (!issueLink && typeof ctx.issues.getByLinearIssueId === "function") {
+                // Fallback: the host allocator path writes only the DB linear_issue_links row,
+                // not the plugin state reverse key. Similarly, broken pre-BLO-11247 runs of
+                // link-linear-issue overwrote the reverse key with "undefined". Recover via
+                // getByLinearIssueId and repair the reverse key for future runs.
+                const hostLinked = await ctx.issues.getByLinearIssueId({ linearIssueId: li.id, companyId });
+                if (hostLinked) {
+                  const forwardLink = await sync.getLink(ctx, hostLinked.id);
+                  if (forwardLink && forwardLink.linearIssueId === li.id) {
+                    await sync.repairReverseLink(ctx, forwardLink);
+                    issueLink = forwardLink;
+                    ctx.logger.debug(
+                      `reconcile-milestones phase 1.5: repaired missing reverse key for ${li.identifier} via host link`,
+                    );
+                  }
+                }
+              }
               if (!issueLink) {
                 ctx.logger.debug(`reconcile-milestones phase 1.5: skipping ${li.identifier} — no PC issue link`);
                 membershipSkipped++;
@@ -1373,7 +1390,7 @@ const plugin = definePlugin({
       }
 
       ctx.logger.info(`Milestone reconcile done: ${reconciled} reconciled, ${imported} imported from Linear, ${created} pushed to Linear, ${membershipBackfilled} issue memberships backfilled`);
-      return { reconciled, created, imported, membershipBackfilled };
+      return { reconciled, created, imported, membershipBackfilled, membershipSkipped };
     });
 
     // One-time bounded backfill: write Paperclip back-links for already-mirrored

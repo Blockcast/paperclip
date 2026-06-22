@@ -160,6 +160,7 @@ const syncModule = vi.hoisted(() => ({
   getMilestoneLink: vi.fn().mockResolvedValue(null),
   getMilestoneLinkByLinear: vi.fn().mockResolvedValue(null),
   createMilestoneLink: vi.fn().mockImplementation((_ctx: unknown, params: Record<string, unknown>) => ({ ...params })),
+  repairReverseLink: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../src/sync.js", () => syncModule);
@@ -208,6 +209,7 @@ describe("paperclip-plugin-linear", () => {
     syncModule.getMilestoneLink.mockResolvedValue(null);
     syncModule.getMilestoneLinkByLinear.mockResolvedValue(null);
     syncModule.createMilestoneLink.mockImplementation((_ctx: unknown, params: Record<string, unknown>) => ({ ...params }));
+    syncModule.repairReverseLink.mockResolvedValue(undefined);
   }
 
   beforeEach(async () => {
@@ -4388,6 +4390,72 @@ describe("paperclip-plugin-linear", () => {
 
       expect(result.membershipBackfilled).toBe(0);
       expect(update).not.toHaveBeenCalled();
+    });
+
+    it("stamps milestoneId via host-link fallback when reverse plugin state key is missing (BLO-11742)", async () => {
+      await seedReconcileEnv(harness);
+      await seedMilestoneLink(harness, { pcMilestoneId: "pc-ms-hl", linearMilestoneId: "lin-ms-hl", name: "HL", pcProjectId: "pc-proj-A" });
+
+      const { listIssuesByMilestone, listProjectMilestones } = await import("../src/linear.js");
+      (listProjectMilestones as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (listIssuesByMilestone as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        issues: [{ id: "lin-iss-hl", identifier: "LUC-HL" }],
+        hasNextPage: false,
+        endCursor: null,
+      });
+
+      // Reverse key missing (host allocator path or broken pre-BLO-11247 run)
+      syncModule.getLinkByLinear.mockResolvedValueOnce(null);
+      // Forward link is intact
+      syncModule.getLink.mockResolvedValueOnce({
+        paperclipIssueId: "pc-iss-hl",
+        paperclipCompanyId: "comp-reconcile",
+        linearIssueId: "lin-iss-hl",
+        linearIdentifier: "LUC-HL",
+        linearUrl: "https://linear.app/t/LUC-HL",
+        syncDirection: "bidirectional",
+        lastSyncAt: "2020-01-01T00:00:00.000Z",
+        lastLinearStateType: "unstarted",
+        lastCommentSyncAt: null,
+      });
+
+      harness.seed({
+        issues: [
+          {
+            id: "pc-iss-hl",
+            companyId: "comp-reconcile",
+            projectId: "pc-proj-A",
+            title: "Host-linked issue",
+            status: "todo",
+            priority: "low",
+            milestoneId: null,
+            assigneeAgentId: null,
+            assigneeUserId: null,
+          } as never,
+        ],
+        linearIssueLinks: [
+          {
+            companyId: "comp-reconcile",
+            linearIssueId: "lin-iss-hl",
+            paperclipIssueId: "pc-iss-hl",
+          },
+        ],
+      });
+
+      const update = vi.spyOn(harness.ctx.issues, "update");
+
+      const result = await harness.performAction<{ membershipBackfilled: number }>(
+        ACTION_KEYS.reconcileMilestones,
+        { companyId: "comp-reconcile" },
+      );
+
+      expect(result.membershipBackfilled).toBe(1);
+      expect(syncModule.repairReverseLink).toHaveBeenCalledOnce();
+      expect(update).toHaveBeenCalledWith(
+        "pc-iss-hl",
+        expect.objectContaining({ milestoneId: "pc-ms-hl" }),
+        "comp-reconcile",
+      );
     });
 
     it("leaves milestoneId unchanged when it is already set on the PC issue", async () => {
