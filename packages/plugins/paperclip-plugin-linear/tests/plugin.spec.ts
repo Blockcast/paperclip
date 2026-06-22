@@ -4623,5 +4623,52 @@ describe("paperclip-plugin-linear", () => {
       expect(result.membershipSkipped).toBeGreaterThanOrEqual(1);
       expect(update).not.toHaveBeenCalled();
     });
+
+    it("phase 1 links to an existing PC milestone by name instead of creating a duplicate (BLO-11742)", async () => {
+      // Scenario: a PC milestone was created by title-backfill but never got a MilestoneLink.
+      // Phase 1 encounters the corresponding Linear milestone, finds no MilestoneLink via
+      // getMilestoneLinkByLinear, but MUST NOT create a duplicate — it should bind to the
+      // existing PC milestone by name.
+      await seedReconcileEnv(harness);
+      harness.seed({
+        milestones: [
+          {
+            id: "pc-ms-legacy",
+            companyId: "comp-reconcile",
+            projectId: "pc-proj-A",
+            name: "Tokeneconomics + supply dashboard",
+          } as never,
+        ],
+      });
+
+      const { listProjectMilestones } = await import("../src/linear.js");
+      // Phase 1: Linear project has one milestone matching the existing PC milestone name.
+      (listProjectMilestones as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: "lin-ms-legacy", name: "Tokeneconomics + supply dashboard", description: null, targetDate: null },
+      ]);
+      // getMilestoneLinkByLinear returns null — no binding exists yet.
+      syncModule.getMilestoneLinkByLinear.mockResolvedValue(null);
+
+      const createMilestoneSpy = vi.spyOn(harness.ctx.milestones, "create");
+
+      const result = await harness.performAction<{
+        reconciled: number;
+        imported: number;
+      }>(ACTION_KEYS.reconcileMilestones, { companyId: "comp-reconcile" });
+
+      // Phase 1 must NOT have created a duplicate PC milestone.
+      expect(createMilestoneSpy).not.toHaveBeenCalled();
+      // The binding counts as a reconcile, not an import.
+      expect(result.imported).toBe(0);
+      expect(result.reconciled).toBeGreaterThanOrEqual(1);
+      // The MilestoneLink must point to the pre-existing PC milestone.
+      expect(syncModule.createMilestoneLink).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          paperclipMilestoneId: "pc-ms-legacy",
+          linearMilestoneId: "lin-ms-legacy",
+        }),
+      );
+    });
   });
 });
