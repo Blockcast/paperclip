@@ -53,6 +53,7 @@ function decide(overrides: Partial<Parameters<typeof decideSuccessfulRunHandoff>
     hasOpenRecoveryIssue: false,
     hasPauseHold: false,
     hasActiveRoutineContinuation: false,
+    isRoutineReceiverParent: false,
     budgetBlocked: false,
     idempotentWakeExists: false,
     ...overrides,
@@ -222,6 +223,13 @@ describe("successful run handoff decision", () => {
     })).toEqual({
       kind: "skip",
       reason: "comment-driven wake already owns the next action",
+    });
+  });
+
+  it("does not queue for active routine receiver-parent issues", () => {
+    expect(decide({ isRoutineReceiverParent: true })).toEqual({
+      kind: "skip",
+      reason: "routine receiver-parent issue is non-executable",
     });
   });
 

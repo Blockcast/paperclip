@@ -5429,6 +5429,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       hasOpenRecoveryIssue: Boolean(openRecoveryIssue),
       hasPauseHold: Boolean(pauseHold),
       hasActiveRoutineContinuation: Boolean(activeRoutineContinuation),
+      isRoutineReceiverParent: Boolean(activeRoutineContinuation),
       budgetBlocked: Boolean(budgetBlock),
       idempotentWakeExists: Boolean(existingWake),
     });

@@ -351,6 +351,7 @@ export function decideSuccessfulRunHandoff(input: {
   hasOpenRecoveryIssue: boolean;
   hasPauseHold: boolean;
   hasActiveRoutineContinuation: boolean;
+  isRoutineReceiverParent: boolean;
   budgetBlocked: boolean;
   idempotentWakeExists: boolean;
 }): SuccessfulRunHandoffDecision {
@@ -373,6 +374,7 @@ export function decideSuccessfulRunHandoff(input: {
   }
   if (issue.assigneeUserId) return { kind: "skip", reason: "issue is human-owned" };
   if (issue.status !== "in_progress") return { kind: "skip", reason: `issue status ${issue.status} is a valid disposition` };
+  if (input.isRoutineReceiverParent) return { kind: "skip", reason: "routine receiver-parent issue is non-executable" };
   if (issue.executionState) return { kind: "skip", reason: "issue has execution policy state" };
   if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
     return { kind: "skip", reason: `agent status ${agent.status} is not invokable` };
