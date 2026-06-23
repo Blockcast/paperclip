@@ -226,7 +226,7 @@ describe("successful run handoff decision", () => {
     });
   });
 
-  it("does not queue for active routine receiver-parent issues", () => {
+  it("does not queue corrective handoff for active routine receiver-parent issues", () => {
     expect(decide({ isRoutineReceiverParent: true })).toEqual({
       kind: "skip",
       reason: "routine receiver-parent issue is non-executable",
