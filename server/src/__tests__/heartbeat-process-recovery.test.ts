@@ -938,21 +938,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.externalRunId).toBe(jobName);
   });
 
-  it("reaps a fresh external-lifecycle run when its persisted Job name is confirmed missing", async () => {
+  it("reaps a silent external-lifecycle run when its persisted Job name is confirmed missing", async () => {
     // Helm rollouts can delete an active k8s-backed agent Job while the
-    // heartbeat run still has fresh output. A namespace-wide Job list no
-    // longer contains the run, but the old false-positive fix requires a long
-    // silence window before reaping list misses. When external_run_id already
-    // records the exact Job name, a direct 404 is strong enough to fail the
-    // run immediately and free the issue/agent dispatch lock.
-    const fresh = new Date(Date.now() - 30 * 1000);
+    // heartbeat run still has an issue/agent dispatch lock. A namespace-wide
+    // Job list no longer contains the run, and once the run is silent past the
+    // stale floor, an exact-name 404 is strong enough to fail the run and free
+    // the lock.
+    const silent = new Date(Date.now() - 20 * 60 * 1000);
     const jobName = "agent-opencode-cd284f1d-6fbf-45-aafe9690-0e04-48-964404";
     const { companyId, agentId, runId } = await seedRunFixture({
       adapterType: "opencode_k8s",
       processPid: null,
       processGroupId: null,
       includeIssue: false,
-      lastOutputAt: fresh,
+      lastOutputAt: silent,
       externalRunId: jobName,
     });
     await seedAdapterInvokeEvent({ companyId, agentId, runId });
