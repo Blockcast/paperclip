@@ -1281,6 +1281,37 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
   });
 
+  it("does NOT reap a confirmed-missing external-lifecycle Job while run output is still fresh", async () => {
+    // Regression for a live finish-line race: opencode_k8s had already posted
+    // its final answer and emitted fresh output, but the Job vanished before
+    // the adapter/postRun path persisted success. The exact-name kube lookup
+    // returned missing and the reaper finalized the run as failed.
+    const fresh = new Date(Date.now() - 30 * 1000);
+    const jobName = "agent-opencode-release-run-abc123";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      externalRunId: jobName,
+      lastOutputAt: fresh,
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    mockListAgentJobRunStatuses.mockResolvedValueOnce(new Map());
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(0);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).not.toBe("job_missing");
+    expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
+  });
+
   it("does not delete a recent terminal external-lifecycle run's live Job", async () => {
     const { runId } = await seedRunFixture({
       adapterType: "opencode_k8s",
