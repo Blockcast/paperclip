@@ -83,6 +83,10 @@ const BUNDLED_PLUGINS = [
   "@lucitra/paperclip-plugin-chat",
   "@lucitra/paperclip-plugin-updater",
   "@lucitra/paperclip-plugin-secrets",
+  // Penstock LLM-proxy connector: repoints agent Anthropic traffic through
+  // managed api.penstock.run. Inert until configured (mode defaults to
+  // "disabled"); live cutover is gated on the native serve (PEN-1039).
+  "@penstock/paperclip-plugin",
 ];
 
 async function autoInstallBundledPlugins(
