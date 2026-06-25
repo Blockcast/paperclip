@@ -489,6 +489,7 @@ describe("handleWebhook — resolved", () => {
       resolvedAt: null,
     };
     mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "todo" });
 
     const resolvedAlert = baseAlert({
       status: "resolved",
@@ -520,6 +521,7 @@ describe("handleWebhook — resolved", () => {
         assigneeAgentId: "agent-1",
       },
     ]);
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "todo" });
 
     const resolvedAlert = baseAlert({
       status: "resolved",

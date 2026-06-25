@@ -108,8 +108,8 @@ export async function handleFiring(
   const severity = alert.labels.severity ?? "unknown";
 
   if (existing && existing.paperclipIssueId) {
-    // Re-fire: already have an issue. Refresh body (drill-in URLs may carry
-    // a fresh time range) and re-open if a human closed it.
+    // Re-fire: refresh body (drill-in URLs may carry a fresh time range) and
+    // re-open if the plugin previously auto-cancelled it on resolve.
     const newDescription = buildIssueDescription(alert);
     try {
       const issue = await ctx.issues.get(
@@ -286,7 +286,7 @@ export async function handleResolved(
         existing.paperclipIssueId,
         existing.paperclipCompanyId,
       );
-      if (!issue || (issue.status !== "done" && issue.status !== "cancelled")) {
+      if (issue && issue.status !== "done" && issue.status !== "cancelled") {
         await ctx.issues.update(
           existing.paperclipIssueId,
           { status: "cancelled" },
