@@ -116,7 +116,11 @@ export async function handleFiring(
         existing.paperclipIssueId,
         existing.paperclipCompanyId,
       );
-      if (issue && (issue.status === "done" || issue.status === "cancelled")) {
+      if (
+        issue &&
+        (issue.status === "done" || issue.status === "cancelled") &&
+        existing.resolvedAt
+      ) {
         await ctx.issues.update(
           existing.paperclipIssueId,
           { status: "todo", description: newDescription },
@@ -126,7 +130,7 @@ export async function handleFiring(
           alertname,
           severity,
         });
-      } else if (issue) {
+      } else if (issue && issue.status !== "done" && issue.status !== "cancelled") {
         await ctx.issues.update(
           existing.paperclipIssueId,
           { description: newDescription },
@@ -278,11 +282,17 @@ export async function handleResolved(
 
   try {
     if (config.autoCloseOnResolve) {
-      await ctx.issues.update(
+      const issue = await ctx.issues.get(
         existing.paperclipIssueId,
-        { status: "cancelled" },
         existing.paperclipCompanyId,
       );
+      if (!issue || (issue.status !== "done" && issue.status !== "cancelled")) {
+        await ctx.issues.update(
+          existing.paperclipIssueId,
+          { status: "cancelled" },
+          existing.paperclipCompanyId,
+        );
+      }
     } else {
       await ctx.issues.createComment(
         existing.paperclipIssueId,
@@ -332,6 +342,7 @@ async function recoverStateFromIssue(
   });
   const issue = matches[0];
   if (!issue) return null;
+  if (issue.status === "done" || issue.status === "cancelled") return null;
 
   return {
     paperclipIssueId: issue.id,
