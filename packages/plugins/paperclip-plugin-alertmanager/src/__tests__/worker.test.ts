@@ -94,6 +94,7 @@ interface MockClients {
   state: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn>; delete: ReturnType<typeof vi.fn> };
   users: { get: ReturnType<typeof vi.fn>; findByEmail: ReturnType<typeof vi.fn> };
   issues: {
+    list: ReturnType<typeof vi.fn>;
     get: ReturnType<typeof vi.fn>;
     create: ReturnType<typeof vi.fn>;
     update: ReturnType<typeof vi.fn>;
@@ -122,6 +123,7 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
       findByEmail: vi.fn(async () => null),
     },
     issues: {
+      list: vi.fn(async () => []),
       get: vi.fn(async () => null),
       create: vi.fn(async () => ({ id: "issue-1" })),
       update: vi.fn(async () => ({ id: "issue-1" })),
@@ -445,7 +447,7 @@ describe("handleWebhook — resolved", () => {
     );
   });
 
-  it("closes the issue when autoCloseOnResolve=true", async () => {
+  it("cancels the issue when autoCloseOnResolve=true", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ autoCloseOnResolve: true });
     const existing: AlertStateRecord = {
@@ -474,10 +476,52 @@ describe("handleWebhook — resolved", () => {
 
     expect(mocks.issues.update).toHaveBeenCalledWith(
       "issue-existing",
-      { status: "done" },
+      { status: "cancelled" },
       "company-1",
     );
     expect(mocks.issues.createComment).not.toHaveBeenCalled();
+  });
+
+  it("recovers missing state from the issue origin before cancelling", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    mocks.state.get.mockResolvedValueOnce(null);
+    mocks.issues.list.mockResolvedValueOnce([
+      {
+        id: "issue-existing",
+        assigneeUserId: null,
+        assigneeAgentId: "agent-1",
+      },
+    ]);
+
+    const resolvedAlert = baseAlert({
+      status: "resolved",
+      endsAt: "2026-04-29T10:00:00Z",
+    });
+    const envelope = baseEnvelope({
+      status: "resolved",
+      alerts: [resolvedAlert],
+    });
+
+    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.list).toHaveBeenCalledWith({
+      companyId: "company-1",
+      originKind: ORIGIN_KIND,
+      originId: resolvedAlert.fingerprint,
+      limit: 1,
+    });
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-existing",
+      { status: "cancelled" },
+      "company-1",
+    );
+    expect(mocks.events.emit).toHaveBeenCalledWith(
+      "alertmanager.alert.resolved",
+      "company-1",
+      expect.objectContaining({ paperclipIssueId: "issue-existing" }),
+    );
+    expect(mocks.state.set).toHaveBeenCalled();
   });
 
   it("logs and drops resolved-without-state (no action taken)", async () => {

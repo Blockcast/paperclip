@@ -116,7 +116,7 @@ export async function handleFiring(
         existing.paperclipIssueId,
         existing.paperclipCompanyId,
       );
-      if (issue && issue.status === "done") {
+      if (issue && (issue.status === "done" || issue.status === "cancelled")) {
         await ctx.issues.update(
           existing.paperclipIssueId,
           { status: "todo", description: newDescription },
@@ -264,7 +264,8 @@ export async function handleResolved(
     scopeKind: "instance" as const,
     stateKey: STATE_KEYS.alert(alert.fingerprint),
   };
-  const existing = (await ctx.state.get(stateRef)) as AlertStateRecord | null;
+  const stateRecord = (await ctx.state.get(stateRef)) as AlertStateRecord | null;
+  const existing = stateRecord ?? (await recoverStateFromIssue(ctx, config, alert));
   if (!existing) {
     ctx.logger.info(
       `Alertmanager: resolved for unknown fingerprint ${alert.fingerprint}, dropping`,
@@ -279,7 +280,7 @@ export async function handleResolved(
     if (config.autoCloseOnResolve) {
       await ctx.issues.update(
         existing.paperclipIssueId,
-        { status: "done" },
+        { status: "cancelled" },
         existing.paperclipCompanyId,
       );
     } else {
@@ -313,6 +314,36 @@ export async function handleResolved(
     alertname,
     severity: existing.severity,
   });
+}
+
+async function recoverStateFromIssue(
+  ctx: PluginContext,
+  config: AlertmanagerPluginConfig,
+  alert: AlertmanagerAlert,
+): Promise<AlertStateRecord | null> {
+  const companyId = config.defaultCompanyId;
+  if (!companyId) return null;
+
+  const matches = await ctx.issues.list({
+    companyId,
+    originKind: ORIGIN_KIND,
+    originId: alert.fingerprint,
+    limit: 1,
+  });
+  const issue = matches[0];
+  if (!issue) return null;
+
+  return {
+    paperclipIssueId: issue.id,
+    paperclipCompanyId: companyId,
+    assigneeUserId: issue.assigneeUserId ?? null,
+    assigneeAgentId: issue.assigneeAgentId ?? null,
+    alertname: alert.labels.alertname ?? "UnnamedAlert",
+    severity: alert.labels.severity ?? "unknown",
+    firstSeenAt: alert.startsAt || new Date().toISOString(),
+    lastFiredAt: alert.startsAt || new Date().toISOString(),
+    resolvedAt: null,
+  };
 }
 
 /**
