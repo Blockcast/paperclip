@@ -13,11 +13,13 @@ const recoveryActionId = "77777777-7777-4777-8777-777777777777";
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
   assertCheckoutOwner: vi.fn(),
+  checkout: vi.fn(),
   create: vi.fn(),
   createChild: vi.fn(),
   getAttachmentById: vi.fn(),
   getByIdentifier: vi.fn(),
   getById: vi.fn(),
+  getDependencyReadiness: vi.fn(),
   getRelationSummaries: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
   listAttachments: vi.fn(),
@@ -289,11 +291,13 @@ describe("agent issue mutation checkout ownership", () => {
     mockCompanyService.getById.mockReset();
     mockIssueService.addComment.mockReset();
     mockIssueService.assertCheckoutOwner.mockReset();
+    mockIssueService.checkout.mockReset();
     mockIssueService.create.mockReset();
     mockIssueService.createChild.mockReset();
     mockIssueService.getAttachmentById.mockReset();
     mockIssueService.getByIdentifier.mockReset();
     mockIssueService.getById.mockReset();
+    mockIssueService.getDependencyReadiness.mockReset();
     mockIssueService.getRelationSummaries.mockReset();
     mockIssueService.getWakeableParentAfterChildCompletion.mockReset();
     mockIssueService.listAttachments.mockReset();
@@ -367,7 +371,14 @@ describe("agent issue mutation checkout ownership", () => {
     mockCompanyService.getById.mockResolvedValue({ id: companyId, issuePrefix: "PAP" });
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockIssueService.getByIdentifier.mockResolvedValue(null);
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      unresolvedBlockerCount: 0,
+      unresolvedBlockerIssueIds: [],
+    });
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+    mockIssueService.checkout.mockImplementation(async (_id: string, agentId: string, _expectedStatuses: string[], checkoutRunId: string | null) => ({
+      ...makeIssue({ assigneeAgentId: agentId, checkoutRunId }),
+    }));
     mockIssueService.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({
       ...makeIssue({
         id: "88888888-8888-4888-8888-888888888888",
@@ -783,6 +794,79 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status).toBe(200);
     expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
     expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("allows the active recovery owner to update source issue disposition without owning checkout", async () => {
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+      id: recoveryActionId,
+      ownerAgentId: peerAgentId,
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "blocked", blockedByIssueIds: [] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({ status: "blocked" }),
+    );
+  });
+
+  it("does not let the active recovery owner use source authority for unrelated issue edits", async () => {
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+      id: recoveryActionId,
+      ownerAgentId: peerAgentId,
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Unrelated edit" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toBe("Issue is checked out by another agent");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("allows the active recovery owner to checkout the source issue", async () => {
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+      id: recoveryActionId,
+      ownerAgentId: peerAgentId,
+    });
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId: peerAgentId, expectedStatuses: ["in_progress"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.checkout).toHaveBeenCalledWith(
+      issueId,
+      peerAgentId,
+      ["in_progress"],
+      "66666666-6666-4666-8666-666666666666",
+      { allowAssigneeTakeover: true },
+    );
+  });
+
+  it("allows the active recovery owner to resume the source issue with a comment", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }));
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+      id: recoveryActionId,
+      ownerAgentId: peerAgentId,
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Recovery owner restored the source path.", resume: true });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.update).toHaveBeenCalledWith(issueId, { status: "todo" });
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "Recovery owner restored the source path.",
+      expect.objectContaining({ agentId: peerAgentId }),
+      expect.any(Object),
+    );
   });
 
   it.each([

@@ -1380,6 +1380,36 @@ export function issueRoutes(
     return true;
   }
 
+  async function activeRecoveryActionAllowsAgent(
+    actorAgentId: string,
+    issue: { id: string; companyId: string },
+  ) {
+    const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+    if (!activeRecoveryAction?.ownerAgentId) return false;
+    if (activeRecoveryAction.ownerAgentId === actorAgentId) return true;
+    return hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, activeRecoveryAction.ownerAgentId);
+  }
+
+  async function isActorActiveRecoveryOwner(
+    req: Request,
+    issue: { id: string; companyId: string },
+  ) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return false;
+    return activeRecoveryActionAllowsAgent(req.actor.agentId, issue);
+  }
+
+  function isRecoveryRelevantIssueUpdateBody(body: unknown) {
+    if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+    const update = body as Record<string, unknown>;
+    return update.status !== undefined ||
+      update.assigneeAgentId !== undefined ||
+      update.assigneeUserId !== undefined ||
+      Array.isArray(update.blockedByIssueIds) ||
+      update.executionPolicy !== undefined ||
+      update.reopen === true ||
+      update.resume === true;
+  }
+
   function assertAgentIssueCommentAllowed(
     req: Request,
     res: Response,
@@ -1563,6 +1593,7 @@ export function issueRoutes(
       return false;
     }
     if (issue.assigneeAgentId === actorAgentId) return true;
+    if (await activeRecoveryActionAllowsAgent(actorAgentId, issue)) return true;
     if (await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)) {
       return true;
     }
@@ -2270,7 +2301,6 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, existing.companyId);
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
     const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id);
     if (
       !(await assertRecoveryActionAuthority(
@@ -2283,6 +2313,7 @@ export function issueRoutes(
     ) {
       return;
     }
+    if (!(await isActorActiveRecoveryOwner(req, existing)) && !(await assertAgentIssueMutationAllowed(req, res, existing))) return;
 
     const { actionId, outcome, sourceIssueStatus, resolutionNote } = req.body;
     if (outcome === "false_positive" || outcome === "cancelled") {
@@ -3413,7 +3444,10 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, existing.companyId);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    if (
+      !(isRecoveryRelevantIssueUpdateBody(req.body) && await isActorActiveRecoveryOwner(req, existing)) &&
+      !(await assertAgentIssueMutationAllowed(req, res, existing))
+    ) return;
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);
@@ -4435,7 +4469,9 @@ export function issueRoutes(
 
     const checkoutRunId = requireAgentRunId(req, res);
     if (req.actor.type === "agent" && !checkoutRunId) return;
-    const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
+    const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId, {
+      allowAssigneeTakeover: await isActorActiveRecoveryOwner(req, issue),
+    });
     const actor = getActorInfo(req);
 
     await logActivity(db, {
