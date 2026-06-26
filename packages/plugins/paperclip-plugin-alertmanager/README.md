@@ -103,10 +103,11 @@ physical infrastructure routes were added for BLO-12202:
 | `physical_infra_bmc` | `support@blockcast.net` | Physical infrastructure operations support queue for iDRAC/BMC sensor and reachability alerts. |
 | `physical_infra_disk` | `support@blockcast.net` | Physical infrastructure operations support queue for SMART/NVMe/RAID/disk-wear alerts. |
 
-Instance config is merged on top, so operators can override any shipped route
-or add more routes in the settings UI without losing the default map for other
-classes. Use that override path when a site has a narrower physical-infra owner
-than the broad support queue.
+Alert rules must set `labels.class` to one of these values for the shipped map
+to match. Instance config is merged on top, so operators can override any
+shipped route or add more routes in the settings UI without losing the default
+map for other classes. Use that override path when a site has a narrower
+physical-infra owner than the broad support queue.
 
 ### Owner resolution chain (§7.7)
 
