@@ -91,7 +91,8 @@ ownerMap:
 ```
 
 The bundled Blockcast plugin ships these `class` routes as defaults so fresh
-deploys and plugin reinstalls keep alerts owned instead of unassigned:
+deploys and plugin reinstalls keep alerts owned instead of unassigned. The
+physical infrastructure routes were added for BLO-12202:
 
 | Class | Default owner | Escalation policy |
 |-------|---------------|-------------------|
