@@ -105,7 +105,8 @@ physical infrastructure routes were added for BLO-12202:
 
 Instance config is merged on top, so operators can override any shipped route
 or add more routes in the settings UI without losing the default map for other
-classes.
+classes. Use that override path when a site has a narrower physical-infra owner
+than the broad support queue.
 
 ### Owner resolution chain (§7.7)
 
