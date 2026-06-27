@@ -10,6 +10,7 @@ let upstream: Server; // mock Paperclip REST API
 let mcp: Server;      // our external MCP server
 let mcpUrl: string;
 let heartbeatSnapshot = { id: "run-1", status: "running", logBytes: 32, lastOutputSeq: 3 };
+let heartbeatRunReadCount = 0;
 
 beforeAll(async () => {
   // Mock Paperclip API: GET /api/agents/me → identity derived from the bearer.
@@ -32,6 +33,7 @@ beforeAll(async () => {
       return;
     }
     if (req.url === "/api/heartbeat-runs/run-1" && req.method === "GET") {
+      heartbeatRunReadCount += 1;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(heartbeatSnapshot));
       return;
@@ -109,6 +111,7 @@ describe("heartbeat run resources", () => {
 
   it("delivers resource update notifications on a standalone GET SSE stream", async () => {
     heartbeatSnapshot = { id: "run-1", status: "running", logBytes: 32, lastOutputSeq: 3 };
+    heartbeatRunReadCount = 0;
     const init = await fetch(mcpUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", Authorization: "Bearer pcp_X" },
@@ -166,6 +169,11 @@ describe("heartbeat run resources", () => {
         }),
       });
       expect(subscribe.status).toBe(200);
+      const deadlineForInitialRead = Date.now() + 5_000;
+      while (heartbeatRunReadCount === 0 && Date.now() < deadlineForInitialRead) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(heartbeatRunReadCount).toBeGreaterThan(0);
       heartbeatSnapshot = { id: "run-1", status: "running", logBytes: 64, lastOutputSeq: 5 };
 
       let buffered = "";
