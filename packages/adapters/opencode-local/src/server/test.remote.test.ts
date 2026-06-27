@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 
 const {
@@ -70,8 +70,27 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
 
 import { testEnvironment } from "./test.js";
 
+const ISOLATED_ENV_KEYS = [
+  "PAPERCLIP_OPENCODE_PROVIDERS",
+  "PAPERCLIP_OPENCODE_SMALL_MODEL",
+  "ANTHROPIC_API_KEY",
+  "OPENAI_API_KEY",
+] as const;
+const ORIGINAL_ENV = new Map<string, string | undefined>(
+  ISOLATED_ENV_KEYS.map((key) => [key, process.env[key]]),
+);
+
 describe("opencode remote environment diagnostics", () => {
+  beforeEach(() => {
+    for (const key of ISOLATED_ENV_KEYS) delete process.env[key];
+  });
+
   afterEach(() => {
+    for (const key of ISOLATED_ENV_KEYS) {
+      const value = ORIGINAL_ENV.get(key);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     vi.clearAllMocks();
   });
 
