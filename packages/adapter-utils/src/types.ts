@@ -26,6 +26,10 @@ export interface AdapterRuntime {
 
 export interface AdapterRunIsolationDescriptor {
   isolationMode: "shared" | "workspace";
+  /**
+   * Stable server-owned scope key, e.g. `shared:${companyId}:${agentId}`
+   * or `workspace:${companyId}:${agentId}:${workspaceId}`.
+   */
   isolationKey: string;
   workspaceRoot: string;
   homeRoot: string;

@@ -12385,6 +12385,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
 
         if (taskKey && !isolationSessionMismatch && (runtimeSessionParams || previousSessionDisplayId || taskSession)) {
+          // Persist the current run's scoped params so failure-path resumes keep the isolation key.
           await upsertTaskSession({
             companyId: agent.companyId,
             agentId: agent.id,
