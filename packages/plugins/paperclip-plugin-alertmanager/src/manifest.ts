@@ -85,13 +85,44 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Auto-close issue when alert resolves",
         default: false,
         description:
-          "If true, transitions the issue to status=done when AM sends status=resolved. If false, posts a 'resolved at <ts>' comment and leaves status alone.",
+          "If true, transitions the issue to status=cancelled when AM sends status=resolved. If false, posts a 'resolved at <ts>' comment and leaves status alone.",
       },
       ownerMap: {
         type: "object",
         title: "Owner map (label-key → value → email)",
         description:
           "Per-instance config. e.g. { team: { 'platform': 'alice@blockcast.net' } }. Resolution chain documented in the plugin spec §7.7.",
+      },
+      issueRouteMap: {
+        type: "object",
+        title: "Issue route map (label-key → value → issue fields)",
+        description:
+          "Per-instance config. e.g. { class: { physical_infra_bmc: { projectId, goalId, assigneeAgentId, status: 'todo' } } }. Shipped defaults route Blockcast physical-infra alerts into the physical-infra project queue.",
+        additionalProperties: {
+          type: "object",
+          additionalProperties: {
+            type: "object",
+            properties: {
+              projectId: { type: "string" },
+              goalId: { type: "string" },
+              status: {
+                type: "string",
+                enum: [
+                  "backlog",
+                  "todo",
+                  "in_progress",
+                  "in_review",
+                  "done",
+                  "blocked",
+                  "cancelled",
+                ],
+              },
+              assigneeAgentId: { type: "string" },
+              assigneeUserId: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+        },
       },
     },
     // No fields are schema-required: the bootstrap auto-config endpoint

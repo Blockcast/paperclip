@@ -17,6 +17,7 @@ import {
   effectiveAlertStatus,
   severityToPriority,
 } from "./issue-mapping.js";
+import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { resolveAssigneeUserId } from "./owner-resolver.js";
 import {
   ORIGIN_KIND,
@@ -31,6 +32,12 @@ export class WebhookUnauthorizedError extends Error {
     super(message);
     this.name = "WebhookUnauthorizedError";
   }
+}
+
+function nonEmptyString(value: string | null | undefined): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
 }
 
 /**
@@ -108,15 +115,19 @@ export async function handleFiring(
   const severity = alert.labels.severity ?? "unknown";
 
   if (existing && existing.paperclipIssueId) {
-    // Re-fire: already have an issue. Refresh body (drill-in URLs may carry
-    // a fresh time range) and re-open if a human closed it.
+    // Re-fire: refresh body (drill-in URLs may carry a fresh time range) and
+    // re-open if the plugin previously auto-cancelled it on resolve.
     const newDescription = buildIssueDescription(alert);
     try {
       const issue = await ctx.issues.get(
         existing.paperclipIssueId,
         existing.paperclipCompanyId,
       );
-      if (issue && issue.status === "done") {
+      if (
+        issue &&
+        (issue.status === "done" || issue.status === "cancelled") &&
+        existing.resolvedAt
+      ) {
         await ctx.issues.update(
           existing.paperclipIssueId,
           { status: "todo", description: newDescription },
@@ -126,7 +137,7 @@ export async function handleFiring(
           alertname,
           severity,
         });
-      } else if (issue) {
+      } else if (issue && issue.status !== "done" && issue.status !== "cancelled") {
         await ctx.issues.update(
           existing.paperclipIssueId,
           { description: newDescription },
@@ -181,15 +192,46 @@ export async function handleFiring(
 
   const { assigneeUserId, assigneeAgentId, resolution } =
     await resolveAssigneeUserId(ctx, alert, config.ownerMap);
+  const issueRouteResolution = resolveIssueRoute(alert, config.issueRouteMap);
+  const issueRoute = issueRouteResolution.route;
+  const ownerOverride =
+    resolution.source === "label-override" ||
+    resolution.source === "annotation-override";
+  const routeAssigneeAgentId = nonEmptyString(issueRoute?.assigneeAgentId);
+  const routeHasAssigneeUserId = Object.prototype.hasOwnProperty.call(
+    issueRoute ?? {},
+    "assigneeUserId",
+  );
+  const routeAssigneeUserId = routeHasAssigneeUserId
+    ? nonEmptyString(issueRoute?.assigneeUserId ?? undefined)
+    : undefined;
+  const createAssigneeAgentId = ownerOverride
+    ? assigneeAgentId
+    : routeAssigneeAgentId ?? assigneeAgentId;
+  const createAssigneeUserId = createAssigneeAgentId
+    ? undefined
+    : ownerOverride
+      ? assigneeUserId
+      : routeHasAssigneeUserId
+        ? routeAssigneeUserId
+        : assigneeUserId;
+  const routeProjectId = nonEmptyString(issueRoute?.projectId);
+  const routeGoalId = nonEmptyString(issueRoute?.goalId);
+  const routeStatus = issueRoute?.status;
   const resolvedTarget =
     resolution.agentId
       ? `agent:${resolution.agentId}`
       : resolution.email ?? "(none)";
   const resolvedAssignee =
-    assigneeAgentId ?? assigneeUserId ?? "(no assignee)";
+    createAssigneeAgentId ?? createAssigneeUserId ?? "(no assignee)";
   ctx.logger.debug(
     `Owner resolution for ${alertname}: ${resolution.source} → ${resolvedTarget} → ${resolvedAssignee}`,
   );
+  if (issueRouteResolution.source) {
+    ctx.logger.debug(
+      `Issue route for ${alertname}: ${issueRouteResolution.source.labelKey}=${issueRouteResolution.source.labelValue}`,
+    );
+  }
 
   const title = buildIssueTitle(alert);
   const description = buildIssueDescription(alert);
@@ -204,16 +246,19 @@ export async function handleFiring(
     priority,
     originKind: ORIGIN_KIND,
     originId: alert.fingerprint,
-    ...(assigneeUserId ? { assigneeUserId } : {}),
-    ...(assigneeAgentId ? { assigneeAgentId } : {}),
+    ...(routeProjectId ? { projectId: routeProjectId } : {}),
+    ...(routeGoalId ? { goalId: routeGoalId } : {}),
+    ...(routeStatus ? { status: routeStatus } : {}),
+    ...(createAssigneeUserId ? { assigneeUserId: createAssigneeUserId } : {}),
+    ...(createAssigneeAgentId ? { assigneeAgentId: createAssigneeAgentId } : {}),
     ...(billingCode ? { billingCode } : {}),
   });
 
   const record: AlertStateRecord = {
     paperclipIssueId: issue.id,
     paperclipCompanyId: companyId,
-    assigneeUserId: assigneeUserId ?? null,
-    assigneeAgentId: assigneeAgentId ?? null,
+    assigneeUserId: createAssigneeUserId ?? null,
+    assigneeAgentId: createAssigneeAgentId ?? null,
     alertname,
     severity,
     firstSeenAt: alert.startsAt || nowIso,
@@ -229,8 +274,8 @@ export async function handleFiring(
     labels: alert.labels,
     annotations: alert.annotations,
     paperclipIssueId: issue.id,
-    assigneeUserId: assigneeUserId ?? null,
-    assigneeAgentId: assigneeAgentId ?? null,
+    assigneeUserId: createAssigneeUserId ?? null,
+    assigneeAgentId: createAssigneeAgentId ?? null,
     reFired: false,
   });
 
@@ -242,6 +287,9 @@ export async function handleFiring(
     metadata: {
       fingerprint: alert.fingerprint,
       assigneeResolutionSource: resolution.source,
+      issueRouteSource: issueRouteResolution.source
+        ? `${issueRouteResolution.source.labelKey}=${issueRouteResolution.source.labelValue}`
+        : "no-match",
     },
   });
 
@@ -264,7 +312,8 @@ export async function handleResolved(
     scopeKind: "instance" as const,
     stateKey: STATE_KEYS.alert(alert.fingerprint),
   };
-  const existing = (await ctx.state.get(stateRef)) as AlertStateRecord | null;
+  const stateRecord = (await ctx.state.get(stateRef)) as AlertStateRecord | null;
+  const existing = stateRecord ?? (await recoverStateFromIssue(ctx, config, alert));
   if (!existing) {
     ctx.logger.info(
       `Alertmanager: resolved for unknown fingerprint ${alert.fingerprint}, dropping`,
@@ -277,11 +326,17 @@ export async function handleResolved(
 
   try {
     if (config.autoCloseOnResolve) {
-      await ctx.issues.update(
+      const issue = await ctx.issues.get(
         existing.paperclipIssueId,
-        { status: "done" },
         existing.paperclipCompanyId,
       );
+      if (issue && issue.status !== "done" && issue.status !== "cancelled") {
+        await ctx.issues.update(
+          existing.paperclipIssueId,
+          { status: "cancelled" },
+          existing.paperclipCompanyId,
+        );
+      }
     } else {
       await ctx.issues.createComment(
         existing.paperclipIssueId,
@@ -313,6 +368,37 @@ export async function handleResolved(
     alertname,
     severity: existing.severity,
   });
+}
+
+async function recoverStateFromIssue(
+  ctx: PluginContext,
+  config: AlertmanagerPluginConfig,
+  alert: AlertmanagerAlert,
+): Promise<AlertStateRecord | null> {
+  const companyId = config.defaultCompanyId;
+  if (!companyId) return null;
+
+  const matches = await ctx.issues.list({
+    companyId,
+    originKind: ORIGIN_KIND,
+    originId: alert.fingerprint,
+    limit: 1,
+  });
+  const issue = matches[0];
+  if (!issue) return null;
+  if (issue.status === "done" || issue.status === "cancelled") return null;
+
+  return {
+    paperclipIssueId: issue.id,
+    paperclipCompanyId: companyId,
+    assigneeUserId: issue.assigneeUserId ?? null,
+    assigneeAgentId: issue.assigneeAgentId ?? null,
+    alertname: alert.labels.alertname ?? "UnnamedAlert",
+    severity: alert.labels.severity ?? "unknown",
+    firstSeenAt: alert.startsAt || new Date().toISOString(),
+    lastFiredAt: alert.startsAt || new Date().toISOString(),
+    resolvedAt: null,
+  };
 }
 
 /**

@@ -121,7 +121,6 @@ const ISSUE_STATUSES = new Set(["todo", "in_progress", "blocked", "done", "cance
 const ISSUE_PRIORITIES = new Set(["urgent", "high", "medium", "low"]);
 const PROJECT_STATUSES = new Set(["backlog", "planned", "in_progress", "completed", "cancelled"]);
 const APPROVAL_STATUSES = new Set(["pending", "approved", "rejected", "revision_requested"]);
-
 export function createToolDefinitions(client: PaperclipApiClient): ToolDefinition[] {
 
   const getAgentSchema = z.object({
@@ -596,6 +595,28 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
           client.requestJson("POST", `/approvals/${encodeURIComponent(String(args.approval_id))}/request-revision`, { body: { comment } }),
         );
       },
+    },
+    {
+      name: "paperclipTailHeartbeatRunLog",
+      description: "Fallback log tail for MCP clients without resource subscription support.",
+      schema: z.object({
+        runId: z.string().default("").describe("Heartbeat run UUID. Preferred stdio-compatible field."),
+        run_id: z.string().default("").describe("Heartbeat run UUID. Compatibility alias."),
+        offset: z.number().int().default(0).describe("Byte offset to resume from. Default: 0."),
+        limitBytes: z.number().int().default(16_384).describe("Max bytes to read (1-256000). Default: 16384."),
+        limit_bytes: z.number().int().default(16_384).describe("Max bytes to read (1-256000). Compatibility alias."),
+      }),
+      execute: async (args) =>
+        runTool(async () => {
+          const runId = String((args.runId as string | undefined) || (args.run_id as string | undefined) || "").trim();
+          if (!runId) return { isError: true, message: "runId is required." };
+          const offset = Math.max(0, Math.trunc(Number(args.offset ?? 0)));
+          const rawLimit = args.limitBytes ?? args.limit_bytes ?? 16_384;
+          const limitBytes = Math.max(1, Math.min(Math.trunc(Number(rawLimit)), 256_000));
+          return await client.requestJson("GET", `/heartbeat-runs/${encodeURIComponent(runId)}/log`, {
+            query: { offset, limitBytes },
+          });
+        }),
     },
     {
       name: "get_dashboard",

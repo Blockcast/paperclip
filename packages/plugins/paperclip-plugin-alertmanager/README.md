@@ -19,10 +19,11 @@ See `docs/specs/2026-04-29-alertmanager-plugin-spec.md` for the full design.
   with a 200 (so AM doesn't retry-storm).
 - Deduplicates by `alert.fingerprint` per spec §5.3 — re-fires bump the
   state row and refresh the issue body, they don't create a second issue.
-- Re-opens issues that a human closed (status=done) when the same
-  fingerprint re-fires (§8.3 option A).
+- Re-opens issues the plugin auto-cancelled on resolve when the same
+  fingerprint re-fires (§8.3 option A), while preserving operator-cancelled
+  suppressions.
 - Resolves issues per `autoCloseOnResolve`: either close the issue (status
-  → done) or post an `Alert resolved at <ts>` comment.
+  → cancelled) or post an `Alert resolved at <ts>` comment.
 - Renders observability drill-in links (Grafana / Tempo / Pyroscope / Hubble
   / runbooks / Prometheus) from a fixed annotation-key allowlist, so a bad
   `PrometheusRule` can't smuggle hostile URLs into the issue body.
@@ -44,6 +45,7 @@ Configured per-instance via the host's plugin settings UI. Schema lives in
 | `severityToPriority` | object  | no       | Override the default severity map. |
 | `autoCloseOnResolve` | boolean | no       | Defaults to false (comment-only). |
 | `ownerMap`           | object  | no       | `{ <labelKey>: { <labelValue>: <email> } }`. |
+| `issueRouteMap`      | object  | no       | `{ <labelKey>: { <labelValue>: { projectId, goalId, assigneeAgentId, status } } }`. |
 
 ### Example `AlertmanagerConfig` YAML
 
@@ -79,16 +81,66 @@ autoCloseOnResolve: false
 ownerMap:
   class:
     paperclip_claude_k8s: support@blockcast.net
+    paperclip_data_volume: support@blockcast.net
+    physical_infra_proxmox: support@blockcast.net
+    physical_infra_ceph: support@blockcast.net
+    physical_infra_bmc: support@blockcast.net
+    physical_infra_disk: support@blockcast.net
   team:
     platform:   alice@blockcast.net
     networking: ned@blockcast.net
+issueRouteMap:
+  class:
+    physical_infra_proxmox:
+      projectId: 9a6f627e-0f16-4b46-acc1-811acd1f548e
+      goalId: 94c9f942-7067-4fde-a313-b3ee30d72f70
+      assigneeAgentId: d2ade02d-112c-4da2-b61f-2301254a154c
+      status: todo
+    physical_infra_ceph:
+      projectId: 9a6f627e-0f16-4b46-acc1-811acd1f548e
+      goalId: 94c9f942-7067-4fde-a313-b3ee30d72f70
+      assigneeAgentId: d2ade02d-112c-4da2-b61f-2301254a154c
+      status: todo
+    physical_infra_bmc:
+      projectId: 9a6f627e-0f16-4b46-acc1-811acd1f548e
+      goalId: 94c9f942-7067-4fde-a313-b3ee30d72f70
+      assigneeAgentId: d2ade02d-112c-4da2-b61f-2301254a154c
+      status: todo
+    physical_infra_disk:
+      projectId: 9a6f627e-0f16-4b46-acc1-811acd1f548e
+      goalId: 94c9f942-7067-4fde-a313-b3ee30d72f70
+      assigneeAgentId: d2ade02d-112c-4da2-b61f-2301254a154c
+      status: todo
 ```
 
-The bundled Blockcast plugin ships `class.paperclip_claude_k8s -> support@blockcast.net`
-as a default route so `ClaudeK8sConcurrentRunBlockedRate` alerts remain owned after
-a fresh deploy or plugin reinstall. Instance config is merged on top, so operators
-can override that route or add more routes in the settings UI without losing the
-default.
+The bundled Blockcast plugin ships these `class` routes as defaults so fresh
+deploys and plugin reinstalls keep alerts owned instead of unassigned. The
+physical infrastructure routes were added for BLO-12202:
+
+| Class | Default owner | Escalation policy |
+|-------|---------------|-------------------|
+| `paperclip_claude_k8s` | `support@blockcast.net` | Paperclip platform incident support queue. |
+| `paperclip_data_volume` | `support@blockcast.net` | Paperclip shared storage support queue. |
+| `physical_infra_proxmox` | `support@blockcast.net` | Physical infrastructure operations support queue for Proxmox node/API/cluster alerts. |
+| `physical_infra_ceph` | `support@blockcast.net` | Physical infrastructure operations support queue for Ceph health/quorum/OSD alerts. |
+| `physical_infra_bmc` | `support@blockcast.net` | Physical infrastructure operations support queue for iDRAC/BMC sensor and reachability alerts. |
+| `physical_infra_disk` | `support@blockcast.net` | Physical infrastructure operations support queue for SMART/NVMe/RAID/disk-wear alerts. |
+
+Alert rules must set `labels.class` to one of these exact values for the
+shipped map to match. Instance config is merged on top, so operators can
+override any shipped route or add more routes in the settings UI without
+losing the default map for other classes. Use that override path when a site
+has a narrower physical-infra owner than the broad support queue.
+
+The plugin also ships default `issueRouteMap` entries for the four
+`physical_infra_*` classes. Those entries create issues in the Blockcast
+Physical Infrastructure Telemetry & Alerting project, link the CDN+ goal,
+assign the Staff Engineer agent queue, and set the initial status to `todo`.
+Owner-map email routes still exist for notification ownership, but the issue
+route decides the project/goal queue when both maps match. A label
+`paperclip_assignee_email` override still wins for one-off assignment
+overrides; annotation overrides follow the existing owner-resolution chain
+below.
 
 ### Owner resolution chain (§7.7)
 

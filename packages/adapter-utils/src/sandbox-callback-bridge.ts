@@ -51,8 +51,15 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "GET", path: /^\/api\/companies\/[^/]+\/approvals$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/routines$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/skills$/ },
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/heartbeat-runs$/ },
   { method: "GET", path: /^\/api\/projects\/[^/]+$/ },
   { method: "GET", path: /^\/api\/goals\/[^/]+$/ },
+
+  // Read-only heartbeat run output used by MCP heartbeat resources/fallback tailing.
+  { method: "GET", path: /^\/api\/heartbeat-runs\/[^/]+$/ },
+  { method: "GET", path: /^\/api\/heartbeat-runs\/[^/]+\/log$/ },
+  { method: "GET", path: /^\/api\/heartbeat-runs\/[^/]+\/events$/ },
+  { method: "GET", path: /^\/api\/heartbeat-runs\/[^/]+\/issues$/ },
 
   // Issue lifecycle: read context, checkout, update, comment, document, release
   { method: "GET", path: /^\/api\/issues\/[^/]+$/ },
@@ -85,6 +92,15 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   // Execution workspaces and runtime services (start/stop/restart dev servers)
   { method: "GET", path: /^\/api\/execution-workspaces\/[^/]+$/ },
   { method: "POST", path: /^\/api\/execution-workspaces\/[^/]+\/runtime-services\/(?:start|stop|restart)$/ },
+
+  // Heartbeat run reads needed by MCP resource streaming. Keep mutations out
+  // of this bridge-only surface; direct API credentials still cover adapters
+  // that need broader heartbeat-run control.
+  { method: "GET", path: /^\/api\/heartbeat-runs\/[^/]+$/ },
+  { method: "GET", path: /^\/api\/heartbeat-runs\/[^/]+\/events$/ },
+  { method: "GET", path: /^\/api\/heartbeat-runs\/[^/]+\/log$/ },
+  { method: "GET", path: /^\/api\/heartbeat-runs\/[^/]+\/workspace-operations$/ },
+  { method: "GET", path: /^\/api\/heartbeat-runs\/[^/]+\/issues$/ },
 
   // Routines (agents manage their own routines and triggers)
   { method: "GET", path: /^\/api\/routines\/[^/]+$/ },

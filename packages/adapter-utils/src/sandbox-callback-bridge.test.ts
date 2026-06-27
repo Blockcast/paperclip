@@ -304,6 +304,23 @@ describe("sandbox callback bridge", () => {
     });
   });
 
+  it("allows read-only heartbeat run callback routes", () => {
+    for (const path of [
+      "/api/companies/company-1/heartbeat-runs",
+      "/api/heartbeat-runs/run-1",
+      "/api/heartbeat-runs/run-1/log",
+      "/api/heartbeat-runs/run-1/events",
+      "/api/heartbeat-runs/run-1/issues",
+    ]) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method: "GET", path })).toBeNull();
+    }
+
+    expect(authorizeSandboxCallbackBridgeRequestWithRoutes({
+      method: "POST",
+      path: "/api/heartbeat-runs/run-1/cancel",
+    })).toBe("Route not allowed: POST /api/heartbeat-runs/run-1/cancel");
+  });
+
   it("drains already-queued requests on stop", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-drain-"));
     cleanupDirs.push(rootDir);
@@ -912,6 +929,11 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/execution-workspaces/ws-1/runtime-services/start" },
       { method: "POST", path: "/api/execution-workspaces/ws-1/runtime-services/stop" },
       { method: "POST", path: "/api/execution-workspaces/ws-1/runtime-services/restart" },
+      { method: "GET", path: "/api/heartbeat-runs/run-1" },
+      { method: "GET", path: "/api/heartbeat-runs/run-1/events" },
+      { method: "GET", path: "/api/heartbeat-runs/run-1/log" },
+      { method: "GET", path: "/api/heartbeat-runs/run-1/workspace-operations" },
+      { method: "GET", path: "/api/heartbeat-runs/run-1/issues" },
       { method: "GET", path: "/api/routines/r-1" },
       { method: "GET", path: "/api/routines/r-1/runs" },
       { method: "POST", path: "/api/companies/co-1/routines" },
@@ -938,6 +960,10 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/companies/co-1/exports" },
       { method: "POST", path: "/api/companies/co-1/imports/apply" },
       { method: "POST", path: "/api/companies/co-1/archive" },
+      { method: "POST", path: "/api/heartbeat-runs/run-1/cancel" },
+      { method: "POST", path: "/api/heartbeat-runs/run-1/watchdog-decisions" },
+      { method: "PATCH", path: "/api/heartbeat-runs/run-1" },
+      { method: "GET", path: "/api/heartbeat-runs/run-1/artifacts" },
       { method: "DELETE", path: "/api/issues/issue-1/documents/plan" },
       { method: "DELETE", path: "/api/issues/issue-1/approvals/ap-1" },
       { method: "POST", path: "/api/approvals/ap-1/approve" },
