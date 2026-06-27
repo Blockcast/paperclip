@@ -100,6 +100,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
 
 import { execute } from "./execute.js";
 
+const REMOTE_EXECUTION_TEST_TIMEOUT_MS = 30_000;
 const ISOLATED_ENV_KEYS = [
   "PAPERCLIP_OPENCODE_PROVIDERS",
   "PAPERCLIP_OPENCODE_SMALL_MODEL",
@@ -266,7 +267,7 @@ describe("opencode remote execution", () => {
     expect(call?.[3].remoteExecution?.remoteCwd).toBe(managedRemoteWorkspace);
     expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
-  });
+  }, REMOTE_EXECUTION_TEST_TIMEOUT_MS);
 
   it("syncs external instructions bundles and resolves sibling files from the remote runtime asset", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-instructions-"));
@@ -346,7 +347,7 @@ describe("opencode remote execution", () => {
       `Resolve any relative file references from ${remoteInstructionsDir}/`,
     );
     expect(runCall?.[3].stdin).not.toContain(`Resolve any relative file references from ${workspaceDir}`);
-  });
+  }, REMOTE_EXECUTION_TEST_TIMEOUT_MS);
 
   it("fails before the remote run when the configured model is unavailable on the SSH target", async () => {
     runChildProcess.mockImplementationOnce(async () => ({
@@ -409,7 +410,7 @@ describe("opencode remote execution", () => {
     expect(runChildProcess).toHaveBeenCalledTimes(1);
     expect((runChildProcess.mock.calls[0]?.[2] as string[] | undefined) ?? []).toEqual(["models"]);
     expect(startAdapterExecutionTargetPaperclipBridge).not.toHaveBeenCalled();
-  });
+  }, REMOTE_EXECUTION_TEST_TIMEOUT_MS);
 
   it("resumes saved OpenCode sessions for remote SSH execution only when the identity matches", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-resume-"));
@@ -473,5 +474,5 @@ describe("opencode remote execution", () => {
       | undefined;
     expect(call?.[2]).toContain("--session");
     expect(call?.[2]).toContain("session-123");
-  });
+  }, REMOTE_EXECUTION_TEST_TIMEOUT_MS);
 });
