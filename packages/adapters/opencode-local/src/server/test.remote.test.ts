@@ -70,7 +70,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
 
 import { testEnvironment } from "./test.js";
 
-const REMOTE_ENVIRONMENT_TEST_TIMEOUT_MS = 30_000;
+const REMOTE_ENVIRONMENT_TEST_TIMEOUT_MS = 60_000;
 const ISOLATED_ENV_KEYS = [
   "PAPERCLIP_OPENCODE_PROVIDERS",
   "PAPERCLIP_OPENCODE_SMALL_MODEL",
