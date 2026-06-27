@@ -177,26 +177,30 @@ describe("heartbeat run resources", () => {
       heartbeatSnapshot = { id: "run-1", status: "running", logBytes: 64, lastOutputSeq: 5 };
 
       let buffered = "";
-      const deadline = Date.now() + 5_000;
+      let pendingRead: Promise<ReadableStreamReadResult<Uint8Array>> | null = null;
+      const deadline = Date.now() + 12_000;
       while (Date.now() < deadline && !buffered.includes("notifications/resources/updated")) {
         const remaining = Math.max(1, deadline - Date.now());
+        pendingRead ??= reader.read();
         const result = await Promise.race([
-          reader.read(),
-          new Promise<ReadableStreamReadResult<Uint8Array>>((resolve) =>
-            setTimeout(() => resolve({ done: true, value: undefined }), remaining),
-          ),
+          pendingRead,
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), Math.min(remaining, 250))),
         ]);
+        if (result === null) continue;
+        pendingRead = null;
         const { value, done } = result;
         if (done) break;
         buffered += decoder.decode(value, { stream: true });
       }
+      if (pendingRead) void pendingRead.catch(() => undefined);
+      buffered += decoder.decode();
       expect(buffered).toContain("notifications/resources/updated");
       expect(buffered).toContain("paperclip://heartbeat-runs/run-1/log");
     } finally {
       abort.abort();
       await reader.cancel().catch(() => undefined);
     }
-  }, 15000);
+  }, 20000);
 });
 
 afterAll(async () => {
