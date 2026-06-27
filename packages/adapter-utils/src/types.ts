@@ -21,6 +21,19 @@ export interface AdapterRuntime {
   sessionParams: Record<string, unknown> | null;
   sessionDisplayId: string | null;
   taskKey: string | null;
+  isolation?: AdapterRunIsolationDescriptor | null;
+}
+
+export interface AdapterRunIsolationDescriptor {
+  isolationMode: "shared" | "workspace";
+  isolationKey: string;
+  workspaceRoot: string;
+  homeRoot: string;
+  cacheRoot: string;
+  sessionScope: {
+    taskKey: string | null;
+    isolationKey: string;
+  };
 }
 
 // ---------------------------------------------------------------------------
