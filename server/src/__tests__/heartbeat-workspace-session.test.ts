@@ -1436,7 +1436,7 @@ describe("K8s session isolation metadata", () => {
   });
 
   it("logs scheduler-side K8s guard decisions with bounded isolation fields", () => {
-    const spy = vi.spyOn(logger, "info").mockImplementation(() => undefined as never);
+    const spy = vi.spyOn(logger, "info").mockImplementation(() => {});
     const workspaceIsolation = buildK8sRunIsolationDescriptor({
       adapterType: "opencode_k8s",
       companyId: "company-1",
@@ -1527,7 +1527,7 @@ describe("K8s session isolation metadata", () => {
   });
 
   it("normalizes malformed scheduler isolation modes before logging", () => {
-    const spy = vi.spyOn(logger, "info").mockImplementation(() => undefined as never);
+    const spy = vi.spyOn(logger, "info").mockImplementation(() => {});
     const malformedIsolation = {
       ...isolation,
       isolationMode: "workspace:company-1:agent-1:bad-high-card-mode" as never,
@@ -1555,7 +1555,7 @@ describe("K8s session isolation metadata", () => {
   });
 
   it("normalizes missing scheduler isolation modes before logging", () => {
-    const spy = vi.spyOn(logger, "info").mockImplementation(() => undefined as never);
+    const spy = vi.spyOn(logger, "info").mockImplementation(() => {});
     const missingModeIsolation = {
       ...isolation,
       // Simulate a malformed scheduler descriptor where the required mode is absent.
