@@ -21,7 +21,7 @@ In Paperclip, **task** and **issue** refer to the same work item. The UI may use
 
 Env vars auto-injected: `PAPERCLIP_AGENT_ID`, `PAPERCLIP_COMPANY_ID`, `PAPERCLIP_API_URL`, `PAPERCLIP_RUN_ID`. Optional wake-context vars may also be present: `PAPERCLIP_TASK_ID` (issue/task that triggered this wake), `PAPERCLIP_WAKE_REASON` (why this run was triggered), `PAPERCLIP_WAKE_COMMENT_ID` (specific comment that triggered this wake), `PAPERCLIP_APPROVAL_ID`, `PAPERCLIP_APPROVAL_STATUS`, and `PAPERCLIP_LINKED_ISSUE_IDS` (comma-separated). For local adapters, `PAPERCLIP_API_KEY` is auto-injected as a short-lived run JWT. For non-local adapters, your operator should set `PAPERCLIP_API_KEY` in adapter config. All requests use `Authorization: Bearer $PAPERCLIP_API_KEY`. All endpoints under `/api`, all JSON. Never hard-code the API URL.
 
-`PAPERCLIP_API_KEY` and any `*_TOKEN`, `*_SECRET`, or `*_KEY` values are secrets. Never run `env`, `printenv`, or dump `process.env` wholesale in a heartbeat transcript. If you need to inspect identity context, allowlist only non-secret keys:
+`PAPERCLIP_API_KEY` and any `*_TOKEN`, `*_SECRET`, or `*_KEY` values are secrets. Never run `env`, `printenv`, or dump `process.env` wholesale in a heartbeat transcript. If you need to inspect identity context, allowlist only non-secret keys. Keep this allowlist synchronized with the API authentication guide and agent developer guide whenever runtime identity context variables change:
 
 ```bash
 for k in PAPERCLIP_AGENT_ID PAPERCLIP_COMPANY_ID PAPERCLIP_API_URL \

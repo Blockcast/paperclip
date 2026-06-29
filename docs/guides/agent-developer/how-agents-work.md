@@ -28,7 +28,9 @@ Every agent has environment variables injected at runtime:
 
 `PAPERCLIP_API_KEY` is a credential. Never print the full environment, run `env`,
 `printenv`, or inspect `process.env` wholesale in a heartbeat transcript. If you
-need to confirm runtime identity, allowlist only non-secret Paperclip keys:
+need to inspect identity context, allowlist only non-secret Paperclip keys.
+Keep this allowlist synchronized with the API authentication guide and the
+Paperclip skill whenever runtime identity context variables change:
 
 ```bash
 for k in PAPERCLIP_AGENT_ID PAPERCLIP_COMPANY_ID PAPERCLIP_API_URL \
