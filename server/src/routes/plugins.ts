@@ -893,14 +893,6 @@ export function pluginRoutes(
     throw badRequest("companyId query parameter is required");
   }
 
-  function rowsFromExecute<T>(result: unknown): T[] {
-    if (Array.isArray(result)) return result as T[];
-    if (typeof result === "object" && result !== null && Array.isArray((result as { rows?: unknown }).rows)) {
-      return (result as { rows: T[] }).rows;
-    }
-    throw new Error("Unexpected bucket result shape from db.execute()");
-  }
-
   /**
    * GET /api/plugins
    *
@@ -1024,23 +1016,26 @@ export function pluginRoutes(
       ))
       .orderBy(desc(plugins.updatedAt));
 
-    const companyScopeCondition = eq(heartbeatRuns.companyId, companyId);
+    const gbrainStatus = sql<string>`coalesce(${pluginState.valueJson}->>'status', 'missing')`;
+    const bucketRows = await db
+      .select({
+        status: gbrainStatus,
+        count: sql<number>`count(*)::int`,
+      })
+      .from(pluginState)
+      .innerJoin(heartbeatRuns, and(
+        eq(pluginState.scopeKind, "run"),
+        eq(pluginState.scopeId, sql<string>`${heartbeatRuns.id}::text`),
+      ))
+      .where(and(
+        eq(pluginState.stateKey, "gbrain-context"),
+        eq(heartbeatRuns.companyId, companyId),
+        gte(pluginState.updatedAt, since),
+      ))
+      .groupBy(gbrainStatus)
+      .orderBy(gbrainStatus);
 
-    const bucketResult = await db.execute(sql`
-      select coalesce(${pluginState.valueJson}->>'status', 'missing') as status,
-             count(*)::int as count
-      from ${pluginState}
-      inner join ${heartbeatRuns}
-        on ${pluginState.scopeKind} = 'run'
-       and ${pluginState.scopeId} = ${heartbeatRuns.id}::text
-      where ${pluginState.stateKey} = 'gbrain-context'
-        and ${companyScopeCondition}
-        and ${pluginState.updatedAt} >= ${since}
-      group by 1
-      order by 1
-    `);
-
-    const gbrainContextBuckets = rowsFromExecute<{ status: string; count: number | string }>(bucketResult)
+    const gbrainContextBuckets = bucketRows
       .map((row): RagHealthGbrainBucket => ({
         status: String(row.status),
         count: Number(row.count),
