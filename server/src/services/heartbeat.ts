@@ -3614,6 +3614,9 @@ export function mergeCoalescedContextSnapshot(
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
   }
+  for (const key of ["issueId", "taskId", "taskKey"] as const) {
+    merged[key] = readNonEmptyString(incoming[key]) ?? readNonEmptyString(existing[key]) ?? merged[key];
+  }
   const mergedCommentIds = mergeWakeCommentIds(existing, incoming);
   if (mergedCommentIds.length > 0) {
     const latestCommentId = mergedCommentIds[mergedCommentIds.length - 1];
@@ -3958,8 +3961,9 @@ async function coalesceQueuedGithubStateWake(input: {
     .returning()
     .then((rows) => rows[0] ?? existingRun);
 
+  let coalescedEventCount: number | null = null;
   if (mergedRun.wakeupRequestId) {
-    await input.tx
+    const updatedWakeupRequest = await input.tx
       .update(agentWakeupRequests)
       .set({
         source: input.source,
@@ -3969,7 +3973,10 @@ async function coalesceQueuedGithubStateWake(input: {
         coalescedCount: sql`coalesce(${agentWakeupRequests.coalescedCount}, 0) + 1`,
         updatedAt: now,
       })
-      .where(eq(agentWakeupRequests.id, mergedRun.wakeupRequestId));
+      .where(eq(agentWakeupRequests.id, mergedRun.wakeupRequestId))
+      .returning({ coalescedCount: agentWakeupRequests.coalescedCount })
+      .then((rows) => rows[0] ?? null);
+    coalescedEventCount = updatedWakeupRequest?.coalescedCount ?? null;
   }
 
   await input.tx.insert(agentWakeupRequests).values({
@@ -3996,6 +4003,7 @@ async function coalesceQueuedGithubStateWake(input: {
       taskKey: input.taskKey,
       wakeReason: input.reason,
       wakeSourceFamily: "github_state_change",
+      coalescedEventCount,
     },
     "github state-change wake coalesced into existing queued heartbeat run",
   );
