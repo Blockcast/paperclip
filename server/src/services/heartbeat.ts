@@ -2983,6 +2983,12 @@ export function sessionParamsMatchIsolation(
   return savedIsolationKey === isolation.isolationKey;
 }
 
+/**
+ * Best-effort scheduler audit log for K8s isolation decisions: dispatch allowed,
+ * saved-session reattached, mismatch requeued, or fail-closed blocked.
+ * `isolation_mode` is normalized through metrics.ts so the log follows the same
+ * bounded vocabulary used by Prometheus labels.
+ */
 export function logK8sGuardDecision(input: {
   decision: "allowed" | "reattached" | "requeued" | "blocked";
   isolation: AdapterRunIsolationDescriptor | null;
@@ -3000,6 +3006,8 @@ export function logK8sGuardDecision(input: {
         ...(input.reason ? { reason: input.reason } : {}),
         isolation_mode: normalizeIsolationMode(input.isolation?.isolationMode),
         isolation_key: input.isolation?.isolationKey ?? null,
+        // Prefer the descriptor's derived scope; input.taskKey is only for blocked
+        // paths without a descriptor.
         task_key: input.isolation?.sessionScope.taskKey ?? input.taskKey ?? null,
         session_id: input.sessionId ?? null,
         agent_id: input.agentId,
