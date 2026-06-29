@@ -97,6 +97,15 @@ function createSelectQueueDb(rows: Array<Array<Record<string, unknown>>>) {
   };
 }
 
+function createRagHealthDb(pluginRows: Array<Record<string, unknown>>, bucketRows: Array<Record<string, unknown>>) {
+  const orderBy = vi.fn(() => Promise.resolve(pluginRows));
+  const where = vi.fn(() => ({ orderBy }));
+  const from = vi.fn(() => ({ where }));
+  const select = vi.fn(() => ({ from }));
+  const execute = vi.fn(() => Promise.resolve({ rows: bucketRows }));
+  return { execute, from, orderBy, select, where };
+}
+
 const companyA = "22222222-2222-4222-8222-222222222222";
 const companyB = "33333333-3333-4333-8333-333333333333";
 const agentA = "44444444-4444-4444-8444-444444444444";
@@ -205,6 +214,74 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(res.body).toMatchObject({
       status: "ok",
       alerts: [],
+    });
+  }, 20_000);
+
+  it("lets agents read the narrow RAG health summary for their company", async () => {
+    const updatedAt = new Date("2026-06-29T12:00:00.000Z");
+    const db = createRagHealthDb(
+      [
+        {
+          id: pluginId,
+          pluginKey: "paperclip-plugin-gbrain",
+          status: "error",
+          lastError: "terminal 401",
+          updatedAt,
+        },
+      ],
+      [
+        { status: "ok", count: 3 },
+        { status: "island", count: "2" },
+      ],
+    );
+    const { app } = await createApp(agentActor(), {}, { db });
+
+    const res = await request(app).get("/api/plugins/rag-health");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      companyId: companyA,
+      windowDays: 7,
+      pluginErrors: [
+        {
+          id: pluginId,
+          pluginKey: "paperclip-plugin-gbrain",
+          status: "error",
+          lastError: "terminal 401",
+          updatedAt: "2026-06-29T12:00:00.000Z",
+        },
+      ],
+      gbrainContextBuckets: [
+        { status: "ok", count: 3 },
+        { status: "island", count: 2 },
+      ],
+    });
+    expect(db.select).toHaveBeenCalledOnce();
+    expect(db.execute).toHaveBeenCalledOnce();
+  }, 20_000);
+
+  it("ignores agent query overrides for the RAG health company scope", async () => {
+    const db = createRagHealthDb([], []);
+    const { app } = await createApp(agentActor(), {}, { db });
+
+    const res = await request(app).get(`/api/plugins/rag-health?companyId=${companyB}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.companyId).toBe(companyA);
+  }, 20_000);
+
+  it("lets board users read RAG health for an accessible company", async () => {
+    const db = createRagHealthDb([], [{ status: "no-issue-page", count: 1 }]);
+    const { app } = await createApp(boardActor(), {}, { db });
+
+    const res = await request(app).get(`/api/plugins/rag-health?companyId=${companyA}&days=14`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      companyId: companyA,
+      windowDays: 14,
+      pluginErrors: [],
+      gbrainContextBuckets: [{ status: "no-issue-page", count: 1 }],
     });
   }, 20_000);
 

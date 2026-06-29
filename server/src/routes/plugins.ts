@@ -25,13 +25,15 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Router } from "express";
 import type { Request, Response } from "express";
-import { and, desc, eq, gte } from "drizzle-orm";
+import { and, desc, eq, gte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
   companies,
   heartbeatRuns,
   pluginLogs,
+  plugins,
+  pluginState,
   pluginWebhookDeliveries,
   projects,
 } from "@paperclipai/db";
@@ -163,12 +165,26 @@ interface PluginHealthAlert {
   updatedAt: string;
 }
 
+type RagHealthPluginError = {
+  id: string;
+  pluginKey: string;
+  status: "error";
+  lastError: string | null;
+  updatedAt: string;
+};
+
+type RagHealthGbrainBucket = {
+  status: string;
+  count: number;
+};
+
 /** UUID v4 regex used for plugin ID route resolution. */
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const PLUGIN_API_BODY_LIMIT_BYTES = 1_000_000;
 const PLUGIN_ACTION_RPC_TIMEOUT_MS = 15 * 60 * 1_000;
+const DEFAULT_RAG_HEALTH_WINDOW_DAYS = 7;
 const PLUGIN_SCOPED_API_RESPONSE_HEADER_ALLOWLIST = new Set([
   "cache-control",
   "etag",
@@ -856,6 +872,34 @@ export function pluginRoutes(
     );
   }
 
+  function resolveRagHealthCompanyId(req: Request): string {
+    assertBoardOrAgent(req);
+    if (req.actor.type === "agent") {
+      if (req.actor.companyId) return req.actor.companyId;
+      throw forbidden("Agent key is missing company scope");
+    }
+
+    const rawCompanyId = req.query.companyId;
+    if (typeof rawCompanyId === "string" && rawCompanyId.trim()) {
+      return rawCompanyId.trim();
+    }
+
+    const companyIds = req.actor.companyIds ?? [];
+    if (companyIds.length === 1) {
+      return companyIds[0]!;
+    }
+
+    throw badRequest("companyId query parameter is required");
+  }
+
+  function rowsFromExecute<T>(result: unknown): T[] {
+    if (Array.isArray(result)) return result as T[];
+    if (typeof result === "object" && result !== null && Array.isArray((result as { rows?: unknown }).rows)) {
+      return (result as { rows: T[] }).rows;
+    }
+    return [];
+  }
+
   /**
    * GET /api/plugins
    *
@@ -939,6 +983,84 @@ export function pluginRoutes(
       status: alerts.length > 0 ? "firing" : "ok",
       alerts,
       checkedAt: new Date().toISOString(),
+    });
+  });
+
+  /**
+   * GET /api/plugins/rag-health
+   *
+   * Narrow read-only health surface for agent-run RAG health routines. This
+   * intentionally exposes only memory-plugin error rows and company-scoped
+   * `gbrain-context` status buckets, not the broad plugin management API.
+   */
+  router.get("/plugins/rag-health", async (req, res) => {
+    const companyId = resolveRagHealthCompanyId(req);
+    assertCompanyAccess(req, companyId);
+
+    const rawDays = req.query.days;
+    const days = rawDays === undefined
+      ? DEFAULT_RAG_HEALTH_WINDOW_DAYS
+      : Number(rawDays);
+    if (!Number.isFinite(days) || days <= 0 || days > 90) {
+      throw badRequest("days must be a number between 1 and 90");
+    }
+
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const checkedAt = new Date().toISOString();
+
+    const pluginErrors = await db
+      .select({
+        id: plugins.id,
+        pluginKey: plugins.pluginKey,
+        status: plugins.status,
+        lastError: plugins.lastError,
+        updatedAt: plugins.updatedAt,
+      })
+      .from(plugins)
+      .where(and(
+        eq(plugins.status, "error"),
+        sql`(
+          ${plugins.pluginKey} ilike '%gbrain%'
+          or ${plugins.pluginKey} ilike '%hindsight%'
+          or ${plugins.pluginKey} ilike '%memory%'
+          or ${plugins.pluginKey} ilike '%plugin-secrets%'
+        )`,
+      ))
+      .orderBy(desc(plugins.updatedAt));
+
+    const bucketResult = await db.execute(sql`
+      select coalesce(${pluginState.valueJson}->>'status', 'missing') as status,
+             count(*)::int as count
+      from ${pluginState}
+      inner join ${heartbeatRuns}
+        on ${pluginState.scopeKind} = 'run'
+       and ${pluginState.scopeId} = ${heartbeatRuns.id}::text
+      where ${pluginState.stateKey} = 'gbrain-context'
+        and ${heartbeatRuns.companyId} = ${companyId}::uuid
+        and ${pluginState.updatedAt} >= ${since}
+      group by 1
+      order by 1
+    `);
+
+    const gbrainContextBuckets = rowsFromExecute<{ status: string; count: number | string }>(bucketResult)
+      .map((row): RagHealthGbrainBucket => ({
+        status: String(row.status),
+        count: Number(row.count),
+      }));
+
+    res.json({
+      companyId,
+      windowDays: days,
+      since: since.toISOString(),
+      checkedAt,
+      pluginErrors: pluginErrors.map((plugin): RagHealthPluginError => ({
+        id: plugin.id,
+        pluginKey: plugin.pluginKey,
+        status: "error",
+        lastError: plugin.lastError ?? null,
+        updatedAt: plugin.updatedAt.toISOString(),
+      })),
+      gbrainContextBuckets,
     });
   });
 
