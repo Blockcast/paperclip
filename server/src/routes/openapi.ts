@@ -3659,6 +3659,14 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/plugins/rag-health",
+  tags: ["plugins"],
+  summary: "Read memory-plugin and gbrain-context health for RAG routines",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/plugins/ui-contributions",
   tags: ["plugins"],
   summary: "List plugin UI contributions",
