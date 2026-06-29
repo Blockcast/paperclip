@@ -1553,6 +1553,34 @@ describe("K8s session isolation metadata", () => {
       "k8s guard decision",
     );
   });
+
+  it("normalizes missing scheduler isolation modes before logging", () => {
+    const spy = vi.spyOn(logger, "info").mockImplementation(() => undefined as never);
+    const missingModeIsolation = {
+      ...isolation,
+      isolationMode: undefined as never,
+    };
+
+    logK8sGuardDecision({
+      decision: "allowed",
+      isolation: missingModeIsolation,
+      sessionId: "session-1",
+      agentId: "agent-1",
+      runId: "run-1",
+    });
+
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "k8s_guard_decision",
+        decision: "allowed",
+        isolation_mode: "unknown",
+        isolation_key: "workspace:company-1:agent-1:workspace-1",
+        task_key: "issue-1",
+        session_id: "session-1",
+      }),
+      "k8s guard decision",
+    );
+  });
 });
 
 describe("deriveTaskKeyWithHeartbeatFallback", () => {
