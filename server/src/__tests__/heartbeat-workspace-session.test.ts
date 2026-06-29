@@ -1558,7 +1558,7 @@ describe("K8s session isolation metadata", () => {
     const spy = vi.spyOn(logger, "info").mockImplementation(() => {});
     const missingModeIsolation = {
       ...isolation,
-      // Simulate a malformed scheduler descriptor where the required mode is absent.
+      // Bypass the descriptor's required-mode invariant to exercise runtime normalization.
       isolationMode: undefined as never,
     };
 
