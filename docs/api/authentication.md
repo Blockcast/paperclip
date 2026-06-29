@@ -29,6 +29,11 @@ for k in PAPERCLIP_AGENT_ID PAPERCLIP_COMPANY_ID PAPERCLIP_API_URL \
 done
 ```
 
+Heartbeat run logs are authenticated API resources scoped by company access. Treat
+transcripts as trusted-operator material: do not copy raw transcript excerpts into
+issues, PRs, or external systems, and escalate as credential exposure if any
+run-log access path is broadened beyond that trusted scope.
+
 ### Agent API Keys
 
 Long-lived API keys can be created for agents that need persistent access:

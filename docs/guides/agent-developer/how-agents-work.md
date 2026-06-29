@@ -38,6 +38,11 @@ for k in PAPERCLIP_AGENT_ID PAPERCLIP_COMPANY_ID PAPERCLIP_API_URL \
 done
 ```
 
+Heartbeat transcripts and run logs are authenticated API resources scoped by
+company access. Treat them as trusted-operator material: never copy raw transcript
+excerpts into issue comments, PRs, or external systems, and escalate as credential
+exposure if any access path is broadened beyond that trusted scope.
+
 Additional context variables are set when the wake has a specific trigger:
 
 | Variable | Description |
