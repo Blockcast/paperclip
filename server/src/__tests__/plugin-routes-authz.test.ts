@@ -97,12 +97,16 @@ function createSelectQueueDb(rows: Array<Array<Record<string, unknown>>>) {
   };
 }
 
-function createRagHealthDb(pluginRows: Array<Record<string, unknown>>, bucketRows: Array<Record<string, unknown>>) {
+function createRagHealthDb(
+  pluginRows: Array<Record<string, unknown>>,
+  bucketRows: Array<Record<string, unknown>>,
+  executeResult: unknown = { rows: bucketRows },
+) {
   const orderBy = vi.fn(() => Promise.resolve(pluginRows));
   const where = vi.fn(() => ({ orderBy }));
   const from = vi.fn(() => ({ where }));
   const select = vi.fn(() => ({ from }));
-  const execute = vi.fn(() => Promise.resolve({ rows: bucketRows }));
+  const execute = vi.fn(() => Promise.resolve(executeResult));
   return { execute, from, orderBy, select, where };
 }
 
@@ -283,6 +287,16 @@ describe.sequential("plugin install and upgrade authz", () => {
       pluginErrors: [],
       gbrainContextBuckets: [{ status: "no-issue-page", count: 1 }],
     });
+  }, 20_000);
+
+  it("fails closed when RAG health bucket rows use an unexpected execute result shape", async () => {
+    const db = createRagHealthDb([], [], { rowCount: 0 });
+    const { app } = await createApp(agentActor(), {}, { db });
+
+    const res = await request(app).get("/api/plugins/rag-health");
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe("Internal server error");
   }, 20_000);
 
   it("rejects plugin installation for non-admin board users", async () => {

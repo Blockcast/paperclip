@@ -25,7 +25,7 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Router } from "express";
 import type { Request, Response } from "express";
-import { and, desc, eq, gte, sql } from "drizzle-orm";
+import { and, desc, eq, gte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -185,6 +185,7 @@ const UUID_REGEX =
 const PLUGIN_API_BODY_LIMIT_BYTES = 1_000_000;
 const PLUGIN_ACTION_RPC_TIMEOUT_MS = 15 * 60 * 1_000;
 const DEFAULT_RAG_HEALTH_WINDOW_DAYS = 7;
+const MEMORY_PLUGIN_KEYWORDS = ["gbrain", "hindsight", "memory", "plugin-secrets"] as const;
 const PLUGIN_SCOPED_API_RESPONSE_HEADER_ALLOWLIST = new Set([
   "cache-control",
   "etag",
@@ -897,7 +898,7 @@ export function pluginRoutes(
     if (typeof result === "object" && result !== null && Array.isArray((result as { rows?: unknown }).rows)) {
       return (result as { rows: T[] }).rows;
     }
-    return [];
+    throw new Error("Unexpected bucket result shape from db.execute()");
   }
 
   /**
@@ -1019,14 +1020,11 @@ export function pluginRoutes(
       .from(plugins)
       .where(and(
         eq(plugins.status, "error"),
-        sql`(
-          ${plugins.pluginKey} ilike '%gbrain%'
-          or ${plugins.pluginKey} ilike '%hindsight%'
-          or ${plugins.pluginKey} ilike '%memory%'
-          or ${plugins.pluginKey} ilike '%plugin-secrets%'
-        )`,
+        or(...MEMORY_PLUGIN_KEYWORDS.map((keyword) => sql`${plugins.pluginKey} ilike ${`%${keyword}%`}`)),
       ))
       .orderBy(desc(plugins.updatedAt));
+
+    const companyScopeCondition = eq(heartbeatRuns.companyId, companyId);
 
     const bucketResult = await db.execute(sql`
       select coalesce(${pluginState.valueJson}->>'status', 'missing') as status,
@@ -1036,7 +1034,7 @@ export function pluginRoutes(
         on ${pluginState.scopeKind} = 'run'
        and ${pluginState.scopeId} = ${heartbeatRuns.id}::text
       where ${pluginState.stateKey} = 'gbrain-context'
-        and ${heartbeatRuns.companyId} = ${companyId}::uuid
+        and ${companyScopeCondition}
         and ${pluginState.updatedAt} >= ${since}
       group by 1
       order by 1
