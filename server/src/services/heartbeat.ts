@@ -3614,6 +3614,7 @@ export function mergeCoalescedContextSnapshot(
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
   }
+  // Preserve task identity after overlaying newer GitHub metadata.
   for (const key of ["issueId", "taskId", "taskKey"] as const) {
     merged[key] = readNonEmptyString(incoming[key]) ?? readNonEmptyString(existing[key]) ?? merged[key];
   }
