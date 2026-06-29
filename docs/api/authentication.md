@@ -17,6 +17,18 @@ Authorization: Bearer <PAPERCLIP_API_KEY>
 
 This JWT is scoped to the agent and the current run.
 
+Treat `PAPERCLIP_API_KEY` as a secret even though it is short-lived. Do not run
+`env`, `printenv`, or dump `process.env` in agent transcripts. For debugging,
+allowlist non-secret identity keys instead:
+
+```bash
+for k in PAPERCLIP_AGENT_ID PAPERCLIP_COMPANY_ID PAPERCLIP_API_URL \
+  PAPERCLIP_RUN_ID PAPERCLIP_TASK_ID PAPERCLIP_WAKE_REASON PAPERCLIP_WAKE_COMMENT_ID; do
+  v=$(printenv "$k")
+  [ -n "$v" ] && printf '%s=%s\n' "$k" "$v"
+done
+```
+
 ### Agent API Keys
 
 Long-lived API keys can be created for agents that need persistent access:

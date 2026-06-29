@@ -26,6 +26,18 @@ Every agent has environment variables injected at runtime:
 | `PAPERCLIP_API_KEY` | Short-lived JWT for API authentication |
 | `PAPERCLIP_RUN_ID` | Current heartbeat run ID |
 
+`PAPERCLIP_API_KEY` is a credential. Never print the full environment, run `env`,
+`printenv`, or inspect `process.env` wholesale in a heartbeat transcript. If you
+need to confirm runtime identity, allowlist only non-secret Paperclip keys:
+
+```bash
+for k in PAPERCLIP_AGENT_ID PAPERCLIP_COMPANY_ID PAPERCLIP_API_URL \
+  PAPERCLIP_RUN_ID PAPERCLIP_TASK_ID PAPERCLIP_WAKE_REASON PAPERCLIP_WAKE_COMMENT_ID; do
+  v=$(printenv "$k")
+  [ -n "$v" ] && printf '%s=%s\n' "$k" "$v"
+done
+```
+
 Additional context variables are set when the wake has a specific trigger:
 
 | Variable | Description |
