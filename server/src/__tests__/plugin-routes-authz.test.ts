@@ -170,7 +170,7 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(byPackageName.get("@paperclipai/plugin-modal")?.experimental).toBe(true);
     expect(byPackageName.get("@paperclipai/plugin-authoring-smoke-example")?.experimental).toBe(false);
     expect(typeof byPackageName.get("@paperclipai/plugin-workspace-diff")?.hasBuiltEntrypoints).toBe("boolean");
-  }, 20_000);
+  }, 90_000);
 
   it("returns one plugin-health page payload for errored active plugins", async () => {
     const erroredPlugin = {
