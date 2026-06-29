@@ -12529,7 +12529,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               agentId: agent.id,
               runId: run.id,
             });
-          } else if (isK8sAdapter(agent.adapterType)) {
+          }
+          if (!k8sRunIsolation && isK8sAdapter(agent.adapterType)) {
+            const errorMessage =
+              "K8s adapter dispatch blocked because scheduler isolation metadata was missing.";
             logK8sGuardDecision({
               decision: "blocked",
               reason: "unknown_isolation_blocked",
@@ -12539,39 +12542,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               agentId: agent.id,
               runId: run.id,
             });
+            adapterResult = {
+              exitCode: 1,
+              signal: null,
+              timedOut: false,
+              errorMessage,
+              errorCode: "k8s_concurrent_run_blocked",
+              errorFamily: "transient_upstream",
+              retryNotBefore: new Date(Date.now() + ADAPTER_RESOLUTION_RETRY_DELAY_MS).toISOString(),
+              summary: "k8s isolation metadata missing",
+              resultJson: { reason: "unknown_isolation_blocked" },
+              provider: "paperclip",
+              model: "unknown",
+            } as Awaited<ReturnType<typeof adapter.execute>>;
+            await recordWorkspaceFinalize("failed", { errorMessage });
+          } else {
+            adapterResult = await adapter.execute({
+              runId: run.id,
+              agent,
+              runtime: runtimeForAdapter,
+              config: runtimeConfig,
+              context,
+              runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
+              executionTarget,
+              executionTransport: remoteExecution
+                ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
+                : undefined,
+              onLog,
+              onMeta: onAdapterMeta,
+              onSpawn: async (meta) => {
+                await persistRunProcessMetadata(run.id, {
+                  pid: meta.pid,
+                  processGroupId:
+                    "processGroupId" in meta && typeof meta.processGroupId === "number"
+                      ? meta.processGroupId
+                      : null,
+                  startedAt: meta.startedAt,
+                });
+              },
+              authToken: authToken ?? undefined,
+            });
+            // Adapter returned cleanly, which means its workspace-restore finally
+            // block also ran without throwing. Record the workspace_finalize
+            // barrier so dependents that share this executionWorkspace can wake.
+            // If recording the barrier itself fails, propagate as a run failure
+            // rather than silently leaving dependents stranded behind a missing
+            // finalize row.
+            await recordWorkspaceFinalize("succeeded");
           }
-          adapterResult = await adapter.execute({
-            runId: run.id,
-            agent,
-            runtime: runtimeForAdapter,
-            config: runtimeConfig,
-            context,
-            runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
-            executionTarget,
-            executionTransport: remoteExecution
-              ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
-              : undefined,
-            onLog,
-            onMeta: onAdapterMeta,
-            onSpawn: async (meta) => {
-              await persistRunProcessMetadata(run.id, {
-                pid: meta.pid,
-                processGroupId:
-                  "processGroupId" in meta && typeof meta.processGroupId === "number"
-                    ? meta.processGroupId
-                    : null,
-                startedAt: meta.startedAt,
-              });
-            },
-            authToken: authToken ?? undefined,
-          });
-          // Adapter returned cleanly, which means its workspace-restore finally
-          // block also ran without throwing. Record the workspace_finalize
-          // barrier so dependents that share this executionWorkspace can wake.
-          // If recording the barrier itself fails, propagate as a run failure
-          // rather than silently leaving dependents stranded behind a missing
-          // finalize row.
-          await recordWorkspaceFinalize("succeeded");
         }
       } catch (adapterErr) {
         // Adapter (or its restore finally) threw — or the finalize record
