@@ -5275,7 +5275,30 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     const closedIssueIds: string[] = [];
     for (const issueId of issueIds) {
-      const updated = await issuesSvc.update(issueId, { status: "done" });
+      const updated = await db
+        .update(issues)
+        .set({
+          status: "done",
+          completedAt: input.now,
+          cancelledAt: null,
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: input.now,
+        })
+        .where(
+          and(
+            eq(issues.id, issueId),
+            eq(issues.companyId, input.companyId),
+            eq(issues.originKind, RECOVERY_ORIGIN_KINDS.ccrotateCapacityExhausted),
+            eq(issues.originId, input.ccrotateTarget),
+            isNull(issues.hiddenAt),
+            notInArray(issues.status, ["done", "cancelled"]),
+          ),
+        )
+        .returning({ id: issues.id })
+        .then((rows) => rows[0] ?? null);
       if (!updated) continue;
       closedIssueIds.push(issueId);
 
