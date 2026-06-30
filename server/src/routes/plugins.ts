@@ -192,7 +192,7 @@ type RagHealthBucketCacheEntry = {
   ts: number;
   loading: boolean;
 };
-const ragHealthBucketCache = new Map<string, RagHealthBucketCacheEntry>();
+export const ragHealthBucketCache = new Map<string, RagHealthBucketCacheEntry>();
 const RAG_HEALTH_CACHE_TTL_MS = 5 * 60 * 1000;
 const PLUGIN_SCOPED_API_RESPONSE_HEADER_ALLOWLIST = new Set([
   "cache-control",
