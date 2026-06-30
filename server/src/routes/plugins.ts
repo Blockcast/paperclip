@@ -84,7 +84,7 @@ import {
   setStoredLocalFolder,
 } from "../services/plugin-local-folders.js";
 import { extractSecretRefPathsFromConfig } from "../services/plugin-secrets-handler.js";
-import { badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
+import { HttpError, badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 import { registerWorkerTierProxyRoutes } from "./worker-tier-proxy.js";
 
 /** UI slot declaration extracted from plugin manifest */
@@ -1001,39 +1001,51 @@ export function pluginRoutes(
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
     const checkedAt = new Date().toISOString();
 
-    const pluginErrors = await db
-      .select({
-        id: plugins.id,
-        pluginKey: plugins.pluginKey,
-        status: plugins.status,
-        lastError: plugins.lastError,
-        updatedAt: plugins.updatedAt,
-      })
-      .from(plugins)
-      .where(and(
-        eq(plugins.status, "error"),
-        or(...MEMORY_PLUGIN_KEYWORDS.map((keyword) => sql`${plugins.pluginKey} ilike ${`%${keyword}%`}`)),
-      ))
-      .orderBy(desc(plugins.updatedAt));
+    let pluginErrors;
+    try {
+      pluginErrors = await db
+        .select({
+          id: plugins.id,
+          pluginKey: plugins.pluginKey,
+          status: plugins.status,
+          lastError: plugins.lastError,
+          updatedAt: plugins.updatedAt,
+        })
+        .from(plugins)
+        .where(and(
+          eq(plugins.status, "error"),
+          or(...MEMORY_PLUGIN_KEYWORDS.map((keyword) => sql`${plugins.pluginKey} ilike ${`%${keyword}%`}`)),
+        ))
+        .orderBy(desc(plugins.updatedAt));
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new HttpError(503, `pluginErrors query failed: ${msg}`);
+    }
 
     const gbrainStatus = sql<string>`coalesce(${pluginState.valueJson}->>'status', 'missing')`;
-    const bucketRows = await db
-      .select({
-        status: gbrainStatus,
-        count: sql<number>`count(*)::int`,
-      })
-      .from(pluginState)
-      .innerJoin(heartbeatRuns, and(
-        eq(pluginState.scopeKind, "run"),
-        eq(pluginState.scopeId, sql<string>`${heartbeatRuns.id}::text`),
-      ))
-      .where(and(
-        eq(pluginState.stateKey, "gbrain-context"),
-        eq(heartbeatRuns.companyId, companyId),
-        gte(pluginState.updatedAt, since),
-      ))
-      .groupBy(gbrainStatus)
-      .orderBy(gbrainStatus);
+    let bucketRows;
+    try {
+      bucketRows = await db
+        .select({
+          status: gbrainStatus,
+          count: sql<number>`count(*)::int`,
+        })
+        .from(pluginState)
+        .innerJoin(heartbeatRuns, and(
+          eq(pluginState.scopeKind, "run"),
+          eq(pluginState.scopeId, sql<string>`${heartbeatRuns.id}::text`),
+        ))
+        .where(and(
+          eq(pluginState.stateKey, "gbrain-context"),
+          eq(heartbeatRuns.companyId, companyId),
+          gte(pluginState.updatedAt, since),
+        ))
+        .groupBy(gbrainStatus)
+        .orderBy(gbrainStatus);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new HttpError(503, `bucketRows query failed: ${msg}`);
+    }
 
     const gbrainContextBuckets = bucketRows
       .map((row): RagHealthGbrainBucket => ({
