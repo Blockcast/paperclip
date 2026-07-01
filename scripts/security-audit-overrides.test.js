@@ -52,7 +52,8 @@ async function main() {
     assertIncludes(lockfile, "esbuild@0.28.1:", "lockfile");
     assertIncludes(lockfile, "js-yaml@4.3.0:", "lockfile");
     const uiViteConfig = await readFile(join(fixtureRoot, "ui/vite.config.ts"), "utf8");
-    assertIncludes(uiViteConfig, 'target: "es2022"', "ui vite config");
+    assertIncludes(uiViteConfig, 'const UI_ESBUILD_TARGET = "es2022";', "ui vite config");
+    assertIncludes(uiViteConfig, "optimizeDeps", "ui vite config");
     assert.match(
       lockfile,
       /@connectrpc\/connect-node@1\.7\.0[\s\S]*?undici: 6\.27\.0/,
