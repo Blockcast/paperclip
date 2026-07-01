@@ -14,9 +14,9 @@ describe("recordCcrotateCapacityDeferred", () => {
 
     const { body, contentType } = await renderMetrics();
     expect(contentType).toContain("text/plain");
-    expect(body).toContain(CCROTATE_CAPACITY_DEFERRED_METRIC);
-    expect(body).toContain('adapter="claude_k8s"');
-    expect(body).toContain('provider="anthropic"');
+    expect(body).toMatch(
+      new RegExp(`${CCROTATE_CAPACITY_DEFERRED_METRIC}[^\\n]*adapter="claude_k8s"[^\\n]*provider="anthropic"`),
+    );
   });
 
   it("normalizes null/undefined adapter and provider to 'unknown'", () => {
