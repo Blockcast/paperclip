@@ -139,7 +139,7 @@ let registry: Registry | null = null;
 let concurrentRunBlocked: Counter<"agent_id" | "reason" | "isolation_mode"> | null = null;
 let isolatedRunStarted: Counter<"agent_id" | "isolation_mode"> | null = null;
 let heartbeatRunFailed: Counter<"adapter" | "error_code" | "invocation_source"> | null = null;
-let ccrotateCpacityDeferred: Counter<"adapter" | "provider"> | null = null;
+let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -148,7 +148,7 @@ function ensureRegistry(): {
   failedCounter: Counter<"adapter" | "error_code" | "invocation_source">;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
 } {
-  if (!registry || !concurrentRunBlocked || !isolatedRunStarted || !heartbeatRunFailed || !ccrotateCpacityDeferred) {
+  if (!registry || !concurrentRunBlocked || !isolatedRunStarted || !heartbeatRunFailed || !ccrotateCapacityDeferred) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
       name: CONCURRENT_RUN_BLOCKED_METRIC,
@@ -179,7 +179,7 @@ function ensureRegistry(): {
       labelNames: ["adapter", "error_code", "invocation_source"],
       registers: [registry],
     });
-    ccrotateCpacityDeferred = new Counter({
+    ccrotateCapacityDeferred = new Counter({
       name: CCROTATE_CAPACITY_DEFERRED_METRIC,
       help:
         "Count of heartbeat dispatches deferred because the penstock availability gate "
@@ -198,7 +198,7 @@ function ensureRegistry(): {
     counter: concurrentRunBlocked,
     isolatedStartedCounter: isolatedRunStarted,
     failedCounter: heartbeatRunFailed,
-    capacityDeferredCounter: ccrotateCpacityDeferred,
+    capacityDeferredCounter: ccrotateCapacityDeferred,
   };
 }
 
