@@ -48,6 +48,9 @@ async function main() {
     assertIncludes(lockfile, "undici@6.27.0:", "lockfile");
     assertIncludes(lockfile, "undici@7.28.0:", "lockfile");
     assertIncludes(lockfile, "multer@2.2.0:", "lockfile");
+    assertIncludes(lockfile, "'@babel/core@7.29.7':", "lockfile");
+    assertIncludes(lockfile, "esbuild@0.28.1:", "lockfile");
+    assertIncludes(lockfile, "js-yaml@4.3.0:", "lockfile");
     assert.match(
       lockfile,
       /@connectrpc\/connect-node@1\.7\.0[\s\S]*?undici: 6\.27\.0/,
