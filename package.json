@@ -110,7 +110,7 @@
         "patchedRange": ">=0.28.1 <0.29",
         "advisories": [
           "GHSA-67mh-4wv8-2f99",
-          "GHSA-p3jp-g4x8-p9q5"
+          "GHSA-g7r4-m6w7-qqqr"
         ]
       }
     }

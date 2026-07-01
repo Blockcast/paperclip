@@ -7,6 +7,10 @@ import { createUiDevWatchOptions } from "./src/lib/vite-watch";
 export default defineConfig(({ mode }) => ({
   plugins: [react(), tailwindcss()],
   build: {
+    // esbuild 0.28.x no longer supports lowering destructuring for Vite's
+    // legacy module target list; keep the production bundle on the modern
+    // baseline already expected by the app.
+    target: "es2022",
     minify: "esbuild",
     chunkSizeWarningLimit: 600,
     rollupOptions: {

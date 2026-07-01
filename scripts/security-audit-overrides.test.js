@@ -51,6 +51,8 @@ async function main() {
     assertIncludes(lockfile, "'@babel/core@7.29.7':", "lockfile");
     assertIncludes(lockfile, "esbuild@0.28.1:", "lockfile");
     assertIncludes(lockfile, "js-yaml@4.3.0:", "lockfile");
+    const uiViteConfig = await readFile(join(fixtureRoot, "ui/vite.config.ts"), "utf8");
+    assertIncludes(uiViteConfig, 'target: "es2022"', "ui vite config");
     assert.match(
       lockfile,
       /@connectrpc\/connect-node@1\.7\.0[\s\S]*?undici: 6\.27\.0/,
@@ -64,6 +66,7 @@ async function main() {
 
     const audit = await runPnpm(["audit", "--prod", "--json"], fixtureRoot, true);
     const auditJson = JSON.parse(audit.stdout);
+    assert.equal(auditJson.metadata.vulnerabilities.moderate, 0);
     assert.equal(auditJson.metadata.vulnerabilities.high, 0);
     assert.equal(auditJson.metadata.vulnerabilities.critical, 0);
   } finally {
