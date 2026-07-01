@@ -44,8 +44,9 @@ export const ISOLATED_RUN_STARTED_METRIC = "paperclip_k8s_isolated_run_started_t
  * sustained over >5 min warrants operator attention.
  *
  * Labels: `adapter` (agent adapter type, e.g. "claude_k8s"), `provider`
- * (penstock provider, e.g. "anthropic"). Both are structurally bounded so
- * cardinality is small.
+ * (penstock provider, e.g. "anthropic"). In practice only `claude_k8s` agents
+ * reach the penstock gate, so cardinality on `adapter` is effectively 1.
+ * Unknown/empty values collapse to "unknown" to guard against future changes.
  */
 export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_deferred_total";
 

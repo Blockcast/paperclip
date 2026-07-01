@@ -7983,7 +7983,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
         recordCcrotateCapacityDeferred({
           adapter: agent?.adapterType ?? null,
-          provider: penstockCapacity.provider ?? null,
+          provider: penstockCapacity.provider,
         });
       }
       if (capacity) {
@@ -14361,7 +14361,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (!penstockGateResult.allow) {
         recordCcrotateCapacityDeferred({
           adapter: agent.adapterType,
-          provider: penstockGateResult.provider ?? null,
+          provider: penstockGateResult.provider,
         });
         const resumeAtIso = penstockGateResult.resumeAt ? penstockGateResult.resumeAt.toISOString() : null;
         const scheduledRetryAt =
