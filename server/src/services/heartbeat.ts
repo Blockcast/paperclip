@@ -7981,6 +7981,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           penstockModel: penstockCapacity.model,
           penstockRetryAfterSeconds: penstockCapacity.retryAfterSeconds,
         };
+        recordCcrotateCapacityDeferred({
+          adapter: agent?.adapterType ?? null,
+          provider: penstockCapacity.provider ?? null,
+        });
       }
       if (capacity) {
         const nextAttempt = (dueRun.scheduledRetryAttempt ?? 0) + 1;

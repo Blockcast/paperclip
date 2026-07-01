@@ -304,8 +304,16 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     });
     await seeding.wakeup(agentId, { source: "assignment", triggerDetail: "system" });
 
+    const deferredSpy = vi.mocked(metricsModule.recordCcrotateCapacityDeferred);
+    deferredSpy.mockClear();
+
     const promotion = await heartbeat.promoteDueScheduledRetries(resumeAt);
     expect(promotion.promoted).toBe(0);
+
+    // Re-deferral at promotion must also increment the counter so a sustained
+    // stall (all runs re-checking on backoff) remains visible in the metric.
+    expect(deferredSpy, "counter fires on re-deferral at promotion").toHaveBeenCalledOnce();
+    expect(deferredSpy).toHaveBeenCalledWith({ adapter: "claude_local", provider: "anthropic" });
 
     const row = await db
       .select()
