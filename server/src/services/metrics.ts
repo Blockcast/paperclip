@@ -35,9 +35,11 @@ export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_to
 export const ISOLATED_RUN_STARTED_METRIC = "paperclip_k8s_isolated_run_started_total";
 /**
  * ccrotate-capacity dispatch deferral counter (BLO-12953). Incremented once per
- * heartbeat tick where the penstock availability gate returns `allow: false` —
- * i.e. all model capacity is unavailable and the run was persisted as a
- * `scheduled_retry` rather than dispatched.
+ * heartbeat tick denied by the penstock availability gate (i.e. the gate returns
+ * `allow: false` because all model capacity is unavailable). The run outcome
+ * after the counter fires varies by call site: fresh-wakeup path persists a
+ * `scheduled_retry`; re-deferral-at-promotion path may cancel the run if the
+ * retry budget is exhausted.
  *
  * A sustained rate on this counter means the fleet is stalled behind quota
  * exhaustion and no work is progressing. Alert threshold: any non-zero rate

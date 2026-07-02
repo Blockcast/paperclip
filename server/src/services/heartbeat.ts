@@ -7982,7 +7982,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           penstockRetryAfterSeconds: penstockCapacity.retryAfterSeconds,
         };
         recordCcrotateCapacityDeferred({
-          adapter: agent?.adapterType ?? null,
+          adapter: agent.adapterType,
           provider: penstockCapacity.provider,
         });
       }
