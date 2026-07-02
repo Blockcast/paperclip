@@ -161,6 +161,38 @@ function readRunLogLimitBytes(value: unknown) {
   return Math.max(1, Math.min(RUN_LOG_MAX_LIMIT_BYTES, Math.trunc(parsed)));
 }
 
+function getRunLogAuditActor(req: Request) {
+  if (req.actor.type === "agent") {
+    return {
+      actorType: "agent" as const,
+      actorId: req.actor.agentId ?? "unknown-agent",
+      agentId: req.actor.agentId ?? null,
+      actorRunId: req.actor.runId ?? null,
+      actorSource: req.actor.source === "agent_jwt" ? "agent_jwt" : "agent_key",
+    };
+  }
+  if (req.actor.type === "board") {
+    const source = req.actor.source ?? "session";
+    const actorSource = ["local_implicit", "board_key", "cloud_tenant"].includes(source)
+      ? source
+      : "session";
+    return {
+      actorType: "user" as const,
+      actorId: req.actor.userId ?? "board",
+      agentId: null,
+      actorRunId: req.actor.runId ?? null,
+      actorSource,
+    };
+  }
+  return {
+    actorType: "system" as const,
+    actorId: "unauthenticated",
+    agentId: null,
+    actorRunId: null,
+    actorSource: "none",
+  };
+}
+
 function readLiveRunsQueryInt(value: unknown, max: number, fallback = 0) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
@@ -239,6 +271,33 @@ export function agentRoutes(
   const workspaceOperations = workspaceOperationService(db);
   const instanceSettings = instanceSettingsService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
+
+  async function logRunLogAccessAudit(
+    req: Request,
+    run: { id: string; companyId: string; logStore: string | null },
+    result: "allowed" | "denied",
+    opts: { offset: number; limitBytes: number },
+  ) {
+    const actor = getRunLogAuditActor(req);
+    await logActivity(db, {
+      companyId: run.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: run.id,
+      action: "heartbeat.run_log_accessed",
+      entityType: "heartbeat_run",
+      entityId: run.id,
+      details: {
+        result,
+        actorSource: actor.actorSource,
+        actorRunId: actor.actorRunId,
+        offset: opts.offset,
+        limitBytes: opts.limitBytes,
+        logStore: run.logStore,
+      },
+    });
+  }
 
   async function assertAgentEnvironmentSelection(
     companyId: string,
@@ -3776,12 +3835,20 @@ export function agentRoutes(
       res.status(404).json({ error: "Heartbeat run not found" });
       return;
     }
-    assertCompanyAccess(req, run.companyId);
-
     const offset = Number(req.query.offset ?? 0);
+    const normalizedOffset = Number.isFinite(offset) ? offset : 0;
     const limitBytes = readRunLogLimitBytes(req.query.limitBytes);
+
+    try {
+      assertCompanyAccess(req, run.companyId);
+    } catch (error) {
+      await logRunLogAccessAudit(req, run, "denied", { offset: normalizedOffset, limitBytes });
+      throw error;
+    }
+
+    await logRunLogAccessAudit(req, run, "allowed", { offset: normalizedOffset, limitBytes });
     const result = await heartbeat.readLog(run, {
-      offset: Number.isFinite(offset) ? offset : 0,
+      offset: normalizedOffset,
       limitBytes,
     });
 

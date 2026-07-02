@@ -26,6 +26,7 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
   getGeneral: vi.fn(),
   listCompanyIds: vi.fn(),
 }));
+const mockLogActivity = vi.hoisted(() => vi.fn());
 
 const routeAgentId = "11111111-1111-4111-8111-111111111111";
 
@@ -67,7 +68,7 @@ function registerModuleMocks() {
     heartbeatService: () => mockHeartbeatService,
     issueApprovalService: () => ({}),
     issueService: () => mockIssueService,
-    logActivity: vi.fn(),
+    logActivity: mockLogActivity,
     secretService: () => ({}),
     syncInstructionsBundleConfigFromFilePath: vi.fn((_agent, config) => config),
     workspaceOperationService: () => ({}),
@@ -82,7 +83,16 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp(db: Record<string, unknown> = {}) {
+async function createApp(
+  db: Record<string, unknown> = {},
+  actor: Record<string, unknown> = {
+    type: "board",
+    userId: "local-board",
+    companyIds: ["company-1"],
+    source: "local_implicit",
+    isInstanceAdmin: false,
+  },
+) {
   const [{ agentRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -91,11 +101,8 @@ async function createApp(db: Record<string, unknown> = {}) {
   app.use(express.json());
   app.use((req, _res, next) => {
     (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
+      ...actor,
+      companyIds: Array.isArray(actor.companyIds) ? [...actor.companyIds] : actor.companyIds,
     };
     next();
   });
@@ -166,6 +173,7 @@ describe("agent live run routes", () => {
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    mockLogActivity.mockResolvedValue(undefined);
     mockIssueService.getByIdentifier.mockResolvedValue({
       id: "issue-1",
       companyId: "company-1",
@@ -402,6 +410,61 @@ describe("agent live run routes", () => {
       content: "chunk",
       nextOffset: 5,
     });
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      companyId: "company-1",
+      actorType: "user",
+      actorId: "local-board",
+      agentId: null,
+      action: "heartbeat.run_log_accessed",
+      entityType: "heartbeat_run",
+      entityId: "run-1",
+      runId: "run-1",
+      details: expect.objectContaining({
+        result: "allowed",
+        actorSource: "local_implicit",
+        offset: 12,
+        limitBytes: 64,
+        logStore: "local_file",
+      }),
+    }));
+    expect(mockLogActivity.mock.calls[0]?.[1]?.details).not.toHaveProperty("content");
+    expect(mockLogActivity.mock.calls[0]?.[1]?.details).not.toHaveProperty("logRef");
+  });
+
+  it("audits denied run log access without reading content", async () => {
+    const res = await requestApp(
+      await createApp({}, {
+        type: "agent",
+        agentId: routeAgentId,
+        companyId: "company-2",
+        source: "agent_key",
+        runId: "actor-run-1",
+      }),
+      (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/log?offset=4&limitBytes=32"),
+    );
+
+    expect(res.status).toBe(403);
+    expect(mockHeartbeatService.readLog).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      companyId: "company-1",
+      actorType: "agent",
+      actorId: routeAgentId,
+      agentId: routeAgentId,
+      action: "heartbeat.run_log_accessed",
+      entityType: "heartbeat_run",
+      entityId: "run-1",
+      runId: "run-1",
+      details: expect.objectContaining({
+        result: "denied",
+        actorSource: "agent_key",
+        actorRunId: "actor-run-1",
+        offset: 4,
+        limitBytes: 32,
+        logStore: "local_file",
+      }),
+    }));
+    expect(mockLogActivity.mock.calls[0]?.[1]?.details).not.toHaveProperty("content");
+    expect(mockLogActivity.mock.calls[0]?.[1]?.details).not.toHaveProperty("logRef");
   });
 
   it("caps company live run polling by default", async () => {
