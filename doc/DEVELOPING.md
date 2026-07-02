@@ -661,9 +661,11 @@ chunks, log references/paths, environment values, or credential material.
 Incident response can inspect these events through the company activity API or
 activity UI filtered by action/entity/run. Use `action = heartbeat.run_log_accessed`,
 `entity_type = heartbeat_run`, and `entity_id = <runId>` to isolate a run's access
-history. Retention follows the deployment's normal `activity_log` database
-retention and backup policy; Paperclip does not currently apply a separate shorter
-retention window for these access-audit rows.
+history. The event `details.result` value is `allowed` when content was eligible
+to be read and `denied` when the company access check rejected the request.
+Retention follows the deployment's normal `activity_log` database retention and
+backup policy; Paperclip does not currently apply a separate shorter retention
+window for these access-audit rows.
 
 - Default local key path: `~/.paperclip/instances/default/secrets/master.key`
 - Override key material directly: `PAPERCLIP_SECRETS_MASTER_KEY`
