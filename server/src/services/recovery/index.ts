@@ -33,7 +33,9 @@ export {
 } from "./service.js";
 export {
   ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES,
+  ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
   isZeroTokenStartupFailureRun,
+  isZeroTokenSessionResetRetryRun,
   runUsageTokenCounts,
 } from "./zero-token-startup-failure.js";
 export type {

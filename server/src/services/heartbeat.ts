@@ -189,6 +189,8 @@ import {
   readContinuationAttempt,
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
+import { runUsageTokenCounts } from "./recovery/zero-token-startup-failure.js";
+import { clearAgentTaskSessions } from "./recovery/session-reset.js";
 import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
@@ -2831,20 +2833,42 @@ export function parseSessionCompactionPolicy(agent: typeof agents.$inferSelect):
 // Pure rotation-trigger decision, factored out of evaluateSessionCompaction so the
 // boundary semantics are unit-testable without a DB harness (BLO-8827). Returns the
 // human-readable rotation reason, or null to keep the current session. Trigger
-// precedence is runs → raw-input → age (first match wins). `latestRawInputTokens` is
-// the NON-cached raw input of the latest run (readRawUsageTotals prefers
-// rawInputTokens, which excludes cached reads) — the ceiling gates re-inflation
-// across wakes, not cache hits. The raw-input comparison is inclusive (>=), so a wake
-// that lands exactly on the threshold rotates. A zero/disabled threshold (value <= 0)
-// disables that trigger.
+// precedence is consecutive-failures → runs → raw-input → age (first match wins);
+// consecutive-failures is checked first because a poisoned session that never does
+// any model work will never trip the other thresholds (BLO-10889 / BLO-10866 WS2).
+// `latestRawInputTokens` is the NON-cached raw input of the latest run
+// (readRawUsageTotals prefers rawInputTokens, which excludes cached reads) — the
+// ceiling gates re-inflation across wakes, not cache hits. The raw-input comparison
+// is inclusive (>=), so a wake that lands exactly on the threshold rotates. A
+// zero/disabled threshold (value <= 0) disables that trigger.
 export function computeSessionCompactionReason(input: {
   policy: SessionCompactionPolicy;
   runsCount: number;
   latestRawInputTokens: number | null;
   sessionAgeHours: number;
+  // Count of the most recent consecutive resumes (on the same persisted
+  // session) that each either burned zero tokens or ended in an unsuccessful
+  // terminal status. Optional/defaults to 0 so existing callers that don't
+  // track this keep working unchanged.
+  consecutiveFailedOrZeroTokenResumes?: number;
 }): string | null {
-  const { policy, runsCount, latestRawInputTokens, sessionAgeHours } = input;
+  const {
+    policy,
+    runsCount,
+    latestRawInputTokens,
+    sessionAgeHours,
+    consecutiveFailedOrZeroTokenResumes = 0,
+  } = input;
 
+  if (
+    policy.maxConsecutiveFailedResumes > 0 &&
+    consecutiveFailedOrZeroTokenResumes >= policy.maxConsecutiveFailedResumes
+  ) {
+    return (
+      `session had ${consecutiveFailedOrZeroTokenResumes} consecutive zero-token/failed resumes ` +
+      `(threshold ${policy.maxConsecutiveFailedResumes})`
+    );
+  }
   if (policy.maxSessionRuns > 0 && runsCount > policy.maxSessionRuns) {
     return `session exceeded ${policy.maxSessionRuns} runs`;
   }
@@ -2863,6 +2887,43 @@ export function computeSessionCompactionReason(input: {
   }
   return null;
 }
+
+// True when a heartbeat run resumed a session without doing any useful work:
+// it either burned zero tokens outright, or it terminated in an unsuccessful
+// status (failed/cancelled/timed_out). Used to detect a poisoned-session
+// streak (BLO-10889) — broader than isZeroTokenStartupFailureRun's specific
+// pre-model error codes, since any repeated resume failure on the same
+// session is defense-in-depth evidence the session itself is the problem.
+function isFailedOrZeroTokenResume(run: {
+  status: string | null;
+  usageJson: Record<string, unknown> | null;
+}): boolean {
+  if (!isHeartbeatRunTerminalStatus(run.status)) return false;
+  if (
+    UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
+      run.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
+    )
+  ) {
+    return true;
+  }
+  const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
+  return inputTokens === 0 && outputTokens === 0;
+}
+
+// Counts the run-list prefix (runs ordered newest-first) that are each a
+// failed-or-zero-token resume, stopping at the first run that isn't. A
+// productive run anywhere in the streak resets the count to 0.
+export function countConsecutiveFailedOrZeroTokenResumes(
+  runsNewestFirst: Array<{ status: string | null; usageJson: Record<string, unknown> | null }>,
+): number {
+  let count = 0;
+  for (const run of runsNewestFirst) {
+    if (!isFailedOrZeroTokenResume(run)) break;
+    count += 1;
+  }
+  return count;
+}
+
 
 export function resolveRuntimeSessionParamsForWorkspace(input: {
   agentId: string;
@@ -5938,13 +5999,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    const fetchLimit = Math.max(policy.maxSessionRuns > 0 ? policy.maxSessionRuns + 1 : 0, 4);
+    const fetchLimit = Math.max(
+      policy.maxSessionRuns > 0 ? policy.maxSessionRuns + 1 : 0,
+      policy.maxConsecutiveFailedResumes > 0 ? policy.maxConsecutiveFailedResumes : 0,
+      4,
+    );
     const runs = await db
       .select({
         id: heartbeatRuns.id,
         createdAt: heartbeatRuns.createdAt,
         usageJson: heartbeatRuns.usageJson,
         error: heartbeatRuns.error,
+        status: heartbeatRuns.status,
         ...heartbeatRunListResultColumns,
       })
       .from(heartbeatRuns)
@@ -5974,13 +6040,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             (new Date(latestRun.createdAt).getTime() - new Date(oldestRun.createdAt).getTime()) / (1000 * 60 * 60),
           )
         : 0;
+    const consecutiveFailedOrZeroTokenResumes = countConsecutiveFailedOrZeroTokenResumes(runs);
 
     const reason = computeSessionCompactionReason({
       policy,
       runsCount: runs.length,
       latestRawInputTokens: latestRawUsage?.inputTokens ?? null,
       sessionAgeHours,
+      consecutiveFailedOrZeroTokenResumes,
     });
+
 
     if (!reason || !latestRun) {
       return {
@@ -6441,22 +6510,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agentId: string,
     opts?: { taskKey?: string | null; adapterType?: string | null },
   ) {
-    const conditions = [
-      eq(agentTaskSessions.companyId, companyId),
-      eq(agentTaskSessions.agentId, agentId),
-    ];
-    if (opts?.taskKey) {
-      conditions.push(eq(agentTaskSessions.taskKey, opts.taskKey));
-    }
-    if (opts?.adapterType) {
-      conditions.push(eq(agentTaskSessions.adapterType, opts.adapterType));
-    }
-
-    return db
-      .delete(agentTaskSessions)
-      .where(and(...conditions))
-      .returning()
-      .then((rows) => rows.length);
+    return clearAgentTaskSessions(db, companyId, agentId, opts);
   }
 
   async function ensureRuntimeState(agent: typeof agents.$inferSelect) {

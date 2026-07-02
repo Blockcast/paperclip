@@ -12,6 +12,7 @@ import {
   decideRunLivenessContinuation,
   isStrandedIssueRecoveryOriginKind,
   isZeroTokenStartupFailureRun,
+  isZeroTokenSessionResetRetryRun,
   parseIssueGraphLivenessIncidentKey,
 } from "../services/recovery/index.js";
 
@@ -317,3 +318,24 @@ describe("zero-token startup-failure classifier (BLO-5681)", () => {
     expect(isZeroTokenStartupFailureRun(undefined)).toBe(false);
   });
 });
+
+describe("zero-token session-reset retry marker (BLO-10889 / BLO-10866 WS2)", () => {
+  it("flags a run dispatched with the reset-and-retry retryReason", () => {
+    expect(
+      isZeroTokenSessionResetRetryRun({
+        contextSnapshot: { retryReason: "zero_token_session_reset" },
+      }),
+    ).toBe(true);
+  });
+
+  it("does not flag a run with a different or missing retryReason", () => {
+    expect(
+      isZeroTokenSessionResetRetryRun({ contextSnapshot: { retryReason: "assignment_recovery" } }),
+    ).toBe(false);
+    expect(isZeroTokenSessionResetRetryRun({ contextSnapshot: {} })).toBe(false);
+    expect(isZeroTokenSessionResetRetryRun({ contextSnapshot: null })).toBe(false);
+    expect(isZeroTokenSessionResetRetryRun(null)).toBe(false);
+    expect(isZeroTokenSessionResetRetryRun(undefined)).toBe(false);
+  });
+});
+

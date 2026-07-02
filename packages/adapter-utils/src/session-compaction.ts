@@ -3,6 +3,10 @@ export interface SessionCompactionPolicy {
   maxSessionRuns: number;
   maxRawInputTokens: number;
   maxSessionAgeHours: number;
+  // BLO-10889 (BLO-10866 WS2): after this many consecutive zero-token/failed
+  // resumes on the same persisted session, force a fresh session instead of
+  // reusing the poisoned one. 0 disables the trigger.
+  maxConsecutiveFailedResumes: number;
 }
 
 export type NativeContextManagement = "confirmed" | "likely" | "unknown" | "none";
@@ -25,15 +29,20 @@ const DEFAULT_SESSION_COMPACTION_POLICY: SessionCompactionPolicy = {
   maxSessionRuns: 200,
   maxRawInputTokens: 2_000_000,
   maxSessionAgeHours: 72,
+  maxConsecutiveFailedResumes: 3,
 };
 
 // Adapters with native context management still participate in session resume,
-// but Paperclip should not rotate them using threshold-based compaction.
+// but Paperclip should not rotate them using threshold-based compaction. Left
+// at 0 (disabled) too: BLO-10866's poisoned-session loop was observed only on
+// the k8s external-lifecycle adapters, and these adapters' own native context
+// management is a materially different session-resume path.
 const ADAPTER_MANAGED_SESSION_POLICY: SessionCompactionPolicy = {
   enabled: true,
   maxSessionRuns: 0,
   maxRawInputTokens: 0,
   maxSessionAgeHours: 0,
+  maxConsecutiveFailedResumes: 0,
 };
 
 // k8s-Job adapters (claude_k8s / opencode_k8s) run a persisted session across
@@ -50,11 +59,17 @@ const ADAPTER_MANAGED_SESSION_POLICY: SessionCompactionPolicy = {
 // crossed 150k). It does not hard-cap a single wake whose own growth blows past
 // the window; if that's still observed the levers are a lower ceiling and
 // maxSessionRuns. Tunable per-agent via runtimeConfig.heartbeat.sessionCompaction.
+// BLO-10889 (BLO-10866 WS2): a k8s external-lifecycle Job can also get stuck
+// resuming a poisoned session that never grows large enough to trip the
+// raw-input ceiling above — every resume just fails/burns zero tokens and the
+// backing k8s Job eventually exhausts backoffLimit. 3 consecutive zero-token
+// or failed resumes on the same persisted session force a fresh one.
 const K8S_AGENT_SESSION_POLICY: SessionCompactionPolicy = {
   enabled: true,
   maxSessionRuns: 200,
   maxRawInputTokens: 150_000,
   maxSessionAgeHours: 72,
+  maxConsecutiveFailedResumes: 3,
 };
 
 export const LEGACY_SESSIONED_ADAPTER_TYPES = new Set([
@@ -177,11 +192,13 @@ export function readSessionCompactionOverride(runtimeConfig: unknown): Partial<S
   const maxSessionRuns = readNumber(compaction.maxSessionRuns);
   const maxRawInputTokens = readNumber(compaction.maxRawInputTokens);
   const maxSessionAgeHours = readNumber(compaction.maxSessionAgeHours);
+  const maxConsecutiveFailedResumes = readNumber(compaction.maxConsecutiveFailedResumes);
 
   if (enabled !== undefined) explicit.enabled = enabled;
   if (maxSessionRuns !== undefined) explicit.maxSessionRuns = maxSessionRuns;
   if (maxRawInputTokens !== undefined) explicit.maxRawInputTokens = maxRawInputTokens;
   if (maxSessionAgeHours !== undefined) explicit.maxSessionAgeHours = maxSessionAgeHours;
+  if (maxConsecutiveFailedResumes !== undefined) explicit.maxConsecutiveFailedResumes = maxConsecutiveFailedResumes;
 
   return explicit;
 }
@@ -205,6 +222,8 @@ export function resolveSessionCompactionPolicy(
       maxSessionRuns: explicitOverride.maxSessionRuns ?? basePolicy.maxSessionRuns,
       maxRawInputTokens: explicitOverride.maxRawInputTokens ?? basePolicy.maxRawInputTokens,
       maxSessionAgeHours: explicitOverride.maxSessionAgeHours ?? basePolicy.maxSessionAgeHours,
+      maxConsecutiveFailedResumes:
+        explicitOverride.maxConsecutiveFailedResumes ?? basePolicy.maxConsecutiveFailedResumes,
     },
     adapterSessionManagement,
     explicitOverride,
@@ -218,7 +237,12 @@ export function resolveSessionCompactionPolicy(
 
 export function hasSessionCompactionThresholds(policy: Pick<
   SessionCompactionPolicy,
-  "maxSessionRuns" | "maxRawInputTokens" | "maxSessionAgeHours"
+  "maxSessionRuns" | "maxRawInputTokens" | "maxSessionAgeHours" | "maxConsecutiveFailedResumes"
 >) {
-  return policy.maxSessionRuns > 0 || policy.maxRawInputTokens > 0 || policy.maxSessionAgeHours > 0;
+  return (
+    policy.maxSessionRuns > 0 ||
+    policy.maxRawInputTokens > 0 ||
+    policy.maxSessionAgeHours > 0 ||
+    policy.maxConsecutiveFailedResumes > 0
+  );
 }
