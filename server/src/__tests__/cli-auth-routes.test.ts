@@ -472,6 +472,7 @@ describe.sequential("cli auth routes", () => {
       userName: "User Seven",
       userEmail: "user7@example.com",
       keyId: "board-key-7",
+      keyExpiresAt: new Date("2026-08-01T00:00:00.000Z"),
       source: "board_key",
       isInstanceAdmin: false,
       companyIds: ["company-7"],
@@ -489,6 +490,7 @@ describe.sequential("cli auth routes", () => {
       memberships: [{ companyId: "company-7", membershipRole: "owner", status: "active" }],
       source: "board_key",
       keyId: "board-key-7",
+      expiresAt: "2026-08-01T00:00:00.000Z",
     });
     expect(mockBoardAuthService.resolveBoardAccess).not.toHaveBeenCalled();
   });
