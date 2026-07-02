@@ -11338,7 +11338,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
         return [];
       }
-      const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
+      // BLO-13176 follow-on: external-lifecycle agents (k8s Jobs) can only run
+      // ONE Job at a time — the runningCount>0 and hasActiveJobForAgent gates
+      // above already reject any SECOND dispatch while one is active. But on an
+      // IDLE agent (runningCount 0) this loop would otherwise claim + executeRun
+      // up to maxConcurrentRuns queued runs CONCURRENTLY (one per distinct
+      // issue). Only the first to reach Job creation wins the single slot; the
+      // rest sit pre-adapter with no Job and get reaped as "process_lost before
+      // external adapter invocation" (observed 2026-07-02: BLO-12825's critical
+      // run repeatedly lost the slot to a sibling that leased ~5s earlier — the
+      // concurrent launch race is first-lease-wins, NOT priority-ordered). Cap
+      // external-lifecycle dispatch to a single run so (a) we never lease work
+      // we cannot immediately give a Job, and (b) the one slot goes to the top
+      // of the priority-sorted queue (critical wins) instead of the fastest
+      // leaser. Non-external (local child-process) adapters keep full concurrency.
+      const effectiveMaxConcurrentRuns = hasExternalLifecycle(agent.adapterType)
+        ? 1
+        : policy.maxConcurrentRuns;
+      const availableSlots = Math.max(0, effectiveMaxConcurrentRuns - runningCount);
       if (availableSlots <= 0) return [];
 
       // BLO-8746/BLO-8827: we hold the agent start lock, orphans have been
