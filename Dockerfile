@@ -30,23 +30,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # its canonical PATH location closes that gap for every pod. Falls back to
 # the unmodified binary (existing hosts.yml/env auth) when the token file
 # isn't present, so non-agent uses of this image are unaffected.
-RUN <<'EOF'
-mv /usr/bin/gh /usr/bin/gh.real
-cat > /usr/bin/gh <<'SH'
-#!/bin/sh
-set -eu
-TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
-if [ -r "${TOKEN_FILE}" ]; then
-  TOKEN="$(tr -d '\r\n' < "${TOKEN_FILE}" 2>/dev/null || true)"
-  if [ -n "${TOKEN}" ]; then
-    export GH_TOKEN="${TOKEN}"
-    export GITHUB_TOKEN="${TOKEN}"
-  fi
-fi
-exec /usr/bin/gh.real "$@"
-SH
-chmod 0755 /usr/bin/gh
-EOF
+#
+# The wrapper is checked in at scripts/gh-token-wrapper.sh (single source of
+# truth, exercised directly by scripts/gh-token-wrapper.test.mjs) rather than
+# inlined here.
+COPY scripts/gh-token-wrapper.sh /usr/bin/gh-token-wrapper.sh
+RUN mv /usr/bin/gh /usr/bin/gh.real \
+  && ln -s /usr/bin/gh-token-wrapper.sh /usr/bin/gh \
+  && chmod 0755 /usr/bin/gh-token-wrapper.sh
 
 # Chromium runtime libs (BLO-3663) — required so headless Playwright works
 # inside agent Job pods. Job pods inherit this base image (the heavier
