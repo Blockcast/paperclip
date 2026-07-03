@@ -225,7 +225,7 @@ async function createCustodyService(): Promise<CustodyService> {
     if (req.url === "/credentials/figma-mcp-token" && req.method === "GET") {
       res.statusCode = 200;
       res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ credential: { credential_id: "figma-mcp-token", value: "figma-secret-token" } }));
+      res.end(JSON.stringify({ credential: { credential_id: "figma-mcp-token", value: "figma-upstream-auth" } }));
       return;
     }
     res.statusCode = 404;
@@ -402,7 +402,7 @@ describe("mcp gateway lifecycle compatibility", () => {
       method: "POST",
       headers: {
         ...jsonHeaders(),
-        authorization: "Bearer penstock-caller-token",
+        authorization: "Bearer caller-auth",
         "x-request-id": "figma-init-1",
       },
       body: JSON.stringify({
@@ -420,7 +420,7 @@ describe("mcp gateway lifecycle compatibility", () => {
       method: "POST",
       headers: {
         ...jsonHeaders(clientSessionId ?? undefined),
-        authorization: "Bearer penstock-caller-token",
+        authorization: "Bearer caller-auth",
         "x-request-id": "figma-tools-1",
       },
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
@@ -428,19 +428,19 @@ describe("mcp gateway lifecycle compatibility", () => {
 
     expect(toolsList.status).toBe(200);
     expect(custody.leaseRequests.map((request) => request.authorization)).toEqual([
-      "Bearer penstock-caller-token",
-      "Bearer penstock-caller-token",
+      "Bearer caller-auth",
+      "Bearer caller-auth",
     ]);
     expect(new Set(custody.leaseRequests.map((request) => request.mcpSessionId))).toEqual(
       new Set([clientSessionId]),
     );
     expect(upstream.receivedHeaders.map((headers) => headers.authorization)).toEqual([
-      "Bearer figma-secret-token",
-      "Bearer figma-secret-token",
-      "Bearer figma-secret-token",
+      "Bearer figma-upstream-auth",
+      "Bearer figma-upstream-auth",
+      "Bearer figma-upstream-auth",
     ]);
     expect(upstream.receivedHeaders.map((headers) => headers.authorization)).not.toContain(
-      "Bearer penstock-caller-token",
+      "Bearer caller-auth",
     );
   });
 
