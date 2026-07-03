@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   activityLog,
   agents,
+  agentTaskSessions,
   agentWakeupRequests,
   budgetPolicies,
   companySecretBindings,
@@ -519,7 +520,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   async function seedStrandedIssueFixture(input: {
     status: "todo" | "in_progress";
     runStatus: "failed" | "timed_out" | "cancelled" | "succeeded";
-    retryReason?: "assignment_recovery" | "issue_continuation_needed" | null;
+    retryReason?: "assignment_recovery" | "issue_continuation_needed" | "zero_token_session_reset" | null;
     runSource?: string | null;
     assignToUser?: boolean;
     activePauseHold?: boolean;
@@ -4849,17 +4850,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain(`non-retryable code \`${runErrorCode}\``);
   });
 
-  // BLO-5681: when a stranded source issue's latest terminal failure is a
-  // structural zero-token pre-model startup wedge (context_overflow /
-  // context_length_exceeded / startup_error_pre_model), do NOT spawn a
-  // stranded_issue_recovery wrapper — a wrapper inherits the same wedged
-  // session and produces another zero-token failed run. Escalate the source
-  // straight to `blocked` so a human can clear the wedge. Concretely models
-  // the BLO-5378 → BLO-5676 loop: a failed continuation retry that
-  // overflowed before the model ran (the gate must apply ahead of
-  // didAutomaticRecoveryFail so even a retried failure does not spawn the
-  // wrapper).
-  it("blocks stranded in-progress work immediately on a zero-token context_overflow startup failure (no recovery wrapper) (BLO-5681)", async () => {
+  // BLO-5681 / BLO-10889 (BLO-10866 WS2): when a stranded source issue's
+  // latest terminal failure is a structural zero-token pre-model startup
+  // wedge (context_overflow / context_length_exceeded / startup_error_pre_model),
+  // do NOT spawn a stranded_issue_recovery wrapper — a wrapper inherits the
+  // same wedged session and produces another zero-token failed run. Instead
+  // of escalating straight to `blocked` on the FIRST occurrence, clear the
+  // agent's persisted task session and retry ONCE (BLO-10889) — a fresh
+  // session breaks the BLO-5378 → BLO-5676-style loop when the wedge really
+  // was session-poisoning, without giving up the same-agent self-heal that
+  // BLO-10866 identified as missing.
+  it("resets the task session and retries once on a zero-token context_overflow startup failure, instead of blocking immediately (BLO-10889)", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -4869,16 +4870,30 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runUsageJson: { inputTokens: 0, outputTokens: 0 },
     });
 
+    // Simulate a persisted task session for this issue so we can prove it
+    // gets cleared rather than resumed by the retry.
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "codex_local",
+      taskKey: issueId,
+      sessionParamsJson: { sessionId: "poisoned-session-1" },
+      sessionDisplayId: "poisoned-session-1",
+    });
+
     const result = await heartbeat.reconcileStrandedAssignedIssues();
     expect(result.continuationRequeued).toBe(0);
-    expect(result.escalated).toBe(1);
-    expect(result.zeroTokenStartupFailureBlocked).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.zeroTokenStartupFailureBlocked).toBe(0);
+    expect(result.zeroTokenSessionResetRetried).toBe(1);
     expect(result.issueIds).toEqual([issueId]);
 
+    // Issue stays in_progress — this is a retry, not an escalation.
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
-    expect(issue?.status).toBe("blocked");
+    expect(issue?.status).toBe("in_progress");
 
-    // The whole point of BLO-5681: NO stranded_issue_recovery wrapper.
+    // No stranded_issue_recovery wrapper — same rationale as BLO-5681, the
+    // retry is a direct wake on the same agent/issue, not a sub-issue.
     const recoveryWrappers = await db
       .select()
       .from(issues)
@@ -4891,12 +4906,70 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       );
     expect(recoveryWrappers).toHaveLength(0);
 
-    // No continuation wake either — the wedged session must not be re-invoked.
+    // The poisoned task session was cleared.
+    const remainingSessions = await db
+      .select()
+      .from(agentTaskSessions)
+      .where(and(eq(agentTaskSessions.companyId, companyId), eq(agentTaskSessions.agentId, agentId)));
+    expect(remainingSessions).toHaveLength(0);
+
+    // A fresh retry wake WAS dispatched (unlike BLO-5681's no-wrapper case,
+    // which suppresses the wake entirely because a reset makes the retry safe).
+    const wakeRows = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeRows.some((row) => row.reason === "issue_zero_token_session_reset")).toBe(true);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("zero-token startup wedge");
+    expect(comments[0]?.body).toContain("reset");
+  });
+
+  // BLO-10889: if the reset-and-retry attempt ALSO fails with the same
+  // zero-token signature, the wedge isn't session-poisoning (or the reset
+  // didn't help) — fall back to the original BLO-5681 blocked-escalation
+  // instead of resetting forever.
+  it("escalates to blocked when the reset-and-retry attempt itself fails with zero tokens again (BLO-10889)", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "zero_token_session_reset",
+      runErrorCode: "context_overflow",
+      runError: "Context window exceeded before first model turn",
+      runUsageJson: { inputTokens: 0, outputTokens: 0 },
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.zeroTokenSessionResetRetried).toBe(0);
+    expect(result.escalated).toBe(1);
+    expect(result.zeroTokenStartupFailureBlocked).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    const recoveryWrappers = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(recoveryWrappers).toHaveLength(0);
+
+    // No further retry wake — the one-shot reset already happened.
     const wakeRows = await db
       .select()
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakeRows.some((row) => row.reason === "issue_continuation_needed")).toBe(false);
+    expect(wakeRows.some((row) => row.reason === "issue_zero_token_session_reset")).toBe(false);
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(1);
@@ -4905,10 +4978,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("BLO-5681");
   });
 
-  // BLO-5681: same gate fires in the assigned-todo branch. An absent usage
-  // blob counts as zero work, so a startup_error_pre_model failure with no
-  // usageJson at all still routes through the no-wrapper path.
-  it("blocks assigned todo work immediately on a zero-token startup_error_pre_model failure (no recovery wrapper) (BLO-5681)", async () => {
+  // BLO-5681 / BLO-10889: same reset-and-retry-then-escalate shape fires in
+  // the assigned-todo branch. An absent usage blob counts as zero work, so a
+  // startup_error_pre_model failure with no usageJson at all still routes
+  // through the reset-and-retry path on its first occurrence.
+  it("resets the task session and retries once on a zero-token startup_error_pre_model failure for an assigned todo issue (BLO-10889)", async () => {
     const { companyId, issueId } = await seedStrandedIssueFixture({
       status: "todo",
       runStatus: "failed",
@@ -4918,6 +4992,44 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
     expect(result.dispatchRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.zeroTokenStartupFailureBlocked).toBe(0);
+    expect(result.zeroTokenSessionResetRetried).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("todo");
+
+    const recoveryWrappers = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(recoveryWrappers).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("zero-token startup wedge");
+    expect(comments[0]?.body).toContain("reset");
+  });
+
+  it("blocks assigned todo work when the reset-and-retry attempt itself fails with zero tokens again (BLO-10889)", async () => {
+    const { companyId, issueId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "failed",
+      retryReason: "zero_token_session_reset",
+      runErrorCode: "startup_error_pre_model",
+      runError: "Adapter crashed before the first model turn",
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.zeroTokenSessionResetRetried).toBe(0);
     expect(result.escalated).toBe(1);
     expect(result.zeroTokenStartupFailureBlocked).toBe(1);
     expect(result.issueIds).toEqual([issueId]);

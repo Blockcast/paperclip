@@ -29,6 +29,7 @@ import {
   prioritizeProjectWorkspaceCandidatesForRun,
   parseSessionCompactionPolicy,
   computeSessionCompactionReason,
+  countConsecutiveFailedOrZeroTokenResumes,
   resolveNextSessionState,
   requiresPushCapabilityPreflight,
   resolveWorkspaceAfterLowTrustPreflight,
@@ -199,6 +200,7 @@ describe("k8s adapters default to session rotation (BLO-8827)", () => {
     maxSessionRuns: 200,
     maxRawInputTokens: 150_000,
     maxSessionAgeHours: 72,
+    maxConsecutiveFailedResumes: 3,
   };
 
   // Full toEqual (not just enabled+maxRawInputTokens) so a fat-fingered
@@ -350,8 +352,122 @@ describe("computeSessionCompactionReason fires rotation at the k8s ceiling (BLO-
         runsCount: 10_000,
         latestRawInputTokens: 5_000_000,
         sessionAgeHours: 9_999,
+        consecutiveFailedOrZeroTokenResumes: 9_999,
       }),
     ).toBeNull();
+  });
+});
+
+describe("consecutive zero-token/failed resume rotation trigger (BLO-10889 / BLO-10866 WS2)", () => {
+  const k8sPolicy = (adapter: string, runtimeConfig: Record<string, unknown> = {}) =>
+    parseSessionCompactionPolicy(buildAgent(adapter, runtimeConfig));
+
+  it("rotates once the consecutive-failure count reaches the k8s default threshold of 3", () => {
+    expect(
+      computeSessionCompactionReason({
+        policy: k8sPolicy("claude_k8s"),
+        runsCount: 1,
+        latestRawInputTokens: 0,
+        sessionAgeHours: 0,
+        consecutiveFailedOrZeroTokenResumes: 3,
+      }),
+    ).toBe("session had 3 consecutive zero-token/failed resumes (threshold 3)");
+  });
+
+  it("does not rotate below the threshold", () => {
+    expect(
+      computeSessionCompactionReason({
+        policy: k8sPolicy("claude_k8s"),
+        runsCount: 1,
+        latestRawInputTokens: 0,
+        sessionAgeHours: 0,
+        consecutiveFailedOrZeroTokenResumes: 2,
+      }),
+    ).toBeNull();
+  });
+
+  it("defaults to 0 (never fires) when the caller omits the field, preserving old callers", () => {
+    expect(
+      computeSessionCompactionReason({
+        policy: k8sPolicy("claude_k8s"),
+        runsCount: 1,
+        latestRawInputTokens: 0,
+        sessionAgeHours: 0,
+      }),
+    ).toBeNull();
+  });
+
+  it("takes precedence over the runs/raw-input/age triggers", () => {
+    // All four thresholds are exceeded; consecutive-failure must win because a
+    // poisoned session that never does model work will never trip the others.
+    expect(
+      computeSessionCompactionReason({
+        policy: k8sPolicy("claude_k8s"),
+        runsCount: 500,
+        latestRawInputTokens: 500_000,
+        sessionAgeHours: 200,
+        consecutiveFailedOrZeroTokenResumes: 5,
+      }),
+    ).toBe("session had 5 consecutive zero-token/failed resumes (threshold 3)");
+  });
+
+  it("honors a per-agent maxConsecutiveFailedResumes override", () => {
+    const policy = k8sPolicy("opencode_k8s", {
+      heartbeat: { sessionCompaction: { maxConsecutiveFailedResumes: 1 } },
+    });
+    expect(
+      computeSessionCompactionReason({
+        policy,
+        runsCount: 1,
+        latestRawInputTokens: 0,
+        sessionAgeHours: 0,
+        consecutiveFailedOrZeroTokenResumes: 1,
+      }),
+    ).toBe("session had 1 consecutive zero-token/failed resumes (threshold 1)");
+  });
+
+  it("disables the trigger entirely when set to 0", () => {
+    const policy = k8sPolicy("claude_k8s", {
+      heartbeat: { sessionCompaction: { maxConsecutiveFailedResumes: 0 } },
+    });
+    expect(
+      computeSessionCompactionReason({
+        policy,
+        runsCount: 1,
+        latestRawInputTokens: 0,
+        sessionAgeHours: 0,
+        consecutiveFailedOrZeroTokenResumes: 1_000,
+      }),
+    ).toBeNull();
+  });
+
+  it("counts a prefix of zero-token or unsuccessful-terminal runs, stopping at the first productive one", () => {
+    const zeroTokenFailed = { status: "failed", usageJson: { inputTokens: 0, outputTokens: 0 } };
+    const zeroTokenCancelled = { status: "cancelled", usageJson: null };
+    const productive = { status: "succeeded", usageJson: { inputTokens: 500, outputTokens: 20 } };
+    expect(
+      countConsecutiveFailedOrZeroTokenResumes([zeroTokenFailed, zeroTokenCancelled, zeroTokenFailed, productive]),
+    ).toBe(3);
+  });
+
+  it("resets to 0 when the newest run in the list is productive", () => {
+    const productive = { status: "succeeded", usageJson: { inputTokens: 500, outputTokens: 20 } };
+    const zeroTokenFailed = { status: "failed", usageJson: { inputTokens: 0, outputTokens: 0 } };
+    expect(countConsecutiveFailedOrZeroTokenResumes([productive, zeroTokenFailed, zeroTokenFailed])).toBe(0);
+  });
+
+  it("does not count a still-running run as a failed resume", () => {
+    const running = { status: "running", usageJson: null };
+    expect(countConsecutiveFailedOrZeroTokenResumes([running])).toBe(0);
+  });
+
+  it("counts a terminal-unsuccessful run even when it burned real tokens (e.g. cancelled mid-flight)", () => {
+    const failedWithTokens = { status: "failed", usageJson: { inputTokens: 40_000, outputTokens: 100 } };
+    expect(countConsecutiveFailedOrZeroTokenResumes([failedWithTokens])).toBe(1);
+  });
+
+  it("returns 0 for an empty run list", () => {
+    expect(countConsecutiveFailedOrZeroTokenResumes([])).toBe(0);
   });
 });
 
@@ -2194,12 +2310,14 @@ describe("parseSessionCompactionPolicy", () => {
       maxSessionRuns: 0,
       maxRawInputTokens: 0,
       maxSessionAgeHours: 0,
+      maxConsecutiveFailedResumes: 0,
     });
     expect(parseSessionCompactionPolicy(buildAgent("claude_local"))).toEqual({
       enabled: true,
       maxSessionRuns: 0,
       maxRawInputTokens: 0,
       maxSessionAgeHours: 0,
+      maxConsecutiveFailedResumes: 0,
     });
   });
 
@@ -2209,12 +2327,14 @@ describe("parseSessionCompactionPolicy", () => {
       maxSessionRuns: 200,
       maxRawInputTokens: 2_000_000,
       maxSessionAgeHours: 72,
+      maxConsecutiveFailedResumes: 3,
     });
     expect(parseSessionCompactionPolicy(buildAgent("opencode_local"))).toEqual({
       enabled: true,
       maxSessionRuns: 200,
       maxRawInputTokens: 2_000_000,
       maxSessionAgeHours: 72,
+      maxConsecutiveFailedResumes: 3,
     });
   });
 
@@ -2235,6 +2355,23 @@ describe("parseSessionCompactionPolicy", () => {
       maxSessionRuns: 25,
       maxRawInputTokens: 500_000,
       maxSessionAgeHours: 0,
+      maxConsecutiveFailedResumes: 0,
+    });
+  });
+
+  it("lets an explicit maxConsecutiveFailedResumes override win over the adapter default", () => {
+    expect(
+      parseSessionCompactionPolicy(
+        buildAgent("codex_local", {
+          heartbeat: { sessionCompaction: { maxConsecutiveFailedResumes: 5 } },
+        }),
+      ),
+    ).toEqual({
+      enabled: true,
+      maxSessionRuns: 0,
+      maxRawInputTokens: 0,
+      maxSessionAgeHours: 0,
+      maxConsecutiveFailedResumes: 5,
     });
   });
 });

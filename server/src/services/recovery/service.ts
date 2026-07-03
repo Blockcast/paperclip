@@ -62,7 +62,12 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
-import { isZeroTokenStartupFailureRun } from "./zero-token-startup-failure.js";
+import {
+  isZeroTokenStartupFailureRun,
+  isZeroTokenSessionResetRetryRun,
+  ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
+} from "./zero-token-startup-failure.js";
+import { clearAgentTaskSessions } from "./session-reset.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
@@ -956,8 +961,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   async function enqueueStrandedIssueRecovery(input: {
     issueId: string;
     agentId: string;
-    reason: "issue_assignment_recovery" | "issue_continuation_needed";
-    retryReason: "assignment_recovery" | "issue_continuation_needed";
+    reason: "issue_assignment_recovery" | "issue_continuation_needed" | "issue_zero_token_session_reset";
+    retryReason: "assignment_recovery" | "issue_continuation_needed" | "zero_token_session_reset";
     source: string;
     retryOfRunId?: string | null;
   }) {
@@ -3771,6 +3776,50 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     });
   }
 
+  // BLO-10889 (BLO-10866 WS2): defense-in-depth for the zero-token
+  // startup-failure wedge. Escalating straight to `blocked` (BLO-5681) is
+  // safe but leaves a poisoned session stuck until a human manually resets
+  // it or reassigns to a different agent (the only known escape, per
+  // BLO-10866/BLO-10777). Now that a persisted task session can be cleared
+  // in place, try ONE bounded reset-and-retry first: clear the agent's task
+  // session for this issue, then re-dispatch. `escalateZeroTokenStartupFailureIssue`
+  // remains the fallback if that retry also fails (see
+  // isZeroTokenSessionResetRetryRun above) — so this never loops past one
+  // extra attempt. Returns the queued run row, or null if the retry could
+  // not be dispatched (caller falls back to `skipped`).
+  async function resetSessionAndRetryZeroTokenFailure(input: {
+    issue: typeof issues.$inferSelect;
+    agent: typeof agents.$inferSelect;
+    latestRun: LatestIssueRun;
+  }) {
+    await clearAgentTaskSessions(db, input.issue.companyId, input.agent.id, {
+      taskKey: input.issue.id,
+      adapterType: input.agent.adapterType,
+    });
+
+    const queued = await enqueueStrandedIssueRecovery({
+      issueId: input.issue.id,
+      agentId: input.agent.id,
+      reason: "issue_zero_token_session_reset",
+      retryReason: ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
+      source: "issue.zero_token_session_reset_recovery",
+      retryOfRunId: input.latestRun?.id ?? null,
+    });
+    if (!queued) return null;
+
+    await issuesSvc.addComment(
+      input.issue.id,
+      "Paperclip detected a zero-token startup wedge on this assigned issue's last run " +
+        "(the BLO-10866 poisoned-session signature). Instead of re-invoking the same possibly-poisoned " +
+        "session, the agent's persisted task session was reset and a fresh retry was queued. If this " +
+        "retry also fails with zero tokens, the issue will move to `blocked` for manual attention.",
+      {},
+      { authorType: "system" },
+    );
+
+    return queued;
+  }
+
   async function reconcileStrandedAssignedIssues() {
     const candidates = await db
       .select()
@@ -3794,6 +3843,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       reviewWaitingParked: 0,
       escalated: 0,
       zeroTokenStartupFailureBlocked: 0,
+      zeroTokenSessionResetRetried: 0,
       waitingOnReviewResolved: 0,
       recentProgressExempted: 0,
       skipped: 0,
@@ -3910,14 +3960,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             result.skipped += 1;
             continue;
           }
-          const updated = await escalateZeroTokenStartupFailureIssue({
-            issue,
-            previousStatus: "todo",
-            latestRun,
-          });
-          if (updated) {
-            result.escalated += 1;
-            result.zeroTokenStartupFailureBlocked += 1;
+          if (isZeroTokenSessionResetRetryRun(latestRun)) {
+            const updated = await escalateZeroTokenStartupFailureIssue({
+              issue,
+              previousStatus: "todo",
+              latestRun,
+            });
+            if (updated) {
+              result.escalated += 1;
+              result.zeroTokenStartupFailureBlocked += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
+          if (await isInvocationBudgetBlocked(issue, agentId)) {
+            result.skipped += 1;
+            continue;
+          }
+          const retried = await resetSessionAndRetryZeroTokenFailure({ issue, agent, latestRun });
+          if (retried) {
+            result.zeroTokenSessionResetRetried += 1;
             result.issueIds.push(issue.id);
           } else {
             result.skipped += 1;
@@ -4139,14 +4203,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           result.skipped += 1;
           continue;
         }
-        const updated = await escalateZeroTokenStartupFailureIssue({
-          issue,
-          previousStatus: "in_progress",
-          latestRun,
-        });
-        if (updated) {
-          result.escalated += 1;
-          result.zeroTokenStartupFailureBlocked += 1;
+        if (isZeroTokenSessionResetRetryRun(latestRun)) {
+          const updated = await escalateZeroTokenStartupFailureIssue({
+            issue,
+            previousStatus: "in_progress",
+            latestRun,
+          });
+          if (updated) {
+            result.escalated += 1;
+            result.zeroTokenStartupFailureBlocked += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+        if (await isInvocationBudgetBlocked(issue, agentId)) {
+          result.skipped += 1;
+          continue;
+        }
+        const retried = await resetSessionAndRetryZeroTokenFailure({ issue, agent, latestRun });
+        if (retried) {
+          result.zeroTokenSessionResetRetried += 1;
           result.issueIds.push(issue.id);
         } else {
           result.skipped += 1;

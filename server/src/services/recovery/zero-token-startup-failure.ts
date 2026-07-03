@@ -80,3 +80,26 @@ export function isZeroTokenStartupFailureRun(
   const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
   return inputTokens === 0 && outputTokens === 0;
 }
+
+// BLO-10889 (BLO-10866 WS2): marker written into the wake `contextSnapshot`
+// (as `retryReason`) when the recovery sweep dispatches its one bounded
+// reset-and-retry attempt for a zero-token startup failure (see
+// resetSessionAndRetryZeroTokenFailure in recovery/service.ts).
+export const ZERO_TOKEN_SESSION_RESET_RETRY_REASON = "zero_token_session_reset";
+
+// True when the latest run was itself dispatched as that one-shot
+// reset-and-retry attempt and failed again with the same zero-token
+// signature — i.e. clearing the persisted task session already happened
+// once for this failure streak and didn't help. The recovery sweep uses
+// this to fall back to `blocked` escalation instead of resetting forever
+// when the wedge isn't actually session-poisoning (e.g. a genuinely
+// oversized workspace tripping context_overflow every time).
+export function isZeroTokenSessionResetRetryRun(
+  run: { contextSnapshot?: Record<string, unknown> | null } | null | undefined,
+): boolean {
+  const context = run?.contextSnapshot;
+  if (!context || typeof context !== "object") return false;
+  const retryReason = context.retryReason;
+  return typeof retryReason === "string" && retryReason === ZERO_TOKEN_SESSION_RESET_RETRY_REASON;
+}
+
