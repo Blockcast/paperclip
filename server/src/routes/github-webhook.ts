@@ -388,7 +388,21 @@ function resolveEventContext(
       const commentBody = comment?.body as string | undefined;
       const commentUser = comment?.user as Record<string, unknown> | undefined;
       const commentAuthorLogin = (commentUser?.login as string | undefined) ?? null;
-      const reviewerRequest = hasPrReviewerRequestMention(commentBody);
+      // A comment authored BY the reviewer bot itself can never be a
+      // request FOR review -- it can only be a false-positive match on the
+      // mention pattern (e.g. a template-completion nudge that greets the
+      // bot by its own handle, or the bot's own reply quoting the alias as
+      // a backtick-quoted example while explaining something). Without
+      // this guard those self-authored matches re-fire
+      // github_pr_review_requested indefinitely: observed live on
+      // Blockcast/paperclip#583, where the commitperclip gate's own nudge
+      // comment and then this bot's own explanatory reply each re-woke the
+      // review cycle in turn.
+      const commentAuthorIsReviewerBot = isConfiguredPrReviewerAuthor(
+        commentAuthorLogin,
+        options.prReviewerBotLogin,
+      );
+      const reviewerRequest = !commentAuthorIsReviewerBot && hasPrReviewerRequestMention(commentBody);
       const reviewFeedback = isActionablePrReviewComment(
         commentBody,
         commentAuthorLogin,
