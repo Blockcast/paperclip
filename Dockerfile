@@ -16,6 +16,29 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
   && apt-get install -y --no-install-recommends ca-certificates gosu curl gh git wget ripgrep python3 \
   && corepack enable
 
+# Wrap `gh` so it reads the live GitHub App installation token from the
+# kubelet-refreshed secret-volume file (PAPERCLIP_GITHUB_TOKEN_FILE, default
+# /paperclip/.secrets/github-token/token) on every invocation, instead of
+# falling back to ~/.config/gh/hosts.yml (BLO-13241: nothing refreshes that
+# file — it went stale ~10 days after a one-off write and broke `gh api`/
+# `gh auth status` for every agent pod, unnoticed because SSH git kept
+# working). A `/paperclip/.local/bin` wrapper with the same job already
+# exists (statefulset seed script, BLO-10448-adjacent), fed by a PATH
+# override in values.blockcast.yaml — but that override lives only on the
+# long-running server pod's env and does not reliably reach ephemeral agent
+# Job pods, which inherit this base image directly. Wrapping the binary at
+# its canonical PATH location closes that gap for every pod. Falls back to
+# the unmodified binary (existing hosts.yml/env auth) when the token file
+# isn't present, so non-agent uses of this image are unaffected.
+#
+# The wrapper is checked in at scripts/gh-token-wrapper.sh (single source of
+# truth, exercised directly by scripts/gh-token-wrapper.test.mjs) rather than
+# inlined here.
+COPY scripts/gh-token-wrapper.sh /usr/bin/gh-token-wrapper.sh
+RUN mv /usr/bin/gh /usr/bin/gh.real \
+  && ln -s /usr/bin/gh-token-wrapper.sh /usr/bin/gh \
+  && chmod 0755 /usr/bin/gh-token-wrapper.sh
+
 # Chromium runtime libs (BLO-3663) — required so headless Playwright works
 # inside agent Job pods. Job pods inherit this base image (the heavier
 # Dockerfile.agent toolchain isn't deployed for adapter Jobs), so the libs
