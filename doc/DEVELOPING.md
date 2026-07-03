@@ -649,6 +649,24 @@ those providers are enabled.
 
 Agent env vars now support secret references. By default, secret values are stored with local encryption and only secret refs are persisted in agent config.
 
+## Heartbeat Run Log Access Auditing
+
+`GET /api/heartbeat-runs/:runId/log` emits a company-scoped `activity_log` entry
+with action `heartbeat.run_log_accessed` for both allowed and denied company
+access checks. The audit row records the actor type/id, company id, heartbeat run
+id, timestamp (`activity_log.created_at`), access result, requested byte window,
+and log store type. It deliberately does not record transcript content, log
+chunks, log references/paths, environment values, or credential material.
+
+Incident response can inspect these events through the company activity API or
+activity UI filtered by action/entity/run. Use `action = heartbeat.run_log_accessed`,
+`entity_type = heartbeat_run`, and `entity_id = <runId>` to isolate a run's access
+history. The event `details.result` value is `allowed` when content was eligible
+to be read and `denied` when the company access check rejected the request.
+Retention follows the deployment's normal `activity_log` database retention and
+backup policy; Paperclip does not currently apply a separate shorter retention
+window for these access-audit rows.
+
 - Default local key path: `~/.paperclip/instances/default/secrets/master.key`
 - Override key material directly: `PAPERCLIP_SECRETS_MASTER_KEY`
 - Override key file path: `PAPERCLIP_SECRETS_MASTER_KEY_FILE`
