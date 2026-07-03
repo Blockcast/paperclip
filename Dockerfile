@@ -159,7 +159,16 @@ WORKDIR /vendor
 # model in session params so Claude jobs do not resume stale non-1M sessions.
 # Bumped 2026-06-30 to 4e3cc38: add Claude Sonnet 5 model IDs and stop
 # tracking generated dist artifacts; CI now builds and pack-verifies them.
-ARG CLAUDE_K8S_REF=4e3cc3881fa8c7281568328906b5a411e69de7e8
+# Bumped 2026-07-02 to ff8c978: per-agent Penstock session identity — merge
+# `x-penstock-session: agent:<name>` into ANTHROPIC_CUSTOM_HEADERS (Claude Code
+# forwards it per request; Penstock client-session extraction gives it top
+# precedence), so each claude_k8s agent shows as its own live entry in
+# org_penstock #accounts instead of the shared-key UNTAGGED bucket. Appends to
+# existing custom headers; a manual x-penstock-session override wins. Twin of
+# the opencode_k8s stamp (kkroo/paperclip-adapter-opencode-k8s#37). PR
+# kkroo/paperclip-adapter-claude-k8s#15; local adapter verification: typecheck
+# clean, 384/384 tests (2 new), rebased over the isolation-mode HOME/cache work.
+ARG CLAUDE_K8S_REF=ff8c978c83e8d33b7d7efcf658ddc96fe9092e75
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
