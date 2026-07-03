@@ -25,6 +25,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issueRelations,
   issues,
 } from "@paperclipai/db";
 import {
@@ -289,6 +290,175 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
 
     // todo/high should have been dispatched (left the queued state).
     expect(todoRun?.status).not.toBe("queued");
+  });
+
+  it("prioritizes ready issue runs before no-id and blocked runs across concurrent slots", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerIssueId = randomUUID();
+    const blockedCriticalIssueId = randomUUID();
+    const highTodoIssueId = randomUUID();
+    const highInProgressIssueId = randomUUID();
+    const lowInProgressIssueId = randomUUID();
+    const issuePrefix = `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "RankTestCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "RankTestAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 4 } },
+      permissions: {},
+    });
+
+    await db.insert(issues).values([
+      {
+        id: blockerIssueId,
+        companyId,
+        title: "Unresolved blocker",
+        status: "todo",
+        priority: "low",
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        id: blockedCriticalIssueId,
+        companyId,
+        title: "Blocked critical work",
+        status: "todo",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+      {
+        id: highTodoIssueId,
+        companyId,
+        title: "High-priority todo work",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        issueNumber: 3,
+        identifier: `${issuePrefix}-3`,
+      },
+      {
+        id: highInProgressIssueId,
+        companyId,
+        title: "High-priority in-progress work",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        issueNumber: 4,
+        identifier: `${issuePrefix}-4`,
+        startedAt: new Date(),
+      },
+      {
+        id: lowInProgressIssueId,
+        companyId,
+        title: "Low-priority in-progress work",
+        status: "in_progress",
+        priority: "low",
+        assigneeAgentId: agentId,
+        issueNumber: 5,
+        identifier: `${issuePrefix}-5`,
+        startedAt: new Date(),
+      },
+    ]);
+
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: blockedCriticalIssueId,
+      type: "blocks",
+    });
+
+    const noIssueRunId = randomUUID();
+    const blockedCriticalRunId = randomUUID();
+    const highTodoRunId = randomUUID();
+    const highInProgressRunId = randomUUID();
+    const lowInProgressRunId = randomUUID();
+    const runCases = [
+      { wakeupId: randomUUID(), runId: noIssueRunId, issueId: null, createdAt: new Date("2026-01-01T00:00:00Z") },
+      { wakeupId: randomUUID(), runId: blockedCriticalRunId, issueId: blockedCriticalIssueId, createdAt: new Date("2026-01-01T00:01:00Z") },
+      { wakeupId: randomUUID(), runId: lowInProgressRunId, issueId: lowInProgressIssueId, createdAt: new Date("2026-01-01T00:02:00Z") },
+      { wakeupId: randomUUID(), runId: highTodoRunId, issueId: highTodoIssueId, createdAt: new Date("2026-01-01T00:03:00Z") },
+      { wakeupId: randomUUID(), runId: highInProgressRunId, issueId: highInProgressIssueId, createdAt: new Date("2026-01-01T00:04:00Z") },
+    ];
+
+    await db.insert(agentWakeupRequests).values(runCases.map(({ wakeupId, runId, issueId, createdAt }) => ({
+      id: wakeupId,
+      companyId,
+      agentId,
+      source: "heartbeat" as const,
+      triggerDetail: "timer",
+      reason: "heartbeat_timer",
+      payload: issueId ? { issueId } : {},
+      status: "queued" as const,
+      runId,
+      requestedAt: createdAt,
+      updatedAt: createdAt,
+    })));
+
+    await db.insert(heartbeatRuns).values(runCases.map(({ wakeupId, runId, issueId, createdAt }) => ({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "heartbeat" as const,
+      triggerDetail: "timer",
+      status: "queued" as const,
+      wakeupRequestId: wakeupId,
+      contextSnapshot: issueId ? { issueId, wakeReason: "heartbeat_timer" } : { wakeReason: "heartbeat_timer" },
+      createdAt,
+      updatedAt: createdAt,
+    })));
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, highInProgressRunId);
+    await waitForRunToSettle(heartbeat, highTodoRunId);
+    await waitForRunToSettle(heartbeat, lowInProgressRunId);
+    await waitForRunToSettle(heartbeat, noIssueRunId);
+
+    // Lower numeric dispatch ranks win: high/in_progress (2), high/todo (3),
+    // low-priority ready in_progress (6), then no-id (10). Adapter execution is
+    // concurrent, so assert the claimed set rather than callback arrival order.
+    expect(new Set(dispatchedRunIds.slice(0, 4))).toEqual(new Set([
+      highInProgressRunId,
+      highTodoRunId,
+      lowInProgressRunId,
+      noIssueRunId,
+    ]));
+    expect(dispatchedRunIds).not.toContain(blockedCriticalRunId);
+
+    const blockedRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, blockedCriticalRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(blockedRun?.status).toBe("cancelled");
   });
 
   it("dispatches queued run despite a stale silent running run (BLO-12990 Fix #1)", async () => {

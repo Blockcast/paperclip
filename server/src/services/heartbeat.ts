@@ -11191,12 +11191,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // BLO-12990: fold priority into the primary dispatch rank so a
         // high-priority `todo` can preempt a low-priority `in_progress`.
         // Old scheme made status the primary key (in_progress always beat
-        // todo regardless of priority gap). New formula:
+        // todo regardless of priority gap). Lower numeric rank dispatches first.
+        // New formula:
         //   ready run  → priorityRank * 2 + (in_progress ? 0 : 1)
         //   no issueId → 10
         //   not-ready  → 12 + priorityRank
         // This lets high-priority todo (rank 3) beat low-priority in_progress
         // (rank 6) while preserving the in_progress bonus within a tier.
+        // Missing priority maps below low priority but still beats no-id/not-ready runs.
         const dispatchRank = (
           issue: { status: string; priority: string | null } | null | undefined,
           ready: boolean,
