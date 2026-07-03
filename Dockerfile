@@ -168,7 +168,16 @@ WORKDIR /vendor
 # the opencode_k8s stamp (kkroo/paperclip-adapter-opencode-k8s#37). PR
 # kkroo/paperclip-adapter-claude-k8s#15; local adapter verification: typecheck
 # clean, 384/384 tests (2 new), rebased over the isolation-mode HOME/cache work.
-ARG CLAUDE_K8S_REF=ff8c978c83e8d33b7d7efcf658ddc96fe9092e75
+# Bumped 2026-07-03 to c04ae02: unbreak this image's vendor build — #581
+# (BLO-10889) made SessionCompactionPolicy.maxConsecutiveFailedResumes required
+# in the vendored adapter-utils, and the adapter's declared policy lacked it
+# (tsc TS2741, Docker red since 4dfb7fd). Adapter declares 3, mirroring the
+# operative K8S_AGENT_SESSION_POLICY, and hoists the literal so it also
+# compiles against published adapter-utils that don't declare the field. PR
+# kkroo/paperclip-adapter-claude-k8s#16; verified: 384/384 tests + tsc clean on
+# published deps, and tsc clean against an adapter-utils tgz built exactly per
+# this file's vendor stage.
+ARG CLAUDE_K8S_REF=c04ae02fda6fff57d2d4acf93e4d7640597b50ef
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
