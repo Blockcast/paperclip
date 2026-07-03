@@ -22,10 +22,24 @@
 
 import { Counter, Registry, collectDefaultMetrics } from "prom-client";
 import { resetDepBlockedMetrics, snapshotDepBlockedMetrics } from "./dep-blocked-metrics.js";
+import {
+  resetBlockerResolvedWakeMetrics,
+  snapshotBlockerResolvedWakeMetrics,
+} from "./blocker-resolved-wake-metrics.js";
 
 export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_total";
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
+/**
+ * Outcome counter for blocker-resolved dependent wakes (BLO-13250). Labeled
+ * only by `outcome` (mirrors {@link DEP_BLOCKED_WAKEUP_METRIC}'s snapshot
+ * style — see blocker-resolved-wake-metrics.ts for the full outcome list).
+ * A sustained non-zero `*_skipped`/`*_failed` rate means dependents whose
+ * blockers just resolved are not being woken, i.e. they will sit `blocked`
+ * with a fully-resolved `blockedBy` set until the periodic sweep or an
+ * operator intervenes.
+ */
+export const BLOCKER_RESOLVED_WAKEUP_METRIC = "paperclip_blocker_resolved_wakeup_total";
 /**
  * Isolated concurrent starts counter (BLO-12212/BLO-12505). Incremented when a
  * K8s adapter run is dispatched under an isolated workspace/session descriptor
@@ -326,7 +340,18 @@ export async function renderMetrics(): Promise<{ contentType: string; body: stri
       ([outcome, value]) => `${DEP_BLOCKED_WAKEUP_METRIC}{outcome="${outcome}"} ${value}`,
     ),
   ].join("\n");
-  return { contentType: reg.contentType, body: `${await reg.metrics()}\n${depBlockedBody}\n` };
+  const blockerResolvedSnapshot = snapshotBlockerResolvedWakeMetrics();
+  const blockerResolvedBody = [
+    `# HELP ${BLOCKER_RESOLVED_WAKEUP_METRIC} Count of blocker-resolved dependent wake outcomes, labeled by outcome (fast_path_* = immediate becameDone wake, sweep_* = periodic reconcileResolvedBlockerDependents sweep).`,
+    `# TYPE ${BLOCKER_RESOLVED_WAKEUP_METRIC} counter`,
+    ...Object.entries(blockerResolvedSnapshot).map(
+      ([outcome, value]) => `${BLOCKER_RESOLVED_WAKEUP_METRIC}{outcome="${outcome}"} ${value}`,
+    ),
+  ].join("\n");
+  return {
+    contentType: reg.contentType,
+    body: `${await reg.metrics()}\n${depBlockedBody}\n${blockerResolvedBody}\n`,
+  };
 }
 
 /** Test-only: drop the registry so each test starts from a clean counter. */
@@ -336,4 +361,5 @@ export function __resetMetricsForTest(): void {
   isolatedRunStarted = null;
   heartbeatRunFailed = null;
   resetDepBlockedMetrics();
+  resetBlockerResolvedWakeMetrics();
 }

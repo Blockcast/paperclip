@@ -116,6 +116,7 @@ import {
   SVG_CONTENT_TYPE,
 } from "../attachment-types.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import { incrementBlockerResolvedWakeMetric } from "../services/blocker-resolved-wake-metrics.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { executionWorkspaceService as executionWorkspaceServiceDirect } from "../services/execution-workspaces.js";
 import { feedbackService } from "../services/feedback.js";
@@ -1109,6 +1110,96 @@ export function issueRoutes(
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
+  type IssueWakeupRequest = NonNullable<Parameters<typeof heartbeat.wakeup>[1]>;
+
+  // Builds the wakeup fired at a single dependent when one of its blockers
+  // transitions to `done`. Shared by both becameDone call sites (PATCH
+  // /issues/:id and POST /issues/:id/comments) so the idempotency-key shape
+  // can never drift between them (BLO-13250).
+  //
+  // The idempotency key is scoped to (resolvedBlockerIssueId, dependent.id) —
+  // deliberately including the dependent id — so that when one blocker
+  // unblocks N sibling dependents in the same becameDone fan-out, each
+  // dependent's wake carries a distinct key and none can coalesce into a
+  // sibling's wake.
+  function buildBlockerResolvedWakeup(
+    dependent: { id: string; assigneeAgentId: string; blockerIssueIds: string[] },
+    resolvedBlockerIssueId: string,
+    actor: Pick<ReturnType<typeof getActorInfo>, "actorType" | "actorId">,
+  ): { agentId: string; wakeup: IssueWakeupRequest } {
+    return {
+      agentId: dependent.assigneeAgentId,
+      wakeup: {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        payload: {
+          issueId: dependent.id,
+          resolvedBlockerIssueId,
+          blockerIssueIds: dependent.blockerIssueIds,
+        },
+        requestedByActorType: actor.actorType,
+        requestedByActorId: actor.actorId,
+        contextSnapshot: {
+          issueId: dependent.id,
+          taskId: dependent.id,
+          wakeReason: "issue_blockers_resolved",
+          source: "issue.blockers_resolved",
+          resolvedBlockerIssueId,
+          blockerIssueIds: dependent.blockerIssueIds,
+        },
+        idempotencyKey: `blockers_resolved:${resolvedBlockerIssueId}:${dependent.id}`,
+      },
+    };
+  }
+
+  // Dispatches every merged wakeup for an issue update/comment. For
+  // `issue_blockers_resolved` wakes specifically, records an explicit
+  // woken/skipped/failed audit log line + metric per dependent — the "no
+  // silent drops" requirement from BLO-13250. `heartbeat.wakeup` resolves to
+  // a truthy value when a run was queued/coalesced/deferred, and to `null`
+  // when the wake was explicitly skipped (budget block, cooldown, penstock
+  // capacity gate, daily cap, inactive company, ...); both are terminal,
+  // intentional outcomes recorded by enqueueWakeup itself; the audit log here
+  // just makes that outcome visible per dependent instead of only on error.
+  function dispatchIssueWakeups(
+    issueId: string,
+    wakeups: Map<string, { agentId: string; wakeup: IssueWakeupRequest }>,
+    genericFailureMessage: string = "failed to wake agent on issue update",
+  ) {
+    for (const { agentId, wakeup } of wakeups.values()) {
+      const isBlockerResolvedWake = wakeup.reason === "issue_blockers_resolved";
+      const dependentIssueId =
+        wakeup.payload && typeof wakeup.payload === "object" && typeof wakeup.payload.issueId === "string"
+          ? wakeup.payload.issueId
+          : null;
+      const resolvedBlockerIssueId =
+        wakeup.payload && typeof wakeup.payload === "object" && typeof wakeup.payload.resolvedBlockerIssueId === "string"
+          ? wakeup.payload.resolvedBlockerIssueId
+          : null;
+      const promise = heartbeat.wakeup(agentId, wakeup);
+      if (isBlockerResolvedWake) {
+        promise
+          .then((result) => {
+            const outcome = result ? "sent" : "skipped";
+            incrementBlockerResolvedWakeMetric(outcome === "sent" ? "fast_path_sent" : "fast_path_skipped");
+            logger.info(
+              { issueId, dependentIssueId, resolvedBlockerIssueId, agentId, outcome, idempotencyKey: wakeup.idempotencyKey ?? null },
+              "blocker-resolved dependent wake outcome",
+            );
+          })
+          .catch((err) => {
+            incrementBlockerResolvedWakeMetric("fast_path_failed");
+            logger.warn(
+              { err, issueId, dependentIssueId, resolvedBlockerIssueId, agentId, outcome: "failed" },
+              "blocker-resolved dependent wake failed",
+            );
+          });
+      } else {
+        promise.catch((err) => logger.warn({ err, issueId, agentId }, genericFailureMessage));
+      }
+    }
+  }
   const feedback = feedbackService(db);
   const companiesSvc = companyService(db);
   let searchSvc = opts.searchService ?? null;
@@ -6852,26 +6943,8 @@ export function issueRoutes(
       if (becameDone) {
         const dependents = await svc.listWakeableBlockedDependents(issue.id);
         for (const dependent of dependents) {
-          addWakeup(dependent.assigneeAgentId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "issue_blockers_resolved",
-            payload: {
-              issueId: dependent.id,
-              resolvedBlockerIssueId: issue.id,
-              blockerIssueIds: dependent.blockerIssueIds,
-            },
-            requestedByActorType: actor.actorType,
-            requestedByActorId: actor.actorId,
-            contextSnapshot: {
-              issueId: dependent.id,
-              taskId: dependent.id,
-              wakeReason: "issue_blockers_resolved",
-              source: "issue.blockers_resolved",
-              resolvedBlockerIssueId: issue.id,
-              blockerIssueIds: dependent.blockerIssueIds,
-            },
-          });
+          const { agentId, wakeup } = buildBlockerResolvedWakeup(dependent, issue.id, actor);
+          addWakeup(agentId, wakeup);
         }
       }
 
@@ -6910,11 +6983,7 @@ export function issueRoutes(
         }
       }
 
-      for (const { agentId, wakeup } of wakeups.values()) {
-        heartbeat
-          .wakeup(agentId, wakeup)
-          .catch((err) => logger.warn({ err, issueId: issue.id, agentId }, "failed to wake agent on issue update"));
-      }
+      dispatchIssueWakeups(issue.id, wakeups);
     })();
 
     await queueTaskWatchdogEvaluation(issue, actor.runId);
@@ -8395,26 +8464,8 @@ export function issueRoutes(
       if (becameDone) {
         const dependents = await svc.listWakeableBlockedDependents(currentIssue.id);
         for (const dependent of dependents) {
-          addWakeup(dependent.assigneeAgentId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "issue_blockers_resolved",
-            payload: {
-              issueId: dependent.id,
-              resolvedBlockerIssueId: currentIssue.id,
-              blockerIssueIds: dependent.blockerIssueIds,
-            },
-            requestedByActorType: actor.actorType,
-            requestedByActorId: actor.actorId,
-            contextSnapshot: {
-              issueId: dependent.id,
-              taskId: dependent.id,
-              wakeReason: "issue_blockers_resolved",
-              source: "issue.blockers_resolved",
-              resolvedBlockerIssueId: currentIssue.id,
-              blockerIssueIds: dependent.blockerIssueIds,
-            },
-          });
+          const { agentId, wakeup } = buildBlockerResolvedWakeup(dependent, currentIssue.id, actor);
+          addWakeup(agentId, wakeup);
         }
       }
 
@@ -8454,11 +8505,7 @@ export function issueRoutes(
         }
       }
 
-      for (const { agentId, wakeup } of wakeups.values()) {
-        heartbeat
-          .wakeup(agentId, wakeup)
-          .catch((err) => logger.warn({ err, issueId: currentIssue.id, agentId }, "failed to wake agent on issue comment"));
-      }
+      dispatchIssueWakeups(currentIssue.id, wakeups, "failed to wake agent on issue comment");
     })();
 
     await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
