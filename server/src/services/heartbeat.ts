@@ -89,6 +89,7 @@ import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
 import { incrementDepBlockedMetric } from "./dep-blocked-metrics.js";
+import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
@@ -11154,6 +11155,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .limit(1);
           if (recentSweepRun.length > 0) {
             skipped += 1;
+            incrementBlockerResolvedWakeMetric("sweep_skipped");
+            logger.info(
+              { issueId: candidate.id, assigneeAgentId: candidate.assigneeAgentId, outcome: "skipped", skipReason: "recent_sweep_wake_already_sent" },
+              "reconcileResolvedBlockerDependents dependent outcome",
+            );
             continue;
           }
         }
@@ -11169,6 +11175,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
         if (preflight.skip) {
           skipped += 1;
+          incrementBlockerResolvedWakeMetric("sweep_skipped");
+          logger.info(
+            { issueId: candidate.id, assigneeAgentId: candidate.assigneeAgentId, outcome: "skipped", skipReason: preflight.frame?.disposition ?? "sweep_wake_preflight" },
+            "reconcileResolvedBlockerDependents dependent outcome",
+          );
           continue;
         }
         const result = await enqueueWakeup(candidate.assigneeAgentId, {
@@ -11195,12 +11206,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
         // enqueueWakeup returns the run row when queued/coalesced, null when
         // skipped or deferred.
-        if (result) woken += 1;
-        else skipped += 1;
+        if (result) {
+          woken += 1;
+          incrementBlockerResolvedWakeMetric("sweep_sent");
+        } else {
+          skipped += 1;
+          incrementBlockerResolvedWakeMetric("sweep_skipped");
+        }
+        logger.info(
+          { issueId: candidate.id, assigneeAgentId: candidate.assigneeAgentId, outcome: result ? "sent" : "skipped" },
+          "reconcileResolvedBlockerDependents dependent outcome",
+        );
       } catch (err) {
         failed += 1;
+        incrementBlockerResolvedWakeMetric("sweep_failed");
         logger.warn(
-          { err, issueId: candidate.id, assigneeAgentId: candidate.assigneeAgentId },
+          { err, issueId: candidate.id, assigneeAgentId: candidate.assigneeAgentId, outcome: "failed" },
           "reconcileResolvedBlockerDependents wake failed",
         );
       }
