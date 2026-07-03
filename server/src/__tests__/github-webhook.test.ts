@@ -306,6 +306,67 @@ describe("github-webhook pure helpers", () => {
     );
   });
 
+  it("does not treat the reviewer bot's own comment as a review request, even when it mentions its own alias (BLO-13247 follow-up)", () => {
+    // Observed live on Blockcast/paperclip#583: a template-completion nudge
+    // that greets the bot by its own handle in the salutation, and
+    // separately the bot's own explanatory reply quoting the alias as a
+    // backtick-quoted example, each re-fired github_pr_review_requested --
+    // an indefinite self-perpetuating loop on any bot-authored PR that gets
+    // an automated reply mentioning the bot by name.
+    expect(
+      __test_resolveEventContext("issue_comment", {
+        action: "created",
+        issue: {
+          number: 583,
+          title: "BLO-13247 precheck idempotency key",
+          pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/583" },
+        },
+        comment: {
+          id: 1,
+          body: "Hey @allyblockcast[bot]! Before this PR can be reviewed...",
+          user: { login: "allyblockcast[bot]" },
+        },
+        repository: { full_name: "Blockcast/paperclip" },
+      }),
+    ).toBeNull();
+
+    expect(
+      __test_resolveEventContext("issue_comment", {
+        action: "created",
+        issue: {
+          number: 583,
+          title: "BLO-13247 precheck idempotency key",
+          pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/583" },
+        },
+        comment: {
+          id: 2,
+          body: "The comment-scoped suffix is `comment:${commentId}`, so a later distinct `@ally` comment still wakes the author.",
+          user: { login: "allyblockcast[bot]" },
+        },
+        repository: { full_name: "Blockcast/paperclip" },
+      }),
+    ).toBeNull();
+
+    // Sanity check: the same body from a DIFFERENT author still fires the
+    // reviewer-request wake -- this guard is author-scoped, not a
+    // body-content change.
+    const fromHuman = __test_resolveEventContext("issue_comment", {
+      action: "created",
+      issue: {
+        number: 583,
+        title: "BLO-13247 precheck idempotency key",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/583" },
+      },
+      comment: {
+        id: 3,
+        body: "Hey @allyblockcast[bot]! Before this PR can be reviewed...",
+        user: { login: "kkroo" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+    expect(fromHuman).toMatchObject({ wakeReason: "github_pr_review_requested" });
+  });
+
   it("ignores issue comments that are not PR @ally review requests", () => {
     expect(
       __test_resolveEventContext("issue_comment", {
