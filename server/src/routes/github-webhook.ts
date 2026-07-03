@@ -1217,6 +1217,47 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       // Non-PR wakes (CI completion, etc.) leave prRole unset.
       const isPrWake =
         context.wakeReason.startsWith("github_pr_") && context.prNumber !== null;
+
+      // BLO-13247: the actionableReviewFeedback branch above already
+      // precheck-and-skips on its own idempotency key before this point, but
+      // every OTHER PR-wake reason (opened/reopened/ready_for_review/a
+      // non-actionable review_requested) fell through with an idempotencyKey
+      // that was only ever passed to heartbeat.wakeup and never checked
+      // first — enqueueWakeup stores the key but does not enforce it (same
+      // gap the reviewer wake above guards against at
+      // shouldFirePrReviewerWake). A single GitHub delivery processed twice
+      // (observed: two heartbeatRuns created 19-45ms apart off the IDENTICAL
+      // x-github-delivery id) fanned into two queued runs for the same
+      // issue because nothing ever looked for the first one. Precheck here
+      // too, mirroring buildPrReviewerWakeIdempotencyKey's comment-scoping
+      // for github_pr_review_requested so a later distinct @ally comment can
+      // still wake the author again.
+      if (isPrWake && !authorWakeIdempotencyKey) {
+        const prNumber = context.prNumber as number;
+        const repo = context.repoFullName ?? "unknown";
+        const suffix =
+          context.wakeReason === "github_pr_review_requested"
+            ? `${context.wakeReason}:comment:${context.commentId ?? deliveryId ?? "unknown"}`
+            : context.wakeReason;
+        authorWakeIdempotencyKey = `pr_review_author:${issue.id}:${repo}:${prNumber}:${suffix}`;
+        const existingPrAuthorWake = await db
+          .select({ id: agentWakeupRequests.id })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.agentId, effectiveAssigneeAgentId),
+              eq(agentWakeupRequests.idempotencyKey, authorWakeIdempotencyKey),
+              inArray(agentWakeupRequests.status, IDEMPOTENT_REVIEWER_WAKE_STATUSES),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existingPrAuthorWake) {
+          skipped.push({ issueIdentifier: issue.identifier, reason: "duplicate_pr_author_wake" });
+          continue;
+        }
+      }
+
       const reviewBody = context.reviewBody ?? (actionableReviewFeedback ? prFeedbackBody(context) : null);
       const reviewAuthorLogin =
         context.reviewAuthorLogin ?? (actionableReviewFeedback ? prFeedbackAuthorLogin(context) : null);
@@ -1263,12 +1304,10 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           // submission can't fan into N author runs. Parallel to the
           // reviewer wake's `pr_review:<repo>:<num>:<reason>` key but
           // scoped by issue so two issues sharing a PR each get their own.
-          ...(isPrWake
-            ? {
-                idempotencyKey: authorWakeIdempotencyKey ??
-                  `pr_review_author:${issue.id}:${context.repoFullName ?? "unknown"}:${context.prNumber}:${context.wakeReason}`,
-              }
-            : {}),
+          // authorWakeIdempotencyKey is always set by this point when
+          // isPrWake is true (either by the actionableReviewFeedback branch
+          // or the precheck above).
+          ...(isPrWake ? { idempotencyKey: authorWakeIdempotencyKey as string } : {}),
         });
         wakes.push({ issueIdentifier: issue.identifier, agentId: effectiveAssigneeAgentId });
       } catch (err) {

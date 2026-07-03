@@ -1099,6 +1099,88 @@ describeEmbeddedPostgres("github-webhook route", () => {
     });
   });
 
+  it("dedupes a duplicate GitHub delivery of the same @ally review-request comment on the author wake too (BLO-13247)", async () => {
+    // BLO-13247: two heartbeatRuns were observed created 19-45ms apart for
+    // the same issue, both carrying the IDENTICAL x-github-delivery id and
+    // comment url -- the same delivery got processed twice, and unlike the
+    // reviewer-wake path above (which prechecks its idempotency key before
+    // inserting), the author-wake loop only ever passed its key to
+    // heartbeat.wakeup without checking for an existing wake first. This
+    // reproduces that duplicate-delivery shape against a matched issue (a
+    // BLO- identifier in the PR title) so the author-wake loop actually
+    // runs, not just the independent reviewer-wake path.
+    const { agentId } = await seedIssueWithIdentifier("BLO-9001");
+    const app = buildApp();
+    const payload = {
+      action: "created",
+      issue: {
+        number: 582,
+        title: "fix(docker): wrap gh to read live GitHub App token (BLO-9001)",
+        body: null,
+        html_url: "https://github.com/Blockcast/paperclip/pull/582",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/582" },
+        user: { login: "allyblockcast[bot]" },
+      },
+      comment: {
+        id: 4871387911,
+        body: "@ally please review",
+        html_url: "https://github.com/Blockcast/paperclip/pull/582#issuecomment-4871387911",
+        user: { login: "kkroo" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+
+    const first = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-author-dupe-1")
+      .set("content-type", "application/json")
+      .send(body);
+    const replay = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-author-dupe-2")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(first.status).toBe(200);
+    expect(first.body.wakes).toEqual([{ issueIdentifier: "BLO-9001", agentId }]);
+    expect(replay.status).toBe(200);
+    expect(replay.body.wakes).toEqual([]);
+    expect(replay.body.skipped).toContainEqual({
+      issueIdentifier: "BLO-9001",
+      reason: "duplicate_pr_author_wake",
+    });
+
+    const runs = await db
+      .select({ status: heartbeatRuns.status, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      status: "queued",
+      contextSnapshot: expect.objectContaining({
+        wakeReason: "github_pr_review_requested",
+        prRole: "author",
+      }),
+    });
+
+    const wakes = await db
+      .select({ status: agentWakeupRequests.status, idempotencyKey: agentWakeupRequests.idempotencyKey })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]).toMatchObject({
+      status: "queued",
+      idempotencyKey: expect.stringContaining(
+        ":Blockcast/paperclip:582:github_pr_review_requested:comment:4871387911",
+      ),
+    });
+  });
+
   it("drives a wake on check_run.completed when the PR head_branch references a paperclip issue (CI completion)", async () => {
     const { agentId, issueId } = await seedIssueWithIdentifier("BLO-3182");
     const app = buildApp();
