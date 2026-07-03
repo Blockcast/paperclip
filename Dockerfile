@@ -241,7 +241,17 @@ ARG CLAUDE_K8S_REF=4e3cc3881fa8c7281568328906b5a411e69de7e8
 # operator override, and request opencode_k8s session management instead of the
 # opencode_local policy. PR kkroo/paperclip-adapter-opencode-k8s#36; local
 # adapter verification passed focused tests, typecheck, and build.
-ARG OPENCODE_K8S_REF=50d2af937a31e40de4d3093898275ac338890d07
+# Bumped 2026-07-02 to 5dae60d: stamp per-agent `x-penstock-session: agent:<name>`
+# on both opencode provider configs (anthropic + openai options.headers) so each
+# Paperclip agent shows as its own live session entry on the org_penstock
+# consumption dashboard instead of the whole fleet melting into one UNTAGGED
+# bucket (Penstock's client-session extraction gives the header top precedence).
+# Also repairs pre-existing breakage: master didn't typecheck (skills.ts read
+# undeclared required/requiredReason fields) and 2 skill-bundle tests never
+# passed — required-by-Paperclip skills now bundle unconditionally via
+# forward-compat reads. PR kkroo/paperclip-adapter-opencode-k8s#37; local
+# adapter verification: typecheck clean, full suite 503/503, build clean.
+ARG OPENCODE_K8S_REF=5dae60d0e37b61072d53b2c4e139b013bc60bd80
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
