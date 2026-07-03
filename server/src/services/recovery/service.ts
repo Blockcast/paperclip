@@ -62,7 +62,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
-import { isZeroTokenStartupFailureRun } from "./zero-token-startup-failure.js";
+import { isZeroTokenStartupFailureRun, shouldRotateSessionForStrandedRun } from "./zero-token-startup-failure.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
@@ -960,6 +960,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     retryReason: "assignment_recovery" | "issue_continuation_needed";
     source: string;
     retryOfRunId?: string | null;
+    // BLO-10889: when the stranding run burned zero tokens (a poisoned/wedged
+    // session), rotate to a fresh session on this recovery re-wake instead of
+    // resuming the same wedged one. Honored by `shouldResetTaskSessionForWake`
+    // in heartbeat.ts via the run contextSnapshot. Omitted (not `false`) for
+    // healthy/transient strands so their session context is preserved.
+    forceFreshSession?: boolean;
   }) {
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
@@ -978,6 +984,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         retryReason: input.retryReason,
         source: input.source,
         ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
+        ...(input.forceFreshSession ? { forceFreshSession: true } : {}),
       }, "normal_model"),
     });
 
@@ -3962,6 +3969,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           retryReason: "assignment_recovery",
           source: "issue.assignment_recovery",
           retryOfRunId: latestRun.id,
+          // BLO-10889: a zero-token stranding run whose failure looks like a
+          // poisoned/wedged session (job_failed/BackoffLimitExceeded, a startup
+          // wedge, or an unknown code) means rotate to a fresh session on this
+          // recovery re-wake instead of the same doomed resume. Transient
+          // environment failures (process_lost, adapter blips) keep their
+          // session. If the fresh retry still zero-tokens, didAutomaticRecoveryFail
+          // (above) escalates to blocked via the existing attemptCount backstop.
+          forceFreshSession: shouldRotateSessionForStrandedRun(latestRun),
         });
         if (queued) {
           result.dispatchRequeued += 1;
@@ -4244,6 +4259,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         retryReason: "issue_continuation_needed",
         source: "issue.continuation_recovery",
         retryOfRunId: latestRun?.id ?? issue.checkoutRunId ?? null,
+        // BLO-10889: same as the assignment path — rotate the session on the
+        // recovery re-wake only when the zero-token strand looks like session
+        // poison, not a transient environment failure. didAutomaticRecoveryFail
+        // (above) still escalates to blocked if the fresh retry also zero-tokens.
+        forceFreshSession: shouldRotateSessionForStrandedRun(latestRun),
       });
       if (queued) {
         result.continuationRequeued += 1;

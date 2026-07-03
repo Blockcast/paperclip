@@ -80,3 +80,55 @@ export function isZeroTokenStartupFailureRun(
   const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
   return inputTokens === 0 && outputTokens === 0;
 }
+
+// True when a run terminated unsuccessfully while burning zero tokens (input +
+// output), REGARDLESS of errorCode. Broader than `isZeroTokenStartupFailureRun`,
+// which gates on the three pre-model startup codes: this also matches
+// post-classification wedges such as `job_failed` / `BackoffLimitExceeded`, where
+// the wrapping k8s Job exhausted its backoff re-running a poisoned session and
+// never rotated it (BLO-10866). The stranded-issue recovery sweep uses this to
+// decide whether a recovery re-wake should ROTATE the task session
+// (`forceFreshSession`) instead of resuming the same wedged one. A false positive
+// (a run that did real work but whose adapter failed to flush usage-on-error)
+// costs only a session reset on an already-failed run — cheap and safe — so the
+// broad, error-code-agnostic gate is the right call at this call site.
+export function isZeroTokenFailedRun(
+  run: ZeroTokenStartupFailureRunInput,
+): boolean {
+  if (!run) return false;
+  if (!run.status || !UNSUCCESSFUL_TERMINAL_STATUSES.has(run.status)) return false;
+  const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
+  return inputTokens === 0 && outputTokens === 0;
+}
+
+// A zero-token terminal failure with one of these codes is a transient
+// ENVIRONMENT failure — the persisted session itself is fine, so a recovery
+// re-wake should RESUME it and preserve in-progress context, not rotate.
+// `process_lost` is the important one: a server redeploy strands in-flight runs
+// (BLO-12292) with zero tokens on a perfectly good session; rotating there would
+// wipe every in-flight agent's context on each deploy. The adapter/upstream/
+// timeout codes are the same story (a blip, not a wedge).
+const SESSION_PRESERVING_ZERO_TOKEN_ERROR_CODES = new Set<string>([
+  "adapter_failed",
+  "codex_transient_upstream",
+  "claude_transient_upstream",
+  "timeout",
+  "process_lost",
+]);
+
+// True when a stranded run should ROTATE its session on the recovery re-wake
+// (BLO-10889 WS2, decision D3): a zero-token terminal failure that looks like a
+// poisoned/structural SESSION wedge rather than a transient environment blip.
+// Poison family = context-overflow startup wedges, `job_failed` /
+// `BackoffLimitExceeded` (k8s Job exhausted its backoff re-running the same
+// session — the BLO-10866 signature), OR an unrecognized code (defense in depth
+// against future poison signatures). Transient-environment codes above are
+// excluded so healthy sessions keep their context across blips and redeploys.
+export function shouldRotateSessionForStrandedRun(
+  run: ZeroTokenStartupFailureRunInput,
+): boolean {
+  if (!isZeroTokenFailedRun(run)) return false;
+  const errorCode = typeof run?.errorCode === "string" ? run.errorCode.trim() : "";
+  if (errorCode && SESSION_PRESERVING_ZERO_TOKEN_ERROR_CODES.has(errorCode)) return false;
+  return true;
+}

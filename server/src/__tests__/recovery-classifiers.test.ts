@@ -11,8 +11,10 @@ import {
   classifyIssueGraphLiveness,
   decideRunLivenessContinuation,
   isStrandedIssueRecoveryOriginKind,
+  isZeroTokenFailedRun,
   isZeroTokenStartupFailureRun,
   parseIssueGraphLivenessIncidentKey,
+  shouldRotateSessionForStrandedRun,
 } from "../services/recovery/index.js";
 
 const companyId = "company-1";
@@ -315,5 +317,97 @@ describe("zero-token startup-failure classifier (BLO-5681)", () => {
     expect(isZeroTokenStartupFailureRun({ status: "failed", errorCode: null })).toBe(false);
     expect(isZeroTokenStartupFailureRun(null)).toBe(false);
     expect(isZeroTokenStartupFailureRun(undefined)).toBe(false);
+  });
+});
+
+describe("broad zero-token failed-run classifier (BLO-10889)", () => {
+  it("flags a terminal zero-token failure REGARDLESS of error code (catches BackoffLimitExceeded)", () => {
+    // The exact BLO-10866 signature the narrow startup classifier misses.
+    expect(
+      isZeroTokenFailedRun({
+        status: "failed",
+        errorCode: "job_failed",
+        usageJson: { inputTokens: 0, outputTokens: 0 },
+      }),
+    ).toBe(true);
+    expect(
+      isZeroTokenFailedRun({
+        status: "failed",
+        errorCode: "BackoffLimitExceeded",
+        usageJson: { input_tokens: 0, output_tokens: 0 },
+      }),
+    ).toBe(true);
+  });
+
+  it("flags zero-token failures across every terminal-unsuccessful status", () => {
+    expect(isZeroTokenFailedRun({ status: "failed", errorCode: "anything" })).toBe(true);
+    expect(isZeroTokenFailedRun({ status: "cancelled", errorCode: "whatever" })).toBe(true);
+    expect(isZeroTokenFailedRun({ status: "timed_out", errorCode: null })).toBe(true);
+  });
+
+  it("treats an absent usage blob as zero work", () => {
+    expect(isZeroTokenFailedRun({ status: "failed", errorCode: "job_failed" })).toBe(true);
+    expect(isZeroTokenFailedRun({ status: "failed", errorCode: "job_failed", usageJson: null })).toBe(true);
+  });
+
+  it("also matches the narrow pre-model startup-failure family (broad is a superset)", () => {
+    for (const errorCode of ["context_overflow", "context_length_exceeded", "startup_error_pre_model"]) {
+      expect(isZeroTokenFailedRun({ status: "failed", errorCode, usageJson: { inputTokens: 0, outputTokens: 0 } })).toBe(true);
+    }
+  });
+
+  // Regression guard: a healthy/transient strand keeps its session context.
+  it("does NOT flag a run that actually burned tokens (session context preserved)", () => {
+    expect(
+      isZeroTokenFailedRun({ status: "failed", errorCode: "job_failed", usageJson: { inputTokens: 4200, outputTokens: 0 } }),
+    ).toBe(false);
+    expect(
+      isZeroTokenFailedRun({ status: "failed", errorCode: "adapter_failed", usageJson: { input_tokens: 0, output_tokens: 7 } }),
+    ).toBe(false);
+  });
+
+  it("does NOT flag succeeded, running, or empty runs", () => {
+    expect(isZeroTokenFailedRun({ status: "succeeded", usageJson: { inputTokens: 0, outputTokens: 0 } })).toBe(false);
+    expect(isZeroTokenFailedRun({ status: "running", errorCode: "job_failed" })).toBe(false);
+    expect(isZeroTokenFailedRun(null)).toBe(false);
+    expect(isZeroTokenFailedRun(undefined)).toBe(false);
+  });
+});
+
+describe("session-rotation trigger for stranded runs (BLO-10889 WS2 / D3)", () => {
+  it("ROTATES on the poisoned-session family: job_failed / BackoffLimitExceeded", () => {
+    // The exact BLO-10866 signature: k8s Job exhausted backoff re-running a session.
+    expect(shouldRotateSessionForStrandedRun({ status: "failed", errorCode: "job_failed", usageJson: { inputTokens: 0, outputTokens: 0 } })).toBe(true);
+    expect(shouldRotateSessionForStrandedRun({ status: "failed", errorCode: "BackoffLimitExceeded", usageJson: { input_tokens: 0, output_tokens: 0 } })).toBe(true);
+  });
+
+  it("ROTATES on zero-token pre-model startup wedges", () => {
+    for (const errorCode of ["context_overflow", "context_length_exceeded", "startup_error_pre_model"]) {
+      expect(shouldRotateSessionForStrandedRun({ status: "failed", errorCode })).toBe(true);
+    }
+  });
+
+  it("ROTATES on an unrecognized zero-token failure code (defense in depth)", () => {
+    expect(shouldRotateSessionForStrandedRun({ status: "failed", errorCode: "some_future_wedge" })).toBe(true);
+    expect(shouldRotateSessionForStrandedRun({ status: "failed", errorCode: null })).toBe(true);
+  });
+
+  // The regression this trigger exists to prevent: a server redeploy (process_lost)
+  // or a transient adapter/upstream blip must NOT wipe a healthy in-flight session.
+  it("PRESERVES the session on transient-environment zero-token failures", () => {
+    for (const errorCode of ["process_lost", "adapter_failed", "timeout", "codex_transient_upstream", "claude_transient_upstream"]) {
+      expect(shouldRotateSessionForStrandedRun({ status: "failed", errorCode, usageJson: { inputTokens: 0, outputTokens: 0 } })).toBe(false);
+    }
+  });
+
+  it("PRESERVES the session when the run actually burned tokens (real work, not a wedge)", () => {
+    expect(shouldRotateSessionForStrandedRun({ status: "failed", errorCode: "job_failed", usageJson: { inputTokens: 8000, outputTokens: 40 } })).toBe(false);
+  });
+
+  it("does NOT rotate on non-terminal-unsuccessful or empty runs", () => {
+    expect(shouldRotateSessionForStrandedRun({ status: "succeeded", errorCode: "job_failed" })).toBe(false);
+    expect(shouldRotateSessionForStrandedRun({ status: "running", errorCode: "job_failed" })).toBe(false);
+    expect(shouldRotateSessionForStrandedRun(null)).toBe(false);
+    expect(shouldRotateSessionForStrandedRun(undefined)).toBe(false);
   });
 });

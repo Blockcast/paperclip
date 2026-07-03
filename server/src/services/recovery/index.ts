@@ -33,8 +33,10 @@ export {
 } from "./service.js";
 export {
   ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES,
+  isZeroTokenFailedRun,
   isZeroTokenStartupFailureRun,
   runUsageTokenCounts,
+  shouldRotateSessionForStrandedRun,
 } from "./zero-token-startup-failure.js";
 export type {
   ZeroTokenStartupFailureRunInput,
