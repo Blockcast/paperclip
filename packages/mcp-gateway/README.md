@@ -48,8 +48,8 @@ plane calls, resolves the leased `credential_ref` server-side, and forwards
 only the resolved Figma authorization header to the upstream Figma MCP server.
 
 ```sh
-PAPERCLIP_MCP_FIGMA_LEASE_URL="https://proxy.example/v1/mcp-apps/leases" \
-PAPERCLIP_MCP_FIGMA_CREDENTIAL_BASE_URL="https://proxy.example/v1/authbot/mcp-credentials" \
+PAPERCLIP_MCP_FIGMA_LEASE_URL=https://proxy.example/v1/mcp-apps/leases \
+PAPERCLIP_MCP_FIGMA_CREDENTIAL_BASE_URL=https://proxy.example/v1/authbot/mcp-credentials \
 PAPERCLIP_MCP_UPSTREAMS='{"figma":"http://figma-mcp-server.paperclip.svc:8000/mcp"}' \
   node dist/server.js
 ```
