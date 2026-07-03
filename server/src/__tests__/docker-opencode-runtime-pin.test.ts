@@ -19,7 +19,7 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   });
 
   it("vendors the claude_k8s adapter commit with shared MCP baseline injection and resume guard", () => {
-    expect(dockerfile).toContain("ARG CLAUDE_K8S_REF=4e3cc3881fa8c7281568328906b5a411e69de7e8");
+    expect(dockerfile).toContain("ARG CLAUDE_K8S_REF=c04ae02fda6fff57d2d4acf93e4d7640597b50ef");
     expect(dockerfile).toContain("always materialize the shared MCP baseline");
     expect(dockerfile).toContain("Fixes BackendEngineerGo/Ally missing paperclip/hindsight/gbrain/linear/etc.");
     expect(dockerfile).toContain("only pass --resume to Claude when the");
@@ -30,10 +30,14 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerfile).toContain("stale non-1M sessions");
     expect(dockerfile).toContain("add Claude Sonnet 5 model IDs");
     expect(dockerfile).toContain("pack-verifies");
+    expect(dockerfile).toContain("per-agent Penstock session identity");
+    expect(dockerfile).toContain("ANTHROPIC_CUSTOM_HEADERS");
+    expect(dockerfile).toContain("maxConsecutiveFailedResumes");
+    expect(dockerfile).toContain("K8S_AGENT_SESSION_POLICY");
   });
 
   it("vendors the opencode_k8s adapter commit with crash, runtime-cache, MCP header, pod-stderr, startup-wait, opencode-db, chunkTimeout, budget-cap, and compact-threshold fixes", () => {
-    expect(dockerfile).toContain("ARG OPENCODE_K8S_REF=50d2af937a31e40de4d3093898275ac338890d07");
+    expect(dockerfile).toContain("ARG OPENCODE_K8S_REF=5dae60d0e37b61072d53b2c4e139b013bc60bd80");
     expect(dockerfile).toContain("type-crash");
     expect(dockerfile).toContain("5-strike adapter crashloop circuit-breaker");
     expect(dockerfile).toContain("writable home (/paperclip/.runtime-cache)");
@@ -61,6 +65,7 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerfile).toContain("model-aware proactive compact thresholds");
     expect(dockerfile).toContain("adapterConfig.compactThreshold");
     expect(dockerfile).toContain("opencode_k8s session management");
+    expect(dockerfile).toContain("x-penstock-session: agent:<name>");
   });
 
   it("routes Paperclip Docker deploy builds through the dedicated deploy runner pool", () => {
