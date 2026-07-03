@@ -39,6 +39,32 @@ PAPERCLIP_MCP_UPSTREAMS_FILE=/config/upstreams.json node dist/server.js
 Prefix must match `/^[a-zA-Z0-9_-]+$/`. URL must start with
 `http://` or `https://`.
 
+### Figma Credential Custody
+
+The `/figma` prefix can be wired to Penstock's MCP app lease and server-side
+credential custody path. Callers authenticate to the gateway with their
+Penstock bearer; the gateway uses that bearer only for the Penstock control
+plane calls, resolves the leased `credential_ref` server-side, and forwards
+only the resolved Figma authorization header to the upstream Figma MCP server.
+
+```sh
+PAPERCLIP_MCP_FIGMA_LEASE_URL="https://proxy.example/v1/mcp-apps/leases" \
+PAPERCLIP_MCP_FIGMA_CREDENTIAL_BASE_URL="https://proxy.example/v1/authbot/mcp-credentials" \
+PAPERCLIP_MCP_UPSTREAMS='{"figma":"http://figma-mcp-server.paperclip.svc:8000/mcp"}' \
+  node dist/server.js
+```
+
+Optional knobs:
+
+- `PAPERCLIP_MCP_FIGMA_LEASE_TTL_MS` — lease TTL, default `3600000`.
+- `PAPERCLIP_MCP_FIGMA_LEASE_MODE` — `exclusive` by default; may be `shared`.
+- `PAPERCLIP_MCP_FIGMA_UPSTREAM_AUTH_SCHEME` — upstream auth scheme, default `Bearer`.
+
+If only one of the Figma custody URLs is configured, startup fails. If custody
+is configured and a request lacks caller authorization or Penstock cannot lease
+or resolve the credential, the gateway fails closed and does not contact the
+Figma upstream.
+
 ## Endpoints
 
 - `GET /healthz` — health check; returns `{ ok: true, upstreams, sessions }`.

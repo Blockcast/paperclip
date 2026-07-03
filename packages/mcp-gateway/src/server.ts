@@ -15,7 +15,17 @@
  */
 
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import {
+  CredentialCustodyError,
+  applyCustodiedAuthorization,
+  configForPrefix,
+  loadCredentialCustodyState,
+  resolveCustodiedToken,
+  type CredentialCustodyState,
+  type CredentialCustodyToken,
+} from "./credential-custody.js";
 import { loadUpstreams, matchUpstream, type UpstreamMap } from "./upstreams.js";
 import { CircuitBreaker, type CircuitBreakerConfig } from "./circuit-breaker.js";
 import {
@@ -76,6 +86,7 @@ export interface GatewayState {
   sessions: Map<string, SessionStore>;
   breaker: CircuitBreaker;
   upstreamTimeoutMs: number;
+  credentialCustody?: CredentialCustodyState;
 }
 
 /**
@@ -146,6 +157,7 @@ async function notifyUpstreamInitialized(
   inboundHeaders: http.IncomingHttpHeaders,
   upstreamSessionId: string,
   timeoutMs: number,
+  credentialToken?: CredentialCustodyToken,
 ): Promise<boolean> {
   const result = await forward(
     upstreamUrl,
@@ -154,6 +166,7 @@ async function notifyUpstreamInitialized(
     buildInitializedNotificationPayload(),
     upstreamSessionId,
     timeoutMs,
+    credentialToken,
   );
   if (isSuccess(result.status)) return true;
   // eslint-disable-next-line no-console
@@ -166,6 +179,7 @@ async function createUpstreamSession(
   inboundHeaders: http.IncomingHttpHeaders,
   initializePayload: Buffer,
   timeoutMs: number,
+  credentialToken?: CredentialCustodyToken,
 ): Promise<string | null> {
   const initializeResult = await forward(
     upstreamUrl,
@@ -174,11 +188,12 @@ async function createUpstreamSession(
     initializePayload,
     null,
     timeoutMs,
+    credentialToken,
   );
   const initializeBody = initializeResult.body.toString("utf8");
   const upstreamSessionId = extractUpstreamSessionId(initializeResult.headers, initializeBody);
   if (!isSuccess(initializeResult.status) || !upstreamSessionId) return null;
-  await notifyUpstreamInitialized(upstreamUrl, inboundHeaders, upstreamSessionId, timeoutMs);
+  await notifyUpstreamInitialized(upstreamUrl, inboundHeaders, upstreamSessionId, timeoutMs, credentialToken);
   return upstreamSessionId;
 }
 
@@ -189,6 +204,7 @@ async function forward(
   body: Buffer,
   upstreamSessionId: string | null,
   timeoutMs: number,
+  credentialToken?: CredentialCustodyToken,
 ): Promise<ForwardResult> {
   const headers: Record<string, string> = {};
   for (const [k, v] of Object.entries(inboundHeaders)) {
@@ -207,6 +223,7 @@ async function forward(
   if (upstreamSessionId) {
     headers[MCP_SESSION_HEADER] = upstreamSessionId;
   }
+  applyCustodiedAuthorization(headers, credentialToken);
   const init: RequestInit = {
     method,
     headers,
@@ -307,11 +324,23 @@ async function handleRequest(
   // is unhealthy and counts against the breaker; anything else (2xx, or an
   // application 4xx like auth/session-not-found) is a healthy round-trip.
   try {
-    const status = await serveMatched(req, res, matched, store, body, bodyText, clientSessionId, state.upstreamTimeoutMs);
+    const status = await serveMatched(
+      req,
+      res,
+      matched,
+      store,
+      body,
+      bodyText,
+      clientSessionId,
+      state.upstreamTimeoutMs,
+      configForPrefix(state.credentialCustody, prefix),
+    );
     if (status >= 500) state.breaker.recordFailure(prefix);
     else state.breaker.recordSuccess(prefix);
   } catch (e) {
-    state.breaker.recordFailure(prefix);
+    if (!(e instanceof CredentialCustodyError)) {
+      state.breaker.recordFailure(prefix);
+    }
     throw e;
   }
 }
@@ -331,12 +360,24 @@ async function serveMatched(
   bodyText: string,
   clientSessionId: string | undefined,
   timeoutMs: number,
+  custodyConfig?: CredentialCustodyState["configs"][string],
 ): Promise<number> {
   // Fast path: known client session, look up upstream id, forward.
   if (clientSessionId) {
     const record = store.get(clientSessionId);
     if (record) {
-      const result = await forward(matched.upstreamUrl, req.method ?? "POST", req.headers, body, record.upstreamSessionId, timeoutMs);
+      const credentialToken = custodyConfig
+        ? await resolveCustodiedToken(custodyConfig, req.headers, record.clientSessionId)
+        : undefined;
+      const result = await forward(
+        matched.upstreamUrl,
+        req.method ?? "POST",
+        req.headers,
+        body,
+        record.upstreamSessionId,
+        timeoutMs,
+        credentialToken,
+      );
       const text = result.body.toString("utf8");
       if (isSessionNotFoundResponse(result.status, text)) {
         // Replay path: re-issue the cached initialize, get a fresh upstream id, retry.
@@ -352,11 +393,12 @@ async function serveMatched(
           record.initializePayload,
           null,
           timeoutMs,
+          credentialToken,
         );
         const replayBody = replayInitResult.body.toString("utf8");
         const newUpstreamId = extractUpstreamSessionId(replayInitResult.headers, replayBody);
         if (isSuccess(replayInitResult.status) && newUpstreamId) {
-          await notifyUpstreamInitialized(matched.upstreamUrl, req.headers, newUpstreamId, timeoutMs);
+          await notifyUpstreamInitialized(matched.upstreamUrl, req.headers, newUpstreamId, timeoutMs, credentialToken);
           store.rotateUpstream(clientSessionId, newUpstreamId);
           // Retry the original call with the new upstream id.
           const retryResult = await forward(
@@ -366,6 +408,7 @@ async function serveMatched(
             body,
             newUpstreamId,
             timeoutMs,
+            credentialToken,
           );
           writeResponse(res, retryResult, clientSessionId);
           return retryResult.status;
@@ -382,13 +425,23 @@ async function serveMatched(
 
   const requestMethod = req.method ?? "POST";
   const isInitializeRequest = looksLikeInitializeRequest(bodyText);
+  const nextClientSessionId = clientSessionId ?? randomUUID();
+  const credentialToken = custodyConfig
+    ? await resolveCustodiedToken(custodyConfig, req.headers, nextClientSessionId)
+    : undefined;
 
   if (!isInitializeRequest && requestMethod !== "GET" && requestMethod !== "HEAD" && body.length > 0) {
     const initializePayload = buildDefaultInitializePayload();
-    const upstreamSessionId = await createUpstreamSession(matched.upstreamUrl, req.headers, initializePayload, timeoutMs);
+    const upstreamSessionId = await createUpstreamSession(
+      matched.upstreamUrl,
+      req.headers,
+      initializePayload,
+      timeoutMs,
+      credentialToken,
+    );
     if (upstreamSessionId) {
       const record = store.createInitialized({
-        clientSessionId,
+        clientSessionId: nextClientSessionId,
         upstreamSessionId,
         initializePayload,
       });
@@ -399,6 +452,7 @@ async function serveMatched(
         body,
         upstreamSessionId,
         timeoutMs,
+        credentialToken,
       );
       writeResponse(res, retryResult, record.clientSessionId);
       return retryResult.status;
@@ -409,14 +463,14 @@ async function serveMatched(
   // response sessionId for future replay, and immediately complete the
   // upstream lifecycle so clients that omit notifications/initialized do
   // not leave the upstream session stuck in its initialization phase.
-  const result = await forward(matched.upstreamUrl, requestMethod, req.headers, body, null, timeoutMs);
+  const result = await forward(matched.upstreamUrl, requestMethod, req.headers, body, null, timeoutMs, credentialToken);
   const text = result.body.toString("utf8");
   if (isInitializeRequest && isSuccess(result.status)) {
     const upstreamId = extractUpstreamSessionId(result.headers, text);
     if (upstreamId) {
-      await notifyUpstreamInitialized(matched.upstreamUrl, req.headers, upstreamId, timeoutMs);
+      await notifyUpstreamInitialized(matched.upstreamUrl, req.headers, upstreamId, timeoutMs, credentialToken);
       const record = store.createInitialized({
-        clientSessionId,
+        clientSessionId: nextClientSessionId,
         upstreamSessionId: upstreamId,
         initializePayload: body,
       });
@@ -450,8 +504,11 @@ function safeOnError(e: unknown, req: http.IncomingMessage, res: http.ServerResp
     `[mcp-gateway] request handler error: method=${req.method} url=${req.url} cause=${causeCode ?? (e as Error).name}: ${causeMessage ?? (e as Error).message}`,
   );
   if (!res.headersSent) {
-    res.statusCode = isTimeout ? 504 : 502;
+    res.statusCode = e instanceof CredentialCustodyError ? e.statusCode : isTimeout ? 504 : 502;
     res.setHeader("content-type", "application/json");
+    if (e instanceof CredentialCustodyError && e.retryAfter) {
+      res.setHeader("retry-after", e.retryAfter);
+    }
     res.end(JSON.stringify({ error: isTimeout ? "gateway timeout" : "gateway error", detail: (e as Error).message }));
   } else {
     res.end();
@@ -467,6 +524,7 @@ function main(): void {
     sessions: new Map(),
     breaker: new CircuitBreaker(config.breaker),
     upstreamTimeoutMs: config.upstreamTimeoutMs,
+    credentialCustody: loadCredentialCustodyState(),
   };
 
   const server = createGatewayServer(state);
