@@ -147,13 +147,30 @@ function hasActionablePrReviewFeedback(body: string | null | undefined, state?: 
   const text = body.trim();
   if (!text) return false;
 
-  const importantIssues = text.match(/\bImportant\s+Issues\s*\((\d+)\)/i);
-  if (importantIssues && Number(importantIssues[1]) > 0) return true;
-  if (/\bImportant\s+Issues\b/i.test(text) && !/\bImportant\s+Issues\s*\(\s*0\s*\)/i.test(text)) return true;
+  // Ally's consolidated review buckets blocking findings under a severity
+  // heading with a count, e.g. "### Critical Issues (1)" or "### Important
+  // Issues (2)". Any bucket with a non-zero count is actionable. `matchAll`
+  // (not `match`) so a zero-count bucket ("Critical Issues (0)") appearing
+  // before a non-zero one doesn't mask it. NOTE: keep this list in sync with
+  // the reviewer's severity taxonomy — a review that flags "Critical Issues"
+  // must not slip through as non-actionable (the BLO-12541/#973 stall).
+  for (const bucket of text.matchAll(/\b(?:Critical|Important)\s+Issues\s*\((\d+)\)/gi)) {
+    if (Number(bucket[1]) > 0) return true;
+  }
+  // Same headings without an explicit count still signal findings unless a
+  // count is explicitly zero.
+  if (
+    /\b(?:Critical|Important)\s+Issues\b/i.test(text) &&
+    !/\b(?:Critical|Important)\s+Issues\s*\(\s*0\s*\)/i.test(text)
+  ) {
+    return true;
+  }
   if (/^[ \t]*decision[ \t]*:[ \t]*changes_requested[ \t]*$/im.test(text)) return true;
   if (/\bchanges\s+requested\b/i.test(text)) return true;
   if (/\brequest(?:ed|s)?\s+changes\b/i.test(text)) return true;
-  if (/\bRecommended\s+Action\b[\s\S]{0,400}\bfix\b[\s\S]{0,400}\bbefore\s+merge\b/i.test(text)) return true;
+  // Match "before merge" and its inflections ("before merging/merged/merges").
+  // The bare `\bmerge\b` form silently missed "before merging" (#973).
+  if (/\bRecommended\s+Action\b[\s\S]{0,400}\bfix\b[\s\S]{0,400}\bbefore\s+merg(?:e|es|ed|ing)\b/i.test(text)) return true;
   return false;
 }
 
@@ -1368,3 +1385,4 @@ export const __test_shouldFirePrReviewerWake = shouldFirePrReviewerWake;
 export const __test_buildPrReviewerWakeIdempotencyKey = buildPrReviewerWakeIdempotencyKey;
 export const __test_buildPrReviewerTaskKey = buildPrReviewerTaskKey;
 export const __test_resolveDependabotAlertContext = resolveDependabotAlertContext;
+export const __test_hasActionablePrReviewFeedback = hasActionablePrReviewFeedback;
