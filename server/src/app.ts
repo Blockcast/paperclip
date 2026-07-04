@@ -301,6 +301,12 @@ export async function createApp(
     allowedHostnames: opts.allowedHostnames,
     bindHost: opts.bindHost,
   });
+  const selfReviewEscalationThresholdEnv =
+    process.env.PAPERCLIP_SELF_REVIEW_ESCALATION_THRESHOLD?.trim();
+  const configuredSelfReviewEscalationThreshold = selfReviewEscalationThresholdEnv
+    ? Number(selfReviewEscalationThresholdEnv)
+    : undefined;
+
   app.use(
     privateHostnameGuard({
       enabled: privateHostnameGateEnabled,
@@ -568,7 +574,9 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
       // Self-review non-convergence escalation threshold (BLO-13353). Falls back
       // to the webhook's default (3) when unset or non-numeric.
       selfReviewEscalationThreshold:
-        Number(process.env.PAPERCLIP_SELF_REVIEW_ESCALATION_THRESHOLD) || undefined,
+        Number.isFinite(configuredSelfReviewEscalationThreshold)
+          ? configuredSelfReviewEscalationThreshold
+          : undefined,
       dependabotAgentId: appConfig.githubDependabotAgentId || null,
       dependabotMinSeverity: (["low", "medium", "high", "critical"] as const).find(
         (level) => level === appConfig.githubDependabotMinSeverity,

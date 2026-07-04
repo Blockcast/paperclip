@@ -274,7 +274,12 @@ function isSelfReviewedPr(context: ResolvedEventContext, reviewerBotLogin: strin
 // Count prior actionable-feedback reopen cycles on this (issue, PR). Each call to
 // reopenInReviewIssueForActionablePrFeedback inserts one github_pr_review_feedback
 // system comment, so this is how many times the PR has been bounced to the author.
-async function countPrReviewFeedbackCycles(db: Db, issueId: string, prNumber: number): Promise<number> {
+async function countPrReviewFeedbackCycles(
+  db: Db,
+  issueId: string,
+  repoFullName: string | null,
+  prNumber: number,
+): Promise<number> {
   const rows = await db
     .select({ c: sql<number>`count(*)::int` })
     .from(issueComments)
@@ -282,6 +287,7 @@ async function countPrReviewFeedbackCycles(db: Db, issueId: string, prNumber: nu
       and(
         eq(issueComments.issueId, issueId),
         sql`${issueComments.metadata}->>'kind' = 'github_pr_review_feedback'`,
+        sql`${issueComments.metadata}->>'repoFullName' = ${repoFullName}`,
         sql`${issueComments.metadata}->>'prNumber' = ${String(prNumber)}`,
       ),
     );
@@ -1375,7 +1381,12 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           isSelfReviewedPr(context, config.prReviewerBotLogin ?? null)
         ) {
           try {
-            const cycles = await countPrReviewFeedbackCycles(db, issue.id, context.prNumber);
+            const cycles = await countPrReviewFeedbackCycles(
+              db,
+              issue.id,
+              context.repoFullName,
+              context.prNumber,
+            );
             const threshold =
               config.selfReviewEscalationThreshold ?? DEFAULT_SELF_REVIEW_ESCALATION_THRESHOLD;
             if (cycles >= threshold) {
