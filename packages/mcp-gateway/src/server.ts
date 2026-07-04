@@ -21,8 +21,10 @@ import {
   CredentialCustodyError,
   applyCustodiedAuthorization,
   configForPrefix,
+  invalidateCustodiedToken,
   loadCredentialCustodyState,
   resolveCustodiedToken,
+  type CredentialCustodyConfig,
   type CredentialCustodyState,
   type CredentialCustodyToken,
 } from "./credential-custody.js";
@@ -206,18 +208,7 @@ async function forward(
   timeoutMs: number,
   credentialToken?: CredentialCustodyToken,
 ): Promise<ForwardResult> {
-  const headers: Record<string, string> = {};
-  for (const [k, v] of Object.entries(inboundHeaders)) {
-    if (Array.isArray(v)) {
-      headers[k] = v.join(", ");
-    } else if (typeof v === "string") {
-      headers[k] = v;
-    }
-  }
-  // Strip framing + hop-by-hop headers we shouldn't forward (see
-  // STRIPPED_REQUEST_HEADERS). Leaving `transfer-encoding` in place makes
-  // undici reject the fetch with UND_ERR_INVALID_ARG.
-  for (const h of STRIPPED_REQUEST_HEADERS) delete headers[h];
+  const headers = buildForwardHeaders(inboundHeaders, credentialToken);
   // Override Mcp-Session-Id with the upstream id (or remove it for fresh init).
   delete headers[MCP_SESSION_HEADER];
   if (upstreamSessionId) {
@@ -241,6 +232,45 @@ async function forward(
   const resp = await fetch(upstreamUrl, init);
   const respBody = Buffer.from(await resp.arrayBuffer());
   return { status: resp.status, headers: resp.headers, body: respBody };
+}
+
+function buildForwardHeaders(
+  inboundHeaders: http.IncomingHttpHeaders,
+  credentialToken?: CredentialCustodyToken,
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (credentialToken) {
+    copyHeader(headers, inboundHeaders, "accept");
+    copyHeader(headers, inboundHeaders, "content-type");
+    applyCustodiedAuthorization(headers, credentialToken);
+    return headers;
+  }
+
+  for (const [k, v] of Object.entries(inboundHeaders)) {
+    if (Array.isArray(v)) {
+      headers[k] = v.join(", ");
+    } else if (typeof v === "string") {
+      headers[k] = v;
+    }
+  }
+  // Strip framing + hop-by-hop headers we shouldn't forward (see
+  // STRIPPED_REQUEST_HEADERS). Leaving `transfer-encoding` in place makes
+  // undici reject the fetch with UND_ERR_INVALID_ARG.
+  for (const h of STRIPPED_REQUEST_HEADERS) delete headers[h];
+  return headers;
+}
+
+function copyHeader(
+  headers: Record<string, string>,
+  inboundHeaders: http.IncomingHttpHeaders,
+  name: string,
+): void {
+  const value = inboundHeaders[name];
+  if (Array.isArray(value)) {
+    headers[name] = value.join(", ");
+  } else if (typeof value === "string") {
+    headers[name] = value;
+  }
 }
 
 function writeResponse(
@@ -333,7 +363,7 @@ async function handleRequest(
       bodyText,
       clientSessionId,
       state.upstreamTimeoutMs,
-      configForPrefix(state.credentialCustody, prefix),
+      matchedCustodyConfig(state.credentialCustody, prefix),
     );
     if (status >= 500) state.breaker.recordFailure(prefix);
     else state.breaker.recordSuccess(prefix);
@@ -360,14 +390,14 @@ async function serveMatched(
   bodyText: string,
   clientSessionId: string | undefined,
   timeoutMs: number,
-  custodyConfig?: CredentialCustodyState["configs"][string],
+  custodyConfig?: MatchedCustodyConfig,
 ): Promise<number> {
   // Fast path: known client session, look up upstream id, forward.
   if (clientSessionId) {
     const record = store.get(clientSessionId);
     if (record) {
       const credentialToken = custodyConfig
-        ? await resolveCustodiedToken(custodyConfig, req.headers, record.clientSessionId)
+        ? await resolveCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, record.clientSessionId)
         : undefined;
       const result = await forward(
         matched.upstreamUrl,
@@ -379,6 +409,9 @@ async function serveMatched(
         credentialToken,
       );
       const text = result.body.toString("utf8");
+      if (result.status === 401 && custodyConfig) {
+        invalidateCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, record.clientSessionId);
+      }
       if (isSessionNotFoundResponse(result.status, text)) {
         // Replay path: re-issue the cached initialize, get a fresh upstream id, retry.
         if (!record.initializePayload) {
@@ -427,7 +460,7 @@ async function serveMatched(
   const isInitializeRequest = looksLikeInitializeRequest(bodyText);
   const nextClientSessionId = clientSessionId ?? randomUUID();
   const credentialToken = custodyConfig
-    ? await resolveCustodiedToken(custodyConfig, req.headers, nextClientSessionId)
+    ? await resolveCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, nextClientSessionId)
     : undefined;
 
   if (!isInitializeRequest && requestMethod !== "GET" && requestMethod !== "HEAD" && body.length > 0) {
@@ -455,6 +488,9 @@ async function serveMatched(
         credentialToken,
       );
       writeResponse(res, retryResult, record.clientSessionId);
+      if (retryResult.status === 401 && custodyConfig) {
+        invalidateCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, record.clientSessionId);
+      }
       return retryResult.status;
     }
   }
@@ -475,11 +511,30 @@ async function serveMatched(
         initializePayload: body,
       });
       writeResponse(res, result, record.clientSessionId);
+      if (result.status === 401 && custodyConfig) {
+        invalidateCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, record.clientSessionId);
+      }
       return result.status;
     }
   }
   writeResponse(res, result, clientSessionId ?? null);
+  if (result.status === 401 && custodyConfig) {
+    invalidateCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, nextClientSessionId);
+  }
   return result.status;
+}
+
+interface MatchedCustodyConfig {
+  readonly state: CredentialCustodyState;
+  readonly config: CredentialCustodyConfig;
+}
+
+function matchedCustodyConfig(
+  state: CredentialCustodyState | undefined,
+  prefix: string,
+): MatchedCustodyConfig | undefined {
+  const config = configForPrefix(state, prefix);
+  return state && config ? { state, config } : undefined;
 }
 
 export function createGatewayServer(state: GatewayState): http.Server {

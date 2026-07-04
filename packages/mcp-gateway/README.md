@@ -45,7 +45,8 @@ The `/figma` prefix can be wired to Penstock's MCP app lease and server-side
 credential custody path. Callers authenticate to the gateway with their
 Penstock bearer; the gateway uses that bearer only for the Penstock control
 plane calls, resolves the leased `credential_ref` server-side, and forwards
-only the resolved Figma authorization header to the upstream Figma MCP server.
+only the resolved Figma authorization header plus MCP/content negotiation
+headers to the upstream Figma MCP server.
 
 ```sh
 PAPERCLIP_MCP_FIGMA_LEASE_URL=https://proxy.example/v1/mcp-apps/leases \
@@ -64,6 +65,11 @@ If only one of the Figma custody URLs is configured, startup fails. If custody
 is configured and a request lacks caller authorization or Penstock cannot lease
 or resolve the credential, the gateway fails closed and does not contact the
 Figma upstream.
+
+Resolved Figma tokens are cached in-memory per stable MCP session and caller
+authorization for most of the configured lease TTL. The cache avoids repeated
+exclusive lease acquisition during ordinary session traffic and is invalidated
+when the upstream Figma server returns `401`.
 
 ## Endpoints
 

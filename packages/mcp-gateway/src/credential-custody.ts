@@ -1,4 +1,5 @@
 import type http from "node:http";
+import { createHash } from "node:crypto";
 
 export interface CredentialCustodyConfig {
   readonly prefix: string;
@@ -12,6 +13,13 @@ export interface CredentialCustodyConfig {
 
 export interface CredentialCustodyState {
   readonly configs: Record<string, CredentialCustodyConfig>;
+  readonly tokenCache: Map<string, CredentialCustodyCacheEntry>;
+}
+
+interface CredentialCustodyCacheEntry {
+  readonly expiresAt: number;
+  readonly token?: CredentialCustodyToken;
+  readonly pending?: Promise<CredentialCustodyToken>;
 }
 
 export interface CredentialCustodyLease {
@@ -39,7 +47,7 @@ export function loadCredentialCustodyState(
   const leaseUrl = env.PAPERCLIP_MCP_FIGMA_LEASE_URL?.trim();
   const credentialBaseUrl = env.PAPERCLIP_MCP_FIGMA_CREDENTIAL_BASE_URL?.trim();
   if (!leaseUrl && !credentialBaseUrl) {
-    return { configs: {} };
+    return { configs: {}, tokenCache: new Map() };
   }
   if (!leaseUrl || !credentialBaseUrl) {
     throw new Error(
@@ -58,6 +66,7 @@ export function loadCredentialCustodyState(
         upstreamAuthorizationScheme: env.PAPERCLIP_MCP_FIGMA_UPSTREAM_AUTH_SCHEME?.trim() || "Bearer",
       },
     },
+    tokenCache: new Map(),
   };
 }
 
@@ -69,6 +78,7 @@ export function configForPrefix(
 }
 
 export async function resolveCustodiedToken(
+  state: CredentialCustodyState,
   config: CredentialCustodyConfig,
   inboundHeaders: http.IncomingHttpHeaders,
   mcpSessionId: string,
@@ -77,9 +87,37 @@ export async function resolveCustodiedToken(
   if (!callerAuthorization) {
     throw new CredentialCustodyError("Missing caller authorization for MCP credential custody", 401);
   }
-  const lease = await acquireLease(config, callerAuthorization, inboundHeaders, mcpSessionId);
-  const value = await readCredential(config, callerAuthorization, inboundHeaders, lease.credentialRef);
-  return { authorizationHeader: `${config.upstreamAuthorizationScheme} ${value}` };
+  const cacheKey = custodyCacheKey(config, callerAuthorization, mcpSessionId);
+  const now = Date.now();
+  const cached = state.tokenCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    if (cached.token) return cached.token;
+    if (cached.pending) return cached.pending;
+  }
+
+  const pending = resolveFreshCustodiedToken(config, callerAuthorization, inboundHeaders, mcpSessionId);
+  state.tokenCache.set(cacheKey, { expiresAt: cacheExpiry(config, now), pending });
+  try {
+    const token = await pending;
+    state.tokenCache.set(cacheKey, { expiresAt: cacheExpiry(config, Date.now()), token });
+    return token;
+  } catch (error) {
+    if (state.tokenCache.get(cacheKey)?.pending === pending) {
+      state.tokenCache.delete(cacheKey);
+    }
+    throw error;
+  }
+}
+
+export function invalidateCustodiedToken(
+  state: CredentialCustodyState,
+  config: CredentialCustodyConfig,
+  inboundHeaders: http.IncomingHttpHeaders,
+  mcpSessionId: string,
+): void {
+  const callerAuthorization = inboundAuthorization(inboundHeaders);
+  if (!callerAuthorization) return;
+  state.tokenCache.delete(custodyCacheKey(config, callerAuthorization, mcpSessionId));
 }
 
 export function applyCustodiedAuthorization(
@@ -119,6 +157,17 @@ async function acquireLease(
   return { credentialRef };
 }
 
+async function resolveFreshCustodiedToken(
+  config: CredentialCustodyConfig,
+  callerAuthorization: string,
+  inboundHeaders: http.IncomingHttpHeaders,
+  mcpSessionId: string,
+): Promise<CredentialCustodyToken> {
+  const lease = await acquireLease(config, callerAuthorization, inboundHeaders, mcpSessionId);
+  const value = await readCredential(config, callerAuthorization, inboundHeaders, lease.credentialRef);
+  return { authorizationHeader: `${config.upstreamAuthorizationScheme} ${value}` };
+}
+
 async function readCredential(
   config: CredentialCustodyConfig,
   callerAuthorization: string,
@@ -137,7 +186,24 @@ async function readCredential(
   if (!value) {
     throw new CredentialCustodyError("MCP credential response did not include a secret value", 502);
   }
+  if (/\r|\n/.test(value)) {
+    throw new CredentialCustodyError("MCP credential response included an invalid header value", 502);
+  }
   return value;
+}
+
+function cacheExpiry(config: CredentialCustodyConfig, now: number): number {
+  const refreshSkewMs = Math.min(60_000, Math.max(1_000, Math.floor(config.leaseTtlMs / 10)));
+  return now + Math.max(1, config.leaseTtlMs - refreshSkewMs);
+}
+
+function custodyCacheKey(
+  config: CredentialCustodyConfig,
+  callerAuthorization: string,
+  mcpSessionId: string,
+): string {
+  const authorizationHash = createHash("sha256").update(callerAuthorization).digest("hex");
+  return `${config.prefix}:${mcpSessionId}:${authorizationHash}`;
 }
 
 function custodyHttpError(message: string, response: Response): CredentialCustodyError {
