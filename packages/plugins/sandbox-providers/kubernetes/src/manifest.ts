@@ -95,7 +95,12 @@ const manifest: PaperclipPluginManifestV1 = {
           podActivityDeadlineSec: {
             type: "integer",
             minimum: 1,
-            description: "Hard ceiling on a single run's wall-clock time (default: 3600).",
+            description: "Hard ceiling on a single run's wall-clock time (default: 7200).",
+          },
+          jobBackoffLimit: {
+            type: "integer",
+            minimum: 0,
+            description: "Kubernetes Job backoffLimit for the job backend (default: 0).",
           },
           adapterType: {
             type: "string",

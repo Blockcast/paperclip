@@ -12,6 +12,7 @@ const baseInput = {
   resources: { requests: { cpu: "250m", memory: "512Mi" }, limits: { cpu: "2", memory: "4Gi" } },
   runtimeClassName: undefined,
   activeDeadlineSec: 3600,
+  backoffLimit: 0,
   ttlSecondsAfterFinished: 900,
 };
 
@@ -22,9 +23,9 @@ describe("buildJobManifest", () => {
     expect(job.kind).toBe("Job");
   });
 
-  it("sets Job-level lifecycle controls: backoffLimit=0, ttlSecondsAfterFinished, activeDeadlineSeconds", () => {
-    const job = buildJobManifest({ ...baseInput, activeDeadlineSec: 1800, ttlSecondsAfterFinished: 600 });
-    expect(job.spec.backoffLimit).toBe(0);
+  it("sets Job-level lifecycle controls: backoffLimit, ttlSecondsAfterFinished, activeDeadlineSeconds", () => {
+    const job = buildJobManifest({ ...baseInput, activeDeadlineSec: 1800, backoffLimit: 4, ttlSecondsAfterFinished: 600 });
+    expect(job.spec.backoffLimit).toBe(4);
     expect(job.spec.ttlSecondsAfterFinished).toBe(600);
     expect(job.spec.activeDeadlineSeconds).toBe(1800);
   });
