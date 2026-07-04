@@ -280,6 +280,9 @@ async function countPrReviewFeedbackCycles(
   repoFullName: string | null,
   prNumber: number,
 ): Promise<number> {
+  const repoPredicate = repoFullName
+    ? sql`(${issueComments.metadata}->>'repoFullName' = ${repoFullName} OR ${issueComments.metadata}->>'repoFullName' IS NULL)`
+    : sql`${issueComments.metadata}->>'repoFullName' IS NULL`;
   const rows = await db
     .select({ c: sql<number>`count(*)::int` })
     .from(issueComments)
@@ -287,7 +290,7 @@ async function countPrReviewFeedbackCycles(
       and(
         eq(issueComments.issueId, issueId),
         sql`${issueComments.metadata}->>'kind' = 'github_pr_review_feedback'`,
-        sql`${issueComments.metadata}->>'repoFullName' = ${repoFullName}`,
+        repoPredicate,
         sql`${issueComments.metadata}->>'prNumber' = ${String(prNumber)}`,
       ),
     );

@@ -1577,6 +1577,64 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(res.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
   });
 
+  it("counts legacy PR feedback cycles without repo metadata for the same issue and PR", async () => {
+    const { companyId, agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorType: "system",
+      body: "Prior feedback before repoFullName was persisted in metadata.",
+      metadata: {
+        kind: "github_pr_review_feedback",
+        prNumber: 269,
+      } as never,
+    });
+
+    const app = buildApp({
+      prReviewerBotLogin: "allyblockcast[bot]",
+      selfReviewEscalationThreshold: 2,
+    });
+    const payload = {
+      action: "created",
+      issue: {
+        number: 269,
+        title: "Fix hosted vault onboarding",
+        body: "Closes PEN-1126",
+        html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/penstock-llm-proxy-core/pulls/269" },
+        user: { login: "allyblockcast[bot]" },
+      },
+      comment: {
+        id: 4784546380,
+        body: "## Ally — Consolidated PR Review\n\n### Important Issues (1)\n\nFix before merge.",
+        html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269#issuecomment-4784546380",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/penstock-llm-proxy-core" },
+    };
+
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-ally-feedback-legacy-repo-metadata")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.escalated).toEqual([
+      { issueIdentifier: "PEN-1126", ownerAgentId: null, ownerType: "board", cycles: 2 },
+    ]);
+    expect(res.body.wakes).toEqual([]);
+
+    const authorWakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(authorWakes).toEqual([]);
+  });
+
   it("escalates self-reviewed PR feedback at threshold without re-waking the assignee", async () => {
     const { agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
     const app = buildApp({
