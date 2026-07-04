@@ -1696,6 +1696,19 @@ describe("hasActionablePrReviewFeedback — reviewer taxonomy", () => {
     expect(__test_hasActionablePrReviewFeedback(body)).toBe(true);
   });
 
+  it("does not mask an uncounted heading with the same label's zero-count bucket", () => {
+    const body = [
+      "### Important Issues (0)",
+      "",
+      "### Important Issues",
+      "- Retry logic can still drop the author wake.",
+      "",
+      "### Recommended Action",
+      "Fix before shipping.",
+    ].join("\n");
+    expect(__test_hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
   it("is not actionable when only zero-count severity buckets are present", () => {
     const body = "### Critical Issues (0)\n### Important Issues (0)\n\nLGTM, ship it.";
     expect(__test_hasActionablePrReviewFeedback(body)).toBe(false);
