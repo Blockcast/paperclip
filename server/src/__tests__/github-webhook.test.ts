@@ -20,8 +20,11 @@ import {
 } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import {
+  __test_backLinkAbsoluteUrl,
+  __test_buildIssueBackLinkBody,
   __test_buildPrReviewerTaskKey,
   __test_buildPrReviewerWakeIdempotencyKey,
+  __test_commentsContainBackLinkMarker,
   __test_extractPaperclipIdentifiers,
   __test_hasActionablePrReviewFeedback,
   __test_hasPrReviewerRequestMention,
@@ -1686,5 +1689,45 @@ describe("hasActionablePrReviewFeedback — reviewer taxonomy", () => {
 
   it("still short-circuits on a formal changes_requested review state", () => {
     expect(__test_hasActionablePrReviewFeedback("looks fine overall", "changes_requested")).toBe(true);
+  });
+});
+
+describe("PR→issue back-link (BLO-13353)", () => {
+  it("builds an absolute issue URL from the public base, prefix, and identifier", () => {
+    expect(__test_backLinkAbsoluteUrl("https://paperclip.blockcast.net", "BLO", "BLO-12541")).toBe(
+      "https://paperclip.blockcast.net/BLO/issues/BLO-12541",
+    );
+  });
+
+  it("strips a trailing slash on the public base and falls back to 'company' prefix when blank", () => {
+    expect(__test_backLinkAbsoluteUrl("https://paperclip.blockcast.net/", "", "PAP-1")).toBe(
+      "https://paperclip.blockcast.net/company/issues/PAP-1",
+    );
+  });
+
+  it("renders a marked, linked comment body for one issue", () => {
+    const body = __test_buildIssueBackLinkBody("https://p.example", [
+      { identifier: "BLO-12541", issuePrefix: "BLO" },
+    ]);
+    expect(body).toContain("<!-- paperclip-issue-backlink -->");
+    expect(body).toContain("[BLO-12541](https://p.example/BLO/issues/BLO-12541)");
+  });
+
+  it("lists every matched issue when a PR maps to more than one", () => {
+    const body = __test_buildIssueBackLinkBody("https://p.example", [
+      { identifier: "BLO-1", issuePrefix: "BLO" },
+      { identifier: "PAP-2", issuePrefix: "PAP" },
+    ]);
+    expect(body).toContain("[BLO-1](https://p.example/BLO/issues/BLO-1)");
+    expect(body).toContain("[PAP-2](https://p.example/PAP/issues/PAP-2)");
+  });
+
+  it("detects the dedup marker so a re-post is suppressed, and ignores unmarked comments", () => {
+    const posted = __test_buildIssueBackLinkBody("https://p.example", [
+      { identifier: "BLO-1", issuePrefix: "BLO" },
+    ]);
+    expect(__test_commentsContainBackLinkMarker(["unrelated", posted])).toBe(true);
+    expect(__test_commentsContainBackLinkMarker(["just a normal comment", "LGTM"])).toBe(false);
+    expect(__test_commentsContainBackLinkMarker([])).toBe(false);
   });
 });

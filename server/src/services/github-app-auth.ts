@@ -335,3 +335,61 @@ export async function githubHasReviewerEvidenceForPr(input: {
 
   return { found: false };
 }
+
+/**
+ * List issue/PR comment bodies (first page, up to 100) for dedup scans.
+ * Returns null when GitHub App creds are absent or the fetch fails — callers
+ * treat null as "can't tell" and skip any write, so an inert app never
+ * blind-posts. A PR→issue back-link is posted at PR-open time (the earliest
+ * comment), so page 1 in GitHub's oldest-first order always contains its marker
+ * once posted. (BLO-13353)
+ */
+export async function githubListIssueCommentBodies(input: {
+  repoFullName: string;
+  prNumber: number;
+}): Promise<string[] | null> {
+  const token = await getInstallationToken();
+  if (!token) return null;
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  try {
+    const url = `${apiBase}/repos/${input.repoFullName}/issues/${input.prNumber}/comments?per_page=100&page=1`;
+    const res = await ghFetch(url, { headers });
+    if (!res.ok) return null;
+    const batch = (await res.json()) as Array<{ body?: string | null }>;
+    return batch.map((c) => c.body ?? "");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Post an issue/PR comment as the GitHub App. Returns false when creds are
+ * absent or the write fails — the caller logs and continues; a back-link post
+ * failure must never break the webhook wake path. (BLO-13353)
+ */
+export async function githubPostIssueComment(input: {
+  repoFullName: string;
+  prNumber: number;
+  body: string;
+}): Promise<boolean> {
+  const token = await getInstallationToken();
+  if (!token) return false;
+  const headers = {
+    ...GITHUB_API_HEADERS,
+    authorization: `Bearer ${token}`,
+    "content-type": "application/json",
+  };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  try {
+    const url = `${apiBase}/repos/${input.repoFullName}/issues/${input.prNumber}/comments`;
+    const res = await ghFetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ body: input.body }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}

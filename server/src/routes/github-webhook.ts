@@ -27,12 +27,16 @@
  */
 import { Router } from "express";
 import crypto from "node:crypto";
-import { type Db, agentWakeupRequests, issueComments, issues } from "@paperclipai/db";
+import { type Db, agentWakeupRequests, companies, issueComments, issues } from "@paperclipai/db";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { logger } from "../middleware/logger.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { extractPaperclipIdentifiers } from "../services/paperclip-identifiers.js";
+import {
+  githubListIssueCommentBodies,
+  githubPostIssueComment,
+} from "../services/github-app-auth.js";
 import {
   recordMergedPullRequest,
   enrichAuthoredLocForRow,
@@ -63,6 +67,18 @@ export interface GithubWebhookConfig {
    * than pull_request_review.submitted.
    */
   prReviewerBotLogin?: string | null;
+  /**
+   * Absolute public origin of this Paperclip deployment (PAPERCLIP_PUBLIC_URL),
+   * used to build the absolute issue URL posted back onto PRs (BLO-13353). When
+   * null, the PR→issue back-link is skipped (no absolute URL can be formed).
+   */
+  publicBaseUrl?: string | null;
+  /**
+   * Gate for the PR→issue back-link comment (BLO-13353). Defaults to enabled;
+   * set false to disable. Self-gates off anyway when publicBaseUrl is unset or
+   * GitHub App creds are absent.
+   */
+  postIssueBackLink?: boolean;
   /**
    * Agent ID that receives a wake for new/reintroduced/reopened Dependabot
    * alerts (`dependabot_alert` events) at or above `dependabotMinSeverity`.
@@ -208,6 +224,31 @@ function githubPrUrl(repoFullName: string | null, prNumber: number | null, expli
   if (explicitUrl) return explicitUrl;
   if (!repoFullName || prNumber === null) return null;
   return `https://github.com/${repoFullName}/pull/${prNumber}`;
+}
+
+// PR→issue back-link (BLO-13353, #973 symptom-1). A hidden marker makes the
+// one-time post idempotent across redeliveries/reopens: if any existing PR
+// comment carries it, we never post again.
+const PR_ISSUE_BACKLINK_MARKER = "<!-- paperclip-issue-backlink -->";
+
+function backLinkAbsoluteUrl(publicBaseUrl: string, issuePrefix: string, identifier: string): string {
+  const base = publicBaseUrl.replace(/\/+$/, "");
+  const prefix = issuePrefix.trim() || "company";
+  return `${base}/${encodeURIComponent(prefix)}/issues/${encodeURIComponent(identifier)}`;
+}
+
+function buildIssueBackLinkBody(
+  publicBaseUrl: string,
+  entries: Array<{ identifier: string; issuePrefix: string }>,
+): string {
+  const lines = entries.map(
+    (e) => `🔗 Paperclip issue: [${e.identifier}](${backLinkAbsoluteUrl(publicBaseUrl, e.issuePrefix, e.identifier)})`,
+  );
+  return `${PR_ISSUE_BACKLINK_MARKER}\n${lines.join("\n")}`;
+}
+
+function commentsContainBackLinkMarker(bodies: string[]): boolean {
+  return bodies.some((b) => b.includes(PR_ISSUE_BACKLINK_MARKER));
 }
 
 interface ResolvedEventContext {
@@ -1166,6 +1207,55 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     }
 
+    // PR→issue back-link (BLO-13353, #973 symptom-1). On PR open/reopen, post a
+    // one-time comment linking the PR to its Paperclip issue(s) so a human
+    // reading the PR can navigate back. Best-effort and idempotent: a hidden
+    // marker on an existing comment suppresses re-posts; any failure (no creds,
+    // no public URL, GitHub error) is logged and never breaks the wake path.
+    // Mirrors the merged-PR forward-capture block above.
+    let backLinked: string[] = [];
+    if (
+      config.postIssueBackLink !== false &&
+      config.publicBaseUrl &&
+      eventName === "pull_request" &&
+      (context.wakeReason === "github_pr_opened" || context.wakeReason === "github_pr_reopened") &&
+      context.prNumber !== null &&
+      context.repoFullName &&
+      matched.length > 0
+    ) {
+      try {
+        const companyIds = [...new Set(matched.map((m) => m.companyId))];
+        const prefixRows = await db
+          .select({ id: companies.id, issuePrefix: companies.issuePrefix })
+          .from(companies)
+          .where(inArray(companies.id, companyIds));
+        const prefixByCompany = new Map(prefixRows.map((r) => [r.id, r.issuePrefix ?? ""]));
+        const entries = matched
+          .filter((m): m is typeof m & { identifier: string } => Boolean(m.identifier))
+          .map((m) => ({ identifier: m.identifier, issuePrefix: prefixByCompany.get(m.companyId) ?? "" }));
+        if (entries.length > 0) {
+          const existing = await githubListIssueCommentBodies({
+            repoFullName: context.repoFullName,
+            prNumber: context.prNumber,
+          });
+          // null => no creds / couldn't read: skip the write (never blind-post).
+          if (existing !== null && !commentsContainBackLinkMarker(existing)) {
+            const posted = await githubPostIssueComment({
+              repoFullName: context.repoFullName,
+              prNumber: context.prNumber,
+              body: buildIssueBackLinkBody(config.publicBaseUrl, entries),
+            });
+            if (posted) backLinked = entries.map((e) => e.identifier);
+          }
+        }
+      } catch (err) {
+        logger.warn(
+          { err, prNumber: context.prNumber, repoFullName: context.repoFullName },
+          "PR→issue back-link post failed (non-fatal)",
+        );
+      }
+    }
+
     if (matched.length === 0) {
       res.status(200).json({
         ok: true,
@@ -1370,7 +1460,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       "github webhook drove issue wakes",
     );
 
-    res.status(200).json({ ok: true, wakes, skipped, reopened });
+    res.status(200).json({ ok: true, wakes, skipped, reopened, ...(backLinked.length ? { backLinked } : {}) });
   });
 
   return router;
@@ -1386,3 +1476,6 @@ export const __test_buildPrReviewerWakeIdempotencyKey = buildPrReviewerWakeIdemp
 export const __test_buildPrReviewerTaskKey = buildPrReviewerTaskKey;
 export const __test_resolveDependabotAlertContext = resolveDependabotAlertContext;
 export const __test_hasActionablePrReviewFeedback = hasActionablePrReviewFeedback;
+export const __test_buildIssueBackLinkBody = buildIssueBackLinkBody;
+export const __test_commentsContainBackLinkMarker = commentsContainBackLinkMarker;
+export const __test_backLinkAbsoluteUrl = backLinkAbsoluteUrl;

@@ -346,6 +346,8 @@ When posting issue comments or writing issue descriptions, use concise markdown 
 
 Never leave bare ticket ids in issue descriptions or comments when a clickable internal link can be provided.
 
+**Pull requests link back to the issue (required):** When you open a GitHub PR for an issue, include the **absolute** Paperclip issue URL in the PR body so a human reading the PR can navigate straight to the issue. Build it as `<PAPERCLIP_PUBLIC_URL>/<prefix>/issues/<issue-identifier>` (e.g. `https://paperclip.blockcast.net/BLO/issues/BLO-12541`) — a bare `/BLO/issues/...` relative path does not resolve on github.com. The control plane also posts this link automatically on `pull_request.opened`, but adding it yourself at PR-creation time makes the linkage immediate and survives even when the webhook path is down.
+
 **Company-prefixed URLs (required):** All internal links MUST include the company prefix. Derive the prefix from any issue identifier you have (e.g., `PAP-315` → prefix is `PAP`). Use this prefix in all UI links:
 
 - Issues: `/<prefix>/issues/<issue-identifier>` (e.g., `/PAP/issues/PAP-224`)

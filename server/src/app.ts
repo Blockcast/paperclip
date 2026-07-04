@@ -559,6 +559,12 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
       pluginWorkerManager: workerManager,
       prReviewerAgentId: appConfig.githubPrReviewerAgentId || null,
       prReviewerBotLogin: appConfig.prReviewerBotLogin || null,
+      // PR→issue back-link (BLO-13353). Absolute public origin used to build the
+      // issue URL posted onto PRs; null (unset PAPERCLIP_PUBLIC_URL) disables it.
+      // Opt-out gate is env-driven and defaults on; the poster also self-gates
+      // off when GitHub App creds are absent.
+      publicBaseUrl: process.env.PAPERCLIP_PUBLIC_URL?.trim() || null,
+      postIssueBackLink: process.env.PAPERCLIP_POST_PR_ISSUE_BACKLINK !== "false",
       dependabotAgentId: appConfig.githubDependabotAgentId || null,
       dependabotMinSeverity: (["low", "medium", "high", "critical"] as const).find(
         (level) => level === appConfig.githubDependabotMinSeverity,
