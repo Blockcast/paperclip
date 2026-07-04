@@ -27,6 +27,7 @@ import {
   __test_commentsContainBackLinkMarker,
   __test_extractPaperclipIdentifiers,
   __test_hasActionablePrReviewFeedback,
+  __test_isSelfReviewedPr,
   __test_hasPrReviewerRequestMention,
   __test_resolveDependabotAlertContext,
   __test_resolveEventContext,
@@ -1729,5 +1730,25 @@ describe("PR→issue back-link (BLO-13353)", () => {
     expect(__test_commentsContainBackLinkMarker(["unrelated", posted])).toBe(true);
     expect(__test_commentsContainBackLinkMarker(["just a normal comment", "LGTM"])).toBe(false);
     expect(__test_commentsContainBackLinkMarker([])).toBe(false);
+  });
+});
+
+describe("self-review non-convergence detection (BLO-13353)", () => {
+  const ctx = (prAuthorLogin: string | null) =>
+    ({ prAuthorLogin }) as unknown as Parameters<typeof __test_isSelfReviewedPr>[0];
+
+  it("flags a PR authored by the reviewer bot as a self-review (case-insensitive)", () => {
+    expect(__test_isSelfReviewedPr(ctx("allyblockcast[bot]"), "allyblockcast[bot]")).toBe(true);
+    expect(__test_isSelfReviewedPr(ctx("AllyBlockcast[bot]"), "allyblockcast[bot]")).toBe(true);
+  });
+
+  it("does not flag a PR authored by someone other than the reviewer bot", () => {
+    expect(__test_isSelfReviewedPr(ctx("some-human"), "allyblockcast[bot]")).toBe(false);
+  });
+
+  it("returns false when the author or reviewer-bot login is missing", () => {
+    expect(__test_isSelfReviewedPr(ctx(null), "allyblockcast[bot]")).toBe(false);
+    expect(__test_isSelfReviewedPr(ctx("allyblockcast[bot]"), null)).toBe(false);
+    expect(__test_isSelfReviewedPr(ctx("allyblockcast[bot]"), "")).toBe(false);
   });
 });

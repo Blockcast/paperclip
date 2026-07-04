@@ -50,6 +50,7 @@ const KIND_LABEL: Record<IssueRecoveryActionKind, string> = {
   configuration_validation: "Configuration Validation",
   active_run_watchdog: "Active Watchdog",
   issue_graph_liveness: "Graph Liveness",
+  pr_review_non_convergence: "PR Review Stalled",
 };
 
 const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
@@ -64,6 +65,8 @@ const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
     "The active run has been silent. Recovery is observing without interrupting it.",
   issue_graph_liveness:
     "Paperclip detected this task lost a live action path. A recovery owner needs to act.",
+  pr_review_non_convergence:
+    "A self-reviewed PR kept getting review feedback without converging. A recovery owner needs to take over.",
 };
 
 const STATE_TONE: Record<RecoveryCardCardState, {

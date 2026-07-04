@@ -37,6 +37,7 @@ import {
   githubListIssueCommentBodies,
   githubPostIssueComment,
 } from "../services/github-app-auth.js";
+import { recoveryService } from "../services/recovery/service.js";
 import {
   recordMergedPullRequest,
   enrichAuthoredLocForRow,
@@ -79,6 +80,12 @@ export interface GithubWebhookConfig {
    * GitHub App creds are absent.
    */
   postIssueBackLink?: boolean;
+  /**
+   * Number of actionable self-review reopen cycles on a single PR before the
+   * webhook escalates up the chain of command instead of re-waking the author
+   * (BLO-13353 (b)). Defaults to 3.
+   */
+  selfReviewEscalationThreshold?: number;
   /**
    * Agent ID that receives a wake for new/reintroduced/reopened Dependabot
    * alerts (`dependabot_alert` events) at or above `dependabotMinSeverity`.
@@ -249,6 +256,36 @@ function buildIssueBackLinkBody(
 
 function commentsContainBackLinkMarker(bodies: string[]): boolean {
   return bodies.some((b) => b.includes(PR_ISSUE_BACKLINK_MARKER));
+}
+
+// Self-review PR non-convergence escalation (BLO-13353 (b)).
+const DEFAULT_SELF_REVIEW_ESCALATION_THRESHOLD = 3;
+
+// Self-review = the PR was authored by the reviewer bot itself, so the bot's
+// "review" is a self-review that can't formally request changes. Detected by
+// comparing the signed-webhook PR author login to the configured reviewer bot.
+function isSelfReviewedPr(context: ResolvedEventContext, reviewerBotLogin: string | null): boolean {
+  if (!reviewerBotLogin) return false;
+  const author = context.prAuthorLogin;
+  if (!author) return false;
+  return normalizeGithubLogin(author) === normalizeGithubLogin(reviewerBotLogin);
+}
+
+// Count prior actionable-feedback reopen cycles on this (issue, PR). Each call to
+// reopenInReviewIssueForActionablePrFeedback inserts one github_pr_review_feedback
+// system comment, so this is how many times the PR has been bounced to the author.
+async function countPrReviewFeedbackCycles(db: Db, issueId: string, prNumber: number): Promise<number> {
+  const rows = await db
+    .select({ c: sql<number>`count(*)::int` })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.issueId, issueId),
+        sql`${issueComments.metadata}->>'kind' = 'github_pr_review_feedback'`,
+        sql`${issueComments.metadata}->>'prNumber' = ${String(prNumber)}`,
+      ),
+    );
+  return rows[0]?.c ?? 0;
 }
 
 interface ResolvedEventContext {
@@ -1272,6 +1309,15 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     const wakes: Array<{ issueIdentifier: string | null; agentId: string }> = [];
     const skipped: Array<{ issueIdentifier: string | null; reason: string }> = [];
     const reopened: Array<{ issueIdentifier: string | null; commentId: string | null }> = [];
+    const escalated: Array<{
+      issueIdentifier: string | null;
+      ownerAgentId: string | null;
+      ownerType: "agent" | "board";
+      cycles: number;
+    }> = [];
+    let recoveryInstance: ReturnType<typeof recoveryService> | null = null;
+    const getRecovery = () =>
+      (recoveryInstance ??= recoveryService(db, { enqueueWakeup: heartbeat.wakeup }));
     const actionableReviewFeedback = isActionableReviewFeedbackContext(context);
 
     // pull_request.synchronize is a reviewer-only signal. The reviewer wake
@@ -1318,6 +1364,43 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         wakeCommentId = reopen.commentId;
         if (reopen.reopened) {
           reopened.push({ issueIdentifier: issue.identifier, commentId: reopen.commentId });
+        }
+        // Self-review non-convergence escalation (BLO-13353 (b)): after N
+        // actionable reopen cycles on a PR authored by the reviewer bot, hand
+        // the issue up the chain of command instead of re-waking the author.
+        // Best-effort — a failure here must never break the wake path.
+        if (
+          reopen.reopened &&
+          context.prNumber !== null &&
+          isSelfReviewedPr(context, config.prReviewerBotLogin ?? null)
+        ) {
+          try {
+            const cycles = await countPrReviewFeedbackCycles(db, issue.id, context.prNumber);
+            const threshold =
+              config.selfReviewEscalationThreshold ?? DEFAULT_SELF_REVIEW_ESCALATION_THRESHOLD;
+            if (cycles >= threshold) {
+              const result = await getRecovery().escalateStalledSelfReviewPr({
+                issueId: issue.id,
+                prNumber: context.prNumber,
+                repoFullName: context.repoFullName,
+                cycleCount: cycles,
+              });
+              escalated.push({
+                issueIdentifier: issue.identifier,
+                ownerAgentId: result.ownerAgentId,
+                ownerType: result.ownerType,
+                cycles,
+              });
+              // Hand-off done: the manager/board now owns unsticking this PR.
+              // Don't also re-wake the author — that's the loop we're breaking.
+              continue;
+            }
+          } catch (err) {
+            logger.warn(
+              { err, issueId: issue.id, prNumber: context.prNumber },
+              "self-review non-convergence escalation failed (non-fatal)",
+            );
+          }
         }
         if (effectiveAssigneeAgentId) {
           authorWakeIdempotencyKey = buildPrAuthorWakeIdempotencyKey(issue.id, context, deliveryId);
@@ -1456,11 +1539,19 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         wakeCount: wakes.length,
         reopenedCount: reopened.length,
         skippedCount: skipped.length,
+        escalatedCount: escalated.length,
       },
       "github webhook drove issue wakes",
     );
 
-    res.status(200).json({ ok: true, wakes, skipped, reopened, ...(backLinked.length ? { backLinked } : {}) });
+    res.status(200).json({
+      ok: true,
+      wakes,
+      skipped,
+      reopened,
+      ...(backLinked.length ? { backLinked } : {}),
+      ...(escalated.length ? { escalated } : {}),
+    });
   });
 
   return router;
@@ -1479,3 +1570,4 @@ export const __test_hasActionablePrReviewFeedback = hasActionablePrReviewFeedbac
 export const __test_buildIssueBackLinkBody = buildIssueBackLinkBody;
 export const __test_commentsContainBackLinkMarker = commentsContainBackLinkMarker;
 export const __test_backLinkAbsoluteUrl = backLinkAbsoluteUrl;
+export const __test_isSelfReviewedPr = isSelfReviewedPr;
