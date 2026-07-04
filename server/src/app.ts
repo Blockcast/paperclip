@@ -565,6 +565,10 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
       // off when GitHub App creds are absent.
       publicBaseUrl: process.env.PAPERCLIP_PUBLIC_URL?.trim() || null,
       postIssueBackLink: process.env.PAPERCLIP_POST_PR_ISSUE_BACKLINK !== "false",
+      // Self-review non-convergence escalation threshold (BLO-13353). Falls back
+      // to the webhook's default (3) when unset or non-numeric.
+      selfReviewEscalationThreshold:
+        Number(process.env.PAPERCLIP_SELF_REVIEW_ESCALATION_THRESHOLD) || undefined,
       dependabotAgentId: appConfig.githubDependabotAgentId || null,
       dependabotMinSeverity: (["low", "medium", "high", "critical"] as const).find(
         (level) => level === appConfig.githubDependabotMinSeverity,
