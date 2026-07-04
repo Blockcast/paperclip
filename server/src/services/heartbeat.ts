@@ -345,6 +345,25 @@ const RATE_LIMIT_HEARTBEAT_RETRY_MAX_ATTEMPTS = 12;
 // poll interval lets the sweep re-check capacity soon. PEN-382.
 export const CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS = 5 * 60 * 1000;
 export const CCROTATE_CAPACITY_RETRY_REASON = "ccrotate_capacity";
+function readIntegerEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw == null || raw.trim() === "") return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+const K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS = Math.max(
+  0,
+  readIntegerEnv("PAPERCLIP_K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS", 6),
+);
+const K8S_CCROTATE_IN_RUN_RETRY_DEFAULT_DELAY_MS = Math.max(
+  1_000,
+  readIntegerEnv("PAPERCLIP_K8S_CCROTATE_IN_RUN_RETRY_DEFAULT_DELAY_MS", 90_000),
+);
+const K8S_CCROTATE_IN_RUN_RETRY_MAX_DELAY_MS = Math.max(
+  1_000,
+  readIntegerEnv("PAPERCLIP_K8S_CCROTATE_IN_RUN_RETRY_MAX_DELAY_MS", 600_000),
+);
 // Backstop so a pool that never recovers eventually stops re-deferring and
 // surfaces for operator attention instead of looping forever. PEN-382.
 export const CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS = 24;
@@ -2328,6 +2347,69 @@ export function isRateLimitExhausted(
   if (typeof opts?.errorMessage === "string" && /API Error:\s*401\b/.test(opts.errorMessage)) return true;
 
   return false;
+}
+
+function looksLikeRetryableDeadlineExceeded(value: unknown): boolean {
+  return typeof value === "string" && /(?:deadline[_\s-]*exceeded|upstream request timeout|gateway timeout|504\b)/i.test(value);
+}
+
+function retryNotBeforeDelayMs(value: unknown, now = Date.now()): number | null {
+  if (!(typeof value === "string" || typeof value === "number" || value instanceof Date)) return null;
+  const parsed = new Date(value).getTime();
+  if (!Number.isFinite(parsed)) return null;
+  return Math.max(0, parsed - now);
+}
+
+function retryAfterDelayMs(value: unknown): number | null {
+  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number.parseFloat(value) : NaN;
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return Math.ceil(parsed * 1000);
+}
+
+function zeroTokenUsage(usage: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number } | undefined) {
+  if (!usage) return true;
+  return (usage.inputTokens ?? 0) <= 0 && (usage.outputTokens ?? 0) <= 0 && (usage.cachedInputTokens ?? 0) <= 0;
+}
+
+export function isRetryableK8sCcrotateThrottleResult(result: {
+  errorMessage?: string | null;
+  errorCode?: string | null;
+  errorFamily?: string | null;
+  retryNotBefore?: string | null;
+  resultJson?: Record<string, unknown> | null;
+  usage?: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number };
+}) {
+  if (!zeroTokenUsage(result.usage)) return false;
+  if (result.errorFamily === "rate_limit_exhausted") return true;
+  if (isRateLimitExhausted(result.resultJson, { errorMessage: result.errorMessage })) return true;
+  const resultJson = result.resultJson ?? null;
+  const textFields = [
+    result.errorMessage,
+    result.errorCode,
+    resultJson?.error,
+    resultJson?.message,
+    resultJson?.summary,
+    resultJson?.result,
+  ];
+  return textFields.some(looksLikeRetryableDeadlineExceeded);
+}
+
+export function k8sCcrotateRetryDelayMs(result: { retryNotBefore?: string | null; resultJson?: Record<string, unknown> | null }) {
+  const resultJson = result.resultJson ?? null;
+  const retryNotBeforeMs = retryNotBeforeDelayMs(
+    result.retryNotBefore ?? resultJson?.retryNotBefore ?? resultJson?.transientRetryNotBefore,
+  );
+  const retryAfterMs = retryAfterDelayMs(
+    resultJson?.retry_after_seconds ?? resultJson?.retryAfterSeconds ?? resultJson?.retry_after ?? resultJson?.retryAfter,
+  );
+  return Math.min(
+    retryNotBeforeMs ?? retryAfterMs ?? K8S_CCROTATE_IN_RUN_RETRY_DEFAULT_DELAY_MS,
+    K8S_CCROTATE_IN_RUN_RETRY_MAX_DELAY_MS,
+  );
+}
+
+function sleepMs(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function readNonEmptyString(value: unknown): string | null {
@@ -13060,31 +13142,62 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             } as Awaited<ReturnType<typeof adapter.execute>>;
             await recordWorkspaceFinalize("failed", { errorMessage });
           } else {
-            adapterResult = await adapter.execute({
-              runId: run.id,
-              agent,
-              runtime: runtimeForAdapter,
-              config: runtimeConfig,
-              context,
-              runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
-              executionTarget,
-              executionTransport: remoteExecution
-                ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
-                : undefined,
-              onLog,
-              onMeta: onAdapterMeta,
-              onSpawn: async (meta) => {
-                await persistRunProcessMetadata(run.id, {
-                  pid: meta.pid,
-                  processGroupId:
-                    "processGroupId" in meta && typeof meta.processGroupId === "number"
-                      ? meta.processGroupId
-                      : null,
-                  startedAt: meta.startedAt,
-                });
-              },
-              authToken: authToken ?? undefined,
-            });
+            let ccrotateRetryAttempt = 0;
+            while (true) {
+              adapterResult = await adapter.execute({
+                runId: run.id,
+                agent,
+                runtime: runtimeForAdapter,
+                config: runtimeConfig,
+                context,
+                runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
+                executionTarget,
+                executionTransport: remoteExecution
+                  ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
+                  : undefined,
+                onLog,
+                onMeta: onAdapterMeta,
+                onSpawn: async (meta) => {
+                  await persistRunProcessMetadata(run.id, {
+                    pid: meta.pid,
+                    processGroupId:
+                      "processGroupId" in meta && typeof meta.processGroupId === "number"
+                        ? meta.processGroupId
+                        : null,
+                    startedAt: meta.startedAt,
+                  });
+                },
+                authToken: authToken ?? undefined,
+              });
+              if (
+                !isK8sAdapter(agent.adapterType) ||
+                !isRetryableK8sCcrotateThrottleResult(adapterResult) ||
+                ccrotateRetryAttempt >= K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS
+              ) {
+                break;
+              }
+              ccrotateRetryAttempt += 1;
+              const retryDelayMs = k8sCcrotateRetryDelayMs(adapterResult);
+              const retryPayload = {
+                attempt: ccrotateRetryAttempt,
+                maxAttempts: K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS,
+                delayMs: retryDelayMs,
+                errorCode: adapterResult.errorCode ?? null,
+                retryNotBefore: adapterResult.retryNotBefore ?? adapterResult.resultJson?.retryNotBefore ?? null,
+              };
+              await appendRunEvent(currentRun, seq++, {
+                eventType: "lifecycle",
+                stream: "system",
+                level: "warn",
+                message: "retryable ccrotate throttle surfaced from k8s adapter; retrying inside the same heartbeat run",
+                payload: retryPayload,
+              });
+              await onLog(
+                "stderr",
+                `[paperclip] Retryable ccrotate throttle before model progress; retrying in ${Math.ceil(retryDelayMs / 1000)}s (${ccrotateRetryAttempt}/${K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS}).\n`,
+              );
+              await sleepMs(retryDelayMs);
+            }
             // Adapter returned cleanly, which means its workspace-restore finally
             // block also ran without throwing. Record the workspace_finalize
             // barrier so dependents that share this executionWorkspace can wake.
@@ -13183,10 +13296,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outcome = "failed";
       }
       let rateLimitExhaustedOverride = false;
+      let providerThrottledNoProgressOverride = false;
       const looksRateLimited = isRateLimitExhausted(adapterResult.resultJson, {
         errorMessage: adapterResult.errorMessage,
       });
-      if (outcome === "succeeded" && looksRateLimited) {
+      if (outcome === "succeeded" && isK8sAdapter(agent.adapterType) && isRetryableK8sCcrotateThrottleResult(adapterResult)) {
+        outcome = "failed";
+        providerThrottledNoProgressOverride = true;
+      } else if (outcome === "succeeded" && looksRateLimited) {
         outcome = "failed";
         rateLimitExhaustedOverride = true;
       } else if (outcome === "failed" && looksRateLimited) {
@@ -13280,6 +13397,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const normalizedUsage = sessionUsageResolution.normalizedUsage;
       const runErrorMessage = rateLimitExhaustedOverride
         ? "Run hit Anthropic rate limit (out of extra usage); scheduled for transient retry"
+        : providerThrottledNoProgressOverride
+          ? "Run hit provider throttle/deadline before any token usage; scheduled for transient retry"
         : prReviewIncompleteOverride
           ? prReviewIncompleteOverride.errorMessage
         : outcome === "cancelled"
@@ -13292,6 +13411,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               );
       const runErrorCode = rateLimitExhaustedOverride
         ? "rate_limit_exhausted"
+        : providerThrottledNoProgressOverride
+          ? "provider_throttled_no_progress"
         : prReviewIncompleteOverride
           ? prReviewIncompleteOverride.errorCode
         : outcome === "timed_out"
@@ -13379,10 +13500,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               // right schedule curve. rate_limit_exhausted -> flat 90s retry
               // (gate decides if pool has capacity); generic adapter-reported
               // transient_upstream -> exponential backoff.
-              errorFamily: rateLimitExhaustedOverride
+              errorFamily: rateLimitExhaustedOverride || providerThrottledNoProgressOverride
                 ? "rate_limit_exhausted"
                 : (adapterResult.errorFamily ?? null),
               retryNotBefore: adapterResult.retryNotBefore ?? null,
+              ...(providerThrottledNoProgressOverride ? { providerThrottleNoProgress: true } : {}),
             }),
             modelProfileApplication,
           ),

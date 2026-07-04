@@ -298,6 +298,7 @@ const plugin = definePlugin({
           resources: config.defaultResources ?? {},
           runtimeClassName: config.runtimeClassName,
           activeDeadlineSec: config.podActivityDeadlineSec,
+          backoffLimit: config.jobBackoffLimit,
           ttlSecondsAfterFinished: config.jobTtlSecondsAfterFinished,
           imagePullSecrets: config.imagePullSecrets,
         });

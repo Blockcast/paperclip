@@ -1,7 +1,7 @@
 // Tests for cap/rate-limit-exhausted detection and the corresponding
 // outcome override that routes the run into the bounded transient retry.
 import { describe, expect, it } from "vitest";
-import { isRateLimitExhausted } from "../services/heartbeat.js";
+import { isRateLimitExhausted, isRetryableK8sCcrotateThrottleResult, k8sCcrotateRetryDelayMs } from "../services/heartbeat.js";
 
 describe("isRateLimitExhausted", () => {
   it("returns false for null", () => {
@@ -289,6 +289,41 @@ describe("heartbeat outcome — rate-limit-exhausted integration", () => {
     expect(r.outcome).toBe("cancelled");
     expect(r.errorCode).toBe("cancelled");
     expect(r.rateLimitExhaustedOverride).toBe(false);
+  });
+});
+
+describe("k8s ccrotate no-progress throttle detection", () => {
+  it("flags zero-token 429/cap results as retryable in-run throttle", () => {
+    expect(
+      isRetryableK8sCcrotateThrottleResult({
+        resultJson: { api_error_status: 429 },
+        usage: { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 },
+      }),
+    ).toBe(true);
+  });
+
+  it("flags zero-token deadline-exceeded surfaces as retryable in-run throttle", () => {
+    expect(
+      isRetryableK8sCcrotateThrottleResult({
+        errorMessage: "ccrotate serve deadline_exceeded before upstream returned",
+        resultJson: {},
+        usage: { inputTokens: 0, outputTokens: 0 },
+      }),
+    ).toBe(true);
+  });
+
+  it("does not retry once the adapter reports token usage", () => {
+    expect(
+      isRetryableK8sCcrotateThrottleResult({
+        resultJson: { api_error_status: 429 },
+        usage: { inputTokens: 12, outputTokens: 0 },
+      }),
+    ).toBe(false);
+  });
+
+  it("honors ccrotate retry_after duration fields when choosing the in-run retry delay", () => {
+    expect(k8sCcrotateRetryDelayMs({ resultJson: { retry_after: 123 } })).toBe(123_000);
+    expect(k8sCcrotateRetryDelayMs({ resultJson: { retry_after_seconds: "45" } })).toBe(45_000);
   });
 });
 

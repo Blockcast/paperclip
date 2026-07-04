@@ -73,7 +73,8 @@ Common optional fields:
 | `runtimeClassName` | (none) | e.g. `kata-fc` for Firecracker-backed microVMs. Cluster must have the RuntimeClass installed. |
 | `serviceAccountAnnotations` | `{}` | Annotations applied to per-tenant ServiceAccount (e.g. IRSA `eks.amazonaws.com/role-arn`). |
 | `jobTtlSecondsAfterFinished` | `900` | Seconds after a Job completes before garbage-collection. |
-| `podActivityDeadlineSec` | `3600` | Hard ceiling on a single run's wall-clock time. |
+| `podActivityDeadlineSec` | `7200` | Hard ceiling on a single run's wall-clock time. |
+| `jobBackoffLimit` | `6` | Kubernetes Job retry limit for the `job` backend. |
 
 Full JSON Schema in `src/manifest.ts`.
 
@@ -104,7 +105,7 @@ Secret             pc-{ulid}-env                   (owned by Sandbox CR; cascade
 For each agent run (job backend):
 
 ```
-Job                pc-{ulid}                       (backoffLimit: 0, ttlSecondsAfterFinished from config)
+Job                pc-{ulid}                       (backoffLimit, ttlSecondsAfterFinished from config)
 Pod                pc-{ulid}-{podSuffix}           (owned by Job; cascade-deleted)
 Secret             pc-{ulid}-env                   (owned by Job; cascade-deleted)
 ```

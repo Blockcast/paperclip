@@ -35,7 +35,8 @@ describe("plugin", () => {
         namespacePrefix: "paperclip-",
         egressMode: "standard",
         jobTtlSecondsAfterFinished: 900,
-        podActivityDeadlineSec: 3600,
+        podActivityDeadlineSec: 7200,
+        jobBackoffLimit: 6,
         adapterType: "claude_local",
         backend: "sandbox-cr", // new default
       }),

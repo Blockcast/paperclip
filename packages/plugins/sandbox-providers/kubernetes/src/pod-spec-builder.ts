@@ -12,6 +12,7 @@ export interface BuildJobManifestInput {
   };
   runtimeClassName?: string;
   activeDeadlineSec: number;
+  backoffLimit: number;
   ttlSecondsAfterFinished: number;
   imagePullSecrets?: string[];
 }
@@ -30,7 +31,7 @@ export function buildJobManifest(input: BuildJobManifestInput): Record<string, u
       labels: { ...input.labels },
     },
     spec: {
-      backoffLimit: 0,
+      backoffLimit: input.backoffLimit,
       ttlSecondsAfterFinished: input.ttlSecondsAfterFinished,
       activeDeadlineSeconds: input.activeDeadlineSec,
       template: {
