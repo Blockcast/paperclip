@@ -27,12 +27,17 @@
  */
 import { Router } from "express";
 import crypto from "node:crypto";
-import { type Db, agentWakeupRequests, issueComments, issues } from "@paperclipai/db";
+import { type Db, agentWakeupRequests, companies, issueComments, issues } from "@paperclipai/db";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { logger } from "../middleware/logger.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { extractPaperclipIdentifiers } from "../services/paperclip-identifiers.js";
+import {
+  githubListIssueCommentBodies,
+  githubPostIssueComment,
+} from "../services/github-app-auth.js";
+import { recoveryService } from "../services/recovery/service.js";
 import {
   recordMergedPullRequest,
   enrichAuthoredLocForRow,
@@ -63,6 +68,24 @@ export interface GithubWebhookConfig {
    * than pull_request_review.submitted.
    */
   prReviewerBotLogin?: string | null;
+  /**
+   * Absolute public origin of this Paperclip deployment (PAPERCLIP_PUBLIC_URL),
+   * used to build the absolute issue URL posted back onto PRs (BLO-13353). When
+   * null, the PR→issue back-link is skipped (no absolute URL can be formed).
+   */
+  publicBaseUrl?: string | null;
+  /**
+   * Gate for the PR→issue back-link comment (BLO-13353). Defaults to enabled;
+   * set false to disable. Self-gates off anyway when publicBaseUrl is unset or
+   * GitHub App creds are absent.
+   */
+  postIssueBackLink?: boolean;
+  /**
+   * Number of actionable self-review reopen cycles on a single PR before the
+   * webhook escalates up the chain of command instead of re-waking the author
+   * (BLO-13353 (b)). Defaults to 3.
+   */
+  selfReviewEscalationThreshold?: number;
   /**
    * Agent ID that receives a wake for new/reintroduced/reopened Dependabot
    * alerts (`dependabot_alert` events) at or above `dependabotMinSeverity`.
@@ -208,6 +231,61 @@ function githubPrUrl(repoFullName: string | null, prNumber: number | null, expli
   if (explicitUrl) return explicitUrl;
   if (!repoFullName || prNumber === null) return null;
   return `https://github.com/${repoFullName}/pull/${prNumber}`;
+}
+
+// PR→issue back-link (BLO-13353, #973 symptom-1). A hidden marker makes the
+// one-time post idempotent across redeliveries/reopens: if any existing PR
+// comment carries it, we never post again.
+const PR_ISSUE_BACKLINK_MARKER = "<!-- paperclip-issue-backlink -->";
+
+function backLinkAbsoluteUrl(publicBaseUrl: string, issuePrefix: string, identifier: string): string {
+  const base = publicBaseUrl.replace(/\/+$/, "");
+  const prefix = issuePrefix.trim() || "company";
+  return `${base}/${encodeURIComponent(prefix)}/issues/${encodeURIComponent(identifier)}`;
+}
+
+function buildIssueBackLinkBody(
+  publicBaseUrl: string,
+  entries: Array<{ identifier: string; issuePrefix: string }>,
+): string {
+  const lines = entries.map(
+    (e) => `🔗 Paperclip issue: [${e.identifier}](${backLinkAbsoluteUrl(publicBaseUrl, e.issuePrefix, e.identifier)})`,
+  );
+  return `${PR_ISSUE_BACKLINK_MARKER}\n${lines.join("\n")}`;
+}
+
+function commentsContainBackLinkMarker(bodies: string[]): boolean {
+  return bodies.some((b) => b.includes(PR_ISSUE_BACKLINK_MARKER));
+}
+
+// Self-review PR non-convergence escalation (BLO-13353 (b)).
+const DEFAULT_SELF_REVIEW_ESCALATION_THRESHOLD = 3;
+
+// Self-review = the PR was authored by the reviewer bot itself, so the bot's
+// "review" is a self-review that can't formally request changes. Detected by
+// comparing the signed-webhook PR author login to the configured reviewer bot.
+function isSelfReviewedPr(context: ResolvedEventContext, reviewerBotLogin: string | null): boolean {
+  if (!reviewerBotLogin) return false;
+  const author = context.prAuthorLogin;
+  if (!author) return false;
+  return normalizeGithubLogin(author) === normalizeGithubLogin(reviewerBotLogin);
+}
+
+// Count prior actionable-feedback reopen cycles on this (issue, PR). Each call to
+// reopenInReviewIssueForActionablePrFeedback inserts one github_pr_review_feedback
+// system comment, so this is how many times the PR has been bounced to the author.
+async function countPrReviewFeedbackCycles(db: Db, issueId: string, prNumber: number): Promise<number> {
+  const rows = await db
+    .select({ c: sql<number>`count(*)::int` })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.issueId, issueId),
+        sql`${issueComments.metadata}->>'kind' = 'github_pr_review_feedback'`,
+        sql`${issueComments.metadata}->>'prNumber' = ${String(prNumber)}`,
+      ),
+    );
+  return rows[0]?.c ?? 0;
 }
 
 interface ResolvedEventContext {
@@ -1166,6 +1244,55 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     }
 
+    // PR→issue back-link (BLO-13353, #973 symptom-1). On PR open/reopen, post a
+    // one-time comment linking the PR to its Paperclip issue(s) so a human
+    // reading the PR can navigate back. Best-effort and idempotent: a hidden
+    // marker on an existing comment suppresses re-posts; any failure (no creds,
+    // no public URL, GitHub error) is logged and never breaks the wake path.
+    // Mirrors the merged-PR forward-capture block above.
+    let backLinked: string[] = [];
+    if (
+      config.postIssueBackLink !== false &&
+      config.publicBaseUrl &&
+      eventName === "pull_request" &&
+      (context.wakeReason === "github_pr_opened" || context.wakeReason === "github_pr_reopened") &&
+      context.prNumber !== null &&
+      context.repoFullName &&
+      matched.length > 0
+    ) {
+      try {
+        const companyIds = [...new Set(matched.map((m) => m.companyId))];
+        const prefixRows = await db
+          .select({ id: companies.id, issuePrefix: companies.issuePrefix })
+          .from(companies)
+          .where(inArray(companies.id, companyIds));
+        const prefixByCompany = new Map(prefixRows.map((r) => [r.id, r.issuePrefix ?? ""]));
+        const entries = matched
+          .filter((m): m is typeof m & { identifier: string } => Boolean(m.identifier))
+          .map((m) => ({ identifier: m.identifier, issuePrefix: prefixByCompany.get(m.companyId) ?? "" }));
+        if (entries.length > 0) {
+          const existing = await githubListIssueCommentBodies({
+            repoFullName: context.repoFullName,
+            prNumber: context.prNumber,
+          });
+          // null => no creds / couldn't read: skip the write (never blind-post).
+          if (existing !== null && !commentsContainBackLinkMarker(existing)) {
+            const posted = await githubPostIssueComment({
+              repoFullName: context.repoFullName,
+              prNumber: context.prNumber,
+              body: buildIssueBackLinkBody(config.publicBaseUrl, entries),
+            });
+            if (posted) backLinked = entries.map((e) => e.identifier);
+          }
+        }
+      } catch (err) {
+        logger.warn(
+          { err, prNumber: context.prNumber, repoFullName: context.repoFullName },
+          "PR→issue back-link post failed (non-fatal)",
+        );
+      }
+    }
+
     if (matched.length === 0) {
       res.status(200).json({
         ok: true,
@@ -1182,6 +1309,15 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     const wakes: Array<{ issueIdentifier: string | null; agentId: string }> = [];
     const skipped: Array<{ issueIdentifier: string | null; reason: string }> = [];
     const reopened: Array<{ issueIdentifier: string | null; commentId: string | null }> = [];
+    const escalated: Array<{
+      issueIdentifier: string | null;
+      ownerAgentId: string | null;
+      ownerType: "agent" | "board";
+      cycles: number;
+    }> = [];
+    let recoveryInstance: ReturnType<typeof recoveryService> | null = null;
+    const getRecovery = () =>
+      (recoveryInstance ??= recoveryService(db, { enqueueWakeup: heartbeat.wakeup }));
     const actionableReviewFeedback = isActionableReviewFeedbackContext(context);
 
     // pull_request.synchronize is a reviewer-only signal. The reviewer wake
@@ -1228,6 +1364,43 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         wakeCommentId = reopen.commentId;
         if (reopen.reopened) {
           reopened.push({ issueIdentifier: issue.identifier, commentId: reopen.commentId });
+        }
+        // Self-review non-convergence escalation (BLO-13353 (b)): after N
+        // actionable reopen cycles on a PR authored by the reviewer bot, hand
+        // the issue up the chain of command instead of re-waking the author.
+        // Best-effort — a failure here must never break the wake path.
+        if (
+          reopen.reopened &&
+          context.prNumber !== null &&
+          isSelfReviewedPr(context, config.prReviewerBotLogin ?? null)
+        ) {
+          try {
+            const cycles = await countPrReviewFeedbackCycles(db, issue.id, context.prNumber);
+            const threshold =
+              config.selfReviewEscalationThreshold ?? DEFAULT_SELF_REVIEW_ESCALATION_THRESHOLD;
+            if (cycles >= threshold) {
+              const result = await getRecovery().escalateStalledSelfReviewPr({
+                issueId: issue.id,
+                prNumber: context.prNumber,
+                repoFullName: context.repoFullName,
+                cycleCount: cycles,
+              });
+              escalated.push({
+                issueIdentifier: issue.identifier,
+                ownerAgentId: result.ownerAgentId,
+                ownerType: result.ownerType,
+                cycles,
+              });
+              // Hand-off done: the manager/board now owns unsticking this PR.
+              // Don't also re-wake the author — that's the loop we're breaking.
+              continue;
+            }
+          } catch (err) {
+            logger.warn(
+              { err, issueId: issue.id, prNumber: context.prNumber },
+              "self-review non-convergence escalation failed (non-fatal)",
+            );
+          }
         }
         if (effectiveAssigneeAgentId) {
           authorWakeIdempotencyKey = buildPrAuthorWakeIdempotencyKey(issue.id, context, deliveryId);
@@ -1366,11 +1539,19 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         wakeCount: wakes.length,
         reopenedCount: reopened.length,
         skippedCount: skipped.length,
+        escalatedCount: escalated.length,
       },
       "github webhook drove issue wakes",
     );
 
-    res.status(200).json({ ok: true, wakes, skipped, reopened });
+    res.status(200).json({
+      ok: true,
+      wakes,
+      skipped,
+      reopened,
+      ...(backLinked.length ? { backLinked } : {}),
+      ...(escalated.length ? { escalated } : {}),
+    });
   });
 
   return router;
@@ -1386,3 +1567,7 @@ export const __test_buildPrReviewerWakeIdempotencyKey = buildPrReviewerWakeIdemp
 export const __test_buildPrReviewerTaskKey = buildPrReviewerTaskKey;
 export const __test_resolveDependabotAlertContext = resolveDependabotAlertContext;
 export const __test_hasActionablePrReviewFeedback = hasActionablePrReviewFeedback;
+export const __test_buildIssueBackLinkBody = buildIssueBackLinkBody;
+export const __test_commentsContainBackLinkMarker = commentsContainBackLinkMarker;
+export const __test_backLinkAbsoluteUrl = backLinkAbsoluteUrl;
+export const __test_isSelfReviewedPr = isSelfReviewedPr;

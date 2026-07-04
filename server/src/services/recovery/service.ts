@@ -5520,7 +5520,98 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  // Self-review non-convergence escalation (BLO-13353 (b)). When a PR authored
+  // by the reviewer bot keeps getting actionable self-review feedback without
+  // converging, the author↔self-review loop can spin forever — a same-identity
+  // self-review can't formally block, so nothing forces a resolution. Once the
+  // caller (github-webhook) detects the Nth actionable reopen cycle, hand the
+  // issue up the chain of command — manager agent first (reportsTo → creator →
+  // CTO/CEO), board only when no agent is invokable (SKILL.md rule #1) — via a
+  // recovery action + owner wake. Mirrors the stranded-recovery upsert+wake
+  // flow; re-fetches the full issue row so the caller can pass just an id.
+  async function escalateStalledSelfReviewPr(input: {
+    issueId: string;
+    prNumber: number;
+    repoFullName: string | null;
+    cycleCount: number;
+  }): Promise<{ escalated: boolean; ownerAgentId: string | null; ownerType: "agent" | "board" }> {
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, input.issueId))
+      .then((rows) => rows[0] ?? null);
+    if (!issue) return { escalated: false, ownerAgentId: null, ownerType: "board" };
+
+    const resolvedOwnerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(issue);
+    // resolveStrandedIssueRecoveryOwnerAgentId falls back to the current
+    // assignee as its last candidate — correct for stranded-run recovery, but
+    // here the assignee IS the looping author we're escalating away from.
+    // Escalating back to them would just re-arm the loop, so if the only
+    // invokable candidate is the assignee, go to the board instead.
+    const ownerAgentId =
+      resolvedOwnerAgentId && resolvedOwnerAgentId === issue.assigneeAgentId
+        ? null
+        : resolvedOwnerAgentId;
+    const action = await recoveryActionsSvc.upsertSourceScoped({
+      companyId: issue.companyId,
+      sourceIssueId: issue.id,
+      kind: "pr_review_non_convergence",
+      ownerType: ownerAgentId ? "agent" : "board",
+      ownerAgentId,
+      previousOwnerAgentId: issue.assigneeAgentId,
+      returnOwnerAgentId: issue.assigneeAgentId,
+      cause: "self_review_pr_non_convergence",
+      fingerprint: `pr_review_non_convergence:${issue.id}:${input.repoFullName ?? "unknown"}:${input.prNumber}`,
+      evidence: {
+        repoFullName: input.repoFullName,
+        prNumber: input.prNumber,
+        cycleCount: input.cycleCount,
+        priorAssigneeAgentId: issue.assigneeAgentId,
+      },
+      nextAction: ownerAgentId
+        ? `Self-reviewed PR #${input.prNumber} has cycled through review feedback ${input.cycleCount} times without converging. Take over the PR, unblock or reassign the author, or record a disposition — do not leave the author looping on its own self-review.`
+        : `Self-reviewed PR #${input.prNumber} is not converging after ${input.cycleCount} review cycles and no invokable agent can own it. Board intervention needed.`,
+      wakePolicy: ownerAgentId
+        ? { type: "wake_owner", reason: "self_review_pr_non_convergence", ownerAgentId }
+        : { type: "board_escalation", reason: "no_invokable_recovery_owner" },
+      monitorPolicy: null,
+      maxAttempts: null,
+      lastAttemptAt: new Date(),
+    });
+
+    if (ownerAgentId) {
+      await deps.enqueueWakeup(ownerAgentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "self_review_pr_non_convergence",
+        idempotencyKey: `self_review_pr_non_convergence:${action.id}:${action.attemptCount}`,
+        payload: {
+          issueId: issue.id,
+          sourceIssueId: issue.id,
+          recoveryActionId: action.id,
+          prNumber: input.prNumber,
+          repoFullName: input.repoFullName,
+          cycleCount: input.cycleCount,
+        },
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: {
+          issueId: issue.id,
+          taskId: issue.id,
+          wakeReason: "self_review_pr_non_convergence",
+          source: "issue_recovery_action",
+          recoveryActionId: action.id,
+          sourceIssueId: issue.id,
+          prNumber: input.prNumber,
+        },
+      });
+    }
+
+    return { escalated: true, ownerAgentId, ownerType: ownerAgentId ? "agent" : "board" };
+  }
+
   return {
+    escalateStalledSelfReviewPr,
     buildRunOutputSilence,
     closeRecoveredCcrotateCapacityEscalations,
     escalateCcrotateCapacityExhausted,
