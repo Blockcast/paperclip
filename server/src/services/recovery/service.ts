@@ -2758,7 +2758,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     ].join("\n");
   }
 
-  async function resolveStrandedIssueRecoveryOwnerAgentId(issue: typeof issues.$inferSelect) {
+  async function resolveStrandedIssueRecoveryOwnerAgentId(
+    issue: typeof issues.$inferSelect,
+    opts: { excludeAgentIds?: readonly (string | null | undefined)[] } = {},
+  ) {
     const candidateIds: string[] = [];
     if (issue.assigneeAgentId) {
       const assignee = await getAgent(issue.assigneeAgentId);
@@ -2778,10 +2781,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     candidateIds.push(...roleCandidates.map((agent) => agent.id));
     if (issue.assigneeAgentId) candidateIds.push(issue.assigneeAgentId);
 
+    const excluded = new Set(opts.excludeAgentIds?.filter((id): id is string => Boolean(id)) ?? []);
     const seen = new Set<string>();
     for (const agentId of candidateIds) {
       if (seen.has(agentId)) continue;
       seen.add(agentId);
+      if (excluded.has(agentId)) continue;
       const candidate = await getAgent(agentId);
       if (!candidate || candidate.companyId !== issue.companyId) continue;
       const budgetBlock = await budgets.getInvocationBlock(issue.companyId, candidate.id, {
@@ -5542,16 +5547,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows[0] ?? null);
     if (!issue) return { escalated: false, ownerAgentId: null, ownerType: "board" };
 
-    const resolvedOwnerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(issue);
-    // resolveStrandedIssueRecoveryOwnerAgentId falls back to the current
-    // assignee as its last candidate — correct for stranded-run recovery, but
-    // here the assignee IS the looping author we're escalating away from.
-    // Escalating back to them would just re-arm the loop, so if the only
-    // invokable candidate is the assignee, go to the board instead.
-    const ownerAgentId =
-      resolvedOwnerAgentId && resolvedOwnerAgentId === issue.assigneeAgentId
-        ? null
-        : resolvedOwnerAgentId;
+    // The assignee is the looping author; skip them but keep trying later
+    // chain-of-command candidates before falling back to the board.
+    const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(issue, {
+      excludeAgentIds: [issue.assigneeAgentId],
+    });
     const action = await recoveryActionsSvc.upsertSourceScoped({
       companyId: issue.companyId,
       sourceIssueId: issue.id,

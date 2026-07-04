@@ -16,6 +16,7 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
@@ -1525,6 +1526,135 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(wakesAfterDuplicate).toHaveLength(1);
   });
 
+  it("escalates non-converging self-review PRs and suppresses redelivery author wakes", async () => {
+    const { companyId, agentId, issueId } = await seedIssueWithIdentifier("BLO-13353", { status: "in_review" });
+    const ctoAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: ctoAgentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issueComments).values([
+      {
+        companyId,
+        issueId,
+        authorType: "system",
+        body: "prior review feedback 1",
+        metadata: { kind: "github_pr_review_feedback", prNumber: 598 },
+      },
+      {
+        companyId,
+        issueId,
+        authorType: "system",
+        body: "prior review feedback 2",
+        metadata: { kind: "github_pr_review_feedback", prNumber: 598 },
+      },
+    ]);
+
+    const app = buildApp();
+    const payload = {
+      action: "created",
+      issue: {
+        number: 598,
+        title: "feat(github-webhook): self-review escalation (BLO-13353)",
+        body: null,
+        html_url: "https://github.com/Blockcast/paperclip/pull/598",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/598" },
+        user: { login: "allyblockcast[bot]" },
+      },
+      comment: {
+        id: 4881352565,
+        body: [
+          "## Ally — Consolidated PR Review",
+          "",
+          "### Critical Issues (1)",
+          "",
+          "I1: The self-review PR still is not converging.",
+          "",
+          "### Recommended Action",
+          "",
+          "Fix I1 before merging.",
+        ].join("\n"),
+        html_url: "https://github.com/Blockcast/paperclip/pull/598#issuecomment-4881352565",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-self-review-feedback")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.reopened).toEqual([
+      { issueIdentifier: "BLO-13353", commentId: expect.any(String) },
+    ]);
+    expect(res.body.wakes).toEqual([]);
+    expect(res.body.escalated).toEqual([
+      { issueIdentifier: "BLO-13353", ownerAgentId: ctoAgentId, ownerType: "agent", cycles: 3 },
+    ]);
+
+    const authorWakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(authorWakes).toHaveLength(0);
+
+    const managerWakes = await db
+      .select({ reason: agentWakeupRequests.reason, payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, ctoAgentId));
+    expect(managerWakes).toHaveLength(1);
+    expect(managerWakes[0]).toMatchObject({
+      reason: "self_review_pr_non_convergence",
+      payload: expect.objectContaining({ issueId, prNumber: 598, cycleCount: 3 }),
+    });
+
+    const actions = await db
+      .select({ kind: issueRecoveryActions.kind, ownerAgentId: issueRecoveryActions.ownerAgentId })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toEqual([
+      { kind: "pr_review_non_convergence", ownerAgentId: ctoAgentId },
+    ]);
+
+    const duplicateRes = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-self-review-feedback")
+      .set("content-type", "application/json")
+      .send(body);
+    expect(duplicateRes.status).toBe(200);
+    expect(duplicateRes.body.wakes).toEqual([]);
+    expect(duplicateRes.body.skipped).toContainEqual({
+      issueIdentifier: "BLO-13353",
+      reason: "self_review_non_convergence_escalated",
+    });
+
+    const authorWakesAfterDuplicate = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(authorWakesAfterDuplicate).toHaveLength(0);
+    const managerWakesAfterDuplicate = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, ctoAgentId));
+    expect(managerWakesAfterDuplicate).toHaveLength(1);
+  });
+
   function dependabotPayload(severity: string, action = "created", alertNumber = 58) {
     return {
       action,
@@ -1746,9 +1876,12 @@ describe("self-review non-convergence detection (BLO-13353)", () => {
     expect(__test_isSelfReviewedPr(ctx("some-human"), "allyblockcast[bot]")).toBe(false);
   });
 
-  it("returns false when the author or reviewer-bot login is missing", () => {
+  it("uses the default reviewer-bot login when the config value is missing", () => {
+    expect(__test_isSelfReviewedPr(ctx("allyblockcast[bot]"), null)).toBe(true);
+    expect(__test_isSelfReviewedPr(ctx("allyblockcast[bot]"), "")).toBe(true);
+  });
+
+  it("returns false when the author is missing", () => {
     expect(__test_isSelfReviewedPr(ctx(null), "allyblockcast[bot]")).toBe(false);
-    expect(__test_isSelfReviewedPr(ctx("allyblockcast[bot]"), null)).toBe(false);
-    expect(__test_isSelfReviewedPr(ctx("allyblockcast[bot]"), "")).toBe(false);
   });
 });

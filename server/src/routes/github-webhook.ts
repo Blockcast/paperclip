@@ -265,10 +265,11 @@ const DEFAULT_SELF_REVIEW_ESCALATION_THRESHOLD = 3;
 // "review" is a self-review that can't formally request changes. Detected by
 // comparing the signed-webhook PR author login to the configured reviewer bot.
 function isSelfReviewedPr(context: ResolvedEventContext, reviewerBotLogin: string | null): boolean {
-  if (!reviewerBotLogin) return false;
+  const reviewer = normalizeGithubLogin(reviewerBotLogin || DEFAULT_PR_REVIEWER_BOT_LOGIN);
+  if (!reviewer) return false;
   const author = context.prAuthorLogin;
   if (!author) return false;
-  return normalizeGithubLogin(author) === normalizeGithubLogin(reviewerBotLogin);
+  return normalizeGithubLogin(author) === reviewer;
 }
 
 // Count prior actionable-feedback reopen cycles on this (issue, PR). Each call to
@@ -1369,28 +1370,31 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         // actionable reopen cycles on a PR authored by the reviewer bot, hand
         // the issue up the chain of command instead of re-waking the author.
         // Best-effort — a failure here must never break the wake path.
-        if (
-          reopen.reopened &&
-          context.prNumber !== null &&
-          isSelfReviewedPr(context, config.prReviewerBotLogin ?? null)
-        ) {
+        if (context.prNumber !== null && isSelfReviewedPr(context, config.prReviewerBotLogin ?? null)) {
           try {
             const cycles = await countPrReviewFeedbackCycles(db, issue.id, context.prNumber);
             const threshold =
               config.selfReviewEscalationThreshold ?? DEFAULT_SELF_REVIEW_ESCALATION_THRESHOLD;
             if (cycles >= threshold) {
-              const result = await getRecovery().escalateStalledSelfReviewPr({
-                issueId: issue.id,
-                prNumber: context.prNumber,
-                repoFullName: context.repoFullName,
-                cycleCount: cycles,
-              });
-              escalated.push({
-                issueIdentifier: issue.identifier,
-                ownerAgentId: result.ownerAgentId,
-                ownerType: result.ownerType,
-                cycles,
-              });
+              if (reopen.reopened) {
+                const result = await getRecovery().escalateStalledSelfReviewPr({
+                  issueId: issue.id,
+                  prNumber: context.prNumber,
+                  repoFullName: context.repoFullName,
+                  cycleCount: cycles,
+                });
+                escalated.push({
+                  issueIdentifier: issue.identifier,
+                  ownerAgentId: result.ownerAgentId,
+                  ownerType: result.ownerType,
+                  cycles,
+                });
+              } else {
+                skipped.push({
+                  issueIdentifier: issue.identifier,
+                  reason: "self_review_non_convergence_escalated",
+                });
+              }
               // Hand-off done: the manager/board now owns unsticking this PR.
               // Don't also re-wake the author — that's the loop we're breaking.
               continue;
