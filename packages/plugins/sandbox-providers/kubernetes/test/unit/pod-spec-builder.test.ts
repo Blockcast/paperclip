@@ -12,7 +12,7 @@ const baseInput = {
   resources: { requests: { cpu: "250m", memory: "512Mi" }, limits: { cpu: "2", memory: "4Gi" } },
   runtimeClassName: undefined,
   activeDeadlineSec: 3600,
-  backoffLimit: 6,
+  backoffLimit: 0,
   ttlSecondsAfterFinished: 900,
 };
 

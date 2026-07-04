@@ -32,7 +32,7 @@ export const kubernetesProviderConfigSchema = z
 
     jobTtlSecondsAfterFinished: z.number().int().nonnegative().default(900),
     podActivityDeadlineSec: z.number().int().positive().default(7200),
-    jobBackoffLimit: z.number().int().nonnegative().default(6),
+    jobBackoffLimit: z.number().int().nonnegative().default(0),
 
     /**
      * The adapter type that Jobs in this environment will run.

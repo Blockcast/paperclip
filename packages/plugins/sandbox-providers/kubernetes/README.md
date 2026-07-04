@@ -74,7 +74,7 @@ Common optional fields:
 | `serviceAccountAnnotations` | `{}` | Annotations applied to per-tenant ServiceAccount (e.g. IRSA `eks.amazonaws.com/role-arn`). |
 | `jobTtlSecondsAfterFinished` | `900` | Seconds after a Job completes before garbage-collection. |
 | `podActivityDeadlineSec` | `7200` | Hard ceiling on a single run's wall-clock time. |
-| `jobBackoffLimit` | `6` | Kubernetes Job retry limit for the `job` backend. |
+| `jobBackoffLimit` | `0` | Kubernetes Job retry limit for the `job` backend. Keep whole-Job retries disabled by default; agent/runtime retries should happen inside the run. |
 
 Full JSON Schema in `src/manifest.ts`.
 

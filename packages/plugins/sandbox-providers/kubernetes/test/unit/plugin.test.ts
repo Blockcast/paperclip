@@ -36,7 +36,7 @@ describe("plugin", () => {
         egressMode: "standard",
         jobTtlSecondsAfterFinished: 900,
         podActivityDeadlineSec: 7200,
-        jobBackoffLimit: 6,
+        jobBackoffLimit: 0,
         adapterType: "claude_local",
         backend: "sandbox-cr", // new default
       }),

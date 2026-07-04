@@ -100,7 +100,7 @@ const manifest: PaperclipPluginManifestV1 = {
           jobBackoffLimit: {
             type: "integer",
             minimum: 0,
-            description: "Kubernetes Job backoffLimit for the job backend (default: 6).",
+            description: "Kubernetes Job backoffLimit for the job backend (default: 0).",
           },
           adapterType: {
             type: "string",
