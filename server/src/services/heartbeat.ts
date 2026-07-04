@@ -13303,6 +13303,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (outcome === "succeeded" && isK8sAdapter(agent.adapterType) && isRetryableK8sCcrotateThrottleResult(adapterResult)) {
         outcome = "failed";
         providerThrottledNoProgressOverride = true;
+      } else if (
+        outcome === "failed" &&
+        isK8sAdapter(agent.adapterType) &&
+        isRetryableK8sCcrotateThrottleResult(adapterResult)
+      ) {
+        providerThrottledNoProgressOverride = true;
       } else if (outcome === "succeeded" && looksRateLimited) {
         outcome = "failed";
         rateLimitExhaustedOverride = true;

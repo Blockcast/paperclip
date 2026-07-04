@@ -106,8 +106,10 @@ describe("heartbeat outcome — rate-limit-exhausted integration", () => {
   // without standing up the full DB/adapter mock harness.
 
   function evaluateOutcome(input: {
+    adapterType?: string;
     exitCode: number | null;
     errorMessage: string | null;
+    usage?: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number };
     timedOut: boolean;
     cancelled: boolean;
     resultJson: Record<string, unknown> | null | undefined;
@@ -115,6 +117,7 @@ describe("heartbeat outcome — rate-limit-exhausted integration", () => {
     outcome: string;
     errorCode: string | null;
     rateLimitExhaustedOverride: boolean;
+    providerThrottledNoProgressOverride: boolean;
     persistedErrorFamily: string | null;
   } {
     let outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
@@ -129,10 +132,29 @@ describe("heartbeat outcome — rate-limit-exhausted integration", () => {
     }
 
     let rateLimitExhaustedOverride = false;
+    let providerThrottledNoProgressOverride = false;
     const looksRateLimited = isRateLimitExhausted(input.resultJson, {
       errorMessage: input.errorMessage,
     });
-    if (outcome === "succeeded" && looksRateLimited) {
+    const adapterResult = {
+      errorMessage: input.errorMessage,
+      resultJson: input.resultJson,
+      usage: input.usage,
+    };
+    if (
+      outcome === "succeeded" &&
+      input.adapterType === "claude_k8s" &&
+      isRetryableK8sCcrotateThrottleResult(adapterResult)
+    ) {
+      outcome = "failed";
+      providerThrottledNoProgressOverride = true;
+    } else if (
+      outcome === "failed" &&
+      input.adapterType === "claude_k8s" &&
+      isRetryableK8sCcrotateThrottleResult(adapterResult)
+    ) {
+      providerThrottledNoProgressOverride = true;
+    } else if (outcome === "succeeded" && looksRateLimited) {
       outcome = "failed";
       rateLimitExhaustedOverride = true;
     } else if (outcome === "failed" && looksRateLimited) {
@@ -144,6 +166,8 @@ describe("heartbeat outcome — rate-limit-exhausted integration", () => {
 
     const errorCode = rateLimitExhaustedOverride
       ? "rate_limit_exhausted"
+      : providerThrottledNoProgressOverride
+        ? "provider_throttled_no_progress"
       : outcome === "timed_out"
         ? "timeout"
         : outcome === "cancelled"
@@ -155,9 +179,16 @@ describe("heartbeat outcome — rate-limit-exhausted integration", () => {
     // Persisted errorFamily mirrors the inline override in the merge path.
     // (Updated 2026-05-06: rate-limit gets its own family so retry uses a
     // flat short delay instead of stacking 2hr exponential backoff.)
-    const persistedErrorFamily = rateLimitExhaustedOverride ? "rate_limit_exhausted" : null;
+    const persistedErrorFamily =
+      rateLimitExhaustedOverride || providerThrottledNoProgressOverride ? "rate_limit_exhausted" : null;
 
-    return { outcome, errorCode, rateLimitExhaustedOverride, persistedErrorFamily };
+    return {
+      outcome,
+      errorCode,
+      rateLimitExhaustedOverride,
+      providerThrottledNoProgressOverride,
+      persistedErrorFamily,
+    };
   }
 
   it("overrides exit-0 + 429-result → failed/rate_limit_exhausted (own family)", () => {
@@ -263,6 +294,22 @@ describe("heartbeat outcome — rate-limit-exhausted integration", () => {
     expect(r.outcome).toBe("failed");
     expect(r.rateLimitExhaustedOverride).toBe(false);
     expect(r.errorCode).toBe("adapter_failed");
+  });
+
+  it("tags already-failed k8s deadline-exceeded throttles as provider_throttled_no_progress", () => {
+    const r = evaluateOutcome({
+      adapterType: "claude_k8s",
+      exitCode: 1,
+      errorMessage: "ccrotate serve deadline_exceeded before upstream returned",
+      usage: { inputTokens: 0, outputTokens: 0 },
+      timedOut: false,
+      cancelled: false,
+      resultJson: {},
+    });
+    expect(r.outcome).toBe("failed");
+    expect(r.providerThrottledNoProgressOverride).toBe(true);
+    expect(r.errorCode).toBe("provider_throttled_no_progress");
+    expect(r.persistedErrorFamily).toBe("rate_limit_exhausted");
   });
 
   it("does NOT override timed-out runs", () => {
