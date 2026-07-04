@@ -180,13 +180,13 @@ function hasActionablePrReviewFeedback(body: string | null | undefined, state?: 
   for (const bucket of text.matchAll(/\b(?:Critical|Important)\s+Issues\s*\((\d+)\)/gi)) {
     if (Number(bucket[1]) > 0) return true;
   }
-  // Same headings without an explicit count still signal findings unless a
-  // count is explicitly zero.
-  if (
-    /\b(?:Critical|Important)\s+Issues\b/i.test(text) &&
-    !/\b(?:Critical|Important)\s+Issues\s*\(\s*0\s*\)/i.test(text)
-  ) {
-    return true;
+  // Same headings without an explicit count still signal findings unless that
+  // same severity label is explicitly zero. Check labels independently so a
+  // zero-count Critical bucket cannot mask an uncounted Important finding.
+  for (const label of ["Critical", "Important"] as const) {
+    const heading = new RegExp(`\\b${label}\\s+Issues\\b`, "i");
+    const zeroed = new RegExp(`\\b${label}\\s+Issues\\s*\\(\\s*0\\s*\\)`, "i");
+    if (heading.test(text) && !zeroed.test(text)) return true;
   }
   if (/^[ \t]*decision[ \t]*:[ \t]*changes_requested[ \t]*$/im.test(text)) return true;
   if (/\bchanges\s+requested\b/i.test(text)) return true;
