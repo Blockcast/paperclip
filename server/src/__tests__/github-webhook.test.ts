@@ -23,6 +23,7 @@ import {
   __test_buildPrReviewerTaskKey,
   __test_buildPrReviewerWakeIdempotencyKey,
   __test_extractPaperclipIdentifiers,
+  __test_hasActionablePrReviewFeedback,
   __test_hasPrReviewerRequestMention,
   __test_resolveDependabotAlertContext,
   __test_resolveEventContext,
@@ -1643,5 +1644,47 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakes).toHaveLength(1);
+  });
+});
+
+describe("hasActionablePrReviewFeedback — reviewer taxonomy", () => {
+  // Regression guard for the #973 / BLO-12541 stall: a same-identity self-review
+  // arrives as an issue_comment (no formal `changes_requested` state), so the
+  // author wake depends entirely on the body-text heuristic. The reviewer's
+  // output had drifted to "Critical Issues" + "before merging", which the old
+  // heuristic ("Important Issues" + "before merge") silently missed.
+  it("treats a 'Critical Issues (N>0)' bucket as actionable", () => {
+    const body = [
+      "## Ally — Consolidated PR Review",
+      "### Critical Issues (1)",
+      "- probePort points at :3443 but the Service only listens on :443.",
+      "### Recommended Action",
+      "1. Fix the probePort mismatch (Critical) before merging.",
+    ].join("\n");
+    expect(__test_hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  it("matches the 'before merging' inflection in the recommended-action heuristic", () => {
+    const body = "### Recommended Action\nFix the dial host before merging.";
+    expect(__test_hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  it("still detects the legacy 'Important Issues' + 'before merge' format", () => {
+    const body = "### Important Issues (1)\n\n### Recommended Action\nFix I1 before merge.";
+    expect(__test_hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  it("does not mask a non-zero bucket that follows a zero-count bucket", () => {
+    const body = "### Critical Issues (0)\n### Important Issues (2)\n- one\n- two";
+    expect(__test_hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  it("is not actionable when only zero-count severity buckets are present", () => {
+    const body = "### Critical Issues (0)\n### Important Issues (0)\n\nLGTM, ship it.";
+    expect(__test_hasActionablePrReviewFeedback(body)).toBe(false);
+  });
+
+  it("still short-circuits on a formal changes_requested review state", () => {
+    expect(__test_hasActionablePrReviewFeedback("looks fine overall", "changes_requested")).toBe(true);
   });
 });
