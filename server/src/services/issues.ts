@@ -5360,7 +5360,18 @@ export function issueService(db: Db) {
           // Log + count it explicitly; the finalize hook re-runs this same
           // query on completion, so this fires again (as ready, or gated on a
           // different blocker) rather than being a one-shot drop.
-          if (readiness.pendingFinalizeBlockerIssueIds.length > 0) {
+          //
+          // Only fire when the finalize barrier is the *sole* reason the
+          // dependent isn't ready — `unresolvedBlockerIssueIds` also contains
+          // blockers that aren't `done` at all (see
+          // `listIssueDependencyReadinessMap`), so a mismatched length means
+          // some other, wholly-unresolved blocker is the real reason this
+          // dependent is stuck. Attributing that case to the finalize gate
+          // would mislead an operator chasing the wrong barrier.
+          if (
+            readiness.pendingFinalizeBlockerIssueIds.length > 0 &&
+            readiness.pendingFinalizeBlockerIssueIds.length === readiness.unresolvedBlockerIssueIds.length
+          ) {
             incrementBlockerResolvedWakeMetric("fast_path_finalize_gated");
             logger.info(
               {
