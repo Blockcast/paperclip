@@ -5551,7 +5551,7 @@ export function issueService(db: Db) {
         naiveReadyByCompany.set(candidate.companyId, list);
       }
       const results: typeof naiveReady = [];
-      for (const [candidateCompanyId, candidatesForCompany] of naiveReadyByCompany) {
+      companyLoop: for (const [candidateCompanyId, candidatesForCompany] of naiveReadyByCompany) {
         const readinessMap = await listIssueDependencyReadinessMap(
           db,
           candidateCompanyId,
@@ -5561,6 +5561,14 @@ export function issueService(db: Db) {
           const readiness = readinessMap.get(candidate.id) ?? createIssueDependencyReadiness(candidate.id);
           if (readiness.isDependencyReady) {
             results.push(candidate);
+            // Stop scanning as soon as `limit` is reached, same as the
+            // pre-#601 single-loop behavior — checking only between companies
+            // let one over-full company push every naively-ready candidate
+            // through the readiness DB call (and through sweep_finalize_gated
+            // accounting) even past `limit`, and, when companyId is undefined,
+            // starved every company after the one that first filled `results`
+            // (Ally review on #602).
+            if (results.length >= limit) break companyLoop;
             continue;
           }
           // Only attribute the gate to workspace_finalize when it's the sole
@@ -5582,11 +5590,26 @@ export function issueService(db: Db) {
               },
               "reconcileResolvedBlockerDependents dependent outcome",
             );
+          } else {
+            // Mixed or wholly-unresolved-blocker case: not attributable to
+            // workspace_finalize. Without this branch the candidate left the
+            // loop with zero counter increment and zero log line — the exact
+            // "operator sees all-zero counters for a stuck dependent" failure
+            // mode BLO-13250/BLO-13577 exist to eliminate (Ally review on #602).
+            incrementBlockerResolvedWakeMetric("sweep_unresolved_gated");
+            logger.info(
+              {
+                dependentIssueId: candidate.id,
+                agentId: candidate.assigneeAgentId,
+                unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+                outcome: "gated",
+                skipReason: "blocker_unresolved",
+              },
+              "reconcileResolvedBlockerDependents dependent outcome",
+            );
           }
         }
-        if (results.length >= limit) break;
       }
-      results.length = Math.min(results.length, limit);
 
       const resultIds = results.map((r) => r.id);
       if (resultIds.length === 0) return results;
