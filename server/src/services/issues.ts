@@ -5364,8 +5364,9 @@ export function issueService(db: Db) {
             incrementBlockerResolvedWakeMetric("fast_path_finalize_gated");
             logger.info(
               {
-                issueId: candidate.id,
-                assigneeAgentId: candidate.assigneeAgentId,
+                issueId: blockerIssueId,
+                dependentIssueId: candidate.id,
+                agentId: candidate.assigneeAgentId,
                 pendingFinalizeBlockerIssueIds: readiness.pendingFinalizeBlockerIssueIds,
                 outcome: "gated",
                 skipReason: "workspace_finalize_pending",
