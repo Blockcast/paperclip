@@ -32,6 +32,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import {
+  getBlockerResolvedWakeMetric,
+  resetBlockerResolvedWakeMetrics,
+} from "../services/blocker-resolved-wake-metrics.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import {
   clampIssueListLimit,
@@ -4141,7 +4145,13 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       startedAt: new Date("2026-05-23T22:00:00.000Z"),
     });
 
+    // BLO-13250 (2026-07-05 recurrence): the readiness gate must count and log
+    // this exclusion, not just silently return an empty candidate list — an
+    // empty result and a genuinely-caught-up dependent were indistinguishable
+    // before this counter existed.
+    resetBlockerResolvedWakeMetrics();
     expect(await svc.listWakeableBlockedDependents(blockerId)).toEqual([]);
+    expect(getBlockerResolvedWakeMetric("fast_path_finalize_gated")).toBe(1);
     await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
       isDependencyReady: false,
       pendingFinalizeBlockerIssueIds: [blockerId],

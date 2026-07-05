@@ -64,6 +64,7 @@ import {
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -5349,7 +5350,31 @@ export function issueService(db: Db) {
           const readiness = readinessMap.get(candidate.id) ?? createIssueDependencyReadiness(candidate.id);
           return { candidate, readiness };
         })
-        .filter(({ readiness }) => readiness.isDependencyReady && readiness.blockerIssueIds.length > 0);
+        .filter(({ candidate, readiness }) => {
+          if (readiness.isDependencyReady && readiness.blockerIssueIds.length > 0) return true;
+          // BLO-13250: a dependent excluded here because a blocker is done but
+          // its execution workspace hasn't recorded workspace_finalize yet
+          // used to vanish from the candidate set with zero audit trail — the
+          // fast-path sent/skipped/failed counters never saw it, so a stuck
+          // dependent was indistinguishable from "nothing happened yet".
+          // Log + count it explicitly; the finalize hook re-runs this same
+          // query on completion, so this fires again (as ready, or gated on a
+          // different blocker) rather than being a one-shot drop.
+          if (readiness.pendingFinalizeBlockerIssueIds.length > 0) {
+            incrementBlockerResolvedWakeMetric("fast_path_finalize_gated");
+            logger.info(
+              {
+                issueId: candidate.id,
+                assigneeAgentId: candidate.assigneeAgentId,
+                pendingFinalizeBlockerIssueIds: readiness.pendingFinalizeBlockerIssueIds,
+                outcome: "gated",
+                skipReason: "workspace_finalize_pending",
+              },
+              "blocker-resolved dependent wake outcome",
+            );
+          }
+          return false;
+        });
 
       const blockedCandidateIds = withReadiness
         .filter(({ candidate }) => candidate.status === "blocked")
