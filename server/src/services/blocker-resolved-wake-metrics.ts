@@ -8,6 +8,15 @@
 //     that re-fires the wake for any dependent whose blockers are all done
 //     but which was never woken (lost fast-path wake, process restart, etc).
 //
+// fast_path_finalize_gated is a distinct, earlier exclusion: a dependent whose
+// blocker(s) are all `done` but whose execution workspace hasn't recorded a
+// successful `workspace_finalize` yet never becomes a wake candidate at all
+// (see `listWakeableBlockedDependents`'s readiness filter) — it doesn't reach
+// the sent/skipped/failed accounting below. Before this counter existed, that
+// exclusion was invisible: an operator staring at fast_path_sent/skipped/failed
+// all reading zero for a stuck dependent had no signal that the readiness gate,
+// not the dispatch path, was the reason (BLO-13250 recurrence, 2026-07-05).
+//
 // A sustained non-zero *_skipped or *_failed rate — especially outside a
 // known ccrotate-capacity or budget-block window — means dependents are
 // silently stalling behind resolved blockers. Reset on process restart;
@@ -17,6 +26,7 @@ export type BlockerResolvedWakeMetricKey =
   | "fast_path_sent"
   | "fast_path_skipped"
   | "fast_path_failed"
+  | "fast_path_finalize_gated"
   | "sweep_sent"
   | "sweep_skipped"
   | "sweep_failed";
@@ -27,6 +37,7 @@ const counters: Record<BlockerResolvedWakeMetricKey, number> = {
   fast_path_sent: 0,
   fast_path_skipped: 0,
   fast_path_failed: 0,
+  fast_path_finalize_gated: 0,
   sweep_sent: 0,
   sweep_skipped: 0,
   sweep_failed: 0,

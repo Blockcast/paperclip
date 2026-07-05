@@ -32,6 +32,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import {
+  getBlockerResolvedWakeMetric,
+  resetBlockerResolvedWakeMetrics,
+} from "../services/blocker-resolved-wake-metrics.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import {
   clampIssueListLimit,
@@ -4141,7 +4145,13 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       startedAt: new Date("2026-05-23T22:00:00.000Z"),
     });
 
+    // BLO-13250 (2026-07-05 recurrence): the readiness gate must count and log
+    // this exclusion, not just silently return an empty candidate list — an
+    // empty result and a genuinely-caught-up dependent were indistinguishable
+    // before this counter existed.
+    resetBlockerResolvedWakeMetrics();
     expect(await svc.listWakeableBlockedDependents(blockerId)).toEqual([]);
+    expect(getBlockerResolvedWakeMetric("fast_path_finalize_gated")).toBe(1);
     await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
       isDependencyReady: false,
       pendingFinalizeBlockerIssueIds: [blockerId],
@@ -4179,6 +4189,115 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       isDependencyReady: true,
       pendingFinalizeBlockerIssueIds: [],
       unresolvedBlockerIssueIds: [],
+    });
+  });
+
+  it("does NOT count/log fast_path_finalize_gated when a dependent also has a wholly-unresolved blocker (Ally review, BLO-13250)", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "QA",
+      role: "qa",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Mixed-blocker project",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Mixed-blocker workspace",
+      sourceType: "local_path",
+      visibility: "default",
+      isPrimary: true,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Mixed-blocker exec workspace",
+      status: "active",
+      providerType: "git_worktree",
+    });
+
+    const finalizePendingBlockerId = randomUUID();
+    const unresolvedBlockerId = randomUUID();
+    const dependentId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: finalizePendingBlockerId,
+        companyId,
+        projectId,
+        title: "Done blocker awaiting finalize",
+        status: "done",
+        priority: "medium",
+        executionWorkspaceId,
+      },
+      {
+        id: unresolvedBlockerId,
+        companyId,
+        projectId,
+        title: "Wholly unresolved blocker",
+        status: "in_progress",
+        priority: "medium",
+      },
+      {
+        id: dependentId,
+        companyId,
+        projectId,
+        title: "Dependent with mixed blockers",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+    await svc.update(dependentId, {
+      blockedByIssueIds: [finalizePendingBlockerId, unresolvedBlockerId],
+    });
+
+    // The done blocker's workspace touched the finalize barrier but hasn't
+    // recorded a successful workspace_finalize yet.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      phase: "worktree_prepare",
+      status: "succeeded",
+      startedAt: new Date("2026-07-05T00:00:00.000Z"),
+    });
+
+    resetBlockerResolvedWakeMetrics();
+    expect(await svc.listWakeableBlockedDependents(finalizePendingBlockerId)).toEqual([]);
+    // The dependent is also stuck on a blocker that isn't `done` at all, so
+    // the finalize gate is not the sole reason — must not be counted/logged
+    // as `fast_path_finalize_gated`.
+    expect(getBlockerResolvedWakeMetric("fast_path_finalize_gated")).toBe(0);
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      isDependencyReady: false,
+      pendingFinalizeBlockerIssueIds: [finalizePendingBlockerId],
+      unresolvedBlockerIssueIds: expect.arrayContaining([finalizePendingBlockerId, unresolvedBlockerId]),
     });
   });
 
