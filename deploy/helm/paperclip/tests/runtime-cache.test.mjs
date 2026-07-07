@@ -19,6 +19,10 @@ const expectedCacheEnv = {
   PLAYWRIGHT_BROWSERS_PATH: "/runtime-cache/ms-playwright",
 };
 
+const expectedConfigEnv = {
+  XDG_CONFIG_HOME: "/runtime-config",
+};
+
 function renderStatefulSet(extraArgs = []) {
   return execFileSync(
     "helm",
@@ -225,6 +229,78 @@ test("runtimeCache can be disabled for API tier rollback", () => {
   assert.doesNotMatch(rendered, /mountPath: "\/runtime-cache"/);
   assert.doesNotMatch(rendered, /\/runtime-cache\//);
   assert.doesNotMatch(rendered, /XDG_CACHE_HOME/);
+});
+
+test("runtimeConfig mounts emptyDir and redirects browser config", () => {
+  const rendered = renderStatefulSet();
+
+  for (const [name, value] of Object.entries(expectedConfigEnv)) {
+    const pattern = new RegExp(
+      `- name: ${escapeRegExp(name)}\\n\\s+value: ["']?${escapeRegExp(value)}["']?`,
+      "g",
+    );
+    assert.equal(
+      countMatches(rendered, pattern),
+      2,
+      `${name} should render for the seed init container and the paperclip container`,
+    );
+  }
+
+  assert.equal(
+    countMatches(rendered, /- name: runtime-config\n\s+mountPath: "\/runtime-config"/g),
+    2,
+    "runtime-config should mount into the seed init container and the paperclip container",
+  );
+  assert.match(
+    rendered,
+    /- name: runtime-config\n\s+emptyDir:\n\s+sizeLimit: "10Gi"/,
+    "runtime-config volume should render as a size-limited emptyDir",
+  );
+});
+
+test("runtimeConfig can be disabled for rollback", () => {
+  const rendered = renderStatefulSet(["--set", "runtimeConfig.enabled=false"]);
+
+  assert.doesNotMatch(rendered, /name: runtime-config/);
+  assert.doesNotMatch(rendered, /mountPath: "\/runtime-config"/);
+  assert.doesNotMatch(rendered, /\/runtime-config/);
+  assert.doesNotMatch(rendered, /XDG_CONFIG_HOME/);
+});
+
+test("runtimeConfig redirects API tier browser config when HA mode is enabled", () => {
+  const rendered = renderApiDeployment();
+
+  for (const [name, value] of Object.entries(expectedConfigEnv)) {
+    const pattern = new RegExp(
+      `- name: ${escapeRegExp(name)}\\n\\s+value: ["']?${escapeRegExp(value)}["']?`,
+      "g",
+    );
+    assert.equal(
+      countMatches(rendered, pattern),
+      1,
+      `${name} should render for the API deployment container`,
+    );
+  }
+
+  assert.equal(
+    countMatches(rendered, /- name: runtime-config\n\s+mountPath: "\/runtime-config"/g),
+    1,
+    "runtime-config should mount into the API deployment container",
+  );
+  assert.match(
+    rendered,
+    /- name: runtime-config\n\s+emptyDir:\n\s+sizeLimit: "10Gi"/,
+    "API deployment runtime-config volume should render as a size-limited emptyDir",
+  );
+});
+
+test("runtimeConfig can be disabled for API tier rollback", () => {
+  const rendered = renderApiDeployment(["--set", "runtimeConfig.enabled=false"]);
+
+  assert.doesNotMatch(rendered, /name: runtime-config/);
+  assert.doesNotMatch(rendered, /mountPath: "\/runtime-config"/);
+  assert.doesNotMatch(rendered, /\/runtime-config/);
+  assert.doesNotMatch(rendered, /XDG_CONFIG_HOME/);
 });
 
 test("Blockcast values route agent LLM traffic through Penstock gateway", () => {
