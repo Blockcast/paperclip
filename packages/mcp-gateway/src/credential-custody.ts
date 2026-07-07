@@ -6,10 +6,13 @@ export interface CredentialCustodyConfig {
   readonly app: string;
   readonly leaseUrl: string;
   readonly credentialBaseUrl: string;
+  readonly controlPlaneTimeoutMs: number;
   readonly leaseMode: "exclusive" | "shared";
   readonly leaseTtlMs: number;
   readonly upstreamAuthorizationScheme: string;
 }
+
+export const DEFAULT_CREDENTIAL_CUSTODY_TIMEOUT_MS = 60_000;
 
 export interface CredentialCustodyState {
   readonly configs: Record<string, CredentialCustodyConfig>;
@@ -61,6 +64,10 @@ export function loadCredentialCustodyState(
         app: env.PAPERCLIP_MCP_FIGMA_APP?.trim() || "figma",
         leaseUrl,
         credentialBaseUrl: credentialBaseUrl.replace(/\/+$/, ""),
+        controlPlaneTimeoutMs: parsePositiveInteger(
+          env.PAPERCLIP_MCP_FIGMA_CUSTODY_TIMEOUT_MS,
+          parsePositiveInteger(env.PAPERCLIP_MCP_UPSTREAM_TIMEOUT_MS, DEFAULT_CREDENTIAL_CUSTODY_TIMEOUT_MS),
+        ),
         leaseMode: env.PAPERCLIP_MCP_FIGMA_LEASE_MODE === "shared" ? "shared" : "exclusive",
         leaseTtlMs: parsePositiveInteger(env.PAPERCLIP_MCP_FIGMA_LEASE_TTL_MS, 60 * 60 * 1000),
         upstreamAuthorizationScheme: env.PAPERCLIP_MCP_FIGMA_UPSTREAM_AUTH_SCHEME?.trim() || "Bearer",
@@ -135,7 +142,7 @@ async function acquireLease(
   inboundHeaders: http.IncomingHttpHeaders,
   mcpSessionId: string,
 ): Promise<CredentialCustodyLease> {
-  const response = await fetch(config.leaseUrl, {
+  const response = await custodyFetch("MCP app lease acquisition failed", config.leaseUrl, config.controlPlaneTimeoutMs, {
     method: "POST",
     headers: jsonControlPlaneHeaders(callerAuthorization, inboundHeaders),
     body: JSON.stringify({
@@ -174,8 +181,10 @@ async function readCredential(
   inboundHeaders: http.IncomingHttpHeaders,
   credentialRef: string,
 ): Promise<string> {
-  const response = await fetch(
+  const response = await custodyFetch(
+    "MCP credential resolution failed",
     `${config.credentialBaseUrl}/${encodeURIComponent(credentialRef)}`,
+    config.controlPlaneTimeoutMs,
     { headers: jsonControlPlaneHeaders(callerAuthorization, inboundHeaders) },
   );
   if (!response.ok) {
@@ -208,6 +217,26 @@ function custodyCacheKey(
 
 function custodyHttpError(message: string, response: Response): CredentialCustodyError {
   return new CredentialCustodyError(message, response.status, response.headers.get("retry-after") ?? undefined);
+}
+
+async function custodyFetch(
+  message: string,
+  url: string,
+  timeoutMs: number,
+  init: RequestInit,
+): Promise<Response> {
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (error) {
+    const isTimeout = (error as Error).name === "TimeoutError";
+    throw new CredentialCustodyError(
+      isTimeout ? `${message}: timed out after ${timeoutMs}ms` : `${message}: ${(error as Error).message}`,
+      isTimeout ? 504 : 502,
+    );
+  }
 }
 
 function jsonControlPlaneHeaders(
