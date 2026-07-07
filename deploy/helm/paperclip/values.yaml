@@ -50,6 +50,20 @@ runtimeCache:
   # -- Optional emptyDir size limit. Set to empty string for no explicit limit.
   sizeLimit: 20Gi
 
+# -- Pod-local XDG config storage for browser profile/config directories such as
+# `google-chrome*`. Durable Paperclip identity/config remains on
+# `persistence.mountPath`; this volume is intentionally ephemeral now that
+# browser session source-of-truth is owned by authbot.
+# Rollback: set `enabled: false`, run a Helm upgrade, and restart affected
+# Paperclip pods/jobs so XDG_CONFIG_HOME falls back to the process default.
+runtimeConfig:
+  # -- Mount an emptyDir config volume and point XDG_CONFIG_HOME at it.
+  enabled: true
+  # -- Mount path for the config emptyDir.
+  mountPath: /runtime-config
+  # -- Optional emptyDir size limit. Set to empty string for no explicit limit.
+  sizeLimit: 10Gi
+
 # -- HA API tier — splits the single-pod StatefulSet into a multi-replica
 # HTTP API Deployment plus a singleton worker StatefulSet. When enabled,
 # the workers tier owns the heartbeat scheduler + plugin workers + Linear
