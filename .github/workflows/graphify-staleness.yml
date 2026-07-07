@@ -1,0 +1,60 @@
+name: graphify staleness gate
+
+# Fails a PR that would land a graphify knowledge graph which is STALE relative to
+# the base branch: i.e. the base has source changes (outside graphify-out/) newer
+# than the graph's own `built_at_commit`. This complements the graphify-reindex
+# bot's generation-time validation with a MERGE-time check that applies to any PR
+# (bot or human) — so a graph refresh that sat open while base advanced (the way
+# Open-Capacity-Marketplace#85 went stale) can't silently land inconsistent.
+#
+# Drop this same file into any repo that commits graphify-out/ to get the gate.
+
+on:
+  pull_request:
+    paths:
+      - '**/graphify-out/graph.json'
+
+permissions:
+  contents: read
+
+jobs:
+  staleness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify committed graphs are fresh vs base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -uo pipefail
+          rc=0
+          changed=$(git diff --name-only "$BASE_SHA"...HEAD | grep -E '(^|/)graphify-out/graph\.json$' || true)
+          if [ -z "$changed" ]; then
+            echo "No graphify-out/graph.json changed in this PR — nothing to gate."
+            exit 0
+          fi
+          while IFS= read -r g; do
+            [ -f "$g" ] || continue
+            d=$(dirname "$(dirname "$g")")
+            if [ "$d" = "." ]; then scope="."; else scope="$d"; fi
+            bac=$(jq -r '.built_at_commit // empty' "$g")
+            if [ -z "$bac" ]; then
+              echo "::error file=$g::graph has no built_at_commit"; rc=1; continue
+            fi
+            if ! git cat-file -e "${bac}^{commit}" 2>/dev/null; then
+              echo "::error file=$g::built_at_commit ${bac} is not a known commit"; rc=1; continue
+            fi
+            if ! git merge-base --is-ancestor "$bac" "$BASE_SHA"; then
+              echo "::error file=$g::built_at_commit ${bac:0:12} is not an ancestor of base ${BASE_SHA:0:12} (graph built off an unknown line)"; rc=1; continue
+            fi
+            # Stale if base has source changes (outside graphify-out) since the graph was built.
+            if ! git diff --quiet "$bac" "$BASE_SHA" -- "$scope" ":(exclude)**/graphify-out/**" ":(exclude)graphify-out/**"; then
+              echo "::error file=$g::STALE graph — base changed '${scope}' since built_at_commit ${bac:0:12}. Rebuild: graphify update ${scope} --force --directed"
+              rc=1
+            else
+              echo "OK: $g is fresh (built_at ${bac:0:12})"
+            fi
+          done <<< "$changed"
+          exit $rc
