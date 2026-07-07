@@ -4060,6 +4060,393 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  it("does not sweep-wake a dependent whose sole blocker is done-but-unfinalized, and counts sweep_finalize_gated (BLO-13577)", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "QA",
+      role: "qa",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Sweep finalize-gate project",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Sweep finalize-gate workspace",
+      sourceType: "local_path",
+      visibility: "default",
+      isPrimary: true,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Sweep finalize-gate exec workspace",
+      status: "active",
+      providerType: "git_worktree",
+    });
+
+    const blockerId = randomUUID();
+    const dependentId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: blockerId,
+        companyId,
+        projectId,
+        title: "Predecessor",
+        status: "done",
+        priority: "medium",
+        executionWorkspaceId,
+        completedAt: new Date("2026-07-05T00:00:00.000Z"),
+      },
+      {
+        id: dependentId,
+        companyId,
+        projectId,
+        title: "Dependent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+    await svc.update(dependentId, { blockedByIssueIds: [blockerId] });
+
+    // The done blocker's workspace touched the finalize barrier but hasn't
+    // recorded a successful workspace_finalize yet — same setup as the
+    // fast-path test above, but exercised through the sweep this time.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      phase: "worktree_prepare",
+      status: "succeeded",
+      startedAt: new Date("2026-07-05T00:00:00.000Z"),
+    });
+
+    resetBlockerResolvedWakeMetrics();
+    await expect(
+      svc.listResolvedBlockerDependentsToSweep(companyId, { minBlockerResolvedAge: { milliseconds: 0 } }),
+    ).resolves.toEqual([]);
+    expect(getBlockerResolvedWakeMetric("sweep_finalize_gated")).toBe(1);
+
+    // Once workspace_finalize succeeds, the sweep must surface the dependent.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      phase: "workspace_finalize",
+      status: "succeeded",
+      startedAt: new Date("2026-07-05T00:05:00.000Z"),
+    });
+
+    await expect(
+      svc.listResolvedBlockerDependentsToSweep(companyId, { minBlockerResolvedAge: { milliseconds: 0 } }),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        id: dependentId,
+        assigneeAgentId,
+        blockerIssueIds: [blockerId],
+      }),
+    ]);
+  });
+
+  it("does NOT count/log sweep_finalize_gated when a dependent also has a wholly-unresolved blocker (Ally review on #602, BLO-13577)", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "QA",
+      role: "qa",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Sweep mixed-blocker project",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Sweep mixed-blocker workspace",
+      sourceType: "local_path",
+      visibility: "default",
+      isPrimary: true,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Sweep mixed-blocker exec workspace",
+      status: "active",
+      providerType: "git_worktree",
+    });
+
+    const finalizePendingBlockerId = randomUUID();
+    const unresolvedBlockerId = randomUUID();
+    const dependentId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: finalizePendingBlockerId,
+        companyId,
+        projectId,
+        title: "Done blocker awaiting finalize",
+        status: "done",
+        priority: "medium",
+        executionWorkspaceId,
+        completedAt: new Date("2026-07-05T00:00:00.000Z"),
+      },
+      {
+        id: unresolvedBlockerId,
+        companyId,
+        projectId,
+        title: "Wholly unresolved blocker",
+        status: "in_progress",
+        priority: "medium",
+      },
+      {
+        id: dependentId,
+        companyId,
+        projectId,
+        title: "Dependent with mixed blockers",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+    await svc.update(dependentId, {
+      blockedByIssueIds: [finalizePendingBlockerId, unresolvedBlockerId],
+    });
+
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      phase: "worktree_prepare",
+      status: "succeeded",
+      startedAt: new Date("2026-07-05T00:00:00.000Z"),
+    });
+
+    // The dependent's other blocker isn't `done` at all, so the naive
+    // "all blockers done by status" prefilter must exclude it before it ever
+    // reaches the per-company readiness re-check — it must not be counted as
+    // sweep_finalize_gated (the finalize barrier isn't the sole reason it's
+    // stuck) nor as sweep_unresolved_gated (it never reaches that check).
+    resetBlockerResolvedWakeMetrics();
+    await expect(
+      svc.listResolvedBlockerDependentsToSweep(companyId, { minBlockerResolvedAge: { milliseconds: 0 } }),
+    ).resolves.toEqual([]);
+    expect(getBlockerResolvedWakeMetric("sweep_finalize_gated")).toBe(0);
+    expect(getBlockerResolvedWakeMetric("sweep_unresolved_gated")).toBe(0);
+  });
+
+  it("stops scanning once `limit` is reached and does not over-count sweep_finalize_gated past it (Ally review on #602, BLO-13577)", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const readyExecutionWorkspaceId = randomUUID();
+    const gatedExecutionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "QA",
+      role: "qa",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Sweep limit project",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Sweep limit workspace",
+      sourceType: "local_path",
+      visibility: "default",
+      isPrimary: true,
+    });
+    await db.insert(executionWorkspaces).values([
+      {
+        id: readyExecutionWorkspaceId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Ready exec workspace",
+        status: "active",
+        providerType: "git_worktree",
+      },
+      {
+        id: gatedExecutionWorkspaceId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Gated exec workspace",
+        status: "active",
+        providerType: "git_worktree",
+      },
+    ]);
+
+    // Insertion (and, absent an ORDER BY on the candidate scan, observed scan)
+    // order matters here: the ready dependent comes first so a fixed
+    // implementation fills `limit` and stops before ever reaching the gated
+    // dependents that follow it. The pre-fix code processed the whole company
+    // regardless of `limit`, so it would have counted both gated dependents
+    // (sweep_finalize_gated === 2) even though only 1 result was ever needed.
+    const readyBlockerId = randomUUID();
+    const readyDependentId = randomUUID();
+    const gatedBlockerId = randomUUID();
+    const gatedDependentId1 = randomUUID();
+    const gatedDependentId2 = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: readyBlockerId,
+        companyId,
+        projectId,
+        title: "Ready predecessor",
+        status: "done",
+        priority: "medium",
+        executionWorkspaceId: readyExecutionWorkspaceId,
+        completedAt: new Date("2026-07-05T00:00:00.000Z"),
+      },
+      {
+        id: readyDependentId,
+        companyId,
+        projectId,
+        title: "Ready dependent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId,
+      },
+      {
+        id: gatedBlockerId,
+        companyId,
+        projectId,
+        title: "Gated predecessor",
+        status: "done",
+        priority: "medium",
+        executionWorkspaceId: gatedExecutionWorkspaceId,
+        completedAt: new Date("2026-07-05T00:00:00.000Z"),
+      },
+      {
+        id: gatedDependentId1,
+        companyId,
+        projectId,
+        title: "Gated dependent 1",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId,
+      },
+      {
+        id: gatedDependentId2,
+        companyId,
+        projectId,
+        title: "Gated dependent 2",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+    await svc.update(readyDependentId, { blockedByIssueIds: [readyBlockerId] });
+    await svc.update(gatedDependentId1, { blockedByIssueIds: [gatedBlockerId] });
+    await svc.update(gatedDependentId2, { blockedByIssueIds: [gatedBlockerId] });
+
+    // Ready blocker's workspace fully finalized; gated blocker's workspace
+    // only reached worktree_prepare (finalize barrier still open).
+    await db.insert(workspaceOperations).values([
+      {
+        companyId,
+        executionWorkspaceId: readyExecutionWorkspaceId,
+        phase: "worktree_prepare",
+        status: "succeeded",
+        startedAt: new Date("2026-07-05T00:00:00.000Z"),
+      },
+      {
+        companyId,
+        executionWorkspaceId: readyExecutionWorkspaceId,
+        phase: "workspace_finalize",
+        status: "succeeded",
+        startedAt: new Date("2026-07-05T00:01:00.000Z"),
+      },
+      {
+        companyId,
+        executionWorkspaceId: gatedExecutionWorkspaceId,
+        phase: "worktree_prepare",
+        status: "succeeded",
+        startedAt: new Date("2026-07-05T00:00:00.000Z"),
+      },
+    ]);
+
+    resetBlockerResolvedWakeMetrics();
+    const results = await svc.listResolvedBlockerDependentsToSweep(companyId, {
+      limit: 1,
+      minBlockerResolvedAge: { milliseconds: 0 },
+    });
+    expect(results).toEqual([
+      expect.objectContaining({ id: readyDependentId, assigneeAgentId }),
+    ]);
+    expect(getBlockerResolvedWakeMetric("sweep_finalize_gated")).toBe(0);
+  });
+
   it("gates dependents on the workspace-finalize barrier when a done blocker's execution workspace has not synced back", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();

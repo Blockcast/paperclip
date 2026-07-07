@@ -8,14 +8,28 @@
 //     that re-fires the wake for any dependent whose blockers are all done
 //     but which was never woken (lost fast-path wake, process restart, etc).
 //
-// fast_path_finalize_gated is a distinct, earlier exclusion: a dependent whose
-// blocker(s) are all `done` but whose execution workspace hasn't recorded a
-// successful `workspace_finalize` yet never becomes a wake candidate at all
-// (see `listWakeableBlockedDependents`'s readiness filter) — it doesn't reach
-// the sent/skipped/failed accounting below. Before this counter existed, that
-// exclusion was invisible: an operator staring at fast_path_sent/skipped/failed
-// all reading zero for a stuck dependent had no signal that the readiness gate,
-// not the dispatch path, was the reason (BLO-13250 recurrence, 2026-07-05).
+// fast_path_finalize_gated / sweep_finalize_gated are a distinct, earlier
+// exclusion: a dependent whose blocker(s) are all `done` but whose execution
+// workspace hasn't recorded a successful `workspace_finalize` yet never
+// becomes a wake candidate at all (see `listWakeableBlockedDependents` and
+// `listResolvedBlockerDependentsToSweep`'s readiness filters) — it doesn't
+// reach the sent/skipped/failed accounting below. Before fast_path_finalize_gated
+// existed, that exclusion was invisible: an operator staring at
+// fast_path_sent/skipped/failed all reading zero for a stuck dependent had no
+// signal that the readiness gate, not the dispatch path, was the reason
+// (BLO-13250 recurrence, 2026-07-05). sweep_finalize_gated closes the same gap
+// on the sweep path (BLO-13577).
+//
+// sweep_unresolved_gated: the sweep's naive pre-filter only admits candidates
+// whose blockers all show status `done`, so by construction the only way its
+// readiness re-check can still find a blocker unresolved is the finalize gate
+// above OR a blocker that flipped away from `done` in the race window between
+// the two DB reads. The former increments sweep_finalize_gated; this counter
+// covers the latter (and any other non-finalize-attributable reason) so that
+// case doesn't leave a candidate with zero signal either (Ally review on
+// PR #602, BLO-13577). Not mirrored to the fast path: there, "not ready and
+// not sole-finalize-reason" is the ordinary, high-volume case of an issue
+// with other blockers still pending — not a gap to instrument.
 //
 // A sustained non-zero *_skipped or *_failed rate — especially outside a
 // known ccrotate-capacity or budget-block window — means dependents are
@@ -29,7 +43,9 @@ export type BlockerResolvedWakeMetricKey =
   | "fast_path_finalize_gated"
   | "sweep_sent"
   | "sweep_skipped"
-  | "sweep_failed";
+  | "sweep_failed"
+  | "sweep_finalize_gated"
+  | "sweep_unresolved_gated";
 
 const MAX_COUNTER_VALUE = Number.MAX_SAFE_INTEGER;
 
@@ -41,6 +57,8 @@ const counters: Record<BlockerResolvedWakeMetricKey, number> = {
   sweep_sent: 0,
   sweep_skipped: 0,
   sweep_failed: 0,
+  sweep_finalize_gated: 0,
+  sweep_unresolved_gated: 0,
 };
 
 export function incrementBlockerResolvedWakeMetric(key: BlockerResolvedWakeMetricKey): void {

@@ -5448,6 +5448,11 @@ export function issueService(db: Db) {
     // dependent existed, etc.) the dependent stays silently stuck with zero wakes
     // targeting it. This sweep finds all eligible dependents whose every blocker
     // is already `done`, so a periodic reconciler can re-fire wakes for them.
+    // "Done by status" alone isn't ready, though: after the cheap status-only
+    // prefilter below, candidates are re-checked against
+    // `listIssueDependencyReadinessMap` so the workspace_finalize barrier gates
+    // the sweep the same way it gates the fast path (BLO-13577, sibling fix to
+    // BLO-13250's fast-path `fast_path_finalize_gated` instrumentation).
     //
     // Cancelled blockers intentionally remain unresolved (see `listIssueDependencyReadinessMap`).
     listResolvedBlockerDependentsToSweep: async (
@@ -5512,7 +5517,7 @@ export function issueService(db: Db) {
       }
 
       const ageCutoff = minAgeMs > 0 ? new Date(Date.now() - minAgeMs) : null;
-      const results: Array<{
+      const naiveReady: Array<{
         id: string;
         companyId: string;
         assigneeAgentId: string;
@@ -5524,14 +5529,86 @@ export function issueService(db: Db) {
         const blockers = byDependent.get(candidate.id);
         if (!blockers || blockers.ids.length === 0 || !blockers.allDone) continue;
         if (ageCutoff && (!blockers.latestResolvedAt || blockers.latestResolvedAt > ageCutoff)) continue;
-        results.push({
+        naiveReady.push({
           id: candidate.id,
           companyId: candidate.companyId,
           assigneeAgentId: candidate.assigneeAgentId!,
           blockerIssueIds: blockers.ids,
           latestBlockerResolvedAt: blockers.latestResolvedAt,
         });
-        if (results.length >= limit) break;
+      }
+
+      // BLO-13577: "all blockers done by status" is not sufficient — mirror
+      // listWakeableBlockedDependents' workspace_finalize readiness check here
+      // too, or this sweep re-introduces BLO-13250's silent-drop bug one hop
+      // later (on reconciliation instead of the becameDone edge). Group by
+      // company since this sweep can span every company in one pass while
+      // listIssueDependencyReadinessMap is scoped to a single companyId.
+      const naiveReadyByCompany = new Map<string, typeof naiveReady>();
+      for (const candidate of naiveReady) {
+        const list = naiveReadyByCompany.get(candidate.companyId) ?? [];
+        list.push(candidate);
+        naiveReadyByCompany.set(candidate.companyId, list);
+      }
+      const results: typeof naiveReady = [];
+      companyLoop: for (const [candidateCompanyId, candidatesForCompany] of naiveReadyByCompany) {
+        const readinessMap = await listIssueDependencyReadinessMap(
+          db,
+          candidateCompanyId,
+          candidatesForCompany.map((c) => c.id),
+        );
+        for (const candidate of candidatesForCompany) {
+          const readiness = readinessMap.get(candidate.id) ?? createIssueDependencyReadiness(candidate.id);
+          if (readiness.isDependencyReady) {
+            results.push(candidate);
+            // Stop scanning as soon as `limit` is reached, same as the
+            // pre-#601 single-loop behavior — checking only between companies
+            // let one over-full company push every naively-ready candidate
+            // through the readiness DB call (and through sweep_finalize_gated
+            // accounting) even past `limit`, and, when companyId is undefined,
+            // starved every company after the one that first filled `results`
+            // (Ally review on #602).
+            if (results.length >= limit) break companyLoop;
+            continue;
+          }
+          // Only attribute the gate to workspace_finalize when it's the sole
+          // reason the dependent isn't ready yet (see the matching comment in
+          // listWakeableBlockedDependents) — otherwise a wholly-unresolved
+          // blocker would be mislabeled as a finalize wait.
+          if (
+            readiness.pendingFinalizeBlockerIssueIds.length > 0 &&
+            readiness.pendingFinalizeBlockerIssueIds.length === readiness.unresolvedBlockerIssueIds.length
+          ) {
+            incrementBlockerResolvedWakeMetric("sweep_finalize_gated");
+            logger.info(
+              {
+                dependentIssueId: candidate.id,
+                agentId: candidate.assigneeAgentId,
+                pendingFinalizeBlockerIssueIds: readiness.pendingFinalizeBlockerIssueIds,
+                outcome: "gated",
+                skipReason: "workspace_finalize_pending",
+              },
+              "reconcileResolvedBlockerDependents dependent outcome",
+            );
+          } else {
+            // Mixed or wholly-unresolved-blocker case: not attributable to
+            // workspace_finalize. Without this branch the candidate left the
+            // loop with zero counter increment and zero log line — the exact
+            // "operator sees all-zero counters for a stuck dependent" failure
+            // mode BLO-13250/BLO-13577 exist to eliminate (Ally review on #602).
+            incrementBlockerResolvedWakeMetric("sweep_unresolved_gated");
+            logger.info(
+              {
+                dependentIssueId: candidate.id,
+                agentId: candidate.assigneeAgentId,
+                unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+                outcome: "gated",
+                skipReason: "blocker_unresolved",
+              },
+              "reconcileResolvedBlockerDependents dependent outcome",
+            );
+          }
+        }
       }
 
       const resultIds = results.map((r) => r.id);
