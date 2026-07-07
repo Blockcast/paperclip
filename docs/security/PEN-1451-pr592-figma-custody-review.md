@@ -6,9 +6,11 @@ Scope: merged PR #592, squash commit `b447917ed8c06b1d6e80aa4444f48ff21b40019a`
 
 ## Verdict
 
-No blocking security findings remain for the `/figma` MCP credential-custody path reviewed in PR #592.
+The core `/figma` MCP credential-custody boundary reviewed in PR #592 is preserved: caller secrets are not forwarded to Figma, and upstream Figma authorization is resolved server-side.
 
 The implementation preserves the required custody boundary: caller Penstock authorization is used only for Penstock lease and credential-resolution control-plane calls, while the Figma upstream receives only the server-resolved Figma authorization plus the MCP/content negotiation headers required for protocol operation.
+
+Two denial-of-service hardening findings remain open from post-merge review. They are tracked as remediation follow-ups and should remain blocking for the broader security gate until resolved or explicitly accepted by an owner.
 
 ## Threat Model Summary
 
@@ -20,11 +22,21 @@ The implementation preserves the required custody boundary: caller Penstock auth
 
 ### Critical/High
 
-None.
+#### High - Penstock control-plane custody fetches lack explicit timeouts
+
+- Location: `packages/mcp-gateway/src/credential-custody.ts`, `acquireLease` and `readCredential`.
+- Evidence: both functions call `fetch()` without an `AbortSignal` or equivalent timeout, while Figma upstream calls in `packages/mcp-gateway/src/server.ts` use `AbortSignal.timeout(timeoutMs)`.
+- Risk: a hung Penstock lease or credential-resolution endpoint can leave the shared custody `pending` promise unresolved and stall concurrent `/figma` MCP traffic for the same session/cache key instead of failing closed promptly.
+- Tracking: `PEN-1524` - Add timeouts to Figma custody Penstock control-plane fetches.
 
 ### Medium/Low
 
-None requiring remediation for this gate.
+#### Medium - Custodied token cache has no size bound or eviction policy
+
+- Location: `packages/mcp-gateway/src/credential-custody.ts`, `tokenCache`.
+- Evidence: the cache is a process-local `Map` keyed by prefix, stable MCP session id, and `sha256(callerAuthorization)`. Entries expire by TTL or explicit invalidation, but there is no maximum size or eviction policy analogous to the gateway `SessionStore` convention.
+- Risk: many unique session/auth combinations on a custody-enabled route can drive memory growth until process pressure or restart.
+- Tracking: `PEN-1523` - Bound Figma custody token cache growth.
 
 One non-blocking process observation remains: the PR's `security-review` check concluded `neutral`/skipping on a credential-custody change. Human re-review covered the security gate before merge, and this co-review found no code issue, but the gate routing should be checked separately if neutral is not intentional for MCP custody PRs.
 
@@ -35,6 +47,7 @@ One non-blocking process observation remains: the PR's `security-review` check c
 - `packages/mcp-gateway/src/server.ts`: `CredentialCustodyError` is excluded from Figma upstream breaker failure accounting, and `retry-after` is propagated when Penstock returns it.
 - `packages/mcp-gateway/src/server.test.ts`: tests cover missing caller auth fail-closed, caller `cookie`/`x-api-key`/`proxy-authorization`/`x-penstock-tenant` non-forwarding, resolved upstream auth forwarding, lease/credential cache reuse under repeated exclusive-session access, invalid credential value classification, and custody error breaker exemption.
 - PR #592 comments: prior S1/S2/S3 review findings were resolved before merge; the final human re-review at head `002ed03c` marked code LGTM.
+- PR #593 Ally review: post-merge review identified the two open Important findings now tracked by `PEN-1524` and `PEN-1523`.
 - GitHub Security Advisories API: `gh api repos/Blockcast/paperclip/security-advisories --method GET` returned `[]` for this token, so there is no visible open/draft repository advisory to close from this review context.
 
 ## Verification
@@ -56,6 +69,8 @@ Results:
 - `pnpm audit --prod --audit-level moderate`: reported one low-severity workspace finding; no moderate-or-higher production dependency finding for this gate.
 - Advisory API: returned an empty list.
 
-## Disposition
+## Updated Disposition
 
-PEN-1451 can be closed from the security co-review side. No remediation issue is required from this review.
+PEN-1451 should not be treated as a clean security closeout until the two tracked denial-of-service hardening items are either resolved or explicitly accepted as risk by an owner.
+
+The custody boundary itself remains verified: caller Penstock/Figma secrets are not forwarded to the Figma upstream, lease state remains scoped to session/caller identity, and cooldown/custody errors are not mixed with Figma upstream breaker state. The remaining work is resilience hardening for Penstock control-plane hangs and cache memory bounds.
