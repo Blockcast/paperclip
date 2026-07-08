@@ -192,7 +192,9 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     {
       name: "get_issue",
       description:
-        "Get the full details of a single Paperclip issue by UUID or key (e.g. PEN-307). Resolves cross-company server-side.",
+        "Get the full details of a single Paperclip issue by UUID or key (e.g. PEN-307). The key's prefix (PEN, BLO, " +
+        "...) is resolved to its owning company server-side, so this works even for issues outside your default " +
+        "company context — no company_id needed.",
       schema: z.object({
         issue_id: z.string().describe('Issue UUID or human-readable key (e.g. "CY-42"). Pass through verbatim.'),
       }),
@@ -293,7 +295,10 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     {
       name: "checkout_issue",
       description:
-        "Assign an issue to an agent and mark it in_progress. The agent is resolved server-side: the issue's current assignee, else the company's sole agent. 409 = owned by another agent; do NOT retry.",
+        "Assign an issue to an agent and mark it in_progress. The agent is resolved server-side: the issue's current " +
+        "assignee, else the company's sole agent (fails with a 422 error if the issue is unassigned and the company " +
+        "has zero or multiple agents — assign one explicitly first via update_issue). 409 = another agent already " +
+        "owns/checked out this issue; do NOT retry, pick different work instead.",
       schema: z.object({ issue_id: z.string().describe("Issue UUID or identifier to check out.") }),
       execute: async (args) => {
         const issueId = String(args.issue_id);
@@ -335,7 +340,10 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     },
     {
       name: "comment_on_issue",
-      description: "Add a comment to an issue (supports Markdown).",
+      description:
+        "Add a comment to an issue (supports Markdown). For multiline bodies, pass literal newlines in the string " +
+        "(a normal multiline argument) rather than hand-escaping \\n into a one-line JSON string — escaped newlines " +
+        "render as smooshed-together text with no paragraph breaks.",
       schema: z.object({
         issue_id: z.string().describe("Issue UUID or identifier."),
         body: z.string().describe("Comment text. Markdown supported."),
@@ -517,7 +525,10 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     {
       name: "invoke_agent_heartbeat",
       description:
-        "Manually trigger an immediate heartbeat (work cycle) for an agent. Use to wake an idle agent, force it to pick up assignments, or run it off-schedule.",
+        "Manually trigger an immediate heartbeat (work cycle) for an agent. Use to wake an idle agent, force it to " +
+        "pick up assignments, or run it off-schedule. If the agent's concurrency limit is already in use, this queues " +
+        "behind the in-flight run rather than starting a second one; calling it again for the same pending wake " +
+        "returns the SAME queued request (idempotent) instead of creating a new one or reprioritizing it.",
       schema: z.object({ agent_id: z.string().describe("UUID of the agent to trigger.") }),
       execute: async (args) =>
         runTool(() => client.requestJson("POST", `/agents/${encodeURIComponent(String(args.agent_id))}/heartbeat/invoke`)),
