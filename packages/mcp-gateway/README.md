@@ -60,6 +60,7 @@ Optional knobs:
 - `PAPERCLIP_MCP_FIGMA_LEASE_TTL_MS` — lease TTL, default `3600000`.
 - `PAPERCLIP_MCP_FIGMA_LEASE_MODE` — `exclusive` by default; may be `shared`.
 - `PAPERCLIP_MCP_FIGMA_UPSTREAM_AUTH_SCHEME` — upstream auth scheme, default `Bearer`.
+- `PAPERCLIP_MCP_FIGMA_TOKEN_CACHE_MAX_ENTRIES` — max in-memory custodied token cache entries, default `4096`; oldest entries evict first.
 
 If only one of the Figma custody URLs is configured, startup fails. If custody
 is configured and a request lacks caller authorization or Penstock cannot lease
@@ -69,7 +70,8 @@ Figma upstream.
 Resolved Figma tokens are cached in-memory per stable MCP session and caller
 authorization for most of the configured lease TTL. The cache avoids repeated
 exclusive lease acquisition during ordinary session traffic and is invalidated
-when the upstream Figma server returns `401`.
+when the upstream Figma server returns `401`. Cache keys hash caller authorization
+values instead of storing raw caller bearer tokens.
 
 ## Endpoints
 

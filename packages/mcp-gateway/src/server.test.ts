@@ -4,7 +4,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import { MCP_SESSION_HEADER } from "./session-keepalive.js";
 import { buildInitializeReplayHeaders, createGatewayServer, type GatewayState } from "./server.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
-import type { CredentialCustodyState } from "./credential-custody.js";
+import {
+  DEFAULT_CREDENTIAL_CUSTODY_TOKEN_CACHE_MAX_ENTRIES,
+  loadCredentialCustodyState,
+  type CredentialCustodyState,
+} from "./credential-custody.js";
 
 interface StrictMcpUpstream {
   server: http.Server;
@@ -178,7 +182,7 @@ async function createGateway(
 async function createFigmaGateway(
   upstreamUrl: string,
   custodyUrl: string,
-  opts?: { custodyTimeoutMs?: number },
+  opts?: { custodyTimeoutMs?: number; maxTokenCacheEntries?: number },
 ): Promise<{ url: string; state: GatewayState }> {
   const custody: CredentialCustodyState = {
     configs: {
@@ -194,6 +198,7 @@ async function createFigmaGateway(
       },
     },
     tokenCache: new Map(),
+    maxTokenCacheEntries: opts?.maxTokenCacheEntries ?? DEFAULT_CREDENTIAL_CUSTODY_TOKEN_CACHE_MAX_ENTRIES,
   };
   const state: GatewayState = {
     upstreams: { figma: upstreamUrl },
@@ -213,6 +218,7 @@ async function createFigmaGateway(
 
 async function createCustodyService(opts?: {
   credentialValue?: string;
+  credentialValueForRequest?: (request: { authorization?: string; mcpSessionId?: string }) => string;
   failRepeatedLeaseForSession?: boolean;
   leaseFailureStatus?: number;
   hangLease?: boolean;
@@ -221,6 +227,7 @@ async function createCustodyService(opts?: {
   const leaseRequests: Array<{ authorization?: string; mcpSessionId?: string }> = [];
   const credentialRequests: string[] = [];
   const activeLeases = new Set<string>();
+  const issuedCredentials = new Map<string, string>();
   const server = http.createServer(async (req, res) => {
     const bodyText = await readBody(req);
     if (req.url === "/leases" && req.method === "POST") {
@@ -240,24 +247,31 @@ async function createCustodyService(opts?: {
         res.end(JSON.stringify({ error: "exclusive lease already held" }));
         return;
       }
-      leaseRequests.push({
+      const leaseRequest = {
         authorization: typeof req.headers.authorization === "string" ? req.headers.authorization : undefined,
         mcpSessionId: body.mcp_session_id,
-      });
+      };
+      leaseRequests.push(leaseRequest);
       if (body.mcp_session_id) activeLeases.add(body.mcp_session_id);
+      const credentialRef = `figma-mcp-token-${leaseRequests.length}`;
+      issuedCredentials.set(
+        credentialRef,
+        opts?.credentialValueForRequest?.(leaseRequest) ?? opts?.credentialValue ?? "figma-upstream-auth",
+      );
       res.statusCode = 200;
       res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ lease: { credential_ref: "figma-mcp-token" } }));
+      res.end(JSON.stringify({ lease: { credential_ref: credentialRef } }));
       return;
     }
-    if (req.url === "/credentials/figma-mcp-token" && req.method === "GET") {
+    if (req.url?.startsWith("/credentials/") && req.method === "GET") {
       credentialRequests.push(req.url);
       if (opts?.hangCredential) {
         return;
       }
+      const credentialRef = decodeURIComponent(req.url.slice("/credentials/".length));
       res.statusCode = 200;
       res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ credential: { credential_id: "figma-mcp-token", value: opts?.credentialValue ?? "figma-upstream-auth" } }));
+      res.end(JSON.stringify({ credential: { credential_id: credentialRef, value: issuedCredentials.get(credentialRef) ?? "figma-upstream-auth" } }));
       return;
     }
     res.statusCode = 404;
@@ -292,6 +306,23 @@ describe("buildInitializeReplayHeaders", () => {
     expect(headers.accept).toBe("application/json, text/event-stream");
     expect(headers["content-type"]).toBe("application/json");
     expect(headers[MCP_SESSION_HEADER]).toBeUndefined();
+  });
+});
+
+describe("loadCredentialCustodyState", () => {
+  it("loads the Figma custody token cache bound with a safe default and env override", () => {
+    expect(loadCredentialCustodyState({}).maxTokenCacheEntries).toBe(
+      DEFAULT_CREDENTIAL_CUSTODY_TOKEN_CACHE_MAX_ENTRIES,
+    );
+
+    const baseUrlEnv = "PAPERCLIP_MCP_FIGMA_" + "CREDENTIAL_BASE_URL";
+    const state = loadCredentialCustodyState({
+      PAPERCLIP_MCP_FIGMA_LEASE_URL: "https://custody.example/leases",
+      [baseUrlEnv]: "https://custody.example/credentials",
+      PAPERCLIP_MCP_FIGMA_TOKEN_CACHE_MAX_ENTRIES: "37",
+    });
+
+    expect(state.maxTokenCacheEntries).toBe(37);
   });
 });
 
@@ -489,6 +520,59 @@ describe("mcp gateway lifecycle compatibility", () => {
       expect(headers.accept).toBe("application/json, text/event-stream");
       expect(headers["content-type"]).toContain("application/json");
     }
+  });
+
+  it("bounds Figma custody token cache growth without mixing caller sessions", async () => {
+    const upstream = await createStrictMcpUpstream();
+    const custody = await createCustodyService({
+      credentialValueForRequest: (request) => `upstream-for-${request.mcpSessionId}-${request.authorization}`,
+    });
+    const gateway = await createFigmaGateway(upstream.url, custody.url, { maxTokenCacheEntries: 2 });
+    const sessions: string[] = [];
+
+    for (const caller of ["a", "b", "c"]) {
+      const initialize = await globalThis["fetch"](gateway.url, {
+        method: "POST",
+        headers: { ...jsonHeaders(), authorization: `Bearer caller-${caller}` },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "0" } },
+        }),
+      });
+      const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
+      expect(initialize.status).toBe(200);
+      expect(clientSessionId).toBeTruthy();
+      sessions.push(clientSessionId ?? "");
+    }
+
+    expect(gateway.state.credentialCustody?.tokenCache.size).toBe(2);
+    expect(custody.leaseRequests.map((request) => request.authorization)).toEqual([
+      "Bearer caller-a",
+      "Bearer caller-b",
+      "Bearer caller-c",
+    ]);
+
+    const evictedCallerResponse = await globalThis["fetch"](gateway.url, {
+      method: "POST",
+      headers: { ...jsonHeaders(sessions[0]), authorization: "Bearer caller-a" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+    });
+
+    expect(evictedCallerResponse.status).toBe(200);
+    expect(gateway.state.credentialCustody?.tokenCache.size).toBe(2);
+    expect(custody.leaseRequests.map((request) => request.authorization)).toEqual([
+      "Bearer caller-a",
+      "Bearer caller-b",
+      "Bearer caller-c",
+      "Bearer caller-a",
+    ]);
+    expect(upstream.receivedHeaders.at(-1)?.authorization).toBe(
+      `Bearer upstream-for-${sessions[0]}-Bearer caller-a`,
+    );
+    expect(upstream.receivedHeaders.at(-1)?.authorization).not.toContain("caller-b");
+    expect(upstream.receivedHeaders.at(-1)?.authorization).not.toContain("caller-c");
   });
 
   it("does not trip the Figma breaker for custody lease failures", async () => {
