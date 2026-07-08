@@ -1,5 +1,5 @@
 export const PLUGIN_ID = "paperclip-plugin-linear";
-export const PLUGIN_VERSION = "0.9.4";
+export const PLUGIN_VERSION = "0.9.5";
 
 /**
  * The originKind value the host stamps on issues created by this plugin.
