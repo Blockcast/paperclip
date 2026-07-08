@@ -179,6 +179,9 @@ async function persistSessions(state: GatewayState): Promise<void> {
 async function persistSessionsNow(state: GatewayState): Promise<void> {
   const file = state.sessionPersistenceFile;
   if (!file) return;
+  // Best-effort shared cache only: concurrent replicas can race between the
+  // reload and atomic rename, but a lost mapping self-heals by re-initializing
+  // the upstream session on the next aggregate call.
   await loadPersistedSessions(state);
   const snapshot: PersistedSessionSnapshot = {
     version: 1,
