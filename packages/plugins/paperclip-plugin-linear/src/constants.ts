@@ -27,6 +27,7 @@ export const TOOL_NAMES = {
   listIssueLabels: "list-linear-issue-labels",
   listProjectLabels: "list-linear-project-labels",
   markDuplicate: "mark-duplicate",
+  auditBindings: "audit-linear-bindings",
 } as const;
 
 export const WEBHOOK_KEYS = {

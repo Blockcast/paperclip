@@ -2579,6 +2579,49 @@ const plugin = definePlugin({
       },
     );
 
+    ctx.tools.register(
+      TOOL_NAMES.auditBindings,
+      {
+        displayName: "Audit Linear Bindings",
+        description: "Read-only bulk audit of Paperclip/Linear sync binding invariants",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            companyId: { type: "string" },
+            includeLinearValidation: { type: "boolean" },
+            limit: { type: "number" },
+          },
+        },
+      },
+      async (params: any, runCtx) => {
+        const { companyId: requestedCompanyId, includeLinearValidation = true, limit = 1000 } = params as {
+          companyId?: string;
+          includeLinearValidation?: boolean;
+          limit?: number;
+        };
+        const companyId = requestedCompanyId?.trim() || runCtx?.companyId || await getCompanyId(ctx);
+        if (!companyId) {
+          return {
+            content: "Error: company id is not configured",
+            data: { ok: false, error: "Company id is not configured for this plugin." },
+          };
+        }
+
+        const report = await auditLinearBindings(ctx, {
+          companyId,
+          includeLinearValidation,
+          limit: Number.isFinite(limit) ? limit : 1000,
+        });
+        const findingCount = report.findings.length;
+        return {
+          content: findingCount === 0
+            ? `Linear binding audit passed: scanned ${report.scanned.issueLinks} issue links and ${report.scanned.projectLinks} project links.`
+            : `Linear binding audit found ${findingCount} finding(s): ${report.summary.byKind.map((entry) => `${entry.kind}=${entry.count}`).join(", ")}`,
+          data: { ok: findingCount === 0, ...report },
+        };
+      },
+    );
+
     // -----------------------------------------------------------------------
     // Events: bidirectional sync
     // -----------------------------------------------------------------------
@@ -4272,6 +4315,57 @@ const LINEAR_ISSUE_SYNC_BATCH_SIZE = 50;
 const LINEAR_LINK_SYNC_MAX_ENTRIES_PER_RUN = 100;
 const LINEAR_MIRROR_RECONCILE_MAX_ENTRIES_PER_RUN = 100;
 
+type AuditFindingKind =
+  | "issue_missing_paperclip"
+  | "issue_lookup_failed"
+  | "issue_missing_reverse_mapping"
+  | "issue_stale_reverse_mapping"
+  | "issue_host_reverse_mismatch"
+  | "issue_duplicate_linear_id"
+  | "issue_missing_linear"
+  | "issue_same_team_no_project_drift"
+  | "issue_active_workspace_lock"
+  | "project_missing_paperclip"
+  | "project_lookup_failed"
+  | "project_missing_reverse_mapping"
+  | "project_stale_reverse_mapping"
+  | "project_duplicate_linear_id"
+  | "project_missing_linear";
+
+type AuditFinding = {
+  kind: AuditFindingKind;
+  severity: "info" | "warning" | "error";
+  message: string;
+  paperclipIssueId?: string;
+  paperclipIssueIdentifier?: string | null;
+  paperclipProjectId?: string;
+  linearIssueId?: string;
+  linearIdentifier?: string | null;
+  linearProjectId?: string;
+  details?: Record<string, unknown>;
+};
+
+type AuditLinearBindingsOptions = {
+  companyId: string;
+  includeLinearValidation: boolean;
+  limit: number;
+};
+
+type AuditLinearBindingsReport = {
+  companyId: string;
+  scanned: {
+    issueLinks: number;
+    projectLinks: number;
+    completeIssueScan: boolean;
+    completeProjectScan: boolean;
+  };
+  summary: {
+    total: number;
+    byKind: Array<{ kind: AuditFindingKind; count: number }>;
+  };
+  findings: AuditFinding[];
+};
+
 function isIssueLink(value: unknown): value is sync.IssueLink {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Partial<sync.IssueLink>;
@@ -4291,6 +4385,392 @@ function isProjectLink(value: unknown): value is sync.ProjectLink {
     && typeof candidate.linearProjectId === "string"
     && typeof candidate.linearProjectName === "string"
     && typeof candidate.syncDirection === "string";
+}
+
+async function listIssueLinksForAudit(
+  ctx: PluginContext,
+  companyId: string,
+  limit: number,
+): Promise<{ links: sync.IssueLink[]; complete: boolean }> {
+  const links: sync.IssueLink[] = [];
+  let offset = 0;
+  while (links.length < limit) {
+    const requestedLimit = Math.min(100, limit - links.length);
+    const page = await ctx.state.list({
+      scopeKind: "instance",
+      namespace: "default",
+      stateKeyPrefix: STATE_KEYS.linkPrefix,
+      limit: requestedLimit,
+      offset,
+    });
+    if (page.entries.length === 0) return { links, complete: true };
+    offset += page.entries.length;
+    for (const entry of page.entries) {
+      if (isIssueLink(entry.value) && entry.value.paperclipCompanyId === companyId) {
+        links.push(entry.value);
+      }
+    }
+    if (page.entries.length < requestedLimit) return { links, complete: true };
+  }
+  return { links, complete: false };
+}
+
+async function listProjectLinksForAudit(
+  ctx: PluginContext,
+  companyId: string,
+  limit: number,
+): Promise<{ links: sync.ProjectLink[]; complete: boolean }> {
+  const links: sync.ProjectLink[] = [];
+  let offset = 0;
+  while (links.length < limit) {
+    const requestedLimit = Math.min(100, limit - links.length);
+    const page = await ctx.state.list({
+      scopeKind: "instance",
+      namespace: "default",
+      stateKeyPrefix: STATE_KEYS.projectLinkPrefix,
+      limit: requestedLimit,
+      offset,
+    });
+    if (page.entries.length === 0) return { links, complete: true };
+    offset += page.entries.length;
+    for (const entry of page.entries) {
+      if (isProjectLink(entry.value) && entry.value.paperclipCompanyId === companyId) {
+        links.push(entry.value);
+      }
+    }
+    if (page.entries.length < requestedLimit) return { links, complete: true };
+  }
+  return { links, complete: false };
+}
+
+function pushDuplicateLinearFindings(
+  findings: AuditFinding[],
+  issueLinks: sync.IssueLink[],
+  projectLinks: sync.ProjectLink[],
+): void {
+  const issuesByLinear = new Map<string, sync.IssueLink[]>();
+  for (const link of issueLinks) {
+    const bucket = issuesByLinear.get(link.linearIssueId) ?? [];
+    bucket.push(link);
+    issuesByLinear.set(link.linearIssueId, bucket);
+  }
+  for (const [linearIssueId, links] of issuesByLinear) {
+    if (links.length <= 1) continue;
+    findings.push({
+      kind: "issue_duplicate_linear_id",
+      severity: "error",
+      linearIssueId,
+      linearIdentifier: links[0]?.linearIdentifier ?? null,
+      message: `Linear issue ${links[0]?.linearIdentifier ?? linearIssueId} is linked from ${links.length} Paperclip issues.`,
+      details: { paperclipIssueIds: links.map((link) => link.paperclipIssueId) },
+    });
+  }
+
+  const projectsByLinear = new Map<string, sync.ProjectLink[]>();
+  for (const link of projectLinks) {
+    const bucket = projectsByLinear.get(link.linearProjectId) ?? [];
+    bucket.push(link);
+    projectsByLinear.set(link.linearProjectId, bucket);
+  }
+  for (const [linearProjectId, links] of projectsByLinear) {
+    if (links.length <= 1) continue;
+    findings.push({
+      kind: "project_duplicate_linear_id",
+      severity: "error",
+      linearProjectId,
+      message: `Linear project ${links[0]?.linearProjectName ?? linearProjectId} is linked from ${links.length} Paperclip projects.`,
+      details: { paperclipProjectIds: links.map((link) => link.paperclipProjectId) },
+    });
+  }
+}
+
+async function listLinearIssuesByIdsForAudit(
+  ctx: PluginContext,
+  token: string,
+  ids: string[],
+): Promise<Map<string, linear.LinearIssue>> {
+  const byId = new Map<string, linear.LinearIssue>();
+  const fetch = ctx.http.fetch.bind(ctx.http);
+  for (let i = 0; i < ids.length; i += LINEAR_ISSUE_SYNC_BATCH_SIZE) {
+    const batch = ids.slice(i, i + LINEAR_ISSUE_SYNC_BATCH_SIZE);
+    for (const issue of await linear.listIssuesByIds(fetch, token, batch)) {
+      byId.set(issue.id, issue);
+    }
+  }
+  return byId;
+}
+
+function summarizeAuditFindings(findings: AuditFinding[]): AuditLinearBindingsReport["summary"] {
+  const byKindMap = new Map<AuditFindingKind, number>();
+  for (const finding of findings) {
+    byKindMap.set(finding.kind, (byKindMap.get(finding.kind) ?? 0) + 1);
+  }
+  return {
+    total: findings.length,
+    byKind: Array.from(byKindMap.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([kind, count]) => ({ kind, count })),
+  };
+}
+
+async function auditLinearBindings(
+  ctx: PluginContext,
+  options: AuditLinearBindingsOptions,
+): Promise<AuditLinearBindingsReport> {
+  const limit = Math.max(1, Math.min(Math.floor(options.limit), 5000));
+  const [issueScan, projectScan] = await Promise.all([
+    listIssueLinksForAudit(ctx, options.companyId, limit),
+    listProjectLinksForAudit(ctx, options.companyId, limit),
+  ]);
+  const findings: AuditFinding[] = [];
+  pushDuplicateLinearFindings(findings, issueScan.links, projectScan.links);
+
+  const token = options.includeLinearValidation ? await resolveToken(ctx).catch(() => null) : null;
+  const teamId = token ? await getTeamId(ctx).catch(() => "") : "";
+  let linearIssueValidationAvailable = false;
+  let linearProjectValidationAvailable = false;
+  let linearIssuesById = new Map<string, linear.LinearIssue>();
+  const linearProjectsById = new Map<string, linear.LinearProject>();
+  if (token) {
+    try {
+      linearIssuesById = await listLinearIssuesByIdsForAudit(ctx, token, issueScan.links.map((link) => link.linearIssueId));
+      linearIssueValidationAvailable = true;
+    } catch (err) {
+      ctx.logger.warn("audit-linear-bindings Linear issue validation failed", { error: String(err) });
+    }
+    try {
+      for (const project of await linear.listProjects(ctx.http.fetch.bind(ctx.http), token)) {
+        linearProjectsById.set(project.id, project);
+      }
+      linearProjectValidationAvailable = true;
+    } catch (err) {
+      ctx.logger.warn("audit-linear-bindings Linear project validation failed", { error: String(err) });
+    }
+  }
+
+  for (const link of issueScan.links) {
+    let paperclipIssue: Record<string, unknown> | null = null;
+    let paperclipIssueLookupFailed = false;
+    try {
+      paperclipIssue = await ctx.issues.get(link.paperclipIssueId, link.paperclipCompanyId) as unknown as Record<string, unknown> | null;
+    } catch (err) {
+      if (sync.isPaperclipIssueNotFoundError(err)) {
+        paperclipIssue = null;
+      } else {
+        paperclipIssueLookupFailed = true;
+        ctx.logger.warn("audit-linear-bindings Paperclip issue lookup failed", { paperclipIssueId: link.paperclipIssueId, error: String(err) });
+      }
+    }
+    const paperclipIdentifier = typeof paperclipIssue?.identifier === "string" ? paperclipIssue.identifier : null;
+
+    if (paperclipIssueLookupFailed) {
+      findings.push({
+        kind: "issue_lookup_failed",
+        severity: "warning",
+        paperclipIssueId: link.paperclipIssueId,
+        linearIssueId: link.linearIssueId,
+        linearIdentifier: link.linearIdentifier,
+        message: `Paperclip issue ${link.paperclipIssueId} could not be fetched; missing-issue checks were skipped for this link.`,
+      });
+    } else if (!paperclipIssue) {
+      findings.push({
+        kind: "issue_missing_paperclip",
+        severity: "error",
+        paperclipIssueId: link.paperclipIssueId,
+        linearIssueId: link.linearIssueId,
+        linearIdentifier: link.linearIdentifier,
+        message: `Issue link points at missing Paperclip issue ${link.paperclipIssueId}.`,
+      });
+    }
+
+    let reverse: sync.IssueLink | null = null;
+    let reverseCheckAvailable = true;
+    try {
+      reverse = await sync.getLinkByLinear(ctx, link.linearIssueId);
+    } catch (err) {
+      reverseCheckAvailable = false;
+      ctx.logger.warn("audit-linear-bindings issue reverse mapping check failed", { linearIssueId: link.linearIssueId, error: String(err) });
+    }
+    if (reverseCheckAvailable && !reverse) {
+      findings.push({
+        kind: "issue_missing_reverse_mapping",
+        severity: "error",
+        paperclipIssueId: link.paperclipIssueId,
+        paperclipIssueIdentifier: paperclipIdentifier,
+        linearIssueId: link.linearIssueId,
+        linearIdentifier: link.linearIdentifier,
+        message: `Issue link ${link.paperclipIssueId} -> ${link.linearIdentifier} is missing its Linear reverse mapping.`,
+      });
+    } else if (reverse && reverse.paperclipIssueId !== link.paperclipIssueId) {
+      findings.push({
+        kind: "issue_stale_reverse_mapping",
+        severity: "error",
+        paperclipIssueId: link.paperclipIssueId,
+        paperclipIssueIdentifier: paperclipIdentifier,
+        linearIssueId: link.linearIssueId,
+        linearIdentifier: link.linearIdentifier,
+        message: `Issue reverse mapping for ${link.linearIdentifier} points to ${reverse.paperclipIssueId}, not ${link.paperclipIssueId}.`,
+        details: { reversePaperclipIssueId: reverse.paperclipIssueId },
+      });
+    }
+
+    if (typeof ctx.issues.getByLinearIssueId === "function") {
+      try {
+        const hostIssue = await ctx.issues.getByLinearIssueId({
+          linearIssueId: link.linearIssueId,
+          companyId: link.paperclipCompanyId,
+        });
+        if (hostIssue && hostIssue.id !== link.paperclipIssueId) {
+          findings.push({
+            kind: "issue_host_reverse_mismatch",
+            severity: "error",
+            paperclipIssueId: link.paperclipIssueId,
+            paperclipIssueIdentifier: paperclipIdentifier,
+            linearIssueId: link.linearIssueId,
+            linearIdentifier: link.linearIdentifier,
+            message: `Host Linear reverse row for ${link.linearIdentifier} points to ${hostIssue.id}, not plugin link ${link.paperclipIssueId}.`,
+            details: { hostPaperclipIssueId: hostIssue.id, hostIdentifier: hostIssue.identifier ?? null },
+          });
+        }
+      } catch (err) {
+        ctx.logger.warn("audit-linear-bindings host issue reverse check failed", { linearIssueId: link.linearIssueId, error: String(err) });
+      }
+    }
+
+    const linearIssue = linearIssuesById.get(link.linearIssueId) ?? null;
+    if (linearIssueValidationAvailable && !linearIssue) {
+      findings.push({
+        kind: "issue_missing_linear",
+        severity: "error",
+        paperclipIssueId: link.paperclipIssueId,
+        paperclipIssueIdentifier: paperclipIdentifier,
+        linearIssueId: link.linearIssueId,
+        linearIdentifier: link.linearIdentifier,
+        message: `Linked Linear issue ${link.linearIdentifier} (${link.linearIssueId}) was not found in Linear.`,
+      });
+    }
+
+    const paperclipProjectId = typeof paperclipIssue?.projectId === "string" ? paperclipIssue.projectId : null;
+    if (linearIssue && teamId && linearIssue.team?.id === teamId && !linearIssue.project?.id && paperclipProjectId) {
+      let projectLink: sync.ProjectLink | null = null;
+      try {
+        projectLink = await sync.getProjectLink(ctx, paperclipProjectId);
+      } catch (err) {
+        ctx.logger.warn("audit-linear-bindings project link lookup failed", { paperclipProjectId, error: String(err) });
+      }
+      if (projectLink) {
+        findings.push({
+          kind: "issue_same_team_no_project_drift",
+          severity: "warning",
+          paperclipIssueId: link.paperclipIssueId,
+          paperclipIssueIdentifier: paperclipIdentifier,
+          paperclipProjectId,
+          linearIssueId: link.linearIssueId,
+          linearIdentifier: link.linearIdentifier,
+          linearProjectId: projectLink.linearProjectId,
+          message: `Linked Linear issue ${link.linearIdentifier} is in the configured team with no Linear project, but Paperclip issue ${paperclipIdentifier ?? link.paperclipIssueId} is in a linked project.`,
+        });
+      }
+    }
+
+    const executionLockedAt = typeof paperclipIssue?.executionLockedAt === "string" ? paperclipIssue.executionLockedAt : null;
+    const executionRunId = typeof paperclipIssue?.executionRunId === "string" ? paperclipIssue.executionRunId : null;
+    const checkoutRunId = typeof paperclipIssue?.checkoutRunId === "string" ? paperclipIssue.checkoutRunId : null;
+    if (paperclipIssue && (executionLockedAt || executionRunId || checkoutRunId)) {
+      findings.push({
+        kind: "issue_active_workspace_lock",
+        severity: "info",
+        paperclipIssueId: link.paperclipIssueId,
+        paperclipIssueIdentifier: paperclipIdentifier,
+        linearIssueId: link.linearIssueId,
+        linearIdentifier: link.linearIdentifier,
+        message: `Linked Paperclip issue ${paperclipIdentifier ?? link.paperclipIssueId} has an active execution/workspace lock.`,
+        details: { executionLockedAt, executionRunId, checkoutRunId },
+      });
+    }
+  }
+
+  for (const link of projectScan.links) {
+    let paperclipProject: { id: string; name?: string | null } | null = null;
+    let paperclipProjectLookupFailed = false;
+    try {
+      paperclipProject = await ctx.projects.get(link.paperclipProjectId, link.paperclipCompanyId) as { id: string; name?: string | null } | null;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes("Project not found")) {
+        paperclipProject = null;
+      } else {
+        paperclipProjectLookupFailed = true;
+        ctx.logger.warn("audit-linear-bindings Paperclip project lookup failed", { paperclipProjectId: link.paperclipProjectId, error: String(err) });
+      }
+    }
+    if (paperclipProjectLookupFailed) {
+      findings.push({
+        kind: "project_lookup_failed",
+        severity: "warning",
+        paperclipProjectId: link.paperclipProjectId,
+        linearProjectId: link.linearProjectId,
+        message: `Paperclip project ${link.paperclipProjectId} could not be fetched; missing-project checks were skipped for this link.`,
+      });
+    } else if (!paperclipProject) {
+      findings.push({
+        kind: "project_missing_paperclip",
+        severity: "error",
+        paperclipProjectId: link.paperclipProjectId,
+        linearProjectId: link.linearProjectId,
+        message: `Project link points at missing Paperclip project ${link.paperclipProjectId}.`,
+      });
+    }
+
+    let reverse: sync.ProjectLink | null = null;
+    let reverseCheckAvailable = true;
+    try {
+      reverse = await sync.getProjectLinkByLinear(ctx, link.linearProjectId);
+    } catch (err) {
+      reverseCheckAvailable = false;
+      ctx.logger.warn("audit-linear-bindings project reverse mapping check failed", { linearProjectId: link.linearProjectId, error: String(err) });
+    }
+    if (reverseCheckAvailable && !reverse) {
+      findings.push({
+        kind: "project_missing_reverse_mapping",
+        severity: "error",
+        paperclipProjectId: link.paperclipProjectId,
+        linearProjectId: link.linearProjectId,
+        message: `Project link ${link.paperclipProjectId} -> ${link.linearProjectName} is missing its Linear reverse mapping.`,
+      });
+    } else if (reverse && reverse.paperclipProjectId !== link.paperclipProjectId) {
+      findings.push({
+        kind: "project_stale_reverse_mapping",
+        severity: "error",
+        paperclipProjectId: link.paperclipProjectId,
+        linearProjectId: link.linearProjectId,
+        message: `Project reverse mapping for ${link.linearProjectName} points to ${reverse.paperclipProjectId}, not ${link.paperclipProjectId}.`,
+        details: { reversePaperclipProjectId: reverse.paperclipProjectId },
+      });
+    }
+
+    if (linearProjectValidationAvailable && !linearProjectsById.has(link.linearProjectId)) {
+      findings.push({
+        kind: "project_missing_linear",
+        severity: "error",
+        paperclipProjectId: link.paperclipProjectId,
+        linearProjectId: link.linearProjectId,
+        message: `Linked Linear project ${link.linearProjectName} (${link.linearProjectId}) was not found in Linear.`,
+      });
+    }
+  }
+
+  return {
+    companyId: options.companyId,
+    scanned: {
+      issueLinks: issueScan.links.length,
+      projectLinks: projectScan.links.length,
+      completeIssueScan: issueScan.complete,
+      completeProjectScan: projectScan.complete,
+    },
+    summary: summarizeAuditFindings(findings),
+    findings,
+  };
 }
 
 function isMilestoneLinkEntry(value: unknown): value is sync.MilestoneLink {
