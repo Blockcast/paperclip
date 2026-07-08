@@ -7,40 +7,16 @@
 # the original call — Claude Code's MCP client doesn't auto-retry on
 # this and surfaces the failure to the user otherwise.
 #
-# Routes incoming requests by path prefix to upstream MCP servers:
-#   /figma/mcp     → figma-mcp-server.paperclip.svc:8000/mcp
-#   /linear/mcp    → linear-mcp-server.paperclip.svc:8000/mcp
-#   /k8s-admin/mcp → kubernetes-mcp-server-admin.paperclip.svc:8080/mcp
-#   etc.
+# Routes incoming requests by path prefix to upstream MCP servers. Upstream
+# metadata comes from penstock state, scoped by the gateway state token's
+# principal/tenant identity. Credential values do not enter penstock state:
+# the state payload names env vars, and this deployment sources those values
+# from Kubernetes Secrets.
 #
-# Update the ConfigMap below to add upstreams; pod restart picks up the
-# new mapping. The session cache is in-memory and lost on restart —
-# clients reconnect transparently via a fresh initialize round-trip.
+# If penstock state is temporarily unavailable, the gateway falls back to the
+# last-known-good cache on /cache instead of dropping all MCP routes.
 # =============================================================================
 
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: paperclip-mcp-gateway-upstreams
-  namespace: paperclip
-  labels:
-    app.kubernetes.io/name: paperclip-mcp-gateway
-    app.kubernetes.io/managed-by: paperclip-mcp
-    app.kubernetes.io/part-of: paperclip
-data:
-  upstreams.json: |
-    {
-      "figma":     "http://figma-mcp-server.paperclip.svc.cluster.local:8000/mcp",
-      "linear":    "http://linear-mcp-server.paperclip.svc.cluster.local:8000/mcp",
-      "k8s-admin": "http://kubernetes-mcp-server-admin.paperclip.svc.cluster.local:8080/mcp",
-      "k8s-rw":    "http://kubernetes-mcp-server-ns-rw.paperclip.svc.cluster.local:8080/mcp",
-      "k8s-ro":    "http://kubernetes-mcp-server-readonly.paperclip.svc.cluster.local:8080/mcp",
-      "prom":      "http://prometheus-mcp-server.paperclip.svc.cluster.local:8080/mcp",
-      "webflow":   "http://webflow-mcp-server.paperclip.svc.cluster.local:8000/mcp",
-      "google-docs": "http://google-docs-mcp-server.paperclip.svc.cluster.local:8080/mcp",
-      "proxmox":   "http://proxmox-mcp-server.proxmox-mcp.svc.cluster.local:8000/mcp"
-    }
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -99,14 +75,26 @@ spec:
           env:
             - name: PORT
               value: "8080"
-            - name: PAPERCLIP_MCP_UPSTREAMS_FILE
-              value: /config/upstreams.json
+            - name: PAPERCLIP_MCP_UPSTREAMS_STATE_URL
+              value: https://api.penstock.run/v1/mcp/upstreams
+            - name: PAPERCLIP_MCP_UPSTREAMS_CACHE_FILE
+              value: /cache/upstreams-lkg.json
+            - name: PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: paperclip-mcp-gateway-state
+                  key: token
             - name: NODE_ENV
               value: production
+          envFrom:
+            # Contains only upstream credential values. Penstock state stores
+            # the matching env-var names (for example CCROTATE_SERVE_TOKEN),
+            # never the values themselves.
+            - secretRef:
+                name: paperclip-mcp-upstream-credentials
           volumeMounts:
-            - name: config
-              mountPath: /config
-              readOnly: true
+            - name: cache
+              mountPath: /cache
           readinessProbe:
             httpGet:
               path: /healthz
@@ -132,9 +120,8 @@ spec:
             capabilities:
               drop: ["ALL"]
       volumes:
-        - name: config
-          configMap:
-            name: paperclip-mcp-gateway-upstreams
+        - name: cache
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
