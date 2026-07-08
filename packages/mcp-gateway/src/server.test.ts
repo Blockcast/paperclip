@@ -343,7 +343,9 @@ describe("mcp gateway lifecycle compatibility", () => {
       breaker: new CircuitBreaker({ failureThreshold: 5, openCooldownMs: 30_000, halfOpenMaxProbes: 1 }),
     };
     const previous = process.env.TEST_MCP_TOKEN;
+    const previousAllowlist = process.env.PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS;
     process.env.TEST_MCP_TOKEN = "secret-token";
+    process.env.PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS = "TEST_MCP_TOKEN";
     const server = createGatewayServer(state);
     const url = (await listen(server)).replace(/\/mcp$/, "/k8s-admin/mcp");
     try {
@@ -358,6 +360,8 @@ describe("mcp gateway lifecycle compatibility", () => {
     } finally {
       if (previous === undefined) delete process.env.TEST_MCP_TOKEN;
       else process.env.TEST_MCP_TOKEN = previous;
+      if (previousAllowlist === undefined) delete process.env.PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS;
+      else process.env.PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS = previousAllowlist;
     }
   });
 

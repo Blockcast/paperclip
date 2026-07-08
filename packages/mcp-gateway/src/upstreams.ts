@@ -29,6 +29,7 @@ export interface UpstreamConfig {
 export type UpstreamMap = Record<string, UpstreamConfig>;
 
 const DEFAULT_UPSTREAMS_CACHE_FILE = "/cache/upstreams-lkg.json";
+const CREDENTIAL_ENV_ALLOWLIST = "PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS";
 
 export async function loadUpstreams(env: NodeJS.ProcessEnv = process.env): Promise<UpstreamMap> {
   const stateUrl = env.PAPERCLIP_MCP_UPSTREAMS_STATE_URL?.trim();
@@ -55,6 +56,7 @@ export function loadLocalUpstreams(env: NodeJS.ProcessEnv = process.env): Upstre
 
 async function loadStateUpstreams(stateUrl: string, env: NodeJS.ProcessEnv): Promise<UpstreamMap> {
   const cacheFile = env.PAPERCLIP_MCP_UPSTREAMS_CACHE_FILE?.trim() || DEFAULT_UPSTREAMS_CACHE_FILE;
+  let raw: string;
   try {
     const headers: Record<string, string> = { accept: "application/json" };
     const token = env.PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN?.trim();
@@ -63,19 +65,22 @@ async function loadStateUpstreams(stateUrl: string, env: NodeJS.ProcessEnv): Pro
     if (!response.ok) {
       throw new Error(`status=${response.status}`);
     }
-    const raw = await response.text();
-    const upstreams = parseUpstreamMap(raw, "PAPERCLIP_MCP_UPSTREAMS_STATE_URL");
-    writeLastKnownGood(cacheFile, raw);
-    return upstreams;
+    raw = await response.text();
   } catch (e) {
-    const raw = readLastKnownGood(cacheFile);
-    if (raw) {
+    const cachedRaw = readLastKnownGood(cacheFile);
+    if (cachedRaw) {
       // eslint-disable-next-line no-console
       console.warn(`[mcp-gateway] state config unavailable; using last-known-good cache: ${(e as Error).message}`);
-      return parseUpstreamMap(raw, `last-known-good ${cacheFile}`);
+      const cachedUpstreams = parseUpstreamMap(cachedRaw, `last-known-good ${cacheFile}`);
+      validateCredentialEnvNames(cachedUpstreams, env);
+      return cachedUpstreams;
     }
     throw new Error(`upstreams: failed to load penstock state and no last-known-good cache is available: ${(e as Error).message}`);
   }
+  const upstreams = parseUpstreamMap(raw, "PAPERCLIP_MCP_UPSTREAMS_STATE_URL");
+  validateCredentialEnvNames(upstreams, env);
+  writeLastKnownGood(cacheFile, raw);
+  return upstreams;
 }
 
 function writeLastKnownGood(cacheFile: string, raw: string): void {
@@ -217,6 +222,7 @@ function firstString(...values: unknown[]): string | undefined {
 }
 
 export function buildCredentialHeaders(config: UpstreamConfig, env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  validateCredentialEnvNames({ upstream: config }, env);
   const headers: Record<string, string> = {};
   for (const credential of config.credentialHeaders) {
     const value = env[credential.env];
@@ -224,6 +230,30 @@ export function buildCredentialHeaders(config: UpstreamConfig, env: NodeJS.Proce
     headers[credential.header.toLowerCase()] = credential.scheme ? `${credential.scheme} ${value}` : value;
   }
   return headers;
+}
+
+function validateCredentialEnvNames(upstreams: UpstreamMap, env: NodeJS.ProcessEnv): void {
+  const allowed = parseCredentialEnvAllowlist(env);
+  for (const [prefix, config] of Object.entries(upstreams)) {
+    for (const credential of config.credentialHeaders) {
+      if (!allowed.has(credential.env)) {
+        throw new Error(
+          `upstreams: prefix "${prefix}" credential env "${credential.env}" is not listed in ${CREDENTIAL_ENV_ALLOWLIST}`,
+        );
+      }
+    }
+  }
+}
+
+function parseCredentialEnvAllowlist(env: NodeJS.ProcessEnv): Set<string> {
+  const raw = env[CREDENTIAL_ENV_ALLOWLIST]?.trim();
+  if (!raw) return new Set();
+  return new Set(
+    raw
+      .split(",")
+      .map((name) => name.trim())
+      .filter((name) => name.length > 0),
+  );
 }
 
 /**

@@ -79,6 +79,8 @@ spec:
               value: https://api.penstock.run/v1/mcp/upstreams
             - name: PAPERCLIP_MCP_UPSTREAMS_CACHE_FILE
               value: /cache/upstreams-lkg.json
+            - name: PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS
+              value: CCROTATE_SERVE_TOKEN
             - name: PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN
               valueFrom:
                 secretKeyRef:

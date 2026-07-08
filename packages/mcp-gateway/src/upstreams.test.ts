@@ -114,10 +114,29 @@ describe("buildCredentialHeaders", () => {
           { header: "x-api-key", env: "CCROTATE_API_KEY" },
         ],
       },
-      { CCROTATE_SERVE_TOKEN: "serve-token", CCROTATE_API_KEY: "api-key" },
+      {
+        PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS: "CCROTATE_SERVE_TOKEN,CCROTATE_API_KEY",
+        CCROTATE_SERVE_TOKEN: "serve-token",
+        CCROTATE_API_KEY: "api-key",
+      },
     );
 
     expect(headers).toEqual({ authorization: "Bearer serve-token", "x-api-key": "api-key" });
+  });
+
+  it("rejects credential env names that are not allowlisted", () => {
+    expect(() =>
+      buildCredentialHeaders(
+        {
+          url: "https://ccrotate.example/mcp",
+          credentialHeaders: [{ header: "authorization", env: "PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN", scheme: "Bearer" }],
+        },
+        {
+          PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS: "CCROTATE_SERVE_TOKEN",
+          PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN: "state-token",
+        },
+      ),
+    ).toThrow(/not listed in PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS/);
   });
 });
 
@@ -152,5 +171,59 @@ describe("loadUpstreams", () => {
     });
 
     expect(map.figma.url).toBe("http://cached-figma:8000/mcp");
+  });
+
+  it("does not fall back to last-known-good cache when reachable state is invalid", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-upstreams-"));
+    const cacheFile = path.join(dir, "lkg.json");
+    fs.writeFileSync(cacheFile, '{"figma":"http://cached-figma:8000/mcp"}');
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({ upstreams: [{ prefix: "ccrotate", url: "https://ccrotate.example/mcp", token: "secret-value" }] }),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    await expect(
+      loadUpstreams({
+        PAPERCLIP_MCP_UPSTREAMS_STATE_URL: "https://penstock.example/mcp-upstreams",
+        PAPERCLIP_MCP_UPSTREAMS_CACHE_FILE: cacheFile,
+      }),
+    ).rejects.toThrow(/credential value/);
+  });
+
+  it("rejects state credential env names that are not allowlisted", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-upstreams-"));
+    const cacheFile = path.join(dir, "lkg.json");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            upstreams: [
+              {
+                prefix: "ccrotate",
+                url: "https://ccrotate.example/mcp",
+                authorizationEnv: "PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN",
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    await expect(
+      loadUpstreams({
+        PAPERCLIP_MCP_UPSTREAMS_STATE_URL: "https://penstock.example/mcp-upstreams",
+        PAPERCLIP_MCP_UPSTREAMS_CACHE_FILE: cacheFile,
+        PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS: "CCROTATE_SERVE_TOKEN",
+        PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN: "state-token",
+      }),
+    ).rejects.toThrow(/not listed in PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS/);
+    expect(fs.existsSync(cacheFile)).toBe(false);
   });
 });
