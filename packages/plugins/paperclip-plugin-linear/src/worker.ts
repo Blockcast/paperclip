@@ -4317,6 +4317,7 @@ const LINEAR_MIRROR_RECONCILE_MAX_ENTRIES_PER_RUN = 100;
 
 type AuditFindingKind =
   | "issue_missing_paperclip"
+  | "issue_lookup_failed"
   | "issue_missing_reverse_mapping"
   | "issue_stale_reverse_mapping"
   | "issue_host_reverse_mismatch"
@@ -4325,6 +4326,7 @@ type AuditFindingKind =
   | "issue_same_team_no_project_drift"
   | "issue_active_workspace_lock"
   | "project_missing_paperclip"
+  | "project_lookup_failed"
   | "project_missing_reverse_mapping"
   | "project_stale_reverse_mapping"
   | "project_duplicate_linear_id"
@@ -4548,14 +4550,29 @@ async function auditLinearBindings(
 
   for (const link of issueScan.links) {
     let paperclipIssue: Record<string, unknown> | null = null;
+    let paperclipIssueLookupFailed = false;
     try {
       paperclipIssue = await ctx.issues.get(link.paperclipIssueId, link.paperclipCompanyId) as unknown as Record<string, unknown> | null;
-    } catch {
-      paperclipIssue = null;
+    } catch (err) {
+      if (sync.isPaperclipIssueNotFoundError(err)) {
+        paperclipIssue = null;
+      } else {
+        paperclipIssueLookupFailed = true;
+        ctx.logger.warn("audit-linear-bindings Paperclip issue lookup failed", { paperclipIssueId: link.paperclipIssueId, error: String(err) });
+      }
     }
     const paperclipIdentifier = typeof paperclipIssue?.identifier === "string" ? paperclipIssue.identifier : null;
 
-    if (!paperclipIssue) {
+    if (paperclipIssueLookupFailed) {
+      findings.push({
+        kind: "issue_lookup_failed",
+        severity: "warning",
+        paperclipIssueId: link.paperclipIssueId,
+        linearIssueId: link.linearIssueId,
+        linearIdentifier: link.linearIdentifier,
+        message: `Paperclip issue ${link.paperclipIssueId} could not be fetched; missing-issue checks were skipped for this link.`,
+      });
+    } else if (!paperclipIssue) {
       findings.push({
         kind: "issue_missing_paperclip",
         severity: "error",
@@ -4675,12 +4692,27 @@ async function auditLinearBindings(
 
   for (const link of projectScan.links) {
     let paperclipProject: { id: string; name?: string | null } | null = null;
+    let paperclipProjectLookupFailed = false;
     try {
       paperclipProject = await ctx.projects.get(link.paperclipProjectId, link.paperclipCompanyId) as { id: string; name?: string | null } | null;
-    } catch {
-      paperclipProject = null;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes("Project not found")) {
+        paperclipProject = null;
+      } else {
+        paperclipProjectLookupFailed = true;
+        ctx.logger.warn("audit-linear-bindings Paperclip project lookup failed", { paperclipProjectId: link.paperclipProjectId, error: String(err) });
+      }
     }
-    if (!paperclipProject) {
+    if (paperclipProjectLookupFailed) {
+      findings.push({
+        kind: "project_lookup_failed",
+        severity: "warning",
+        paperclipProjectId: link.paperclipProjectId,
+        linearProjectId: link.linearProjectId,
+        message: `Paperclip project ${link.paperclipProjectId} could not be fetched; missing-project checks were skipped for this link.`,
+      });
+    } else if (!paperclipProject) {
       findings.push({
         kind: "project_missing_paperclip",
         severity: "error",
