@@ -18,7 +18,7 @@ import {
 } from "./manifest.js";
 import {
   OAuthClientManager,
-  loadClientsFromFile,
+  loadClients,
 } from "./oauth-client-manager.js";
 import { resolveGbrainUrlForAgent } from "./client-routing.js";
 import {
@@ -36,6 +36,8 @@ interface GbrainConfig {
   gbrainMcpUrl?: string;
   gbrainOauthTokenUrl?: string;
   oauthClientsPath?: string;
+  oauthClientsUrl?: string;
+  authbotServiceKeyFile?: string;
   hindsightApiUrl?: string;
   autoRetain?: boolean;
   promoteFactsToPages?: boolean;
@@ -61,26 +63,34 @@ const plugin = definePlugin({
   async setup(ctx) {
     ctx.logger.info("gbrain plugin starting");
 
-    // Load the OAuth client map once at plugin startup. Falls back to
-    // anonymous (legacy bridge) calls when the file is absent. The
-    // file path comes from instance config so operators can move the
-    // mount around without rebuilding the plugin.
+    // Load the OAuth client map once at plugin startup. Authbot is
+    // authoritative when configured; otherwise the legacy mounted file is
+    // still accepted for older deployments.
     const bootConfig = await getConfig(ctx);
     const clientsPath = bootConfig.oauthClientsPath ?? DEFAULT_GBRAIN_OAUTH_CLIENTS_PATH;
+    const clientsUrl = process.env.PAPERCLIP_GBRAIN_OAUTH_CLIENTS_URL ?? bootConfig.oauthClientsUrl;
+    const authbotServiceKeyFile =
+      process.env.PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY_FILE ?? bootConfig.authbotServiceKeyFile;
     const tokenUrl = bootConfig.gbrainOauthTokenUrl ?? DEFAULT_GBRAIN_OAUTH_TOKEN_URL;
-    const clients = await loadClientsFromFile(clientsPath);
+    const loadedClients = await loadClients({
+      authbotUrl: clientsUrl,
+      authbotServiceKeyFile,
+      filePath: clientsPath,
+    });
 
     let oauth: OAuthClientManager | null = null;
-    if (clients) {
-      oauth = new OAuthClientManager({ tokenUrl, clients });
+    if (loadedClients) {
+      oauth = new OAuthClientManager({ tokenUrl, clients: loadedClients.clients });
       ctx.logger.info("gbrain OAuth client manager loaded", {
         agentCount: oauth.agentCount(),
-        clientsPath,
+        clientsSource: loadedClients.source,
+        clientsSourceLabel: loadedClients.sourceLabel,
         tokenUrl,
       });
     } else {
       ctx.logger.info("gbrain OAuth disabled — falling back to anonymous calls", {
         clientsPath,
+        clientsUrl: clientsUrl ?? null,
       });
     }
 

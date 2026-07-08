@@ -26,6 +26,8 @@
 import { readFile } from "node:fs/promises";
 
 const REFRESH_LEEWAY_SEC = 60;
+const DEFAULT_AUTHBOT_TIMEOUT_MS = 10_000;
+const AUTHBOT_CONSUMER_HEADER = "paperclip-gbrain-plugin";
 
 export interface OAuthClientEntry {
   client_id: string;
@@ -43,6 +45,38 @@ interface TokenResponse {
   token_type: string;
   expires_in: number;
   scope?: string;
+}
+
+interface AuthbotCredentialResponse {
+  credential_id?: unknown;
+  service?: unknown;
+  source?: unknown;
+  value?: unknown;
+  value_redacted?: unknown;
+}
+
+interface AuthbotCredentialEnvelope {
+  credential?: unknown;
+  value?: unknown;
+}
+
+export interface OAuthClientsLoadOptions {
+  /** Authbot credential API URL. When set, this source is authoritative. */
+  authbotUrl?: string;
+  /** Managed service key file used for the Authbot credential API. */
+  authbotServiceKeyFile?: string;
+  /** Legacy mounted clients.json path. Used only when authbotUrl is absent. */
+  filePath: string;
+  /** Override fetch (tests). */
+  fetch?: typeof fetch;
+  /** Authbot read timeout. */
+  timeoutMs?: number;
+}
+
+export interface LoadedOAuthClients {
+  source: "authbot" | "file";
+  sourceLabel: string;
+  clients: Record<string, OAuthClientEntry>;
 }
 
 export interface OAuthClientManagerOptions {
@@ -144,22 +178,7 @@ export class OAuthClientManager {
   }
 }
 
-/**
- * Load the per-agent OAuth clients JSON from a file mounted via k8s
- * Secret (or any other path). Returns null when the file is absent,
- * unreadable, or malformed — caller falls back to anonymous mode.
- *
- * The expected shape is documented in the manager header.
- */
-export async function loadClientsFromFile(
-  path: string,
-): Promise<Record<string, OAuthClientEntry> | null> {
-  let raw: string;
-  try {
-    raw = await readFile(path, "utf8");
-  } catch {
-    return null;
-  }
+function parseClientsJson(raw: string): Record<string, OAuthClientEntry> | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -182,4 +201,94 @@ export async function loadClientsFromFile(
     }
   }
   return Object.keys(out).length > 0 ? out : null;
+}
+
+function authbotCredentialValue(payload: AuthbotCredentialEnvelope): string | null {
+  const candidate =
+    payload.credential && typeof payload.credential === "object"
+      ? (payload.credential as AuthbotCredentialResponse)
+      : (payload as AuthbotCredentialResponse);
+  return typeof candidate.value === "string" && candidate.value.length > 0
+    ? candidate.value
+    : null;
+}
+
+/**
+ * Load the per-agent OAuth clients JSON from a file mounted via k8s
+ * Secret (or any other path). Returns null when the file is absent,
+ * unreadable, or malformed — caller falls back to anonymous mode.
+ *
+ * The expected shape is documented in the manager header.
+ */
+export async function loadClientsFromFile(
+  path: string,
+): Promise<Record<string, OAuthClientEntry> | null> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch {
+    return null;
+  }
+  return parseClientsJson(raw);
+}
+
+export async function loadClientsFromAuthbot(
+  opts: {
+    url: string;
+    serviceKeyFile?: string;
+    fetch?: typeof fetch;
+    timeoutMs?: number;
+  },
+): Promise<Record<string, OAuthClientEntry> | null> {
+  if (!opts.serviceKeyFile) return null;
+  let serviceKey: string;
+  try {
+    serviceKey = (await readFile(opts.serviceKeyFile, "utf8")).trim();
+  } catch {
+    return null;
+  }
+  if (!serviceKey) return null;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    opts.timeoutMs ?? DEFAULT_AUTHBOT_TIMEOUT_MS,
+  );
+  try {
+    const resp = await (opts.fetch ?? fetch)(opts.url, {
+      method: "GET",
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${serviceKey}`,
+        "x-paperclip-consumer": AUTHBOT_CONSUMER_HEADER,
+      },
+      signal: controller.signal,
+    });
+    if (!resp.ok) return null;
+    const value = authbotCredentialValue((await resp.json()) as AuthbotCredentialEnvelope);
+    return value ? parseClientsJson(value) : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export async function loadClients(
+  opts: OAuthClientsLoadOptions,
+): Promise<LoadedOAuthClients | null> {
+  if (opts.authbotUrl) {
+    const clients = await loadClientsFromAuthbot({
+      url: opts.authbotUrl,
+      serviceKeyFile: opts.authbotServiceKeyFile,
+      fetch: opts.fetch,
+      timeoutMs: opts.timeoutMs,
+    });
+    return clients
+      ? { source: "authbot", sourceLabel: opts.authbotUrl, clients }
+      : null;
+  }
+
+  const clients = await loadClientsFromFile(opts.filePath);
+  return clients ? { source: "file", sourceLabel: opts.filePath, clients } : null;
 }

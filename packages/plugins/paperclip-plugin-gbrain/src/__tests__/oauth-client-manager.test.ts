@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   OAuthClientManager,
+  loadClients,
+  loadClientsFromAuthbot,
   loadClientsFromFile,
 } from "../oauth-client-manager.js";
 
@@ -224,6 +226,187 @@ describe("loadClientsFromFile", () => {
     const path = join(dir, "clients.json");
     await writeFile(path, JSON.stringify({ invalid: 123 }));
     expect(await loadClientsFromFile(path)).toBeNull();
+    await rm(dir, { recursive: true });
+  });
+});
+
+describe("loadClientsFromAuthbot", () => {
+  it("parses clients from an unredacted Authbot credential response", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gbrain-test-"));
+    const serviceKeyFile = join(dir, "service-key");
+    await writeFile(serviceKeyFile, "service-key-1\n");
+    const fetchMock = vi.fn(async (_url: unknown, _init?: RequestInit) =>
+      new Response(
+        JSON.stringify({
+          request_id: "req-1",
+          credential: {
+            credential_id: "gbrain-plugin-oauth-clients",
+            service: "gbrain",
+            source: "env",
+            value: JSON.stringify({
+              "agent-1": {
+                client_id: "cid-1",
+                client_secret: "csec-1",
+                name: "paperclip:Blockcast:CTO",
+              },
+            }),
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    const out = await loadClientsFromAuthbot({
+      url: "https://api.penstock.run/v1/authbot/mcp-credentials/gbrain-plugin-oauth-clients",
+      serviceKeyFile,
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    expect(out).not.toBeNull();
+    expect(out!["agent-1"].client_id).toBe("cid-1");
+    const call = fetchMock.mock.calls[0];
+    expect(call?.[0]).toBe(
+      "https://api.penstock.run/v1/authbot/mcp-credentials/gbrain-plugin-oauth-clients",
+    );
+    expect((call?.[1]?.headers as Record<string, string>).authorization).toBe(
+      "Bearer service-key-1",
+    );
+    expect((call?.[1]?.headers as Record<string, string>)["x-paperclip-consumer"]).toBe(
+      "paperclip-gbrain-plugin",
+    );
+    await rm(dir, { recursive: true });
+  });
+
+  it("also accepts the older flat Authbot credential response shape", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gbrain-test-"));
+    const serviceKeyFile = join(dir, "service-key");
+    await writeFile(serviceKeyFile, "service-key-1\n");
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          credential_id: "gbrain-plugin-oauth-clients",
+          service: "gbrain",
+          source: "env",
+          value: JSON.stringify({
+            "agent-1": {
+              client_id: "cid-1",
+              client_secret: "csec-1",
+            },
+          }),
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    const out = await loadClientsFromAuthbot({
+      url: "https://api.penstock.run/v1/authbot/mcp-credentials/gbrain-plugin-oauth-clients",
+      serviceKeyFile,
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    expect(out).not.toBeNull();
+    expect(out!["agent-1"].client_id).toBe("cid-1");
+    await rm(dir, { recursive: true });
+  });
+
+  it("returns null when Authbot returns a redacted probe response", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gbrain-test-"));
+    const serviceKeyFile = join(dir, "service-key");
+    await writeFile(serviceKeyFile, "service-key-1\n");
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          request_id: "req-1",
+          credential: {
+            credential_id: "gbrain-plugin-oauth-clients",
+            service: "gbrain",
+            source: "env",
+            value_redacted: true,
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    await expect(
+      loadClientsFromAuthbot({
+        url: "https://api.penstock.run/v1/authbot/mcp-credentials/gbrain-plugin-oauth-clients",
+        serviceKeyFile,
+        fetch: fetchMock as unknown as typeof fetch,
+      }),
+    ).resolves.toBeNull();
+    await rm(dir, { recursive: true });
+  });
+
+  it("returns null when the service key file is missing", async () => {
+    const fetchMock = vi.fn();
+    await expect(
+      loadClientsFromAuthbot({
+        url: "https://api.penstock.run/v1/authbot/mcp-credentials/gbrain-plugin-oauth-clients",
+        serviceKeyFile: "/missing/service-key",
+        fetch: fetchMock as unknown as typeof fetch,
+      }),
+    ).resolves.toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("returns null when Authbot's credential value is malformed clients JSON", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gbrain-test-"));
+    const serviceKeyFile = join(dir, "service-key");
+    await writeFile(serviceKeyFile, "service-key-1\n");
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          credential_id: "gbrain-plugin-oauth-clients",
+          service: "gbrain",
+          source: "env",
+          value: "{not json",
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    await expect(
+      loadClientsFromAuthbot({
+        url: "https://api.penstock.run/v1/authbot/mcp-credentials/gbrain-plugin-oauth-clients",
+        serviceKeyFile,
+        fetch: fetchMock as unknown as typeof fetch,
+      }),
+    ).resolves.toBeNull();
+    await rm(dir, { recursive: true });
+  });
+});
+
+describe("loadClients", () => {
+  it("uses the legacy file source when no Authbot URL is configured", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gbrain-test-"));
+    const path = join(dir, "clients.json");
+    await writeFile(path, JSON.stringify({ "agent-1": { client_id: "cid", client_secret: "csec" } }));
+
+    const out = await loadClients({ filePath: path });
+
+    expect(out?.source).toBe("file");
+    expect(out?.sourceLabel).toBe(path);
+    expect(out?.clients["agent-1"].client_secret).toBe("csec");
+    await rm(dir, { recursive: true });
+  });
+
+  it("does not fall back to the file when Authbot is configured but unavailable", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gbrain-test-"));
+    const path = join(dir, "clients.json");
+    const serviceKeyFile = join(dir, "service-key");
+    await writeFile(path, JSON.stringify({ "agent-1": { client_id: "cid", client_secret: "csec" } }));
+    await writeFile(serviceKeyFile, "service-key-1\n");
+    const fetchMock = vi.fn(async () => new Response("unavailable", { status: 503 }));
+
+    await expect(
+      loadClients({
+        authbotUrl: "https://api.penstock.run/v1/authbot/mcp-credentials/gbrain-plugin-oauth-clients",
+        authbotServiceKeyFile: serviceKeyFile,
+        filePath: path,
+        fetch: fetchMock as unknown as typeof fetch,
+      }),
+    ).resolves.toBeNull();
     await rm(dir, { recursive: true });
   });
 });

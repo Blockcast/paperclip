@@ -83,6 +83,8 @@ interface JsonRpcResponse {
 const DEFAULT_GBRAIN_MCP_URL = "http://gbrain-mcp-admin.paperclip.svc.cluster.local:3130/mcp";
 const DEFAULT_GBRAIN_TOKEN_URL = "http://gbrain-mcp-admin.paperclip.svc.cluster.local:3130/token";
 const DEFAULT_GBRAIN_CLIENTS_FILE = "/etc/paperclip-plugin-gbrain/clients.json";
+const DEFAULT_AUTHBOT_TIMEOUT_MS = 10_000;
+const AUTHBOT_CONSUMER_HEADER = "paperclip-gbrain-plugin";
 
 // Blockcast CEO agent UUID — the same client identity the StatefulSet `seed`
 // init container mints under for the baseline /paperclip/.mcp.json gbrain
@@ -144,13 +146,19 @@ export class NullBearer implements BearerSource {
 
 interface OAuthMintBearerOpts {
   clientsFilePath: string;
+  clientsUrl?: string;
+  serviceKeyFilePath?: string;
   agentId: string;
   tokenUrl: string;
   fetch: typeof fetch;
+  /** Authbot credential read timeout. Defaults to 10s. */
+  credentialFetchTimeoutMs?: number;
   /** Refresh this many ms before stated expiry. Defaults to 1h. */
   refreshLeadMs?: number;
   /** File reader override (tests). Defaults to fs/promises readFile. */
   readClientsFile?: (path: string) => Promise<string>;
+  /** Service-key reader override (tests). Defaults to fs/promises readFile. */
+  readServiceKeyFile?: (path: string) => Promise<string>;
   /** Clock override (tests). Defaults to `Date.now`. */
   now?: () => number;
 }
@@ -162,6 +170,26 @@ interface ClientsFile {
 interface TokenResponse {
   access_token?: string;
   expires_in?: number;
+}
+
+interface AuthbotCredentialResponse {
+  value?: unknown;
+  value_redacted?: unknown;
+}
+
+interface AuthbotCredentialEnvelope {
+  credential?: unknown;
+  value?: unknown;
+}
+
+function authbotCredentialValue(payload: AuthbotCredentialEnvelope): string | null {
+  const candidate =
+    payload.credential && typeof payload.credential === "object"
+      ? (payload.credential as AuthbotCredentialResponse)
+      : (payload as AuthbotCredentialResponse);
+  return typeof candidate.value === "string" && candidate.value.length > 0
+    ? candidate.value
+    : null;
 }
 
 export class OAuthMintBearer implements BearerSource {
@@ -188,13 +216,12 @@ export class OAuthMintBearer implements BearerSource {
   }
 
   private async mint(now: number): Promise<string | undefined> {
-    const reader = this.opts.readClientsFile ?? ((p: string) => readFile(p, "utf8"));
     let clients: ClientsFile;
     try {
-      const raw = await reader(this.opts.clientsFilePath);
+      const raw = await this.readClientsJson();
       clients = JSON.parse(raw) as ClientsFile;
     } catch {
-      // File missing / unreadable / not JSON. Caller will fail-open.
+      // File/Authbot missing, unreadable, or not JSON. Caller will fail-open.
       return undefined;
     }
     const entry = clients[this.opts.agentId];
@@ -228,6 +255,48 @@ export class OAuthMintBearer implements BearerSource {
     const expiresInMs = (json.expires_in ?? 86400) * 1000;
     this.cached = { token: json.access_token, expiresAt: now + expiresInMs };
     return json.access_token;
+  }
+
+  private async readClientsJson(): Promise<string> {
+    if (!this.opts.clientsUrl) {
+      const reader = this.opts.readClientsFile ?? ((p: string) => readFile(p, "utf8"));
+      return reader(this.opts.clientsFilePath);
+    }
+    if (!this.opts.serviceKeyFilePath) {
+      throw new Error("gbrain OAuth Authbot service key file is not configured");
+    }
+    const keyReader = this.opts.readServiceKeyFile ?? ((p: string) => readFile(p, "utf8"));
+    const serviceKey = (await keyReader(this.opts.serviceKeyFilePath)).trim();
+    if (!serviceKey) {
+      throw new Error("gbrain OAuth Authbot service key file is empty");
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      this.opts.credentialFetchTimeoutMs ?? DEFAULT_AUTHBOT_TIMEOUT_MS,
+    );
+    try {
+      const resp = await this.opts.fetch(this.opts.clientsUrl, {
+        method: "GET",
+        headers: {
+          accept: "application/json",
+          authorization: `Bearer ${serviceKey}`,
+          "x-paperclip-consumer": AUTHBOT_CONSUMER_HEADER,
+        },
+        signal: controller.signal,
+      });
+      if (!resp.ok) {
+        throw new Error(`Authbot returned HTTP ${resp.status}`);
+      }
+      const value = authbotCredentialValue((await resp.json()) as AuthbotCredentialEnvelope);
+      if (!value) {
+        throw new Error("Authbot credential response did not include a value");
+      }
+      return value;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 }
 
@@ -307,8 +376,10 @@ class HttpServerGbrainClient implements ServerGbrainClient {
  *  2. `opts.bearerToken`             — caller-supplied static value
  *  3. `PAPERCLIP_GBRAIN_MCP_BEARER_TOKEN` env — static override
  *  4. `clients.json` mint            — production path; reads
+ *     `PAPERCLIP_GBRAIN_OAUTH_CLIENTS_URL` from Authbot when set, otherwise
  *     `PAPERCLIP_GBRAIN_OAUTH_CLIENTS_FILE` (default
  *     `/etc/paperclip-plugin-gbrain/clients.json`),
+ *     `PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY_FILE` for Authbot reads,
  *     `PAPERCLIP_GBRAIN_OAUTH_AGENT_ID` (default Blockcast CEO),
  *     `PAPERCLIP_GBRAIN_MCP_TOKEN_URL` (default admin-ui :3130/token).
  *
@@ -320,6 +391,8 @@ export function resolveBearerSource(opts: ServerGbrainClientOptions = {}): Beare
   if (explicit) return new StaticBearer(explicit);
   return new OAuthMintBearer({
     clientsFilePath: process.env.PAPERCLIP_GBRAIN_OAUTH_CLIENTS_FILE ?? DEFAULT_GBRAIN_CLIENTS_FILE,
+    clientsUrl: process.env.PAPERCLIP_GBRAIN_OAUTH_CLIENTS_URL,
+    serviceKeyFilePath: process.env.PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY_FILE,
     agentId: process.env.PAPERCLIP_GBRAIN_OAUTH_AGENT_ID ?? DEFAULT_BLOCKCAST_CEO_AGENT_ID,
     tokenUrl: process.env.PAPERCLIP_GBRAIN_MCP_TOKEN_URL ?? DEFAULT_GBRAIN_TOKEN_URL,
     fetch: opts.fetch ?? fetch,

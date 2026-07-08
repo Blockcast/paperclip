@@ -383,19 +383,47 @@ spec:
               #   1. admin-ui:3130/mcp   — OAuth Bearer, scales independently
               #   2. gbrain-mcp-internal:3131/gbrain — bridge (unauthed),
               #      same gbrain backend but OOMs ~3/hr under aggregate load.
-              # We pick #1 by minting a Bearer here against the CEO agent's
-              # OAuth client at boot. Per-agent identity at the paperclip
-              # plugin layer is preserved via adapter_config.mcpServers.gbrain
-              # (refreshed by the gbrain-oauth-refresher CronJob in
-              # onprem-k8s/paperclip/). All 7 agents have equivalent /mcp
-              # access; using CEO's client for the shared claude-direct
-              # path is operationally neutral.
+              # We pick #1 by fetching the per-agent OAuth clients bundle from
+              # Penstock/Authbot, then minting a Bearer here against the CEO
+              # agent's OAuth client at boot. Per-agent identity at the
+              # paperclip plugin layer is preserved via
+              # adapter_config.mcpServers.gbrain (refreshed by the
+              # gbrain-oauth-refresher CronJob in onprem-k8s/paperclip/). All
+              # 7 agents have equivalent /mcp access; using CEO's client for
+              # the shared claude-direct path is operationally neutral.
               # Falls back to the bridge if minting fails so claude_k8s still
               # has a working gbrain MCP path on first deploy / outage.
               GBRAIN_ENTRY='{"type":"http","url":"http://gbrain-mcp-internal.paperclip.svc.cluster.local:3131/gbrain"}'
-              if [ -r /etc/paperclip-plugin-gbrain/clients.json ]; then
-                CEO_ID=$(jq -r '."4eca1725-632f-45fa-97a2-8cf7e0430958".client_id // empty' /etc/paperclip-plugin-gbrain/clients.json 2>/dev/null || true)
-                CEO_SEC=$(jq -r '."4eca1725-632f-45fa-97a2-8cf7e0430958".client_secret // empty' /etc/paperclip-plugin-gbrain/clients.json 2>/dev/null || true)
+              GBRAIN_CLIENTS_FILE=""
+              GBRAIN_AUTHBOT_URL="${PAPERCLIP_GBRAIN_OAUTH_CLIENTS_URL:-https://api.penstock.run/v1/authbot/mcp-credentials/gbrain-plugin-oauth-clients}"
+              GBRAIN_AUTHBOT_KEY_FILE="${PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY_FILE:-/var/run/authbot/gbrain-plugin-service-key}"
+              if [ -r "${GBRAIN_AUTHBOT_KEY_FILE}" ]; then
+                GBRAIN_AUTHBOT_KEY="$(tr -d '\r\n' < "${GBRAIN_AUTHBOT_KEY_FILE}")"
+                if [ -n "${GBRAIN_AUTHBOT_KEY}" ]; then
+                  if curl -sf --max-time 5 \
+                    -H "accept: application/json" \
+                    -H "authorization: Bearer ${GBRAIN_AUTHBOT_KEY}" \
+                    -H "x-paperclip-consumer: paperclip-gbrain-plugin" \
+                    "${GBRAIN_AUTHBOT_URL}" \
+                    | jq -r '.credential.value // .value // empty' > /tmp/gbrain-clients.json; then
+                    if [ -s /tmp/gbrain-clients.json ] && jq -e 'type == "object"' /tmp/gbrain-clients.json >/dev/null 2>&1; then
+                      GBRAIN_CLIENTS_FILE="/tmp/gbrain-clients.json"
+                      echo "seed: loaded gbrain OAuth clients from Authbot"
+                    else
+                      echo "seed: Authbot gbrain clients response was empty or malformed"
+                    fi
+                  else
+                    echo "seed: Authbot gbrain clients fetch failed"
+                  fi
+                fi
+              fi
+              if [ -z "${GBRAIN_CLIENTS_FILE}" ] && [ -r /etc/paperclip-plugin-gbrain/clients.json ]; then
+                GBRAIN_CLIENTS_FILE="/etc/paperclip-plugin-gbrain/clients.json"
+                echo "seed: using legacy gbrain OAuth clients file"
+              fi
+              if [ -n "${GBRAIN_CLIENTS_FILE}" ]; then
+                CEO_ID=$(jq -r '."4eca1725-632f-45fa-97a2-8cf7e0430958".client_id // empty' "${GBRAIN_CLIENTS_FILE}" 2>/dev/null || true)
+                CEO_SEC=$(jq -r '."4eca1725-632f-45fa-97a2-8cf7e0430958".client_secret // empty' "${GBRAIN_CLIENTS_FILE}" 2>/dev/null || true)
                 if [ -n "${CEO_ID}" ] && [ -n "${CEO_SEC}" ]; then
                   GBRAIN_BEARER=$(curl -sf --max-time 5 -X POST \
                     http://gbrain-mcp-admin.paperclip.svc.cluster.local:3130/token \
