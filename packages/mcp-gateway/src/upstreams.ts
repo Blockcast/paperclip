@@ -111,6 +111,9 @@ export function parseUpstreamMap(raw: string, source: string): UpstreamMap {
     if (!/^[a-zA-Z0-9_-]+$/.test(prefix)) {
       throw new Error(`upstreams: prefix "${prefix}" must match /^[a-zA-Z0-9_-]+$/`);
     }
+    if (prefix.includes("__")) {
+      throw new Error(`upstreams: prefix "${prefix}" must not contain "__"; aggregate tool names reserve it as a separator`);
+    }
     const config = parseUpstreamConfig(prefix, value);
     if (!/^https?:\/\//.test(config.url)) {
       throw new Error(`upstreams: prefix "${prefix}" URL must start with http:// or https://`);
