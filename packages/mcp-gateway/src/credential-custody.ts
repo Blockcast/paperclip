@@ -13,10 +13,12 @@ export interface CredentialCustodyConfig {
 }
 
 export const DEFAULT_CREDENTIAL_CUSTODY_TIMEOUT_MS = 60_000;
+export const DEFAULT_CREDENTIAL_CUSTODY_TOKEN_CACHE_MAX_ENTRIES = 4096;
 
 export interface CredentialCustodyState {
   readonly configs: Record<string, CredentialCustodyConfig>;
   readonly tokenCache: Map<string, CredentialCustodyCacheEntry>;
+  readonly maxTokenCacheEntries: number;
 }
 
 interface CredentialCustodyCacheEntry {
@@ -50,7 +52,11 @@ export function loadCredentialCustodyState(
   const leaseUrl = env.PAPERCLIP_MCP_FIGMA_LEASE_URL?.trim();
   const credentialBaseUrl = env.PAPERCLIP_MCP_FIGMA_CREDENTIAL_BASE_URL?.trim();
   if (!leaseUrl && !credentialBaseUrl) {
-    return { configs: {}, tokenCache: new Map() };
+    return {
+      configs: {},
+      tokenCache: new Map(),
+      maxTokenCacheEntries: DEFAULT_CREDENTIAL_CUSTODY_TOKEN_CACHE_MAX_ENTRIES,
+    };
   }
   if (!leaseUrl || !credentialBaseUrl) {
     throw new Error(
@@ -74,6 +80,10 @@ export function loadCredentialCustodyState(
       },
     },
     tokenCache: new Map(),
+    maxTokenCacheEntries: parsePositiveInteger(
+      env.PAPERCLIP_MCP_FIGMA_TOKEN_CACHE_MAX_ENTRIES,
+      DEFAULT_CREDENTIAL_CUSTODY_TOKEN_CACHE_MAX_ENTRIES,
+    ),
   };
 }
 
@@ -103,16 +113,36 @@ export async function resolveCustodiedToken(
   }
 
   const pending = resolveFreshCustodiedToken(config, callerAuthorization, inboundHeaders, mcpSessionId);
-  state.tokenCache.set(cacheKey, { expiresAt: cacheExpiry(config, now), pending });
+  setCustodiedTokenCacheEntry(state, cacheKey, { expiresAt: cacheExpiry(config, now), pending });
   try {
     const token = await pending;
-    state.tokenCache.set(cacheKey, { expiresAt: cacheExpiry(config, Date.now()), token });
+    if (state.tokenCache.get(cacheKey)?.pending === pending) {
+      setCustodiedTokenCacheEntry(state, cacheKey, { expiresAt: cacheExpiry(config, Date.now()), token });
+    }
     return token;
   } catch (error) {
     if (state.tokenCache.get(cacheKey)?.pending === pending) {
       state.tokenCache.delete(cacheKey);
     }
     throw error;
+  }
+}
+
+function setCustodiedTokenCacheEntry(
+  state: CredentialCustodyState,
+  cacheKey: string,
+  entry: CredentialCustodyCacheEntry,
+): void {
+  state.tokenCache.delete(cacheKey);
+  state.tokenCache.set(cacheKey, entry);
+  evictCustodiedTokenCacheEntries(state);
+}
+
+function evictCustodiedTokenCacheEntries(state: CredentialCustodyState): void {
+  while (state.tokenCache.size > state.maxTokenCacheEntries) {
+    const oldestKey = state.tokenCache.keys().next().value as string | undefined;
+    if (!oldestKey) return;
+    state.tokenCache.delete(oldestKey);
   }
 }
 
