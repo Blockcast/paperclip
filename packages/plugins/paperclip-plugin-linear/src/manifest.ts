@@ -354,6 +354,29 @@ const manifest: PaperclipPluginManifestV1 = {
         required: ["dupeRef", "keeperRef"],
       },
     },
+    {
+      name: TOOL_NAMES.auditBindings,
+      displayName: "Audit Linear Bindings",
+      description:
+        "audit-linear-bindings: read-only bulk audit of Paperclip/Linear issue and project sync bindings, reverse mappings, duplicate Linear IDs, same-team no-project drift, and active workspace locks.",
+      parametersSchema: {
+        type: "object",
+        properties: {
+          companyId: {
+            type: "string",
+            description: "Optional Paperclip company ID. Defaults to the current run company or configured plugin company.",
+          },
+          includeLinearValidation: {
+            type: "boolean",
+            description: "When true, validates linked Linear issue/project IDs against the Linear API. Defaults to true.",
+          },
+          limit: {
+            type: "number",
+            description: "Maximum forward issue and project links to scan per kind. Defaults to 1000.",
+          },
+        },
+      },
+    },
   ],
   ui: {
     slots: [

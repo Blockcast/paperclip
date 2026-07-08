@@ -593,6 +593,132 @@ describe("paperclip-plugin-linear", () => {
     });
   });
 
+  describe("tool: audit-linear-bindings", () => {
+    it("reports missing reverse mappings and duplicate Linear issue IDs", async () => {
+      const issue = await harness.ctx.issues.create({ companyId: "comp-1", title: "Linked issue" });
+      const issueLink = {
+        paperclipIssueId: issue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-dup-1",
+        linearIdentifier: "LUC-77",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-77",
+        syncDirection: "bidirectional",
+        lastSyncAt: "2026-07-08T00:00:00.000Z",
+        lastLinearStateType: "started",
+        lastCommentSyncAt: null,
+      };
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: `${STATE_KEYS.linkPrefix}${issue.id}` },
+        issueLink,
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: `${STATE_KEYS.linkPrefix}pc-other` },
+        { ...issueLink, paperclipIssueId: "pc-other" },
+      );
+
+      const result = await harness.executeTool(TOOL_NAMES.auditBindings, {
+        companyId: "comp-1",
+        includeLinearValidation: false,
+      });
+
+      expect((result.data as any).ok).toBe(false);
+      expect((result.data as any).findings).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: "issue_duplicate_linear_id", linearIssueId: "lin-dup-1" }),
+          expect.objectContaining({ kind: "issue_missing_reverse_mapping", paperclipIssueId: issue.id }),
+        ]),
+      );
+    });
+
+    it("reports project reverse mapping failures", async () => {
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: `${STATE_KEYS.projectLinkPrefix}pc-proj-1` },
+        {
+          paperclipProjectId: "pc-proj-1",
+          paperclipCompanyId: "comp-1",
+          linearProjectId: "lin-proj-1",
+          linearProjectName: "Linear Project",
+          syncDirection: "bidirectional",
+          lastSyncAt: "2026-07-08T00:00:00.000Z",
+          lastLinearState: "started",
+        },
+      );
+
+      const result = await harness.executeTool(TOOL_NAMES.auditBindings, {
+        companyId: "comp-1",
+        includeLinearValidation: false,
+      });
+
+      expect((result.data as any).findings).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: "project_missing_reverse_mapping", linearProjectId: "lin-proj-1" }),
+        ]),
+      );
+    });
+
+    it("validates live Linear issue state for same-team no-project drift", async () => {
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthToken },
+        "lin_token_123",
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthTeamId },
+        "team-1",
+      );
+      const issue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Linked project issue",
+        projectId: "pc-proj-1",
+      });
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: `${STATE_KEYS.linkPrefix}${issue.id}` },
+        {
+          paperclipIssueId: issue.id,
+          paperclipCompanyId: "comp-1",
+          linearIssueId: "lin-issue-noproject",
+          linearIdentifier: "LUC-78",
+          linearUrl: "https://linear.app/lucitra/issue/LUC-78",
+          syncDirection: "bidirectional",
+          lastSyncAt: "2026-07-08T00:00:00.000Z",
+          lastLinearStateType: "started",
+          lastCommentSyncAt: null,
+        },
+      );
+      syncModule.getProjectLink.mockResolvedValue({
+        paperclipProjectId: "pc-proj-1",
+        paperclipCompanyId: "comp-1",
+        linearProjectId: "lin-proj-1",
+        linearProjectName: "Linear Project",
+        syncDirection: "bidirectional",
+        lastSyncAt: "2026-07-08T00:00:00.000Z",
+        lastLinearState: "started",
+      });
+      const { listIssuesByIds } = await import("../src/linear.js");
+      (listIssuesByIds as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+        {
+          id: "lin-issue-noproject",
+          identifier: "LUC-78",
+          title: "Linked project issue",
+          url: "https://linear.app/lucitra/issue/LUC-78",
+          state: { name: "In Progress", type: "started" },
+          team: { id: "team-1", name: "Lucitra", key: "LUC" },
+          project: null,
+        },
+      ]);
+
+      const result = await harness.executeTool(TOOL_NAMES.auditBindings, {
+        companyId: "comp-1",
+        includeLinearValidation: true,
+      });
+
+      expect((result.data as any).findings).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: "issue_same_team_no_project_drift", linearIssueId: "lin-issue-noproject" }),
+        ]),
+      );
+    });
+  });
+
   describe("manifest: tool parameter schemas", () => {
     // The MCP server builds each tool's Zod schema from the manifest's
     // parametersSchema and `.parse()`s the agent's arguments through it, which
