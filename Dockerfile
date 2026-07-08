@@ -269,7 +269,17 @@ ARG CLAUDE_K8S_REF=c04ae02fda6fff57d2d4acf93e4d7640597b50ef
 # passed — required-by-Paperclip skills now bundle unconditionally via
 # forward-compat reads. PR kkroo/paperclip-adapter-opencode-k8s#37; local
 # adapter verification: typecheck clean, full suite 503/503, build clean.
-ARG OPENCODE_K8S_REF=5dae60d0e37b61072d53b2c4e139b013bc60bd80
+#
+# Bumped 2026-07-08 to e7288de5: reserve opencode XDG config/data/state onto the
+# writable /runtime-cache emptyDir (BLO-14003). The reserved-cache env map only
+# pinned XDG_CACHE_HOME; the other three fell through to an unwritable
+# /runtime-config, so opencode crashed at boot with EACCES mkdir '/runtime-config'
+# and every opencode_k8s agent flipped to error (claude_k8s unaffected — shares
+# the image but never hits the opencode codepath). Values are byte-identical to
+# the per-agent adapterConfig.env stopgap that booted clean. PR
+# kkroo/paperclip-adapter-opencode-k8s#38; local adapter verification: typecheck
+# clean, job-manifest suite 112/112.
+ARG OPENCODE_K8S_REF=e7288de5ea626d91d48ca3f82499c4d60f1ca2bb
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
