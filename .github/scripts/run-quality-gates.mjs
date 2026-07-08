@@ -18,6 +18,18 @@ import { checkLockfile } from './check-pr-lockfile.mjs';
 import { checkDependencies } from './check-pr-dependencies.mjs';
 
 const COMMENT_SIGNATURE = '— commitperclip';
+const GRAPHIFY_REINDEX_AUTHOR = 'allyblockcast[bot]';
+const GRAPHIFY_REINDEX_BRANCH = 'bot/graphify-reindex';
+const GRAPHIFY_OUT_PREFIX = 'server/src/graphify-out/';
+
+export function isGraphifyReindexArtifactOnlyPr({ author, branch, files }) {
+  return (
+    author === GRAPHIFY_REINDEX_AUTHOR &&
+    branch === GRAPHIFY_REINDEX_BRANCH &&
+    files.length > 0 &&
+    files.every(f => f.filename?.startsWith(GRAPHIFY_OUT_PREFIX))
+  );
+}
 
 function buildComment(author, failures, informational) {
   if (failures.length === 0 && informational.length === 0) {
@@ -108,12 +120,13 @@ async function main() {
   const prBody = pr.body ?? '';
   const author = PR_AUTHOR ?? pr.user.login;
   const branch = PR_BRANCH ?? pr.head.ref;
+  const skipTemplate = isGraphifyReindexArtifactOnlyPr({ author, branch, files });
 
   // Run all quality gates (pure functions run sync, deps check is async)
   const prTitle = pr.title ?? '';
   const [templateResult, issueResult, dedupResult, testResult, lockfileResult, depsResult] =
     await Promise.all([
-      Promise.resolve(checkTemplate(prBody)),
+      Promise.resolve(skipTemplate ? { passed: true, failures: [] } : checkTemplate(prBody)),
       Promise.resolve(checkLinkedIssue(prBody, prTitle)),
       Promise.resolve(checkDedupSearch(prBody, prTitle)),
       Promise.resolve(checkTestCoverage(files, prTitle)),

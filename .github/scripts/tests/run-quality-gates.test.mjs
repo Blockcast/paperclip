@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { findExistingComment } from '../run-quality-gates.mjs';
+import {
+  findExistingComment,
+  isGraphifyReindexArtifactOnlyPr,
+} from '../run-quality-gates.mjs';
 
 test('findExistingComment: paginates until it finds the commitperclip comment', async () => {
   const seenPaths = [];
@@ -40,4 +43,61 @@ test('findExistingComment: returns null when no signed comment exists', async ()
   ]), 'token', 'paperclipai/paperclip', 6469);
 
   assert.equal(comment, null);
+});
+
+test('isGraphifyReindexArtifactOnlyPr: permits generated graphify reindex PRs', () => {
+  const result = isGraphifyReindexArtifactOnlyPr({
+    author: 'allyblockcast[bot]',
+    branch: 'bot/graphify-reindex',
+    files: [
+      { filename: 'server/src/graphify-out/graph.json' },
+      { filename: 'server/src/graphify-out/GRAPH_REPORT.md' },
+      { filename: 'server/src/graphify-out/.graphify_labels.json' },
+    ],
+  });
+
+  assert.equal(result, true);
+});
+
+test('isGraphifyReindexArtifactOnlyPr: rejects non-graphify authors', () => {
+  const result = isGraphifyReindexArtifactOnlyPr({
+    author: 'someone-else',
+    branch: 'bot/graphify-reindex',
+    files: [{ filename: 'server/src/graphify-out/graph.json' }],
+  });
+
+  assert.equal(result, false);
+});
+
+test('isGraphifyReindexArtifactOnlyPr: rejects non-graphify branches', () => {
+  const result = isGraphifyReindexArtifactOnlyPr({
+    author: 'allyblockcast[bot]',
+    branch: 'feature/change',
+    files: [{ filename: 'server/src/graphify-out/graph.json' }],
+  });
+
+  assert.equal(result, false);
+});
+
+test('isGraphifyReindexArtifactOnlyPr: rejects mixed source changes', () => {
+  const result = isGraphifyReindexArtifactOnlyPr({
+    author: 'allyblockcast[bot]',
+    branch: 'bot/graphify-reindex',
+    files: [
+      { filename: 'server/src/graphify-out/graph.json' },
+      { filename: 'server/src/routes/github-webhook.ts' },
+    ],
+  });
+
+  assert.equal(result, false);
+});
+
+test('isGraphifyReindexArtifactOnlyPr: rejects empty file lists', () => {
+  const result = isGraphifyReindexArtifactOnlyPr({
+    author: 'allyblockcast[bot]',
+    branch: 'bot/graphify-reindex',
+    files: [],
+  });
+
+  assert.equal(result, false);
 });
