@@ -77,6 +77,16 @@ const manifest: PaperclipPluginManifestV1 = {
         description:
           "Path to a JSON map of agentId → {client_id, client_secret}, typically mounted from a k8s Secret. If the file is absent the plugin falls back to anonymous (legacy bridge) calls.",
       },
+      oauthClientsUrl: {
+        type: "string",
+        description:
+          "Optional Authbot credential API URL for the per-agent OAuth clients JSON. When set, this source is authoritative and oauthClientsPath is ignored.",
+      },
+      authbotServiceKeyFile: {
+        type: "string",
+        description:
+          "Managed service key file used to read oauthClientsUrl from Authbot.",
+      },
       hindsightApiUrl: {
         type: "string",
         default: "http://hindsight-api.hindsight.svc.cluster.local:8888",

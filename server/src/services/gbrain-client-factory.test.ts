@@ -134,6 +134,78 @@ describe("OAuthMintBearer", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("reads clients from Authbot when clientsUrl is configured", async () => {
+    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
+      if (urlStr.includes("/v1/authbot/mcp-credentials/")) {
+        expect((init?.headers as Record<string, string>).authorization).toBe(
+          "Bearer service-key-1",
+        );
+        expect((init?.headers as Record<string, string>)["x-paperclip-consumer"]).toBe(
+          "paperclip-gbrain-plugin",
+        );
+        return new Response(
+          JSON.stringify({
+            request_id: "req-1",
+            credential: {
+              credential_id: "gbrain-plugin-oauth-clients",
+              service: "gbrain",
+              source: "env",
+              value: FAKE_CLIENTS_JSON,
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return mockTokenResponse({ token: "minted-from-authbot" });
+    });
+    const src = new OAuthMintBearer({
+      clientsFilePath: "/legacy/clients.json",
+      clientsUrl: "https://api.penstock.run/v1/authbot/mcp-credentials/gbrain-plugin-oauth-clients",
+      serviceKeyFilePath: "/var/run/authbot/gbrain-plugin-service-key",
+      agentId: "agent-ceo",
+      tokenUrl: "http://gbrain/token",
+      fetch: fetchMock as unknown as typeof fetch,
+      readClientsFile: async () => {
+        throw new Error("legacy file should not be read");
+      },
+      readServiceKeyFile: async () => "service-key-1\n",
+    });
+
+    expect(await src.getBearer()).toBe("minted-from-authbot");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns undefined when Authbot returns a redacted response", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          request_id: "req-1",
+          credential: {
+            credential_id: "gbrain-plugin-oauth-clients",
+            service: "gbrain",
+            source: "env",
+            value_redacted: true,
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    const src = new OAuthMintBearer({
+      clientsFilePath: "/legacy/clients.json",
+      clientsUrl: "https://api.penstock.run/v1/authbot/mcp-credentials/gbrain-plugin-oauth-clients",
+      serviceKeyFilePath: "/var/run/authbot/gbrain-plugin-service-key",
+      agentId: "agent-ceo",
+      tokenUrl: "http://gbrain/token",
+      fetch: fetchMock as unknown as typeof fetch,
+      readClientsFile: async () => FAKE_CLIENTS_JSON,
+      readServiceKeyFile: async () => "service-key-1\n",
+    });
+
+    expect(await src.getBearer()).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("returns undefined when clients.json is not valid JSON", async () => {
     const fetchMock = vi.fn();
     const src = new OAuthMintBearer({
@@ -241,6 +313,8 @@ describe("OAuthMintBearer", () => {
 describe("resolveBearerSource", () => {
   beforeEach(() => {
     delete process.env.PAPERCLIP_GBRAIN_MCP_BEARER_TOKEN;
+    delete process.env.PAPERCLIP_GBRAIN_OAUTH_CLIENTS_URL;
+    delete process.env.PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY_FILE;
     delete process.env.PAPERCLIP_GBRAIN_OAUTH_CLIENTS_FILE;
     delete process.env.PAPERCLIP_GBRAIN_OAUTH_AGENT_ID;
     delete process.env.PAPERCLIP_GBRAIN_MCP_TOKEN_URL;
@@ -248,6 +322,8 @@ describe("resolveBearerSource", () => {
 
   afterEach(() => {
     delete process.env.PAPERCLIP_GBRAIN_MCP_BEARER_TOKEN;
+    delete process.env.PAPERCLIP_GBRAIN_OAUTH_CLIENTS_URL;
+    delete process.env.PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY_FILE;
     delete process.env.PAPERCLIP_GBRAIN_OAUTH_CLIENTS_FILE;
     delete process.env.PAPERCLIP_GBRAIN_OAUTH_AGENT_ID;
     delete process.env.PAPERCLIP_GBRAIN_MCP_TOKEN_URL;

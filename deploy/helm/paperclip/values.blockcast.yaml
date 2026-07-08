@@ -166,6 +166,12 @@ env:
       value: /paperclip/.local/bin:/paperclip/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     - name: PAPERCLIP_GITHUB_TOKEN_FILE
       value: /paperclip/.secrets/github-token/token
+    # gbrain per-agent OAuth clients are now read from Penstock/Authbot instead
+    # of the legacy paperclip-plugin-gbrain-oauth-secrets clients.json Secret.
+    - name: PAPERCLIP_GBRAIN_OAUTH_CLIENTS_URL
+      value: https://api.penstock.run/v1/authbot/mcp-credentials/gbrain-plugin-oauth-clients
+    - name: PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY_FILE
+      value: /var/run/authbot/gbrain-plugin-service-key
     # HMAC verification key for the /api/webhooks/github route added in
     # paperclip#118 Phase D. The route reads appConfig.githubWebhookSecret
     # at startup and refuses every request (503) when it is unset, so the
@@ -368,16 +374,17 @@ secret:
 githubApp:
   enabled: true
 
-# paperclip-plugin-gbrain (Blockcast/paperclip#25, wave 2.1) reads
-# per-agent OAuth client credentials from /etc/paperclip-plugin-gbrain/clients.json
-# to route gbrain MCP calls through admin-ui:3130/mcp (Bearer-authed, leak-free)
-# instead of the supergateway-bridge at :3131. The Secret was seeded
-# 2026-05-15 via the gbrain admin API. Chart support for these knobs
-# landed in #26.
+# paperclip-plugin-gbrain reads per-agent OAuth client credentials through
+# Penstock/Authbot. The mounted Secret below contains only the managed service
+# key used to read gbrain-plugin-oauth-clients; the clients JSON itself lives in
+# penstock/authbot-mcp-credential-runtime.
 extraVolumes:
-  - name: gbrain-oauth-secrets
+  - name: gbrain-authbot-service-key
     secret:
-      secretName: paperclip-plugin-gbrain-oauth-secrets
+      secretName: authbot-mcp-consumer-service-keys
+      items:
+        - key: gbrain-plugin-service-key
+          path: gbrain-plugin-service-key
       defaultMode: 0444
   - name: github-mcp-token
     secret:
@@ -401,8 +408,8 @@ extraVolumes:
       defaultMode: 0444
       optional: true
 extraVolumeMounts:
-  - name: gbrain-oauth-secrets
-    mountPath: /etc/paperclip-plugin-gbrain
+  - name: gbrain-authbot-service-key
+    mountPath: /var/run/authbot
     readOnly: true
   - name: github-mcp-token
     mountPath: /paperclip/.secrets/github-token

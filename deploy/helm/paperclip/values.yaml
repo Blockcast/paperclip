@@ -127,13 +127,12 @@ env:
   extra: []
 
 # -- Additional pod-level volumes. Used to mount Secrets/ConfigMaps that
-# plugins read from disk (e.g. paperclip-plugin-gbrain reads OAuth client
-# credentials from `/etc/paperclip-plugin-gbrain/clients.json`).
+# plugins or runtime helpers read from disk (for example Authbot service keys).
 # Example:
 #   extraVolumes:
-#     - name: gbrain-oauth-secrets
+#     - name: plugin-service-key
 #       secret:
-#         secretName: paperclip-plugin-gbrain-oauth-secrets
+#         secretName: plugin-service-keys
 #         defaultMode: 0444
 extraVolumes: []
 
@@ -141,8 +140,8 @@ extraVolumes: []
 # `extraVolumes`; each entry must reference a name declared there.
 # Example:
 #   extraVolumeMounts:
-#     - name: gbrain-oauth-secrets
-#       mountPath: /etc/paperclip-plugin-gbrain
+#     - name: plugin-service-key
+#       mountPath: /var/run/plugin-service-keys
 #       readOnly: true
 extraVolumeMounts: []
 
