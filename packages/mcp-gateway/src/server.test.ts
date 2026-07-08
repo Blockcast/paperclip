@@ -1,4 +1,7 @@
 import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { MCP_SESSION_HEADER } from "./session-keepalive.js";
@@ -10,6 +13,7 @@ interface StrictMcpUpstream {
   url: string;
   methods: string[];
   receivedHeaders: http.IncomingHttpHeaders[];
+  receivedToolCalls: string[];
   clearSessions: () => void;
   close: () => Promise<void>;
 }
@@ -47,11 +51,12 @@ async function listen(server: http.Server): Promise<string> {
   return `http://127.0.0.1:${address.port}/mcp`;
 }
 
-async function createStrictMcpUpstream(): Promise<StrictMcpUpstream> {
+async function createStrictMcpUpstream(tools: Array<Record<string, unknown>> = [{ name: "ping", description: "Ping" }]): Promise<StrictMcpUpstream> {
   let nextSession = 1;
   const sessions = new Map<string, { initialized: boolean }>();
   const methods: string[] = [];
   const receivedHeaders: http.IncomingHttpHeaders[] = [];
+  const receivedToolCalls: string[] = [];
   const server = http.createServer(async (req, res) => {
     receivedHeaders.push(req.headers);
     const bodyText = await readBody(req);
@@ -92,6 +97,22 @@ async function createStrictMcpUpstream(): Promise<StrictMcpUpstream> {
       return;
     }
 
+    if (method === "tools/list") {
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id ?? 1, result: { tools } }));
+      return;
+    }
+
+    if (method === "tools/call") {
+      const params = (message as { params?: { name?: string } }).params;
+      receivedToolCalls.push(params?.name ?? "");
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id ?? 1, result: { content: [{ type: "text", text: params?.name ?? "" }] } }));
+      return;
+    }
+
     res.statusCode = 200;
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id ?? 1, result: { ok: true } }));
@@ -102,6 +123,7 @@ async function createStrictMcpUpstream(): Promise<StrictMcpUpstream> {
     url,
     methods,
     receivedHeaders,
+    receivedToolCalls,
     clearSessions: () => sessions.clear(),
     close: () => closeServer(server),
   };
@@ -166,6 +188,27 @@ async function createGateway(
   const server = createGatewayServer(state);
   const url = await listen(server);
   return { url: url.replace(/\/mcp$/, "/k8s-admin/mcp"), state };
+}
+
+async function createAggregateGateway(
+  upstreams: GatewayState["upstreams"],
+  opts?: { sessionPersistenceFile?: string },
+): Promise<{ url: string; state: GatewayState }> {
+  const state: GatewayState = {
+    upstreams,
+    sessions: new Map(),
+    upstreamCallCounts: new Map(),
+    upstreamTimeoutMs: 60_000,
+    sessionPersistenceFile: opts?.sessionPersistenceFile,
+    breaker: new CircuitBreaker({
+      failureThreshold: 5,
+      openCooldownMs: 30_000,
+      halfOpenMaxProbes: 1,
+    }),
+  };
+  const server = createGatewayServer(state);
+  const url = await listen(server);
+  return { url: url.replace(/\/mcp$/, "/mcp"), state };
 }
 
 function jsonHeaders(sessionId?: string): HeadersInit {
@@ -371,6 +414,96 @@ describe("mcp gateway lifecycle compatibility", () => {
       "initialize",
       "notifications/initialized",
       "tools/list",
+    ]);
+  });
+
+  it("aggregates tool names at one logical /mcp endpoint and rewrites calls upstream", async () => {
+    const alpha = await createStrictMcpUpstream([{ name: "search", description: "Alpha search" }]);
+    const beta = await createStrictMcpUpstream([{ name: "search", description: "Beta search" }]);
+    const gateway = await createAggregateGateway({
+      alpha: { url: alpha.url, credentialHeaders: [] },
+      beta: { url: beta.url, credentialHeaders: [] },
+    });
+
+    const initialize = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
+    expect(initialize.status).toBe(200);
+    expect(clientSessionId).toBeTruthy();
+
+    const list = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(clientSessionId ?? undefined),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+    });
+    const listBody = await list.json() as { result: { tools: Array<{ name: string }> } };
+    expect(listBody.result.tools.map((tool) => tool.name).sort()).toEqual(["alpha__search", "beta__search"]);
+
+    const call = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(clientSessionId ?? undefined),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "beta__search", arguments: {} } }),
+    });
+    expect(call.status).toBe(200);
+    expect(beta.receivedToolCalls).toEqual(["search"]);
+    expect(alpha.receivedToolCalls).toEqual([]);
+  });
+
+  it("reloads persisted aggregate sessions after gateway restart", async () => {
+    const upstream = await createStrictMcpUpstream([{ name: "ping", description: "Ping" }]);
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-gateway-sessions-"));
+    const sessionPersistenceFile = path.join(tmpDir, "sessions.json");
+    const first = await createAggregateGateway({ alpha: { url: upstream.url, credentialHeaders: [] } }, { sessionPersistenceFile });
+
+    const initialize = await fetch(first.url, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
+    expect(clientSessionId).toBeTruthy();
+
+    const second = await createAggregateGateway({ alpha: { url: upstream.url, credentialHeaders: [] } }, { sessionPersistenceFile });
+    const call = await fetch(second.url, {
+      method: "POST",
+      headers: jsonHeaders(clientSessionId ?? undefined),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "alpha__ping", arguments: {} } }),
+    });
+
+    expect(call.status).toBe(200);
+    expect(upstream.receivedToolCalls).toEqual(["ping"]);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("replays stale upstream sessions on aggregate tool calls", async () => {
+    const upstream = await createStrictMcpUpstream([{ name: "ping", description: "Ping" }]);
+    const gateway = await createAggregateGateway({ alpha: { url: upstream.url, credentialHeaders: [] } });
+
+    const initialize = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
+    upstream.clearSessions();
+
+    const call = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(clientSessionId ?? undefined),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "alpha__ping", arguments: {} } }),
+    });
+
+    expect(call.status).toBe(200);
+    expect(upstream.methods).toEqual([
+      "initialize",
+      "notifications/initialized",
+      "tools/call",
+      "initialize",
+      "notifications/initialized",
+      "tools/call",
     ]);
   });
 });

@@ -71,6 +71,23 @@ describe("SessionStore", () => {
     expect(store.size()).toBe(2);
     expect(store.get(a.clientSessionId)).toBeUndefined();
   });
+
+  it("snapshots and restores persisted session records", () => {
+    const store = new SessionStore();
+    const record = store.createInitialized({
+      clientSessionId: "client-1",
+      upstreamSessionId: "upstream-1",
+      initializePayload: Buffer.from('{"method":"initialize"}'),
+    });
+    record.lastSeenMs = Date.now() - 100;
+
+    const restored = new SessionStore();
+    restored.restore(store.snapshot());
+
+    const fetched = restored.get("client-1");
+    expect(fetched?.upstreamSessionId).toBe("upstream-1");
+    expect(fetched?.initializePayload?.toString("utf8")).toBe('{"method":"initialize"}');
+  });
 });
 
 describe("isSessionNotFoundResponse", () => {

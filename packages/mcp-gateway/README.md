@@ -1,12 +1,11 @@
 # @paperclipai/mcp-gateway
 
-Reverse-proxy in front of the cluster's stateful HTTP MCP servers.
-Catches `Session not found` 404s from upstreams and transparently
-replays the cached `initialize` request to mint a fresh upstream
-session before retrying the original call. Claude Code's MCP client
-doesn't auto-retry on this — the next tool call surfaces the failure
-to the user otherwise. The client side never sees the upstream rotation;
-its `Mcp-Session-Id` stays stable.
+Reverse-proxy in front of the cluster's stateful HTTP MCP servers. It exposes
+one logical aggregate MCP endpoint at `/mcp`, rewrites aggregated tool names back
+to the correct upstream server, and catches `Session not found` 404s from
+upstreams by transparently replaying the cached `initialize` request. Claude
+Code's MCP client doesn't auto-retry on this; the client side never sees the
+upstream rotation and its `Mcp-Session-Id` stays stable.
 
 ## Why
 
@@ -21,6 +20,20 @@ A single multi-tenant gateway routes by path prefix
 (`/figma/mcp`, `/linear/mcp`, etc.) and keeps one place to evolve
 session keepalive, observability, and rate limiting.
 
+Fleet clients should prefer one server URL:
+
+```json
+{
+  "paperclip-fleet": { "url": "http://paperclip-mcp-gateway.paperclip.svc.cluster.local:8080/mcp", "type": "http" }
+}
+```
+
+The gateway returns one aggregated `tools/list` result. To make collisions stable
+and readable, tool names are rewritten as `<prefix>__<toolName>` (for example
+`figma__get_file`). `tools/call` reverses that name before forwarding the call to
+the matching upstream. The old `/<prefix>/mcp` endpoints remain available for
+compatibility and migration.
+
 ## Configuration
 
 Production routing is identity-synced from penstock state:
@@ -29,6 +42,7 @@ Production routing is identity-synced from penstock state:
 PAPERCLIP_MCP_UPSTREAMS_STATE_URL=https://api.penstock.run/v1/mcp/upstreams \
 PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN="$STATE_TOKEN" \
 PAPERCLIP_MCP_UPSTREAMS_CACHE_FILE=/cache/upstreams-lkg.json \
+PAPERCLIP_MCP_SESSION_STORE_FILE=/cache/sessions.json \
   node dist/server.js
 ```
 
@@ -58,6 +72,12 @@ When state fetch succeeds, the raw metadata is persisted to
 later startup, the gateway serves the last-known-good cache instead of losing all
 routes.
 
+Set `PAPERCLIP_MCP_SESSION_STORE_FILE` to externalize client-to-upstream session
+mappings. The file contains only session ids, cached initialize payloads, and
+timestamps; it must live on storage shared by all gateway replicas if the
+Deployment runs with more than one pod. Without this setting, sessions remain
+process-local and a replica restart requires clients to initialize again.
+
 For local development and bootstrap, routing table JSON is still supported:
 
 Routing table is JSON: `prefix → upstream URL`. Either pass inline:
@@ -80,6 +100,7 @@ Prefix must match `/^[a-zA-Z0-9_-]+$/`. URL must start with
 
 - `GET /healthz` — health check; returns `{ ok: true, upstreams, upstreamCallCounts, breakers, sessions }`.
 - `GET /` — same as `/healthz`.
+- `<METHOD> /mcp` — aggregate MCP endpoint; exposes one stable tool list with `<prefix>__<toolName>` names.
 - `<METHOD> /<prefix>/mcp` — proxied to the upstream URL for `<prefix>`.
 - `<METHOD> /<prefix>/mcp/<rest...>` — preserves the trailing path.
 
@@ -89,25 +110,25 @@ Prefix must match `/^[a-zA-Z0-9_-]+$/`. URL must start with
    ```json
    "figma": { "url": "http://figma-mcp-server.paperclip.svc.cluster.local:8000/mcp", "type": "http" }
    ```
-2. Replace it with the gateway URL using the configured prefix:
+2. Prefer one aggregate gateway server:
+   ```json
+   "paperclip-fleet": { "url": "http://paperclip-mcp-gateway.paperclip.svc.cluster.local:8080/mcp", "type": "http" }
+   ```
+3. During incremental migration, the per-upstream compatibility URL is still valid:
    ```json
    "figma": { "url": "http://paperclip-mcp-gateway.paperclip.svc.cluster.local:8080/figma/mcp", "type": "http" }
    ```
-3. Save (no agent restart needed; mcp config is read on next run).
+4. Save (no agent restart needed; mcp config is read on next run).
 
 ## Limits and known issues
 
-- **Session cache is in-memory.** Gateway restart loses all sessions.
-  Clients re-initialize transparently — graceful failure mode.
 - **Initialize replay assumes the upstream is idempotent on init.**
   If the upstream's `initialize` mutates external state (rare for MCP),
   replay can double-fire. Figma / Linear / k8s / prometheus / webflow
   all have stateless initialize handlers.
-- **No persistent state.** Per-prefix session maps live in the pod's
-  RAM and are scoped to that gateway replica. If you scale to >1
-  replica, sessions affinity-stick to the replica that handled the
-  initialize. Either run `replicas: 1` or wire up sessionAffinity:
-  ClientIP + Mcp-Session-Id (custom header LB).
+- **HA session storage is file-backed.** Multi-replica deployments must mount
+  `PAPERCLIP_MCP_SESSION_STORE_FILE` on shared storage. The fallback is still
+  in-memory session state for local/bootstrap runs.
 
 ## Test
 
