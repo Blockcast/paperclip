@@ -2,6 +2,10 @@
 
 Paperclip applies a default-on defense-in-depth control for agent runtime environment dumps.
 
+## Issue Context
+
+This guard addresses Paperclip issue `PEN-1305`: repeated agent heartbeat transcripts persisted secret-bearing runtime environment variables after agents ran unrestricted environment-inspection commands. The control is intentionally shared by the server heartbeat/run-log path so it applies uniformly across current and future agent adapters.
+
 ## Enforcement
 
 - `server/src/agent-shell-guard.ts` classifies full-environment dump commands such as `env`, `printenv`, bare `set`, `export -p`, and `/proc/*/environ` reads as blocked commands.
