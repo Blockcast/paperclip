@@ -15,6 +15,8 @@
  */
 
 import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import {
@@ -33,6 +35,7 @@ import { CircuitBreaker, type CircuitBreakerConfig } from "./circuit-breaker.js"
 import {
   MCP_SESSION_HEADER,
   SessionStore,
+  type PersistedSessionRecord,
   isSessionNotFoundResponse,
   looksLikeInitializeRequest,
   extractUpstreamSessionId,
@@ -55,6 +58,7 @@ export const DEFAULT_BREAKER_HALF_OPEN_MAX_PROBES = 1;
 export interface GatewayConfig {
   upstreamTimeoutMs: number;
   breaker: CircuitBreakerConfig;
+  sessionPersistenceFile: string | null;
 }
 
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
@@ -80,6 +84,7 @@ export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): Gateway
         DEFAULT_BREAKER_HALF_OPEN_MAX_PROBES,
       ),
     },
+    sessionPersistenceFile: env.PAPERCLIP_MCP_SESSION_STORE_FILE?.trim() || null,
   };
 }
 
@@ -90,6 +95,19 @@ export interface GatewayState {
   breaker: CircuitBreaker;
   upstreamTimeoutMs: number;
   credentialCustody?: CredentialCustodyState;
+  sessionPersistenceFile?: string | null;
+}
+
+interface PersistedSessionSnapshot {
+  version: 1;
+  prefixes: Record<string, PersistedSessionRecord[]>;
+}
+
+interface JsonRpcRequest {
+  jsonrpc?: string;
+  id?: string | number | null;
+  method?: string;
+  params?: Record<string, unknown>;
 }
 
 /**
@@ -127,6 +145,45 @@ function getOrCreateStore(state: GatewayState, prefix: string): SessionStore {
   return fresh;
 }
 
+function loadPersistedSessions(state: GatewayState): void {
+  const file = state.sessionPersistenceFile;
+  if (!file) return;
+  let parsed: PersistedSessionSnapshot;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, "utf8")) as PersistedSessionSnapshot;
+  } catch {
+    return;
+  }
+  if (!parsed || parsed.version !== 1 || !parsed.prefixes || typeof parsed.prefixes !== "object") return;
+  for (const [prefix, records] of Object.entries(parsed.prefixes)) {
+    if (!Array.isArray(records)) continue;
+    getOrCreateStore(state, prefix).restore(records);
+  }
+}
+
+function persistSessions(state: GatewayState): void {
+  const file = state.sessionPersistenceFile;
+  if (!file) return;
+  const snapshot: PersistedSessionSnapshot = {
+    version: 1,
+    prefixes: Object.fromEntries(Array.from(state.sessions.entries()).map(([prefix, store]) => [prefix, store.snapshot()])),
+  };
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(snapshot), { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      // best-effort cleanup only
+    }
+    // eslint-disable-next-line no-console
+    console.warn(`[mcp-gateway] failed to persist session store: ${(e as Error).message}`);
+  }
+}
+
 async function readBody(req: http.IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
@@ -153,6 +210,24 @@ export function buildInitializeReplayHeaders(
 
 function isSuccess(status: number): boolean {
   return status >= 200 && status < 300;
+}
+
+function parseJsonRpcRequest(bodyText: string): JsonRpcRequest | null {
+  try {
+    const parsed = JSON.parse(bodyText) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed as JsonRpcRequest;
+  } catch {
+    return null;
+  }
+}
+
+function buildJsonRpcResponse(id: JsonRpcRequest["id"], result: unknown): Buffer {
+  return Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: id ?? null, result }));
+}
+
+function buildJsonRpcError(id: JsonRpcRequest["id"], code: number, message: string): Buffer {
+  return Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: id ?? null, error: { code, message } }));
 }
 
 async function notifyUpstreamInitialized(
@@ -202,6 +277,49 @@ async function createUpstreamSession(
   if (!isSuccess(initializeResult.status) || !upstreamSessionId) return null;
   await notifyUpstreamInitialized(upstreamUrl, inboundHeaders, upstreamSessionId, timeoutMs, credentialToken, upstreamConfig);
   return upstreamSessionId;
+}
+
+async function ensureUpstreamSession(
+  state: GatewayState,
+  prefix: string,
+  upstream: UpstreamConfig,
+  inboundHeaders: http.IncomingHttpHeaders,
+  clientSessionId: string,
+  initializePayload: Buffer,
+): Promise<string | null> {
+  const store = getOrCreateStore(state, prefix);
+  const existing = store.get(clientSessionId);
+  if (existing) return existing.upstreamSessionId;
+  const upstreamSessionId = await createUpstreamSession(upstream.url, inboundHeaders, initializePayload, state.upstreamTimeoutMs, upstream);
+  if (!upstreamSessionId) return null;
+  store.createInitialized({ clientSessionId, upstreamSessionId, initializePayload });
+  persistSessions(state);
+  return upstreamSessionId;
+}
+
+async function forwardAggregateWithSessionRecovery(
+  state: GatewayState,
+  prefix: string,
+  upstream: UpstreamConfig,
+  inboundHeaders: http.IncomingHttpHeaders,
+  method: string,
+  body: Buffer,
+  clientSessionId: string,
+  initializePayload: Buffer,
+): Promise<ForwardResult | null> {
+  const upstreamSessionId = await ensureUpstreamSession(state, prefix, upstream, inboundHeaders, clientSessionId, initializePayload);
+  if (!upstreamSessionId) return null;
+  const store = getOrCreateStore(state, prefix);
+  let result = await forward(upstream.url, method, inboundHeaders, body, upstreamSessionId, state.upstreamTimeoutMs, upstream);
+  const text = result.body.toString("utf8");
+  if (!isSessionNotFoundResponse(result.status, text)) return result;
+
+  const newUpstreamSessionId = await createUpstreamSession(upstream.url, inboundHeaders, initializePayload, state.upstreamTimeoutMs, upstream);
+  if (!newUpstreamSessionId) return result;
+  store.rotateUpstream(clientSessionId, newUpstreamSessionId);
+  result = await forward(upstream.url, method, inboundHeaders, body, newUpstreamSessionId, state.upstreamTimeoutMs, upstream);
+  persistSessions(state);
+  return result;
 }
 
 async function forward(
@@ -308,6 +426,7 @@ async function handleRequest(
   state: GatewayState,
 ): Promise<void> {
   const url = req.url ?? "/";
+  loadPersistedSessions(state);
 
   // Health endpoint.
   if (url === "/" || url === "/healthz") {
@@ -322,6 +441,11 @@ async function handleRequest(
         Array.from(state.sessions.entries()).map(([prefix, store]) => [prefix, store.size()]),
       ),
     }));
+    return;
+  }
+
+  if (url === "/mcp" || url.startsWith("/mcp/")) {
+    await handleAggregateRequest(req, res, state);
     return;
   }
 
@@ -377,6 +501,7 @@ async function handleRequest(
       state.upstreamTimeoutMs,
       matchedCustodyConfig(state.credentialCustody, prefix),
     );
+    persistSessions(state);
     if (status >= 500) state.breaker.recordFailure(prefix);
     else state.breaker.recordSuccess(prefix);
   } catch (e) {
@@ -385,6 +510,146 @@ async function handleRequest(
     }
     throw e;
   }
+}
+
+async function handleAggregateRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  state: GatewayState,
+): Promise<void> {
+  const body = await readBody(req);
+  const bodyText = body.toString("utf8");
+  const message = parseJsonRpcRequest(bodyText);
+  const inboundSessionId = (() => {
+    const v = req.headers[MCP_SESSION_HEADER];
+    return Array.isArray(v) ? v[0] : (v as string | undefined);
+  })();
+  const clientSessionId = inboundSessionId || randomUUID();
+  const initializePayload = looksLikeInitializeRequest(bodyText) ? body : buildDefaultInitializePayload();
+
+  if (!message?.method) {
+    res.statusCode = 400;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ error: "invalid JSON-RPC request" }));
+    return;
+  }
+
+  if (message.method === "initialize") {
+    for (const [prefix, upstream] of Object.entries(state.upstreams)) {
+      state.upstreamCallCounts.set(prefix, (state.upstreamCallCounts.get(prefix) ?? 0) + 1);
+      await ensureUpstreamSession(state, prefix, upstream, req.headers, clientSessionId, initializePayload);
+    }
+    res.statusCode = 200;
+    res.setHeader("content-type", "application/json");
+    res.setHeader(MCP_SESSION_HEADER, clientSessionId);
+    res.end(buildJsonRpcResponse(message.id, {
+      protocolVersion: "2024-11-05",
+      capabilities: { tools: {} },
+      serverInfo: { name: "paperclip-mcp-gateway", version: "0.1.0" },
+    }));
+    return;
+  }
+
+  if (message.method === "notifications/initialized") {
+    res.statusCode = 202;
+    res.setHeader(MCP_SESSION_HEADER, clientSessionId);
+    res.end();
+    return;
+  }
+
+  if (message.method === "tools/list") {
+    const tools: unknown[] = [];
+    for (const [prefix, upstream] of Object.entries(state.upstreams)) {
+      if (!state.breaker.tryAcquire(prefix)) continue;
+      state.upstreamCallCounts.set(prefix, (state.upstreamCallCounts.get(prefix) ?? 0) + 1);
+      try {
+        const result = await forwardAggregateWithSessionRecovery(
+          state,
+          prefix,
+          upstream,
+          req.headers,
+          req.method ?? "POST",
+          body,
+          clientSessionId,
+          initializePayload,
+        );
+        if (!result) continue;
+        if (result.status >= 500) state.breaker.recordFailure(prefix);
+        else state.breaker.recordSuccess(prefix);
+        if (!isSuccess(result.status)) continue;
+        const parsed = JSON.parse(result.body.toString("utf8")) as { result?: { tools?: unknown[] } };
+        for (const tool of parsed.result?.tools ?? []) {
+          if (!tool || typeof tool !== "object" || Array.isArray(tool)) continue;
+          const record = tool as Record<string, unknown>;
+          if (typeof record.name !== "string" || record.name.length === 0) continue;
+          tools.push({ ...record, name: `${prefix}__${record.name}` });
+        }
+      } catch (e) {
+        state.breaker.recordFailure(prefix);
+        // eslint-disable-next-line no-console
+        console.warn(`[mcp-gateway] aggregate tools/list skipped prefix=${prefix}: ${(e as Error).message}`);
+      }
+    }
+    persistSessions(state);
+    res.statusCode = 200;
+    res.setHeader("content-type", "application/json");
+    res.setHeader(MCP_SESSION_HEADER, clientSessionId);
+    res.end(buildJsonRpcResponse(message.id, { tools }));
+    return;
+  }
+
+  if (message.method === "tools/call") {
+    const toolName = typeof message.params?.name === "string" ? message.params.name : "";
+    const separatorIndex = toolName.indexOf("__");
+    const prefix = separatorIndex > 0 ? toolName.slice(0, separatorIndex) : "";
+    const upstreamToolName = separatorIndex > 0 ? toolName.slice(separatorIndex + 2) : "";
+    const upstream = prefix ? state.upstreams[prefix] : undefined;
+    if (!upstream || upstreamToolName.length === 0) {
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.setHeader(MCP_SESSION_HEADER, clientSessionId);
+      res.end(buildJsonRpcError(message.id, -32602, `unknown aggregated tool name "${toolName}"`));
+      return;
+    }
+    if (!state.breaker.tryAcquire(prefix)) {
+      res.statusCode = 503;
+      res.setHeader("content-type", "application/json");
+      res.setHeader("retry-after", String(Math.ceil(state.upstreamTimeoutMs / 1000)));
+      res.end(JSON.stringify({ error: "upstream circuit open", prefix }));
+      return;
+    }
+    state.upstreamCallCounts.set(prefix, (state.upstreamCallCounts.get(prefix) ?? 0) + 1);
+    const rewritten = Buffer.from(JSON.stringify({
+      ...message,
+      params: { ...(message.params ?? {}), name: upstreamToolName },
+    }));
+    const result = await forwardAggregateWithSessionRecovery(
+      state,
+      prefix,
+      upstream,
+      req.headers,
+      req.method ?? "POST",
+      rewritten,
+      clientSessionId,
+      initializePayload,
+    );
+    if (!result) {
+      res.statusCode = 502;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ error: "failed to initialize upstream session", prefix }));
+      return;
+    }
+    if (result.status >= 500) state.breaker.recordFailure(prefix);
+    else state.breaker.recordSuccess(prefix);
+    persistSessions(state);
+    writeResponse(res, result, clientSessionId);
+    return;
+  }
+
+  res.statusCode = 200;
+  res.setHeader("content-type", "application/json");
+  res.setHeader(MCP_SESSION_HEADER, clientSessionId);
+  res.end(buildJsonRpcError(message.id, -32601, `method "${message.method}" is not supported by aggregate endpoint`));
 }
 
 /**
@@ -598,7 +863,9 @@ async function main(): Promise<void> {
     breaker: new CircuitBreaker(config.breaker),
     upstreamTimeoutMs: config.upstreamTimeoutMs,
     credentialCustody: loadCredentialCustodyState(),
+    sessionPersistenceFile: config.sessionPersistenceFile,
   };
+  loadPersistedSessions(state);
 
   const server = createGatewayServer(state);
 
@@ -606,7 +873,8 @@ async function main(): Promise<void> {
     // eslint-disable-next-line no-console
     console.log(
       `[mcp-gateway] listening on :${port}; upstreams: ${Object.keys(upstreams).join(", ")}; ` +
-        `timeout=${config.upstreamTimeoutMs}ms breaker(threshold=${config.breaker.failureThreshold},cooldown=${config.breaker.openCooldownMs}ms)`,
+        `timeout=${config.upstreamTimeoutMs}ms breaker(threshold=${config.breaker.failureThreshold},cooldown=${config.breaker.openCooldownMs}ms) ` +
+        `sessionStore=${config.sessionPersistenceFile ?? "memory"}`,
     );
   });
 
