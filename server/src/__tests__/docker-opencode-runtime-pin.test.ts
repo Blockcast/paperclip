@@ -37,7 +37,8 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   });
 
   it("vendors the opencode_k8s adapter commit with crash, runtime-cache, MCP header, pod-stderr, startup-wait, opencode-db, chunkTimeout, budget-cap, and compact-threshold fixes", () => {
-    expect(dockerfile).toContain("ARG OPENCODE_K8S_REF=e7288de5ea626d91d48ca3f82499c4d60f1ca2bb");
+    expect(dockerfile).toContain("ARG OPENCODE_K8S_REF=30466007c5bb5e8e52ee51b8d0b3ebf2cf2f9120");
+    expect(dockerfile).toContain("opencode config/auth writers respect XDG_*");
     expect(dockerfile).toContain("reserve opencode XDG config/data/state onto the");
     expect(dockerfile).toContain("type-crash");
     expect(dockerfile).toContain("5-strike adapter crashloop circuit-breaker");

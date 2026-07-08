@@ -279,7 +279,15 @@ ARG CLAUDE_K8S_REF=c04ae02fda6fff57d2d4acf93e4d7640597b50ef
 # the per-agent adapterConfig.env stopgap that booted clean. PR
 # kkroo/paperclip-adapter-opencode-k8s#38; local adapter verification: typecheck
 # clean, job-manifest suite 112/112.
-ARG OPENCODE_K8S_REF=e7288de5ea626d91d48ca3f82499c4d60f1ca2bb
+#
+# Bumped 2026-07-08 to 30466007: opencode config/auth writers respect XDG_* —
+# configSetup + authBootstrap now write to ${XDG_CONFIG_HOME:-$HOME/.config} and
+# ${XDG_DATA_HOME:-$HOME/.local/share} instead of hardcoded HOME dirs, so a future
+# no-MCP or chatgpt-oauth opencode agent's config/auth writer agrees with
+# opencode's XDG reader (follow-up to #38; inert for current MCP+api-key agents).
+# PR kkroo/paperclip-adapter-opencode-k8s#39; local adapter verification: typecheck
+# clean, job-manifest suite 112/112, bash syntax + resolution checked.
+ARG OPENCODE_K8S_REF=30466007c5bb5e8e52ee51b8d0b3ebf2cf2f9120
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
