@@ -151,6 +151,16 @@ const K8S_IN_CLUSTER_ENV_PASSTHROUGH = [
   "KUBERNETES_SERVICE_PORT_HTTPS",
 ];
 
+/**
+ * Non-secret runtime coordinates for the bundled gbrain plugin. The service key
+ * itself stays in the mounted Kubernetes Secret; the worker only receives the
+ * Authbot URL and the file path it should read.
+ */
+const GBRAIN_PLUGIN_ENV_PASSTHROUGH = [
+  "PAPERCLIP_GBRAIN_OAUTH_CLIENTS_URL",
+  "PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY_FILE",
+];
+
 export function buildPluginWorkerEnv(input: {
   manifest: Pick<PaperclipPluginManifestV1, "capabilities"> & { id?: string };
   instanceInfo: { deploymentMode?: string | null; deploymentExposure?: string | null };
@@ -161,6 +171,15 @@ export function buildPluginWorkerEnv(input: {
     PAPERCLIP_DEPLOYMENT_MODE: input.instanceInfo.deploymentMode ?? "",
     PAPERCLIP_DEPLOYMENT_EXPOSURE: input.instanceInfo.deploymentExposure ?? "",
   };
+
+  if (input.manifest.id === "kkroo.gbrain") {
+    for (const key of GBRAIN_PLUGIN_ENV_PASSTHROUGH) {
+      const value = processEnv[key];
+      if (value && value.trim().length > 0) {
+        env[key] = value;
+      }
+    }
+  }
 
   const canRegisterEnvironmentDrivers = Array.isArray(input.manifest.capabilities)
     && input.manifest.capabilities.includes("environment.drivers.register");

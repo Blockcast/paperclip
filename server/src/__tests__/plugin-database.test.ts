@@ -202,6 +202,45 @@ describe("buildPluginWorkerEnv", () => {
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
     });
   });
+
+  it("passes only non-secret Authbot coordinates to the bundled gbrain plugin", () => {
+    const env = buildPluginWorkerEnv({
+      manifest: { id: "kkroo.gbrain", capabilities: ["events.subscribe"] },
+      instanceInfo,
+      processEnv: {
+        PAPERCLIP_GBRAIN_OAUTH_CLIENTS_URL:
+          "https://api.penstock.run/v1/authbot/mcp-credentials/gbrain-plugin-oauth-clients",
+        PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY_FILE: "/var/run/authbot/gbrain-plugin-service-key",
+        PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY: "service-key-must-not-leak",
+        DATABASE_URL: "postgres://must-not-leak",
+      },
+    });
+
+    expect(env).toEqual({
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+      PAPERCLIP_GBRAIN_OAUTH_CLIENTS_URL:
+        "https://api.penstock.run/v1/authbot/mcp-credentials/gbrain-plugin-oauth-clients",
+      PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY_FILE: "/var/run/authbot/gbrain-plugin-service-key",
+    });
+  });
+
+  it("does not pass gbrain Authbot coordinates to other plugins", () => {
+    const env = buildPluginWorkerEnv({
+      manifest: { id: "kkroo.slack", capabilities: ["events.subscribe"] },
+      instanceInfo,
+      processEnv: {
+        PAPERCLIP_GBRAIN_OAUTH_CLIENTS_URL:
+          "https://api.penstock.run/v1/authbot/mcp-credentials/gbrain-plugin-oauth-clients",
+        PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY_FILE: "/var/run/authbot/gbrain-plugin-service-key",
+      },
+    });
+
+    expect(env).toEqual({
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+    });
+  });
 });
 
 describeEmbeddedPostgres("plugin database namespaces", () => {
