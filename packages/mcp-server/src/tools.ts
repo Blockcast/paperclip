@@ -730,7 +730,15 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipTailHeartbeatRunLog",
-      "Fallback log tail for MCP clients without resource subscription support",
+      "Fallback raw NDJSON log tail for ONE heartbeat run, for MCP clients without resource " +
+        "subscription support. Prefer paperclipGetIssue/paperclipGetAgent for status first — " +
+        "cheap and structured; reach for this only to debug why a specific run did what it did. " +
+        "A runId is a snapshot of a single heartbeat cycle: once the agent has cycled to a newer " +
+        "run, tailing this runId further shows no new activity even though the agent may still be " +
+        "working — re-check the issue's current executionRunId before re-tailing. Each run's log " +
+        "starts with ~15-20KB of boilerplate (SessionStart hooks, tool/skill list); pass a nonzero " +
+        "offset to skip past it. Default limitBytes is 16384 (matches the resource-subscription " +
+        "chunk size) — for a low-context read, pass 2000-4000 explicitly instead.",
       tailHeartbeatRunLogSchema,
       async ({ runId, offset, limitBytes }) =>
         client.requestJson(

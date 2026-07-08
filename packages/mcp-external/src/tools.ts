@@ -609,12 +609,21 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     },
     {
       name: "paperclipTailHeartbeatRunLog",
-      description: "Fallback log tail for MCP clients without resource subscription support.",
+      description:
+        "Fallback raw NDJSON log tail for ONE heartbeat run, for MCP clients without resource " +
+        "subscription support. Prefer get_issue/get_agent for status (done/completedAt/comments) " +
+        "first — they're cheap and structured; reach for this only to debug why a specific run did " +
+        "what it did. A runId is a snapshot of a single heartbeat cycle: once the agent's " +
+        "lastHeartbeatAt moves past this run's timestamps, the run is superseded and tailing it " +
+        "further shows no new activity even though the agent may still be working under a newer " +
+        "run you don't have the ID for — re-check the issue's current executionRunId before " +
+        "re-tailing. Each run's log starts with ~15-20KB of SessionStart/tool-list boilerplate; " +
+        "pass a nonzero offset to skip past it instead of re-reading from 0.",
       schema: z.object({
         runId: z.string().default("").describe("Heartbeat run UUID. Preferred stdio-compatible field."),
         run_id: z.string().default("").describe("Heartbeat run UUID. Compatibility alias."),
         offset: z.number().int().default(0).describe("Byte offset to resume from. Default: 0."),
-        limitBytes: z.number().int().default(16_384).describe("Max bytes to read (1-256000). Default: 16384."),
+        limitBytes: z.number().int().default(16_384).describe("Max bytes to read (1-256000). Default: 16384 (matches the resource-subscription chunk size). For a low-context read, pass 2000-4000 explicitly plus a nonzero offset."),
         limit_bytes: z.number().int().default(16_384).describe("Max bytes to read (1-256000). Compatibility alias."),
       }),
       execute: async (args) =>
