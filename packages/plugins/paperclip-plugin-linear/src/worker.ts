@@ -4393,11 +4393,12 @@ async function listIssueLinksForAudit(
   const links: sync.IssueLink[] = [];
   let offset = 0;
   while (links.length < limit) {
+    const requestedLimit = Math.min(100, limit - links.length);
     const page = await ctx.state.list({
       scopeKind: "instance",
       namespace: "default",
       stateKeyPrefix: STATE_KEYS.linkPrefix,
-      limit: Math.min(100, limit - links.length),
+      limit: requestedLimit,
       offset,
     });
     if (page.entries.length === 0) return { links, complete: true };
@@ -4407,7 +4408,7 @@ async function listIssueLinksForAudit(
         links.push(entry.value);
       }
     }
-    if (page.entries.length < 100) return { links, complete: true };
+    if (page.entries.length < requestedLimit) return { links, complete: true };
   }
   return { links, complete: false };
 }
@@ -4420,11 +4421,12 @@ async function listProjectLinksForAudit(
   const links: sync.ProjectLink[] = [];
   let offset = 0;
   while (links.length < limit) {
+    const requestedLimit = Math.min(100, limit - links.length);
     const page = await ctx.state.list({
       scopeKind: "instance",
       namespace: "default",
       stateKeyPrefix: STATE_KEYS.projectLinkPrefix,
-      limit: Math.min(100, limit - links.length),
+      limit: requestedLimit,
       offset,
     });
     if (page.entries.length === 0) return { links, complete: true };
@@ -4434,7 +4436,7 @@ async function listProjectLinksForAudit(
         links.push(entry.value);
       }
     }
-    if (page.entries.length < 100) return { links, complete: true };
+    if (page.entries.length < requestedLimit) return { links, complete: true };
   }
   return { links, complete: false };
 }
@@ -4523,13 +4525,24 @@ async function auditLinearBindings(
 
   const token = options.includeLinearValidation ? await resolveToken(ctx).catch(() => null) : null;
   const teamId = token ? await getTeamId(ctx).catch(() => "") : "";
-  const linearIssuesById = token
-    ? await listLinearIssuesByIdsForAudit(ctx, token, issueScan.links.map((link) => link.linearIssueId))
-    : new Map<string, linear.LinearIssue>();
+  let linearIssueValidationAvailable = false;
+  let linearProjectValidationAvailable = false;
+  let linearIssuesById = new Map<string, linear.LinearIssue>();
   const linearProjectsById = new Map<string, linear.LinearProject>();
   if (token) {
-    for (const project of await linear.listProjects(ctx.http.fetch.bind(ctx.http), token, teamId)) {
-      linearProjectsById.set(project.id, project);
+    try {
+      linearIssuesById = await listLinearIssuesByIdsForAudit(ctx, token, issueScan.links.map((link) => link.linearIssueId));
+      linearIssueValidationAvailable = true;
+    } catch (err) {
+      ctx.logger.warn("audit-linear-bindings Linear issue validation failed", { error: String(err) });
+    }
+    try {
+      for (const project of await linear.listProjects(ctx.http.fetch.bind(ctx.http), token, teamId)) {
+        linearProjectsById.set(project.id, project);
+      }
+      linearProjectValidationAvailable = true;
+    } catch (err) {
+      ctx.logger.warn("audit-linear-bindings Linear project validation failed", { error: String(err) });
     }
   }
 
@@ -4601,7 +4614,7 @@ async function auditLinearBindings(
     }
 
     const linearIssue = linearIssuesById.get(link.linearIssueId) ?? null;
-    if (token && !linearIssue) {
+    if (linearIssueValidationAvailable && !linearIssue) {
       findings.push({
         kind: "issue_missing_linear",
         severity: "error",
@@ -4685,7 +4698,7 @@ async function auditLinearBindings(
       });
     }
 
-    if (token && !linearProjectsById.has(link.linearProjectId)) {
+    if (linearProjectValidationAvailable && !linearProjectsById.has(link.linearProjectId)) {
       findings.push({
         kind: "project_missing_linear",
         severity: "error",
