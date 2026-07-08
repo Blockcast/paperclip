@@ -1,7 +1,12 @@
 // Tests for cap/rate-limit-exhausted detection and the corresponding
 // outcome override that routes the run into the bounded transient retry.
 import { describe, expect, it } from "vitest";
-import { isRateLimitExhausted, isRetryableK8sCcrotateThrottleResult, k8sCcrotateRetryDelayMs } from "../services/heartbeat.js";
+import {
+  countConsecutiveZeroTokenCompletedRuns,
+  isRateLimitExhausted,
+  isRetryableK8sCcrotateThrottleResult,
+  k8sCcrotateRetryDelayMs,
+} from "../services/heartbeat.js";
 
 describe("isRateLimitExhausted", () => {
   it("returns false for null", () => {
@@ -371,6 +376,34 @@ describe("k8s ccrotate no-progress throttle detection", () => {
   it("honors ccrotate retry_after duration fields when choosing the in-run retry delay", () => {
     expect(k8sCcrotateRetryDelayMs({ resultJson: { retry_after: 123 } })).toBe(123_000);
     expect(k8sCcrotateRetryDelayMs({ resultJson: { retry_after_seconds: "45" } })).toBe(45_000);
+  });
+});
+
+describe("countConsecutiveZeroTokenCompletedRuns", () => {
+  it("counts only the newest terminal zero-token prefix", () => {
+    expect(countConsecutiveZeroTokenCompletedRuns([
+      { status: "failed", usageJson: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 } },
+      { status: "succeeded", usageJson: null },
+      { status: "failed", usageJson: { inputTokens: 25, outputTokens: 0 } },
+      { status: "failed", usageJson: null },
+    ])).toBe(2);
+  });
+
+  it("resets on raw/cached-token activity and non-terminal rows", () => {
+    expect(countConsecutiveZeroTokenCompletedRuns([
+      { status: "succeeded", usageJson: { inputTokens: 0, cachedInputTokens: 12, outputTokens: 0 } },
+      { status: "failed", usageJson: null },
+    ])).toBe(0);
+
+    expect(countConsecutiveZeroTokenCompletedRuns([
+      { status: "succeeded", usageJson: { inputTokens: 0, rawInputTokens: 25, outputTokens: 0 } },
+      { status: "failed", usageJson: null },
+    ])).toBe(0);
+
+    expect(countConsecutiveZeroTokenCompletedRuns([
+      { status: "running", usageJson: null },
+      { status: "failed", usageJson: null },
+    ])).toBe(0);
   });
 });
 

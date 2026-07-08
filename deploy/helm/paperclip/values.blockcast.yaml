@@ -411,6 +411,20 @@ extraVolumeMounts:
     mountPath: /paperclip/.secrets/github-merge-token
     readOnly: true
 
+serviceMonitor:
+  enabled: true
+  labels:
+    release: kube-prometheus-stack
+  scrapeAllowFromNamespaces:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+
+prometheusRule:
+  enabled: true
+  labels:
+    release: kube-prometheus-stack
+
 networkPolicy:
   enabled: true
   allowFromNamespaces:

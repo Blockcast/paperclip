@@ -308,6 +308,29 @@ serviceMonitor:
   # Example: `[{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}}]`.
   scrapeAllowFromNamespaces: []
 
+# -- Prometheus Operator rules for Paperclip runtime health. Requires the
+# `monitoring.coreos.com/v1` CRDs and the ServiceMonitor scrape above. Disabled
+# by default so the chart still installs on clusters without the operator.
+prometheusRule:
+  # -- Create a PrometheusRule with Paperclip runtime alerts.
+  enabled: false
+  # -- Namespace for the PrometheusRule. Empty renders it into the release namespace.
+  namespace: ""
+  # -- Extra labels so a Prometheus `ruleSelector` can adopt it (e.g. `{release: kube-prometheus-stack}`).
+  labels: {}
+  # -- Alert when an agent has at least this many consecutive terminal runs with zero token usage.
+  zeroTokenStreakThreshold: 3
+  # -- How long the zero-token streak condition must persist before firing.
+  zeroTokenFor: 2m
+  # -- Regex for Kubernetes Job names owned by Paperclip agents.
+  agentJobNameRegex: "ac-.*"
+  # -- Rate window for BackoffLimitExceeded Job failures.
+  backoffLimitExceededWindow: 5m
+  # -- How long the BackoffLimitExceeded rate condition must persist before firing.
+  backoffLimitExceededFor: 2m
+  # -- Additional PrometheusRule groups appended verbatim.
+  additionalGroups: []
+
 # -- Dedicated ServiceAccount for the pod.
 serviceAccount:
   # -- Create a dedicated ServiceAccount.

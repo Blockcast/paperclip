@@ -1,0 +1,37 @@
+{{- if .Values.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "paperclip.fullname" . }}-runtime-alerts
+  {{- with .Values.prometheusRule.namespace }}
+  namespace: {{ . }}
+  {{- end }}
+  labels:
+    {{- include "paperclip.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: paperclip-runtime
+      rules:
+        - alert: PaperclipAgentZeroTokenRunStreak
+          expr: max by (agent_id, adapter) (paperclip_agent_zero_token_completed_run_streak) >= {{ .Values.prometheusRule.zeroTokenStreakThreshold }}
+          for: {{ .Values.prometheusRule.zeroTokenFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip agent has {{ .Values.prometheusRule.zeroTokenStreakThreshold }}+ consecutive zero-token runs"
+            description: "Agent {{`{{ $labels.agent_id }}`}} on adapter {{`{{ $labels.adapter }}`}} has completed {{ .Values.prometheusRule.zeroTokenStreakThreshold }} or more consecutive terminal runs with zero token usage. This catches poisoned-session/pre-model throttle loops like BLO-10866 within minutes."
+        - alert: PaperclipAgentJobBackoffLimitExceeded
+          expr: sum by (namespace) (rate(kube_job_status_failed{job_name=~{{ .Values.prometheusRule.agentJobNameRegex | quote }},reason="BackoffLimitExceeded"}[{{ .Values.prometheusRule.backoffLimitExceededWindow }}])) > 0
+          for: {{ .Values.prometheusRule.backoffLimitExceededFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip agent Kubernetes Jobs are hitting BackoffLimitExceeded"
+            description: "One or more ac-* Paperclip agent Jobs in namespace {{`{{ $labels.namespace }}`}} are failing with BackoffLimitExceeded. Check the matching Job/Pod logs and the zero-token streak alert for poisoned-session loops."
+    {{- with .Values.prometheusRule.additionalGroups }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

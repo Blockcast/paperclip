@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  AGENT_ZERO_TOKEN_COMPLETED_RUN_STREAK_METRIC,
   CONCURRENT_RUN_BLOCKED_METRIC,
   DEP_BLOCKED_WAKEUP_METRIC,
   HEARTBEAT_RUN_FAILED_METRIC,
@@ -17,6 +18,7 @@ import {
   normalizeIsolationMode,
   normalizeReason,
   recordConcurrentRunBlocked,
+  recordAgentZeroTokenCompletedRunStreak,
   recordHeartbeatRunFailed,
   recordIsolatedRunStarted,
   renderMetrics,
@@ -271,6 +273,42 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
     expect(body).toContain(
       `${HEARTBEAT_RUN_FAILED_METRIC}{adapter="claude_k8s",error_code="k8s_concurrent_run_blocked",invocation_source="transient_failure_retry"} 2`,
     );
+  });
+});
+
+describe("recordAgentZeroTokenCompletedRunStreak + renderMetrics", () => {
+  it("sets a bounded per-agent gauge for consecutive zero-token completed runs", async () => {
+    const labels = recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "opencode_k8s",
+      streak: 3,
+      knownAgentIds: new Set(["agent-a"]),
+    });
+
+    expect(labels).toEqual({ agent_id: "agent-a", adapter: "opencode_k8s", streak: 3 });
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${AGENT_ZERO_TOKEN_COMPLETED_RUN_STREAK_METRIC} gauge`);
+    expect(body).toContain(
+      `${AGENT_ZERO_TOKEN_COMPLETED_RUN_STREAK_METRIC}{agent_id="agent-a",adapter="opencode_k8s"} 3`,
+    );
+  });
+
+  it("collapses unknown agents and invalid streaks to bounded values", async () => {
+    const labels = recordAgentZeroTokenCompletedRunStreak({
+      agentId: "ghost",
+      adapter: "",
+      streak: Number.NaN,
+      knownAgentIds: new Set(["agent-a"]),
+    });
+
+    expect(labels).toEqual({ agent_id: UNKNOWN_AGENT_ID, adapter: "unknown", streak: 0 });
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${AGENT_ZERO_TOKEN_COMPLETED_RUN_STREAK_METRIC}{agent_id="${UNKNOWN_AGENT_ID}",adapter="unknown"} 0`,
+    );
+    expect(body).not.toContain("ghost");
   });
 });
 
