@@ -51,7 +51,7 @@ jobs:
             fi
             # Stale if base has source changes (outside graphify-out) since the graph was built.
             if ! git diff --quiet "$bac" "$BASE_SHA" -- "$scope" ":(exclude)**/graphify-out/**" ":(exclude)graphify-out/**"; then
-              echo "::error file=$g::STALE graph — base changed '${scope}' since built_at_commit ${bac:0:12}. Rebuild: graphify update ${scope} --force --directed"
+              echo "::error file=$g::STALE graph — base changed '${scope}' since built_at_commit ${bac:0:12}. Rebuild: graphify update ${scope} --force"
               rc=1
             else
               echo "OK: $g is fresh (built_at ${bac:0:12})"
