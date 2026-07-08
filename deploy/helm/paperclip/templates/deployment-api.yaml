@@ -144,6 +144,10 @@ spec:
             - name: PLAYWRIGHT_BROWSERS_PATH
               value: {{ printf "%s/ms-playwright" .Values.runtimeCache.mountPath | quote }}
             {{- end }}
+            {{- if .Values.runtimeConfig.enabled }}
+            - name: XDG_CONFIG_HOME
+              value: {{ .Values.runtimeConfig.mountPath | quote }}
+            {{- end }}
             - name: PAPERCLIP_AGENT_JWT_SECRET
               valueFrom:
                 secretKeyRef:
@@ -206,6 +210,10 @@ spec:
             - name: runtime-cache
               mountPath: {{ .Values.runtimeCache.mountPath | quote }}
             {{- end }}
+            {{- if .Values.runtimeConfig.enabled }}
+            - name: runtime-config
+              mountPath: {{ .Values.runtimeConfig.mountPath | quote }}
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -222,6 +230,15 @@ spec:
           {{- if .Values.runtimeCache.sizeLimit }}
           emptyDir:
             sizeLimit: {{ .Values.runtimeCache.sizeLimit | quote }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
+        {{- if .Values.runtimeConfig.enabled }}
+        - name: runtime-config
+          {{- if .Values.runtimeConfig.sizeLimit }}
+          emptyDir:
+            sizeLimit: {{ .Values.runtimeConfig.sizeLimit | quote }}
           {{- else }}
           emptyDir: {}
           {{- end }}

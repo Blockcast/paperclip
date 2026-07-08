@@ -595,12 +595,20 @@ spec:
             - name: PLAYWRIGHT_BROWSERS_PATH
               value: {{ printf "%s/ms-playwright" .Values.runtimeCache.mountPath | quote }}
             {{- end }}
+            {{- if .Values.runtimeConfig.enabled }}
+            - name: XDG_CONFIG_HOME
+              value: {{ .Values.runtimeConfig.mountPath | quote }}
+            {{- end }}
           volumeMounts:
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
             {{- if .Values.runtimeCache.enabled }}
             - name: runtime-cache
               mountPath: {{ .Values.runtimeCache.mountPath | quote }}
+            {{- end }}
+            {{- if .Values.runtimeConfig.enabled }}
+            - name: runtime-config
+              mountPath: {{ .Values.runtimeConfig.mountPath | quote }}
             {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
@@ -653,6 +661,10 @@ spec:
               value: {{ printf "%s/pip" .Values.runtimeCache.mountPath | quote }}
             - name: PLAYWRIGHT_BROWSERS_PATH
               value: {{ printf "%s/ms-playwright" .Values.runtimeCache.mountPath | quote }}
+            {{- end }}
+            {{- if .Values.runtimeConfig.enabled }}
+            - name: XDG_CONFIG_HOME
+              value: {{ .Values.runtimeConfig.mountPath | quote }}
             {{- end }}
             - name: PAPERCLIP_AGENT_JWT_SECRET
               valueFrom:
@@ -713,6 +725,10 @@ spec:
             - name: runtime-cache
               mountPath: {{ .Values.runtimeCache.mountPath | quote }}
             {{- end }}
+            {{- if .Values.runtimeConfig.enabled }}
+            - name: runtime-config
+              mountPath: {{ .Values.runtimeConfig.mountPath | quote }}
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -728,7 +744,7 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if or (and .Values.persistence.enabled .Values.persistence.existingClaim) .Values.runtimeCache.enabled .Values.extraVolumes }}
+      {{- if or (and .Values.persistence.enabled .Values.persistence.existingClaim) .Values.runtimeCache.enabled .Values.runtimeConfig.enabled .Values.extraVolumes }}
       volumes:
         {{- if and .Values.persistence.enabled .Values.persistence.existingClaim }}
         - name: data
@@ -740,6 +756,15 @@ spec:
           {{- if .Values.runtimeCache.sizeLimit }}
           emptyDir:
             sizeLimit: {{ .Values.runtimeCache.sizeLimit | quote }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
+        {{- if .Values.runtimeConfig.enabled }}
+        - name: runtime-config
+          {{- if .Values.runtimeConfig.sizeLimit }}
+          emptyDir:
+            sizeLimit: {{ .Values.runtimeConfig.sizeLimit | quote }}
           {{- else }}
           emptyDir: {}
           {{- end }}
