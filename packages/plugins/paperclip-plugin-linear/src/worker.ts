@@ -4539,7 +4539,7 @@ async function auditLinearBindings(
       ctx.logger.warn("audit-linear-bindings Linear issue validation failed", { error: String(err) });
     }
     try {
-      for (const project of await linear.listProjects(ctx.http.fetch.bind(ctx.http), token, teamId)) {
+      for (const project of await linear.listProjects(ctx.http.fetch.bind(ctx.http), token)) {
         linearProjectsById.set(project.id, project);
       }
       linearProjectValidationAvailable = true;

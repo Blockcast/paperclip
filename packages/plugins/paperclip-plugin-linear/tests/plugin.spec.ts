@@ -905,6 +905,52 @@ describe("paperclip-plugin-linear", () => {
         ]),
       );
     });
+
+    it("validates linked Linear projects globally instead of only within the configured team", async () => {
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthToken },
+        "lin_token_123",
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: STATE_KEYS.oauthTeamId },
+        "team-1",
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: `${STATE_KEYS.projectLinkPrefix}pc-proj-cross-team` },
+        {
+          paperclipProjectId: "pc-proj-cross-team",
+          paperclipCompanyId: "comp-1",
+          linearProjectId: "lin-proj-cross-team",
+          linearProjectName: "Cross-team Project",
+          syncDirection: "bidirectional",
+          lastSyncAt: "2026-07-08T00:00:00.000Z",
+          lastLinearState: "started",
+        },
+      );
+      const { listProjects } = await import("../src/linear.js");
+      (listProjects as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+        {
+          id: "lin-proj-cross-team",
+          name: "Cross-team Project",
+          description: null,
+          state: "started",
+          startDate: null,
+          targetDate: null,
+        },
+      ]);
+
+      const result = await harness.executeTool(TOOL_NAMES.auditBindings, {
+        companyId: "comp-1",
+        includeLinearValidation: true,
+      });
+
+      expect(listProjects).toHaveBeenCalledWith(expect.any(Function), "lin_token_123");
+      expect((result.data as any).findings).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: "project_missing_linear", linearProjectId: "lin-proj-cross-team" }),
+        ]),
+      );
+    });
   });
 
   describe("manifest: tool parameter schemas", () => {
