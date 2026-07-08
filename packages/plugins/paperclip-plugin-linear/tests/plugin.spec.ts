@@ -701,6 +701,73 @@ describe("paperclip-plugin-linear", () => {
       );
     });
 
+    it("keeps local findings when plugin reverse mapping lookups fail", async () => {
+      const issue = await harness.ctx.issues.create({ companyId: "comp-1", title: "Linked issue" });
+      const issueLink = {
+        paperclipIssueId: issue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-state-fails",
+        linearIdentifier: "LUC-83",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-83",
+        syncDirection: "bidirectional",
+        lastSyncAt: "2026-07-08T00:00:00.000Z",
+        lastLinearStateType: "started",
+        lastCommentSyncAt: null,
+      };
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: `${STATE_KEYS.linkPrefix}${issue.id}` },
+        issueLink,
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: `${STATE_KEYS.linkPrefix}pc-state-fails-other` },
+        { ...issueLink, paperclipIssueId: "pc-state-fails-other" },
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: `${STATE_KEYS.projectLinkPrefix}pc-proj-state-fails-1` },
+        {
+          paperclipProjectId: "pc-proj-state-fails-1",
+          paperclipCompanyId: "comp-1",
+          linearProjectId: "lin-proj-state-fails",
+          linearProjectName: "Linear Project",
+          syncDirection: "bidirectional",
+          lastSyncAt: "2026-07-08T00:00:00.000Z",
+          lastLinearState: "started",
+        },
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "instance", stateKey: `${STATE_KEYS.projectLinkPrefix}pc-proj-state-fails-2` },
+        {
+          paperclipProjectId: "pc-proj-state-fails-2",
+          paperclipCompanyId: "comp-1",
+          linearProjectId: "lin-proj-state-fails",
+          linearProjectName: "Linear Project",
+          syncDirection: "bidirectional",
+          lastSyncAt: "2026-07-08T00:00:00.000Z",
+          lastLinearState: "started",
+        },
+      );
+      syncModule.getLinkByLinear.mockRejectedValue(new Error("state unavailable"));
+      syncModule.getProjectLinkByLinear.mockRejectedValue(new Error("state unavailable"));
+
+      const result = await harness.executeTool(TOOL_NAMES.auditBindings, {
+        companyId: "comp-1",
+        includeLinearValidation: false,
+      });
+
+      expect((result.data as any).findings).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: "issue_duplicate_linear_id", linearIssueId: "lin-state-fails" }),
+          expect.objectContaining({ kind: "project_duplicate_linear_id", linearProjectId: "lin-proj-state-fails" }),
+        ]),
+      );
+      expect((result.data as any).findings).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: "issue_missing_reverse_mapping", linearIssueId: "lin-state-fails" }),
+          expect.objectContaining({ kind: "project_missing_reverse_mapping", linearProjectId: "lin-proj-state-fails" }),
+        ]),
+      );
+    });
+
     it("reports project reverse mapping failures", async () => {
       await harness.ctx.state.set(
         { scopeKind: "instance", stateKey: `${STATE_KEYS.projectLinkPrefix}pc-proj-1` },

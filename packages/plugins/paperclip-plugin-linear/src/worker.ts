@@ -4566,8 +4566,15 @@ async function auditLinearBindings(
       });
     }
 
-    const reverse = await sync.getLinkByLinear(ctx, link.linearIssueId);
-    if (!reverse) {
+    let reverse: sync.IssueLink | null = null;
+    let reverseCheckAvailable = true;
+    try {
+      reverse = await sync.getLinkByLinear(ctx, link.linearIssueId);
+    } catch (err) {
+      reverseCheckAvailable = false;
+      ctx.logger.warn("audit-linear-bindings issue reverse mapping check failed", { linearIssueId: link.linearIssueId, error: String(err) });
+    }
+    if (reverseCheckAvailable && !reverse) {
       findings.push({
         kind: "issue_missing_reverse_mapping",
         severity: "error",
@@ -4577,7 +4584,7 @@ async function auditLinearBindings(
         linearIdentifier: link.linearIdentifier,
         message: `Issue link ${link.paperclipIssueId} -> ${link.linearIdentifier} is missing its Linear reverse mapping.`,
       });
-    } else if (reverse.paperclipIssueId !== link.paperclipIssueId) {
+    } else if (reverse && reverse.paperclipIssueId !== link.paperclipIssueId) {
       findings.push({
         kind: "issue_stale_reverse_mapping",
         severity: "error",
@@ -4628,7 +4635,12 @@ async function auditLinearBindings(
 
     const paperclipProjectId = typeof paperclipIssue?.projectId === "string" ? paperclipIssue.projectId : null;
     if (linearIssue && teamId && linearIssue.team?.id === teamId && !linearIssue.project?.id && paperclipProjectId) {
-      const projectLink = await sync.getProjectLink(ctx, paperclipProjectId);
+      let projectLink: sync.ProjectLink | null = null;
+      try {
+        projectLink = await sync.getProjectLink(ctx, paperclipProjectId);
+      } catch (err) {
+        ctx.logger.warn("audit-linear-bindings project link lookup failed", { paperclipProjectId, error: String(err) });
+      }
       if (projectLink) {
         findings.push({
           kind: "issue_same_team_no_project_drift",
@@ -4678,8 +4690,15 @@ async function auditLinearBindings(
       });
     }
 
-    const reverse = await sync.getProjectLinkByLinear(ctx, link.linearProjectId);
-    if (!reverse) {
+    let reverse: sync.ProjectLink | null = null;
+    let reverseCheckAvailable = true;
+    try {
+      reverse = await sync.getProjectLinkByLinear(ctx, link.linearProjectId);
+    } catch (err) {
+      reverseCheckAvailable = false;
+      ctx.logger.warn("audit-linear-bindings project reverse mapping check failed", { linearProjectId: link.linearProjectId, error: String(err) });
+    }
+    if (reverseCheckAvailable && !reverse) {
       findings.push({
         kind: "project_missing_reverse_mapping",
         severity: "error",
@@ -4687,7 +4706,7 @@ async function auditLinearBindings(
         linearProjectId: link.linearProjectId,
         message: `Project link ${link.paperclipProjectId} -> ${link.linearProjectName} is missing its Linear reverse mapping.`,
       });
-    } else if (reverse.paperclipProjectId !== link.paperclipProjectId) {
+    } else if (reverse && reverse.paperclipProjectId !== link.paperclipProjectId) {
       findings.push({
         kind: "project_stale_reverse_mapping",
         severity: "error",
