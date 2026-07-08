@@ -75,6 +75,7 @@ import {
   readAgentJobRunStatusByName,
   type AgentJobRunStatus,
 } from "./k8s-job-liveness.js";
+import { getActiveAgentIds } from "./agent-roster.js";
 import { processPendingImageBumpForAgent } from "./agent-image-bump.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
 import type {
@@ -11477,16 +11478,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .from(heartbeatRuns)
         .where(and(
           eq(heartbeatRuns.agentId, agent.id),
+          // Keep this filter aligned with countConsecutiveZeroTokenCompletedRuns:
+          // non-terminal rows would reset the streak, but this production query
+          // intentionally measures only completed terminal attempts.
           inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
         ))
         .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.createdAt))
         .limit(10);
+      const knownAgentIds = await getActiveAgentIds(db, agent.companyId);
 
       recordAgentZeroTokenCompletedRunStreak({
         agentId: agent.id,
         adapter: agent.adapterType,
         streak: countConsecutiveZeroTokenCompletedRuns(recentRuns),
-        knownAgentIds: new Set([agent.id]),
+        knownAgentIds,
       });
     } catch (err) {
       logger.warn({ err, agentId: agent.id }, "failed to record zero-token completed-run streak metric");
