@@ -65,7 +65,7 @@ export const ISOLATED_RUN_STARTED_METRIC = "paperclip_k8s_isolated_run_started_t
  * Unknown/empty values collapse to "unknown" to guard against future changes.
  */
 export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_deferred_total";
-export const AGENT_ZERO_TOKEN_COMPLETED_RUN_STREAK_METRIC = "paperclip_agent_zero_token_completed_run_streak";
+export const AGENT_NO_USAGE_STREAK_METRIC = "paperclip_agent_zero_token_completed_run_streak";
 
 /**
  * Bounded `reason` allow-list (mirrors the adapter-lane reasons defined in
@@ -217,7 +217,7 @@ function ensureRegistry(): {
       registers: [registry],
     });
     agentZeroTokenCompletedRunStreak = new Gauge({
-      name: AGENT_ZERO_TOKEN_COMPLETED_RUN_STREAK_METRIC,
+      name: AGENT_NO_USAGE_STREAK_METRIC,
       help:
         "Current count of consecutive terminal heartbeat runs for an agent that completed with zero token usage. "
         + "Alerts at >=3 catch poisoned-session or pre-model throttle loops within minutes (BLO-10891).",

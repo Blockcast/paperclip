@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  AGENT_ZERO_TOKEN_COMPLETED_RUN_STREAK_METRIC,
+  AGENT_NO_USAGE_STREAK_METRIC,
   CONCURRENT_RUN_BLOCKED_METRIC,
   DEP_BLOCKED_WAKEUP_METRIC,
   HEARTBEAT_RUN_FAILED_METRIC,
@@ -288,9 +288,9 @@ describe("recordAgentZeroTokenCompletedRunStreak + renderMetrics", () => {
     expect(labels).toEqual({ agent_id: "agent-a", adapter: "opencode_k8s", streak: 3 });
 
     const { body } = await renderMetrics();
-    expect(body).toContain(`# TYPE ${AGENT_ZERO_TOKEN_COMPLETED_RUN_STREAK_METRIC} gauge`);
+    expect(body).toContain(`# TYPE ${AGENT_NO_USAGE_STREAK_METRIC} gauge`);
     expect(body).toContain(
-      `${AGENT_ZERO_TOKEN_COMPLETED_RUN_STREAK_METRIC}{agent_id="agent-a",adapter="opencode_k8s"} 3`,
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="opencode_k8s"} 3`,
     );
   });
 
@@ -306,7 +306,7 @@ describe("recordAgentZeroTokenCompletedRunStreak + renderMetrics", () => {
 
     const { body } = await renderMetrics();
     expect(body).toContain(
-      `${AGENT_ZERO_TOKEN_COMPLETED_RUN_STREAK_METRIC}{agent_id="${UNKNOWN_AGENT_ID}",adapter="unknown"} 0`,
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="${UNKNOWN_AGENT_ID}",adapter="unknown"} 0`,
     );
     expect(body).not.toContain("ghost");
   });
