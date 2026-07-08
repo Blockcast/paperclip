@@ -15,7 +15,7 @@
  */
 
 import http from "node:http";
-import fs from "node:fs";
+import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -96,6 +96,8 @@ export interface GatewayState {
   upstreamTimeoutMs: number;
   credentialCustody?: CredentialCustodyState;
   sessionPersistenceFile?: string | null;
+  sessionPersistenceLoaded?: boolean;
+  sessionPersistenceWrite?: Promise<void>;
 }
 
 interface PersistedSessionSnapshot {
@@ -145,12 +147,12 @@ function getOrCreateStore(state: GatewayState, prefix: string): SessionStore {
   return fresh;
 }
 
-function loadPersistedSessions(state: GatewayState): void {
+async function loadPersistedSessions(state: GatewayState): Promise<void> {
   const file = state.sessionPersistenceFile;
   if (!file) return;
   let parsed: PersistedSessionSnapshot;
   try {
-    parsed = JSON.parse(fs.readFileSync(file, "utf8")) as PersistedSessionSnapshot;
+    parsed = JSON.parse(await fs.readFile(file, "utf8")) as PersistedSessionSnapshot;
   } catch {
     return;
   }
@@ -161,21 +163,35 @@ function loadPersistedSessions(state: GatewayState): void {
   }
 }
 
-function persistSessions(state: GatewayState): void {
+async function ensurePersistedSessionsLoaded(state: GatewayState): Promise<void> {
+  if (!state.sessionPersistenceFile || state.sessionPersistenceLoaded) return;
+  await loadPersistedSessions(state);
+  state.sessionPersistenceLoaded = true;
+}
+
+async function persistSessions(state: GatewayState): Promise<void> {
+  const prior = state.sessionPersistenceWrite ?? Promise.resolve();
+  const write = prior.catch(() => undefined).then(() => persistSessionsNow(state));
+  state.sessionPersistenceWrite = write;
+  await write;
+}
+
+async function persistSessionsNow(state: GatewayState): Promise<void> {
   const file = state.sessionPersistenceFile;
   if (!file) return;
+  await loadPersistedSessions(state);
   const snapshot: PersistedSessionSnapshot = {
     version: 1,
     prefixes: Object.fromEntries(Array.from(state.sessions.entries()).map(([prefix, store]) => [prefix, store.snapshot()])),
   };
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(tmp, JSON.stringify(snapshot), { encoding: "utf8", mode: 0o600 });
-    fs.renameSync(tmp, file);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(tmp, JSON.stringify(snapshot), { encoding: "utf8", mode: 0o600 });
+    await fs.rename(tmp, file);
   } catch (e) {
     try {
-      fs.rmSync(tmp, { force: true });
+      await fs.rm(tmp, { force: true });
     } catch {
       // best-effort cleanup only
     }
@@ -293,7 +309,7 @@ async function ensureUpstreamSession(
   const upstreamSessionId = await createUpstreamSession(upstream.url, inboundHeaders, initializePayload, state.upstreamTimeoutMs, upstream);
   if (!upstreamSessionId) return null;
   store.createInitialized({ clientSessionId, upstreamSessionId, initializePayload });
-  persistSessions(state);
+  await persistSessions(state);
   return upstreamSessionId;
 }
 
@@ -318,7 +334,7 @@ async function forwardAggregateWithSessionRecovery(
   if (!newUpstreamSessionId) return result;
   store.rotateUpstream(clientSessionId, newUpstreamSessionId);
   result = await forward(upstream.url, method, inboundHeaders, body, newUpstreamSessionId, state.upstreamTimeoutMs, upstream);
-  persistSessions(state);
+  await persistSessions(state);
   return result;
 }
 
@@ -426,7 +442,6 @@ async function handleRequest(
   state: GatewayState,
 ): Promise<void> {
   const url = req.url ?? "/";
-  loadPersistedSessions(state);
 
   // Health endpoint.
   if (url === "/" || url === "/healthz") {
@@ -465,6 +480,7 @@ async function handleRequest(
     const slashIdx = trimmed.indexOf("/");
     return slashIdx === -1 ? trimmed : trimmed.slice(0, slashIdx);
   })();
+  await ensurePersistedSessionsLoaded(state);
   const store = getOrCreateStore(state, prefix);
   state.upstreamCallCounts.set(prefix, (state.upstreamCallCounts.get(prefix) ?? 0) + 1);
 
@@ -501,7 +517,7 @@ async function handleRequest(
       state.upstreamTimeoutMs,
       matchedCustodyConfig(state.credentialCustody, prefix),
     );
-    persistSessions(state);
+    await persistSessions(state);
     if (status >= 500) state.breaker.recordFailure(prefix);
     else state.breaker.recordSuccess(prefix);
   } catch (e) {
@@ -517,6 +533,7 @@ async function handleAggregateRequest(
   res: http.ServerResponse,
   state: GatewayState,
 ): Promise<void> {
+  await ensurePersistedSessionsLoaded(state);
   const body = await readBody(req);
   const bodyText = body.toString("utf8");
   const message = parseJsonRpcRequest(bodyText);
@@ -535,10 +552,19 @@ async function handleAggregateRequest(
   }
 
   if (message.method === "initialize") {
-    for (const [prefix, upstream] of Object.entries(state.upstreams)) {
+    await Promise.allSettled(Object.entries(state.upstreams).map(async ([prefix, upstream]) => {
+      if (!state.breaker.tryAcquire(prefix)) return;
       state.upstreamCallCounts.set(prefix, (state.upstreamCallCounts.get(prefix) ?? 0) + 1);
-      await ensureUpstreamSession(state, prefix, upstream, req.headers, clientSessionId, initializePayload);
-    }
+      try {
+        const upstreamSessionId = await ensureUpstreamSession(state, prefix, upstream, req.headers, clientSessionId, initializePayload);
+        if (upstreamSessionId) state.breaker.recordSuccess(prefix);
+        else state.breaker.recordFailure(prefix);
+      } catch (e) {
+        state.breaker.recordFailure(prefix);
+        // eslint-disable-next-line no-console
+        console.warn(`[mcp-gateway] aggregate initialize skipped prefix=${prefix}: ${(e as Error).message}`);
+      }
+    }));
     res.statusCode = 200;
     res.setHeader("content-type", "application/json");
     res.setHeader(MCP_SESSION_HEADER, clientSessionId);
@@ -590,7 +616,7 @@ async function handleAggregateRequest(
         console.warn(`[mcp-gateway] aggregate tools/list skipped prefix=${prefix}: ${(e as Error).message}`);
       }
     }
-    persistSessions(state);
+    await persistSessions(state);
     res.statusCode = 200;
     res.setHeader("content-type", "application/json");
     res.setHeader(MCP_SESSION_HEADER, clientSessionId);
@@ -641,7 +667,7 @@ async function handleAggregateRequest(
     }
     if (result.status >= 500) state.breaker.recordFailure(prefix);
     else state.breaker.recordSuccess(prefix);
-    persistSessions(state);
+    await persistSessions(state);
     writeResponse(res, result, clientSessionId);
     return;
   }
@@ -865,7 +891,8 @@ async function main(): Promise<void> {
     credentialCustody: loadCredentialCustodyState(),
     sessionPersistenceFile: config.sessionPersistenceFile,
   };
-  loadPersistedSessions(state);
+  await loadPersistedSessions(state);
+  state.sessionPersistenceLoaded = true;
 
   const server = createGatewayServer(state);
 

@@ -242,16 +242,16 @@ async function createFigmaGateway(
 
 async function createAggregateGateway(
   upstreams: GatewayState["upstreams"],
-  opts?: { sessionPersistenceFile?: string },
+  opts?: { sessionPersistenceFile?: string; timeoutMs?: number; failureThreshold?: number },
 ): Promise<{ url: string; state: GatewayState }> {
   const state: GatewayState = {
     upstreams,
     sessions: new Map(),
     upstreamCallCounts: new Map(),
-    upstreamTimeoutMs: 60_000,
+    upstreamTimeoutMs: opts?.timeoutMs ?? 60_000,
     sessionPersistenceFile: opts?.sessionPersistenceFile,
     breaker: new CircuitBreaker({
-      failureThreshold: 5,
+      failureThreshold: opts?.failureThreshold ?? 5,
       openCooldownMs: 30_000,
       halfOpenMaxProbes: 1,
     }),
@@ -820,6 +820,41 @@ describe("mcp gateway lifecycle compatibility", () => {
     expect(call.status).toBe(200);
     expect(beta.receivedToolCalls).toEqual(["search"]);
     expect(alpha.receivedToolCalls).toEqual([]);
+  });
+
+  it("keeps aggregate initialize available when one upstream is unhealthy", async () => {
+    const alpha = await createStrictMcpUpstream([{ name: "search", description: "Alpha search" }]);
+    const hanging = await createHangingUpstream();
+    const gateway = await createAggregateGateway(
+      {
+        alpha: { url: alpha.url, credentialHeaders: [] },
+        stuck: { url: hanging.url, credentialHeaders: [] },
+      },
+      { timeoutMs: 150, failureThreshold: 1 },
+    );
+
+    const start = Date.now();
+    const initialize = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    const elapsed = Date.now() - start;
+    const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
+
+    expect(initialize.status).toBe(200);
+    expect(clientSessionId).toBeTruthy();
+    expect(elapsed).toBeLessThan(1000);
+    expect(gateway.state.breaker.stateOf("stuck")).toBe("open");
+
+    const list = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(clientSessionId ?? undefined),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+    });
+    const listBody = await list.json() as { result: { tools: Array<{ name: string }> } };
+    expect(list.status).toBe(200);
+    expect(listBody.result.tools.map((tool) => tool.name)).toEqual(["alpha__search"]);
   });
 
   it("reloads persisted aggregate sessions after gateway restart", async () => {
