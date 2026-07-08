@@ -140,6 +140,10 @@ metadata:
     app.kubernetes.io/managed-by: paperclip-mcp
     app.kubernetes.io/part-of: paperclip
 spec:
+  # Target cluster default is cephfs today, but pin it so a future default
+  # StorageClass drift to RWO (for example local-path/RBD) cannot strand the
+  # HA rollout with an unbound RWX claim.
+  storageClassName: cephfs
   accessModes:
     - ReadWriteMany
   resources:
