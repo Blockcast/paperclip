@@ -18,7 +18,11 @@ const ESCAPED_JSON_SECRET_FIELD_TEXT_RE = new RegExp(
   "gi",
 );
 const ENV_DUMP_SECRET_KEY_RE =
-  /^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|TOKEN|SECRET|PASSWD|PASSWORD|CREDENTIAL|JWT|PRIVATE_KEY|COOKIE|BASE_URL)[A-Za-z0-9_]*=/i;
+  /[A-Za-z_][A-Za-z0-9_]*(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|TOKEN|SECRET|PASSWD|PASSWORD|CREDENTIAL|JWT|PRIVATE_KEY|COOKIE|BASE_URL)[A-Za-z0-9_]*/i;
+const ENV_DUMP_SECRET_ASSIGNMENT_RE = new RegExp(
+  String.raw`(^|[\r\n\x00])((?:export\s+|declare\s+-x\s+)?${ENV_DUMP_SECRET_KEY_RE.source}=)("[^"\r\n\x00]*"|'[^'\r\n\x00]*'|[^\r\n\x00]*)`,
+  "gi",
+);
 const SECRET_TEXT_HINTS = [
   "api",
   "key",
@@ -130,14 +134,11 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
 export function redactSensitiveText(input: string): string {
   if (!maybeContainsSecretText(input)) return input;
   const envRedacted = input
-    .split(/(\r?\n)/)
-    .map((part) => {
-      if (!ENV_DUMP_SECRET_KEY_RE.test(part.trimStart())) return part;
-      const idx = part.indexOf("=");
-      if (idx < 0) return part;
-      return `${part.slice(0, idx + 1)}${REDACTED_EVENT_VALUE}`;
+    .replace(ENV_DUMP_SECRET_ASSIGNMENT_RE, (_match, boundary, prefix, value) => {
+      const quote = value.startsWith('"') || value.startsWith("'") ? value[0] : "";
+      return `${boundary}${prefix}${quote}${REDACTED_EVENT_VALUE}${quote}`;
     })
-    .join("");
+    .replaceAll("\0", "\n");
   return redactCommandText(
     envRedacted
       .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)

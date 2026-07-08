@@ -54,6 +54,27 @@ describe("compactRunLogChunk", () => {
     expect(compacted).toContain("SAFE_ENV_NAME=visible");
   });
 
+  it("redacts declare/export and nul-delimited env dumps before persisting run-log chunks", () => {
+    const declareSecret = "fake-pen1305-declare-secret";
+    const exportSecret = "fake-pen1305-export-secret";
+    const procSecret = "fake-pen1305-proc-secret";
+    const chunk = [
+      `declare -x PAPERCLIP_API_KEY="${declareSecret}"`,
+      `export PAPERCLIP_ACCESS_TOKEN='${exportSecret}'`,
+      `PATH=/usr/bin\0PAPERCLIP_PRIVATE_KEY=${procSecret}\0SAFE_ENV_NAME=visible`,
+    ].join("\n");
+
+    const compacted = compactRunLogChunk(chunk);
+
+    expect(compacted).toContain('declare -x PAPERCLIP_API_KEY="***REDACTED***"');
+    expect(compacted).toContain("export PAPERCLIP_ACCESS_TOKEN='***REDACTED***'");
+    expect(compacted).toContain("PAPERCLIP_PRIVATE_KEY=***REDACTED***");
+    expect(compacted).not.toContain(declareSecret);
+    expect(compacted).not.toContain(exportSecret);
+    expect(compacted).not.toContain(procSecret);
+    expect(compacted).toContain("SAFE_ENV_NAME=visible");
+  });
+
   it("sanitizes secret-prefixed environment values before the run-log store append path", () => {
     const fakeSecret = "fake-pen1305-store-secret";
     const sanitized = sanitizeRunLogChunkForStorage(
