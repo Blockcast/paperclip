@@ -8,15 +8,15 @@
  * the cached `initialize` request to mint a fresh upstream session,
  * then retries the original call. The client never sees the failure.
  *
- * Routing config: env `PAPERCLIP_MCP_UPSTREAMS` (inline JSON) or
- * `PAPERCLIP_MCP_UPSTREAMS_FILE` (path to JSON file).
+ * Routing config: penstock state via `PAPERCLIP_MCP_UPSTREAMS_STATE_URL`,
+ * with a last-known-good cache fallback, or legacy local JSON env/file.
  *
  * Health check: GET / → 200 with the current upstream table.
  */
 
 import http from "node:http";
 import { fileURLToPath } from "node:url";
-import { loadUpstreams, matchUpstream, type UpstreamMap } from "./upstreams.js";
+import { buildCredentialHeaders, loadUpstreams, matchUpstream, type UpstreamConfig, type UpstreamMap } from "./upstreams.js";
 import { CircuitBreaker, type CircuitBreakerConfig } from "./circuit-breaker.js";
 import {
   MCP_SESSION_HEADER,
@@ -74,6 +74,7 @@ export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): Gateway
 export interface GatewayState {
   upstreams: UpstreamMap;
   sessions: Map<string, SessionStore>;
+  upstreamCallCounts: Map<string, number>;
   breaker: CircuitBreaker;
   upstreamTimeoutMs: number;
 }
@@ -146,6 +147,7 @@ async function notifyUpstreamInitialized(
   inboundHeaders: http.IncomingHttpHeaders,
   upstreamSessionId: string,
   timeoutMs: number,
+  upstreamConfig?: UpstreamConfig,
 ): Promise<boolean> {
   const result = await forward(
     upstreamUrl,
@@ -154,6 +156,7 @@ async function notifyUpstreamInitialized(
     buildInitializedNotificationPayload(),
     upstreamSessionId,
     timeoutMs,
+    upstreamConfig,
   );
   if (isSuccess(result.status)) return true;
   // eslint-disable-next-line no-console
@@ -166,6 +169,7 @@ async function createUpstreamSession(
   inboundHeaders: http.IncomingHttpHeaders,
   initializePayload: Buffer,
   timeoutMs: number,
+  upstreamConfig?: UpstreamConfig,
 ): Promise<string | null> {
   const initializeResult = await forward(
     upstreamUrl,
@@ -174,11 +178,12 @@ async function createUpstreamSession(
     initializePayload,
     null,
     timeoutMs,
+    upstreamConfig,
   );
   const initializeBody = initializeResult.body.toString("utf8");
   const upstreamSessionId = extractUpstreamSessionId(initializeResult.headers, initializeBody);
   if (!isSuccess(initializeResult.status) || !upstreamSessionId) return null;
-  await notifyUpstreamInitialized(upstreamUrl, inboundHeaders, upstreamSessionId, timeoutMs);
+  await notifyUpstreamInitialized(upstreamUrl, inboundHeaders, upstreamSessionId, timeoutMs, upstreamConfig);
   return upstreamSessionId;
 }
 
@@ -189,6 +194,7 @@ async function forward(
   body: Buffer,
   upstreamSessionId: string | null,
   timeoutMs: number,
+  upstreamConfig?: UpstreamConfig,
 ): Promise<ForwardResult> {
   const headers: Record<string, string> = {};
   for (const [k, v] of Object.entries(inboundHeaders)) {
@@ -206,6 +212,9 @@ async function forward(
   delete headers[MCP_SESSION_HEADER];
   if (upstreamSessionId) {
     headers[MCP_SESSION_HEADER] = upstreamSessionId;
+  }
+  if (upstreamConfig) {
+    Object.assign(headers, buildCredentialHeaders(upstreamConfig));
   }
   const init: RequestInit = {
     method,
@@ -260,6 +269,7 @@ async function handleRequest(
       ok: true,
       upstreams: Object.keys(state.upstreams),
       breakers: state.breaker.snapshot(),
+      upstreamCallCounts: Object.fromEntries(state.upstreamCallCounts.entries()),
       sessions: Object.fromEntries(
         Array.from(state.sessions.entries()).map(([prefix, store]) => [prefix, store.size()]),
       ),
@@ -284,6 +294,7 @@ async function handleRequest(
     return slashIdx === -1 ? trimmed : trimmed.slice(0, slashIdx);
   })();
   const store = getOrCreateStore(state, prefix);
+  state.upstreamCallCounts.set(prefix, (state.upstreamCallCounts.get(prefix) ?? 0) + 1);
 
   const body = await readBody(req);
   const bodyText = body.toString("utf8");
@@ -325,7 +336,7 @@ async function handleRequest(
 async function serveMatched(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  matched: { upstreamUrl: string; remainder: string },
+  matched: { upstreamUrl: string; remainder: string; config: UpstreamConfig },
   store: SessionStore,
   body: Buffer,
   bodyText: string,
@@ -336,7 +347,7 @@ async function serveMatched(
   if (clientSessionId) {
     const record = store.get(clientSessionId);
     if (record) {
-      const result = await forward(matched.upstreamUrl, req.method ?? "POST", req.headers, body, record.upstreamSessionId, timeoutMs);
+      const result = await forward(matched.upstreamUrl, req.method ?? "POST", req.headers, body, record.upstreamSessionId, timeoutMs, matched.config);
       const text = result.body.toString("utf8");
       if (isSessionNotFoundResponse(result.status, text)) {
         // Replay path: re-issue the cached initialize, get a fresh upstream id, retry.
@@ -352,11 +363,12 @@ async function serveMatched(
           record.initializePayload,
           null,
           timeoutMs,
+          matched.config,
         );
         const replayBody = replayInitResult.body.toString("utf8");
         const newUpstreamId = extractUpstreamSessionId(replayInitResult.headers, replayBody);
         if (isSuccess(replayInitResult.status) && newUpstreamId) {
-          await notifyUpstreamInitialized(matched.upstreamUrl, req.headers, newUpstreamId, timeoutMs);
+          await notifyUpstreamInitialized(matched.upstreamUrl, req.headers, newUpstreamId, timeoutMs, matched.config);
           store.rotateUpstream(clientSessionId, newUpstreamId);
           // Retry the original call with the new upstream id.
           const retryResult = await forward(
@@ -366,6 +378,7 @@ async function serveMatched(
             body,
             newUpstreamId,
             timeoutMs,
+            matched.config,
           );
           writeResponse(res, retryResult, clientSessionId);
           return retryResult.status;
@@ -385,7 +398,7 @@ async function serveMatched(
 
   if (!isInitializeRequest && requestMethod !== "GET" && requestMethod !== "HEAD" && body.length > 0) {
     const initializePayload = buildDefaultInitializePayload();
-    const upstreamSessionId = await createUpstreamSession(matched.upstreamUrl, req.headers, initializePayload, timeoutMs);
+    const upstreamSessionId = await createUpstreamSession(matched.upstreamUrl, req.headers, initializePayload, timeoutMs, matched.config);
     if (upstreamSessionId) {
       const record = store.createInitialized({
         clientSessionId,
@@ -399,6 +412,7 @@ async function serveMatched(
         body,
         upstreamSessionId,
         timeoutMs,
+        matched.config,
       );
       writeResponse(res, retryResult, record.clientSessionId);
       return retryResult.status;
@@ -409,12 +423,12 @@ async function serveMatched(
   // response sessionId for future replay, and immediately complete the
   // upstream lifecycle so clients that omit notifications/initialized do
   // not leave the upstream session stuck in its initialization phase.
-  const result = await forward(matched.upstreamUrl, requestMethod, req.headers, body, null, timeoutMs);
+  const result = await forward(matched.upstreamUrl, requestMethod, req.headers, body, null, timeoutMs, matched.config);
   const text = result.body.toString("utf8");
   if (isInitializeRequest && isSuccess(result.status)) {
     const upstreamId = extractUpstreamSessionId(result.headers, text);
     if (upstreamId) {
-      await notifyUpstreamInitialized(matched.upstreamUrl, req.headers, upstreamId, timeoutMs);
+      await notifyUpstreamInitialized(matched.upstreamUrl, req.headers, upstreamId, timeoutMs, matched.config);
       const record = store.createInitialized({
         clientSessionId,
         upstreamSessionId: upstreamId,
@@ -458,13 +472,14 @@ function safeOnError(e: unknown, req: http.IncomingMessage, res: http.ServerResp
   }
 }
 
-function main(): void {
-  const upstreams = loadUpstreams();
+async function main(): Promise<void> {
+  const upstreams = await loadUpstreams();
   const config = loadGatewayConfig();
   const port = Number.parseInt(process.env.PORT ?? "8080", 10);
   const state: GatewayState = {
     upstreams,
     sessions: new Map(),
+    upstreamCallCounts: new Map(),
     breaker: new CircuitBreaker(config.breaker),
     upstreamTimeoutMs: config.upstreamTimeoutMs,
   };
@@ -490,5 +505,9 @@ function main(): void {
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  main();
+  main().catch((e) => {
+    // eslint-disable-next-line no-console
+    console.error(`[mcp-gateway] startup failed: ${(e as Error).message}`);
+    process.exit(1);
+  });
 }

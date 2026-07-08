@@ -23,6 +23,43 @@ session keepalive, observability, and rate limiting.
 
 ## Configuration
 
+Production routing is identity-synced from penstock state:
+
+```sh
+PAPERCLIP_MCP_UPSTREAMS_STATE_URL=https://api.penstock.run/v1/mcp/upstreams \
+PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN="$STATE_TOKEN" \
+PAPERCLIP_MCP_UPSTREAMS_CACHE_FILE=/cache/upstreams-lkg.json \
+  node dist/server.js
+```
+
+The state response may be either a legacy `prefix -> URL` object or metadata:
+
+```json
+{
+  "upstreams": [
+    {
+      "prefix": "ccrotate",
+      "name": "ccrotate",
+      "url": "http://ccrotate-mcp-server.paperclip.svc.cluster.local:8000/mcp",
+      "authorizationEnv": "CCROTATE_SERVE_TOKEN"
+    }
+  ]
+}
+```
+
+Credential values are not valid state. State may only name the gateway env var
+that holds a credential. Kubernetes Secrets remain the source of truth for those
+values; the gateway injects them as upstream headers at request time. A state
+payload containing fields such as `token`, `secret`, `password`, or `apiKey` is
+rejected before serving.
+
+When state fetch succeeds, the raw metadata is persisted to
+`PAPERCLIP_MCP_UPSTREAMS_CACHE_FILE`. If the control plane is unavailable on a
+later startup, the gateway serves the last-known-good cache instead of losing all
+routes.
+
+For local development and bootstrap, routing table JSON is still supported:
+
 Routing table is JSON: `prefix → upstream URL`. Either pass inline:
 
 ```sh
@@ -41,7 +78,7 @@ Prefix must match `/^[a-zA-Z0-9_-]+$/`. URL must start with
 
 ## Endpoints
 
-- `GET /healthz` — health check; returns `{ ok: true, upstreams, sessions }`.
+- `GET /healthz` — health check; returns `{ ok: true, upstreams, upstreamCallCounts, breakers, sessions }`.
 - `GET /` — same as `/healthz`.
 - `<METHOD> /<prefix>/mcp` — proxied to the upstream URL for `<prefix>`.
 - `<METHOD> /<prefix>/mcp/<rest...>` — preserves the trailing path.

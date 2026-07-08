@@ -153,8 +153,9 @@ async function createGateway(
   opts?: { timeoutMs?: number; failureThreshold?: number },
 ): Promise<{ url: string; state: GatewayState }> {
   const state: GatewayState = {
-    upstreams: { "k8s-admin": upstreamUrl },
+    upstreams: { "k8s-admin": { url: upstreamUrl, credentialHeaders: [] } },
     sessions: new Map(),
+    upstreamCallCounts: new Map(),
     upstreamTimeoutMs: opts?.timeoutMs ?? 60_000,
     breaker: new CircuitBreaker({
       failureThreshold: opts?.failureThreshold ?? 5,
@@ -196,6 +197,54 @@ describe("buildInitializeReplayHeaders", () => {
 });
 
 describe("mcp gateway lifecycle compatibility", () => {
+  it("injects configured credential headers from env into upstream calls", async () => {
+    const upstream = await createStrictMcpUpstream();
+    const state: GatewayState = {
+      upstreams: {
+        "k8s-admin": {
+          url: upstream.url,
+          credentialHeaders: [{ header: "authorization", env: "TEST_MCP_TOKEN", scheme: "Bearer" }],
+        },
+      },
+      sessions: new Map(),
+      upstreamCallCounts: new Map(),
+      upstreamTimeoutMs: 60_000,
+      breaker: new CircuitBreaker({ failureThreshold: 5, openCooldownMs: 30_000, halfOpenMaxProbes: 1 }),
+    };
+    const previous = process.env.TEST_MCP_TOKEN;
+    process.env.TEST_MCP_TOKEN = "secret-token";
+    const server = createGatewayServer(state);
+    const url = (await listen(server)).replace(/\/mcp$/, "/k8s-admin/mcp");
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(upstream.receivedHeaders[0]?.authorization).toBe("Bearer secret-token");
+    } finally {
+      if (previous === undefined) delete process.env.TEST_MCP_TOKEN;
+      else process.env.TEST_MCP_TOKEN = previous;
+    }
+  });
+
+  it("reports per-upstream call counts on health", async () => {
+    const upstream = await createStrictMcpUpstream();
+    const gateway = await createGateway(upstream.url);
+
+    await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    const health = await fetch(gateway.url.replace(/\/k8s-admin\/mcp$/, "/healthz"));
+    const body = await health.json() as { upstreamCallCounts: Record<string, number> };
+
+    expect(body.upstreamCallCounts["k8s-admin"]).toBe(1);
+  });
+
   it("sends initialized after a client initialize request", async () => {
     const upstream = await createStrictMcpUpstream();
     const gateway = await createGateway(upstream.url);
