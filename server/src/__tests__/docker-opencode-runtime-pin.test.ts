@@ -91,7 +91,15 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerDesignerWorkflow).toContain("file: packages/services/designer/Dockerfile");
     expect(dockerDesignerWorkflow).toContain("run: npm ci --no-audit --no-fund");
     expect(designerDockerfile).toContain("COPY package.json package-lock.json ./");
+    expect(designerDockerfile).toContain("COPY scripts/postinstall.mjs ./scripts/");
     expect(designerDockerfile).toContain("RUN npm ci --include=dev");
+    expect(designerDockerfile.indexOf("COPY scripts/postinstall.mjs ./scripts/")).toBeLessThan(
+      designerDockerfile.indexOf("RUN npm ci --include=dev"),
+    );
+    expect(designerDockerfile).toContain("npm i -g ./blockcast-designer-*.tgz");
+    expect(designerDockerfile).toContain('$(npm root -g)/@blockcast/designer/skills/designer-loop/.');
+    expect(designerDockerfile).not.toContain("pro-vi-designer-*.tgz");
+    expect(designerDockerfile).not.toContain("@pro-vi/designer/skills");
     expect(JSON.parse(designerPackageLock)).toMatchObject({
       name: "@blockcast/designer",
       lockfileVersion: 3,
