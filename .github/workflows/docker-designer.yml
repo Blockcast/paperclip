@@ -62,7 +62,7 @@ jobs:
 
   build-and-push:
     needs: test
-    runs-on: self-hosted
+    runs-on: arc-dind
     timeout-minutes: 30
     concurrency:
       group: docker-designer-${{ github.ref }}

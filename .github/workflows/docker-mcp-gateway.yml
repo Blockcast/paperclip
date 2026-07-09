@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   build-and-push:
-    runs-on: self-hosted
+    runs-on: arc-dind
     timeout-minutes: 15
     concurrency:
       group: docker-mcp-gateway-${{ github.ref }}

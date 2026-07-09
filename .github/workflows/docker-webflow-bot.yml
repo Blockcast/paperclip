@@ -83,7 +83,7 @@ jobs:
     # Mirrors docker-figma-bot.yml.
     if: github.event_name != 'pull_request'
     needs: test
-    runs-on: self-hosted
+    runs-on: arc-dind
     timeout-minutes: 30
     concurrency:
       group: docker-webflow-bot-${{ github.ref }}
