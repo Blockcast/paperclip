@@ -297,8 +297,10 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       description:
         "Assign an issue to an agent and mark it in_progress. The agent is resolved server-side: the issue's current " +
         "assignee, else the company's sole agent (fails with a 422 error if the issue is unassigned and the company " +
-        "has zero or multiple agents — assign one explicitly first via update_issue). 409 = another agent already " +
-        "owns/checked out this issue; do NOT retry, pick different work instead.",
+        "has zero or multiple agents — assign one explicitly first via update_issue). 409 = checkout conflict — " +
+        "commonly another agent already owns it, but can also fire on a status mismatch (e.g. the issue is " +
+        "blocked/in_review) even when you already own it. Re-fetch the issue (get_issue) to see the actual " +
+        "status/assignee before deciding whether to wait, retry, or pick different work.",
       schema: z.object({ issue_id: z.string().describe("Issue UUID or identifier to check out.") }),
       execute: async (args) => {
         const issueId = String(args.issue_id);
@@ -526,9 +528,10 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       name: "invoke_agent_heartbeat",
       description:
         "Manually trigger an immediate heartbeat (work cycle) for an agent. Use to wake an idle agent, force it to " +
-        "pick up assignments, or run it off-schedule. If the agent's concurrency limit is already in use, this queues " +
-        "behind the in-flight run rather than starting a second one; calling it again for the same pending wake " +
-        "returns the SAME queued request (idempotent) instead of creating a new one or reprioritizing it.",
+        "pick up assignments, or run it off-schedule. This tool only takes agent_id — it does NOT carry issue/payload " +
+        "context, so repeat calls do NOT dedupe to the same request: each call inserts a new queued heartbeat run " +
+        "(the concurrency limit only throttles how many queued runs start at once, it doesn't stop new ones from " +
+        "queuing). Avoid calling this in a retry/poll loop for the same agent.",
       schema: z.object({ agent_id: z.string().describe("UUID of the agent to trigger.") }),
       execute: async (args) =>
         runTool(() => client.requestJson("POST", `/agents/${encodeURIComponent(String(args.agent_id))}/heartbeat/invoke`)),

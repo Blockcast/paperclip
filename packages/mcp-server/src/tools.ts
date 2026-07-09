@@ -536,7 +536,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipCheckoutIssue",
-      "Check out an issue: assigns it (if unassigned) and moves it to in_progress. You MUST do this before doing any work on an issue. Returns 409 if another agent already owns it — do NOT retry, pick different work instead.",
+      "Check out an issue: assigns it (if unassigned) and moves it to in_progress. You MUST do this before doing any work on an issue. Returns 409 on a checkout conflict — commonly another agent already owns it, but can also fire on a status mismatch (e.g. the issue is blocked/in_review) even when you already own it. Re-fetch the issue to see the actual status/assignee before deciding whether to wait, retry, or pick different work.",
       checkoutIssueToolSchema,
       async ({ issueId, agentId, expectedStatuses }) =>
         client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/checkout`, {
