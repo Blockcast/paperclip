@@ -20,7 +20,7 @@
  * @module server/services/metrics
  */
 
-import { Counter, Registry, collectDefaultMetrics } from "prom-client";
+import { Counter, Gauge, Registry, collectDefaultMetrics } from "prom-client";
 import { resetDepBlockedMetrics, snapshotDepBlockedMetrics } from "./dep-blocked-metrics.js";
 import {
   resetBlockerResolvedWakeMetrics,
@@ -65,6 +65,7 @@ export const ISOLATED_RUN_STARTED_METRIC = "paperclip_k8s_isolated_run_started_t
  * Unknown/empty values collapse to "unknown" to guard against future changes.
  */
 export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_deferred_total";
+export const AGENT_NO_USAGE_STREAK_METRIC = "paperclip_agent_zero_token_completed_run_streak";
 
 /**
  * Bounded `reason` allow-list (mirrors the adapter-lane reasons defined in
@@ -157,6 +158,7 @@ let concurrentRunBlocked: Counter<"agent_id" | "reason" | "isolation_mode"> | nu
 let isolatedRunStarted: Counter<"agent_id" | "isolation_mode"> | null = null;
 let heartbeatRunFailed: Counter<"adapter" | "error_code" | "invocation_source"> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
+let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -164,8 +166,16 @@ function ensureRegistry(): {
   isolatedStartedCounter: Counter<"agent_id" | "isolation_mode">;
   failedCounter: Counter<"adapter" | "error_code" | "invocation_source">;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
+  zeroTokenCompletedRunStreakGauge: Gauge<"agent_id" | "adapter">;
 } {
-  if (!registry || !concurrentRunBlocked || !isolatedRunStarted || !heartbeatRunFailed || !ccrotateCapacityDeferred) {
+  if (
+    !registry
+    || !concurrentRunBlocked
+    || !isolatedRunStarted
+    || !heartbeatRunFailed
+    || !ccrotateCapacityDeferred
+    || !agentZeroTokenCompletedRunStreak
+  ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
       name: CONCURRENT_RUN_BLOCKED_METRIC,
@@ -206,6 +216,14 @@ function ensureRegistry(): {
       labelNames: ["adapter", "provider"],
       registers: [registry],
     });
+    agentZeroTokenCompletedRunStreak = new Gauge({
+      name: AGENT_NO_USAGE_STREAK_METRIC,
+      help:
+        "Current count of consecutive terminal heartbeat runs for an agent that completed with zero token usage. "
+        + "Alerts at >=3 catch poisoned-session or pre-model throttle loops within minutes (BLO-10891).",
+      labelNames: ["agent_id", "adapter"],
+      registers: [registry],
+    });
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -216,6 +234,7 @@ function ensureRegistry(): {
     isolatedStartedCounter: isolatedRunStarted,
     failedCounter: heartbeatRunFailed,
     capacityDeferredCounter: ccrotateCapacityDeferred,
+    zeroTokenCompletedRunStreakGauge: agentZeroTokenCompletedRunStreak,
   };
 }
 
@@ -330,6 +349,29 @@ export function recordCcrotateCapacityDeferred(
   return labels;
 }
 
+export interface RecordAgentZeroTokenCompletedRunStreakInput {
+  /** Agent id is bounded against the active company roster before emission. */
+  agentId: string | null | undefined;
+  /** Agent adapter type (e.g. "claude_k8s", "opencode_k8s"). */
+  adapter: string | null | undefined;
+  /** Consecutive terminal zero-token runs, computed from persisted heartbeat_runs. */
+  streak: number;
+  /** Active company agent roster used to bound the `agent_id` label. */
+  knownAgentIds: ReadonlySet<string>;
+}
+
+export function recordAgentZeroTokenCompletedRunStreak(
+  input: RecordAgentZeroTokenCompletedRunStreakInput,
+): { agent_id: string; adapter: string; streak: number } {
+  const labels = {
+    agent_id: normalizeAgentId(input.agentId, input.knownAgentIds),
+    adapter: typeof input.adapter === "string" && input.adapter.length > 0 ? input.adapter : "unknown",
+  };
+  const streak = Number.isFinite(input.streak) ? Math.max(0, Math.floor(input.streak)) : 0;
+  ensureRegistry().zeroTokenCompletedRunStreakGauge.set(labels, streak);
+  return { ...labels, streak };
+}
+
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
   const reg = getMetricsRegistry();
   const depBlockedSnapshot = snapshotDepBlockedMetrics();
@@ -360,6 +402,8 @@ export function __resetMetricsForTest(): void {
   concurrentRunBlocked = null;
   isolatedRunStarted = null;
   heartbeatRunFailed = null;
+  ccrotateCapacityDeferred = null;
+  agentZeroTokenCompletedRunStreak = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
 }

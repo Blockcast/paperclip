@@ -75,6 +75,7 @@ import {
   readAgentJobRunStatusByName,
   type AgentJobRunStatus,
 } from "./k8s-job-liveness.js";
+import { getActiveAgentIds } from "./agent-roster.js";
 import { processPendingImageBumpForAgent } from "./agent-image-bump.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
 import type {
@@ -162,7 +163,12 @@ import {
   resolveExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
-import { normalizeIsolationMode, recordCcrotateCapacityDeferred, recordHeartbeatRunFailed } from "./metrics.js";
+import {
+  normalizeIsolationMode,
+  recordAgentZeroTokenCompletedRunStreak,
+  recordCcrotateCapacityDeferred,
+  recordHeartbeatRunFailed,
+} from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
 import { mapAdapterToCcrotateTarget } from "./ccrotate-target.js";
@@ -2991,6 +2997,59 @@ function isFailedOrZeroTokenResume(run: {
   }
   const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
   return inputTokens === 0 && outputTokens === 0;
+}
+
+function heartbeatRunTokenUsage(usageJson: Record<string, unknown> | null): UsageTotals {
+  const parsed = parseObject(usageJson);
+  return {
+    inputTokens: Math.max(
+      0,
+      Math.floor(asNumber(parsed.rawInputTokens, asNumber(parsed.inputTokens, asNumber(parsed.input_tokens, 0)))),
+    ),
+    cachedInputTokens: Math.max(
+      0,
+      Math.floor(asNumber(parsed.rawCachedInputTokens, asNumber(parsed.cachedInputTokens, asNumber(parsed.cached_input_tokens, 0)))),
+    ),
+    outputTokens: Math.max(
+      0,
+      Math.floor(asNumber(parsed.rawOutputTokens, asNumber(parsed.outputTokens, asNumber(parsed.output_tokens, 0)))),
+    ),
+  };
+}
+
+function isZeroTokenCompletedRun(run: {
+  status: string | null;
+  usageJson: Record<string, unknown> | null;
+}): boolean {
+  if (!isHeartbeatRunTerminalStatus(run.status)) return false;
+  const usage = heartbeatRunTokenUsage(run.usageJson);
+  return usage.inputTokens === 0 && usage.cachedInputTokens === 0 && usage.outputTokens === 0;
+}
+
+export function countConsecutiveZeroTokenCompletedRuns(
+  runsNewestFirst: Array<{ status: string | null; usageJson: Record<string, unknown> | null }>,
+): number {
+  let count = 0;
+  for (const run of runsNewestFirst) {
+    if (!isZeroTokenCompletedRun(run)) break;
+    count += 1;
+  }
+  return count;
+}
+
+export async function listRecentTerminalRunsForZeroTokenStreak(db: Db, agentId: string) {
+  return db
+    .select({ status: heartbeatRuns.status, usageJson: heartbeatRuns.usageJson })
+    .from(heartbeatRuns)
+    .where(and(
+      eq(heartbeatRuns.agentId, agentId),
+      // Keep this filter aligned with countConsecutiveZeroTokenCompletedRuns:
+      // non-terminal rows would reset the streak, but this production query
+      // intentionally measures only completed terminal attempts.
+      inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+    ))
+    .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.createdAt))
+    .limit(10);
 }
 
 // Counts the run-list prefix (runs ordered newest-first) that are each a
@@ -11427,6 +11486,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  async function recordZeroTokenCompletedRunStreak(agent: typeof agents.$inferSelect) {
+    try {
+      const recentRuns = await listRecentTerminalRunsForZeroTokenStreak(db, agent.id);
+      const knownAgentIds = await getActiveAgentIds(db, agent.companyId);
+
+      recordAgentZeroTokenCompletedRunStreak({
+        agentId: agent.id,
+        adapter: agent.adapterType,
+        streak: countConsecutiveZeroTokenCompletedRuns(recentRuns),
+        knownAgentIds,
+      });
+    } catch (err) {
+      logger.warn({ err, agentId: agent.id }, "failed to record zero-token completed-run streak metric");
+    }
+  }
+
   async function startNextQueuedRunForAgent(agentId: string) {
     if (options.skipQueuedRunDispatch) return [];
     // Failure-B fence (BLO-9089): the api tier never claims/executes runs — it
@@ -13596,6 +13671,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             invocationSource: readNonEmptyString(contextSnapshotObj.wakeReason) ?? readNonEmptyString(contextSnapshotObj.retryReason),
           });
         }
+        await recordZeroTokenCompletedRunStreak(agent);
         if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
           const policy = parseMaxTurnContinuationPolicy(agent);
           if (policy.enabled && policy.maxAttempts > 0) {
@@ -13812,6 +13888,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }, {
           legacySessionId: runtimeForAdapter.sessionId,
         });
+        await recordZeroTokenCompletedRunStreak(agent);
 
         if (taskKey && !isolationSessionMismatch && (runtimeSessionParams || previousSessionDisplayId || taskSession)) {
           // Persist the current run's scoped params so failure-path resumes keep the isolation key.
