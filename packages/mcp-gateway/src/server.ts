@@ -555,8 +555,8 @@ async function handleRequest(
       clientSessionId,
       state.upstreamTimeoutMs,
       matchedCustodyConfig(state.credentialCustody, prefix),
+      () => persistSessions(state),
     );
-    await persistSessions(state);
     if (status >= 500) state.breaker.recordFailure(prefix);
     else state.breaker.recordSuccess(prefix);
   } catch (e) {
@@ -667,7 +667,6 @@ async function handleAggregateRequest(
         console.warn(`[mcp-gateway] aggregate tools/list skipped prefix=${prefix}: ${(e as Error).message}`);
       }
     }
-    await persistSessions(state);
     res.statusCode = 200;
     res.setHeader("content-type", "application/json");
     res.setHeader(MCP_SESSION_HEADER, clientSessionId);
@@ -720,7 +719,6 @@ async function handleAggregateRequest(
     }
     if (result.status >= 500) state.breaker.recordFailure(prefix);
     else state.breaker.recordSuccess(prefix);
-    await persistSessions(state);
     writeResponse(res, result, clientSessionId);
     return;
   }
@@ -747,6 +745,7 @@ async function serveMatched(
   clientSessionId: string | undefined,
   timeoutMs: number,
   custodyConfig?: MatchedCustodyConfig,
+  persistSessionStore?: () => Promise<void>,
 ): Promise<number> {
   // Fast path: known client session, look up upstream id, forward.
   if (clientSessionId) {
@@ -803,6 +802,7 @@ async function serveMatched(
             matched.config,
           );
           writeResponse(res, retryResult, clientSessionId);
+          await persistSessionStore?.();
           return retryResult.status;
         }
         // Re-init failed; pass the original 404 through so the client can recover its own way.
@@ -849,6 +849,7 @@ async function serveMatched(
         matched.config,
       );
       writeResponse(res, retryResult, record.clientSessionId);
+      await persistSessionStore?.();
       if (retryResult.status === 401 && custodyConfig) {
         invalidateCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, record.clientSessionId);
       }
@@ -872,6 +873,7 @@ async function serveMatched(
         initializePayload: body,
       });
       writeResponse(res, result, record.clientSessionId);
+      await persistSessionStore?.();
       if (result.status === 401 && custodyConfig) {
         invalidateCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, record.clientSessionId);
       }

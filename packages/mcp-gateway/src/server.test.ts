@@ -1138,6 +1138,28 @@ describe("mcp gateway lifecycle compatibility", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  it("does not rewrite persisted aggregate sessions on steady-state tools/list", async () => {
+    const upstream = await createStrictMcpUpstream([{ name: "ping", description: "Ping" }]);
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-gateway-sessions-"));
+    const sessionPersistenceFile = path.join(tmpDir, "sessions.json");
+    const gateway = await createAggregateGateway({ alpha: { url: upstream.url, credentialHeaders: [] } }, { sessionPersistenceFile });
+
+    const initialize = await postJson(gateway.url, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
+    const before = fs.statSync(sessionPersistenceFile).mtimeMs;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    const list = await postJson(
+      gateway.url,
+      { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+      jsonHeaders(clientSessionId ?? undefined),
+    );
+
+    expect(list.status).toBe(200);
+    expect(fs.statSync(sessionPersistenceFile).mtimeMs).toBe(before);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
   it("replays stale upstream sessions on aggregate tool calls", async () => {
     const upstream = await createStrictMcpUpstream([{ name: "ping", description: "Ping" }]);
     const gateway = await createAggregateGateway({ alpha: { url: upstream.url, credentialHeaders: [] } });
