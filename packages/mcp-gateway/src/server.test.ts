@@ -170,6 +170,26 @@ async function createHangingUpstream(): Promise<{ url: string }> {
   return { url };
 }
 
+async function createRejectingInitializeUpstream(): Promise<{ url: string; methods: string[] }> {
+  const methods: string[] = [];
+  const server = http.createServer(async (req, res) => {
+    const bodyText = await readBody(req);
+    const message = JSON.parse(bodyText) as { method?: string };
+    methods.push(message.method ?? "");
+    if (message.method === "initialize") {
+      res.statusCode = 500;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ error: "init failed" }));
+      return;
+    }
+    res.statusCode = 200;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { ok: true } }));
+  });
+  const url = await listen(server);
+  return { url, methods };
+}
+
 async function createGateway(
   upstreamUrl: string,
   opts?: { timeoutMs?: number; failureThreshold?: number },
@@ -485,6 +505,56 @@ describe("mcp gateway lifecycle compatibility", () => {
     const listBody = await list.json() as { result: { tools: Array<{ name: string }> } };
     expect(list.status).toBe(200);
     expect(listBody.result.tools.map((tool) => tool.name)).toEqual(["alpha__search"]);
+  });
+
+  it("opens the aggregate breaker when tools/list session bootstrap is rejected", async () => {
+    const alpha = await createStrictMcpUpstream([{ name: "search", description: "Alpha search" }]);
+    const rejecting = await createRejectingInitializeUpstream();
+    const gateway = await createAggregateGateway(
+      {
+        alpha: { url: alpha.url, credentialHeaders: [] },
+        bad: { url: rejecting.url, credentialHeaders: [] },
+      },
+      { failureThreshold: 1 },
+    );
+
+    const initialize = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
+    expect(initialize.status).toBe(200);
+
+    const list = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(clientSessionId ?? undefined),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+    });
+    const listBody = await list.json() as { result: { tools: Array<{ name: string }> } };
+
+    expect(list.status).toBe(200);
+    expect(listBody.result.tools.map((tool) => tool.name)).toEqual(["alpha__search"]);
+    expect(gateway.state.breaker.stateOf("bad")).toBe("open");
+    expect(rejecting.methods).toEqual(["initialize"]);
+  });
+
+  it("opens the aggregate breaker when tools/call session bootstrap is rejected", async () => {
+    const rejecting = await createRejectingInitializeUpstream();
+    const gateway = await createAggregateGateway(
+      { bad: { url: rejecting.url, credentialHeaders: [] } },
+      { failureThreshold: 1 },
+    );
+
+    const call = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders("client-session"),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "bad__ping", arguments: {} } }),
+    });
+
+    expect(call.status).toBe(502);
+    expect(gateway.state.breaker.stateOf("bad")).toBe("open");
+    expect(rejecting.methods).toEqual(["initialize"]);
   });
 
   it("reloads persisted aggregate sessions after gateway restart", async () => {
