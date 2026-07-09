@@ -328,7 +328,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     // (user) actors, so a user bearer can release without an agentId.
     {
       name: "release_issue",
-      description: "Release an issue: unassign it and revert it to its previous state. Inverse of checkout_issue.",
+      description: "Release an issue: unassign it and reset it to todo (regardless of what status it was in before checkout — this is not a revert). Inverse of checkout_issue.",
       schema: z.object({ issue_id: z.string().describe("Issue UUID or identifier to release.") }),
       execute: async (args) =>
         runTool(() => client.requestJson("POST", `/issues/${encodeURIComponent(String(args.issue_id))}/release`)),

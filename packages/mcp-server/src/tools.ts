@@ -548,7 +548,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipReleaseIssue",
-      "Release your checkout on an issue: unassigns it and reverts it to its previous status. Inverse of paperclipCheckoutIssue — use when you can no longer make progress and want another agent to be able to pick it up.",
+      "Release your checkout on an issue: unassigns it and resets it to todo (regardless of what status it was in before checkout — this is not a revert). Inverse of paperclipCheckoutIssue — use when you can no longer make progress and want another agent to be able to pick it up.",
       z.object({ issueId: issueIdSchema }),
       async ({ issueId }) => client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/release`, { body: {} }),
     ),
