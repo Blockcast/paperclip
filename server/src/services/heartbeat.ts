@@ -15911,6 +15911,195 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return newRun;
   }
 
+  // BLO-14395: webhook-triggered wakes (github-webhook.ts) call `wakeup()`
+  // synchronously and always 200 the delivery back to GitHub regardless of the
+  // outcome (so their own event-handling side effects, e.g. issue back-links,
+  // aren't lost to a webhook redelivery loop) -- which means GitHub will never
+  // redeliver on our behalf. Before this wrapper, any exception out of
+  // enqueueWakeup for a webhook wake (a PR-opened reviewer wake, an @ally
+  // re-review nudge, ...) was caught in the route handler, logged, and dropped
+  // forever with no retry and no durable record: a transient DB hiccup at
+  // exactly the wrong moment silently ate a review request.
+  //
+  // Business-rule outcomes (company inactive, budget blocked, agent not
+  // invokable, heartbeat disabled, ...) are HttpErrors that enqueueWakeup
+  // already durably records via writeSkippedRequest before throwing, and
+  // retrying them wastes attempts on a result that cannot change within this
+  // call -- only genuinely unexpected failures are retried here. After
+  // exhausting the bounded in-process retry, persist a durable
+  // `dispatch_failed` row so reconcileFailedWakeDispatches (driven by the
+  // periodic heartbeat scheduler tick, see index.ts) can keep retrying with
+  // backoff long after this request has returned.
+  const WAKE_DISPATCH_RETRY_BACKOFF_MS = [300, 1200];
+
+  async function wakeupWithDispatchRetry(agentId: string, opts: WakeupOptions = {}) {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= WAKE_DISPATCH_RETRY_BACKOFF_MS.length; attempt++) {
+      try {
+        return await enqueueWakeup(agentId, opts);
+      } catch (err) {
+        lastError = err;
+        if (err instanceof HttpError) throw err;
+        if (attempt < WAKE_DISPATCH_RETRY_BACKOFF_MS.length) {
+          await new Promise((resolve) => setTimeout(resolve, WAKE_DISPATCH_RETRY_BACKOFF_MS[attempt]));
+        }
+      }
+    }
+
+    try {
+      const agent = await getAgent(agentId);
+      if (agent) {
+        // Round-trip through JSON so a non-serializable opts/payload (a
+        // circular reference, a BigInt, ...) can never take down the durable
+        // safety-net write itself -- that would silently re-create exactly
+        // the "lost forever, no record" failure mode this wrapper exists to
+        // close. Falls back to a placeholder marker for the piece that
+        // doesn't survive the round-trip rather than dropping the whole row.
+        const safeJson = (value: unknown, fallback: unknown) => {
+          try {
+            return JSON.parse(JSON.stringify(value ?? null));
+          } catch {
+            return fallback;
+          }
+        };
+        await db.insert(agentWakeupRequests).values({
+          companyId: agent.companyId,
+          agentId,
+          source: opts.source ?? "on_demand",
+          triggerDetail: opts.triggerDetail ?? null,
+          reason: opts.reason ?? null,
+          payload: {
+            ...safeJson(opts.payload, { unserializable: true }),
+            dispatchRetry: {
+              attempts: 0,
+              nextAttemptAt: new Date(Date.now() + DISPATCH_RETRY_RECONCILE_BACKOFF_MS[0]).toISOString(),
+              originalOpts: safeJson(opts, { unserializable: true, reason: opts.reason ?? null, source: opts.source ?? null }),
+              lastError: lastError instanceof Error ? lastError.message : String(lastError),
+            },
+          },
+          status: "dispatch_failed",
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+        });
+      } else {
+        logger.error(
+          { agentId, err: lastError },
+          "wake dispatch retry exhausted and agent could not be resolved; dropping without a durable record",
+        );
+      }
+    } catch (persistErr) {
+      logger.error(
+        { err: persistErr, agentId, originalErr: lastError },
+        "failed to persist durable wake-dispatch-failed record after retry exhaustion",
+      );
+    }
+
+    throw lastError;
+  }
+
+  const DISPATCH_RETRY_RECONCILE_BACKOFF_MS = [60_000, 120_000, 240_000, 480_000, 900_000];
+  const DISPATCH_RETRY_MAX_ATTEMPTS = DISPATCH_RETRY_RECONCILE_BACKOFF_MS.length;
+
+  /**
+   * Periodic reconciliation for `dispatch_failed` rows written by
+   * wakeupWithDispatchRetry. Retries the original wakeup() call with
+   * increasing backoff; a business-rule HttpError (the underlying condition
+   * resolved into a durable skip, e.g. the agent got paused) marks the row
+   * `dispatch_superseded` rather than retrying a result that can't change.
+   * After DISPATCH_RETRY_MAX_ATTEMPTS the row is marked
+   * `dispatch_failed_exhausted` -- terminal and queryable/alertable, never
+   * silently dropped again.
+   */
+  async function reconcileFailedWakeDispatches(now: Date = new Date()) {
+    const dueRows = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.status, "dispatch_failed"))
+      .orderBy(asc(agentWakeupRequests.requestedAt))
+      .limit(50);
+
+    let recovered = 0;
+    let superseded = 0;
+    let exhausted = 0;
+    let stillFailing = 0;
+
+    for (const row of dueRows) {
+      const payload = parseObject(row.payload);
+      const retryState = parseObject(payload.dispatchRetry) as {
+        attempts?: number;
+        nextAttemptAt?: string;
+        originalOpts?: WakeupOptions;
+      };
+      const nextAttemptAt = retryState.nextAttemptAt ? new Date(retryState.nextAttemptAt) : null;
+      if (nextAttemptAt && nextAttemptAt.getTime() > now.getTime()) continue;
+
+      const attempts = (retryState.attempts ?? 0) + 1;
+      const originalOpts = retryState.originalOpts ?? {};
+
+      try {
+        await enqueueWakeup(row.agentId, originalOpts);
+        await db
+          .update(agentWakeupRequests)
+          .set({ status: "dispatch_recovered", finishedAt: now, updatedAt: now })
+          .where(eq(agentWakeupRequests.id, row.id));
+        recovered += 1;
+      } catch (err) {
+        if (err instanceof HttpError) {
+          await db
+            .update(agentWakeupRequests)
+            .set({
+              status: "dispatch_superseded",
+              error: err.message,
+              finishedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(agentWakeupRequests.id, row.id));
+          superseded += 1;
+          continue;
+        }
+
+        if (attempts >= DISPATCH_RETRY_MAX_ATTEMPTS) {
+          await db
+            .update(agentWakeupRequests)
+            .set({
+              status: "dispatch_failed_exhausted",
+              error: err instanceof Error ? err.message : String(err),
+              finishedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(agentWakeupRequests.id, row.id));
+          exhausted += 1;
+          logger.error(
+            { agentId: row.agentId, wakeupRequestId: row.id, attempts, err },
+            "wake dispatch retry exhausted after max attempts; giving up (BLO-14395)",
+          );
+          continue;
+        }
+
+        const backoffMs = DISPATCH_RETRY_RECONCILE_BACKOFF_MS[attempts] ?? DISPATCH_RETRY_RECONCILE_BACKOFF_MS.at(-1)!;
+        await db
+          .update(agentWakeupRequests)
+          .set({
+            payload: {
+              ...payload,
+              dispatchRetry: {
+                ...retryState,
+                attempts,
+                nextAttemptAt: new Date(now.getTime() + backoffMs).toISOString(),
+                lastError: err instanceof Error ? err.message : String(err),
+              },
+            },
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, row.id));
+        stillFailing += 1;
+      }
+    }
+
+    return { recovered, superseded, exhausted, stillFailing };
+  }
+
   async function listProjectScopedRunIds(companyId: string, projectId: string) {
     const runIssueId = sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`;
     const effectiveProjectId = sql<string | null>`coalesce(${heartbeatRuns.contextSnapshot} ->> 'projectId', ${issues.projectId}::text)`;
@@ -16475,7 +16664,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         requestedByActorId: actor?.actorId ?? null,
       }),
 
-    wakeup: enqueueWakeup,
+    wakeup: wakeupWithDispatchRetry,
+    reconcileFailedWakeDispatches,
     triggerIssueMonitor,
 
     reportRunActivity: clearDetachedRunWarning,
