@@ -294,13 +294,19 @@ async function createFigmaGateway(
 
 async function createAggregateGateway(
   upstreams: GatewayState["upstreams"],
-  opts?: { sessionPersistenceFile?: string; timeoutMs?: number; failureThreshold?: number },
+  opts?: {
+    sessionPersistenceFile?: string;
+    timeoutMs?: number;
+    failureThreshold?: number;
+    credentialCustody?: CredentialCustodyState;
+  },
 ): Promise<{ url: string; state: GatewayState }> {
   const state: GatewayState = {
     upstreams,
     sessions: new Map(),
     upstreamCallCounts: new Map(),
     upstreamTimeoutMs: opts?.timeoutMs ?? 60_000,
+    credentialCustody: opts?.credentialCustody,
     sessionPersistenceFile: opts?.sessionPersistenceFile,
     breaker: new CircuitBreaker({
       failureThreshold: opts?.failureThreshold ?? 5,
@@ -868,6 +874,169 @@ describe("mcp gateway lifecycle compatibility", () => {
     expect(call.status).toBe(200);
     expect(beta.receivedToolCalls).toEqual(["search"]);
     expect(alpha.receivedToolCalls).toEqual([]);
+  });
+
+  it("applies credential custody to aggregate upstream sessions", async () => {
+    const upstream = await createStrictMcpUpstream([{ name: "inspect", description: "Inspect" }]);
+    const custody = await createCustodyService({ failRepeatedLeaseForSession: true });
+    const gateway = await createAggregateGateway(
+      { figma: { url: upstream.url, credentialHeaders: [] } },
+      {
+        credentialCustody: {
+          configs: {
+            figma: {
+              prefix: "figma",
+              app: "figma",
+              leaseUrl: `${custody.url}/leases`,
+              credentialBaseUrl: `${custody.url}/credentials`,
+              controlPlaneTimeoutMs: 60_000,
+              leaseMode: "exclusive",
+              leaseTtlMs: 60_000,
+              upstreamAuthorizationScheme: "Bearer",
+            },
+          },
+          tokenCache: new Map(),
+          maxTokenCacheEntries: DEFAULT_CREDENTIAL_CUSTODY_TOKEN_CACHE_MAX_ENTRIES,
+        },
+      },
+    );
+
+    const callerHeaders = {
+      ...jsonHeaders(),
+      authorization: "Bearer caller-auth",
+      cookie: "session=caller-cookie",
+      "x-api-key": "caller-api-key",
+      "proxy-authorization": "Basic caller-proxy",
+      "x-penstock-tenant": "tenant-a",
+    };
+    const initialize = await postJson(
+      gateway.url,
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+      callerHeaders,
+    );
+    const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
+    expect(initialize.status).toBe(200);
+    expect(clientSessionId).toBeTruthy();
+
+    const aggregateHeaders = { ...callerHeaders, [MCP_SESSION_HEADER]: clientSessionId ?? "" };
+    const list = await postJson(
+      gateway.url,
+      { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+      aggregateHeaders,
+    );
+    const call = await postJson(
+      gateway.url,
+      { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "figma__inspect", arguments: {} } },
+      aggregateHeaders,
+    );
+
+    expect(list.status).toBe(200);
+    expect(call.status).toBe(200);
+    expect(custody.leaseRequests.map((request) => request.authorization)).toEqual(["Bearer caller-auth"]);
+    expect(custody.credentialRequests).toHaveLength(1);
+    expect(new Set(custody.leaseRequests.map((request) => request.mcpSessionId))).toEqual(
+      new Set([clientSessionId]),
+    );
+    expect(upstream.receivedHeaders.map((headers) => headers.authorization)).toEqual([
+      "Bearer figma-upstream-auth",
+      "Bearer figma-upstream-auth",
+      "Bearer figma-upstream-auth",
+      "Bearer figma-upstream-auth",
+    ]);
+    expect(upstream.receivedHeaders.map((headers) => headers.authorization)).not.toContain("Bearer caller-auth");
+    for (const headers of upstream.receivedHeaders) {
+      expect(headers.cookie).toBeUndefined();
+      expect(headers["x-api-key"]).toBeUndefined();
+      expect(headers["proxy-authorization"]).toBeUndefined();
+      expect(headers["x-penstock-tenant"]).toBeUndefined();
+    }
+  });
+
+  it("invalidates aggregate custody tokens after upstream 401 responses", async () => {
+    let nextSession = 1;
+    const sessions = new Set<string>();
+    const receivedHeaders: http.IncomingHttpHeaders[] = [];
+    const server = http.createServer(async (req, res) => {
+      receivedHeaders.push(req.headers);
+      const message = JSON.parse(await readBody(req)) as { id?: number; method?: string };
+      if (message.method === "initialize") {
+        const sessionId = `upstream-${nextSession++}`;
+        sessions.add(sessionId);
+        res.statusCode = 200;
+        res.setHeader(MCP_SESSION_HEADER, sessionId);
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id ?? 0, result: { protocolVersion: "2024-11-05" } }));
+        return;
+      }
+      const sessionId = req.headers[MCP_SESSION_HEADER];
+      if (typeof sessionId !== "string" || !sessions.has(sessionId)) {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ error: "Session not found" }));
+        return;
+      }
+      if (message.method === "notifications/initialized") {
+        res.statusCode = 202;
+        res.end();
+        return;
+      }
+      if (req.headers.authorization === "Bearer stale-upstream-auth") {
+        res.statusCode = 401;
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ error: "stale token" }));
+        return;
+      }
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id ?? 1, result: { tools: [] } }));
+    });
+    const upstreamUrl = await listen(server);
+    let issuedCredentials = 0;
+    const custody = await createCustodyService({
+      credentialValueForRequest: () => issuedCredentials++ === 0 ? "stale-upstream-auth" : "fresh-upstream-auth",
+    });
+    const gateway = await createAggregateGateway(
+      { figma: { url: upstreamUrl, credentialHeaders: [] } },
+      {
+        credentialCustody: {
+          configs: {
+            figma: {
+              prefix: "figma",
+              app: "figma",
+              leaseUrl: `${custody.url}/leases`,
+              credentialBaseUrl: `${custody.url}/credentials`,
+              controlPlaneTimeoutMs: 60_000,
+              leaseMode: "exclusive",
+              leaseTtlMs: 60_000,
+              upstreamAuthorizationScheme: "Bearer",
+            },
+          },
+          tokenCache: new Map(),
+          maxTokenCacheEntries: DEFAULT_CREDENTIAL_CUSTODY_TOKEN_CACHE_MAX_ENTRIES,
+        },
+      },
+    );
+
+    const initialize = await postJson(
+      gateway.url,
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+      { ...jsonHeaders(), authorization: "Bearer caller-auth" },
+    );
+    const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
+    expect(clientSessionId).toBeTruthy();
+    const headers = { ...jsonHeaders(clientSessionId ?? undefined), authorization: "Bearer caller-auth" };
+
+    const staleList = await postJson(gateway.url, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, headers);
+    const freshList = await postJson(gateway.url, { jsonrpc: "2.0", id: 3, method: "tools/list", params: {} }, headers);
+
+    expect(staleList.status).toBe(200);
+    expect(freshList.status).toBe(200);
+    expect(custody.leaseRequests).toHaveLength(2);
+    expect(receivedHeaders.map((headers) => headers.authorization)).toEqual([
+      "Bearer stale-upstream-auth",
+      "Bearer stale-upstream-auth",
+      "Bearer stale-upstream-auth",
+      "Bearer fresh-upstream-auth",
+    ]);
   });
 
   it("keeps aggregate initialize available when one upstream is unhealthy", async () => {
