@@ -160,7 +160,7 @@ async function createStrictMcpUpstream(tools: Array<Record<string, unknown>> = [
  * upstream auth-proxy does for some requests — and what the global `fetch`
  * client cannot send (undici forbids a caller-set transfer-encoding header).
  */
-function postChunked(url: string, body: string, headers: Record<string, string>): Promise<{ status: number; body: string }> {
+function postChunked(url: string, body: string, headers: Record<string, string>): Promise<{ status: number; headers: Headers; body: string }> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const req = http.request(
@@ -174,7 +174,14 @@ function postChunked(url: string, body: string, headers: Record<string, string>)
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (c) => chunks.push(c as Buffer));
-        res.on("end", () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
+        res.on("end", () => {
+          const responseHeaders = new Headers();
+          for (const [name, value] of Object.entries(res.headers)) {
+            if (Array.isArray(value)) responseHeaders.set(name, value.join(", "));
+            else if (value !== undefined) responseHeaders.set(name, value);
+          }
+          resolve({ status: res.statusCode ?? 0, headers: responseHeaders, body: Buffer.concat(chunks).toString("utf8") });
+        });
       },
     );
     req.on("error", reject);
@@ -188,38 +195,12 @@ function postJson(
   body: Record<string, unknown>,
   headers: Record<string, string> = jsonHeaders(),
 ): Promise<{ status: number; headers: Headers; json: () => Promise<unknown> }> {
-  return new Promise((resolve, reject) => {
-    const parsed = new URL(url);
-    const payload = JSON.stringify(body);
-    const req = http.request(
-      {
-        hostname: parsed.hostname,
-        port: parsed.port,
-        path: `${parsed.pathname}${parsed.search}`,
-        method: "POST",
-        headers: { ...headers, "content-length": Buffer.byteLength(payload).toString() },
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (c) => chunks.push(c as Buffer));
-        res.on("end", () => {
-          const responseHeaders = new Headers();
-          for (const [name, value] of Object.entries(res.headers)) {
-            if (Array.isArray(value)) responseHeaders.set(name, value.join(", "));
-            else if (value !== undefined) responseHeaders.set(name, value);
-          }
-          const responseBody = Buffer.concat(chunks).toString("utf8");
-          resolve({
-            status: res.statusCode ?? 0,
-            headers: responseHeaders,
-            json: async () => JSON.parse(responseBody),
-          });
-        });
-      },
-    );
-    req.on("error", reject);
-    req.end(payload);
-  });
+  const payload = JSON.stringify(body);
+  return postChunked(url, payload, { ...headers, "content-length": Buffer.byteLength(payload).toString() }).then((res) => ({
+    status: res.status,
+    headers: res.headers,
+    json: async () => JSON.parse(res.body),
+  }));
 }
 
 async function createHangingUpstream(): Promise<{ url: string }> {
