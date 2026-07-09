@@ -7,6 +7,9 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../
 const dockerfile = readFileSync(path.join(repoRoot, "Dockerfile"), "utf8");
 const dockerWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/docker.yml"), "utf8");
 const dockerAgentWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/docker-agent.yml"), "utf8");
+const dockerDesignerWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/docker-designer.yml"), "utf8");
+const designerDockerfile = readFileSync(path.join(repoRoot, "packages/services/designer/Dockerfile"), "utf8");
+const designerPackageLock = readFileSync(path.join(repoRoot, "packages/services/designer/package-lock.json"), "utf8");
 
 describe("production Dockerfile k8s adapter runtime pins", () => {
   it("pins opencode-ai and asserts the installed version", () => {
@@ -81,5 +84,22 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
 
   it("keeps the agent image build timeout above full toolchain rebuild duration", () => {
     expect(dockerAgentWorkflow).toContain("timeout-minutes: 90");
+  });
+
+  it("keeps the designer Docker build context aligned with npm ci inputs", () => {
+    expect(dockerDesignerWorkflow).toContain("context: packages/services/designer");
+    expect(dockerDesignerWorkflow).toContain("file: packages/services/designer/Dockerfile");
+    expect(dockerDesignerWorkflow).toContain("run: npm ci --no-audit --no-fund");
+    expect(designerDockerfile).toContain("COPY package.json package-lock.json ./");
+    expect(designerDockerfile).toContain("RUN npm ci --include=dev");
+    expect(JSON.parse(designerPackageLock)).toMatchObject({
+      name: "@blockcast/designer",
+      lockfileVersion: 3,
+      packages: {
+        "": {
+          name: "@blockcast/designer",
+        },
+      },
+    });
   });
 });
