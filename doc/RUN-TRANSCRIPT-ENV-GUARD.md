@@ -4,7 +4,7 @@ Paperclip applies a default-on defense-in-depth control for agent runtime enviro
 
 ## Issue Context
 
-This guard addresses Paperclip issue `PEN-1305`: repeated agent heartbeat transcripts persisted secret-bearing runtime environment variables after agents ran unrestricted environment-inspection commands. The control is intentionally shared by the server heartbeat/run-log path so it applies uniformly across current and future agent adapters.
+This guard addresses Paperclip issue `PEN-1305` and the follow-up incident `PEN-1561`: agent heartbeat transcripts persisted secret-bearing runtime environment variables after agents ran unrestricted environment-inspection commands. The control is intentionally shared by the server heartbeat/run-log path so it applies uniformly across current and future agent adapters.
 
 ## Command Policy
 
