@@ -8,6 +8,10 @@ const dockerfile = readFileSync(path.join(repoRoot, "Dockerfile"), "utf8");
 const dockerWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/docker.yml"), "utf8");
 const dockerAgentWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/docker-agent.yml"), "utf8");
 const dockerDesignerWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/docker-designer.yml"), "utf8");
+const agentRuntimeImagesWorkflow = readFileSync(
+  path.join(repoRoot, ".github/workflows/agent-runtime-images.yml"),
+  "utf8",
+);
 const designerDockerfile = readFileSync(path.join(repoRoot, "packages/services/designer/Dockerfile"), "utf8");
 const designerPackageLock = readFileSync(path.join(repoRoot, "packages/services/designer/package-lock.json"), "utf8");
 
@@ -84,6 +88,12 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
 
   it("keeps the agent image build timeout above full toolchain rebuild duration", () => {
     expect(dockerAgentWorkflow).toContain("timeout-minutes: 90");
+  });
+
+  it("publishes agent runtime images to a GHCR owner this repo token can write", () => {
+    expect(agentRuntimeImagesWorkflow).toContain("REGISTRY: ${{ vars.AGENT_RUNTIME_REGISTRY || 'ghcr.io/blockcast' }}");
+    expect(agentRuntimeImagesWorkflow).toContain("password: ${{ secrets.GITHUB_TOKEN }}");
+    expect(agentRuntimeImagesWorkflow).not.toContain("REGISTRY: ghcr.io/paperclipai");
   });
 
   it("keeps the designer Docker build context aligned with npm ci inputs", () => {
