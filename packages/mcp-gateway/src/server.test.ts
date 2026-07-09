@@ -15,6 +15,7 @@ interface StrictMcpUpstream {
   receivedHeaders: http.IncomingHttpHeaders[];
   receivedToolCalls: string[];
   clearSessions: () => void;
+  rejectNextInitialize: () => void;
   close: () => Promise<void>;
 }
 
@@ -53,6 +54,7 @@ async function listen(server: http.Server): Promise<string> {
 
 async function createStrictMcpUpstream(tools: Array<Record<string, unknown>> = [{ name: "ping", description: "Ping" }]): Promise<StrictMcpUpstream> {
   let nextSession = 1;
+  let rejectNextInitialize = false;
   const sessions = new Map<string, { initialized: boolean }>();
   const methods: string[] = [];
   const receivedHeaders: http.IncomingHttpHeaders[] = [];
@@ -65,6 +67,13 @@ async function createStrictMcpUpstream(tools: Array<Record<string, unknown>> = [
     methods.push(method);
 
     if (method === "initialize") {
+      if (rejectNextInitialize) {
+        rejectNextInitialize = false;
+        res.statusCode = 500;
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ error: "init failed" }));
+        return;
+      }
       const sessionId = `upstream-${nextSession++}`;
       sessions.set(sessionId, { initialized: false });
       res.statusCode = 200;
@@ -125,6 +134,9 @@ async function createStrictMcpUpstream(tools: Array<Record<string, unknown>> = [
     receivedHeaders,
     receivedToolCalls,
     clearSessions: () => sessions.clear(),
+    rejectNextInitialize: () => {
+      rejectNextInitialize = true;
+    },
     close: () => closeServer(server),
   };
 }
@@ -609,6 +621,38 @@ describe("mcp gateway lifecycle compatibility", () => {
       "initialize",
       "notifications/initialized",
       "tools/call",
+    ]);
+  });
+
+  it("opens the aggregate breaker when stale-session recovery bootstrap is rejected", async () => {
+    const upstream = await createStrictMcpUpstream([{ name: "ping", description: "Ping" }]);
+    const gateway = await createAggregateGateway(
+      { alpha: { url: upstream.url, credentialHeaders: [] } },
+      { failureThreshold: 1 },
+    );
+
+    const initialize = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
+    upstream.clearSessions();
+    upstream.rejectNextInitialize();
+
+    const call = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(clientSessionId ?? undefined),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "alpha__ping", arguments: {} } }),
+    });
+
+    expect(call.status).toBe(502);
+    expect(gateway.state.breaker.stateOf("alpha")).toBe("open");
+    expect(upstream.methods).toEqual([
+      "initialize",
+      "notifications/initialized",
+      "tools/call",
+      "initialize",
     ]);
   });
 });

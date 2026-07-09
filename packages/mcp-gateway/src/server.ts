@@ -318,7 +318,7 @@ async function forwardAggregateWithSessionRecovery(
   if (!isSessionNotFoundResponse(result.status, text)) return result;
 
   const newUpstreamSessionId = await createUpstreamSession(upstream.url, inboundHeaders, initializePayload, state.upstreamTimeoutMs, upstream);
-  if (!newUpstreamSessionId) return result;
+  if (!newUpstreamSessionId) return null;
   store.rotateUpstream(clientSessionId, newUpstreamSessionId);
   result = await forward(upstream.url, method, inboundHeaders, body, newUpstreamSessionId, state.upstreamTimeoutMs, upstream);
   await persistSessions(state);
