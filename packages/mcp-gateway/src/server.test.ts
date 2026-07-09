@@ -256,7 +256,7 @@ async function createFigmaGateway(
     maxTokenCacheEntries: opts?.maxTokenCacheEntries ?? DEFAULT_CREDENTIAL_CUSTODY_TOKEN_CACHE_MAX_ENTRIES,
   };
   const state: GatewayState = {
-    upstreams: { figma: upstreamUrl },
+    upstreams: { figma: { url: upstreamUrl, credentialHeaders: [] } },
     sessions: new Map(),
     upstreamTimeoutMs: 60_000,
     upstreamCallCounts: new Map(),

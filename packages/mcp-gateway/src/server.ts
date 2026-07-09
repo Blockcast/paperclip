@@ -309,7 +309,7 @@ async function ensureUpstreamSession(
   const store = getOrCreateStore(state, prefix);
   const existing = store.get(clientSessionId);
   if (existing) return existing.upstreamSessionId;
-  const upstreamSessionId = await createUpstreamSession(upstream.url, inboundHeaders, initializePayload, state.upstreamTimeoutMs, upstream);
+  const upstreamSessionId = await createUpstreamSession(upstream.url, inboundHeaders, initializePayload, state.upstreamTimeoutMs, undefined, upstream);
   if (!upstreamSessionId) return null;
   store.createInitialized({ clientSessionId, upstreamSessionId, initializePayload });
   await persistSessions(state);
@@ -329,14 +329,14 @@ async function forwardAggregateWithSessionRecovery(
   const upstreamSessionId = await ensureUpstreamSession(state, prefix, upstream, inboundHeaders, clientSessionId, initializePayload);
   if (!upstreamSessionId) return null;
   const store = getOrCreateStore(state, prefix);
-  let result = await forward(upstream.url, method, inboundHeaders, body, upstreamSessionId, state.upstreamTimeoutMs, upstream);
+  let result = await forward(upstream.url, method, inboundHeaders, body, upstreamSessionId, state.upstreamTimeoutMs, undefined, upstream);
   const text = result.body.toString("utf8");
   if (!isSessionNotFoundResponse(result.status, text)) return result;
 
-  const newUpstreamSessionId = await createUpstreamSession(upstream.url, inboundHeaders, initializePayload, state.upstreamTimeoutMs, upstream);
+  const newUpstreamSessionId = await createUpstreamSession(upstream.url, inboundHeaders, initializePayload, state.upstreamTimeoutMs, undefined, upstream);
   if (!newUpstreamSessionId) return null;
   store.rotateUpstream(clientSessionId, newUpstreamSessionId);
-  result = await forward(upstream.url, method, inboundHeaders, body, newUpstreamSessionId, state.upstreamTimeoutMs, upstream);
+  result = await forward(upstream.url, method, inboundHeaders, body, newUpstreamSessionId, state.upstreamTimeoutMs, undefined, upstream);
   await persistSessions(state);
   return result;
 }
