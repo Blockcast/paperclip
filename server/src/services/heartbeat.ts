@@ -3037,6 +3037,21 @@ export function countConsecutiveZeroTokenCompletedRuns(
   return count;
 }
 
+export async function listRecentTerminalRunsForZeroTokenStreak(db: Db, agentId: string) {
+  return db
+    .select({ status: heartbeatRuns.status, usageJson: heartbeatRuns.usageJson })
+    .from(heartbeatRuns)
+    .where(and(
+      eq(heartbeatRuns.agentId, agentId),
+      // Keep this filter aligned with countConsecutiveZeroTokenCompletedRuns:
+      // non-terminal rows would reset the streak, but this production query
+      // intentionally measures only completed terminal attempts.
+      inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+    ))
+    .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.createdAt))
+    .limit(10);
+}
+
 // Counts the run-list prefix (runs ordered newest-first) that are each a
 // failed-or-zero-token resume, stopping at the first run that isn't. A
 // productive run anywhere in the streak resets the count to 0.
@@ -11473,18 +11488,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function recordZeroTokenCompletedRunStreak(agent: typeof agents.$inferSelect) {
     try {
-      const recentRuns = await db
-        .select({ status: heartbeatRuns.status, usageJson: heartbeatRuns.usageJson })
-        .from(heartbeatRuns)
-        .where(and(
-          eq(heartbeatRuns.agentId, agent.id),
-          // Keep this filter aligned with countConsecutiveZeroTokenCompletedRuns:
-          // non-terminal rows would reset the streak, but this production query
-          // intentionally measures only completed terminal attempts.
-          inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
-        ))
-        .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.createdAt))
-        .limit(10);
+      const recentRuns = await listRecentTerminalRunsForZeroTokenStreak(db, agent.id);
       const knownAgentIds = await getActiveAgentIds(db, agent.companyId);
 
       recordAgentZeroTokenCompletedRunStreak({

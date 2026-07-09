@@ -1,12 +1,33 @@
 // Tests for cap/rate-limit-exhausted detection and the corresponding
 // outcome override that routes the run into the bounded transient retry.
-import { describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import {
+  agents,
+  companies,
+  createDb,
+  heartbeatRuns,
+} from "@paperclipai/db";
 import {
   countConsecutiveZeroTokenCompletedRuns,
   isRateLimitExhausted,
   isRetryableK8sCcrotateThrottleResult,
   k8sCcrotateRetryDelayMs,
+  listRecentTerminalRunsForZeroTokenStreak,
 } from "../services/heartbeat.js";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping embedded Postgres zero-token streak query tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+  );
+}
 
 describe("isRateLimitExhausted", () => {
   it("returns false for null", () => {
@@ -404,6 +425,116 @@ describe("countConsecutiveZeroTokenCompletedRuns", () => {
       { status: "running", usageJson: null },
       { status: "failed", usageJson: null },
     ])).toBe(0);
+  });
+});
+
+describeEmbeddedPostgres("listRecentTerminalRunsForZeroTokenStreak", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-zero-token-streak-");
+    db = createDb(tempDb.connectionString);
+  });
+
+  afterEach(async () => {
+    await db.delete(heartbeatRuns);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("returns the newest terminal runs for the target agent", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const otherAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values([
+      {
+        id: agentId,
+        companyId,
+        name: "Target",
+        role: "engineer",
+        status: "idle",
+        adapterType: "opencode_k8s",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherAgentId,
+        companyId,
+        name: "Other",
+        role: "engineer",
+        status: "idle",
+        adapterType: "opencode_k8s",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: randomUUID(),
+        companyId,
+        agentId,
+        status: "failed",
+        usageJson: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+        finishedAt: new Date("2026-07-08T12:02:00Z"),
+        createdAt: new Date("2026-07-08T12:00:00Z"),
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        agentId,
+        status: "succeeded",
+        usageJson: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 0 },
+        finishedAt: new Date("2026-07-08T12:01:00Z"),
+        createdAt: new Date("2026-07-08T12:00:00Z"),
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        agentId,
+        status: "running",
+        usageJson: null,
+        createdAt: new Date("2026-07-08T12:03:00Z"),
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        agentId: otherAgentId,
+        status: "failed",
+        usageJson: null,
+        finishedAt: new Date("2026-07-08T12:04:00Z"),
+        createdAt: new Date("2026-07-08T12:00:00Z"),
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      status: "cancelled",
+      usageJson: null,
+      finishedAt: new Date("2026-07-08T12:02:00Z"),
+      createdAt: new Date("2026-07-08T12:01:00Z"),
+    });
+
+    const rows = await listRecentTerminalRunsForZeroTokenStreak(db, agentId);
+
+    expect(rows.map((row) => row.status)).toEqual(["cancelled", "failed", "succeeded"]);
   });
 });
 
