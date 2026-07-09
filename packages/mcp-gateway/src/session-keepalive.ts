@@ -41,6 +41,13 @@ export interface SessionStoreOpts {
   maxSessions?: number;
 }
 
+export interface PersistedSessionRecord {
+  clientSessionId: string;
+  upstreamSessionId: string;
+  initializePayloadBase64: string | null;
+  lastSeenMs: number;
+}
+
 /**
  * In-memory map of clientSessionId → SessionRecord, scoped per upstream.
  * Two clients hitting different upstreams (e.g. /figma + /linear) will
@@ -107,6 +114,31 @@ export class SessionStore {
   /** Visible-for-testing iterator. */
   *all(): IterableIterator<SessionRecord> {
     for (const r of this.records.values()) yield r;
+  }
+
+  snapshot(): PersistedSessionRecord[] {
+    return Array.from(this.records.values()).map((record) => ({
+      clientSessionId: record.clientSessionId,
+      upstreamSessionId: record.upstreamSessionId,
+      initializePayloadBase64: record.initializePayload?.toString("base64") ?? null,
+      lastSeenMs: record.lastSeenMs,
+    }));
+  }
+
+  restore(records: PersistedSessionRecord[]): void {
+    for (const record of records) {
+      if (!record.clientSessionId || !record.upstreamSessionId || !Number.isFinite(record.lastSeenMs)) continue;
+      const existing = this.records.get(record.clientSessionId);
+      if (existing && existing.lastSeenMs > record.lastSeenMs) continue;
+      const restored: SessionRecord = {
+        clientSessionId: record.clientSessionId,
+        upstreamSessionId: record.upstreamSessionId,
+        initializePayload: record.initializePayloadBase64 ? Buffer.from(record.initializePayloadBase64, "base64") : null,
+        lastSeenMs: record.lastSeenMs,
+      };
+      if (!this.isExpired(restored)) this.records.set(restored.clientSessionId, restored);
+    }
+    this.evictIfNeeded();
   }
 
   private isExpired(record: SessionRecord): boolean {

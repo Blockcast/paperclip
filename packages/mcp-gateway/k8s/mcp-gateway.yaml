@@ -13,8 +13,12 @@
 # the state payload names env vars, and this deployment sources those values
 # from Kubernetes Secrets.
 #
-# If penstock state is temporarily unavailable, the gateway falls back to the
-# last-known-good cache on /cache instead of dropping all MCP routes.
+# Agents should target one logical MCP endpoint at /mcp. The gateway aggregates
+# upstream tools, rewrites names as <prefix>__<tool>, and routes tools/call back
+# to the owning upstream. If penstock state is temporarily unavailable, the
+# gateway falls back to the last-known-good cache on /cache instead of dropping
+# all MCP routes. Session mappings are persisted on the shared /cache PVC so
+# replica restarts do not drop client sessions.
 # =============================================================================
 
 apiVersion: apps/v1
@@ -27,7 +31,7 @@ metadata:
     app.kubernetes.io/managed-by: paperclip-mcp
     app.kubernetes.io/part-of: paperclip
 spec:
-  replicas: 1
+  replicas: 2
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -81,6 +85,8 @@ spec:
               value: /cache/upstreams-lkg.json
             - name: PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS
               value: CCROTATE_SERVE_TOKEN
+            - name: PAPERCLIP_MCP_SESSION_STORE_FILE
+              value: /cache/sessions.json
             - name: PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -123,7 +129,28 @@ spec:
               drop: ["ALL"]
       volumes:
         - name: cache
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: paperclip-mcp-gateway-cache
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: paperclip-mcp-gateway-cache
+  namespace: paperclip
+  labels:
+    app.kubernetes.io/name: paperclip-mcp-gateway
+    app.kubernetes.io/managed-by: paperclip-mcp
+    app.kubernetes.io/part-of: paperclip
+spec:
+  # Target cluster default is cephfs today, but pin it so a future default
+  # StorageClass drift to RWO (for example local-path/RBD) cannot strand the
+  # HA rollout with an unbound RWX claim.
+  storageClassName: cephfs
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 1Gi
 ---
 apiVersion: v1
 kind: Service

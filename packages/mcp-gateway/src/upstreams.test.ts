@@ -65,6 +65,7 @@ describe("parseUpstreamMap", () => {
 
   it("rejects bad prefixes", () => {
     expect(() => parseUpstreamMap('{"foo/bar":"http://x"}', "test")).toThrow(/match/);
+    expect(() => parseUpstreamMap('{"my__service":"http://x"}', "test")).toThrow(/must not contain "__"/);
     expect(() => parseUpstreamMap('{"":"http://x"}', "test")).toThrow();
   });
 
