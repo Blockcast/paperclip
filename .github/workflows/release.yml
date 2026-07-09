@@ -78,11 +78,29 @@ jobs:
       matrix:
         include:
           - group: general-server
-            group_label: server
+            group_label: server 1/4
+            shard_index: 0
+            shard_count: 4
+          - group: general-server
+            group_label: server 2/4
+            shard_index: 1
+            shard_count: 4
+          - group: general-server
+            group_label: server 3/4
+            shard_index: 2
+            shard_count: 4
+          - group: general-server
+            group_label: server 4/4
+            shard_index: 3
+            shard_count: 4
           - group: general-workspaces-a
             group_label: workspaces-a
+            shard_index: ''
+            shard_count: ''
           - group: general-workspaces-b
             group_label: workspaces-b
+            shard_index: ''
+            shard_count: ''
 
     steps:
       - name: Checkout repository
@@ -109,7 +127,12 @@ jobs:
         run: pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile
 
       - name: Run grouped general test suites
-        run: pnpm test:run:general -- --group '${{ matrix.group }}'
+        run: |
+          args=(--group '${{ matrix.group }}')
+          if [ -n '${{ matrix.shard_count }}' ]; then
+            args+=(--shard-index '${{ matrix.shard_index }}' --shard-count '${{ matrix.shard_count }}')
+          fi
+          pnpm test:run:general -- "${args[@]}"
 
   verify_canary_serialized_server:
     name: Canary serialized server suites (${{ matrix.shard_label }})
