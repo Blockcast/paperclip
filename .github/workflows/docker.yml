@@ -34,7 +34,7 @@ jobs:
     # prior push build already put in Harbor (the deploy job verifies it
     # exists before rolling).
     if: ${{ github.event_name == 'push' }}
-    runs-on: arc-deploy
+    runs-on: arc-dind
     timeout-minutes: 90
     concurrency:
       group: docker-${{ github.ref }}
@@ -142,7 +142,7 @@ jobs:
           # to it, and the cleanup:true above ensures each run's local
           # builder starts fresh so the corruption can't be re-introduced.
           cache-from: type=registry,ref=harbor.blockcast.net/paperclip/paperclip:buildcache-v6
-          cache-to: type=registry,ref=harbor.blockcast.net/paperclip/paperclip:buildcache-v6,mode=max,image-manifest=true,oci-mediatypes=true
+          cache-to: type=registry,ref=harbor.blockcast.net/paperclip/paperclip:buildcache-v6,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           secrets: |

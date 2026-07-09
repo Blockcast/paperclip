@@ -70,9 +70,11 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerfile).toContain("x-penstock-session: agent:<name>");
   });
 
-  it("routes Paperclip Docker deploy builds through the dedicated deploy runner pool", () => {
-    expect(dockerWorkflow.match(/runs-on: arc-deploy/g)).toHaveLength(2);
-    expect(dockerAgentWorkflow.match(/runs-on: arc-deploy/g)).toHaveLength(1);
+  it("routes Paperclip Docker image builds through the DIND runner pool", () => {
+    expect(dockerWorkflow.match(/runs-on: arc-dind/g)).toHaveLength(1);
+    expect(dockerWorkflow.match(/runs-on: arc-deploy/g)).toHaveLength(1);
+    expect(dockerAgentWorkflow.match(/runs-on: arc-dind/g)).toHaveLength(1);
+    expect(dockerAgentWorkflow).not.toContain("runs-on: arc-deploy");
     expect(dockerWorkflow).not.toContain("runs-on: self-hosted");
     expect(dockerAgentWorkflow).not.toContain("runs-on: self-hosted");
   });

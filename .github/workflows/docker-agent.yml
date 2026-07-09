@@ -23,7 +23,7 @@ permissions:
 jobs:
   build-and-push:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    runs-on: arc-deploy
+    runs-on: arc-dind
     # Full agent-image rebuilds invalidate the heavy apt/toolchain layers when
     # the base paperclip server image changes. Keep enough room for that path;
     # Buildx still fails fast on real command errors.
@@ -125,7 +125,7 @@ jobs:
           # trip the same Ceph RGW zero-byte truncation that the FROM
           # blob hit).
           cache-from: type=registry,ref=harbor.blockcast.net/paperclip-agent/paperclip-agent:buildcache-v6
-          cache-to: type=registry,ref=harbor.blockcast.net/paperclip-agent/paperclip-agent:buildcache-v6,mode=max,image-manifest=true,oci-mediatypes=true
+          cache-to: type=registry,ref=harbor.blockcast.net/paperclip-agent/paperclip-agent:buildcache-v6,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 

@@ -48,7 +48,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: self-hosted
+    runs-on: arc-dind
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -82,7 +82,7 @@ jobs:
     # on the master push event.
     if: github.event_name != 'pull_request'
     needs: test
-    runs-on: self-hosted
+    runs-on: arc-dind
     timeout-minutes: 30
     concurrency:
       group: docker-figma-bot-${{ github.ref }}
@@ -128,6 +128,6 @@ jobs:
           provenance: false
           sbom: false
           cache-from: type=registry,ref=harbor.blockcast.net/paperclip-figma-bot/figma-bot:buildcache-v1
-          cache-to: type=registry,ref=harbor.blockcast.net/paperclip-figma-bot/figma-bot:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true
+          cache-to: type=registry,ref=harbor.blockcast.net/paperclip-figma-bot/figma-bot:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
