@@ -49,16 +49,17 @@ RUN npm i -g agent-browser@latest
 # so pod-only patches ship before they're upstreamed.
 WORKDIR /opt/designer-src
 COPY package.json package-lock.json ./
+COPY scripts/postinstall.mjs ./scripts/
 RUN npm ci --include=dev
 COPY . .
 RUN npm run build && npm pack && \
-    npm i -g ./pro-vi-designer-*.tgz && \
+    npm i -g ./blockcast-designer-*.tgz && \
     rm -rf /opt/designer-src
 
 # Place the designer-loop skill in a system location; the entrypoint links
 # it into ~/.claude/skills/ at boot so per-agent HOME mounts pick it up.
 RUN mkdir -p /opt/claude-skills/designer-loop && \
-    cp -r /usr/lib/node_modules/@pro-vi/designer/skills/designer-loop/* /opt/claude-skills/designer-loop/
+    cp -r "$(npm root -g)/@blockcast/designer/skills/designer-loop/." /opt/claude-skills/designer-loop/
 
 # Bring the pod entrypoint + launcher script in.
 COPY scripts/designer-chrome-pod.sh /usr/local/bin/designer-chrome-pod
