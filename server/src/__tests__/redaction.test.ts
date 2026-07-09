@@ -89,6 +89,27 @@ describe("redaction", () => {
     expect(result).not.toContain(jwt);
   });
 
+  it("redacts secret env values from declare/export and nul-delimited dumps", () => {
+    const declareSecret = "fake-declare-secret-value";
+    const exportSecret = "fake-export-secret-value";
+    const procSecret = "fake-proc-secret-value";
+    const input = [
+      `declare -x PAPERCLIP_API_KEY="${declareSecret}"`,
+      `export PAPERCLIP_ACCESS_TOKEN='${exportSecret}'`,
+      `PATH=/usr/bin\0PAPERCLIP_PRIVATE_KEY=${procSecret}\0SAFE_ENV_NAME=visible`,
+    ].join("\n");
+
+    const result = redactSensitiveText(input);
+
+    expect(result).toContain(`declare -x PAPERCLIP_API_KEY="${REDACTED_EVENT_VALUE}"`);
+    expect(result).toContain(`export PAPERCLIP_ACCESS_TOKEN='${REDACTED_EVENT_VALUE}'`);
+    expect(result).toContain(`PAPERCLIP_PRIVATE_KEY=${REDACTED_EVENT_VALUE}`);
+    expect(result).not.toContain(declareSecret);
+    expect(result).not.toContain(exportSecret);
+    expect(result).not.toContain(procSecret);
+    expect(result).toContain("SAFE_ENV_NAME=visible");
+  });
+
   it("redacts inline secrets from command metadata without hiding safe command text", () => {
     const input = {
       command: "custom-acp --token ghp_example_secret env OPENAI_API_KEY=sk-live-example custom-acp",

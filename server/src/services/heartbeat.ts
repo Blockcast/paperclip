@@ -1953,6 +1953,14 @@ export function compactRunLogChunk(chunk: string, maxChars = MAX_PERSISTED_LOG_C
   return `${normalized.slice(0, headChars)}${marker}${normalized.slice(normalized.length - tailChars)}`;
 }
 
+export function sanitizeRunLogChunkForStorage(
+  chunk: string,
+  currentUserRedactionOptions: Parameters<typeof redactCurrentUserText>[1],
+  maxChars = MAX_PERSISTED_LOG_CHUNK_CHARS,
+) {
+  return compactRunLogChunk(redactCurrentUserText(chunk, currentUserRedactionOptions), maxChars);
+}
+
 const SYNTHETIC_KEEPALIVE_RUN_LOG_LINE_RE =
   /^\[paperclip\] keepalive\b.*\bjob\b.*\brunning \(\d+s since last output\)$/;
 
@@ -12927,9 +12935,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-        const sanitizedChunk = compactRunLogChunk(
-          redactCurrentUserText(chunk, currentUserRedactionOptions),
-        );
+        const sanitizedChunk = sanitizeRunLogChunkForStorage(chunk, currentUserRedactionOptions);
         const countsAsRunProgress = !isSyntheticNonProgressRunLogChunk(sanitizedChunk);
         if (countsAsRunProgress && stream === "stdout") {
           stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
