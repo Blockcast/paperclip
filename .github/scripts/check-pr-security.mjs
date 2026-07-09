@@ -326,6 +326,15 @@ export function startScriptWatchdog(timeoutMs = SCRIPT_WATCHDOG_MS, exit = proce
   return timer;
 }
 
+async function warnOnFailure(label, promise) {
+  try {
+    await promise;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`[security] ${label} failed; continuing per always-exit-0 contract: ${message}`);
+  }
+}
+
 async function main() {
   const watchdog = startScriptWatchdog();
 
@@ -375,12 +384,12 @@ async function main() {
   if (allFlags.length > 0) {
     console.error(`[security] ${allFlags.length} flag(s) detected — creating draft advisory and pending check run`);
     await Promise.all([
-      syncDraftAdvisory(ghFetch, GH_TOKEN, GH_REPO, prNumber, pr.title, allFlags),
-      postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, true),
+      warnOnFailure('draft advisory sync', syncDraftAdvisory(ghFetch, GH_TOKEN, GH_REPO, prNumber, pr.title, allFlags)),
+      warnOnFailure('security check-run update', postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, true)),
     ]);
   } else {
     console.log('[security] all clear');
-    await postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, false);
+    await warnOnFailure('security check-run update', postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, false));
   }
 
   // Always exit 0 — security flags are silent, never block the PR publicly
