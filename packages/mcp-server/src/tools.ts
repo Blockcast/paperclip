@@ -281,19 +281,19 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
   return [
     makeTool(
       "paperclipMe",
-      "Get the current authenticated Paperclip actor details",
+      "Get your own agent identity: id, companyId, role, chainOfCommand, and budget. Call this first in a heartbeat if identity isn't already in context.",
       z.object({}),
       async () => client.requestJson("GET", "/agents/me"),
     ),
     makeTool(
       "paperclipInboxLite",
-      "Get the current authenticated agent inbox-lite assignment list",
+      "Get your compact assignment list for prioritizing this heartbeat (in_progress, in_review, todo). Prefer this over paperclipListIssues(assigneeAgentId=me) for the normal heartbeat inbox check — it's the cheaper, purpose-built call.",
       z.object({}),
       async () => client.requestJson("GET", "/agents/me/inbox-lite"),
     ),
     makeTool(
       "paperclipListAgents",
-      "List agents in a company",
+      "List every agent in a company with their name, role, status (running/idle/paused/error), and reporting line.",
       z.object({ companyId: companyIdOptional }),
       async ({ companyId }) => {
         const resolved = await client.resolveCompany({ override: companyId });
@@ -302,7 +302,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipGetAgent",
-      "Get a single agent by id",
+      "Get one agent's full record by id: status, budget (monthly cap + spend), pause/error reason, and org-chain health.",
       z.object({ agentId: z.string().min(1), companyId: companyIdOptional }),
       async ({ agentId, companyId }) => {
         const resolved = await client.resolveCompany({ override: companyId });
@@ -314,7 +314,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipListIssues",
-      "List issues for a company with optional filters",
+      "List issues for a company with optional filters (status, projectId, assigneeAgentId, labelId, q, ...). Omitting a filter does not scope it — pass status explicitly if you only want open work; unfiltered can return the full company backlog.",
       listIssuesSchema,
       async (input) => listIssues(client, input),
     ),
@@ -536,7 +536,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipCheckoutIssue",
-      "Checkout an issue for an agent",
+      "Check out an issue: assigns it (if unassigned) and moves it to in_progress. You MUST do this before doing any work on an issue. Returns 409 on a checkout conflict — commonly another agent already owns it, but can also fire on a status mismatch (e.g. the issue is blocked/in_review) even when you already own it. Re-fetch the issue to see the actual status/assignee before deciding whether to wait, retry, or pick different work.",
       checkoutIssueToolSchema,
       async ({ issueId, agentId, expectedStatuses }) =>
         client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/checkout`, {
@@ -548,7 +548,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipReleaseIssue",
-      "Release an issue checkout",
+      "Release your checkout on an issue: unassigns it and resets it to todo (regardless of what status it was in before checkout — this is not a revert). Inverse of paperclipCheckoutIssue — use when you can no longer make progress and want another agent to be able to pick it up.",
       z.object({ issueId: issueIdSchema }),
       async ({ issueId }) => client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/release`, { body: {} }),
     ),
@@ -730,7 +730,15 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipTailHeartbeatRunLog",
-      "Fallback log tail for MCP clients without resource subscription support",
+      "Fallback raw NDJSON log tail for ONE heartbeat run, for MCP clients without resource " +
+        "subscription support. Prefer paperclipGetIssue/paperclipGetAgent for status first — " +
+        "cheap and structured; reach for this only to debug why a specific run did what it did. " +
+        "A runId is a snapshot of a single heartbeat cycle: once the agent has cycled to a newer " +
+        "run, tailing this runId further shows no new activity even though the agent may still be " +
+        "working — re-check the issue's current executionRunId before re-tailing. Each run's log " +
+        "starts with ~15-20KB of boilerplate (SessionStart hooks, tool/skill list); pass a nonzero " +
+        "offset to skip past it. Default limitBytes is 16384 (matches the resource-subscription " +
+        "chunk size) — for a low-context read, pass 2000-4000 explicitly instead.",
       tailHeartbeatRunLogSchema,
       async ({ runId, offset, limitBytes }) =>
         client.requestJson(
@@ -740,7 +748,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipApiRequest",
-      "Make a JSON request to an existing Paperclip /api endpoint for unsupported operations",
+      "Escape hatch: make a raw JSON request to any /api endpoint not covered by a named tool above. Prefer the named tools when one exists — they validate inputs and shape errors consistently; this one does neither.",
       apiRequestSchema,
       async ({ method, path, jsonBody }) => {
         if (!path.startsWith("/") || path.includes("..")) {

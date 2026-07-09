@@ -192,7 +192,9 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     {
       name: "get_issue",
       description:
-        "Get the full details of a single Paperclip issue by UUID or key (e.g. PEN-307). Resolves cross-company server-side.",
+        "Get the full details of a single Paperclip issue by UUID or key (e.g. PEN-307). The key's prefix (PEN, BLO, " +
+        "...) is resolved to its owning company server-side, so this works even for issues outside your default " +
+        "company context — no company_id needed.",
       schema: z.object({
         issue_id: z.string().describe('Issue UUID or human-readable key (e.g. "CY-42"). Pass through verbatim.'),
       }),
@@ -293,7 +295,12 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     {
       name: "checkout_issue",
       description:
-        "Assign an issue to an agent and mark it in_progress. The agent is resolved server-side: the issue's current assignee, else the company's sole agent. 409 = owned by another agent; do NOT retry.",
+        "Assign an issue to an agent and mark it in_progress. The agent is resolved server-side: the issue's current " +
+        "assignee, else the company's sole agent (fails with a 422 error if the issue is unassigned and the company " +
+        "has zero or multiple agents — assign one explicitly first via update_issue). 409 = checkout conflict — " +
+        "commonly another agent already owns it, but can also fire on a status mismatch (e.g. the issue is " +
+        "blocked/in_review) even when you already own it. Re-fetch the issue (get_issue) to see the actual " +
+        "status/assignee before deciding whether to wait, retry, or pick different work.",
       schema: z.object({ issue_id: z.string().describe("Issue UUID or identifier to check out.") }),
       execute: async (args) => {
         const issueId = String(args.issue_id);
@@ -321,7 +328,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     // (user) actors, so a user bearer can release without an agentId.
     {
       name: "release_issue",
-      description: "Release an issue: unassign it and revert it to its previous state. Inverse of checkout_issue.",
+      description: "Release an issue: unassign it and reset it to todo (regardless of what status it was in before checkout — this is not a revert). Inverse of checkout_issue.",
       schema: z.object({ issue_id: z.string().describe("Issue UUID or identifier to release.") }),
       execute: async (args) =>
         runTool(() => client.requestJson("POST", `/issues/${encodeURIComponent(String(args.issue_id))}/release`)),
@@ -335,7 +342,10 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     },
     {
       name: "comment_on_issue",
-      description: "Add a comment to an issue (supports Markdown).",
+      description:
+        "Add a comment to an issue (supports Markdown). For multiline bodies, pass literal newlines in the string " +
+        "(a normal multiline argument) rather than hand-escaping \\n into a one-line JSON string — escaped newlines " +
+        "render as smooshed-together text with no paragraph breaks.",
       schema: z.object({
         issue_id: z.string().describe("Issue UUID or identifier."),
         body: z.string().describe("Comment text. Markdown supported."),
@@ -517,7 +527,11 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     {
       name: "invoke_agent_heartbeat",
       description:
-        "Manually trigger an immediate heartbeat (work cycle) for an agent. Use to wake an idle agent, force it to pick up assignments, or run it off-schedule.",
+        "Manually trigger an immediate heartbeat (work cycle) for an agent. Use to wake an idle agent, force it to " +
+        "pick up assignments, or run it off-schedule. This tool only takes agent_id — it does NOT carry issue/payload " +
+        "context, so repeat calls do NOT dedupe to the same request: each call inserts a new queued heartbeat run " +
+        "(the concurrency limit only throttles how many queued runs start at once, it doesn't stop new ones from " +
+        "queuing). Avoid calling this in a retry/poll loop for the same agent.",
       schema: z.object({ agent_id: z.string().describe("UUID of the agent to trigger.") }),
       execute: async (args) =>
         runTool(() => client.requestJson("POST", `/agents/${encodeURIComponent(String(args.agent_id))}/heartbeat/invoke`)),
@@ -598,12 +612,21 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     },
     {
       name: "paperclipTailHeartbeatRunLog",
-      description: "Fallback log tail for MCP clients without resource subscription support.",
+      description:
+        "Fallback raw NDJSON log tail for ONE heartbeat run, for MCP clients without resource " +
+        "subscription support. Prefer get_issue/get_agent for status (done/completedAt/comments) " +
+        "first — they're cheap and structured; reach for this only to debug why a specific run did " +
+        "what it did. A runId is a snapshot of a single heartbeat cycle: once the agent's " +
+        "lastHeartbeatAt moves past this run's timestamps, the run is superseded and tailing it " +
+        "further shows no new activity even though the agent may still be working under a newer " +
+        "run you don't have the ID for — re-check the issue's current executionRunId before " +
+        "re-tailing. Each run's log starts with ~15-20KB of SessionStart/tool-list boilerplate; " +
+        "pass a nonzero offset to skip past it instead of re-reading from 0.",
       schema: z.object({
         runId: z.string().default("").describe("Heartbeat run UUID. Preferred stdio-compatible field."),
         run_id: z.string().default("").describe("Heartbeat run UUID. Compatibility alias."),
         offset: z.number().int().default(0).describe("Byte offset to resume from. Default: 0."),
-        limitBytes: z.number().int().default(16_384).describe("Max bytes to read (1-256000). Default: 16384."),
+        limitBytes: z.number().int().default(16_384).describe("Max bytes to read (1-256000). Default: 16384 (matches the resource-subscription chunk size). For a low-context read, pass 2000-4000 explicitly plus a nonzero offset."),
         limit_bytes: z.number().int().default(16_384).describe("Max bytes to read (1-256000). Compatibility alias."),
       }),
       execute: async (args) =>
