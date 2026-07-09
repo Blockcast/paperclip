@@ -183,6 +183,45 @@ function postChunked(url: string, body: string, headers: Record<string, string>)
   });
 }
 
+function postJson(
+  url: string,
+  body: Record<string, unknown>,
+  headers: Record<string, string> = jsonHeaders(),
+): Promise<{ status: number; headers: Headers; json: () => Promise<unknown> }> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const payload = JSON.stringify(body);
+    const req = http.request(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port,
+        path: `${parsed.pathname}${parsed.search}`,
+        method: "POST",
+        headers: { ...headers, "content-length": Buffer.byteLength(payload).toString() },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c) => chunks.push(c as Buffer));
+        res.on("end", () => {
+          const responseHeaders = new Headers();
+          for (const [name, value] of Object.entries(res.headers)) {
+            if (Array.isArray(value)) responseHeaders.set(name, value.join(", "));
+            else if (value !== undefined) responseHeaders.set(name, value);
+          }
+          const responseBody = Buffer.concat(chunks).toString("utf8");
+          resolve({
+            status: res.statusCode ?? 0,
+            headers: responseHeaders,
+            json: async () => JSON.parse(responseBody),
+          });
+        });
+      },
+    );
+    req.on("error", reject);
+    req.end(payload);
+  });
+}
+
 async function createHangingUpstream(): Promise<{ url: string }> {
   // Never responds — models a hung/dead upstream (figma's OOM / websocket-drop
   // state) so the gateway's own timeout + circuit breaker are exercised rather
@@ -827,28 +866,24 @@ describe("mcp gateway lifecycle compatibility", () => {
       beta: { url: beta.url, credentialHeaders: [] },
     });
 
-    const initialize = await fetch(gateway.url, {
-      method: "POST",
-      headers: jsonHeaders(),
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
-    });
+    const initialize = await postJson(gateway.url, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
     const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
     expect(initialize.status).toBe(200);
     expect(clientSessionId).toBeTruthy();
 
-    const list = await fetch(gateway.url, {
-      method: "POST",
-      headers: jsonHeaders(clientSessionId ?? undefined),
-      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
-    });
+    const list = await postJson(
+      gateway.url,
+      { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+      jsonHeaders(clientSessionId ?? undefined),
+    );
     const listBody = await list.json() as { result: { tools: Array<{ name: string }> } };
     expect(listBody.result.tools.map((tool) => tool.name).sort()).toEqual(["alpha__search", "beta__search"]);
 
-    const call = await fetch(gateway.url, {
-      method: "POST",
-      headers: jsonHeaders(clientSessionId ?? undefined),
-      body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "beta__search", arguments: {} } }),
-    });
+    const call = await postJson(
+      gateway.url,
+      { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "beta__search", arguments: {} } },
+      jsonHeaders(clientSessionId ?? undefined),
+    );
     expect(call.status).toBe(200);
     expect(beta.receivedToolCalls).toEqual(["search"]);
     expect(alpha.receivedToolCalls).toEqual([]);
@@ -866,11 +901,7 @@ describe("mcp gateway lifecycle compatibility", () => {
     );
 
     const start = Date.now();
-    const initialize = await fetch(gateway.url, {
-      method: "POST",
-      headers: jsonHeaders(),
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
-    });
+    const initialize = await postJson(gateway.url, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
     const elapsed = Date.now() - start;
     const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
 
@@ -879,11 +910,11 @@ describe("mcp gateway lifecycle compatibility", () => {
     expect(elapsed).toBeLessThan(1000);
     expect(gateway.state.breaker.stateOf("stuck")).toBe("open");
 
-    const list = await fetch(gateway.url, {
-      method: "POST",
-      headers: jsonHeaders(clientSessionId ?? undefined),
-      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
-    });
+    const list = await postJson(
+      gateway.url,
+      { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+      jsonHeaders(clientSessionId ?? undefined),
+    );
     const listBody = await list.json() as { result: { tools: Array<{ name: string }> } };
     expect(list.status).toBe(200);
     expect(listBody.result.tools.map((tool) => tool.name)).toEqual(["alpha__search"]);
@@ -900,19 +931,15 @@ describe("mcp gateway lifecycle compatibility", () => {
       { failureThreshold: 1 },
     );
 
-    const initialize = await fetch(gateway.url, {
-      method: "POST",
-      headers: jsonHeaders(),
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
-    });
+    const initialize = await postJson(gateway.url, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
     const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
     expect(initialize.status).toBe(200);
 
-    const list = await fetch(gateway.url, {
-      method: "POST",
-      headers: jsonHeaders(clientSessionId ?? undefined),
-      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
-    });
+    const list = await postJson(
+      gateway.url,
+      { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+      jsonHeaders(clientSessionId ?? undefined),
+    );
     const listBody = await list.json() as { result: { tools: Array<{ name: string }> } };
 
     expect(list.status).toBe(200);
@@ -928,11 +955,11 @@ describe("mcp gateway lifecycle compatibility", () => {
       { failureThreshold: 1 },
     );
 
-    const call = await fetch(gateway.url, {
-      method: "POST",
-      headers: jsonHeaders("client-session"),
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "bad__ping", arguments: {} } }),
-    });
+    const call = await postJson(
+      gateway.url,
+      { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "bad__ping", arguments: {} } },
+      jsonHeaders("client-session"),
+    );
 
     expect(call.status).toBe(502);
     expect(gateway.state.breaker.stateOf("bad")).toBe("open");
@@ -945,20 +972,16 @@ describe("mcp gateway lifecycle compatibility", () => {
     const sessionPersistenceFile = path.join(tmpDir, "sessions.json");
     const first = await createAggregateGateway({ alpha: { url: upstream.url, credentialHeaders: [] } }, { sessionPersistenceFile });
 
-    const initialize = await fetch(first.url, {
-      method: "POST",
-      headers: jsonHeaders(),
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
-    });
+    const initialize = await postJson(first.url, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
     const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
     expect(clientSessionId).toBeTruthy();
 
     const second = await createAggregateGateway({ alpha: { url: upstream.url, credentialHeaders: [] } }, { sessionPersistenceFile });
-    const call = await fetch(second.url, {
-      method: "POST",
-      headers: jsonHeaders(clientSessionId ?? undefined),
-      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "alpha__ping", arguments: {} } }),
-    });
+    const call = await postJson(
+      second.url,
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "alpha__ping", arguments: {} } },
+      jsonHeaders(clientSessionId ?? undefined),
+    );
 
     expect(call.status).toBe(200);
     expect(upstream.receivedToolCalls).toEqual(["ping"]);
@@ -969,19 +992,15 @@ describe("mcp gateway lifecycle compatibility", () => {
     const upstream = await createStrictMcpUpstream([{ name: "ping", description: "Ping" }]);
     const gateway = await createAggregateGateway({ alpha: { url: upstream.url, credentialHeaders: [] } });
 
-    const initialize = await fetch(gateway.url, {
-      method: "POST",
-      headers: jsonHeaders(),
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
-    });
+    const initialize = await postJson(gateway.url, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
     const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
     upstream.clearSessions();
 
-    const call = await fetch(gateway.url, {
-      method: "POST",
-      headers: jsonHeaders(clientSessionId ?? undefined),
-      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "alpha__ping", arguments: {} } }),
-    });
+    const call = await postJson(
+      gateway.url,
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "alpha__ping", arguments: {} } },
+      jsonHeaders(clientSessionId ?? undefined),
+    );
 
     expect(call.status).toBe(200);
     expect(upstream.methods).toEqual([
@@ -1001,20 +1020,16 @@ describe("mcp gateway lifecycle compatibility", () => {
       { failureThreshold: 1 },
     );
 
-    const initialize = await fetch(gateway.url, {
-      method: "POST",
-      headers: jsonHeaders(),
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
-    });
+    const initialize = await postJson(gateway.url, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
     const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
     upstream.clearSessions();
     upstream.rejectNextInitialize();
 
-    const call = await fetch(gateway.url, {
-      method: "POST",
-      headers: jsonHeaders(clientSessionId ?? undefined),
-      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "alpha__ping", arguments: {} } }),
-    });
+    const call = await postJson(
+      gateway.url,
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "alpha__ping", arguments: {} } },
+      jsonHeaders(clientSessionId ?? undefined),
+    );
 
     expect(call.status).toBe(502);
     expect(gateway.state.breaker.stateOf("alpha")).toBe("open");
