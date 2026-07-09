@@ -602,7 +602,10 @@ async function handleAggregateRequest(
           clientSessionId,
           initializePayload,
         );
-        if (!result) continue;
+        if (!result) {
+          state.breaker.recordFailure(prefix);
+          continue;
+        }
         if (result.status >= 500) state.breaker.recordFailure(prefix);
         else state.breaker.recordSuccess(prefix);
         if (!isSuccess(result.status)) continue;
@@ -663,6 +666,7 @@ async function handleAggregateRequest(
       initializePayload,
     );
     if (!result) {
+      state.breaker.recordFailure(prefix);
       res.statusCode = 502;
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ error: "failed to initialize upstream session", prefix }));
