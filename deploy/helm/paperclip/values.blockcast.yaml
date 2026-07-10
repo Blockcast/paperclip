@@ -427,8 +427,17 @@ serviceMonitor:
         matchLabels:
           kubernetes.io/metadata.name: monitoring
 
+# Disabled (BLO-14032): the paperclip-ci-deploy ServiceAccount used by `helm
+# upgrade` has no RBAC grant on prometheusrules.monitoring.coreos.com, so
+# enabling this makes every deploy fail at "helm upgrade" with a 403 on the
+# diff/get step — it doesn't just skip the resource, it blocks the whole
+# release. Every other PrometheusRule in the paperclip namespace is managed
+# by onprem-k8s's own apply pipeline (see onprem-k8s paperclip/*.yaml), which
+# has that permission; this chart's copy never should have been turned on
+# without the same grant. Move the BLO-10891 alert rules to onprem-k8s
+# alongside the existing ones instead of re-enabling this.
 prometheusRule:
-  enabled: true
+  enabled: false
   labels:
     release: kube-prometheus-stack
 
