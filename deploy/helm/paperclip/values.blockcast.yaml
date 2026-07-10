@@ -418,8 +418,15 @@ extraVolumeMounts:
     mountPath: /paperclip/.secrets/github-merge-token
     readOnly: true
 
+# Disabled (BLO-14591): same RBAC gap as prometheusRule below — the
+# paperclip-ci-deploy ServiceAccount has no grant on
+# servicemonitors.monitoring.coreos.com, so enabling this makes every deploy
+# fail at "helm upgrade" with a 403 on the diff/get step (not just skip the
+# resource). This flag has been on since BLO-10891 (#620); the disable of
+# prometheusRule alongside it in BLO-14556 missed this sibling CRD. Don't
+# re-enable without granting the SA get/list/watch on servicemonitors first.
 serviceMonitor:
-  enabled: true
+  enabled: false
   labels:
     release: kube-prometheus-stack
   scrapeAllowFromNamespaces:
