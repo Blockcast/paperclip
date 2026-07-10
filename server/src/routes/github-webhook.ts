@@ -920,6 +920,15 @@ const IDEMPOTENT_REVIEWER_WAKE_STATUSES = [
   "deferred_issue_execution",
   "coalesced",
   "completed",
+  // BLO-14395: a wake that hit an unexpected dispatch failure is durably
+  // tracked under these statuses (see wakeupWithDispatchRetry /
+  // reconcileFailedWakeDispatches in heartbeat.ts) -- a redelivery or a fresh
+  // re-mention with the same idempotency key should defer to that pending
+  // retry/reconciliation rather than re-running the full dispatch path.
+  "dispatch_failed",
+  "dispatch_recovered",
+  "dispatch_superseded",
+  "dispatch_failed_exhausted",
 ];
 
 function githubContextMetadata(context: ResolvedEventContext) {

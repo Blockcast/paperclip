@@ -16012,11 +16012,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * silently dropped again.
    */
   async function reconcileFailedWakeDispatches(now: Date = new Date()) {
+    // BLO-14395 review follow-up: filter+order by due-ness (the JSON
+    // `dispatchRetry.nextAttemptAt`) rather than `requestedAt`. Applying the
+    // 50-row cap before a due-ness filter let older rows whose backoff had
+    // escalated further out occupy the whole fetched batch under a backlog,
+    // starving younger rows that were actually due right now.
+    const nextAttemptAtExpr = sql`(${agentWakeupRequests.payload} -> 'dispatchRetry' ->> 'nextAttemptAt')::timestamptz`;
     const dueRows = await db
       .select()
       .from(agentWakeupRequests)
-      .where(eq(agentWakeupRequests.status, "dispatch_failed"))
-      .orderBy(asc(agentWakeupRequests.requestedAt))
+      .where(
+        and(
+          eq(agentWakeupRequests.status, "dispatch_failed"),
+          sql`${nextAttemptAtExpr} <= ${now.toISOString()}::timestamptz`,
+        ),
+      )
+      .orderBy(asc(nextAttemptAtExpr))
       .limit(50);
 
     let recovered = 0;
@@ -16031,8 +16042,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         nextAttemptAt?: string;
         originalOpts?: WakeupOptions;
       };
-      const nextAttemptAt = retryState.nextAttemptAt ? new Date(retryState.nextAttemptAt) : null;
-      if (nextAttemptAt && nextAttemptAt.getTime() > now.getTime()) continue;
 
       const attempts = (retryState.attempts ?? 0) + 1;
       const originalOpts = retryState.originalOpts ?? {};
