@@ -19,7 +19,7 @@ import {
   issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   __test_backLinkAbsoluteUrl,
   __test_buildIssueBackLinkBody,
@@ -1007,6 +1007,140 @@ describeEmbeddedPostgres("github-webhook route", () => {
         repoFullName: "Blockcast/magma",
       }),
     });
+  });
+
+  it("does not permanently block reviewer wakes once a dispatch retry chain is exhausted (BLO-14395 regression)", async () => {
+    const reviewerAgentId = randomUUID();
+    const { companyId } = await seedCompanyAndAgent();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+    const synchronizePayload = (headSha: string) => ({
+      action: "synchronize",
+      pull_request: {
+        number: 630,
+        title: "fix(heartbeat): wake-dispatch retry",
+        body: null,
+        html_url: "https://github.com/Blockcast/paperclip/pull/630",
+        head: { ref: "fix/blo-14395-wake-dispatch-retry", sha: headSha },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+
+    // Simulate a prior synchronize event whose wake dispatch retried and
+    // exhausted (5 attempts, all failed) -- this durably persists a row
+    // under the SAME idempotency key every future synchronize event on this
+    // PR will also compute, since that key omits head sha (repo+prNumber+reason
+    // only; see buildPrReviewerWakeIdempotencyKey).
+    const idempotencyKey = "pr_review:Blockcast/paperclip:630:github_pr_synchronized";
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: reviewerAgentId,
+      source: "github",
+      reason: "github_pr_synchronized",
+      idempotencyKey,
+      status: "dispatch_failed_exhausted",
+      payload: { taskKey: "pr_review:Blockcast/paperclip:630" },
+    });
+
+    const fresh = signedRequest(synchronizePayload("freshsha"));
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", fresh.signature)
+      .set("x-github-delivery", "delivery-post-exhaustion")
+      .set("content-type", "application/json")
+      .send(fresh.body);
+
+    expect(res.status).toBe(200);
+
+    const queuedWakes = await db
+      .select({ status: agentWakeupRequests.status, payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.agentId, reviewerAgentId),
+          eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+          eq(agentWakeupRequests.status, "queued"),
+        ),
+      );
+    expect(queuedWakes).toHaveLength(1);
+    expect(queuedWakes[0]?.payload).toMatchObject({ headSha: "freshsha" });
+  });
+
+  it("still defers to a pending or resolved dispatch-retry row (dispatch_failed / dispatch_recovered / dispatch_superseded)", async () => {
+    const reviewerAgentId = randomUUID();
+    const { companyId } = await seedCompanyAndAgent();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+    const openedPayload = (prNumber: number) => ({
+      action: "opened",
+      pull_request: {
+        number: prNumber,
+        title: "Some PR",
+        body: null,
+        head: { ref: "some-branch" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+
+    let prNumber = 700;
+    for (const status of ["dispatch_failed", "dispatch_recovered", "dispatch_superseded"] as const) {
+      prNumber += 1;
+      const idempotencyKey = `pr_review:Blockcast/paperclip:${prNumber}:github_pr_opened`;
+      await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId: reviewerAgentId,
+        source: "github",
+        reason: "github_pr_opened",
+        idempotencyKey,
+        status,
+        payload: { taskKey: `pr_review:Blockcast/paperclip:${prNumber}` },
+      });
+
+      const { body, signature } = signedRequest(openedPayload(prNumber));
+      const res = await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", `delivery-opened-${status}`)
+        .set("content-type", "application/json")
+        .send(body);
+      expect(res.status).toBe(200);
+
+      const queuedWakes = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.agentId, reviewerAgentId),
+            eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+            eq(agentWakeupRequests.status, "queued"),
+          ),
+        );
+      expect(queuedWakes).toHaveLength(0);
+    }
   });
 
   it("drives a reviewer wake for pull_request.reopened even without a paperclip identifier (BLO-7426)", async () => {
