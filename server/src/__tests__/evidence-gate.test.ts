@@ -377,12 +377,23 @@ describe("evaluateEvidence — PR + e2e", () => {
     expect(result.verdict).toBe("pass");
   });
 
-  it("blocks PR URLs outside the repository allowlist", () => {
+  it("accepts a well-formed PR URL from another repository by default", () => {
+    const result = evaluateEvidence({
+      issue: { description: "## Done when\n- PR opened", labels: [{ name: "pr" }] },
+      comments: [agentComment("https://github.com/Blockcast/onprem-k8s/pull/1316")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.verdict).toBe("pass");
+  });
+
+  it("blocks PR URLs outside an explicitly configured repository allowlist", () => {
     const result = evaluateEvidence({
       issue: { description: "## Done when\n- PR opened", labels: [{ name: "pr" }] },
       comments: [agentComment("https://github.com/acme/repo/pull/132")],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      allowedPrRepos: ["Blockcast/paperclip", "kkroo/paperclip"],
     });
     expect(result.verdict).toBe("block");
   });

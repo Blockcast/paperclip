@@ -47,7 +47,7 @@ export interface EvaluateEvidenceInput {
   registry: EvidenceRegistry;
   /** Number of most-recent agent comments to concatenate when scanning. Default 10. */
   recentCommentLimit?: number;
-  /** GitHub repositories whose PR URLs count as reviewable evidence. */
+  /** Optional repositories whose PR URLs count as reviewable evidence. */
   allowedPrRepos?: readonly string[];
 }
 
@@ -70,8 +70,6 @@ export interface EvaluateEvidenceResult {
 }
 
 const DEFAULT_RECENT_COMMENT_LIMIT = 10;
-const DEFAULT_ALLOWED_PR_REPOS = ["Blockcast/paperclip", "kkroo/paperclip"] as const;
-
 function normalizeLabel(value: string): string {
   return value.trim().normalize("NFC").toLocaleLowerCase("en-US");
 }
@@ -285,13 +283,15 @@ function detectUrlProbe(text: string): boolean {
   return /\bcurl\b[^\n]+https?:\/\/[^\s]+/i.test(text);
 }
 
-function detectPrLink(text: string, allowedRepos: readonly string[]): boolean {
-  const allowed = new Set(allowedRepos.map((repo) => repo.toLocaleLowerCase("en-US")));
+function detectPrLink(text: string, allowedRepos?: readonly string[]): boolean {
   const matches = text.matchAll(/https?:\/\/github\.com\/([\w-]+\/[\w.-]+)\/pull\/\d+/gi);
+  if (!allowedRepos) return !matches.next().done;
+
+  const allowed = new Set(allowedRepos.map((repo) => repo.toLocaleLowerCase("en-US")));
   return Array.from(matches).some((match) => allowed.has(match[1]!.toLocaleLowerCase("en-US")));
 }
 
-function detectCiGreen(text: string, allowedRepos: readonly string[]): boolean {
+function detectCiGreen(text: string, allowedRepos?: readonly string[]): boolean {
   if (!detectPrLink(text, allowedRepos)) return false;
   if (/All checks have passed/i.test(text)) return true;
   if (/"mergeable_state"\s*:\s*"clean"/i.test(text)) return true;
@@ -357,7 +357,7 @@ function detectAll(input: {
   issueDescription: string | null | undefined;
   text: string;
   workProducts: EvidenceWorkProductLite[];
-  allowedPrRepos: readonly string[];
+  allowedPrRepos?: readonly string[];
 }): { detections: Record<EvidenceShape, boolean>; found: EvidenceShape[] } {
   const { issueDescription, text, workProducts, allowedPrRepos } = input;
   const detections: Record<EvidenceShape, boolean> = {
@@ -416,7 +416,7 @@ export function evaluateEvidence(
     issueDescription: input.issue.description,
     text,
     workProducts: input.workProducts,
-    allowedPrRepos: input.allowedPrRepos ?? DEFAULT_ALLOWED_PR_REPOS,
+    allowedPrRepos: input.allowedPrRepos,
   });
 
   const missing = required.filter((s) => !detections[s]);
