@@ -287,7 +287,18 @@ ARG CLAUDE_K8S_REF=c04ae02fda6fff57d2d4acf93e4d7640597b50ef
 # opencode's XDG reader (follow-up to #38; inert for current MCP+api-key agents).
 # PR kkroo/paperclip-adapter-opencode-k8s#39; local adapter verification: typecheck
 # clean, job-manifest suite 112/112, bash syntax + resolution checked.
-ARG OPENCODE_K8S_REF=30466007c5bb5e8e52ee51b8d0b3ebf2cf2f9120
+#
+# Bumped 2026-07-11 to 64c327d0: disable opencode's turn-zero workspace
+# snapshot (BLO-14758). opencode's `git add --all --sparse` of the whole work
+# tree into a shadow snapshot store was pegging a core in uninterruptible
+# disk I/O for 20-30+ min against large/cold agent workspace dirs before the
+# first LLM turn ran — observed live via `ps` (STAT=Ds) on a run that produced
+# zero opencode output for 33 minutes. Sets `snapshot: false` in both opencode
+# config paths (buildRuntimeConfigJson's default opencode.json and the
+# MCP-path OPENCODE_CONFIG_JSON literal; opencode doesn't merge config
+# sources). PR kkroo/paperclip-adapter-opencode-k8s#42; typecheck clean, full
+# suite 515/515 pass (2 new tests), build clean.
+ARG OPENCODE_K8S_REF=64c327d08db23fb86018375f5d8174a73db74c9d
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest

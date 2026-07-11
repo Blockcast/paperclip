@@ -43,8 +43,10 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerfile).toContain("K8S_AGENT_SESSION_POLICY");
   });
 
-  it("vendors the opencode_k8s adapter commit with crash, runtime-cache, MCP header, pod-stderr, startup-wait, opencode-db, chunkTimeout, budget-cap, and compact-threshold fixes", () => {
-    expect(dockerfile).toContain("ARG OPENCODE_K8S_REF=30466007c5bb5e8e52ee51b8d0b3ebf2cf2f9120");
+  it("vendors the opencode_k8s adapter commit with crash, runtime-cache, MCP header, pod-stderr, startup-wait, opencode-db, chunkTimeout, budget-cap, compact-threshold, and turn-zero-snapshot fixes", () => {
+    expect(dockerfile).toContain("ARG OPENCODE_K8S_REF=64c327d08db23fb86018375f5d8174a73db74c9d");
+    expect(dockerfile).toContain("disable opencode's turn-zero workspace");
+    expect(dockerfile).toContain("snapshot: false");
     expect(dockerfile).toContain("opencode config/auth writers respect XDG_*");
     expect(dockerfile).toContain("reserve opencode XDG config/data/state onto the");
     expect(dockerfile).toContain("type-crash");
