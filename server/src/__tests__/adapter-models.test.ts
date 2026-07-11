@@ -280,6 +280,7 @@ describe("adapter model listing", () => {
     await expect(refreshAdapterModels("opencode_k8s")).resolves.toEqual([
       { id: "openai/gpt-5.6-sol", label: "openai/gpt-5.6-sol" },
       { id: "openai/gpt-5.6-terra", label: "openai/gpt-5.6-terra" },
+      { id: "openai/gpt-5.5", label: "openai/gpt-5.5" },
     ]);
   });
 
