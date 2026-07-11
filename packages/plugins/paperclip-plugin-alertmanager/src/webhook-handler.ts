@@ -19,6 +19,7 @@ import {
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { resolveAssigneeUserId } from "./owner-resolver.js";
+import { escalationDeadlineMs } from "./escalation.js";
 import {
   ORIGIN_KIND,
   type AlertStateRecord,
@@ -156,6 +157,17 @@ export async function handleFiring(
       severity,
       lastFiredAt: nowIso,
       resolvedAt: null,
+      nextEscalationAt: existing.resolvedAt
+        ? (() => {
+            const delay = escalationDeadlineMs(alert, config);
+            return delay === null ? null : new Date(Date.now() + delay).toISOString();
+          })()
+        : existing.nextEscalationAt,
+      escalationAttempt: existing.resolvedAt ? 0 : existing.escalationAttempt,
+      escalationComplete: existing.resolvedAt ? false : existing.escalationComplete,
+      escalationIntervalMs: existing.resolvedAt
+        ? escalationDeadlineMs(alert, config)
+        : (existing.escalationIntervalMs ?? escalationDeadlineMs(alert, config)),
     };
     await ctx.state.set(stateRef, updated);
 
@@ -264,6 +276,13 @@ export async function handleFiring(
     firstSeenAt: alert.startsAt || nowIso,
     lastFiredAt: nowIso,
     resolvedAt: null,
+    nextEscalationAt: (() => {
+      const delay = escalationDeadlineMs(alert, config);
+      return delay === null ? null : new Date(Date.now() + delay).toISOString();
+    })(),
+    escalationAttempt: 0,
+    escalationComplete: false,
+    escalationIntervalMs: escalationDeadlineMs(alert, config),
   };
   await ctx.state.set(stateRef, record);
 
@@ -350,7 +369,12 @@ export async function handleResolved(
     );
   }
 
-  const updated: AlertStateRecord = { ...existing, resolvedAt };
+  const updated: AlertStateRecord = {
+    ...existing,
+    resolvedAt,
+    nextEscalationAt: null,
+    escalationComplete: true,
+  };
   await ctx.state.set(stateRef, updated);
 
   await ctx.events.emit(

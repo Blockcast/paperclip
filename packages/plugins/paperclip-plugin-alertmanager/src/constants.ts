@@ -31,6 +31,11 @@ export const DEFAULT_SEVERITY_TO_PRIORITY: Record<string, PaperclipPriority> = {
   info: "medium",
 };
 
+export const DEFAULT_ESCALATION_DEADLINE_MINUTES: Record<string, number> = {
+  critical: 30,
+  warning: 240,
+};
+
 /** Default owner routes shipped with the bundled Blockcast Alertmanager plugin. */
 export const DEFAULT_OWNER_MAP: OwnerMap = {
   class: {
@@ -175,6 +180,7 @@ export const DEFAULT_CONFIG: AlertmanagerPluginConfig = {
   autoCloseOnResolve: true,
   ownerMap: DEFAULT_OWNER_MAP,
   issueRouteMap: DEFAULT_ISSUE_ROUTE_MAP,
+  escalationDeadlineMinutes: DEFAULT_ESCALATION_DEADLINE_MINUTES,
 };
 
 /**
