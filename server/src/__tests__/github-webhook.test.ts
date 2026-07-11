@@ -1078,6 +1078,77 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(queuedWakes[0]?.payload).toMatchObject({ headSha: "freshsha" });
   });
 
+  it("re-reviews a PR after a fixup push even though the prior review completed (stale-head regression)", async () => {
+    const reviewerAgentId = randomUUID();
+    const { companyId } = await seedCompanyAndAgent();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+    const synchronizePayload = (headSha: string) => ({
+      action: "synchronize",
+      pull_request: {
+        number: 813,
+        title: "feat: some change",
+        body: null,
+        html_url: "https://github.com/Blockcast/paperclip/pull/813",
+        head: { ref: "feat/some-change", sha: headSha },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+
+    // A prior synchronize was reviewed to COMPLETION on an earlier head. Its
+    // wake row persists under the head-sha-omitting idempotency key that every
+    // future synchronize on this PR also computes.
+    const idempotencyKey = "pr_review:Blockcast/paperclip:813:github_pr_synchronized";
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: reviewerAgentId,
+      source: "github",
+      reason: "github_pr_synchronized",
+      idempotencyKey,
+      status: "completed",
+      payload: { taskKey: "pr_review:Blockcast/paperclip:813", headSha: "oldhead" },
+    });
+
+    // Author pushes a fixup; the review gate is now pending on the new head. A
+    // completed review of the earlier head must NOT permanently block this
+    // re-review (that was the stale-head bug: `completed` in
+    // IDEMPOTENT_REVIEWER_WAKE_STATUSES).
+    const fresh = signedRequest(synchronizePayload("newhead"));
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", fresh.signature)
+      .set("x-github-delivery", "delivery-fixup-after-completed-review")
+      .set("content-type", "application/json")
+      .send(fresh.body);
+
+    expect(res.status).toBe(200);
+
+    const queuedWakes = await db
+      .select({ status: agentWakeupRequests.status, payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.agentId, reviewerAgentId),
+          eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+          eq(agentWakeupRequests.status, "queued"),
+        ),
+      );
+    expect(queuedWakes).toHaveLength(1);
+    expect(queuedWakes[0]?.payload).toMatchObject({ headSha: "newhead" });
+  });
+
   it("still defers to a pending or resolved dispatch-retry row (dispatch_failed / dispatch_recovered / dispatch_superseded)", async () => {
     const reviewerAgentId = randomUUID();
     const { companyId } = await seedCompanyAndAgent();

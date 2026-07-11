@@ -714,8 +714,12 @@ function buildPrReviewerWakeIdempotencyKey(
   //
   // Every other reason, including github_pr_synchronized, keys on
   // repo+prNumber+reason alone. This deliberately omits head sha and delivery
-  // id so the idempotency precheck can skip duplicate pending/completed wake
-  // requests for the same PR+reason. Active run coalescing is controlled by
+  // id so the idempotency precheck can skip duplicate in-flight wake requests
+  // for the same PR+reason (a review already queued/running covers the latest
+  // head). Note: `completed` is intentionally NOT an idempotent status (see
+  // IDEMPOTENT_REVIEWER_WAKE_STATUSES), so a fixup pushed AFTER a review
+  // finishes still enqueues a fresh reviewer wake rather than being blocked by
+  // the earlier completed review. Active run coalescing is controlled by
   // buildPrReviewerTaskKey plus enqueueWakeup's same-task-scope logic.
   const commentScopedSuffix =
     context.wakeReason === "github_pr_review_requested"
@@ -919,7 +923,20 @@ const IDEMPOTENT_REVIEWER_WAKE_STATUSES = [
   "scheduled",
   "deferred_issue_execution",
   "coalesced",
-  "completed",
+  // `completed` is deliberately EXCLUDED. For reasons whose idempotency key
+  // omits the head sha (github_pr_synchronized keys on repo+prNumber+reason
+  // alone -- see buildPrReviewerWakeIdempotencyKey), a COMPLETED reviewer wake
+  // for an earlier push would otherwise permanently block every future
+  // synchronize on that PR: the reviewer reviews the first pushed head once and
+  // never re-reviews any later head, so `review/ally-complete` stays pending on
+  // a stale head forever (observed 2026-07-11: a batch of PRs whose authors
+  // pushed fixups after the first review sat permanently un-re-reviewed). This
+  // is the same failure mode already called out below for
+  // `dispatch_failed_exhausted` -- a fresh webhook event deserves its own
+  // attempt. Rapid-push coalescing is preserved: the in-flight statuses above
+  // (queued/claimed/running/...) still dedup wake rows while a review is
+  // pending, and taskKey-scoped coalescing in enqueueWakeup still prevents any
+  // real duplicate execution.
   // BLO-14395: a wake that hit an unexpected dispatch failure is durably
   // tracked under these statuses (see wakeupWithDispatchRetry /
   // reconcileFailedWakeDispatches in heartbeat.ts). `dispatch_failed` defers
