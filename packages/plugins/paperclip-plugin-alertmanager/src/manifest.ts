@@ -1,6 +1,7 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 import {
   DEFAULT_SEVERITY_TO_PRIORITY,
+  DEFAULT_ESCALATION_DEADLINE_MINUTES,
   PLUGIN_ID,
   PLUGIN_VERSION,
   WEBHOOK_KEYS,
@@ -20,9 +21,13 @@ const manifest: PaperclipPluginManifestV1 = {
     "issues.read",
     "issues.create",
     "issues.update",
+    "issues.wakeup",
+    "issue.comments.read",
     "issue.comments.create",
     // Owner mapping
     "users.read",
+    "agents.read",
+    "access.members.read",
     // State (dedup by fingerprint, owner-by-email cache)
     "plugin.state.read",
     "plugin.state.write",
@@ -36,6 +41,7 @@ const manifest: PaperclipPluginManifestV1 = {
     // Webhook entrypoint (the plugin is webhook-driven)
     "webhooks.receive",
     "instance.settings.register",
+    "jobs.schedule",
   ],
   entrypoints: {
     worker: "./dist/worker.js",
@@ -119,10 +125,19 @@ const manifest: PaperclipPluginManifestV1 = {
               },
               assigneeAgentId: { type: "string" },
               assigneeUserId: { type: "string" },
+              escalationDeadlineMinutes: { type: "number", minimum: 1 },
             },
             additionalProperties: false,
           },
         },
+      },
+      escalationDeadlineMinutes: {
+        type: "object",
+        title: "Escalation deadline by severity (minutes)",
+        description:
+          "Delay before an unresolved alert climbs the reportsTo chain. Defaults: critical=30, warning=240.",
+        default: DEFAULT_ESCALATION_DEADLINE_MINUTES,
+        additionalProperties: { type: "number", minimum: 1 },
       },
     },
     // No fields are schema-required: the bootstrap auto-config endpoint
@@ -139,6 +154,14 @@ const manifest: PaperclipPluginManifestV1 = {
       displayName: "Alertmanager v2 webhook",
       description:
         "Alertmanager `webhook_configs` target. Accepts POST with the AM v2 JSON payload. Authenticates via static bearer token (Authorization: Bearer <token>).",
+    },
+  ],
+  jobs: [
+    {
+      jobKey: "check-alert-escalations",
+      displayName: "Check unresolved alert escalations",
+      description: "Advances overdue alerts through the reportsTo chain.",
+      schedule: "*/1 * * * *",
     },
   ],
   // No tools registered for V1 — pure event/webhook plugin.

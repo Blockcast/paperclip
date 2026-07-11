@@ -47,6 +47,7 @@ export interface IssueRoute {
   status?: IssueRouteStatus;
   assigneeAgentId?: string;
   assigneeUserId?: string | null;
+  escalationDeadlineMinutes?: number;
 }
 
 /**
@@ -99,6 +100,7 @@ export interface AlertmanagerPluginConfig {
    * goal, status, and queue defaults to created issues.
    */
   issueRouteMap?: IssueRouteMap;
+  escalationDeadlineMinutes?: Record<string, number>;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +167,9 @@ export interface AlertStateRecord {
   firstSeenAt: string;
   lastFiredAt: string;
   resolvedAt: string | null;
+  nextEscalationAt?: string | null;
+  escalationAttempt?: number;
+  escalationComplete?: boolean;
 }
 
 /**

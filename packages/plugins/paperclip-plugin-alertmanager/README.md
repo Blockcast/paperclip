@@ -33,6 +33,18 @@ See `docs/specs/2026-04-29-alertmanager-plugin-spec.md` for the full design.
 
 ## Configuration
 
+Unresolved alert issues are checked once per minute and escalate through the
+assigned agent's `reportsTo` chain. The first deadline wakes the current owner,
+later checks reassign up the chain, and an exhausted chain creates a board-owned
+`[user-cover]` issue. Critical alerts default to 30 minutes and warnings to 240
+minutes. Override these globally with `escalationDeadlineMinutes` or per route
+with `issueRouteMap.<label>.<value>.escalationDeadlineMinutes`. Repeat firing
+deliveries preserve ladder state; resolving an alert clears its schedule.
+
+This uses a plugin job rather than core `executionPolicy.monitor`: the plugin SDK
+does not expose monitor policy writes or a callback that can perform `reportsTo`
+reassignment and user-cover creation.
+
 Configured per-instance via the host's plugin settings UI. Schema lives in
 `src/manifest.ts` (`instanceConfigSchema`).
 
