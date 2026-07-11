@@ -83,6 +83,42 @@ export const DEFAULT_ISSUE_ROUTE_MAP: IssueRouteMap = {
       assigneeAgentId: BLOCKCAST_PHYSICAL_INFRA_AGENT_ID,
       status: "todo",
     },
+    pod_pending: {
+      projectId: BLOCKCAST_PHYSICAL_INFRA_PROJECT_ID,
+      goalId: BLOCKCAST_PHYSICAL_INFRA_GOAL_ID,
+      assigneeAgentId: BLOCKCAST_PHYSICAL_INFRA_AGENT_ID,
+      status: "todo",
+    },
+    pod_init_stuck: {
+      projectId: BLOCKCAST_PHYSICAL_INFRA_PROJECT_ID,
+      goalId: BLOCKCAST_PHYSICAL_INFRA_GOAL_ID,
+      assigneeAgentId: BLOCKCAST_PHYSICAL_INFRA_AGENT_ID,
+      status: "todo",
+    },
+    pod_crashloop: {
+      projectId: BLOCKCAST_PHYSICAL_INFRA_PROJECT_ID,
+      goalId: BLOCKCAST_PHYSICAL_INFRA_GOAL_ID,
+      assigneeAgentId: BLOCKCAST_PHYSICAL_INFRA_AGENT_ID,
+      status: "todo",
+    },
+    pod_create_error: {
+      projectId: BLOCKCAST_PHYSICAL_INFRA_PROJECT_ID,
+      goalId: BLOCKCAST_PHYSICAL_INFRA_GOAL_ID,
+      assigneeAgentId: BLOCKCAST_PHYSICAL_INFRA_AGENT_ID,
+      status: "todo",
+    },
+    pod_config_error: {
+      projectId: BLOCKCAST_PHYSICAL_INFRA_PROJECT_ID,
+      goalId: BLOCKCAST_PHYSICAL_INFRA_GOAL_ID,
+      assigneeAgentId: BLOCKCAST_PHYSICAL_INFRA_AGENT_ID,
+      status: "todo",
+    },
+    pod_image_pull: {
+      projectId: BLOCKCAST_PHYSICAL_INFRA_PROJECT_ID,
+      goalId: BLOCKCAST_PHYSICAL_INFRA_GOAL_ID,
+      assigneeAgentId: BLOCKCAST_PHYSICAL_INFRA_AGENT_ID,
+      status: "todo",
+    },
   },
 };
 

@@ -383,6 +383,43 @@ describe("handleWebhook — firing first time", () => {
     );
   });
 
+  it.each([
+    ["pod_pending", "PodPendingCritical"],
+    ["pod_init_stuck", "PodContainerCreatingStuck"],
+    ["pod_crashloop", "PodCrashLooping"],
+    ["pod_create_error", "PodCreateError"],
+    ["pod_config_error", "PodConfigError"],
+    ["pod_image_pull", "PodImagePullBackOff"],
+  ])(
+    "routes %s pod-health alerts to the Platform/SRE owner",
+    async (className, alertname) => {
+      const { ctx, mocks } = mkCtx();
+      const config = baseConfig({
+        issueRouteMap: DEFAULT_ISSUE_ROUTE_MAP,
+        ownerMap: {},
+      });
+      const alert = baseAlert({
+        labels: {
+          alertname,
+          severity: "critical",
+          class: className,
+          namespace: "paperclip",
+        },
+        fingerprint: `pod-health-${className}`,
+      });
+      const envelope = baseEnvelope({ alerts: [alert] });
+
+      await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+
+      const createArgs = mocks.issues.create.mock.calls[0][0];
+      expect(createArgs.projectId).toBe(BLOCKCAST_PHYSICAL_INFRA_PROJECT_ID);
+      expect(createArgs.goalId).toBe(BLOCKCAST_PHYSICAL_INFRA_GOAL_ID);
+      expect(createArgs.status).toBe("todo");
+      expect(createArgs.assigneeAgentId).toBe(BLOCKCAST_PHYSICAL_INFRA_AGENT_ID);
+      expect(createArgs.assigneeUserId).toBeUndefined();
+    },
+  );
+
   it("leaves non-routed alerts on the existing create path", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ issueRouteMap: DEFAULT_ISSUE_ROUTE_MAP });
