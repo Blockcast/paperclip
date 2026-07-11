@@ -150,7 +150,7 @@ describe("runEvidenceGate", () => {
     expect(result.allDetected).toContain("e2e-run");
   });
 
-  it("rejects PR links outside the default repository allowlist", async () => {
+  it("accepts cross-repository PR links when wiring has no allowlist", async () => {
     const fetch = vi.fn<(id: string) => Promise<EvidenceFetchResult>>(
       async () => ({
         description: "## Done when\n- QA evidence exists",
@@ -174,8 +174,9 @@ describe("runEvidenceGate", () => {
       }),
     );
     const result = await runEvidenceGate(fetch, "issue-qa-only");
-    expect(result.allDetected).toEqual(expect.arrayContaining(["test-output", "checklist:done-when"]));
-    expect(result.allDetected).not.toContain("pr-link");
+    expect(result.allDetected).toEqual(
+      expect.arrayContaining(["test-output", "checklist:done-when", "pr-link"]),
+    );
   });
 
   it("propagates fetch failures back to the caller (no swallowing)", async () => {
