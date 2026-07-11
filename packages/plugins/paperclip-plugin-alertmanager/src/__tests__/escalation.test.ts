@@ -40,6 +40,7 @@ function sweepContext(state: AlertStateRecord, reportsTo: string | null = "cto")
         : { id, name: "CTO", reportsTo: null }),
     },
     access: { members: { list: vi.fn(async () => [{ principalType: "user", principalId: "board-1", status: "active", membershipRole: "owner" }]) } },
+    logger: { info: vi.fn(), warn: vi.fn() },
   };
   return { ctx: mocks as unknown as PluginContext, mocks };
 }
@@ -88,6 +89,42 @@ describe("alert escalation", () => {
     const mocks = { state: { get: vi.fn(async () => state), set: vi.fn(async () => undefined) }, issues: { get: vi.fn(async () => ({ id: "issue-1", status: "todo" })), update: vi.fn(async () => ({})), createComment: vi.fn() }, events: { emit: vi.fn() }, metrics: { write: vi.fn() }, logger: { info: vi.fn(), warn: vi.fn() } };
     await handleResolved(mocks as unknown as PluginContext, config(), { ...alert(), status: "resolved", endsAt: "2026-07-11T02:00:00Z" });
     expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationComplete: true, nextEscalationAt: null }));
+  });
+
+  it("advances the ladder and posts exactly one comment even when the wake is refused", async () => {
+    const due = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 0 };
+    const { ctx, mocks } = sweepContext(due);
+    mocks.issues.requestWakeup = vi.fn(async () => { throw new Error("Issue is not wakeable in status: backlog"); });
+    await expect(runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"))).resolves.toBeUndefined();
+    // live incident 2026-07-11: the throw used to abort before the state
+    // write, repeating rung 1 (comment + wake) every minute-sweep forever
+    expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 1 }));
+    expect(mocks.issues.createComment).toHaveBeenCalledTimes(1);
+    expect(mocks.logger.warn).toHaveBeenCalled();
+  });
+
+  it("wakes the new owner after a reassign rung", async () => {
+    const due = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1 };
+    const { ctx, mocks } = sweepContext(due);
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+    expect(mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
+    expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("continues the sweep past an issue whose processing throws", async () => {
+    const due = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 0 };
+    const { ctx, mocks } = sweepContext(due);
+    const issueA = { id: "issue-broken", identifier: "BLO-0", title: "Alert", status: "todo", priority: "critical", originId: "fp-broken", assigneeAgentId: "engineer", projectId: null, goalId: null };
+    const issueB = { id: "issue-1", identifier: "BLO-1", title: "Alert", status: "todo", priority: "critical", originId: "fp-1", assigneeAgentId: "engineer", projectId: null, goalId: null };
+    mocks.issues.list = vi.fn(async (input: { originKind?: string }) => input.originKind?.endsWith(":escalation") ? [] : [issueA, issueB]);
+    mocks.issues.listComments = vi.fn(async (issueId: string) => {
+      if (issueId === "issue-broken") throw new Error("boom");
+      return [];
+    });
+    await expect(runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"))).resolves.toBeUndefined();
+    // the healthy issue behind the broken one still advanced
+    expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 1 }));
+    expect(mocks.logger.warn).toHaveBeenCalledWith(expect.stringContaining("BLO-0"));
   });
 
   it("does not reset the ladder on repeat firing deliveries", async () => {

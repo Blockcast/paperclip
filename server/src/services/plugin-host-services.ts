@@ -2058,7 +2058,11 @@ export function buildHostServices(
         if (!issue.assigneeAgentId) {
           throw new Error("Issue has no assigned agent to wake");
         }
-        if (["backlog", "done", "cancelled"].includes(issue.status)) {
+        // "backlog" is deliberately wakeable here: plugin escalation flows
+        // (e.g. alertmanager deadline ladders, BLO-14626) exist precisely to
+        // wake assignees of issues nobody has started. Only terminal statuses
+        // are refused.
+        if (["done", "cancelled"].includes(issue.status)) {
           throw new Error(`Issue is not wakeable in status: ${issue.status}`);
         }
         const relations = await issues.getRelationSummaries(issue.id);
@@ -2126,7 +2130,9 @@ export function buildHostServices(
           if (!issue.assigneeAgentId) {
             throw new Error("Issue has no assigned agent to wake");
           }
-          if (["backlog", "done", "cancelled"].includes(issue.status)) {
+          // Backlog is wakeable (see requestWakeup above); only terminal
+          // statuses are refused.
+          if (["done", "cancelled"].includes(issue.status)) {
             throw new Error(`Issue is not wakeable in status: ${issue.status}`);
           }
           const relations = await issues.getRelationSummaries(issue.id);
