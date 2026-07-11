@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
-import { redactEventPayload } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, redactEventPayload } from "../redaction.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
 import {
@@ -124,13 +124,55 @@ export function isRedactedEnvBinding(binding: unknown): boolean {
   return false;
 }
 
+const OMIT_REDACTED_ADAPTER_VALUE = Symbol("omit-redacted-adapter-value");
+
+function containsRedactedAdapterValue(value: unknown): boolean {
+  if (value === REDACTED_EVENT_VALUE) return true;
+  if (Array.isArray(value)) return value.some(containsRedactedAdapterValue);
+  if (!value || typeof value !== "object") return false;
+  return Object.values(value as Record<string, unknown>).some(containsRedactedAdapterValue);
+}
+
+function restoreRedactedAdapterValue(incoming: unknown, existing: unknown): unknown {
+  if (incoming === REDACTED_EVENT_VALUE) {
+    return existing === undefined ? OMIT_REDACTED_ADAPTER_VALUE : existing;
+  }
+  if (Array.isArray(incoming)) {
+    const existingArray = Array.isArray(existing) ? existing : [];
+    return incoming.flatMap((value, index) => {
+      const restored = restoreRedactedAdapterValue(value, existingArray[index]);
+      return restored === OMIT_REDACTED_ADAPTER_VALUE ? [] : [restored];
+    });
+  }
+  if (!incoming || typeof incoming !== "object") return incoming;
+
+  const existingRecord =
+    existing && typeof existing === "object" && !Array.isArray(existing)
+      ? (existing as Record<string, unknown>)
+      : {};
+  const restored: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(incoming as Record<string, unknown>)) {
+    const restoredValue = restoreRedactedAdapterValue(value, existingRecord[key]);
+    if (restoredValue !== OMIT_REDACTED_ADAPTER_VALUE) restored[key] = restoredValue;
+  }
+  return restored;
+}
+
+// The legacy name is retained for call-site compatibility; this now restores
+// both env sentinels and recursively redacted adapter values on API round-trips.
 export function stripRedactedEnvBindingsFromAdapterConfig(
   incomingAdapterConfig: Record<string, unknown>,
   existingAdapterConfig: Record<string, unknown> | null,
 ): Record<string, unknown> {
-  const incomingEnv = incomingAdapterConfig.env;
+  const restoredAdapterConfig = containsRedactedAdapterValue(incomingAdapterConfig)
+    ? (restoreRedactedAdapterValue(
+        incomingAdapterConfig,
+        existingAdapterConfig ?? {},
+      ) as Record<string, unknown>)
+    : incomingAdapterConfig;
+  const incomingEnv = restoredAdapterConfig.env;
   if (!incomingEnv || typeof incomingEnv !== "object" || Array.isArray(incomingEnv)) {
-    return incomingAdapterConfig;
+    return restoredAdapterConfig;
   }
   const existingEnv =
     existingAdapterConfig
@@ -152,7 +194,7 @@ export function stripRedactedEnvBindingsFromAdapterConfig(
       cleaned[key] = value;
     }
   }
-  return { ...incomingAdapterConfig, env: cleaned };
+  return { ...restoredAdapterConfig, env: cleaned };
 }
 
 function readRunLogLimitBytes(value: unknown) {
