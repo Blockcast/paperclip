@@ -147,10 +147,10 @@ describe("runEvidenceGate", () => {
     // we want to assert here is that the evidenceFound list DOES include
     // e2e-run, proving the wiring's status→result mapping worked.
     const result = await runEvidenceGate(fetch, "issue-5");
-    expect(result.evidenceFound).toContain("e2e-run");
+    expect(result.allDetected).toContain("e2e-run");
   });
 
-  it("detects PR links in agent-authored QA/recovery evidence comments", async () => {
+  it("rejects PR links outside the default repository allowlist", async () => {
     const fetch = vi.fn<(id: string) => Promise<EvidenceFetchResult>>(
       async () => ({
         description: "## Done when\n- QA evidence exists",
@@ -174,7 +174,8 @@ describe("runEvidenceGate", () => {
       }),
     );
     const result = await runEvidenceGate(fetch, "issue-qa-only");
-    expect(result.evidenceFound).toEqual(expect.arrayContaining(["pr-link", "test-output", "checklist:done-when"]));
+    expect(result.allDetected).toEqual(expect.arrayContaining(["test-output", "checklist:done-when"]));
+    expect(result.allDetected).not.toContain("pr-link");
   });
 
   it("propagates fetch failures back to the caller (no swallowing)", async () => {

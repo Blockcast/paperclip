@@ -6629,6 +6629,7 @@ export function issueService(db: Db) {
               missing: verdict.missing,
               evidenceFound: verdict.evidenceFound,
               unlabeledFallback: verdict.unlabeledFallback,
+              diagnostics: verdict.diagnostics,
             },
             `evidence-gate: ${verdict.verdict} on in_review transition`,
           );
