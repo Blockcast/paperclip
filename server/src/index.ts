@@ -1092,6 +1092,11 @@ export async function startServer(): Promise<StartedServer> {
       if (blockerDependentsSwept.woken > 0 || blockerDependentsSwept.failed > 0) {
         logger.warn({ ...blockerDependentsSwept }, "startup resolved-blocker-dependents sweep enqueued wakes");
       }
+
+      const failedWakeDispatches = await heartbeat.reconcileFailedWakeDispatches();
+      if (failedWakeDispatches.recovered > 0 || failedWakeDispatches.exhausted > 0) {
+        logger.warn({ ...failedWakeDispatches }, "startup failed-wake-dispatch reconciliation retried durable wake failures (BLO-14395)");
+      }
     })().catch((err) => {
       logger.error({ err }, "startup heartbeat recovery failed");
     });
@@ -1174,6 +1179,15 @@ export async function startServer(): Promise<StartedServer> {
           const swept = await heartbeat.reconcileResolvedBlockerDependents();
           if (swept.woken > 0 || swept.failed > 0) {
             logger.warn({ ...swept }, "periodic resolved-blocker-dependents sweep enqueued wakes");
+          }
+        })
+        .then(async () => {
+          const failedWakeDispatches = await heartbeat.reconcileFailedWakeDispatches();
+          if (failedWakeDispatches.recovered > 0 || failedWakeDispatches.exhausted > 0) {
+            logger.warn(
+              { ...failedWakeDispatches },
+              "periodic failed-wake-dispatch reconciliation retried durable wake failures (BLO-14395)",
+            );
           }
         })
         .catch((err) => {

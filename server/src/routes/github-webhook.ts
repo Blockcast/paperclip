@@ -920,6 +920,25 @@ const IDEMPOTENT_REVIEWER_WAKE_STATUSES = [
   "deferred_issue_execution",
   "coalesced",
   "completed",
+  // BLO-14395: a wake that hit an unexpected dispatch failure is durably
+  // tracked under these statuses (see wakeupWithDispatchRetry /
+  // reconcileFailedWakeDispatches in heartbeat.ts). `dispatch_failed` defers
+  // to the pending in-flight retry (reconciliation will pick it up within
+  // 15m) and `dispatch_superseded` means a retry already resolved to a
+  // business-rule outcome -- both are "already handled, don't re-dispatch".
+  //
+  // `dispatch_failed_exhausted` is deliberately EXCLUDED: for reasons whose
+  // idempotency key omits the head sha (e.g. github_pr_synchronized, keyed
+  // by repo+prNumber+reason alone -- see buildPrReviewerWakeIdempotencyKey),
+  // including it here would let one exhausted retry chain permanently block
+  // every future same-reason event on that PR, since reconciliation never
+  // re-arms eligibility for new events once a row is exhausted. A fresh
+  // webhook event deserves its own attempt; the taskKey-scoped coalescing in
+  // enqueueWakeup already prevents any real duplicate execution if the
+  // exhausted retry chain and the fresh attempt ever raced.
+  "dispatch_failed",
+  "dispatch_recovered",
+  "dispatch_superseded",
 ];
 
 function githubContextMetadata(context: ResolvedEventContext) {
