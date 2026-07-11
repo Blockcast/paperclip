@@ -423,4 +423,63 @@ describe("stripRedactedEnvBindingsFromAdapterConfig — round-trip guard", () =>
       OPENAI_API_KEY: { type: "secret_ref", secretId: "11111111-1111-4111-8111-111111111111" },
     });
   });
+
+  it("preserves nested values returned as the recursive redaction sentinel", () => {
+    const incoming = {
+      model: "openai/gpt-5.6-sol",
+      mcpServers: {
+        gbrain: {
+          type: "http",
+          url: "http://gbrain.example/mcp",
+          headers: { Authorization: "***REDACTED***" },
+        },
+      },
+    };
+    const existing = {
+      model: "openai/gpt-5.5",
+      mcpServers: {
+        gbrain: {
+          type: "http",
+          url: "http://gbrain.example/mcp",
+          headers: { Authorization: "Bearer gbrain_at_existing" },
+        },
+      },
+    };
+
+    expect(stripRedactedEnvBindingsFromAdapterConfig(incoming, existing)).toEqual({
+      model: "openai/gpt-5.6-sol",
+      mcpServers: {
+        gbrain: {
+          type: "http",
+          url: "http://gbrain.example/mcp",
+          headers: { Authorization: "Bearer gbrain_at_existing" },
+        },
+      },
+    });
+  });
+
+  it("preserves nested plain bindings returned with a redacted value", () => {
+    const incoming = {
+      credentials: { type: "plain", value: "***REDACTED***" },
+    };
+    const existing = {
+      credentials: { type: "plain", value: "existing-secret" },
+    };
+
+    expect(stripRedactedEnvBindingsFromAdapterConfig(incoming, existing)).toEqual(existing);
+  });
+
+  it("drops recursive redaction sentinels that have no existing value", () => {
+    const incoming = {
+      model: "openai/gpt-5.6-sol",
+      mcpServers: {
+        gbrain: { headers: { Authorization: "***REDACTED***" } },
+      },
+    };
+
+    expect(stripRedactedEnvBindingsFromAdapterConfig(incoming, null)).toEqual({
+      model: "openai/gpt-5.6-sol",
+      mcpServers: { gbrain: { headers: {} } },
+    });
+  });
 });
