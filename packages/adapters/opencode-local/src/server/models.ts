@@ -50,6 +50,23 @@ function sortModels(models: AdapterModel[]): AdapterModel[] {
   );
 }
 
+function parseModelAllowlist(raw: string | undefined): Set<string> | null {
+  const ids = (raw ?? "")
+    .split(/[,\s]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return ids.length > 0 ? new Set(ids) : null;
+}
+
+export function filterOpenCodeModelsForConfiguredAllowlist(
+  models: AdapterModel[],
+  rawAllowlist = process.env.PAPERCLIP_OPENCODE_MODEL_ALLOWLIST,
+): AdapterModel[] {
+  const allowlist = parseModelAllowlist(rawAllowlist);
+  if (!allowlist) return models;
+  return models.filter((model) => allowlist.has(model.id));
+}
+
 function firstNonEmptyLine(text: string): string {
   return (
     text
@@ -221,7 +238,7 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
 
 export async function listOpenCodeModels(): Promise<AdapterModel[]> {
   try {
-    return await discoverOpenCodeModelsCached();
+    return filterOpenCodeModelsForConfiguredAllowlist(await discoverOpenCodeModelsCached());
   } catch {
     return [];
   }

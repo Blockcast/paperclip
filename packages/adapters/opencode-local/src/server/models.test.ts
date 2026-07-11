@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
+  filterOpenCodeModelsForConfiguredAllowlist,
   listOpenCodeModels,
   requireOpenCodeModelId,
   resetOpenCodeModelsCacheForTests,
@@ -73,5 +74,25 @@ describe("openCode models", () => {
         env: { OPENCODE_ALLOW_ALL_MODELS: "true" },
       }),
     ).rejects.toThrow("OpenCode requires `adapterConfig.model`");
+  });
+
+  it("filters discovered models when a deployment allowlist is configured", () => {
+    expect(
+      filterOpenCodeModelsForConfiguredAllowlist(
+        [
+          { id: "openai/gpt-5.6", label: "openai/gpt-5.6" },
+          { id: "openai/gpt-5.6-sol", label: "openai/gpt-5.6-sol" },
+          { id: "openai/gpt-5.6-sol-fast", label: "openai/gpt-5.6-sol-fast" },
+          { id: "openai/gpt-5.6-terra", label: "openai/gpt-5.6-terra" },
+          { id: "openai/gpt-5.6-luna", label: "openai/gpt-5.6-luna" },
+          { id: "openai/gpt-5.5", label: "openai/gpt-5.5" },
+        ],
+        "openai/gpt-5.6-sol, openai/gpt-5.6-terra openai/gpt-5.5",
+      ),
+    ).toEqual([
+      { id: "openai/gpt-5.6-sol", label: "openai/gpt-5.6-sol" },
+      { id: "openai/gpt-5.6-terra", label: "openai/gpt-5.6-terra" },
+      { id: "openai/gpt-5.5", label: "openai/gpt-5.5" },
+    ]);
   });
 });
