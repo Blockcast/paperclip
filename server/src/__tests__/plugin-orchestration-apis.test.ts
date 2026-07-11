@@ -863,6 +863,28 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     ).rejects.toThrow("Issue is blocked by unresolved blockers");
   });
 
+  it("allows plugin wakeups for assigned backlog issues (escalation ladders)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const backlogIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: backlogIssueId,
+      companyId,
+      title: "Untouched alert issue",
+      status: "backlog",
+      priority: "critical",
+      assigneeAgentId: agentId,
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    await expect(
+      services.issues.requestWakeup({
+        issueId: backlogIssueId,
+        companyId,
+        reason: "alert_escalation_deadline",
+      }),
+    ).resolves.toMatchObject({ queued: expect.any(Boolean) });
+  });
+
   it("narrows orchestration cost summaries by subtree and billing code", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const rootIssueId = randomUUID();

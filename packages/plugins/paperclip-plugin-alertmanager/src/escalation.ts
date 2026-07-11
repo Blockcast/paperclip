@@ -63,31 +63,76 @@ export async function runAlertEscalationSweep(ctx: PluginContext, config: Alertm
   if (!companyId) return;
   const issues = await ctx.issues.list({ companyId, originKind: ORIGIN_KIND, limit: 200 });
   for (const issue of issues) {
-    if (["done", "cancelled"].includes(issue.status) || !issue.originId) continue;
-    const ref = { scopeKind: "instance" as const, stateKey: STATE_KEYS.alert(issue.originId) };
-    const state = await ctx.state.get(ref) as AlertStateRecord | null;
-    if (!state || state.resolvedAt || state.escalationComplete || !state.nextEscalationAt || Date.parse(state.nextEscalationAt) > now.getTime()) continue;
-    const hold = holdUntil(await ctx.issues.listComments(issue.id, companyId));
-    if (hold && hold > now.getTime()) {
-      await ctx.state.set(ref, { ...state, nextEscalationAt: new Date(hold).toISOString() });
-      continue;
+    try {
+      await advanceIssueLadder(ctx, config, issue, companyId, now);
+    } catch (err) {
+      // One broken issue must not stall the sweep for the rest of the fleet
+      // (live incident 2026-07-11: a throwing requestWakeup aborted the whole
+      // sweep before the state write, repeating rung 1 every minute).
+      ctx.logger.warn(`alert-escalation: skipping issue ${issue.identifier ?? issue.id}: ${String(err)}`);
     }
-    const attempt = state.escalationAttempt ?? 0;
-    const current = issue.assigneeAgentId ? await ctx.agents.get(issue.assigneeAgentId, companyId) : null;
-    if (attempt === 0 && current) {
-      await ctx.issues.createComment(issue.id, `[alert-escalation 1/${MAX_ATTEMPTS}] Alert is still firing; waking current owner ${current.name}.`, companyId);
-      await ctx.issues.requestWakeup(issue.id, companyId, { reason: "alert_escalation_deadline", contextSource: "alertmanager-escalation", idempotencyKey: `alert-escalation:${issue.id}:1` });
-    } else if (current?.reportsTo && attempt < MAX_ATTEMPTS) {
-      const manager = await ctx.agents.get(current.reportsTo, companyId);
-      await ctx.issues.update(issue.id, { assigneeAgentId: current.reportsTo, assigneeUserId: null }, companyId);
-      await ctx.issues.createComment(issue.id, `[alert-escalation ${attempt + 1}/${MAX_ATTEMPTS}] Alert remains firing; reassigned from ${current.name} to ${manager?.name ?? current.reportsTo}.`, companyId);
-    } else {
-      await createCover(ctx, issue, companyId);
-      await ctx.issues.createComment(issue.id, "[alert-escalation] Agent chain exhausted while alert remains firing; created a [user-cover] escalation.", companyId);
-      await ctx.state.set(ref, { ...state, escalationAttempt: MAX_ATTEMPTS, escalationComplete: true, nextEscalationAt: null });
-      continue;
-    }
-    const next = attempt + 1;
-    await ctx.state.set(ref, { ...state, escalationAttempt: next, escalationComplete: false, nextEscalationAt: new Date(now.getTime() + rungIntervalMs(state, config)).toISOString() });
+  }
+}
+
+type SweepIssue = Awaited<ReturnType<PluginContext["issues"]["list"]>>[number];
+
+async function advanceIssueLadder(
+  ctx: PluginContext,
+  config: AlertmanagerPluginConfig,
+  issue: SweepIssue,
+  companyId: string,
+  now: Date,
+): Promise<void> {
+  if (["done", "cancelled"].includes(issue.status) || !issue.originId) return;
+  const ref = { scopeKind: "instance" as const, stateKey: STATE_KEYS.alert(issue.originId) };
+  const state = await ctx.state.get(ref) as AlertStateRecord | null;
+  if (!state || state.resolvedAt || state.escalationComplete || !state.nextEscalationAt || Date.parse(state.nextEscalationAt) > now.getTime()) return;
+  const hold = holdUntil(await ctx.issues.listComments(issue.id, companyId));
+  if (hold && hold > now.getTime()) {
+    await ctx.state.set(ref, { ...state, nextEscalationAt: new Date(hold).toISOString() });
+    return;
+  }
+  const attempt = state.escalationAttempt ?? 0;
+  const current = issue.assigneeAgentId ? await ctx.agents.get(issue.assigneeAgentId, companyId) : null;
+
+  if (!(attempt === 0 && current) && !(current?.reportsTo && attempt < MAX_ATTEMPTS)) {
+    // Chain exhausted (or no agent owner at all): board cover. Cover creation
+    // stays ahead of the state write — it dedups via originKind/originId, so a
+    // partial failure retries next sweep instead of silently never covering.
+    await createCover(ctx, issue, companyId);
+    await ctx.issues.createComment(issue.id, "[alert-escalation] Agent chain exhausted while alert remains firing; created a [user-cover] escalation.", companyId);
+    await ctx.state.set(ref, { ...state, escalationAttempt: MAX_ATTEMPTS, escalationComplete: true, nextEscalationAt: null });
+    return;
+  }
+
+  // Persist the advanced rung BEFORE side effects: a failing comment or wake
+  // then degrades to a missed notification on this rung, never a per-sweep
+  // repeat of the same rung (comment storm). The reassign rung re-reads the
+  // live assignee next time, so an interrupted rung self-heals upward.
+  const next = attempt + 1;
+  await ctx.state.set(ref, { ...state, escalationAttempt: next, escalationComplete: false, nextEscalationAt: new Date(now.getTime() + rungIntervalMs(state, config)).toISOString() });
+
+  if (attempt === 0 && current) {
+    await ctx.issues.createComment(issue.id, `[alert-escalation 1/${MAX_ATTEMPTS}] Alert is still firing; waking current owner ${current.name}.`, companyId);
+    await requestWakeupBestEffort(ctx, issue, companyId, next);
+  } else if (current?.reportsTo) {
+    const manager = await ctx.agents.get(current.reportsTo, companyId);
+    await ctx.issues.update(issue.id, { assigneeAgentId: current.reportsTo, assigneeUserId: null }, companyId);
+    await ctx.issues.createComment(issue.id, `[alert-escalation ${next}/${MAX_ATTEMPTS}] Alert remains firing; reassigned from ${current.name} to ${manager?.name ?? current.reportsTo}.`, companyId);
+    // Plugin-side issues.update does not fire core's assignment wake, so the
+    // new owner is woken explicitly — otherwise the reassignment just sits in
+    // their backlog until the next scheduled heartbeat.
+    await requestWakeupBestEffort(ctx, issue, companyId, next);
+  }
+}
+
+async function requestWakeupBestEffort(ctx: PluginContext, issue: SweepIssue, companyId: string, rung: number): Promise<void> {
+  try {
+    await ctx.issues.requestWakeup(issue.id, companyId, { reason: "alert_escalation_deadline", contextSource: "alertmanager-escalation", idempotencyKey: `alert-escalation:${issue.id}:${rung}` });
+  } catch (err) {
+    // The escalation comment already landed and the ladder state already
+    // advanced; a refused wake (paused agent, budget block) must not repeat
+    // the rung.
+    ctx.logger.warn(`alert-escalation: wakeup for ${issue.identifier ?? issue.id} rung ${rung} failed: ${String(err)}`);
   }
 }
