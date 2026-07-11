@@ -34,8 +34,9 @@ See `docs/specs/2026-04-29-alertmanager-plugin-spec.md` for the full design.
 ## Configuration
 
 Unresolved alert issues are checked once per minute and escalate through the
-assigned agent's `reportsTo` chain. The first deadline wakes the current owner,
-later checks reassign up the chain, and an exhausted chain creates a board-owned
+assigned agent's `reportsTo` chain, one rung per deadline interval. The first
+deadline wakes the current owner; each subsequent full interval reassigns one
+level up the chain, and an exhausted chain creates a board-owned
 `[user-cover]` issue. Critical alerts default to 30 minutes and warnings to 240
 minutes. Override these globally with `escalationDeadlineMinutes` or per route
 with `issueRouteMap.<label>.<value>.escalationDeadlineMinutes`. Repeat firing

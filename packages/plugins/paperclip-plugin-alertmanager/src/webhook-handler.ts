@@ -165,6 +165,9 @@ export async function handleFiring(
         : existing.nextEscalationAt,
       escalationAttempt: existing.resolvedAt ? 0 : existing.escalationAttempt,
       escalationComplete: existing.resolvedAt ? false : existing.escalationComplete,
+      escalationIntervalMs: existing.resolvedAt
+        ? escalationDeadlineMs(alert, config)
+        : (existing.escalationIntervalMs ?? escalationDeadlineMs(alert, config)),
     };
     await ctx.state.set(stateRef, updated);
 
@@ -279,6 +282,7 @@ export async function handleFiring(
     })(),
     escalationAttempt: 0,
     escalationComplete: false,
+    escalationIntervalMs: escalationDeadlineMs(alert, config),
   };
   await ctx.state.set(stateRef, record);
 

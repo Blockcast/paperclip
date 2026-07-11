@@ -62,6 +62,19 @@ describe("alert escalation", () => {
     expect(second.mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
   });
 
+  it("re-arms each rung a full deadline interval out, not one sweep tick", async () => {
+    const due = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 0 };
+    const { ctx, mocks } = sweepContext(due);
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+    // critical default = 30m: next rung fires at 01:30, so the chain climbs one
+    // level per deadline period rather than one level per minute-sweep.
+    expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 1, nextEscalationAt: "2026-07-11T01:30:00.000Z" }));
+    const stored = sweepContext({ ...due, escalationAttempt: 1, escalationIntervalMs: 5 * 60_000 });
+    await runAlertEscalationSweep(stored.ctx, config(), new Date("2026-07-11T01:00:00Z"));
+    // an interval captured at firing time (e.g. route override) wins over severity config
+    expect(stored.mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 2, nextEscalationAt: "2026-07-11T01:05:00.000Z" }));
+  });
+
   it("creates one board-owned user-cover issue at the top of chain", async () => {
     const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1 };
     const { ctx, mocks } = sweepContext(state, null);

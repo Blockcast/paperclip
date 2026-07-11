@@ -14,6 +14,20 @@ export function escalationDeadlineMs(alert: AlertmanagerAlert, config: Alertmana
   return typeof minutes === "number" && Number.isFinite(minutes) && minutes > 0 ? minutes * 60_000 : null;
 }
 
+/**
+ * Interval between ladder rungs for an already-tracked alert. Prefers the
+ * route/severity-resolved interval captured at firing time; state records
+ * written before that field existed fall back to severity config.
+ */
+function rungIntervalMs(state: AlertStateRecord, config: AlertmanagerPluginConfig): number {
+  if (typeof state.escalationIntervalMs === "number" && Number.isFinite(state.escalationIntervalMs) && state.escalationIntervalMs > 0) {
+    return state.escalationIntervalMs;
+  }
+  const minutes = config.escalationDeadlineMinutes?.[state.severity]
+    ?? DEFAULT_ESCALATION_DEADLINE_MINUTES[state.severity];
+  return typeof minutes === "number" && Number.isFinite(minutes) && minutes > 0 ? minutes * 60_000 : 60 * 60_000;
+}
+
 function holdUntil(comments: Array<{ body: string }>): number | null {
   let latest: number | null = null;
   for (const { body } of comments) {
@@ -74,6 +88,6 @@ export async function runAlertEscalationSweep(ctx: PluginContext, config: Alertm
       continue;
     }
     const next = attempt + 1;
-    await ctx.state.set(ref, { ...state, escalationAttempt: next, escalationComplete: false, nextEscalationAt: new Date(now.getTime() + 60_000).toISOString() });
+    await ctx.state.set(ref, { ...state, escalationAttempt: next, escalationComplete: false, nextEscalationAt: new Date(now.getTime() + rungIntervalMs(state, config)).toISOString() });
   }
 }

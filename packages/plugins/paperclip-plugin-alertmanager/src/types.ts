@@ -170,6 +170,12 @@ export interface AlertStateRecord {
   nextEscalationAt?: string | null;
   escalationAttempt?: number;
   escalationComplete?: boolean;
+  /**
+   * Deadline interval captured at firing time (route/severity-resolved).
+   * Each ladder rung re-arms by this much — the route override is not
+   * recomputable in the sweep because alert labels are not persisted.
+   */
+  escalationIntervalMs?: number | null;
 }
 
 /**
