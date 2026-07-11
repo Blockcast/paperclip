@@ -265,6 +265,11 @@ env:
           name: paperclip-penstock-org-key
           key: token
           optional: true
+    # Keep OpenCode model pickers aligned with the models served by the
+    # Penstock route. `opencode models` also advertises generic/fast/pro/Luna
+    # aliases that this route does not currently serve.
+    - name: PAPERCLIP_OPENCODE_MODEL_ALLOWLIST
+      value: "openai/gpt-5.6-sol,openai/gpt-5.6-terra,openai/gpt-5.5"
     - name: PAPERCLIP_CODEX_PROVIDERS
       value: '{"providers":{"penstock":{"name":"Penstock OpenAI gateway","base_url":"https://api.penstock.run/v1","env_key":"OPENAI_API_KEY","wire_api":"responses"}},"model_provider":"penstock"}'
 
