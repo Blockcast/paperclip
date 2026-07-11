@@ -750,6 +750,13 @@ export async function refreshAdapterModels(type: string): Promise<{ id: string; 
   if (adapter.refreshModels) {
     const refreshed = await adapter.refreshModels();
     if (refreshed.length > 0) {
+      if (isOpenCodeAdapterType(type)) {
+        const discovered = adapter.listModels ? await adapter.listModels() : [];
+        return filterAdapterModelsForConfiguredAllowlist(
+          type,
+          dedupeAdapterModels([...refreshed, ...discovered, ...(adapter.models ?? [])]),
+        );
+      }
       return filterAdapterModelsForConfiguredAllowlist(type, refreshed);
     }
   }
