@@ -99,6 +99,7 @@ import {
   testEnvironment as openCodeTestEnvironment,
   sessionCodec as openCodeSessionCodec,
   listOpenCodeModels,
+  filterOpenCodeModelsForConfiguredAllowlist,
 } from "@paperclipai/adapter-opencode-local/server";
 import {
   agentConfigurationDoc as openCodeAgentConfigurationDoc,
@@ -712,18 +713,35 @@ function getDeclaredAdapterModels(): ReturnType<typeof parseAdapterModelsEnv> {
   return value;
 }
 
+function isOpenCodeAdapterType(type: string): boolean {
+  return type === "opencode_local" || type.startsWith("opencode_");
+}
+
+function filterAdapterModelsForConfiguredAllowlist(
+  type: string,
+  models: { id: string; label: string }[],
+): { id: string; label: string }[] {
+  if (!isOpenCodeAdapterType(type)) return models;
+  return filterOpenCodeModelsForConfiguredAllowlist(models);
+}
+
 export async function listAdapterModels(type: string): Promise<{ id: string; label: string }[]> {
   const declaredModels = getDeclaredAdapterModels();
   if (declaredModels && declaredModels[type]?.length) {
-    return declaredModels[type].map((m) => ({ id: m.id, label: m.label ?? m.id }));
+    return filterAdapterModelsForConfiguredAllowlist(
+      type,
+      declaredModels[type].map((m) => ({ id: m.id, label: m.label ?? m.id })),
+    );
   }
   const adapter = findActiveServerAdapter(type);
   if (!adapter) return [];
   if (adapter.listModels) {
     const discovered = await adapter.listModels();
-    if (discovered.length > 0) return discovered;
+    if (discovered.length > 0) {
+      return filterAdapterModelsForConfiguredAllowlist(type, discovered);
+    }
   }
-  return adapter.models ?? [];
+  return filterAdapterModelsForConfiguredAllowlist(type, adapter.models ?? []);
 }
 
 export async function refreshAdapterModels(type: string): Promise<{ id: string; label: string }[]> {
@@ -731,13 +749,17 @@ export async function refreshAdapterModels(type: string): Promise<{ id: string; 
   if (!adapter) return [];
   if (adapter.refreshModels) {
     const refreshed = await adapter.refreshModels();
-    if (refreshed.length > 0) return refreshed;
+    if (refreshed.length > 0) {
+      return filterAdapterModelsForConfiguredAllowlist(type, refreshed);
+    }
   }
   if (adapter.listModels) {
     const discovered = await adapter.listModels();
-    if (discovered.length > 0) return discovered;
+    if (discovered.length > 0) {
+      return filterAdapterModelsForConfiguredAllowlist(type, discovered);
+    }
   }
-  return adapter.models ?? [];
+  return filterAdapterModelsForConfiguredAllowlist(type, adapter.models ?? []);
 }
 
 export async function listAdapterModelProfiles(type: string): Promise<AdapterModelProfileDefinition[]> {
