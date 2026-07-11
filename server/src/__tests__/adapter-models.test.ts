@@ -9,7 +9,14 @@ import { resetClaudeModelsCacheForTests } from "@paperclipai/adapter-claude-loca
 import { models as cursorFallbackModels } from "@paperclipai/adapter-cursor-local";
 import { models as opencodeFallbackModels } from "@paperclipai/adapter-opencode-local";
 import { resetOpenCodeModelsCacheForTests } from "@paperclipai/adapter-opencode-local/server";
-import { listAdapterModels, listServerAdapters, refreshAdapterModels } from "../adapters/index.js";
+import {
+  listAdapterModels,
+  listServerAdapters,
+  refreshAdapterModels,
+  registerServerAdapter,
+  unregisterServerAdapter,
+} from "../adapters/index.js";
+import type { ServerAdapterModule } from "../adapters/index.js";
 import { resetCodexModelsCacheForTests } from "../adapters/codex-models.js";
 import { resetCursorModelsCacheForTests, setCursorModelsRunnerForTests } from "../adapters/cursor-models.js";
 
@@ -28,11 +35,13 @@ describe("adapter model listing", () => {
     delete process.env.ANTHROPIC_BEDROCK_BASE_URL;
     delete process.env.CLAUDE_CODE_USE_BEDROCK;
     delete process.env.PAPERCLIP_OPENCODE_COMMAND;
+    delete process.env.PAPERCLIP_OPENCODE_MODEL_ALLOWLIST;
     resetClaudeModelsCacheForTests();
     resetCodexModelsCacheForTests();
     resetCursorModelsCacheForTests();
     setCursorModelsRunnerForTests(null);
     resetOpenCodeModelsCacheForTests();
+    unregisterServerAdapter("opencode_k8s");
     vi.restoreAllMocks();
   });
 
@@ -233,6 +242,45 @@ describe("adapter model listing", () => {
     const models = await listAdapterModels("opencode_local");
 
     expect(models).toEqual(opencodeFallbackModels);
+  });
+
+  it("applies the OpenCode model allowlist to external opencode adapter discovery", async () => {
+    process.env.PAPERCLIP_OPENCODE_MODEL_ALLOWLIST = "openai/gpt-5.6-sol,openai/gpt-5.6-terra openai/gpt-5.5";
+    const adapter: ServerAdapterModule = {
+      type: "opencode_k8s",
+      execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
+      testEnvironment: async () => ({
+        adapterType: "opencode_k8s",
+        status: "pass",
+        checks: [],
+        testedAt: new Date(0).toISOString(),
+      }),
+      listModels: async () => [
+        { id: "openai/gpt-5.6", label: "openai/gpt-5.6" },
+        { id: "openai/gpt-5.6-sol", label: "openai/gpt-5.6-sol" },
+        { id: "openai/gpt-5.6-sol-fast", label: "openai/gpt-5.6-sol-fast" },
+        { id: "openai/gpt-5.6-terra", label: "openai/gpt-5.6-terra" },
+        { id: "openai/gpt-5.6-luna", label: "openai/gpt-5.6-luna" },
+        { id: "openai/gpt-5.5", label: "openai/gpt-5.5" },
+      ],
+      refreshModels: async () => [
+        { id: "openai/gpt-5.6-pro", label: "openai/gpt-5.6-pro" },
+        { id: "openai/gpt-5.6-sol", label: "openai/gpt-5.6-sol" },
+        { id: "openai/gpt-5.6-terra-fast", label: "openai/gpt-5.6-terra-fast" },
+        { id: "openai/gpt-5.6-terra", label: "openai/gpt-5.6-terra" },
+      ],
+    };
+    registerServerAdapter(adapter);
+
+    await expect(listAdapterModels("opencode_k8s")).resolves.toEqual([
+      { id: "openai/gpt-5.6-sol", label: "openai/gpt-5.6-sol" },
+      { id: "openai/gpt-5.6-terra", label: "openai/gpt-5.6-terra" },
+      { id: "openai/gpt-5.5", label: "openai/gpt-5.5" },
+    ]);
+    await expect(refreshAdapterModels("opencode_k8s")).resolves.toEqual([
+      { id: "openai/gpt-5.6-sol", label: "openai/gpt-5.6-sol" },
+      { id: "openai/gpt-5.6-terra", label: "openai/gpt-5.6-terra" },
+    ]);
   });
 
   it("loads cursor models dynamically and caches them", async () => {
