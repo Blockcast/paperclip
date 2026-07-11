@@ -31,6 +31,9 @@ export const OPENAI_PRICING_USD_PER_MTOK: Record<
 > = {
   // --- Original BLO-7436 entries (unverified; LiteLLM azure_ai/ variants
   // suggest 5.4/5.4-mini output may be understated — flagged for re-verify). ---
+  "openai/gpt-5.6-sol": { input: 5.0, cachedInput: 0.5, output: 30.0 },
+  "openai/gpt-5.6-terra": { input: 2.5, cachedInput: 0.25, output: 15.0 },
+  "openai/gpt-5.6-luna": { input: 1.0, cachedInput: 0.1, output: 6.0 },
   "openai/gpt-5.5": { input: 3.0, cachedInput: 0.3, output: 12.0 },
   "openai/gpt-5.4": { input: 2.5, cachedInput: 0.25, output: 10.0 },
   "openai/gpt-5.4-mini": { input: 0.5, cachedInput: 0.05, output: 2.0 },

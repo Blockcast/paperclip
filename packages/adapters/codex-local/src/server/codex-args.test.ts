@@ -109,6 +109,26 @@ describe("buildCodexExecArgs", () => {
     ]);
   });
 
+  it("keeps GPT-5.6 known models on the standard lane until fast mode is verified", () => {
+    const result = buildCodexExecArgs({
+      model: "gpt-5.6-sol",
+      fastMode: true,
+    });
+
+    expect(result.fastModeRequested).toBe(true);
+    expect(result.fastModeApplied).toBe(false);
+    expect(result.fastModeIgnoredReason).toContain(
+      "currently only supported on gpt-5.5, gpt-5.4 or manually configured model IDs",
+    );
+    expect(result.args).toEqual([
+      "exec",
+      "--json",
+      "--model",
+      "gpt-5.6-sol",
+      "-",
+    ]);
+  });
+
   it("adds --skip-git-repo-check when requested", () => {
     const result = buildCodexExecArgs(
       {
