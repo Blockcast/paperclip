@@ -3,6 +3,35 @@ import { classifyCostSource, computeOpenAICompatibleCost, OPENAI_PRICING_USD_PER
 import { models as openCodeModels, modelProfiles as openCodeModelProfiles } from "../index.js";
 
 describe("computeOpenAICompatibleCost", () => {
+  it("returns positive cost for gpt-5.6-sol with non-zero usage", () => {
+    const cost = computeOpenAICompatibleCost("openai/gpt-5.6-sol", {
+      inputTokens: 1_000_000,
+      cachedInputTokens: 0,
+      outputTokens: 1_000_000,
+    });
+    // openai/gpt-5.6-sol: $5/Mtok input + $30/Mtok output = $35.00
+    expect(cost).not.toBeNull();
+    expect(cost!).toBeCloseTo(35.0, 6);
+  });
+
+  it("prices GPT-5.6 Codex variants by their public tiers", () => {
+    expect(OPENAI_PRICING_USD_PER_MTOK["openai/gpt-5.6-sol"]).toEqual({
+      input: 5.0,
+      cachedInput: 0.5,
+      output: 30.0,
+    });
+    expect(OPENAI_PRICING_USD_PER_MTOK["openai/gpt-5.6-terra"]).toEqual({
+      input: 2.5,
+      cachedInput: 0.25,
+      output: 15.0,
+    });
+    expect(OPENAI_PRICING_USD_PER_MTOK["openai/gpt-5.6-luna"]).toEqual({
+      input: 1.0,
+      cachedInput: 0.1,
+      output: 6.0,
+    });
+  });
+
   it("returns positive cost for a known model with non-zero usage", () => {
     const cost = computeOpenAICompatibleCost("openai/gpt-5.5", {
       inputTokens: 1_000_000,
