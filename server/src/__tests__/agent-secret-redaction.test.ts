@@ -21,6 +21,16 @@ const baseAgent = {
   adapterType: "claude_local",
   adapterConfig: {
     cwd: "/workspace",
+    mcpServers: {
+      gbrain: {
+        type: "http",
+        url: "http://gbrain-mcp-admin.paperclip.svc.cluster.local:3130/mcp",
+        headers: {
+          Authorization: "Bearer gbrain_at_secret_12345",
+          "x-safe-routing-header": "paperclip",
+        },
+      },
+    },
     env: {
       OPENAI_API_KEY: "sk-secret-key-12345",
       ANTHROPIC_API_KEY: "sk-ant-secret-67890",
@@ -228,6 +238,21 @@ describe("agent secret redaction in API responses", () => {
     });
   });
 
+  it("GET /agents/me redacts nested MCP authorization headers", async () => {
+    const app = createApp(agentActor);
+    const res = await request(app).get("/api/agents/me");
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig.mcpServers.gbrain).toEqual({
+      type: "http",
+      url: "http://gbrain-mcp-admin.paperclip.svc.cluster.local:3130/mcp",
+      headers: {
+        Authorization: "***REDACTED***",
+        "x-safe-routing-header": "paperclip",
+      },
+    });
+  });
+
   it("GET /agents/:id redacts env values", async () => {
     const app = createApp(boardActor);
     const res = await request(app).get(`/api/agents/${agentId}`);
@@ -284,14 +309,24 @@ describe("agent secret redaction in API responses", () => {
   it("handles agents with no env in adapterConfig", async () => {
     mockAgentService.list.mockResolvedValue([{
       ...baseAgent,
-      adapterConfig: { cwd: "/workspace" },
+      adapterConfig: {
+        cwd: "/workspace",
+        mcpServers: {
+          gbrain: { headers: { Authorization: "Bearer nested-secret" } },
+        },
+      },
     }]);
 
     const app = createApp(boardActor);
     const res = await request(app).get(`/api/companies/${companyId}/agents`);
 
     expect(res.status).toBe(200);
-    expect(res.body[0].adapterConfig).toEqual({ cwd: "/workspace" });
+    expect(res.body[0].adapterConfig).toEqual({
+      cwd: "/workspace",
+      mcpServers: {
+        gbrain: { headers: { Authorization: "***REDACTED***" } },
+      },
+    });
   });
 });
 

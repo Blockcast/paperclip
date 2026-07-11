@@ -1601,13 +1601,16 @@ export function agentRoutes(
     let result = { ...agent };
     const config = asRecord(agent.adapterConfig);
     if (config) {
+      const redactedConfig = redactEventPayload(config) ?? {};
       const env = asRecord(config.env);
       if (env) {
         const redactedEnv: Record<string, string> = {};
         for (const key of Object.keys(env)) {
           redactedEnv[key] = REDACTED_ENV_SENTINEL;
         }
-        result.adapterConfig = { ...config, env: redactedEnv } as T["adapterConfig"];
+        result.adapterConfig = { ...redactedConfig, env: redactedEnv } as T["adapterConfig"];
+      } else {
+        result.adapterConfig = redactedConfig as T["adapterConfig"];
       }
     }
     const rtConfig = asRecord(agent.runtimeConfig);
