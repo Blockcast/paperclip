@@ -21,6 +21,7 @@ export interface EvidenceFetchResult {
   doneWhenBulletsRemoved?: boolean;
   labels: Array<{ name: string }>;
   comments: EvidenceCommentLite[];
+  operatorOverrideComments?: EvidenceCommentLite[];
   workProducts: Array<{
     type: string;
     metadata: Record<string, unknown> | null;
@@ -30,6 +31,7 @@ export interface EvidenceFetchResult {
 
 export type FetchEvidenceForGate = (
   issueId: string,
+  now: Date,
 ) => Promise<EvidenceFetchResult>;
 
 export interface EvidenceVerdictRecord {
@@ -68,8 +70,8 @@ export async function runEvidenceGate(
   issueId: string,
   now: Date = new Date(),
 ): Promise<EvidenceVerdictRecord> {
-  const data = await fetch(issueId);
-  const override = data.comments
+  const data = await fetch(issueId, now);
+  const override = (data.operatorOverrideComments ?? data.comments)
     .filter((comment) => comment.authorUserId !== null && comment.authorAgentId === null)
     .map((comment) => ({
       createdAt: new Date(comment.createdAt).getTime(),

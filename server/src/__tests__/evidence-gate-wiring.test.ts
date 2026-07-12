@@ -37,7 +37,7 @@ describe("runEvidenceGate", () => {
     );
     const fixedNow = new Date("2026-05-11T22:00:00.000Z");
     const result = await runEvidenceGate(fetch, "issue-1", fixedNow);
-    expect(fetch).toHaveBeenCalledWith("issue-1");
+    expect(fetch).toHaveBeenCalledWith("issue-1", fixedNow);
     expect(result.verdict).toBe("pass");
     expect(result.missing).toEqual([]);
     expect(result.unlabeledFallback).toBe(false);
@@ -93,6 +93,35 @@ describe("runEvidenceGate", () => {
       overridden: true,
       overrideReason: "incident response requires landing now",
       missing: [],
+    });
+  });
+
+  it("finds an operator override outside the evaluator comment window", async () => {
+    const override = {
+      body: "evidence-gate: override incident response requires landing now",
+      authorAgentId: null,
+      authorUserId: "operator-1",
+      createdAt: "2026-05-11T21:30:00.000Z",
+    };
+    const fetch = vi.fn<(id: string) => Promise<EvidenceFetchResult>>(async () => ({
+      description: FRONTEND_DONE_WHEN,
+      labels: [{ name: "frontend" }],
+      comments: Array.from({ length: 10 }, (_, index) => ({
+        body: `later agent comment ${index}`,
+        authorAgentId: "agent-1",
+        authorUserId: null,
+        createdAt: `2026-05-11T21:4${index}:00.000Z`,
+      })),
+      operatorOverrideComments: [override],
+      workProducts: [],
+    }));
+
+    const result = await runEvidenceGate(fetch, "issue-displaced-override", new Date("2026-05-11T22:00:00.000Z"));
+
+    expect(result).toMatchObject({
+      verdict: "pass",
+      overridden: true,
+      overrideReason: "incident response requires landing now",
     });
   });
 

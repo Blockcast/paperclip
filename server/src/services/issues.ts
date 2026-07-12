@@ -1472,17 +1472,18 @@ async function withIssueLabels(dbOrTx: any, rows: IssueRow[]): Promise<IssueWith
 
 /**
  * Evidence-gate fetcher (BLO-4824 / BLO-4461). Loads the data the pure
- * evaluator needs: issue labels, the 10 most-recent comments, and any
- * work_products. Caller supplies the description (already on the existing
- * row in the PATCH handler, no need to re-select).
+ * evaluator needs: issue labels, the 10 most-recent comments, any recent
+ * operator overrides, and any work_products. Caller supplies the description
+ * (already on the existing row in the PATCH handler, no need to re-select).
  */
 async function fetchEvidenceForIssue(
   dbOrTx: any,
   issueId: string,
   description: string | null,
   previousDescription: string | null = description,
+  now: Date = new Date(),
 ): Promise<EvidenceFetchResult> {
-  const [recentComments, workProductRows, labelsByIssueId, descriptionHistory] = await Promise.all([
+  const [recentComments, operatorOverrideComments, workProductRows, labelsByIssueId, descriptionHistory] = await Promise.all([
     dbOrTx
       .select({
         body: issueComments.body,
@@ -1494,6 +1495,23 @@ async function fetchEvidenceForIssue(
       .where(eq(issueComments.issueId, issueId))
       .orderBy(desc(issueComments.createdAt))
       .limit(10),
+    dbOrTx
+      .select({
+        body: issueComments.body,
+        authorAgentId: issueComments.authorAgentId,
+        authorUserId: issueComments.authorUserId,
+        createdAt: issueComments.createdAt,
+      })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.issueId, issueId),
+        isNotNull(issueComments.authorUserId),
+        isNull(issueComments.authorAgentId),
+        like(issueComments.body, "evidence-gate: override %"),
+        sql`${issueComments.createdAt} >= ${new Date(now.getTime() - 60 * 60 * 1000)}`,
+        sql`${issueComments.createdAt} <= ${now}`,
+      ))
+      .orderBy(desc(issueComments.createdAt)),
     dbOrTx
       .select({
         type: issueWorkProducts.type,
@@ -1527,6 +1545,7 @@ async function fetchEvidenceForIssue(
       countDoneWhenBullets(description ?? "") === 0 && hadPriorDoneWhenBullets,
     labels: issueLabels.map((l: { name: string }) => ({ name: l.name })),
     comments: recentComments as EvidenceFetchResult["comments"],
+    operatorOverrideComments: operatorOverrideComments as EvidenceFetchResult["operatorOverrideComments"],
     workProducts: workProductRows as EvidenceFetchResult["workProducts"],
   };
 }
@@ -6504,11 +6523,12 @@ export function issueService(db: Db) {
       if (experimental.enableDoneExecutionGate && shouldBlockNarratedDone(doneGateInput)) {
         try {
           doneTransitionEvidenceVerdict = await runEvidenceGate(
-            (issueId) => fetchEvidenceForIssue(
+            (issueId, now) => fetchEvidenceForIssue(
               dbOrTx,
               issueId,
               issueData.description !== undefined ? issueData.description : existing.description,
               existing.description,
+              now,
             ),
             id,
           );
@@ -6636,11 +6656,12 @@ export function issueService(db: Db) {
         let inReviewVerdict: Awaited<ReturnType<typeof runEvidenceGate>> | null = null;
         try {
           const verdict = await runEvidenceGate(
-            (issueId) => fetchEvidenceForIssue(
+            (issueId, now) => fetchEvidenceForIssue(
               dbOrTx,
               issueId,
               issueData.description !== undefined ? issueData.description : existing.description,
               existing.description,
+              now,
             ),
             id,
           );
