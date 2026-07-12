@@ -2992,6 +2992,8 @@ async function listIssueBlockedInboxAttentionMap(
         role: agents.role,
         title: agents.title,
         status: agents.status,
+        pauseReason: agents.pauseReason,
+        runtimeConfig: agents.runtimeConfig,
         reportsTo: agents.reportsTo,
       })
       .from(agents)
@@ -3007,6 +3009,8 @@ async function listIssueBlockedInboxAttentionMap(
     role: string;
     title: string | null;
     status: string;
+    pauseReason: string | null;
+    runtimeConfig: Record<string, unknown> | null;
     reportsTo: string | null;
   }>;
   const graphIssueIds = graphIssues.map((issue) => issue.id);

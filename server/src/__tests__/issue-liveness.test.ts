@@ -42,7 +42,6 @@ const manager = agent({
   role: "cto",
   reportsTo: null,
 });
-
 const blocks = [{ companyId, blockerIssueId: blockerId, blockedIssueId: blockedId }];
 
 describe("issue graph liveness classifier", () => {
@@ -271,6 +270,51 @@ describe("issue graph liveness classifier", () => {
       agents: [agent(), manager, agent({ id: "blocker-agent", name: "Paused", status: "paused" })],
     });
     expect(paused[0]?.state).toBe("blocked_by_uninvokable_assignee");
+  });
+
+  it("accepts intentionally non-executing attribution agents as blocker owners", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue(),
+        issue({
+          id: blockerId,
+          identifier: "PAP-1704",
+          title: "Operator-owned unblock work",
+          status: "todo",
+          assigneeAgentId: "operator-agent",
+        }),
+      ],
+      relations: blocks,
+      agents: [
+        agent(),
+        manager,
+        agent({
+          id: "operator-agent",
+          name: "Operator",
+          status: "paused",
+          pauseReason: "manual",
+          runtimeConfig: { heartbeat: { enabled: false } },
+        }),
+      ],
+    });
+
+    expect(findings).toEqual([]);
+  });
+
+  it("does not exempt paused agents unless the attribution contract is complete", () => {
+    for (const blockerAgent of [
+      agent({ id: "blocker-agent", status: "paused", pauseReason: "manual" }),
+      agent({ id: "blocker-agent", status: "paused", pauseReason: "budget", runtimeConfig: { heartbeat: { enabled: false } } }),
+      agent({ id: "blocker-agent", status: "paused", pauseReason: "manual", runtimeConfig: { heartbeat: { enabled: true } } }),
+    ]) {
+      const findings = classifyIssueGraphLiveness({
+        issues: [issue(), issue({ id: blockerId, status: "todo", assigneeAgentId: "blocker-agent" })],
+        relations: blocks,
+        agents: [agent(), manager, blockerAgent],
+      });
+
+      expect(findings[0]?.state).toBe("blocked_by_uninvokable_assignee");
+    }
   });
 
   it("detects blocker assignees under terminated org ancestors as uninvokable", () => {
@@ -579,4 +623,3 @@ describe("issue graph liveness classifier", () => {
     expect(findings).toEqual([]);
   });
 });
-
