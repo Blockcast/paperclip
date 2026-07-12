@@ -43,6 +43,16 @@ describe("resolveRequiredShapes", () => {
     expect(required).toContain("screenshot:1440x900");
   });
 
+  it("normalizes whitespace and Unicode forms in label names", () => {
+    const registry = { "fróntend": DEFAULT_EVIDENCE_REGISTRY.frontend };
+    const { required, unlabeledFallback } = resolveRequiredShapes(
+      { labels: [{ name: " Fro\u0301ntEnd " }] },
+      registry,
+    );
+    expect(unlabeledFallback).toBe(false);
+    expect(required).toContain("screenshot:1440x900");
+  });
+
   it("falls back to weak default when no labels match", () => {
     const { required, unlabeledFallback } = resolveRequiredShapes(
       { labels: [{ name: "random-tag" }] },
@@ -243,10 +253,10 @@ describe("evaluateEvidence — unlabeled issue", () => {
     expect(result.missing).toEqual(["checklist:done-when"]);
   });
 
-  it("requires a pr-link (not a vacuous checklist) when unlabeled issue has no Done-when section", () => {
+  it("does not vacuously satisfy the fallback checklist without Done-when bullets", () => {
     // The narrated-in_review hole: with no Done-when section the checklist
     // shape used to pass vacuously, letting analysis-only agent runs reach
-    // in_review with zero artifacts. The fallback now substitutes pr-link.
+    // in_review with zero artifacts.
     const result = evaluateEvidence({
       issue: { description: "## Goal\njust do it", labels: [] },
       comments: [agentComment("done")],
@@ -255,22 +265,23 @@ describe("evaluateEvidence — unlabeled issue", () => {
     });
     expect(result.verdict).toBe("warn");
     expect(result.unlabeledFallback).toBe(true);
-    expect(result.missing).toEqual(["pr-link"]);
+    expect(result.missing).toEqual(["checklist:done-when"]);
     expect(result.evidenceFound).not.toContain("checklist:done-when");
   });
 
-  it("passes when unlabeled issue with no Done-when section has a PR link", () => {
+  it("still requires the fallback checklist when an unlabeled issue has no Done-when section", () => {
     const result = evaluateEvidence({
       issue: { description: "## Goal\njust do it", labels: [] },
-      comments: [agentComment("Shipped: https://github.com/acme/repo/pull/123")],
+      comments: [agentComment("Shipped: https://github.com/Blockcast/paperclip/pull/123")],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
     });
-    expect(result.verdict).toBe("pass");
-    expect(result.evidenceFound).toContain("pr-link");
+    expect(result.verdict).toBe("warn");
+    expect(result.missing).toEqual(["checklist:done-when"]);
+    expect(result.allDetected).toContain("pr-link");
   });
 
-  it("requires pr-link when unlabeled issue has no description at all", () => {
+  it("requires checklist evidence when unlabeled issue has no description at all", () => {
     const result = evaluateEvidence({
       issue: { description: null, labels: [] },
       comments: [agentComment("done")],
@@ -278,21 +289,19 @@ describe("evaluateEvidence — unlabeled issue", () => {
       registry: DEFAULT_EVIDENCE_REGISTRY,
     });
     expect(result.verdict).toBe("warn");
-    expect(result.missing).toEqual(["pr-link"]);
+    expect(result.missing).toEqual(["checklist:done-when"]);
   });
 
-  it("drops the inapplicable checklist shape for labeled issues with no Done-when section", () => {
-    // backend requires [test-output, checklist:done-when]; without a
-    // Done-when section the checklist is undetectable, so only the
-    // test-output shape should gate (not an unsatisfiable checklist).
+  it("blocks labeled issues when required Done-when criteria are absent", () => {
     const result = evaluateEvidence({
       issue: { description: "## Goal\nfix the thing", labels: [{ name: "backend" }] },
       comments: [agentComment("Test Files  3 passed (3)")],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
     });
-    expect(result.verdict).toBe("pass");
-    expect(result.missing).toEqual([]);
+    expect(result.verdict).toBe("block");
+    expect(result.missing).toEqual(["checklist:done-when"]);
+    expect(result.diagnostics).toContain("missing-done-when-bullets");
   });
 });
 
@@ -338,7 +347,17 @@ describe("evaluateEvidence — infra label", () => {
       registry: DEFAULT_EVIDENCE_REGISTRY,
     });
     expect(result.verdict).toBe("block");
-    expect(result.missing).toEqual(["probe-output"]);
+    expect(result.missing).toEqual(expect.arrayContaining(["kubectl-state", "probe-output"]));
+  });
+
+  it("does not accept bare JSON health status as probe output", () => {
+    const result = evaluateEvidence({
+      issue: { description: "## Done when\n- probe healthy", labels: [{ name: "infra" }] },
+      comments: [agentComment('{"status":"ok"}')],
+      workProducts: [],
+      registry: { infra: { required: ["probe-output"] } },
+    });
+    expect(result.verdict).toBe("block");
   });
 });
 
@@ -356,6 +375,27 @@ describe("evaluateEvidence — PR + e2e", () => {
       registry: DEFAULT_EVIDENCE_REGISTRY,
     });
     expect(result.verdict).toBe("pass");
+  });
+
+  it("accepts a well-formed PR URL from another repository by default", () => {
+    const result = evaluateEvidence({
+      issue: { description: "## Done when\n- PR opened", labels: [{ name: "pr" }] },
+      comments: [agentComment("https://github.com/Blockcast/onprem-k8s/pull/1316")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.verdict).toBe("pass");
+  });
+
+  it("blocks PR URLs outside an explicitly configured repository allowlist", () => {
+    const result = evaluateEvidence({
+      issue: { description: "## Done when\n- PR opened", labels: [{ name: "pr" }] },
+      comments: [agentComment("https://github.com/acme/repo/pull/132")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      allowedPrRepos: ["Blockcast/paperclip", "kkroo/paperclip"],
+    });
+    expect(result.verdict).toBe("block");
   });
 
   it("detects e2e-script work_product as evidence (for issues that need it)", () => {
@@ -611,7 +651,7 @@ describe("evaluateEvidence — additional shape coverage (review-driven)", () =>
     expect(result.verdict).toBe("pass");
   });
 
-  it("known Phase-1 looseness (BLO-4828 will tighten): screenshot looseFilename matches prose", () => {
+  it("blocks prose-only viewport claims without an image filename", () => {
     // Documents intentional Phase-1 leniency: a comment mentioning
     // "screenshot 1440x900" without an actual image satisfies the inline
     // detector. The gate is shape-only in Phase 1; QA Engineer (BLO-4827)
@@ -627,10 +667,10 @@ describe("evaluateEvidence — additional shape coverage (review-driven)", () =>
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
     });
-    expect(result.verdict).toBe("pass");
+    expect(result.verdict).toBe("block");
   });
 
-  it("known Phase-1 looseness (BLO-4828 will tighten): CI green substring matches prose", () => {
+  it("blocks CI-green prose without an allowlisted PR link", () => {
     // Documents intentional Phase-1 leniency: "TODO: make sure CI green" or
     // similar prose satisfies the detector. Phase-2 (BLO-4828) tightens this
     // to require co-occurrence with a PR link or a status URL. Flip this
@@ -645,7 +685,29 @@ describe("evaluateEvidence — additional shape coverage (review-driven)", () =>
       workProducts: [],
       registry: customRegistry,
     });
-    expect(result.verdict).toBe("pass");
+    expect(result.verdict).toBe("block");
+  });
+
+  it("does not count incomplete checkboxes or bare pass/fail words", () => {
+    const result = evaluateEvidence({
+      issue: { description: "## Done when\n- one\n- two", labels: [{ name: "checklist" }] },
+      comments: [agentComment("- [ ] one\n- [ ] two\n\n| one | pass |\n| two | fail |")],
+      workProducts: [],
+      registry: { checklist: { required: ["checklist:done-when"] } },
+    });
+    expect(result.verdict).toBe("block");
+  });
+
+  it("reports required and all detected shapes separately", () => {
+    const result = evaluateEvidence({
+      issue: { description: "## Done when\n- PR opened", labels: [{ name: "pr" }] },
+      comments: [agentComment("https://github.com/Blockcast/paperclip/pull/132\nTest Files 1 passed")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.requiredFound).toEqual(["pr-link"]);
+    expect(result.evidenceFound).toEqual(result.requiredFound);
+    expect(result.allDetected).toEqual(expect.arrayContaining(["pr-link", "test-output"]));
   });
 });
 

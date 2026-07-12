@@ -35,7 +35,10 @@ export interface EvidenceVerdictRecord {
   verdict: EvidenceVerdict;
   missing: string[];
   evidenceFound: string[];
+  requiredFound: string[];
+  allDetected: string[];
   unlabeledFallback: boolean;
+  diagnostics: string[];
   evaluatedAt: string;
 }
 
@@ -77,7 +80,10 @@ export async function runEvidenceGate(
     verdict: evaluation.verdict,
     missing: evaluation.missing,
     evidenceFound: evaluation.evidenceFound,
+    requiredFound: evaluation.requiredFound,
+    allDetected: evaluation.allDetected,
     unlabeledFallback: evaluation.unlabeledFallback,
+    diagnostics: evaluation.diagnostics,
     evaluatedAt: now.toISOString(),
   };
 }

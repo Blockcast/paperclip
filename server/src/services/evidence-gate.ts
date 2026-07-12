@@ -47,21 +47,32 @@ export interface EvaluateEvidenceInput {
   registry: EvidenceRegistry;
   /** Number of most-recent agent comments to concatenate when scanning. Default 10. */
   recentCommentLimit?: number;
+  /** Optional repositories whose PR URLs count as reviewable evidence. */
+  allowedPrRepos?: readonly string[];
 }
 
 export interface EvaluateEvidenceResult {
   verdict: EvidenceVerdict;
   /** Shapes that were required but not detected. Empty on `pass`. */
   missing: EvidenceShape[];
-  /** Shapes that were detected. */
+  /** Required shapes that were detected. */
   evidenceFound: EvidenceShape[];
+  /** Required shapes that were detected. */
+  requiredFound: EvidenceShape[];
+  /** All shapes detected, including shapes not required for this issue. */
+  allDetected: EvidenceShape[];
   /** Per-shape detection booleans, useful for UI debugging + tests. */
   shapeDetections: Record<EvidenceShape, boolean>;
   /** True when the issue's labels did not match any registry entry. */
   unlabeledFallback: boolean;
+  /** Suspicious or degraded inputs that callers should log. */
+  diagnostics: string[];
 }
 
 const DEFAULT_RECENT_COMMENT_LIMIT = 10;
+function normalizeLabel(value: string): string {
+  return value.trim().normalize("NFC").toLocaleLowerCase("en-US");
+}
 
 const ALL_SHAPES: readonly EvidenceShape[] = [
   "screenshot:1440x900",
@@ -89,13 +100,13 @@ export function resolveRequiredShapes(
 ): { required: EvidenceShape[]; unlabeledFallback: boolean } {
   const lowerRegistry: EvidenceRegistry = {};
   for (const [key, entry] of Object.entries(registry)) {
-    lowerRegistry[key.toLowerCase()] = entry;
+    lowerRegistry[normalizeLabel(key)] = entry;
   }
 
   const union = new Set<EvidenceShape>();
   let matchedAnyLabel = false;
   for (const label of issue.labels) {
-    const entry = lowerRegistry[label.name.toLowerCase()];
+    const entry = lowerRegistry[normalizeLabel(label.name)];
     if (!entry) continue;
     matchedAnyLabel = true;
     for (const shape of entry.required) union.add(shape);
@@ -171,7 +182,7 @@ function detectScreenshotViewport(
   // 3. Filename/path reference near a screenshot / Playwright keyword.
   //    Matches "blog_listing_desktop_1440.png ... 1440x900" or similar.
   const looseFilename = new RegExp(
-    `\\b(?:screenshot|playwright|png|jpg|jpeg)\\b[\\s\\S]{0,200}\\b${w}\\s*[x_-]?\\s*${h}\\b|\\b${w}\\s*[x_-]?\\s*${h}\\b[\\s\\S]{0,200}\\b(?:screenshot|playwright|png|jpg|jpeg)\\b`,
+    `(?:\\b[\\w./-]+\\.(?:png|jpe?g|webp)\\b[\\s\\S]{0,200}\\b${w}\\s*[x_-]?\\s*${h}\\b|\\b${w}\\s*[x_-]?\\s*${h}\\b[\\s\\S]{0,200}\\b[\\w./-]+\\.(?:png|jpe?g|webp)\\b)`,
     "i",
   );
   return looseFilename.test(text);
@@ -194,14 +205,14 @@ function detectChecklistDoneWhen(
   if (doneWhenBullets === 0) return false;
 
   // A "checklist" is either:
-  //  (a) A markdown table with N >= doneWhenBullets rows that include a
-  //      status marker (✅/✓/✔/❌/✗/⏸ or [x]/[ ]/[X]) in any cell.
-  //  (b) A task-list with N >= doneWhenBullets `- [ ]` / `- [x]` lines.
+  //  (a) A markdown table with N >= doneWhenBullets rows that include an
+  //      explicit completion marker in any cell.
+  //  (b) A completed task-list with N >= doneWhenBullets `- [x]` lines.
 
-  const statusMarker = /✅|✓|✔|❌|✗|⏸|⏹|⚠️|\[\s\]|\[[xX]\]|\bpass\b|\bfail\b/;
+  const statusMarker = /✅|✓|✔|❌|✗|\[[xX]\]/;
 
   // (b) Task list count.
-  const taskListMatches = text.match(/^[-*]\s+\[[ xX]\]/gm);
+  const taskListMatches = text.match(/^[-*]\s+\[[xX]\]/gm);
   if (taskListMatches && taskListMatches.length >= doneWhenBullets) return true;
 
   // (a) Markdown table — count rows that contain a status marker.
@@ -245,7 +256,7 @@ function detectKubectlState(text: string): boolean {
   // Service / generic listing header.
   if (/^\s*NAME\s+TYPE\s+CLUSTER-IP/m.test(text)) return true;
   // Rollout output.
-  if (/\bdeployment\s+"[\w-]+"\s+successfully rolled out\b/i.test(text)) {
+  if (/```[^`]*\bdeployment\s+"[\w-]+"\s+successfully rolled out\b[^`]*```/i.test(text)) {
     return true;
   }
   return false;
@@ -259,7 +270,10 @@ function detectProbeOutput(text: string): boolean {
     /\b(?:curl|wget|http)\b[^\n]*\n[\s\S]{0,500}?(?:HTTP\/[\d.]+\s+\d{3}|^\{[\s\S]*?\}$|<\!?DOCTYPE|<html)/im;
   if (probeAndBody.test(text)) return true;
   // Healthz / status-endpoint output.
-  if (/"(?:status|state|ok)"\s*:\s*(?:"ok"|"healthy"|true)/i.test(text)) {
+  if (
+    /\b(?:curl|wget)\b|HTTP\/1\.1/i.test(text) &&
+    /"(?:status|state|ok)"\s*:\s*(?:"ok"|"healthy"|true)/i.test(text)
+  ) {
     return true;
   }
   return false;
@@ -269,11 +283,16 @@ function detectUrlProbe(text: string): boolean {
   return /\bcurl\b[^\n]+https?:\/\/[^\s]+/i.test(text);
 }
 
-function detectPrLink(text: string): boolean {
-  return /https?:\/\/github\.com\/[\w-]+\/[\w-]+\/pull\/\d+/i.test(text);
+function detectPrLink(text: string, allowedRepos?: readonly string[]): boolean {
+  const matches = text.matchAll(/https?:\/\/github\.com\/([\w-]+\/[\w.-]+)\/pull\/\d+/gi);
+  if (!allowedRepos) return !matches.next().done;
+
+  const allowed = new Set(allowedRepos.map((repo) => repo.toLocaleLowerCase("en-US")));
+  return Array.from(matches).some((match) => allowed.has(match[1]!.toLocaleLowerCase("en-US")));
 }
 
-function detectCiGreen(text: string): boolean {
+function detectCiGreen(text: string, allowedRepos?: readonly string[]): boolean {
+  if (!detectPrLink(text, allowedRepos)) return false;
   if (/All checks have passed/i.test(text)) return true;
   if (/"mergeable_state"\s*:\s*"clean"/i.test(text)) return true;
   if (/\bCI\s+green\b/i.test(text)) return true;
@@ -338,8 +357,9 @@ function detectAll(input: {
   issueDescription: string | null | undefined;
   text: string;
   workProducts: EvidenceWorkProductLite[];
+  allowedPrRepos?: readonly string[];
 }): { detections: Record<EvidenceShape, boolean>; found: EvidenceShape[] } {
-  const { issueDescription, text, workProducts } = input;
+  const { issueDescription, text, workProducts, allowedPrRepos } = input;
   const detections: Record<EvidenceShape, boolean> = {
     "screenshot:1440x900": detectScreenshotViewport(text, workProducts, "1440x900"),
     "screenshot:390x844": detectScreenshotViewport(text, workProducts, "390x844"),
@@ -348,8 +368,8 @@ function detectAll(input: {
     "kubectl-state": detectKubectlState(text),
     "probe-output": detectProbeOutput(text),
     "url-probe": detectUrlProbe(text),
-    "pr-link": detectPrLink(text),
-    "ci-green": detectCiGreen(text),
+    "pr-link": detectPrLink(text, allowedPrRepos),
+    "ci-green": detectCiGreen(text, allowedPrRepos),
     "e2e-script": detectE2eScript(text, workProducts),
     "e2e-run": detectE2eRun(workProducts, text),
     "migration-output": detectMigrationOutput(text),
@@ -373,35 +393,34 @@ export function evaluateEvidence(
   input: EvaluateEvidenceInput,
 ): EvaluateEvidenceResult {
   const limit = input.recentCommentLimit ?? DEFAULT_RECENT_COMMENT_LIMIT;
+  const diagnostics: string[] = [];
+  if (Object.keys(input.registry).length === 0) diagnostics.push("empty-registry");
+  if (input.comments.some((comment) => !Number.isFinite(new Date(comment.createdAt).getTime()))) {
+    diagnostics.push("invalid-comment-timestamp");
+  }
   const text = buildAgentEvidenceText(input.comments, limit);
   const resolved = resolveRequiredShapes(input.issue, input.registry);
   const { unlabeledFallback } = resolved;
-  let required = resolved.required;
+  const required = resolved.required;
 
-  // Done-when applicability: `checklist:done-when` only means something when
-  // the issue actually has a `## Done when` section to check against. When it
-  // doesn't, the shape is undetectable — drop it from the required set rather
-  // than letting it vacuously pass (the narrated-in_review hole: an unlabeled
-  // issue with no criteria reached `pass` with zero artifacts). Labeled
-  // issues simply lose the inapplicable shape (their other shapes carry the
-  // signal); the unlabeled fallback substitutes `pr-link`, because with no
-  // criteria to check, a PR is the only reviewable receipt.
   const doneWhenApplicable =
     !!input.issue.description && countDoneWhenBullets(input.issue.description) > 0;
   if (!doneWhenApplicable && required.includes("checklist:done-when")) {
-    required = required.filter((s) => s !== "checklist:done-when");
-    if (unlabeledFallback && !required.includes("pr-link")) {
-      required.push("pr-link");
-    }
+    diagnostics.push(input.issue.description ? "missing-done-when-bullets" : "missing-description");
+  }
+  if (unlabeledFallback && input.issue.labels.length > 0) {
+    diagnostics.push("unmatched-labels-used-fallback");
   }
 
   const { detections, found } = detectAll({
     issueDescription: input.issue.description,
     text,
     workProducts: input.workProducts,
+    allowedPrRepos: input.allowedPrRepos,
   });
 
   const missing = required.filter((s) => !detections[s]);
+  const requiredFound = required.filter((s) => detections[s]);
   let verdict: EvidenceVerdict;
   if (missing.length === 0) {
     verdict = "pass";
@@ -414,8 +433,11 @@ export function evaluateEvidence(
   return {
     verdict,
     missing,
-    evidenceFound: found,
+    evidenceFound: requiredFound,
+    requiredFound,
+    allDetected: found,
     shapeDetections: detections,
     unlabeledFallback,
+    diagnostics,
   };
 }
