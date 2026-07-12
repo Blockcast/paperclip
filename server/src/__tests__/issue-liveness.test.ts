@@ -42,7 +42,6 @@ const manager = agent({
   role: "cto",
   reportsTo: null,
 });
-
 const blocks = [{ companyId, blockerIssueId: blockerId, blockedIssueId: blockedId }];
 
 describe("issue graph liveness classifier", () => {
@@ -273,6 +272,51 @@ describe("issue graph liveness classifier", () => {
     expect(paused[0]?.state).toBe("blocked_by_uninvokable_assignee");
   });
 
+  it("accepts intentionally non-executing attribution agents as blocker owners", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue(),
+        issue({
+          id: blockerId,
+          identifier: "PAP-1704",
+          title: "Operator-owned unblock work",
+          status: "todo",
+          assigneeAgentId: "operator-agent",
+        }),
+      ],
+      relations: blocks,
+      agents: [
+        agent(),
+        manager,
+        agent({
+          id: "operator-agent",
+          name: "Operator",
+          status: "paused",
+          pauseReason: "manual",
+          runtimeConfig: { heartbeat: { enabled: false } },
+        }),
+      ],
+    });
+
+    expect(findings).toEqual([]);
+  });
+
+  it("does not exempt paused agents unless the attribution contract is complete", () => {
+    for (const blockerAgent of [
+      agent({ id: "blocker-agent", status: "paused", pauseReason: "manual" }),
+      agent({ id: "blocker-agent", status: "paused", pauseReason: "budget", runtimeConfig: { heartbeat: { enabled: false } } }),
+      agent({ id: "blocker-agent", status: "paused", pauseReason: "manual", runtimeConfig: { heartbeat: { enabled: true } } }),
+    ]) {
+      const findings = classifyIssueGraphLiveness({
+        issues: [issue(), issue({ id: blockerId, status: "todo", assigneeAgentId: "blocker-agent" })],
+        relations: blocks,
+        agents: [agent(), manager, blockerAgent],
+      });
+
+      expect(findings[0]?.state).toBe("blocked_by_uninvokable_assignee");
+    }
+  });
+
   it("detects blocker assignees under terminated org ancestors as uninvokable", () => {
     const findings = classifyIssueGraphLiveness({
       issues: [
@@ -299,6 +343,43 @@ describe("issue graph liveness classifier", () => {
     expect(findings[0]).toMatchObject({
       state: "blocked_by_uninvokable_assignee",
       reason: "PAP-1703 is blocked by PAP-1704, but its assignee is in an invalid org chain.",
+      recommendedOwnerAgentId: managerId,
+    });
+  });
+
+  it("does not exempt attribution agents under terminated org ancestors", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue(),
+        issue({
+          id: blockerId,
+          identifier: "PAP-1704",
+          title: "Invalid attribution tree unblock work",
+          status: "todo",
+          assigneeAgentId: "operator-agent",
+        }),
+      ],
+      relations: blocks,
+      agents: [
+        agent(),
+        manager,
+        agent({
+          id: "operator-agent",
+          name: "Operator",
+          status: "paused",
+          pauseReason: "manual",
+          runtimeConfig: { heartbeat: { enabled: false } },
+          reportsTo: "cto-2",
+        }),
+        agent({ id: "cto-2", name: "CTO 2", status: "terminated", reportsTo: "ceo-2" }),
+        agent({ id: "ceo-2", name: "CEO 2", status: "terminated", reportsTo: null }),
+      ],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      state: "blocked_by_uninvokable_assignee",
+      reason: "PAP-1703 is blocked by PAP-1704, but its assignee is paused.",
       recommendedOwnerAgentId: managerId,
     });
   });
@@ -579,4 +660,3 @@ describe("issue graph liveness classifier", () => {
     expect(findings).toEqual([]);
   });
 });
-

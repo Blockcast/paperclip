@@ -4422,6 +4422,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           role: agents.role,
           title: agents.title,
           status: agents.status,
+          pauseReason: agents.pauseReason,
+          runtimeConfig: agents.runtimeConfig,
           reportsTo: agents.reportsTo,
         })
         .from(agents),

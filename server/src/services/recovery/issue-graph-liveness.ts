@@ -48,6 +48,8 @@ export interface IssueLivenessAgentInput {
   role: string;
   title?: string | null;
   status: string;
+  pauseReason?: string | null;
+  runtimeConfig?: Record<string, unknown> | null;
   reportsTo?: string | null;
 }
 
@@ -130,6 +132,11 @@ function isInvokableAgent(
   agentsById: Map<string, IssueLivenessAgentInput>,
 ) {
   return Boolean(agent && isAgentInvokable({ agent, agents: [...agentsById.values()] }));
+}
+
+function isNonExecutingAttributionAgent(agent: IssueLivenessAgentInput) {
+  const heartbeat = readRecord(readRecord(agent.runtimeConfig)?.heartbeat);
+  return agent.status === "paused" && agent.pauseReason === "manual" && heartbeat?.enabled === false;
 }
 
 function hasActiveExecutionPath(
@@ -555,7 +562,14 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     const blockerEligibility = blockerAgent
       ? getAgentWorkEligibility({ agent: blockerAgent, agents: input.agents })
       : null;
-    if (!blockerAgent || blockerAgent.companyId !== source.companyId || !blockerEligibility?.invokable) {
+    if (
+      !blockerAgent ||
+      blockerAgent.companyId !== source.companyId ||
+      (!blockerEligibility?.invokable && !(
+        isNonExecutingAttributionAgent(blockerAgent) &&
+        blockerEligibility?.orgChainHealth.status !== "invalid_org_chain"
+      ))
+    ) {
       return finding({
         issue: source,
         state: "blocked_by_uninvokable_assignee",
