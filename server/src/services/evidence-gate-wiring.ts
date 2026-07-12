@@ -18,6 +18,7 @@ import { DEFAULT_EVIDENCE_REGISTRY } from "./evidence-shapes.js";
 
 export interface EvidenceFetchResult {
   description: string | null;
+  doneWhenBulletsRemoved?: boolean;
   labels: Array<{ name: string }>;
   comments: EvidenceCommentLite[];
   workProducts: Array<{
@@ -75,6 +76,7 @@ export async function runEvidenceGate(
       result: wp.status,
     })),
     registry: DEFAULT_EVIDENCE_REGISTRY,
+    doneWhenBulletsRemoved: data.doneWhenBulletsRemoved,
   });
   return {
     verdict: evaluation.verdict,

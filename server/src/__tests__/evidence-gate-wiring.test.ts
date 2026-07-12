@@ -179,6 +179,63 @@ describe("runEvidenceGate", () => {
     );
   });
 
+  it("blocks with a dedicated diagnostic when history shows Done-when bullets were removed", async () => {
+    const fetch = vi.fn<(id: string) => Promise<EvidenceFetchResult>>(
+      async () => ({
+        description: "No acceptance checklist remains.",
+        doneWhenBulletsRemoved: true,
+        labels: [],
+        comments: [],
+        workProducts: [],
+      }),
+    );
+
+    const result = await runEvidenceGate(fetch, "issue-history-removal");
+
+    expect(result.verdict).toBe("block");
+    expect(result.diagnostics).toContain("done-when-bullets-removed");
+  });
+
+  it("does not report removal when an issue never had Done-when bullets", async () => {
+    const fetch = vi.fn<(id: string) => Promise<EvidenceFetchResult>>(
+      async () => ({
+        description: "No acceptance checklist was defined.",
+        doneWhenBulletsRemoved: false,
+        labels: [],
+        comments: [],
+        workProducts: [],
+      }),
+    );
+
+    const result = await runEvidenceGate(fetch, "issue-without-history");
+
+    expect(result.diagnostics).not.toContain("done-when-bullets-removed");
+  });
+
+  it("ignores removed Done-when bullets when the issue type does not require them", async () => {
+    const fetch = vi.fn<(id: string) => Promise<EvidenceFetchResult>>(
+      async () => ({
+        description: "No acceptance checklist remains.",
+        doneWhenBulletsRemoved: true,
+        labels: [{ name: "pr" }],
+        comments: [
+          {
+            body: "Opened https://github.com/Blockcast/paperclip/pull/649",
+            authorAgentId: "a1",
+            authorUserId: null,
+            createdAt: "2026-07-12T14:00:00.000Z",
+          },
+        ],
+        workProducts: [],
+      }),
+    );
+
+    const result = await runEvidenceGate(fetch, "pr-with-irrelevant-history");
+
+    expect(result.verdict).toBe("pass");
+    expect(result.diagnostics).not.toContain("done-when-bullets-removed");
+  });
+
   it("propagates fetch failures back to the caller (no swallowing)", async () => {
     const fetch = vi.fn<(id: string) => Promise<EvidenceFetchResult>>(
       async () => {

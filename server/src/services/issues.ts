@@ -95,6 +95,7 @@ import {
   type ActiveIssueTreePauseHoldGate,
 } from "./issue-tree-control.js";
 import { runEvidenceGate, type EvidenceFetchResult } from "./evidence-gate-wiring.js";
+import { countDoneWhenBullets } from "./evidence-gate.js";
 import { shouldBlockNarratedDone } from "./done-gate.js";
 import { shouldBlockUnreviewableInReview } from "./in-review-gate.js";
 import {
@@ -118,6 +119,7 @@ const CHILD_COMPLETION_SUMMARY_BODY_MAX_CHARS = 500;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_LOG_BYTES = 2_000_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_CHUNK_BYTES = 256_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_END_SLACK_MS = 60_000;
+const EVIDENCE_DESCRIPTION_HISTORY_LIMIT = 100;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_PARALLEL_READS = 8;
 function awaitingUserInputReason(body: string): string | null {
   const normalized = body.toLowerCase();
@@ -1478,8 +1480,9 @@ async function fetchEvidenceForIssue(
   dbOrTx: any,
   issueId: string,
   description: string | null,
+  previousDescription: string | null = description,
 ): Promise<EvidenceFetchResult> {
-  const [recentComments, workProductRows, labelsByIssueId] = await Promise.all([
+  const [recentComments, workProductRows, labelsByIssueId, descriptionHistory] = await Promise.all([
     dbOrTx
       .select({
         body: issueComments.body,
@@ -1500,11 +1503,28 @@ async function fetchEvidenceForIssue(
       .from(issueWorkProducts)
       .where(eq(issueWorkProducts.issueId, issueId)),
     labelMapForIssues(dbOrTx, [issueId]),
+    dbOrTx
+      .select({ description: sql<string | null>`${activityLog.details}->'_previous'->>'description'` })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.action, "issue.updated"),
+        sql`${activityLog.details}->'_previous' ? 'description'`,
+      ))
+      .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+      .limit(EVIDENCE_DESCRIPTION_HISTORY_LIMIT),
   ]);
 
   const issueLabels = labelsByIssueId.get(issueId) ?? [];
+  const hadPriorDoneWhenBullets = [
+    previousDescription,
+    ...descriptionHistory.map((row: { description: string | null }) => row.description),
+  ].some((priorDescription) => countDoneWhenBullets(priorDescription ?? "") > 0);
   return {
     description,
+    doneWhenBulletsRemoved:
+      countDoneWhenBullets(description ?? "") === 0 && hadPriorDoneWhenBullets,
     labels: issueLabels.map((l: { name: string }) => ({ name: l.name })),
     comments: recentComments as EvidenceFetchResult["comments"],
     workProducts: workProductRows as EvidenceFetchResult["workProducts"],
@@ -6484,7 +6504,12 @@ export function issueService(db: Db) {
       if (experimental.enableDoneExecutionGate && shouldBlockNarratedDone(doneGateInput)) {
         try {
           doneTransitionEvidenceVerdict = await runEvidenceGate(
-            (issueId) => fetchEvidenceForIssue(dbOrTx, issueId, existing.description),
+            (issueId) => fetchEvidenceForIssue(
+              dbOrTx,
+              issueId,
+              issueData.description !== undefined ? issueData.description : existing.description,
+              existing.description,
+            ),
             id,
           );
           doneGateEvidenceVerdict = doneTransitionEvidenceVerdict;
@@ -6619,7 +6644,12 @@ export function issueService(db: Db) {
         let inReviewVerdict: Awaited<ReturnType<typeof runEvidenceGate>> | null = null;
         try {
           const verdict = await runEvidenceGate(
-            (issueId) => fetchEvidenceForIssue(dbOrTx, issueId, existing.description),
+            (issueId) => fetchEvidenceForIssue(
+              dbOrTx,
+              issueId,
+              issueData.description !== undefined ? issueData.description : existing.description,
+              existing.description,
+            ),
             id,
           );
           inReviewVerdict = verdict;
