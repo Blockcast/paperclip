@@ -49,6 +49,8 @@ export interface EvaluateEvidenceInput {
   recentCommentLimit?: number;
   /** Optional repositories whose PR URLs count as reviewable evidence. */
   allowedPrRepos?: readonly string[];
+  /** Caller-derived history signal: a prior description had Done-when bullets, current does not. */
+  doneWhenBulletsRemoved?: boolean;
 }
 
 export interface EvaluateEvidenceResult {
@@ -408,6 +410,9 @@ export function evaluateEvidence(
   if (!doneWhenApplicable && required.includes("checklist:done-when")) {
     diagnostics.push(input.issue.description ? "missing-done-when-bullets" : "missing-description");
   }
+  if (input.doneWhenBulletsRemoved) {
+    diagnostics.push("done-when-bullets-removed");
+  }
   if (unlabeledFallback && input.issue.labels.length > 0) {
     diagnostics.push("unmatched-labels-used-fallback");
   }
@@ -422,7 +427,9 @@ export function evaluateEvidence(
   const missing = required.filter((s) => !detections[s]);
   const requiredFound = required.filter((s) => detections[s]);
   let verdict: EvidenceVerdict;
-  if (missing.length === 0) {
+  if (input.doneWhenBulletsRemoved) {
+    verdict = "block";
+  } else if (missing.length === 0) {
     verdict = "pass";
   } else if (unlabeledFallback) {
     verdict = "warn";
