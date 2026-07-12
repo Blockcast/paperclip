@@ -680,6 +680,28 @@ function resolveDependabotAlertContext(
   };
 }
 
+// BLO-15799: self-echo guard for the reviewer wake. The reviewer posts its
+// review through the configured bot identity (allyblockcast[bot]; historically
+// blockcast-ci-packages[bot]) and GitHub then delivers a
+// pull_request_review.submitted webhook FOR THAT VERY REVIEW. Without this
+// guard the echo re-woke the reviewer into a full run (K8s pod spin-up, ~$0.74
+// of API spend, 1-3 minutes of the single maxConcurrentRuns slot) that only
+// ever exited as an "already reviewed this head" no-op — during PR bursts the
+// reviewer looked stuck. Scope is deliberately narrow: only the
+// github_pr_review_submitted reason, and only when the review's author IS the
+// reviewer's own posting identity (via isConfiguredPrReviewerAuthor, the same
+// identity source the issue_comment mention guard uses). Human reviews and
+// other bots' reviews still drive the counter-review wake, and the
+// author-assignee wake is untouched — the reviewer's actionable findings still
+// reopen and wake the PR author.
+function isReviewerSelfEchoReview(
+  context: ResolvedEventContext,
+  configuredReviewerLogin: string | null | undefined,
+): boolean {
+  if (context.wakeReason !== "github_pr_review_submitted") return false;
+  return isConfiguredPrReviewerAuthor(context.reviewAuthorLogin, configuredReviewerLogin);
+}
+
 function shouldFirePrReviewerWake(context: ResolvedEventContext | null): context is ResolvedEventContext & { prNumber: number } {
   if (!context || !context.wakeReason || typeof context.prNumber !== "number") return false;
   return new Set([
@@ -1026,12 +1048,30 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     //       and duplicate wake requests are skipped by the PR+reason
     //       idempotency precheck, so rapid pushes don't fan out per push.
     //   - issue_comment.created with @ally — explicit operator re-review request
-    //   - pull_request_review.submitted — request a counter-review pass
+    //   - pull_request_review.submitted — request a counter-review pass; the
+    //       reviewer's OWN posted review is filtered as a self-echo (BLO-15799,
+    //       see isReviewerSelfEchoReview).
     // (We deliberately skip pull_request.closed and check_run/workflow_run —
     //  those are post-merge signals or duplicate the CI-completion path.)
     const reviewerWakeFired = await (async () => {
       if (!config.prReviewerAgentId) return false;
       if (!shouldFirePrReviewerWake(context)) return false;
+      // BLO-15799: don't enqueue a reviewer wake for the reviewer's own posted
+      // review — that's a self-echo, not new review work (see
+      // isReviewerSelfEchoReview). One log line so the suppression is
+      // observable in production.
+      if (isReviewerSelfEchoReview(context, config.prReviewerBotLogin)) {
+        logger.info(
+          {
+            deliveryId,
+            repoFullName: context.repoFullName,
+            prNumber: context.prNumber,
+            reviewAuthorLogin: context.reviewAuthorLogin,
+          },
+          "github webhook reviewer wake skipped: self-echo of the reviewer's own posted review",
+        );
+        return false;
+      }
       try {
         const heartbeat = heartbeatService(db, {
           pluginWorkerManager: config.pluginWorkerManager,
@@ -1609,6 +1649,7 @@ export const __test_hasPrReviewerRequestMention = hasPrReviewerRequestMention;
 export const __test_verifyGithubSignature = verifyGithubSignature;
 export const __test_resolveEventContext = resolveEventContext;
 export const __test_shouldFirePrReviewerWake = shouldFirePrReviewerWake;
+export const __test_isReviewerSelfEchoReview = isReviewerSelfEchoReview;
 export const __test_buildPrReviewerWakeIdempotencyKey = buildPrReviewerWakeIdempotencyKey;
 export const __test_buildPrReviewerTaskKey = buildPrReviewerTaskKey;
 export const __test_resolveDependabotAlertContext = resolveDependabotAlertContext;

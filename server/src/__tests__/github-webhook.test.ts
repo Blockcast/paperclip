@@ -28,6 +28,7 @@ import {
   __test_commentsContainBackLinkMarker,
   __test_extractPaperclipIdentifiers,
   __test_hasActionablePrReviewFeedback,
+  __test_isReviewerSelfEchoReview,
   __test_isSelfReviewedPr,
   __test_hasPrReviewerRequestMention,
   __test_resolveDependabotAlertContext,
@@ -458,6 +459,52 @@ describe("github-webhook pure helpers", () => {
       headSha: "feedface",
     });
     expect(__test_shouldFirePrReviewerWake(ctx)).toBe(true);
+  });
+
+  it("flags the reviewer's own pull_request_review.submitted as a self-echo (BLO-15799)", () => {
+    const reviewCtx = (login: string) =>
+      __test_resolveEventContext("pull_request_review", {
+        action: "submitted",
+        pull_request: {
+          number: 730,
+          title: "Some PR",
+          body: null,
+          head: { ref: "some-branch", sha: "abc123" },
+          user: { login: "codex" },
+        },
+        review: { body: "Consolidated review findings.", state: "commented", user: { login } },
+        repository: { full_name: "Blockcast/paperclip" },
+      });
+
+    // Observed posting identities, current and historical.
+    expect(__test_isReviewerSelfEchoReview(reviewCtx("allyblockcast[bot]")!, "allyblockcast[bot]")).toBe(true);
+    expect(__test_isReviewerSelfEchoReview(reviewCtx("blockcast-ci-packages[bot]")!, "allyblockcast[bot]")).toBe(true);
+    // The default posting identity applies when no login is configured.
+    expect(__test_isReviewerSelfEchoReview(reviewCtx("allyblockcast[bot]")!, null)).toBe(true);
+    // A custom configured posting identity is honored.
+    expect(__test_isReviewerSelfEchoReview(reviewCtx("my-review-bot[bot]")!, "my-review-bot[bot]")).toBe(true);
+    // Human reviews and OTHER bots' reviews are not self-echoes.
+    expect(__test_isReviewerSelfEchoReview(reviewCtx("kkroo")!, "allyblockcast[bot]")).toBe(false);
+    expect(__test_isReviewerSelfEchoReview(reviewCtx("coderabbitai[bot]")!, "allyblockcast[bot]")).toBe(false);
+  });
+
+  it("scopes the self-echo filter to github_pr_review_submitted, never other wake reasons (BLO-15799)", () => {
+    // A pull_request.opened context (even one authored by the reviewer bot)
+    // must never be treated as a self-echo — pr opened/synchronize/comment
+    // wakes are untouched by the filter.
+    const openedCtx = __test_resolveEventContext("pull_request", {
+      action: "opened",
+      pull_request: {
+        number: 731,
+        title: "Some PR",
+        body: null,
+        head: { ref: "some-branch" },
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+    expect(openedCtx?.wakeReason).toBe("github_pr_opened");
+    expect(__test_isReviewerSelfEchoReview(openedCtx!, "allyblockcast[bot]")).toBe(false);
   });
 
   it("truncates oversize review bodies to ~4KB with a marker so the contextSnapshot row stays small (BLO-6300)", () => {
@@ -1289,6 +1336,87 @@ describeEmbeddedPostgres("github-webhook route", () => {
         reviewKind: "pr_review",
       }),
     });
+  });
+
+  it("skips the reviewer wake for the reviewer's own review self-echo but still wakes for human and other-bot reviews (BLO-15799)", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Ally" });
+    const app = buildApp({ prReviewerAgentId: agentId, prReviewerBotLogin: "allyblockcast[bot]" });
+    const reviewSubmittedPayload = (prNumber: number, reviewAuthorLogin: string) => ({
+      action: "submitted",
+      pull_request: {
+        number: prNumber,
+        title: "Some PR",
+        body: null,
+        html_url: `https://github.com/Blockcast/paperclip/pull/${prNumber}`,
+        head: { ref: "some-branch", sha: "cafef00d" },
+        user: { login: "codex" },
+      },
+      review: {
+        body: "Consolidated review findings.",
+        state: "commented",
+        html_url: `https://github.com/Blockcast/paperclip/pull/${prNumber}#pullrequestreview-${prNumber}1`,
+        user: { login: reviewAuthorLogin },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+    const send = async (payload: Record<string, unknown>, deliveryId: string) => {
+      const { body, signature } = signedRequest(payload);
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request_review")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", deliveryId)
+        .set("content-type", "application/json")
+        .send(body);
+    };
+
+    // 1. GitHub echoes the reviewer's own just-posted review straight back as
+    //    pull_request_review.submitted — the observed live loop: the echo run
+    //    spun a full pod, held the single run slot 1-3 minutes, and exited as
+    //    an "already reviewed this head" no-op. No wake may be enqueued.
+    const selfEcho = await send(reviewSubmittedPayload(1012, "allyblockcast[bot]"), "delivery-self-echo");
+    expect(selfEcho.status).toBe(200);
+    expect(selfEcho.body).toMatchObject({
+      ignored: "no_paperclip_identifier",
+      reviewerWakeFired: false,
+    });
+
+    // 2. A human review on the SAME PR still wakes — the self-echo skip must
+    //    not consume the PR+reason idempotency key.
+    const humanReview = await send(reviewSubmittedPayload(1012, "kkroo"), "delivery-human-review");
+    expect(humanReview.status).toBe(200);
+    expect(humanReview.body).toMatchObject({
+      ignored: "no_paperclip_identifier",
+      reviewerWakeFired: true,
+    });
+
+    // 3. Another bot's review still wakes — the filter targets the reviewer's
+    //    own posting identity, not bots in general.
+    const otherBotReview = await send(reviewSubmittedPayload(1013, "coderabbitai[bot]"), "delivery-other-bot");
+    expect(otherBotReview.status).toBe(200);
+    expect(otherBotReview.body).toMatchObject({
+      ignored: "no_paperclip_identifier",
+      reviewerWakeFired: true,
+    });
+
+    const wakes = await db
+      .select({
+        reason: agentWakeupRequests.reason,
+        idempotencyKey: agentWakeupRequests.idempotencyKey,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.map((wake) => wake.idempotencyKey).sort()).toEqual([
+      "pr_review:Blockcast/paperclip:1012:github_pr_review_submitted",
+      "pr_review:Blockcast/paperclip:1013:github_pr_review_submitted",
+    ]);
+    expect(wakes.every((wake) => wake.reason === "github_pr_review_submitted")).toBe(true);
+
+    const runs = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(2);
   });
 
   it("dedupes replayed @ally PR comment reviewer wakes by comment-scoped idempotency key", async () => {
