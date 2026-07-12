@@ -95,6 +95,7 @@ import {
   type ActiveIssueTreePauseHoldGate,
 } from "./issue-tree-control.js";
 import { runEvidenceGate, type EvidenceFetchResult } from "./evidence-gate-wiring.js";
+import { countDoneWhenBullets } from "./evidence-gate.js";
 import { shouldBlockNarratedDone } from "./done-gate.js";
 import { shouldBlockUnreviewableInReview } from "./in-review-gate.js";
 import {
@@ -1519,25 +1520,15 @@ async function fetchEvidenceForIssue(
   const hadPriorDoneWhenBullets = [
     previousDescription,
     ...descriptionHistory.map((row: { description: string | null }) => row.description),
-  ].some((priorDescription) => countEvidenceDoneWhenBullets(priorDescription) > 0);
+  ].some((priorDescription) => countDoneWhenBullets(priorDescription ?? "") > 0);
   return {
     description,
     doneWhenBulletsRemoved:
-      countEvidenceDoneWhenBullets(description) === 0 && hadPriorDoneWhenBullets,
+      countDoneWhenBullets(description ?? "") === 0 && hadPriorDoneWhenBullets,
     labels: issueLabels.map((l: { name: string }) => ({ name: l.name })),
     comments: recentComments as EvidenceFetchResult["comments"],
     workProducts: workProductRows as EvidenceFetchResult["workProducts"],
   };
-}
-
-function countEvidenceDoneWhenBullets(description: string | null): number {
-  if (!description) return 0;
-  const headingIndex = description.search(/^##+\s*Done when\b/im);
-  if (headingIndex === -1) return 0;
-  const rest = description.slice(headingIndex);
-  const nextHeading = rest.slice(2).search(/^##+\s/m);
-  const section = nextHeading === -1 ? rest : rest.slice(0, nextHeading + 2);
-  return section.match(/^[-*]\s+/gm)?.length ?? 0;
 }
 
 async function watchdogMapForIssues(dbOrTx: any, rows: IssueRow[]): Promise<Map<string, IssueWatchdogSummary>> {

@@ -228,7 +228,7 @@ function detectChecklistDoneWhen(
   return taggedRowCount >= doneWhenBullets;
 }
 
-function countDoneWhenBullets(description: string): number {
+export function countDoneWhenBullets(description: string): number {
   const doneWhenIdx = description.search(/^##+\s*Done when\b/im);
   if (doneWhenIdx === -1) return 0;
   const rest = description.slice(doneWhenIdx);
@@ -410,7 +410,9 @@ export function evaluateEvidence(
   if (!doneWhenApplicable && required.includes("checklist:done-when")) {
     diagnostics.push(input.issue.description ? "missing-done-when-bullets" : "missing-description");
   }
-  if (input.doneWhenBulletsRemoved) {
+  const requiredDoneWhenBulletsRemoved =
+    input.doneWhenBulletsRemoved && required.includes("checklist:done-when");
+  if (requiredDoneWhenBulletsRemoved) {
     diagnostics.push("done-when-bullets-removed");
   }
   if (unlabeledFallback && input.issue.labels.length > 0) {
@@ -427,7 +429,7 @@ export function evaluateEvidence(
   const missing = required.filter((s) => !detections[s]);
   const requiredFound = required.filter((s) => detections[s]);
   let verdict: EvidenceVerdict;
-  if (input.doneWhenBulletsRemoved) {
+  if (requiredDoneWhenBulletsRemoved) {
     verdict = "block";
   } else if (missing.length === 0) {
     verdict = "pass";
