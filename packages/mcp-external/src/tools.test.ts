@@ -344,6 +344,27 @@ describe("update_issue", () => {
     expect(client.requestJson).not.toHaveBeenCalled();
   });
 
+  it.each(["backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled"])(
+    "forwards the canonical issue status %s",
+    async (status) => {
+      const client = okClient({ id: "PEN-1", status });
+      await tool(client, "update_issue").execute({ issue_id: "PEN-1", status }, {} as any);
+      expect(client.requestJson).toHaveBeenCalledWith("PATCH", "/issues/PEN-1", {
+        body: { status },
+        companyId: null,
+      });
+    },
+  );
+
+  it.each(["critical", "high", "medium", "low"])("forwards the canonical issue priority %s", async (priority) => {
+    const client = okClient({ id: "PEN-1", priority });
+    await tool(client, "update_issue").execute({ issue_id: "PEN-1", priority }, {} as any);
+    expect(client.requestJson).toHaveBeenCalledWith("PATCH", "/issues/PEN-1", {
+      body: { priority },
+      companyId: null,
+    });
+  });
+
   it("returns { isError } when no fields are provided", async () => {
     const client = okClient();
     const res = await tool(client, "update_issue").execute({ issue_id: "PEN-1" }, {} as any);

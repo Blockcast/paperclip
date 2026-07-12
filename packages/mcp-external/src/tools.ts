@@ -117,8 +117,8 @@ function clampLimit(limit: unknown, max: number): number {
   return Math.max(1, Math.min(n, max));
 }
 
-const ISSUE_STATUSES = new Set(["todo", "in_progress", "blocked", "done", "cancelled"]);
-const ISSUE_PRIORITIES = new Set(["urgent", "high", "medium", "low"]);
+const ISSUE_STATUSES = new Set(["backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled"]);
+const ISSUE_PRIORITIES = new Set(["critical", "high", "medium", "low"]);
 const PROJECT_STATUSES = new Set(["backlog", "planned", "in_progress", "completed", "cancelled"]);
 const APPROVAL_STATUSES = new Set(["pending", "approved", "rejected", "revision_requested"]);
 export function createToolDefinitions(client: PaperclipApiClient): ToolDefinition[] {
@@ -160,7 +160,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       description: "List issues (tasks) in a company.",
       schema: z.object({
         status: z.string().default("todo,in_progress").describe(
-          "Comma-separated statuses: todo, in_progress, blocked, done, cancelled. Default: todo,in_progress",
+          "Comma-separated statuses: backlog, todo, in_progress, in_review, done, blocked, cancelled. Default: todo,in_progress",
         ),
         assignee_agent_id: z.string().default("").describe("Filter by assignee agent UUID. Empty for all."),
         project_id: z.string().default("").describe("Filter by project UUID. Empty for all."),
@@ -178,7 +178,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       schema: z.object({
         query: z.string().describe("Full-text issue search query."),
         status: z.string().default("todo,in_progress").describe(
-          "Comma-separated statuses: todo, in_progress, blocked, done, cancelled. Default: todo,in_progress",
+          "Comma-separated statuses: backlog, todo, in_progress, in_review, done, blocked, cancelled. Default: todo,in_progress",
         ),
         assignee_agent_id: z.string().default("").describe("Filter by assignee agent UUID. Empty for all."),
         project_id: z.string().default("").describe("Filter by project UUID. Empty for all."),
@@ -210,7 +210,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
         assignee_agent_id: z.string().default("").describe("Assignee agent UUID. Empty to leave unassigned."),
         project_id: z.string().default("").describe("Project UUID. Empty for none."),
         parent_issue_id: z.string().default("").describe("Parent issue UUID for a subtask. Empty for top-level."),
-        priority: z.string().default("medium").describe("urgent, high, medium, or low. Default: medium."),
+        priority: z.string().default("medium").describe("critical, high, medium, or low. Default: medium."),
         company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
         blocked_by_issue_ids: z
           .array(z.string())
@@ -240,9 +240,9 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
         issue_id: z.string().describe('Issue UUID or identifier (e.g. "CY-42").'),
         title: z.string().default("").describe("New title. Empty to keep."),
         description: z.string().default("").describe("New description (Markdown). Empty to keep."),
-        status: z.string().default("").describe("todo, in_progress, blocked, done, or cancelled. Empty to keep."),
+        status: z.string().default("").describe("backlog, todo, in_progress, in_review, done, blocked, or cancelled. Empty to keep."),
         assignee_agent_id: z.string().default("").describe("New assignee agent UUID. Empty to keep."),
-        priority: z.string().default("").describe("urgent, high, medium, or low. Empty to keep."),
+        priority: z.string().default("").describe("critical, high, medium, or low. Empty to keep."),
         project_id: z
           .string()
           .nullable()
@@ -258,11 +258,11 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       execute: async (args) => {
         const status = String((args.status as string | undefined) ?? "");
         if (status && !ISSUE_STATUSES.has(status)) {
-          return errorResult(`Invalid status '${status}'. Allowed: todo, in_progress, blocked, done, cancelled.`);
+          return errorResult(`Invalid status '${status}'. Allowed: backlog, todo, in_progress, in_review, done, blocked, cancelled.`);
         }
         const priority = String((args.priority as string | undefined) ?? "");
         if (priority && !ISSUE_PRIORITIES.has(priority)) {
-          return errorResult(`Invalid priority '${priority}'. Allowed: urgent, high, medium, low.`);
+          return errorResult(`Invalid priority '${priority}'. Allowed: critical, high, medium, low.`);
         }
         const body: Record<string, unknown> = {};
         if (args.title) body.title = String(args.title);
