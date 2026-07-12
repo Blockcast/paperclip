@@ -565,7 +565,10 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     if (
       !blockerAgent ||
       blockerAgent.companyId !== source.companyId ||
-      (!blockerEligibility?.invokable && !isNonExecutingAttributionAgent(blockerAgent))
+      (!blockerEligibility?.invokable && !(
+        isNonExecutingAttributionAgent(blockerAgent) &&
+        blockerEligibility?.orgChainHealth.status !== "invalid_org_chain"
+      ))
     ) {
       return finding({
         issue: source,
