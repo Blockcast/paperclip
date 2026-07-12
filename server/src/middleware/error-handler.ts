@@ -50,10 +50,20 @@ export function errorHandler(
       const tc = getTelemetryClient();
       if (tc) trackErrorHandlerCrash(tc, { errorCode: err.name });
     }
-    res.status(err.status).json({
-      error: err.message,
-      ...(err.details ? { details: err.details } : {}),
-    });
+    if (
+      err.status === 422 &&
+      err.message === "missing-evidence" &&
+      typeof err.details === "object" &&
+      err.details !== null &&
+      Array.isArray((err.details as { missing?: unknown }).missing)
+    ) {
+      res.status(422).json({
+        error: "missing-evidence",
+        missing: (err.details as { missing: unknown[] }).missing,
+      });
+      return;
+    }
+    res.status(err.status).json({ error: err.message, ...(err.details ? { details: err.details } : {}) });
     return;
   }
 

@@ -75,4 +75,22 @@ describe("errorHandler", () => {
     expect(res.err).toBe(err);
     expect(res.__errorContext?.error?.message).toBe("db exploded");
   });
+
+  it("returns the evidence-gate 422 contract without a details wrapper", () => {
+    const req = makeReq();
+    const res = makeRes();
+    const next = vi.fn() as unknown as NextFunction;
+    const err = new HttpError(422, "missing-evidence", {
+      code: "missing-evidence",
+      missing: ["test-output", "checklist:done-when"],
+    });
+
+    errorHandler(err, req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(422);
+    expect(res.json).toHaveBeenCalledWith({
+      error: "missing-evidence",
+      missing: ["test-output", "checklist:done-when"],
+    });
+  });
 });

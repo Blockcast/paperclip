@@ -40,8 +40,13 @@ export interface EvidenceVerdictRecord {
   allDetected: string[];
   unlabeledFallback: boolean;
   diagnostics: string[];
+  overridden?: boolean;
+  overrideReason?: string;
   evaluatedAt: string;
 }
+
+const OPERATOR_OVERRIDE_PATTERN = /^evidence-gate: override (.+)$/;
+const OPERATOR_OVERRIDE_MAX_AGE_MS = 60 * 60 * 1000;
 
 /**
  * Run the gate for one issue. Returns the verdict record the caller should
@@ -64,6 +69,34 @@ export async function runEvidenceGate(
   now: Date = new Date(),
 ): Promise<EvidenceVerdictRecord> {
   const data = await fetch(issueId);
+  const override = data.comments
+    .filter((comment) => comment.authorUserId !== null && comment.authorAgentId === null)
+    .map((comment) => ({
+      createdAt: new Date(comment.createdAt).getTime(),
+      match: OPERATOR_OVERRIDE_PATTERN.exec(comment.body),
+    }))
+    .filter(({ createdAt, match }) =>
+      match !== null &&
+      match[1]!.trim().length > 0 &&
+      Number.isFinite(createdAt) &&
+      createdAt <= now.getTime() &&
+      now.getTime() - createdAt <= OPERATOR_OVERRIDE_MAX_AGE_MS
+    )
+    .sort((a, b) => b.createdAt - a.createdAt)[0];
+  if (override?.match) {
+    return {
+      verdict: "pass",
+      missing: [],
+      evidenceFound: [],
+      requiredFound: [],
+      allDetected: [],
+      unlabeledFallback: false,
+      diagnostics: [],
+      overridden: true,
+      overrideReason: override.match[1]!.trim(),
+      evaluatedAt: now.toISOString(),
+    };
+  }
   const evaluation = evaluateEvidence({
     issue: {
       description: data.description,

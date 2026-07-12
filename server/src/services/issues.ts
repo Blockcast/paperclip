@@ -6627,16 +6627,8 @@ export function issueService(db: Db) {
 
       applyStatusSideEffects(issueData.status, patch);
 
-      // Phase-1 warn-only evidence gate (BLO-4824 / BLO-4461). Records the
-      // gate's verdict but never throws on its own — Phase 2 (BLO-4828) will
-      // flip `block` to a 422. Errors during evaluation are swallowed so a
-      // misbehaving gate can't break the PATCH; production runs surface
-      // them via the warn log.
-      //
-      // The flag-gated in_review enforcement below intentionally lives
-      // OUTSIDE the try/catch: an evaluation failure yields verdict == null
-      // (gate fails open), while a successfully-computed non-pass verdict
-      // throws without being swallowed.
+      // Evaluation failures remain fail-open, but a computed block verdict
+      // rejects every new transition to in_review.
       if (
         issueData.status === "in_review" &&
         existing.status !== "in_review"
@@ -6664,6 +6656,8 @@ export function issueService(db: Db) {
               evidenceFound: verdict.evidenceFound,
               unlabeledFallback: verdict.unlabeledFallback,
               diagnostics: verdict.diagnostics,
+              overridden: verdict.overridden,
+              overrideReason: verdict.overrideReason,
             },
             `evidence-gate: ${verdict.verdict} on in_review transition`,
           );
@@ -6675,6 +6669,13 @@ export function issueService(db: Db) {
             },
             "evidence-gate: evaluation failed; proceeding without verdict",
           );
+        }
+
+        if (inReviewVerdict?.verdict === "block") {
+          throw unprocessable("missing-evidence", {
+            code: "missing-evidence",
+            missing: inReviewVerdict.missing,
+          });
         }
 
         // In-review evidence gate (narrated-review hardening, instance flag

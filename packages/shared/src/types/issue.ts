@@ -599,6 +599,8 @@ export interface Issue {
     missing: string[];
     evidenceFound: string[];
     unlabeledFallback: boolean;
+    overridden?: boolean;
+    overrideReason?: string;
     evaluatedAt: string;
   } | null;
   activeRecoveryAction?: IssueRecoveryAction | null;
