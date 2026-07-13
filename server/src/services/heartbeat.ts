@@ -3051,9 +3051,13 @@ export async function listRecentTerminalRunsForZeroTokenStreak(db: Db, agentId: 
     .from(heartbeatRuns)
     .where(and(
       eq(heartbeatRuns.agentId, agentId),
+      // Runs rejected by a pre-dispatch gate are terminal database rows, but
+      // they are not adapter attempts and cannot provide a token-usage signal.
+      // claimQueuedRun sets startedAt immediately before adapter dispatch.
+      isNotNull(heartbeatRuns.startedAt),
       // Keep this filter aligned with countConsecutiveZeroTokenCompletedRuns:
       // non-terminal rows would reset the streak, but this production query
-      // intentionally measures only completed terminal attempts.
+      // intentionally measures only completed, started terminal attempts.
       inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
     ))
     .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.createdAt))
