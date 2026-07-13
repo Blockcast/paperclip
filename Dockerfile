@@ -177,7 +177,13 @@ WORKDIR /vendor
 # kkroo/paperclip-adapter-claude-k8s#16; verified: 384/384 tests + tsc clean on
 # published deps, and tsc clean against an adapter-utils tgz built exactly per
 # this file's vendor stage.
-ARG CLAUDE_K8S_REF=c04ae02fda6fff57d2d4acf93e4d7640597b50ef
+# Bumped 2026-07-13 to 63d00ecf (BLO-15896): omit pod-level fsGroup from
+# claude_k8s Jobs. The container's primary runAsGroup=1000 and DinD's explicit
+# socket group preserve access without asking kubelet to recursively chown the
+# shared paperclip-data CephFS PVC. Manifest suite 141/141, typecheck, and build
+# passed; live concurrent shared-PVC pods reached Ready without
+# VolumePermissionChangeInProgress. PR Blockcast/paperclip#653.
+ARG CLAUDE_K8S_REF=63d00ecf69dc4cdd35259772d7e10152e6145f56
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
@@ -298,7 +304,13 @@ ARG CLAUDE_K8S_REF=c04ae02fda6fff57d2d4acf93e4d7640597b50ef
 # MCP-path OPENCODE_CONFIG_JSON literal; opencode doesn't merge config
 # sources). PR kkroo/paperclip-adapter-opencode-k8s#42; typecheck clean, full
 # suite 515/515 pass (2 new tests), build clean.
-ARG OPENCODE_K8S_REF=64c327d08db23fb86018375f5d8174a73db74c9d
+# Bumped 2026-07-13 to 010f0e7e (BLO-15896): omit pod-level fsGroup from
+# opencode_k8s Jobs. The container's primary runAsGroup=1000 and DinD's explicit
+# socket group preserve access without asking kubelet to recursively chown the
+# shared paperclip-data CephFS PVC. Manifest suite 113/113, typecheck, and build
+# passed; live concurrent shared-PVC pods reached Ready without
+# VolumePermissionChangeInProgress. PR Blockcast/paperclip#653.
+ARG OPENCODE_K8S_REF=010f0e7e6f9058b887ec3e82d91e1ceb34f691ca
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
