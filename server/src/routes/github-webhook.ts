@@ -168,9 +168,14 @@ function hasAllyConsolidatedReviewHeader(body: string | null | undefined): boole
 // on TC PR #1115 said "Clean. No changes requested from this lens", which the bare
 // `changes\s+requested` phrase match flagged as actionable and bounced a fully
 // approved PR back to the implementer (BLO-15942). Scanned in the text immediately
-// preceding a match, stopping at sentence punctuation, so a genuine, later
-// occurrence of the phrase elsewhere in the body still counts.
-const NEGATION_CUE_REGEX = /\b(?:no|not|zero|none|without|isn't|aren't|doesn't|didn't)\b[^.\n]*$/i;
+// preceding a match, bounded to NEGATION_LOOKBACK_WORDS words and stopping at
+// sentence punctuation, so a genuine, later occurrence of the phrase elsewhere in
+// the body still counts, and an unrelated earlier negation in the same long
+// sentence (e.g. "The docs aren't complete, changes requested for section 3.")
+// doesn't suppress it.
+const NEGATION_CUE_REGEX =
+  /\b(?:no|not|zero|none|never|without|isn't|aren't|doesn't|didn't|won't|cannot)\b/i;
+const NEGATION_LOOKBACK_WORDS = 8;
 
 // Returns true if `pattern` matches `text` at least once outside a negated context
 // (see NEGATION_CUE_REGEX). Used for bare-phrase heuristics ("changes requested")
@@ -182,7 +187,10 @@ function hasNonNegatedMatch(text: string, pattern: RegExp): boolean {
   let match: RegExpExecArray | null;
   while ((match = regex.exec(text)) !== null) {
     const preceding = text.slice(0, match.index);
-    if (!NEGATION_CUE_REGEX.test(preceding)) return true;
+    const sentenceStart = Math.max(preceding.lastIndexOf("."), preceding.lastIndexOf("\n")) + 1;
+    const sentenceLocal = preceding.slice(sentenceStart);
+    const lookback = sentenceLocal.trim().split(/\s+/).slice(-NEGATION_LOOKBACK_WORDS).join(" ");
+    if (!NEGATION_CUE_REGEX.test(lookback)) return true;
     if (regex.lastIndex === match.index) regex.lastIndex += 1;
   }
   return false;

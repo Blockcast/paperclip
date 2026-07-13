@@ -1159,5 +1159,78 @@ describe("issue execution policy routes", () => {
       expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
+
+    it("resolves the override grant against the stage's currentParticipant, not a diverged issue assignee", async () => {
+      // Regression for the Ally review finding on this PR: the issue's
+      // assigneeAgentId and the stage's currentParticipant can diverge (e.g. a
+      // prior reassignment that didn't walk through the execution-policy
+      // transition). The override must authorize against the participant a
+      // manager is trying to unstick, not whoever the issue happens to be
+      // assigned to.
+      const divergedAssigneeAgentId = "44444444-4444-4444-8444-444444444444";
+      const managerOfParticipantAgentId = "55555555-5555-4555-8555-555555555555";
+      const issue = {
+        ...makeStuckReviewIssue(),
+        assigneeAgentId: divergedAssigneeAgentId,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const decideCalls: Array<{ action?: string; resource?: { assigneeAgentId?: string | null } }> = [];
+      mockAccessService.decide.mockImplementation(async (input: {
+        actor?: { type?: string; agentId?: string; source?: string };
+        action?: string;
+        resource?: { assigneeAgentId?: string | null };
+      }) => {
+        decideCalls.push({ action: input.action, resource: input.resource });
+        const isTestActor = input.actor?.type === "agent" && input.actor.agentId === managerOfParticipantAgentId;
+        // Mirror the suite-wide default mock's blanket allow for the general
+        // read/mutate actions every PATCH exercises, so only the two override
+        // grants below are actually under test.
+        const isGenerallyAllowedAction =
+          isTestActor &&
+          ["company_scope:read", "issue:read", "issue:mutate", "runtime:manage"].includes(input.action ?? "");
+        // Grant the pre-existing tasks:manage_active_checkouts boundary check
+        // broadly (unrelated to this fix) so the request reaches the
+        // execution-stage override decision below. Only a manager of the
+        // *participant* (not the diverged assignee) is granted
+        // tasks:override_execution_stage — proving the resource passed to
+        // access.decide for that action targets the participant, not the
+        // issue's assignee.
+        const allowed =
+          isGenerallyAllowedAction ||
+          (input.action === "tasks:manage_active_checkouts" && isTestActor) ||
+          (input.action === "tasks:override_execution_stage" &&
+            isTestActor &&
+            input.resource?.assigneeAgentId === mandateBoundParticipantAgentId);
+        return {
+          allowed,
+          action: input.action,
+          reason: allowed ? "allow_manager_chain" : "deny_missing_grant",
+          explanation: allowed ? "Allowed by test grant." : `Missing permission: ${input.action ?? "action"}`,
+        };
+      });
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: managerOfParticipantAgentId,
+        companyId: "company-1",
+        runId: "run-blo-15942-divergence",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({
+          status: "done",
+          comment: "Overriding as manager of the mandate-bound participant.",
+        });
+
+      expect(res.status).toBe(200);
+      const overrideCall = decideCalls.find((call) => call.action === "tasks:override_execution_stage");
+      expect(overrideCall?.resource?.assigneeAgentId).toBe(mandateBoundParticipantAgentId);
+      expect(overrideCall?.resource?.assigneeAgentId).not.toBe(divergedAssigneeAgentId);
+    });
   });
 });

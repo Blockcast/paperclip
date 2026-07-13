@@ -2085,6 +2085,23 @@ describe("hasActionablePrReviewFeedback — reviewer taxonomy", () => {
   it("still short-circuits on a formal changes_requested review state", () => {
     expect(__test_hasActionablePrReviewFeedback("looks fine overall", "changes_requested")).toBe(true);
   });
+
+  // Ally review on #654 (BLO-15942): the negation scan originally looked back to
+  // the start of the sentence, so a negation cue far earlier in a long sentence
+  // could mask a genuine, unrelated "changes requested" later in that same
+  // sentence. Bounding the lookback to NEGATION_LOOKBACK_WORDS words shrinks that
+  // false-negative window while still suppressing the close-proximity negations
+  // (like "No changes requested...") this heuristic exists to catch.
+  it("does not let a negation cue far earlier in a long sentence mask a later genuine match", () => {
+    const body =
+      "not one of these old fixture issues affected the merge outcome whatsoever, so changes requested here.";
+    expect(__test_hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  it("still suppresses a negation cue close to the match within the same sentence", () => {
+    const body = "Clean pass, no changes requested at this time.";
+    expect(__test_hasActionablePrReviewFeedback(body)).toBe(false);
+  });
 });
 
 describe("GitHub review state → stage signal mapping (BLO-15942)", () => {

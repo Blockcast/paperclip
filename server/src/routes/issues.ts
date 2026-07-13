@@ -2124,7 +2124,7 @@ export function issueRoutes(
   // stage the actor doesn't already hold authority over.
   async function hasExecutionStageOverrideAuthorization(
     req: Request,
-    existing: { companyId: string; executionState: unknown; assigneeAgentId: string | null; assigneeUserId: string | null },
+    existing: { id: string; companyId: string; executionState: unknown; assigneeAgentId: string | null; assigneeUserId: string | null },
     actor: { actorType: "user" | "agent"; actorId: string },
     requestedStatus: string | undefined,
   ): Promise<boolean> {
@@ -2132,14 +2132,32 @@ export function issueRoutes(
     const existingState = parseIssueExecutionState(existing.executionState);
     if (existingState?.status !== "pending" || !existingState.currentParticipant) return false;
     if (actorMatchesExecutionParticipant(actor, existingState.currentParticipant)) return false;
+    const participant = existingState.currentParticipant;
+    const participantAgentId = participant.type === "agent" ? participant.agentId : null;
+    const participantUserId = participant.type === "user" ? participant.userId : null;
+    // BLO-15942 review: resolve the override grant against the stage's actual
+    // currentParticipant, not the issue's assigneeAgentId/assigneeUserId. Those
+    // normally track each other, but this override exists precisely for the
+    // "state got weird" path where a prior reassignment or bug could let them
+    // diverge — in which case a manager of the *assignee* must not gain
+    // authority over a different *participant*.
+    if (
+      (participantAgentId && participantAgentId !== existing.assigneeAgentId) ||
+      (participantUserId && participantUserId !== existing.assigneeUserId)
+    ) {
+      logger.warn(
+        { issueId: existing.id, participantAgentId, participantUserId, assigneeAgentId: existing.assigneeAgentId, assigneeUserId: existing.assigneeUserId },
+        "execution-stage override: currentParticipant diverges from issue assignee",
+      );
+    }
     const decision = await access.decide({
       actor: req.actor,
       action: "tasks:override_execution_stage",
       resource: {
         type: "issue",
         companyId: existing.companyId,
-        assigneeAgentId: existing.assigneeAgentId,
-        assigneeUserId: existing.assigneeUserId,
+        assigneeAgentId: participantAgentId,
+        assigneeUserId: participantUserId,
       },
     });
     return decision.allowed;
