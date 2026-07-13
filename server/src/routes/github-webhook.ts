@@ -163,6 +163,31 @@ function hasAllyConsolidatedReviewHeader(body: string | null | undefined): boole
   return typeof body === "string" && /\bAlly\s*(?:—|-|:)\s*Consolidated\s+PR\s+Review\b/i.test(body);
 }
 
+// Negation cues that flip an otherwise-actionable bare phrase into a confirmation
+// that nothing is required — e.g. Ally's COMMENTED, zero-finding review 4682219268
+// on TC PR #1115 said "Clean. No changes requested from this lens", which the bare
+// `changes\s+requested` phrase match flagged as actionable and bounced a fully
+// approved PR back to the implementer (BLO-15942). Scanned in the text immediately
+// preceding a match, stopping at sentence punctuation, so a genuine, later
+// occurrence of the phrase elsewhere in the body still counts.
+const NEGATION_CUE_REGEX = /\b(?:no|not|zero|none|without|isn't|aren't|doesn't|didn't)\b[^.\n]*$/i;
+
+// Returns true if `pattern` matches `text` at least once outside a negated context
+// (see NEGATION_CUE_REGEX). Used for bare-phrase heuristics ("changes requested")
+// that read very differently as "no changes requested" vs "please make the changes
+// requested".
+function hasNonNegatedMatch(text: string, pattern: RegExp): boolean {
+  const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+  const regex = new RegExp(pattern.source, flags);
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(text)) !== null) {
+    const preceding = text.slice(0, match.index);
+    if (!NEGATION_CUE_REGEX.test(preceding)) return true;
+    if (regex.lastIndex === match.index) regex.lastIndex += 1;
+  }
+  return false;
+}
+
 function hasActionablePrReviewFeedback(body: string | null | undefined, state?: string | null): boolean {
   const normalizedState = state?.trim().toLowerCase();
   if (normalizedState === "changes_requested" || normalizedState === "changes-requested") return true;
@@ -185,8 +210,8 @@ function hasActionablePrReviewFeedback(body: string | null | undefined, state?: 
   // cannot mask a later uncounted findings section.
   if (/\b(?:Critical|Important)\s+Issues\b(?!\s*\()/i.test(text)) return true;
   if (/^[ \t]*decision[ \t]*:[ \t]*changes_requested[ \t]*$/im.test(text)) return true;
-  if (/\bchanges\s+requested\b/i.test(text)) return true;
-  if (/\brequest(?:ed|s)?\s+changes\b/i.test(text)) return true;
+  if (hasNonNegatedMatch(text, /\bchanges\s+requested\b/i)) return true;
+  if (hasNonNegatedMatch(text, /\brequest(?:ed|s)?\s+changes\b/i)) return true;
   // Match "before merge" and its inflections ("before merging/merged/merges").
   // The bare `\bmerge\b` form silently missed "before merging" (#973).
   if (/\bRecommended\s+Action\b[\s\S]{0,400}\bfix\b[\s\S]{0,400}\bbefore\s+merg(?:e|es|ed|ing)\b/i.test(text)) return true;

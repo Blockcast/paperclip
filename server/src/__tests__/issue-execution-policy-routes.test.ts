@@ -40,9 +40,16 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
 })));
 const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
-const mockDb = vi.hoisted(() => ({
-  select: mockDbSelect,
-}));
+const mockDbInsertValues = vi.hoisted(() => vi.fn(async () => undefined));
+const mockDbInsert = vi.hoisted(() => vi.fn(() => ({ values: mockDbInsertValues })));
+const mockDb = vi.hoisted(() => {
+  const db: any = {
+    select: mockDbSelect,
+    insert: mockDbInsert,
+    transaction: async (cb: (tx: unknown) => unknown) => cb(db),
+  };
+  return db;
+});
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
@@ -1043,6 +1050,113 @@ describe("issue execution policy routes", () => {
         .send({ status: "blocked" });
 
       expect(res.status).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("execution-stage deadlock override (BLO-15942)", () => {
+    const reviewStageId = "77777777-7777-4777-8777-777777777777";
+    // Stands in for a mandate-bound reviewer (e.g. Ally) whose mandate excludes
+    // advancing issue stages — only tasks:override_execution_stage lets another
+    // actor unstick the stage.
+    const mandateBoundParticipantAgentId = "88888888-8888-4888-8888-888888888888";
+    const implementerAgentId = "33333333-3333-4333-8333-333333333333";
+    const unrelatedAgentId = "99999999-9999-4999-8999-999999999999";
+
+    function makeStuckReviewIssue() {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [
+          {
+            id: reviewStageId,
+            type: "review",
+            participants: [{ type: "agent", agentId: mandateBoundParticipantAgentId }],
+          },
+        ],
+      })!;
+      return {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        companyId: "company-1",
+        status: "in_review",
+        assigneeAgentId: mandateBoundParticipantAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-15942",
+        title: "Deadlocked review stage",
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: mandateBoundParticipantAgentId },
+          returnAssignee: { type: "agent", agentId: implementerAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      };
+    }
+
+    it("an authorized operator override force-completes a stage the mandate-bound participant cannot act on", async () => {
+      const issue = makeStuckReviewIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      // Board/local_implicit is always allowed by the real authorization
+      // service (allow_local_board) and is mirrored here by the mock.
+      const res = await request(await createApp({
+        type: "board",
+        userId: "local-board",
+        companyIds: ["company-1"],
+        source: "local_implicit",
+        isInstanceAdmin: false,
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({
+          status: "done",
+          comment: "Overriding: reviewer's mandate excludes stage decisions; verified independently.",
+        });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        expect.objectContaining({
+          status: "done",
+          executionState: expect.objectContaining({
+            status: "completed",
+            completedStageIds: [reviewStageId],
+            lastDecisionOutcome: "approved",
+            lastDecisionId: expect.any(String),
+          }),
+        }),
+        expect.anything(),
+      );
+    });
+
+    it("still rejects an unrelated, unauthorized agent (regression: override does not open the stage to anyone)", async () => {
+      const issue = makeStuckReviewIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: unrelatedAgentId,
+        companyId: "company-1",
+        runId: "run-blo-15942",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ status: "done", comment: "Trying to bypass review" });
+
+      // Rejected at the assignee-ownership boundary (403) before the
+      // execution-stage transition is even evaluated — an unrelated agent
+      // with no tasks:manage_active_checkouts / tasks:override_execution_stage
+      // grant never gets far enough to hit the stage's own "only the active
+      // reviewer or approver can advance" 422.
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
   });

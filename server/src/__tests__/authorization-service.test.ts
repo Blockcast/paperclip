@@ -1021,6 +1021,63 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  // BLO-15942: a review/approval stage can be pinned to a participant whose
+  // mandate excludes stage decisions, which otherwise deadlocks the stage
+  // forever. tasks:override_execution_stage lets an actor above that
+  // participant (a legacy CEO/CTO-tier agent, or an org-chain manager of the
+  // participant) force-complete or re-route it — same allow paths as the
+  // existing tasks:manage_active_checkouts override.
+  it("preserves legacy CEO authority for execution-stage override", async () => {
+    const company = await createCompany(db, "LegacyOverride");
+    const actorAgent = await createAgent(db, company.id, { role: "ceo" });
+    const participantAgent = await createAgent(db, company.id, { role: "engineer" });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "tasks:override_execution_stage",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: participantAgent.id },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      reason: "allow_legacy_agent_creator",
+    });
+  });
+
+  it("allows an org-chain manager to override an execution stage pinned to a report", async () => {
+    const company = await createCompany(db, "ManagerOverride");
+    const managerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const participantAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: managerAgent.id });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: managerAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "tasks:override_execution_stage",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: participantAgent.id },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      reason: "allow_manager_chain",
+    });
+  });
+
+  it("denies execution-stage override for an unrelated peer agent", async () => {
+    const company = await createCompany(db, "UnrelatedOverride");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const participantAgent = await createAgent(db, company.id, { role: "engineer" });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "tasks:override_execution_stage",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: participantAgent.id },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
   it("denies active-checkout management outside the CEO caller company scope", async () => {
     const sourceCompany = await createCompany(db, "CheckoutSource");
     const targetCompany = await createCompany(db, "CheckoutTarget");
