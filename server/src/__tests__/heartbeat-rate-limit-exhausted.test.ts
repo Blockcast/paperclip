@@ -447,7 +447,7 @@ describeEmbeddedPostgres("listRecentTerminalRunsForZeroTokenStreak", () => {
     await tempDb?.cleanup();
   });
 
-  it("returns the newest terminal runs for the target agent", async () => {
+  it("returns the newest started terminal runs for the target agent", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const otherAgentId = randomUUID();
@@ -491,6 +491,7 @@ describeEmbeddedPostgres("listRecentTerminalRunsForZeroTokenStreak", () => {
         agentId,
         status: "failed",
         usageJson: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+        startedAt: new Date("2026-07-08T12:00:30Z"),
         finishedAt: new Date("2026-07-08T12:02:00Z"),
         createdAt: new Date("2026-07-08T12:00:00Z"),
       },
@@ -500,6 +501,7 @@ describeEmbeddedPostgres("listRecentTerminalRunsForZeroTokenStreak", () => {
         agentId,
         status: "succeeded",
         usageJson: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 0 },
+        startedAt: new Date("2026-07-08T12:00:10Z"),
         finishedAt: new Date("2026-07-08T12:01:00Z"),
         createdAt: new Date("2026-07-08T12:00:00Z"),
       },
@@ -509,6 +511,7 @@ describeEmbeddedPostgres("listRecentTerminalRunsForZeroTokenStreak", () => {
         agentId,
         status: "running",
         usageJson: null,
+        startedAt: new Date("2026-07-08T12:03:00Z"),
         createdAt: new Date("2026-07-08T12:03:00Z"),
       },
       {
@@ -517,6 +520,7 @@ describeEmbeddedPostgres("listRecentTerminalRunsForZeroTokenStreak", () => {
         agentId: otherAgentId,
         status: "failed",
         usageJson: null,
+        startedAt: new Date("2026-07-08T12:03:30Z"),
         finishedAt: new Date("2026-07-08T12:04:00Z"),
         createdAt: new Date("2026-07-08T12:00:00Z"),
       },
@@ -528,8 +532,20 @@ describeEmbeddedPostgres("listRecentTerminalRunsForZeroTokenStreak", () => {
       agentId,
       status: "cancelled",
       usageJson: null,
+      errorCode: "issue_dependencies_blocked",
       finishedAt: new Date("2026-07-08T12:02:00Z"),
       createdAt: new Date("2026-07-08T12:01:00Z"),
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      status: "cancelled",
+      usageJson: null,
+      startedAt: new Date("2026-07-08T12:02:30Z"),
+      finishedAt: new Date("2026-07-08T12:03:00Z"),
+      createdAt: new Date("2026-07-08T12:02:00Z"),
     });
 
     const rows = await listRecentTerminalRunsForZeroTokenStreak(db, agentId);
