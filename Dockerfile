@@ -182,7 +182,7 @@ WORKDIR /vendor
 # socket group preserve access without asking kubelet to recursively chown the
 # shared paperclip-data CephFS PVC. Manifest suite 141/141, typecheck, and build
 # passed; live concurrent shared-PVC pods reached Ready without
-# VolumePermissionChangeInProgress.
+# VolumePermissionChangeInProgress. PR Blockcast/paperclip#653.
 ARG CLAUDE_K8S_REF=63d00ecf69dc4cdd35259772d7e10152e6145f56
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
@@ -309,7 +309,7 @@ ARG CLAUDE_K8S_REF=63d00ecf69dc4cdd35259772d7e10152e6145f56
 # socket group preserve access without asking kubelet to recursively chown the
 # shared paperclip-data CephFS PVC. Manifest suite 113/113, typecheck, and build
 # passed; live concurrent shared-PVC pods reached Ready without
-# VolumePermissionChangeInProgress.
+# VolumePermissionChangeInProgress. PR Blockcast/paperclip#653.
 ARG OPENCODE_K8S_REF=010f0e7e6f9058b887ec3e82d91e1ceb34f691ca
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
