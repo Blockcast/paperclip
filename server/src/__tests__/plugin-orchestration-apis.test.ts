@@ -13,6 +13,7 @@ import {
   costEvents,
   createDb,
   executionWorkspaces,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueRelations,
   issues,
@@ -68,6 +69,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     tempRoots.length = 0;
     await db.delete(activityLog);
     await db.delete(costEvents);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issueRelations);
@@ -865,6 +867,22 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
 
   it("allows plugin wakeups for assigned backlog issues (escalation ladders)", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
+    // This test covers the plugin wakeup contract, not adapter execution.
+    // Occupy the agent's execution slot so the new run stays queued instead
+    // of starting a background adapter lifecycle that can race teardown.
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, agentId));
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "assignment",
+      startedAt: new Date(),
+      lastUsefulActionAt: new Date(),
+      contextSnapshot: {},
+    });
     const backlogIssueId = randomUUID();
     await db.insert(issues).values({
       id: backlogIssueId,
