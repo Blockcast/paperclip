@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { DEFAULT_COVER_DEDUP_WINDOW_MINUTES, DEFAULT_ESCALATION_DEADLINE_MINUTES, STATE_KEYS } from "./constants.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
@@ -6,7 +7,13 @@ import { ORIGIN_KIND, type AlertmanagerAlert, type AlertmanagerPluginConfig, typ
 /** Origin kind stamped on board-owned "chain exhausted" cover issues. */
 export const COVER_ORIGIN = "plugin:paperclip-plugin-alertmanager:escalation";
 const MAX_ATTEMPTS = 3;
-const COVER_LIST_PAGE_SIZE = 50;
+const COVERS_TABLE = "alert_escalation_covers";
+const MEMBERS_TABLE = "alert_escalation_cover_members";
+const STUCK_COVER_RECONCILE_LIMIT = 200;
+
+function q(ns: string, table: string): string {
+  return `${ns}.${table}`;
+}
 
 export function escalationDeadlineMs(alert: AlertmanagerAlert, config: AlertmanagerPluginConfig): number | null {
   const severity = alert.labels.severity ?? "unknown";
@@ -66,38 +73,41 @@ function isCoverDedupConflict(err: unknown): boolean {
 }
 
 /**
- * Idempotently records `siblingIssue` as sharing the retained cover, keyed
- * off a durable marker in the comment body rather than in-memory state — a
- * retry (crash, sweep re-run) that lands on the same sibling re-checks the
- * marker instead of posting a second comment.
+ * Idempotently upserts `alertIssueId` as an OPEN member of `coverIssueId`.
+ * A brand-new pairing inserts a fresh row; a pairing that previously
+ * resolved (the alert re-fired into the same still-open cover) reopens it.
+ * Backed by the `(cover_issue_id, alert_issue_id)` unique constraint, so
+ * concurrent callers racing the same pairing serialize at the DB and only
+ * one of them observes `rowCount > 0` (used to gate the one-time
+ * "sibling attached" comment — a retried attach is a silent no-op).
  */
-async function attachAsSibling(
-  ctx: PluginContext,
-  companyId: string,
-  coverId: string,
-  siblingIssue: { id: string; identifier?: string | null },
-  alertname: string,
-): Promise<void> {
-  const marker = `sibling:${siblingIssue.id}`;
-  const comments = await ctx.issues.listComments(coverId, companyId);
-  if (comments.some((comment) => comment.body.includes(marker))) return;
-  await ctx.issues.createComment(
-    coverId,
-    `[alert-escalation] (${marker}) Sibling alert ${siblingIssue.identifier ?? siblingIssue.id} ("${alertname}") also exhausted its agent chain within the dedup window; tracked here instead of opening a duplicate cover.`,
-    companyId,
+async function upsertOpenMember(ctx: PluginContext, coverIssueId: string, alertIssueId: string): Promise<boolean> {
+  const ns = ctx.db.namespace;
+  const result = await ctx.db.execute(
+    `INSERT INTO ${q(ns, MEMBERS_TABLE)} (id, cover_issue_id, alert_issue_id)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (cover_issue_id, alert_issue_id)
+     DO UPDATE SET resolved_at = NULL, updated_at = now()
+     WHERE ${q(ns, MEMBERS_TABLE)}.resolved_at IS NOT NULL`,
+    [randomUUID(), coverIssueId, alertIssueId],
   );
+  return result.rowCount > 0;
 }
 
 /**
  * Creates (or joins) the board-owned "chain exhausted" cover for `issue`.
  *
- * Race safety: `originFingerprint` carries the alertname+window dedup key,
- * backed by a partial unique index on the host
- * (`issues_active_alert_escalation_cover_uq`). Two concurrent same-alertname
- * ladders both calling `ctx.issues.create()` cannot both win — the DB
- * constraint, not a read-then-create check here, is the source of truth. The
- * loser catches the 409 and attaches itself to the winner's cover instead of
- * creating a duplicate.
+ * Race safety has two independent layers:
+ *  1. `originFingerprint` carries the alertname+window dedup key, backed by
+ *     a partial unique index on the host (`issues_active_alert_escalation_cover_uq`).
+ *     Two concurrent same-alertname ladders both calling `ctx.issues.create()`
+ *     cannot both win the *issue* — the DB constraint, not a read-then-create
+ *     check here, is the source of truth. The loser catches the 409 and
+ *     joins the winner's cover instead of creating a duplicate.
+ *  2. Membership in that cover (winner's own alert, plus every losing
+ *     sibling) is a durable, race-safe row in `alert_escalation_cover_members`
+ *     (BLO-16120) — not a free-form comment — so resolving any one member
+ *     never has to guess whether siblings are still firing.
  */
 async function createCover(
   ctx: PluginContext,
@@ -107,17 +117,21 @@ async function createCover(
   config: AlertmanagerPluginConfig,
   now: Date,
 ) {
-  for (let offset = 0; ; offset += COVER_LIST_PAGE_SIZE) {
-    const owned = await ctx.issues.list({
-      companyId,
-      originKind: COVER_ORIGIN,
-      originId: issue.id,
-      limit: COVER_LIST_PAGE_SIZE,
-      offset,
-    });
-    if (owned.some((cover) => cover.status !== "done" && cover.status !== "cancelled")) return;
-    if (owned.length < COVER_LIST_PAGE_SIZE) break;
-  }
+  const ns = ctx.db.namespace;
+
+  // Already an open member of a still-open cover? Reopen (in case this is a
+  // re-fire racing the sweep) and stop — idempotent guard against a partial
+  // failure earlier in this same sweep tick retrying from the top.
+  const already = await ctx.db.execute(
+    `UPDATE ${q(ns, MEMBERS_TABLE)} AS m
+     SET resolved_at = NULL, updated_at = now()
+     FROM ${q(ns, COVERS_TABLE)} c
+     WHERE m.cover_issue_id = c.cover_issue_id
+       AND m.alert_issue_id = $1
+       AND c.cancelled_at IS NULL`,
+    [issue.id],
+  );
+  if (already.rowCount > 0) return;
 
   const windowMinutes = config.coverDedupWindowMinutes ?? DEFAULT_COVER_DEDUP_WINDOW_MINUTES;
   const fingerprint = coverDedupFingerprint(alertname, windowMinutes, now);
@@ -125,11 +139,11 @@ async function createCover(
   const owner = members.find((member) => member.principalType === "user" && member.status === "active" && ["owner", "admin"].includes(member.membershipRole ?? ""));
 
   // At most 2 attempts: the second only fires if the conflicting cover
-  // vanished between our failed create and the follow-up lookup (e.g. it was
-  // just cancelled) — in that narrow race the dedup slot is free again.
+  // vanished (or already fully resolved) between our failed create and the
+  // follow-up lookup — in that narrow race the dedup slot is free again.
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      await ctx.issues.create({
+      const created = await ctx.issues.create({
         companyId,
         parentId: issue.id,
         projectId: issue.projectId ?? undefined,
@@ -143,35 +157,156 @@ async function createCover(
         originId: issue.id,
         originFingerprint: fingerprint,
       });
+      await ctx.db.execute(
+        `INSERT INTO ${q(ns, COVERS_TABLE)} (cover_issue_id, company_id, dedup_fingerprint)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (cover_issue_id) DO NOTHING`,
+        [created.id, companyId, fingerprint],
+      );
+      await upsertOpenMember(ctx, created.id, issue.id);
       return;
     } catch (err) {
       if (!isCoverDedupConflict(err)) throw err;
       const [retained] = await ctx.issues.list({ companyId, originKind: COVER_ORIGIN, originFingerprint: fingerprint, limit: 1 });
-      if (!retained) continue;
-      await attachAsSibling(ctx, companyId, retained.id, issue, alertname);
+      if (!retained || retained.status === "done" || retained.status === "cancelled") continue;
+      // Defensive upsert: makes the covers-row bootstrap convergent from
+      // whichever caller reaches it first, even if the winner's own insert
+      // above hasn't landed yet (or failed) when this loser runs.
+      await ctx.db.execute(
+        `INSERT INTO ${q(ns, COVERS_TABLE)} (cover_issue_id, company_id, dedup_fingerprint)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (cover_issue_id) DO NOTHING`,
+        [retained.id, companyId, fingerprint],
+      );
+      const attached = await upsertOpenMember(ctx, retained.id, issue.id);
+      if (attached) {
+        await ctx.issues.createComment(
+          retained.id,
+          `[alert-escalation] Sibling alert ${issue.identifier ?? issue.id} ("${alertname}") also exhausted its agent chain within the dedup window; tracked here instead of opening a duplicate cover.`,
+          companyId,
+        );
+      }
       return;
     }
   }
 }
 
 /**
- * BLO-15982 cascade cleanup: when the source alert issue resolves, every
- * open cover it owns (originKind=COVER_ORIGIN, originId=<alert issue id>)
- * should close with it instead of sitting open on the board forever. Bounded
- * to a single indexed list() call — no per-alert N+1 — and idempotent:
- * a cover already in a terminal state is skipped, so a retried resolve
- * neither re-comments nor re-cancels it.
+ * Attempts to close `coverIssueId` once every represented source alert has
+ * resolved. The claim (who gets to post the one resolution comment AND run
+ * the terminal transition) is a single atomic UPDATE guarded by
+ * `NOT EXISTS (unresolved members)` — under concurrent callers (duplicate
+ * resolve deliveries, two siblings resolving at once), Postgres row-level
+ * locking on the covers row serializes the UPDATEs, so exactly one caller
+ * observes `rowCount > 0`. Only that caller proceeds inline; every other
+ * concurrent caller returns immediately rather than racing the winner
+ * through `ctx.issues.update` — a second read-then-write "is it cancelled
+ * yet" check there would reintroduce exactly the race this claim exists to
+ * prevent. A winner that crashes before finishing relies on the sweep's
+ * reconciliation pass (`reconcileStuckCovers`) to resume, not on another
+ * concurrent resolve.
  */
-export async function cancelOpenEscalationCovers(
+async function closeCoverIfEligible(ctx: PluginContext, companyId: string, coverIssueId: string): Promise<void> {
+  const ns = ctx.db.namespace;
+  const claim = await ctx.db.execute(
+    `UPDATE ${q(ns, COVERS_TABLE)} AS c
+     SET resolution_comment_posted_at = now(), updated_at = now()
+     WHERE c.cover_issue_id = $1
+       AND c.resolution_comment_posted_at IS NULL
+       AND c.cancelled_at IS NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM ${q(ns, MEMBERS_TABLE)} m
+         WHERE m.cover_issue_id = c.cover_issue_id AND m.resolved_at IS NULL
+       )`,
+    [coverIssueId],
+  );
+  if (claim.rowCount === 0) return; // not yet eligible, or another caller already claimed it
+  await ctx.issues.createComment(
+    coverIssueId,
+    "[alert-escalation] All source alerts represented by this cover have resolved; closing.",
+    companyId,
+  );
+  await finalizeCoverCancellation(ctx, companyId, coverIssueId);
+}
+
+/**
+ * Completes the terminal transition for a cover whose resolution comment is
+ * already (durably) claimed. Called by the claim winner inline, and by the
+ * sweep's `reconcileStuckCovers` pass when a prior winner claimed but
+ * crashed before finishing — never by a losing concurrent caller, which
+ * avoids a second read-then-write "is it cancelled yet" race here.
+ */
+async function finalizeCoverCancellation(ctx: PluginContext, companyId: string, coverIssueId: string): Promise<void> {
+  const ns = ctx.db.namespace;
+  const [row] = await ctx.db.query<{ resolution_comment_posted_at: string | null; cancelled_at: string | null }>(
+    `SELECT resolution_comment_posted_at, cancelled_at FROM ${q(ns, COVERS_TABLE)} WHERE cover_issue_id = $1`,
+    [coverIssueId],
+  );
+  if (!row || !row.resolution_comment_posted_at || row.cancelled_at) return;
+  const issue = await ctx.issues.get(coverIssueId, companyId);
+  if (issue && issue.status !== "done" && issue.status !== "cancelled") {
+    await ctx.issues.update(coverIssueId, { status: "cancelled" }, companyId);
+  }
+  await ctx.db.execute(
+    `UPDATE ${q(ns, COVERS_TABLE)} SET cancelled_at = now(), updated_at = now() WHERE cover_issue_id = $1 AND cancelled_at IS NULL`,
+    [coverIssueId],
+  );
+}
+
+/**
+ * BLO-16120 aggregate-aware cascade cleanup: marks `alertIssueId` resolved
+ * within every cover it's a member of (idempotent — a retried resolve is a
+ * no-op UPDATE), then attempts to close each of those covers. A cover only
+ * actually closes once its LAST unresolved member resolves — resolving the
+ * winning source before a sibling leaves the cover open. Membership lookup
+ * is a single indexed query keyed on `alert_issue_id`, so it can't silently
+ * stop short the way a paginated `ctx.issues.list(..., limit: 50)` scan can.
+ */
+export async function recordSourceResolvedAndCloseCovers(
   ctx: PluginContext,
   companyId: string,
   alertIssueId: string,
 ): Promise<void> {
-  const covers = await ctx.issues.list({ companyId, originKind: COVER_ORIGIN, originId: alertIssueId, limit: 50 });
-  for (const cover of covers) {
-    if (cover.status === "done" || cover.status === "cancelled") continue;
-    await ctx.issues.createComment(cover.id, "[alert-escalation] Source alert resolved; closing cover.", companyId);
-    await ctx.issues.update(cover.id, { status: "cancelled" }, companyId);
+  const ns = ctx.db.namespace;
+  const resolved = await ctx.db.execute(
+    `UPDATE ${q(ns, MEMBERS_TABLE)}
+     SET resolved_at = COALESCE(resolved_at, now()), updated_at = now()
+     WHERE alert_issue_id = $1`,
+    [alertIssueId],
+  );
+  if (resolved.rowCount === 0) return; // never joined a cover — nothing to cascade
+
+  const coverRows = await ctx.db.query<{ cover_issue_id: string }>(
+    `SELECT DISTINCT cover_issue_id FROM ${q(ns, MEMBERS_TABLE)} WHERE alert_issue_id = $1`,
+    [alertIssueId],
+  );
+  for (const { cover_issue_id: coverIssueId } of coverRows) {
+    await closeCoverIfEligible(ctx, companyId, coverIssueId);
+  }
+}
+
+/**
+ * Sweep backstop for the durable-retry requirement: a cover whose comment
+ * claim succeeded but whose terminal transition never completed (a crash or
+ * transient failure between the two steps) has no further inbound trigger —
+ * no more alerts will resolve into an already-fully-resolved cover. The
+ * sweep already runs every minute (see manifest `jobs`), so it doubles as
+ * the retry loop via the partial index on "claimed but not cancelled".
+ */
+async function reconcileStuckCovers(ctx: PluginContext, companyId: string): Promise<void> {
+  const ns = ctx.db.namespace;
+  const stuck = await ctx.db.query<{ cover_issue_id: string }>(
+    `SELECT cover_issue_id FROM ${q(ns, COVERS_TABLE)}
+     WHERE company_id = $1 AND resolution_comment_posted_at IS NOT NULL AND cancelled_at IS NULL
+     LIMIT ${STUCK_COVER_RECONCILE_LIMIT}`,
+    [companyId],
+  );
+  for (const { cover_issue_id: coverIssueId } of stuck) {
+    try {
+      await finalizeCoverCancellation(ctx, companyId, coverIssueId);
+    } catch (err) {
+      ctx.logger.warn(`alert-escalation: failed to finalize stuck cover ${coverIssueId}: ${String(err)}`);
+    }
   }
 }
 
@@ -188,6 +323,11 @@ export async function runAlertEscalationSweep(ctx: PluginContext, config: Alertm
       // sweep before the state write, repeating rung 1 every minute).
       ctx.logger.warn(`alert-escalation: skipping issue ${issue.identifier ?? issue.id}: ${String(err)}`);
     }
+  }
+  try {
+    await reconcileStuckCovers(ctx, companyId);
+  } catch (err) {
+    ctx.logger.warn(`alert-escalation: cover reconciliation pass failed: ${String(err)}`);
   }
 }
 
