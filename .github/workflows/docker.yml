@@ -206,8 +206,28 @@ jobs:
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
         run: |
           set -e
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            # BLO-12563: the 6h catch-up window must not double-roll a pod that a
+            # recent push already rolled to tip. Skip only when paperclip-0 is
+            # <6h old AND already running the tip sha; otherwise deploy (a
+            # debounced commit is still waiting for this window).
+            CREATED=$(kubectl -n "$NS" get pod paperclip-0 -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null || true)
+            RUNNING_IMG=$(kubectl -n "$NS" get sts paperclip -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+            TIP_SHORT=$(git rev-parse --short=7 HEAD)
+            if [ -n "$CREATED" ]; then
+              AGE=$(( $(date +%s) - $(date -d "$CREATED" +%s) ))
+              if [ "$AGE" -lt 21600 ] && printf '%s' "$RUNNING_IMG" | grep -qF "sha-${TIP_SHORT}"; then
+                echo "schedule window: paperclip-0 ${AGE}s old and already running tip (sha-${TIP_SHORT}) — skipping catch-up roll"
+                echo "proceed=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+            echo "schedule window — deploying tip"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "${{ github.event_name }}" != "push" ]; then
-            echo "batch window / manual dispatch — deploying"
+            echo "manual dispatch / tag — deploying"
             echo "proceed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
