@@ -324,6 +324,12 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "codex_transient_upstream",
   "claude_transient_upstream",
   "timeout",
+  // BLO-16182: `process_lost` means the run died before ANY adapter/model call
+  // (server/pod restart in the setup window) — no work product, idempotent to
+  // re-dispatch. Treat it as transient infra (3 bounded attempts + backoff)
+  // instead of the `default` single-attempt/instant-escalate path, so a lone
+  // control-plane blip no longer strands the issue as `blocked`.
+  "process_lost",
 ]);
 
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
@@ -340,6 +346,55 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
 // issue has a real waiting target we convert it into a normal dependency wait rather
 // than escalating it as stranded.
 const CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE = "issue_continuation_waiting_on_review";
+
+// BLO-16182: `process_lost` has two automatic retry engines — the continuation
+// sweep (which dispatches runs with retryReason `issue_continuation_needed`) and
+// the in-reaper `enqueueProcessLossRetry` (retryReason `process_lost`). To keep a
+// single bounded attempt budget once `process_lost` is a retryable transient code,
+// the sweep's consecutive-attempt counter must count BOTH reasons for a
+// `process_lost` budget — otherwise the sweep would grant a fresh 3 attempts on top
+// of the reaper's retry. Scoped to the `process_lost` budget so an in-reaper retry
+// run that later fails with a *different* code cannot shorten that other code's
+// separate budget.
+const CONTINUATION_ATTEMPT_RETRY_REASON = "issue_continuation_needed";
+const IN_REAPER_PROCESS_LOSS_RETRY_REASON = "process_lost";
+const PROCESS_LOST_ERROR_CODE = "process_lost";
+
+export function isContinuationAttemptRetryReason(
+  retryReason: string | null,
+  errorCodeToMatch: string | null,
+): boolean {
+  if (retryReason === CONTINUATION_ATTEMPT_RETRY_REASON) return true;
+  if (
+    retryReason === IN_REAPER_PROCESS_LOSS_RETRY_REASON &&
+    errorCodeToMatch === PROCESS_LOST_ERROR_CODE
+  ) {
+    return true;
+  }
+  return false;
+}
+
+// BLO-16182: the continuation cap+backoff block must ENTER whenever the latest
+// terminal run is an automatic retry attempt for this budget — symmetric with the
+// broadened streak counter above. For non-`process_lost` codes this is identical to
+// the old `didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")` gate;
+// for `process_lost` it ALSO admits an in-reaper (engine B) retry whose retryReason
+// is `process_lost` and which is the most recent run — otherwise that interleaving
+// skips the cap and re-dispatches uncapped + backoff-free (the exact window this
+// change bounds).
+function isAutomaticContinuationRecoveryRun(
+  latestRun: LatestIssueRun,
+  errorCodeToMatch: string | null,
+): boolean {
+  if (!latestRun) return false;
+  const latestRetryReason = readNonEmptyString(parseObject(latestRun.contextSnapshot).retryReason);
+  return (
+    isContinuationAttemptRetryReason(latestRetryReason, errorCodeToMatch) &&
+    UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
+      latestRun.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
+    )
+  );
+}
 
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
@@ -835,7 +890,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     for (const row of rows) {
       const ctx = parseObject(row.contextSnapshot);
       const retryReason = readNonEmptyString(ctx.retryReason);
-      if (retryReason !== "issue_continuation_needed") break;
+      // BLO-16182: count continuation-sweep AND in-reaper process_lost retries
+      // toward one bounded budget (see isContinuationAttemptRetryReason). This
+      // check runs BEFORE the errorCode-equality check below on purpose: a
+      // `process_lost`-reason run returns false here for any non-`process_lost`
+      // budget, fencing it out of another code's streak (cross-error leakage).
+      if (!isContinuationAttemptRetryReason(retryReason, errorCodeToMatch)) break;
       if (
         !UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
           row.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
@@ -4377,7 +4437,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
+        // BLO-16182: enter the cap+backoff block for any latest terminal run that
+        // is an automatic retry attempt for this budget (continuation sweep OR, for
+        // process_lost, the in-reaper engine-B retry) — symmetric with the streak
+        // counter so an engine-B-latest interleaving can't skip the cap.
+        if (isAutomaticContinuationRecoveryRun(latestRun, classification.errorCode)) {
           const { consecutive, latestFinishedAt } = await summarizeRecentContinuationRetries(
             issue.companyId,
             issue.id,
