@@ -2213,6 +2213,85 @@ describe("hasActionablePrReviewFeedback — reviewer taxonomy", () => {
   it("still short-circuits on a formal changes_requested review state", () => {
     expect(__test_hasActionablePrReviewFeedback("looks fine overall", "changes_requested")).toBe(true);
   });
+
+  // Ally review on #654 (BLO-15942): the negation scan originally looked back to
+  // the start of the sentence, so a negation cue far earlier in a long sentence
+  // could mask a genuine, unrelated "changes requested" later in that same
+  // sentence. Bounding the lookback to NEGATION_LOOKBACK_WORDS words shrinks that
+  // false-negative window while still suppressing the close-proximity negations
+  // (like "No changes requested...") this heuristic exists to catch.
+  it("does not let a negation cue far earlier in a long sentence mask a later genuine match", () => {
+    const body =
+      "not one of these old fixture issues affected the merge outcome whatsoever, so changes requested here.";
+    expect(__test_hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  it("still suppresses a negation cue close to the match within the same sentence", () => {
+    const body = "Clean pass, no changes requested at this time.";
+    expect(__test_hasActionablePrReviewFeedback(body)).toBe(false);
+  });
+});
+
+describe("GitHub review state → stage signal mapping (BLO-15942)", () => {
+  // Fixture derived from the real payload shape of Ally's review 4682219268 on
+  // Blockcast/trafficcontrol#1115: a COMMENTED, zero-Critical/Important-finding
+  // confirmation pass ("No changes requested from this lens"). The old heuristic's
+  // bare `changes\s+requested` match fired on that negated phrase and emitted a
+  // `## Changes Requested` system comment, bouncing a fully-approved deliverable
+  // and deadlocking BLO-15813's review stage (only the mandate-bound reviewer
+  // could act on it, and it correctly declined).
+  const commentedZeroFindingsReviewPayload = {
+    action: "submitted",
+    pull_request: {
+      number: 1115,
+      title: "design(marketplace): location-vocabulary translator",
+      head: { ref: "feat/BLO-15022", sha: "f88a7442e43f54b967b400a710bcfe943fc741da" },
+    },
+    review: {
+      body: [
+        "## Ally — Consolidated PR Review",
+        "",
+        "### Critical Issues (0)",
+        "None.",
+        "",
+        "### Important Issues (0)",
+        "None. Both of kkroo's blocking findings are correctly resolved in f88a7442e:",
+        "",
+        "### Recommended Action",
+        "Clean. No changes requested from this lens - ready per kkroo's \"merge on full-CI green\" gate.",
+      ].join("\n"),
+      state: "commented",
+      html_url: "https://github.com/Blockcast/trafficcontrol/pull/1115#pullrequestreview-4682219268",
+      user: { login: "allyblockcast[bot]" },
+    },
+    repository: { full_name: "Blockcast/trafficcontrol" },
+  };
+
+  it("COMMENTED + zero-finding body maps to a neutral signal, not changes_requested", () => {
+    const ctx = __test_resolveEventContext("pull_request_review", commentedZeroFindingsReviewPayload);
+    expect(ctx?.reviewState).toBe("commented");
+    expect(__test_hasActionablePrReviewFeedback(ctx?.reviewBody, ctx?.reviewState)).toBe(false);
+  });
+
+  it("CHANGES_REQUESTED maps to changes_requested even with an otherwise-clean body", () => {
+    const ctx = __test_resolveEventContext("pull_request_review", {
+      ...commentedZeroFindingsReviewPayload,
+      review: { ...commentedZeroFindingsReviewPayload.review, state: "changes_requested" },
+    });
+    expect(__test_hasActionablePrReviewFeedback(ctx?.reviewBody, ctx?.reviewState)).toBe(true);
+  });
+
+  it("APPROVED does not map to changes_requested", () => {
+    const ctx = __test_resolveEventContext("pull_request_review", {
+      ...commentedZeroFindingsReviewPayload,
+      review: {
+        ...commentedZeroFindingsReviewPayload.review,
+        state: "approved",
+        body: "Approved — merge on full-CI green.",
+      },
+    });
+    expect(__test_hasActionablePrReviewFeedback(ctx?.reviewBody, ctx?.reviewState)).toBe(false);
+  });
 });
 
 describe("PR→issue back-link (BLO-13353)", () => {

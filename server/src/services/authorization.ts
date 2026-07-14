@@ -1322,7 +1322,8 @@ export function authorizationService(db: Db) {
       (input.action === "agents:create" ||
         input.action === "agent_config:read" ||
         input.action === "agent_config:update" ||
-        input.action === "tasks:manage_active_checkouts") &&
+        input.action === "tasks:manage_active_checkouts" ||
+        input.action === "tasks:override_execution_stage") &&
       canCreateAgentsLegacy(actorAgent)
     ) {
       return allow({
@@ -1333,7 +1334,7 @@ export function authorizationService(db: Db) {
     }
 
     if (
-      input.action === "tasks:manage_active_checkouts" &&
+      (input.action === "tasks:manage_active_checkouts" || input.action === "tasks:override_execution_stage") &&
       input.resource.type === "issue" &&
       input.resource.assigneeAgentId &&
       await isManagerOf(companyId, actorAgentId, input.resource.assigneeAgentId)
