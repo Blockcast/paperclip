@@ -1182,14 +1182,26 @@ describeEmbeddedPostgres("github-webhook route", () => {
   });
 
   it("cancels pending reviewer work when the PR becomes a draft", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Ally" });
+    const { companyId, agentId: authorAgentId } = await seedIssueWithIdentifier("BLO-982");
+    const reviewerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
     const taskKey = "pr_review:Blockcast/paperclip:982";
     const runId = randomUUID();
 
     await db.insert(heartbeatRuns).values({
       id: runId,
       companyId,
-      agentId,
+      agentId: reviewerAgentId,
       invocationSource: "automation",
       triggerDetail: "system",
       status: "scheduled_retry",
@@ -1204,12 +1216,12 @@ describeEmbeddedPostgres("github-webhook route", () => {
       },
     });
 
-    const app = buildApp({ prReviewerAgentId: agentId });
+    const app = buildApp({ prReviewerAgentId: reviewerAgentId });
     const payload = {
       action: "converted_to_draft",
       pull_request: {
         number: 982,
-        title: "Pause reviewer work",
+        title: "BLO-982 Pause reviewer work",
         body: null,
         draft: true,
         html_url: "https://github.com/Blockcast/paperclip/pull/982",
@@ -1230,8 +1242,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
     expect(response.status).toBe(200);
     expect(response.body).toMatchObject({
-      ignored: "no_paperclip_identifier",
-      reviewerWakeFired: false,
+      wakes: [],
       reviewerRunsCancelled: 1,
     });
 
@@ -1240,6 +1251,12 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId));
     expect(run?.status).toBe("cancelled");
+
+    const authorWakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, authorAgentId));
+    expect(authorWakes).toEqual([]);
   });
 
   it("does not permanently block reviewer wakes once a dispatch retry chain is exhausted (BLO-14395 regression)", async () => {

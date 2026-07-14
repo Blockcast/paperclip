@@ -1115,10 +1115,11 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           deliveryId,
           repoFullName: context.repoFullName,
           prNumber: context.prNumber,
+          wakeReason: context.wakeReason,
           reviewerTaskKey,
           cancelled,
         },
-        "github webhook retired queued reviewer runs for closed PR",
+        "github webhook retired pending reviewer runs for PR lifecycle transition",
       );
       return cancelled;
     })();
@@ -1492,15 +1493,16 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       (recoveryInstance ??= recoveryService(db, { enqueueWakeup: heartbeat.wakeup }));
     const actionableReviewFeedback = isActionableReviewFeedbackContext(context);
 
-    // pull_request.synchronize is a reviewer-only signal. The reviewer wake
-    // above is PR-scoped: active runs coalesce on taskKey, and duplicate request
-    // rows are skipped by the idempotency precheck. The author-assignee wake
-    // below is deliberately not driven by synchronize: the assignee is the one
-    // who just pushed, so waking them per push would be redundant and would fan
-    // out one author run per push. The author still gets woken by
-    // check_run/workflow_run on terminal CI and by review-submitted/@ally
-    // feedback, as before.
+    // synchronize and converted_to_draft are reviewer-lifecycle signals. The
+    // reviewer wake above is PR-scoped: active runs coalesce on taskKey, and
+    // duplicate request rows are skipped by the idempotency precheck. The
+    // author-assignee wake below is deliberately not driven by either event:
+    // the author just pushed or drafted the PR, so waking them would be
+    // redundant. The author still gets woken by check_run/workflow_run on
+    // terminal CI and by review-submitted/@ally feedback, as before.
     const synchronizeReviewerOnly = context.wakeReason === "github_pr_synchronized";
+    const suppressAuthorWake =
+      synchronizeReviewerOnly || context.wakeReason === "github_pr_converted_to_draft";
     if (
       eventName === "pull_request" &&
       synchronizeReviewerOnly &&
@@ -1517,7 +1519,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       );
     }
 
-    for (const issue of synchronizeReviewerOnly ? [] : matched) {
+    for (const issue of suppressAuthorWake ? [] : matched) {
       // Terminal-status issues don't need to wake -- the assignee
       // shouldn't reopen `done`/`cancelled` work just because a stale
       // CI ping arrived.
