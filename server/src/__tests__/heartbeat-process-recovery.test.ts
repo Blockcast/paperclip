@@ -4916,6 +4916,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: "in_progress",
       runStatus: "failed",
       retryReason: "issue_continuation_needed",
+      // BLO-16182: default-classified code — escalates at one attempt
+      // (process_lost is now transient / 3-attempt).
+      runErrorCode: "adapter_exit_code",
     });
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
@@ -4951,6 +4954,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: "in_progress",
       runStatus: "failed",
       retryReason: "issue_continuation_needed",
+      // BLO-16182: default-classified code — escalates at one attempt
+      // (process_lost is now transient / 3-attempt).
+      runErrorCode: "adapter_exit_code",
     });
 
     const firstResult = await heartbeat.reconcileStrandedAssignedIssues();
@@ -5428,6 +5434,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: "in_progress",
       runStatus: "failed",
       retryReason: "issue_continuation_needed",
+      // BLO-16182: default-classified code — escalates at one attempt
+      // (process_lost is now transient / 3-attempt).
+      runErrorCode: "adapter_exit_code",
     });
 
     const results = await Promise.allSettled(
@@ -6240,6 +6249,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         status: "in_progress",
         runStatus: "failed",
         retryReason: "issue_continuation_needed",
+        // BLO-16182: exercises generic escalation/wake routing, not process_lost's
+        // transient budget — use a default-classified code so it escalates at one
+        // attempt (process_lost is now transient / 3-attempt).
+        runErrorCode: "adapter_exit_code",
       });
       const { companyId, agentId, issueId } = fixture;
 
@@ -6377,6 +6390,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         status: "in_progress",
         runStatus: "failed",
         retryReason: "issue_continuation_needed",
+        // BLO-16182: default-classified code so it escalates at one attempt
+        // (process_lost is now transient / 3-attempt); this test targets wake
+        // suppression, not the transient budget.
+        runErrorCode: "adapter_exit_code",
       });
       const { agentId, issueId, companyId } = fixture;
 
