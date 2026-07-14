@@ -333,7 +333,8 @@ ARG CLAUDE_K8S_REF=c10a12b0b7d41ea20a40e92ffcf4c1131c404a81
 # Paperclip applies a narrow follow-up patch because the GitHub integration
 # cannot push to the personal adapter repository. It keeps Kubernetes from
 # creating a fresh run workspace as root before the uid-1000 process starts,
-# and fails isolation setup immediately instead of hiding EACCES.
+# and fails isolation setup immediately instead of hiding EACCES. Paperclip
+# follow-up: Blockcast/paperclip#671.
 ARG OPENCODE_K8S_REF=dfd13f28a15c02632b7b2f6378fc17c88b570856
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
