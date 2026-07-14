@@ -83,6 +83,7 @@ import {
   externalRuntimeReservationCanRelease,
   getActiveExternalRuntimeReservation,
   markExternalRuntimeReservationLaunching,
+  rearmExternalRuntimeReservationForRetry,
   recordExpectedExternalRuntimeJobName,
   recordExternalRuntimeJobIdentity,
   releaseExternalRuntimeReservation,
@@ -13584,6 +13585,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 `[paperclip] Retryable ccrotate throttle before model progress; retrying in ${Math.ceil(retryDelayMs / 1000)}s (${ccrotateRetryAttempt}/${K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS}).\n`,
               );
               await sleepMs(retryDelayMs);
+              if (externalRuntimeReservation) {
+                const rearmedReservation = await rearmExternalRuntimeReservationForRetry(db, {
+                  runId: run.id,
+                  reservationId: externalRuntimeReservation.id,
+                });
+                if (!rearmedReservation) {
+                  throw new Error(`External runtime reservation no longer owns retry launch for run ${run.id}`);
+                }
+              }
             }
             // Adapter returned cleanly, which means its workspace-restore finally
             // block also ran without throwing. Record the workspace_finalize

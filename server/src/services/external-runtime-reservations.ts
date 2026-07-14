@@ -5,6 +5,7 @@ import {
   recordExternalRuntimeReservationEvent,
   setExternalRuntimeReservationMetrics,
 } from "./metrics.js";
+import { logger } from "../middleware/logger.js";
 
 const DEFAULT_EXTERNAL_RUNTIME_SLOT_ID = 0;
 
@@ -37,6 +38,16 @@ export async function refreshExternalRuntimeReservationMetrics(db: Db, now = new
   setExternalRuntimeReservationMetrics({
     active: Number(snapshot?.active ?? 0),
     oldestAgeSeconds: Math.max(0, (now.getTime() - oldestMs) / 1000),
+  });
+}
+
+function refreshExternalRuntimeReservationMetricsBestEffort(
+  db: Db,
+  now: Date,
+  operation: string,
+) {
+  void refreshExternalRuntimeReservationMetrics(db, now).catch((err) => {
+    logger.warn({ err, operation }, "failed to refresh external-runtime reservation metrics");
   });
 }
 
@@ -103,7 +114,7 @@ export async function claimRunWithExternalRuntimeSlot(
   });
 
   recordExternalRuntimeReservationEvent(claimed ? "reserved" : "contended");
-  void refreshExternalRuntimeReservationMetrics(db, claimedAt).catch(() => undefined);
+  refreshExternalRuntimeReservationMetricsBestEffort(db, claimedAt, "claim");
   return claimed;
 }
 
@@ -144,6 +155,37 @@ export async function markExternalRuntimeReservationLaunching(
   return reservation;
 }
 
+export async function rearmExternalRuntimeReservationForRetry(
+  db: Db,
+  input: { runId: string; reservationId: string; now?: Date },
+): Promise<ExternalRuntimeReservation | null> {
+  const now = input.now ?? new Date();
+  const reservation = await db
+    .update(externalRuntimeReservations)
+    .set({
+      state: "launching",
+      expectedJobName: null,
+      jobName: null,
+      jobUid: null,
+      launchingAt: now,
+      launchedAt: null,
+      updatedAt: now,
+    })
+    .where(and(
+      eq(externalRuntimeReservations.id, input.reservationId),
+      eq(externalRuntimeReservations.runId, input.runId),
+      isNull(externalRuntimeReservations.releasedAt),
+      or(
+        eq(externalRuntimeReservations.state, "launching"),
+        eq(externalRuntimeReservations.state, "launched"),
+      ),
+    ))
+    .returning()
+    .then((rows) => rows[0] ?? null);
+  if (reservation) recordExternalRuntimeReservationEvent("launching");
+  return reservation;
+}
+
 export async function requireExternalRuntimeLaunchOwnership(
   db: Db,
   input: { runId: string; reservationId: string },
@@ -176,7 +218,7 @@ export async function releaseExternalRuntimeReservation(
     .then((rows) => rows[0] ?? null);
   if (reservation) {
     recordExternalRuntimeReservationEvent("released");
-    void refreshExternalRuntimeReservationMetrics(db, now).catch(() => undefined);
+    refreshExternalRuntimeReservationMetricsBestEffort(db, now, "release");
   }
   return reservation;
 }
@@ -283,6 +325,6 @@ export async function recordExternalRuntimeJobIdentity(
   }
 
   recordExternalRuntimeReservationEvent("launched");
-  void refreshExternalRuntimeReservationMetrics(db, now).catch(() => undefined);
+  refreshExternalRuntimeReservationMetricsBestEffort(db, now, "launch");
   return reservation;
 }

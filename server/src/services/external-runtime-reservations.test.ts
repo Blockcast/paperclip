@@ -16,6 +16,7 @@ import {
   claimRunWithExternalRuntimeSlot,
   externalRuntimeReservationCanRelease,
   markExternalRuntimeReservationLaunching,
+  rearmExternalRuntimeReservationForRetry,
   recordExpectedExternalRuntimeJobName,
   recordExternalRuntimeJobIdentity,
   releaseExternalRuntimeReservation,
@@ -164,6 +165,71 @@ describeEmbeddedPostgres("external runtime reservations", () => {
       jobName: "agent-opencode-run-2",
       jobUid: "uid-2",
     })).rejects.toThrow(/identity mismatch/);
+  });
+
+  it("re-arms a launched reservation for a replacement Job", async () => {
+    const [runId] = await seedQueuedRuns(1);
+    const claim = await claimRunWithExternalRuntimeSlot(db, runId, new Date());
+    await markExternalRuntimeReservationLaunching(db, runId);
+    await recordExpectedExternalRuntimeJobName(db, {
+      runId,
+      jobName: "agent-opencode-run-1",
+    });
+    await recordExternalRuntimeJobIdentity(db, {
+      runId,
+      jobName: "agent-opencode-run-1",
+      jobUid: "uid-1",
+    });
+
+    const rearmed = await rearmExternalRuntimeReservationForRetry(db, {
+      runId,
+      reservationId: claim!.reservation.id,
+    });
+
+    expect(rearmed).toMatchObject({
+      state: "launching",
+      expectedJobName: null,
+      jobName: null,
+      jobUid: null,
+      launchedAt: null,
+    });
+    await recordExpectedExternalRuntimeJobName(db, {
+      runId,
+      jobName: "agent-opencode-run-2",
+    });
+    const replacement = await recordExternalRuntimeJobIdentity(db, {
+      runId,
+      jobName: "agent-opencode-run-2",
+      jobUid: "uid-2",
+    });
+    expect(replacement).toMatchObject({
+      state: "launched",
+      expectedJobName: "agent-opencode-run-2",
+      jobName: "agent-opencode-run-2",
+      jobUid: "uid-2",
+    });
+  });
+
+  it("re-arms a retry when throttling happens before Job acknowledgment", async () => {
+    const [runId] = await seedQueuedRuns(1);
+    const claim = await claimRunWithExternalRuntimeSlot(db, runId, new Date());
+    await markExternalRuntimeReservationLaunching(db, runId);
+    await recordExpectedExternalRuntimeJobName(db, {
+      runId,
+      jobName: "agent-opencode-unacknowledged",
+    });
+
+    const rearmed = await rearmExternalRuntimeReservationForRetry(db, {
+      runId,
+      reservationId: claim!.reservation.id,
+    });
+
+    expect(rearmed).toMatchObject({
+      state: "launching",
+      expectedJobName: null,
+      jobName: null,
+      jobUid: null,
+    });
   });
 
   it("rejects launch identity after the run has lost its reservation", async () => {

@@ -281,7 +281,9 @@ export async function createApp(
   // otherwise spam request logs every scrape interval.
   app.get("/metrics", async (_req, res, next) => {
     try {
-      await refreshExternalRuntimeReservationMetrics(db).catch(() => undefined);
+      await refreshExternalRuntimeReservationMetrics(db).catch((err) => {
+        logger.warn({ err }, "failed to refresh external-runtime reservation metrics before scrape");
+      });
       const { contentType, body } = await renderMetrics();
       res.status(200).set("Content-Type", contentType).send(body);
     } catch (err) {
