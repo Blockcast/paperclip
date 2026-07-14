@@ -1,6 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { COVER_ORIGIN, escalationDeadlineMs, runAlertEscalationSweep } from "../escalation.js";
+import { COVER_ORIGIN, escalationDeadlineMs, recordSourceResolvedAndCloseCovers, runAlertEscalationSweep } from "../escalation.js";
 import { handleFiring, handleResolved } from "../webhook-handler.js";
 import { DEFAULT_ISSUE_ROUTE_MAP } from "../constants.js";
 import { ORIGIN_KIND } from "../types.js";
@@ -21,7 +22,153 @@ const config = (overrides: Partial<AlertmanagerPluginConfig> = {}): Alertmanager
   ...overrides,
 });
 
-function sweepContext(state: AlertStateRecord, reportsTo: string | null = "cto") {
+/**
+ * In-memory model of the plugin's own `alert_escalation_covers` /
+ * `alert_escalation_cover_members` tables (see migrations/001) plus the
+ * board-cover issues they reference. Every branch below is synchronous JS
+ * with no internal `await`, so — same reasoning as a real Postgres
+ * single-statement UPDATE — the check-and-act pairs (claim eligibility,
+ * insert-on-conflict) stay atomic across interleaved concurrent callers
+ * driven through `Promise.all`, not just sequential calls.
+ */
+function buildFakeAlertmanagerStore() {
+  const coverIssuesById = new Map<string, { id: string; status: string; originId?: string; identifier?: string }>();
+  const openCoverIdByFingerprint = new Map<string, string>();
+  const covers = new Map<string, { cover_issue_id: string; company_id: string; dedup_fingerprint: string; closing_claimed_at: string | null; resolution_comment_posted_at: string | null; cancelled_at: string | null }>();
+  const members = new Map<string, { id: string; cover_issue_id: string; alert_issue_id: string; resolved_at: string | null }>();
+  let seq = 0;
+
+  async function issuesList(input: { originKind?: string; originFingerprint?: string; originId?: string }) {
+    if (input.originKind !== COVER_ORIGIN) return [];
+    if (input.originFingerprint) {
+      const id = openCoverIdByFingerprint.get(input.originFingerprint);
+      const issue = id ? coverIssuesById.get(id) : undefined;
+      return issue ? [issue] : [];
+    }
+    return [];
+  }
+
+  async function issuesCreate(params: { originFingerprint?: string | null; originId?: string; identifier?: string; [k: string]: unknown }) {
+    seq += 1;
+    const id = `cover-${seq}`;
+    if (params.originFingerprint) {
+      if (openCoverIdByFingerprint.has(params.originFingerprint)) {
+        throw new Error("Alert escalation cover conflict"); // no await above — atomic check-and-claim
+      }
+      const issue = { id, status: "todo", ...params };
+      coverIssuesById.set(id, issue);
+      openCoverIdByFingerprint.set(params.originFingerprint, id);
+      return issue;
+    }
+    const issue = { id, status: "todo", ...params };
+    coverIssuesById.set(id, issue);
+    return issue;
+  }
+
+  function openMemberCount(coverIssueId: string): number {
+    let count = 0;
+    for (const m of members.values()) if (m.cover_issue_id === coverIssueId && m.resolved_at === null) count += 1;
+    return count;
+  }
+
+  const db = {
+    namespace: "ns",
+    async execute(sql: string, params: unknown[] = []) {
+      const text = sql.replace(/\s+/g, " ").trim();
+      if (text.includes("ON CONFLICT (cover_issue_id, alert_issue_id)")) {
+        const [id, coverIssueId, alertIssueId] = params as [string, string, string];
+        const key = `${coverIssueId}:${alertIssueId}`;
+        const existing = members.get(key);
+        if (!existing) {
+          members.set(key, { id, cover_issue_id: coverIssueId, alert_issue_id: alertIssueId, resolved_at: null });
+          return { rowCount: 1 };
+        }
+        if (existing.resolved_at !== null) {
+          existing.resolved_at = null;
+          return { rowCount: 1 };
+        }
+        return { rowCount: 0 };
+      }
+      if (text.includes("ON CONFLICT (cover_issue_id) DO NOTHING")) {
+        const [coverIssueId, companyId, fingerprint] = params as [string, string, string];
+        if (covers.has(coverIssueId)) return { rowCount: 0 };
+        covers.set(coverIssueId, { cover_issue_id: coverIssueId, company_id: companyId, dedup_fingerprint: fingerprint, closing_claimed_at: null, resolution_comment_posted_at: null, cancelled_at: null });
+        return { rowCount: 1 };
+      }
+      if (text.includes("NOT EXISTS")) {
+        const [coverIssueId] = params as [string];
+        const cover = covers.get(coverIssueId);
+        if (!cover || cover.closing_claimed_at !== null || cover.cancelled_at !== null) return { rowCount: 0 };
+        if (openMemberCount(coverIssueId) > 0) return { rowCount: 0 };
+        cover.closing_claimed_at = new Date().toISOString();
+        return { rowCount: 1 };
+      }
+      if (text.includes("SET resolution_comment_posted_at = now()")) {
+        const [coverIssueId] = params as [string];
+        const cover = covers.get(coverIssueId);
+        if (!cover || cover.resolution_comment_posted_at !== null) return { rowCount: 0 };
+        cover.resolution_comment_posted_at = new Date().toISOString();
+        return { rowCount: 1 };
+      }
+      if (text.includes("c.cancelled_at IS NULL") && text.startsWith("UPDATE")) {
+        // "already an open member" reopen check in createCover.
+        const [alertIssueId] = params as [string];
+        let count = 0;
+        for (const m of members.values()) {
+          if (m.alert_issue_id !== alertIssueId) continue;
+          const cover = covers.get(m.cover_issue_id);
+          if (!cover || cover.cancelled_at !== null || cover.closing_claimed_at !== null) continue;
+          m.resolved_at = null;
+          count += 1;
+        }
+        return { rowCount: count };
+      }
+      if (text.includes("COALESCE(resolved_at, now())")) {
+        const [alertIssueId] = params as [string];
+        let count = 0;
+        for (const m of members.values()) {
+          if (m.alert_issue_id !== alertIssueId) continue;
+          if (m.resolved_at === null) m.resolved_at = new Date().toISOString();
+          count += 1;
+        }
+        return { rowCount: count };
+      }
+      if (text.includes("SET cancelled_at = now()")) {
+        const [coverIssueId] = params as [string];
+        const cover = covers.get(coverIssueId);
+        if (!cover || cover.cancelled_at !== null) return { rowCount: 0 };
+        cover.cancelled_at = new Date().toISOString();
+        return { rowCount: 1 };
+      }
+      throw new Error(`fake db: unrecognized execute statement: ${text}`);
+    },
+    async query<T>(sql: string, params: unknown[] = []): Promise<T[]> {
+      const text = sql.replace(/\s+/g, " ").trim();
+      if (text.startsWith("SELECT DISTINCT cover_issue_id")) {
+        const [alertIssueId] = params as [string];
+        const ids = new Set<string>();
+        for (const m of members.values()) if (m.alert_issue_id === alertIssueId) ids.add(m.cover_issue_id);
+        return [...ids].map((cover_issue_id) => ({ cover_issue_id })) as T[];
+      }
+      if (text.startsWith("SELECT closing_claimed_at, resolution_comment_posted_at, cancelled_at")) {
+        const [coverIssueId] = params as [string];
+        const cover = covers.get(coverIssueId);
+        return cover ? [{ closing_claimed_at: cover.closing_claimed_at, resolution_comment_posted_at: cover.resolution_comment_posted_at, cancelled_at: cover.cancelled_at }] as T[] : [];
+      }
+      if (text.includes("closing_claimed_at IS NOT NULL AND cancelled_at IS NULL")) {
+        const [companyId] = params as [string];
+        return [...covers.values()]
+          .filter((c) => c.company_id === companyId && c.closing_claimed_at !== null && c.cancelled_at === null)
+          .map((c) => ({ cover_issue_id: c.cover_issue_id })) as T[];
+      }
+      throw new Error(`fake db: unrecognized query statement: ${text}`);
+    },
+  };
+
+  return { issuesList, issuesCreate, db, coverIssuesById, covers, members, openMemberCount };
+}
+
+function sweepContext(state: AlertStateRecord, reportsTo: string | null = "cto", store = buildFakeAlertmanagerStore()) {
   const issue = {
     id: "issue-1", identifier: "BLO-1", title: "Alert", status: "todo", priority: "critical",
     originId: "fp-1", assigneeAgentId: "engineer", projectId: null, goalId: null,
@@ -29,13 +176,15 @@ function sweepContext(state: AlertStateRecord, reportsTo: string | null = "cto")
   const mocks = {
     state: { get: vi.fn(async () => state), set: vi.fn(async () => undefined) },
     issues: {
-      list: vi.fn(async (input: { originKind?: string }) => input.originKind?.endsWith(":escalation") ? [] : [issue]),
+      list: vi.fn(async (input: { originKind?: string }) => input.originKind?.endsWith(":escalation") ? store.issuesList(input as any) : [issue]),
       listComments: vi.fn(async () => []),
       createComment: vi.fn(async () => ({})),
       requestWakeup: vi.fn(async () => ({})),
       update: vi.fn(async () => issue),
-      create: vi.fn(async () => ({ id: "cover-1" })),
+      create: vi.fn(store.issuesCreate as any),
+      get: vi.fn(async () => issue),
     },
+    db: store.db,
     agents: {
       get: vi.fn(async (id: string) => id === "engineer"
         ? { id, name: "Engineer", reportsTo }
@@ -44,7 +193,7 @@ function sweepContext(state: AlertStateRecord, reportsTo: string | null = "cto")
     access: { members: { list: vi.fn(async () => [{ principalType: "user", principalId: "board-1", status: "active", membershipRole: "owner" }]) } },
     logger: { info: vi.fn(), warn: vi.fn() },
   };
-  return { ctx: mocks as unknown as PluginContext, mocks };
+  return { ctx: mocks as unknown as PluginContext, mocks, store };
 }
 
 describe("alert escalation", () => {
@@ -78,25 +227,23 @@ describe("alert escalation", () => {
     expect(stored.mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 2, nextEscalationAt: "2026-07-11T01:05:00.000Z" }));
   });
 
-  it("creates one board-owned user-cover issue at the top of chain", async () => {
+  it("creates one board-owned user-cover issue at the top of chain, with durable membership", async () => {
     const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1 };
-    const { ctx, mocks } = sweepContext(state, null);
+    const { ctx, mocks, store } = sweepContext(state, null);
     await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
     expect(mocks.issues.create).toHaveBeenCalledWith(expect.objectContaining({ title: expect.stringContaining("[user-cover]"), assigneeUserId: "board-1", originId: "issue-1" }));
     expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationComplete: true, nextEscalationAt: null }));
+    expect(store.covers.size).toBe(1);
+    const [coverRow] = [...store.covers.values()];
+    expect(store.members.get(`${coverRow.cover_issue_id}:issue-1`)?.resolved_at).toBeNull();
   });
 
-  it("creates a fresh cover after a prior owned cover was cancelled on resolution", async () => {
+  it("creates a fresh cover once the prior cover for this alert is cancelled", async () => {
     const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1 };
-    const { ctx, mocks } = sweepContext(state, null);
-    const alertIssue = {
-      id: "issue-1", identifier: "BLO-1", title: "Alert", status: "todo", priority: "critical",
-      originId: "fp-1", assigneeAgentId: "engineer", projectId: null, goalId: null,
-    };
-    mocks.issues.list = vi.fn(async (input: { originKind?: string }) =>
-      input.originKind === COVER_ORIGIN
-        ? [{ id: "old-cover", status: "cancelled" }]
-        : [alertIssue]);
+    const store = buildFakeAlertmanagerStore();
+    store.covers.set("old-cover", { cover_issue_id: "old-cover", company_id: "company-1", dedup_fingerprint: "cover:SyntheticAlert:stale", closing_claimed_at: "2026-07-10T00:00:00Z", resolution_comment_posted_at: "2026-07-10T00:00:00Z", cancelled_at: "2026-07-10T00:00:00Z" });
+    store.members.set("old-cover:issue-1", { id: randomUUID(), cover_issue_id: "old-cover", alert_issue_id: "issue-1", resolved_at: "2026-07-10T00:00:00Z" });
+    const { ctx, mocks } = sweepContext(state, null, store);
 
     await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
 
@@ -104,55 +251,50 @@ describe("alert escalation", () => {
     expect(mocks.issues.create).toHaveBeenCalledWith(expect.objectContaining({ originId: "issue-1" }));
   });
 
-  it("does not create another cover when a terminal cover sorts ahead of an active cover", async () => {
+  it("does not create a duplicate cover when this alert is already an open member of a non-cancelled cover", async () => {
     const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1 };
-    const { ctx, mocks } = sweepContext(state, null);
-    const alertIssue = {
-      id: "issue-1", identifier: "BLO-1", title: "Alert", status: "todo", priority: "critical",
-      originId: "fp-1", assigneeAgentId: "engineer", projectId: null, goalId: null,
-    };
-    const covers = [
-      { id: "recently-commented-terminal-cover", status: "cancelled" },
-      { id: "current-active-cover", status: "todo" },
-    ];
-    mocks.issues.list = vi.fn(async (input: { originKind?: string; limit?: number; offset?: number }) => {
-      if (input.originKind !== COVER_ORIGIN) return [alertIssue];
-      const offset = input.offset ?? 0;
-      return covers.slice(offset, offset + (input.limit ?? covers.length));
-    });
+    const store = buildFakeAlertmanagerStore();
+    store.coverIssuesById.set("cover-existing", { id: "cover-existing", status: "todo" });
+    store.covers.set("cover-existing", { cover_issue_id: "cover-existing", company_id: "company-1", dedup_fingerprint: "cover:SyntheticAlert:current", closing_claimed_at: null, resolution_comment_posted_at: null, cancelled_at: null });
+    store.members.set("cover-existing:issue-1", { id: randomUUID(), cover_issue_id: "cover-existing", alert_issue_id: "issue-1", resolved_at: "2026-07-10T00:00:00Z" });
+    const { ctx, mocks } = sweepContext(state, null, store);
 
     await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
 
     expect(mocks.issues.create).not.toHaveBeenCalled();
-    expect(mocks.issues.list).toHaveBeenCalledWith(expect.objectContaining({
-      originKind: COVER_ORIGIN,
-      originId: "issue-1",
-      limit: 50,
-      offset: 0,
-    }));
+    // the reopen path un-resolves the existing membership since the alert is firing again
+    expect(store.members.get("cover-existing:issue-1")?.resolved_at).toBeNull();
   });
 
-  it("checks every page of owned cover history for an active cover", async () => {
+  it("does not reopen membership on a cover that has already claimed to close (BLO-16120 PR #662 review) — falls through to a fresh cover instead of racing the finalize", async () => {
     const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1 };
-    const { ctx, mocks } = sweepContext(state, null);
-    const alertIssue = {
-      id: "issue-1", identifier: "BLO-1", title: "Alert", status: "todo", priority: "critical",
-      originId: "fp-1", assigneeAgentId: "engineer", projectId: null, goalId: null,
-    };
-    const covers = [
-      ...Array.from({ length: 50 }, (_, index) => ({ id: `terminal-cover-${index}`, status: "cancelled" })),
-      { id: "active-cover-on-second-page", status: "in_progress" },
-    ];
-    mocks.issues.list = vi.fn(async (input: { originKind?: string; limit?: number; offset?: number }) => {
-      if (input.originKind !== COVER_ORIGIN) return [alertIssue];
-      const offset = input.offset ?? 0;
-      return covers.slice(offset, offset + (input.limit ?? covers.length));
-    });
+    const store = buildFakeAlertmanagerStore();
+    store.coverIssuesById.set("cover-closing", { id: "cover-closing", status: "todo" });
+    // Cover already won the closing claim (mid `closeCoverIfEligible` /
+    // `finalizeCoverCancellation`, or sitting in the stuck-reconcile window)
+    // but hasn't cancelled yet; this alert's own membership on it already
+    // resolved, then it re-fired — racing the finalize.
+    store.covers.set("cover-closing", { cover_issue_id: "cover-closing", company_id: "company-1", dedup_fingerprint: "cover:SyntheticAlert:stale-claim", closing_claimed_at: "2026-07-11T00:55:00Z", resolution_comment_posted_at: null, cancelled_at: null });
+    store.members.set("cover-closing:issue-1", { id: randomUUID(), cover_issue_id: "cover-closing", alert_issue_id: "issue-1", resolved_at: "2026-07-10T00:00:00Z" });
+    const { ctx, mocks } = sweepContext(state, null, store);
 
     await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
 
-    expect(mocks.issues.create).not.toHaveBeenCalled();
-    expect(mocks.issues.list).toHaveBeenCalledWith(expect.objectContaining({ offset: 50 }));
+    // must NOT silently reopen membership on the closing cover —
+    // `finalizeCoverCancellation` never re-checks membership before
+    // cancelling, so a reopen here would let the cover close anyway and
+    // orphan this re-fire from any cover. Instead membership stays resolved,
+    // so the old cover is free to finalize on its own (via this same sweep's
+    // reconcile pass, since it has no other unresolved members) —
+    // legitimately, since the re-fired alert is no longer tracked there.
+    expect(store.members.get("cover-closing:issue-1")?.resolved_at).not.toBeNull();
+    expect(store.covers.get("cover-closing")?.cancelled_at).not.toBeNull();
+    // instead the re-fire falls through to createCover's normal create-or-join path
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.create).toHaveBeenCalledWith(expect.objectContaining({ originId: "issue-1" }));
+    const [newCoverRow] = [...store.covers.values()].filter((c) => c.cover_issue_id !== "cover-closing");
+    expect(newCoverRow).toBeDefined();
+    expect(store.members.get(`${newCoverRow!.cover_issue_id}:issue-1`)?.resolved_at).toBeNull();
   });
 
   it("clears the escalation schedule when an alert resolves", async () => {
@@ -160,6 +302,8 @@ describe("alert escalation", () => {
     const mocks = { state: { get: vi.fn(async () => state), set: vi.fn(async () => undefined) }, issues: { get: vi.fn(async () => ({ id: "issue-1", status: "todo" })), update: vi.fn(async () => ({})), createComment: vi.fn() }, events: { emit: vi.fn() }, metrics: { write: vi.fn() }, logger: { info: vi.fn(), warn: vi.fn() } };
     await handleResolved(mocks as unknown as PluginContext, config(), { ...alert(), status: "resolved", endsAt: "2026-07-11T02:00:00Z" });
     expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationComplete: true, nextEscalationAt: null }));
+    // no `ctx.db` on this mock — the cover cascade must be swallowed, not crash the resolve.
+    expect(mocks.logger.warn).toHaveBeenCalled();
   });
 
   it("advances the ladder and posts exactly one comment even when the wake is refused", async () => {
@@ -206,121 +350,169 @@ describe("alert escalation", () => {
   });
 });
 
-describe("BLO-15982 cascade cover cleanup on resolve", () => {
-  const resolvedState: AlertStateRecord = {
-    paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null,
-    assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical",
-    firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T01:00:00Z",
-    escalationAttempt: 3, escalationComplete: true,
-  };
-
-  function resolveMocks(covers: Array<{ id: string; status: string }>) {
-    return {
-      state: { get: vi.fn(async () => resolvedState), set: vi.fn(async () => undefined) },
+describe("BLO-16120 aggregate-aware cover cleanup on resolve", () => {
+  /** Seeds a cover with N unresolved members and returns a resolve-ready ctx. */
+  function coverContext(memberAlertIssueIds: string[]) {
+    const store = buildFakeAlertmanagerStore();
+    const coverId = "cover-1";
+    store.covers.set(coverId, { cover_issue_id: coverId, company_id: "company-1", dedup_fingerprint: "cover:SyntheticAlert:1", closing_claimed_at: null, resolution_comment_posted_at: null, cancelled_at: null });
+    for (const alertIssueId of memberAlertIssueIds) {
+      store.members.set(`${coverId}:${alertIssueId}`, { id: randomUUID(), cover_issue_id: coverId, alert_issue_id: alertIssueId, resolved_at: null });
+    }
+    const mocks = {
       issues: {
-        // Alert issue already terminal (a prior sweep/resolve closed it) so
-        // these tests isolate cascade cover cleanup from the pre-existing
-        // autoCloseOnResolve side effect on the alert issue itself.
-        get: vi.fn(async () => ({ id: "issue-1", status: "done" })),
-        update: vi.fn(async (id: string, patch: Record<string, unknown>) => {
-          const cover = covers.find((c) => c.id === id);
-          if (cover) cover.status = patch.status as string;
-          return { id, ...patch };
-        }),
+        get: vi.fn(async () => ({ id: coverId, status: "todo" })),
+        update: vi.fn(async () => ({})),
         createComment: vi.fn(async () => ({})),
-        list: vi.fn(async (input: { originKind?: string; originId?: string }) =>
-          input.originKind === COVER_ORIGIN && input.originId === "issue-1" ? covers : []),
+        list: vi.fn(async () => []),
+        listComments: vi.fn(async () => []),
       },
-      events: { emit: vi.fn() },
-      metrics: { write: vi.fn() },
+      db: store.db,
       logger: { info: vi.fn(), warn: vi.fn() },
     };
+    return { ctx: mocks as unknown as PluginContext, mocks, store, coverId };
   }
 
-  it("finds every open cover for the resolved alert issue, comments, and cancels each", async () => {
-    const covers = [{ id: "cover-1", status: "todo" }, { id: "cover-2", status: "in_progress" }];
-    const mocks = resolveMocks(covers);
-    await handleResolved(mocks as unknown as PluginContext, config(), { ...alert(), status: "resolved", endsAt: "2026-07-11T02:00:00Z" });
-    expect(mocks.issues.list).toHaveBeenCalledWith(expect.objectContaining({ originKind: COVER_ORIGIN, originId: "issue-1" }));
-    expect(mocks.issues.createComment).toHaveBeenCalledTimes(2);
-    expect(mocks.issues.createComment).toHaveBeenCalledWith("cover-1", expect.stringContaining("Source alert resolved"), "company-1");
-    expect(mocks.issues.update).toHaveBeenCalledWith("cover-1", { status: "cancelled" }, "company-1");
-    expect(mocks.issues.update).toHaveBeenCalledWith("cover-2", { status: "cancelled" }, "company-1");
-    expect(covers.every((c) => c.status === "cancelled")).toBe(true);
+  it("cover stays open while a sibling is still firing — resolving the winner first does not cancel or hide it", async () => {
+    const { ctx, mocks, store, coverId } = coverContext(["alert-A", "alert-B"]);
+    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A");
+    expect(mocks.issues.createComment).not.toHaveBeenCalled();
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(store.covers.get(coverId)?.cancelled_at).toBeNull();
+    expect(store.members.get(`${coverId}:alert-A`)?.resolved_at).not.toBeNull();
+    expect(store.members.get(`${coverId}:alert-B`)?.resolved_at).toBeNull();
   });
 
-  it("skips a cover already in a terminal state — no duplicate comment or update", async () => {
-    const covers = [{ id: "cover-1", status: "cancelled" }, { id: "cover-2", status: "done" }];
-    const mocks = resolveMocks(covers);
-    await handleResolved(mocks as unknown as PluginContext, config(), { ...alert(), status: "resolved", endsAt: "2026-07-11T02:00:00Z" });
+  it("closes with exactly one resolution comment once the last member resolves", async () => {
+    const { ctx, mocks, store, coverId } = coverContext(["alert-A", "alert-B"]);
+    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A");
+    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-B");
+    expect(mocks.issues.createComment).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.createComment).toHaveBeenCalledWith(coverId, expect.stringContaining("resolved"), "company-1");
+    expect(mocks.issues.update).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.update).toHaveBeenCalledWith(coverId, { status: "cancelled" }, "company-1");
+    expect(store.covers.get(coverId)?.cancelled_at).not.toBeNull();
+  });
+
+  it("a retried resolve delivery is idempotent — no duplicate comment or cancel", async () => {
+    const { ctx, mocks, coverId } = coverContext(["alert-A"]);
+    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A");
+    expect(mocks.issues.createComment).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.update).toHaveBeenCalledTimes(1);
+    // retried delivery of the same resolved webhook
+    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A");
+    expect(mocks.issues.createComment).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.update).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.update).toHaveBeenCalledWith(coverId, { status: "cancelled" }, "company-1");
+  });
+
+  it("an alert that never joined a cover resolves without touching any cover", async () => {
+    const { ctx, mocks } = coverContext(["alert-A"]);
+    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "some-other-alert");
     expect(mocks.issues.createComment).not.toHaveBeenCalled();
     expect(mocks.issues.update).not.toHaveBeenCalled();
   });
 
-  it("a retried resolve is idempotent — second call is a no-op once covers are cancelled", async () => {
-    const covers = [{ id: "cover-1", status: "todo" }];
-    const mocks = resolveMocks(covers);
-    await handleResolved(mocks as unknown as PluginContext, config(), { ...alert(), status: "resolved", endsAt: "2026-07-11T02:00:00Z" });
+  it("failure-injection: status update fails after the resolution comment is committed — retry converges without duplicating either", async () => {
+    const { ctx, mocks, store, coverId } = coverContext(["alert-A"]);
+    mocks.issues.update = vi.fn(async () => { throw new Error("transient: paperclip API 503"); });
+
+    await expect(recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A")).rejects.toThrow("transient");
+    expect(mocks.issues.createComment).toHaveBeenCalledTimes(1);
+    expect(store.covers.get(coverId)?.resolution_comment_posted_at).not.toBeNull();
+    expect(store.covers.get(coverId)?.cancelled_at).toBeNull();
+
+    // durable retry path: the sweep's reconciliation pass (or another resolve
+    // delivery) resumes — must NOT re-post the comment, only finish the cancel.
+    mocks.issues.update = vi.fn(async () => ({}));
+    await runAlertEscalationSweep(ctx as any, config(), new Date("2026-07-11T01:00:00Z"));
+
     expect(mocks.issues.createComment).toHaveBeenCalledTimes(1);
     expect(mocks.issues.update).toHaveBeenCalledTimes(1);
-    // second, retried delivery of the same resolved webhook
-    await handleResolved(mocks as unknown as PluginContext, config(), { ...alert(), status: "resolved", endsAt: "2026-07-11T02:00:00Z" });
+    expect(mocks.issues.update).toHaveBeenCalledWith(coverId, { status: "cancelled" }, "company-1");
+    expect(store.covers.get(coverId)?.cancelled_at).not.toBeNull();
+  });
+
+  it("failure-injection (BLO-16120 PR #662 review): createComment itself fails during close — the claim is won but the comment stays unposted, so reconciliation retries it instead of silently finalizing", async () => {
+    const { ctx, mocks, store, coverId } = coverContext(["alert-A"]);
+    mocks.issues.createComment = vi.fn(async () => { throw new Error("transient: paperclip API 503"); });
+
+    await expect(recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A")).rejects.toThrow("transient");
+    // the claim was won (exactly one closer) but the comment never durably landed
+    expect(store.covers.get(coverId)?.closing_claimed_at).not.toBeNull();
+    expect(store.covers.get(coverId)?.resolution_comment_posted_at).toBeNull();
+    expect(store.covers.get(coverId)?.cancelled_at).toBeNull();
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+
+    // reconciliation must retry the comment (not skip straight to cancelling
+    // with no audit trail) and only then finish the terminal transition
+    mocks.issues.createComment = vi.fn(async () => ({}));
+    mocks.issues.update = vi.fn(async () => ({}));
+    await runAlertEscalationSweep(ctx as any, config(), new Date("2026-07-11T01:00:00Z"));
+
+    expect(mocks.issues.createComment).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.update).toHaveBeenCalledWith(coverId, { status: "cancelled" }, "company-1");
+    expect(store.covers.get(coverId)?.resolution_comment_posted_at).not.toBeNull();
+    expect(store.covers.get(coverId)?.cancelled_at).not.toBeNull();
+  });
+
+  it("concurrency: two siblings resolving at once yield exactly one comment and one terminal transition", async () => {
+    const { ctx, mocks, store, coverId } = coverContext(["alert-A", "alert-B"]);
+    await Promise.all([
+      recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A"),
+      recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-B"),
+    ]);
     expect(mocks.issues.createComment).toHaveBeenCalledTimes(1);
     expect(mocks.issues.update).toHaveBeenCalledTimes(1);
+    expect(store.covers.get(coverId)?.cancelled_at).not.toBeNull();
+  });
+
+  it("concurrency: duplicate resolve deliveries for the same single-member cover yield exactly one comment and cancel", async () => {
+    const { ctx, mocks, store, coverId } = coverContext(["alert-A"]);
+    await Promise.all([
+      recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A"),
+      recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A"),
+    ]);
+    expect(mocks.issues.createComment).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.update).toHaveBeenCalledTimes(1);
+    expect(store.covers.get(coverId)?.cancelled_at).not.toBeNull();
+  });
+});
+
+describe("BLO-16120 sweep reconciliation backstop for stuck covers", () => {
+  it("finalizes a cover whose comment claim succeeded but whose cancel never ran, without re-posting", async () => {
+    const store = buildFakeAlertmanagerStore();
+    store.covers.set("cover-stuck", { cover_issue_id: "cover-stuck", company_id: "company-1", dedup_fingerprint: "cover:X:1", closing_claimed_at: "2026-07-11T00:00:00Z", resolution_comment_posted_at: "2026-07-11T00:00:00Z", cancelled_at: null });
+    const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: "2026-07-10T00:00:00Z", escalationComplete: true, nextEscalationAt: null, escalationAttempt: 3 };
+    const { ctx, mocks } = sweepContext(state, null, store);
+    mocks.issues.get = vi.fn(async () => ({ id: "cover-stuck", status: "todo" }));
+
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+    expect(mocks.issues.createComment).not.toHaveBeenCalled();
+    expect(mocks.issues.update).toHaveBeenCalledWith("cover-stuck", { status: "cancelled" }, "company-1");
+    expect(store.covers.get("cover-stuck")?.cancelled_at).not.toBeNull();
+  });
+
+  it("leaves an eligible-but-unclaimed cover alone — reconciliation only resumes already-claimed covers", async () => {
+    const store = buildFakeAlertmanagerStore();
+    store.covers.set("cover-open", { cover_issue_id: "cover-open", company_id: "company-1", dedup_fingerprint: "cover:X:1", closing_claimed_at: null, resolution_comment_posted_at: null, cancelled_at: null });
+    store.members.set("cover-open:alert-A", { id: randomUUID(), cover_issue_id: "cover-open", alert_issue_id: "alert-A", resolved_at: null });
+    const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: "2026-07-10T00:00:00Z", escalationComplete: true, nextEscalationAt: null, escalationAttempt: 3 };
+    const { ctx, mocks } = sweepContext(state, null, store);
+
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+    expect(mocks.issues.createComment).not.toHaveBeenCalled();
+    expect(mocks.issues.update).not.toHaveBeenCalled();
   });
 });
 
 describe("BLO-15982 storm batching: concurrent same-alertname ladders", () => {
-  /**
-   * Models the host's `issues_active_alert_escalation_cover_uq` partial
-   * unique index: `create()` for an `originFingerprint` already claimed by
-   * an open row rejects atomically. Critically, the check-and-claim has no
-   * `await` between them, so it stays atomic across interleaved concurrent
-   * callers the same way a real DB unique-index insert would — this is what
-   * makes the test below prove something a sequential-only mock could not.
-   */
-  function buildAtomicCoverStore() {
-    const issuesById = new Map<string, { id: string; status: string; originFingerprint?: string | null }>();
-    const openCoverIdByFingerprint = new Map<string, string>();
-    let seq = 0;
-
-    async function list(input: { originKind?: string; originFingerprint?: string; originId?: string }) {
-      if (input.originKind !== COVER_ORIGIN) return [];
-      if (input.originFingerprint) {
-        const id = openCoverIdByFingerprint.get(input.originFingerprint);
-        const issue = id ? issuesById.get(id) : undefined;
-        return issue && !["done", "cancelled"].includes(issue.status) ? [issue] : [];
-      }
-      if (input.originId) {
-        return [...issuesById.values()].filter((issue) => (issue as any).originId === input.originId);
-      }
-      return [];
-    }
-
-    async function create(params: { originFingerprint?: string | null; originId?: string; [k: string]: unknown }) {
-      seq += 1;
-      const id = `cover-${seq}`;
-      if (params.originFingerprint) {
-        if (openCoverIdByFingerprint.has(params.originFingerprint)) {
-          throw new Error("Alert escalation cover conflict"); // no await above this line — atomic check
-        }
-        const issue = { id, status: "todo", ...params };
-        issuesById.set(id, issue);
-        openCoverIdByFingerprint.set(params.originFingerprint, id); // claim happens synchronously with the check
-        return issue;
-      }
-      const issue = { id, status: "todo", ...params };
-      issuesById.set(id, issue);
-      return issue;
-    }
-
-    return { list, create, issuesById, openCoverIdByFingerprint };
-  }
-
-  it("N concurrent ladder advances for one alertname yield exactly one open cover, siblings durably referenced", async () => {
+  it("N concurrent ladder advances for one alertname yield exactly one open cover, siblings durably tracked", async () => {
     const N = 6;
     const alertname = "PodPendingCritical";
-    const store = buildAtomicCoverStore();
+    const store = buildFakeAlertmanagerStore();
     const commentsByCoverId = new Map<string, string[]>();
 
     const alertIssues = Array.from({ length: N }, (_, i) => ({
@@ -341,17 +533,17 @@ describe("BLO-15982 storm batching: concurrent same-alertname ladders", () => {
         state: { get: vi.fn(async () => state), set: vi.fn(async () => undefined) },
         issues: {
           list: vi.fn(async (input: { originKind?: string }) =>
-            input.originKind === ORIGIN_KIND ? [issue] : store.list(input as any)),
-          listComments: vi.fn(async (coverId: string) =>
-            (commentsByCoverId.get(coverId) ?? []).map((body) => ({ body }))),
+            input.originKind === ORIGIN_KIND ? [issue] : store.issuesList(input as any)),
+          listComments: vi.fn(async () => []),
           createComment: vi.fn(async (coverId: string, body: string) => {
             const existing = commentsByCoverId.get(coverId) ?? [];
             commentsByCoverId.set(coverId, [...existing, body]);
             return { id: `comment-${coverId}-${existing.length}`, body };
           }),
           update: vi.fn(async () => ({})),
-          create: vi.fn(store.create as any),
+          create: vi.fn(store.issuesCreate as any),
         },
+        db: store.db,
         agents: { get: vi.fn(async () => null) },
         access: { members: { list: vi.fn(async () => [{ principalType: "user", principalId: "board-1", status: "active", membershipRole: "owner" }]) } },
         logger: { info: vi.fn(), warn: vi.fn() },
@@ -361,21 +553,26 @@ describe("BLO-15982 storm batching: concurrent same-alertname ladders", () => {
 
     await Promise.all(alertIssues.map(runWorker));
 
-    const openCovers = [...store.issuesById.values()].filter((c) => !["done", "cancelled"].includes(c.status));
+    const openCovers = [...store.coverIssuesById.values()].filter((c) => !["done", "cancelled"].includes(c.status));
     expect(openCovers).toHaveLength(1);
+    const winnerCoverId = openCovers[0].id;
 
-    const winnerId = openCovers[0].id;
-    const siblingComments = commentsByCoverId.get(winnerId) ?? [];
-    // Every non-winning alert issue is durably referenced on the retained
-    // cover via a distinct sibling marker — none silently dropped.
+    // Every alert issue — winner and every losing sibling — is a durable,
+    // open member of the single retained cover. Not a comment scan: a real
+    // DB row per (cover, alert) pair.
+    for (const issue of alertIssues) {
+      const member = store.members.get(`${winnerCoverId}:${issue.id}`);
+      expect(member, `missing durable membership for ${issue.id}`).toBeDefined();
+      expect(member?.resolved_at).toBeNull();
+    }
+
+    const siblingComments = commentsByCoverId.get(winnerCoverId) ?? [];
+    // Every losing sibling gets exactly one attach comment; the winner gets none.
     for (const issue of alertIssues) {
       const wasWinner = (openCovers[0] as any).originId === issue.id;
-      if (wasWinner) continue;
-      expect(siblingComments.some((body) => body.includes(`sibling:${issue.id}`))).toBe(true);
+      const matching = siblingComments.filter((body) => body.includes(issue.identifier));
+      expect(matching).toHaveLength(wasWinner ? 0 : 1);
     }
-    // No duplicate sibling comments even though every loser hit the same
-    // conflict independently.
-    expect(new Set(siblingComments).size).toBe(siblingComments.length);
   });
 });
 

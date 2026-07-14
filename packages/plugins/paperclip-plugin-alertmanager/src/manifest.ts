@@ -42,9 +42,18 @@ const manifest: PaperclipPluginManifestV1 = {
     "webhooks.receive",
     "instance.settings.register",
     "jobs.schedule",
+    // Durable, race-safe storm-cover membership + resolution state (BLO-16120)
+    "database.namespace.migrate",
+    "database.namespace.read",
+    "database.namespace.write",
   ],
   entrypoints: {
     worker: "./dist/worker.js",
+  },
+  database: {
+    namespaceSlug: "alertmanager",
+    migrationsDir: "migrations",
+    coreReadTables: ["companies", "issues"],
   },
   instanceConfigSchema: {
     type: "object",

@@ -6,7 +6,7 @@ import type {
 } from "./types.js";
 
 export const PLUGIN_ID = "paperclip-plugin-alertmanager";
-export const PLUGIN_VERSION = "0.1.0";
+export const PLUGIN_VERSION = "0.2.0";
 
 export const WEBHOOK_KEYS = {
   alertmanager: "alertmanager",
