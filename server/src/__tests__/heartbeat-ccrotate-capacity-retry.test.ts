@@ -98,6 +98,31 @@ function allowingGate(): PenstockAvailabilityGate {
   };
 }
 
+function denyingGateAtBarrier(expectedChecks: number): PenstockAvailabilityGate {
+  let checks = 0;
+  let release!: () => void;
+  const allChecked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  return {
+    async checkAdapter(): Promise<PenstockAvailabilityGateResult> {
+      checks += 1;
+      if (checks === expectedChecks) release();
+      await allChecked;
+      return {
+        allow: false,
+        provider: "anthropic",
+        reason: "penstock.model_capacity_unavailable",
+        model: "claude-sonnet-5[1m]",
+        resumeAt: new Date("2026-07-14T11:00:00.000Z"),
+        retryAfterSeconds: 300,
+      };
+    },
+    _resetForTesting() {},
+  };
+}
+
 describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -137,6 +162,60 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     });
     return { companyId, agentId };
   }
+
+  it("coalesces concurrent capacity deferrals for one task across service instances", async () => {
+    const { agentId } = await seedAgent();
+    const taskKey = "pr_review:Blockcast/linux-amt:123";
+    const penstockAvailabilityGate = denyingGateAtBarrier(2);
+    const firstApi = heartbeatService(db, {
+      penstockAvailabilityGate,
+      skipQueuedRunDispatch: true,
+    });
+    const secondDb = createDb(tempDb!.connectionString);
+    const secondApi = heartbeatService(secondDb, {
+      penstockAvailabilityGate,
+      skipQueuedRunDispatch: true,
+    });
+    const wake = {
+      source: "automation" as const,
+      triggerDetail: "system",
+      reason: "github_pr_opened",
+      payload: { taskKey, deliveryId: "same-github-delivery" },
+      contextSnapshot: {
+        taskKey,
+        reviewKind: "pr_review",
+        wakeReason: "github_pr_opened",
+        githubDeliveryId: "same-github-delivery",
+      },
+    };
+
+    await Promise.all([
+      firstApi.wakeup(agentId, wake),
+      secondApi.wakeup(agentId, wake),
+    ]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      status: "scheduled_retry",
+      scheduledRetryReason: "ccrotate_capacity",
+      wakeupRequestId: null,
+    });
+    expect(runs[0]?.contextSnapshot).toMatchObject({ taskKey });
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]).toMatchObject({
+      status: "coalesced",
+      runId: runs[0]?.id,
+    });
+  });
 
   it("schedules a capacity retry instead of dropping the wake when the gate defers", async () => {
     const { agentId } = await seedAgent();

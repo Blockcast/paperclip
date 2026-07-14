@@ -188,6 +188,7 @@ import { mapAdapterToCcrotateTarget } from "./ccrotate-target.js";
 import {
   createPenstockAvailabilityGate,
   type PenstockAvailabilityGate,
+  type PenstockAvailabilityGateDenyResult,
 } from "./penstock-availability-gate.js";
 import {
   evaluateExecutionAllowlist,
@@ -15210,6 +15211,67 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return null;
     }
 
+    async function persistProviderCapacityRetry(gateResult: PenstockAvailabilityGateDenyResult) {
+      const resumeAtIso = gateResult.resumeAt ? gateResult.resumeAt.toISOString() : null;
+      const scheduledRetryAt =
+        gateResult.resumeAt ?? new Date(Date.now() + CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS);
+      const retryContextSnapshot = {
+        ...enrichedContextSnapshot,
+        wakeSource: source,
+        wakeTriggerDetail: triggerDetail,
+        penstockProvider: gateResult.provider,
+        penstockModel: gateResult.model,
+        ...(resumeAtIso ? { penstockResumeAt: resumeAtIso } : {}),
+      };
+
+      return db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
+        );
+
+        const coalescedRun = await coalescePendingTaskScopeWake({
+          tx,
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          reason,
+          payload,
+          contextSnapshot: retryContextSnapshot,
+          taskKey: effectiveTaskKey,
+          requestedByActorType: opts.requestedByActorType,
+          requestedByActorId: opts.requestedByActorId,
+          idempotencyKey: opts.idempotencyKey,
+        });
+        if (coalescedRun) return coalescedRun;
+
+        return tx
+          .insert(heartbeatRuns)
+          .values({
+            companyId: agent.companyId,
+            agentId,
+            invocationSource: source,
+            triggerDetail,
+            status: "scheduled_retry",
+            scheduledRetryAt,
+            scheduledRetryReason: CCROTATE_CAPACITY_RETRY_REASON,
+            scheduledRetryAttempt: 0,
+            errorCode: "rate_limit_exhausted",
+            resultJson: {
+              errorFamily: "rate_limit_exhausted",
+              ...(resumeAtIso ? { retryNotBefore: resumeAtIso, transientRetryNotBefore: resumeAtIso } : {}),
+              penstockProvider: gateResult.provider,
+              penstockModel: gateResult.model,
+              penstockReason: gateResult.reason,
+              penstockRetryAfterSeconds: gateResult.retryAfterSeconds,
+            },
+            contextSnapshot: retryContextSnapshot,
+          })
+          .returning()
+          .then((rows) => rows[0]);
+      });
+    }
+
     // Heartbeat ccrotate-awareness: for adapters routed through ccrotate
     // (claude_local, codex_local), refuse to dispatch a *timer* heartbeat when
     // no underlying provider account is on a usable tier. The agent will be
@@ -15259,36 +15321,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           adapter: agent.adapterType,
           provider: penstockGateResult.provider,
         });
-        const resumeAtIso = penstockGateResult.resumeAt ? penstockGateResult.resumeAt.toISOString() : null;
-        const scheduledRetryAt =
-          penstockGateResult.resumeAt ?? new Date(Date.now() + CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS);
-        await db.insert(heartbeatRuns).values({
-          companyId: agent.companyId,
-          agentId,
-          invocationSource: source,
-          triggerDetail,
-          status: "scheduled_retry",
-          scheduledRetryAt,
-          scheduledRetryReason: CCROTATE_CAPACITY_RETRY_REASON,
-          scheduledRetryAttempt: 0,
-          errorCode: "rate_limit_exhausted",
-          resultJson: {
-            errorFamily: "rate_limit_exhausted",
-            ...(resumeAtIso ? { retryNotBefore: resumeAtIso, transientRetryNotBefore: resumeAtIso } : {}),
-            penstockProvider: penstockGateResult.provider,
-            penstockModel: penstockGateResult.model,
-            penstockReason: penstockGateResult.reason,
-            penstockRetryAfterSeconds: penstockGateResult.retryAfterSeconds,
-          },
-          contextSnapshot: {
-            ...enrichedContextSnapshot,
-            wakeSource: source,
-            wakeTriggerDetail: triggerDetail,
-            penstockProvider: penstockGateResult.provider,
-            penstockModel: penstockGateResult.model,
-            ...(resumeAtIso ? { penstockResumeAt: resumeAtIso } : {}),
-          },
-        });
+        await persistProviderCapacityRetry(penstockGateResult);
         return null;
       }
     }
