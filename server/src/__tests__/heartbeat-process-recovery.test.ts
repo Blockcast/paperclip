@@ -3526,8 +3526,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).not.toContain("issue_continuation_waiting_on_review");
   });
 
-  it("still escalates a continuation parked for review when no open dependency remains", async () => {
-    const { companyId, issueId } = await seedStrandedIssueFixture({
+  it("parks a review-waiting continuation in_review when no open dependency remains", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "cancelled",
       retryReason: "issue_continuation_needed",
@@ -3538,10 +3538,48 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     heartbeat = heartbeatService(db, { penstockAvailabilityGate: allowPenstockGate });
     const result = await heartbeat.reconcileStrandedAssignedIssues();
 
-    // With no real waiting target, the deliberate-wait conversion must not fire;
-    // genuine-strand detection downstream is preserved.
+    // BLO-16146: a deliberate review/approval wait with no dependency to point a
+    // `blocked` state at and no active monitor path must be parked `in_review` — the
+    // designated "waiting on a reviewer/approver" status — not escalated to `blocked`
+    // as if its live execution were lost, and not converted into a dependency wait
+    // (there is nothing to depend on). The dependency-wait conversion must not fire.
     expect(result.waitingOnReviewResolved).toBe(0);
+    expect(result.reviewWaitingParked).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const parked = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(parked?.status).toBe("in_review");
+    // Original assignee is preserved — no reassignment to a recovery owner.
+    expect(parked?.assigneeAgentId).toBe(agentId);
+
+    // No blockers are fabricated for a dependency-less wait.
     await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+
+    // No stranded-recovery issue is opened for a deliberate wait.
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+    expect(recoveryIssues).toHaveLength(0);
+
+    // A plain-language system comment explains the wait; the raw machine error code
+    // never leaks into the thread.
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.authorType).toBe("system");
+    expect(comments[0]?.body).toContain("review/approval");
+    expect(comments[0]?.body).not.toContain("issue_continuation_waiting_on_review");
+
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(
+      activity.some(
+        (event) =>
+          event.action === "issue.updated" &&
+          (event.details as { source?: string } | null)?.source ===
+            "recovery.reconcile_review_waiting_no_dependency_park",
+      ),
+    ).toBe(true);
   });
 
   it("clears the detached warning when the run reports activity again", async () => {

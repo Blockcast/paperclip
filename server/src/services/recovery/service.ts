@@ -3360,6 +3360,97 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     });
   }
 
+  async function parkNoDependencyReviewWaitingIssue(input: {
+    issue: typeof issues.$inferSelect;
+    previousStatus: "in_progress";
+    latestRun: LatestIssueRun;
+  }) {
+    // BLO-16146: a continuation that deliberately parked for review/approval, with no
+    // dependency to convert into a `blocked` wait (resolveContinuationWaitingOnReview
+    // returned null) and no active monitor path (the monitor-path park earlier in the
+    // reconcile arm did not fire). Park it `in_review` — the designated "waiting on a
+    // reviewer/approver" status — instead of escalating it to `blocked` as if its live
+    // execution were lost. It resumes on the next reviewer/approver response (or linked
+    // PR update); there is nothing to retry in the meantime. Mirrors
+    // parkReviewWaitingContinuationIssue minus the monitor-path requirement, plus a
+    // plain-language comment (no monitor path guarantees a re-poke, so the wait must be
+    // visible in the thread).
+    return await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${input.issue.companyId} || ':' || ${input.issue.id}, 0))`,
+      );
+
+      const [fresh] = await tx
+        .select()
+        .from(issues)
+        .where(eq(issues.id, input.issue.id))
+        .limit(1);
+      if (!fresh || fresh.status !== "in_progress") return null;
+
+      // The in_review transition runs an evidence gate (issues.ts) that throws
+      // `unprocessable` when the issue has no reviewable evidence yet (analysis-only
+      // work: no PR, branch, or commits). Catch it so a single un-reviewable issue
+      // cannot abort the whole recovery sweep — bail and let the caller fall through to
+      // `blocked` escalation, the correct disposition when there is nothing to review.
+      // Any other transient failure degrades the same safe way.
+      let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
+      try {
+        updated = await issuesSvc.update(fresh.id, { status: "in_review" }, tx);
+      } catch (err) {
+        logger.warn(
+          { err, issueId: fresh.id, identifier: fresh.identifier },
+          "parkNoDependencyReviewWaitingIssue: in_review park rejected; escalating instead",
+        );
+        return null;
+      }
+      if (!updated) return null;
+
+      const activeRecoveryAction = await recoveryActionsSvc.resolveActiveForIssue({
+        companyId: fresh.companyId,
+        sourceIssueId: fresh.id,
+        status: "resolved",
+        outcome: "restored",
+        resolutionNote:
+          "Continuation retry was intentionally cancelled because the issue is waiting on review/approval " +
+          "with no dependency to wait on; parked in_review to await a reviewer/approver response.",
+      }, tx);
+
+      await issuesSvc.addComment(
+        fresh.id,
+        "Paused for review/approval. The latest run reported it was waiting on a reviewer or approver, and there " +
+          "is no dependency to wait on — so it is now `in_review` rather than flagged as stuck. It will resume " +
+          "automatically when a reviewer or approver responds (or the linked pull request updates); there's nothing " +
+          "to retry in the meantime.",
+        {},
+        { authorType: "system" },
+        tx,
+      );
+
+      await logActivity(db, {
+        companyId: fresh.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: fresh.id,
+        details: {
+          identifier: fresh.identifier,
+          status: "in_review",
+          previousStatus: input.previousStatus,
+          source: "recovery.reconcile_review_waiting_no_dependency_park",
+          latestRunId: input.latestRun?.id ?? null,
+          latestRunStatus: input.latestRun?.status ?? null,
+          latestRunErrorCode: input.latestRun?.errorCode ?? null,
+          recoveryActionId: activeRecoveryAction?.id ?? null,
+        },
+      });
+
+      return updated;
+    });
+  }
+
   async function existingBlockerIssueIds(companyId: string, issueId: string) {
     return db
       .select({ blockerIssueId: issueRelations.issueId })
@@ -4245,6 +4336,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             result.waitingOnReviewResolved += 1;
             result.issueIds.push(issue.id);
             continue;
+          }
+          // BLO-16146: a genuine continuation cancellation that deliberately parked for
+          // review/approval, with no dependency to wait on and no active monitor path.
+          // Park it `in_review` rather than escalating to `blocked` as if its execution
+          // were lost. Gated on isWaitingOnReviewContinuationRun (cancelled +
+          // issue_continuation_needed) so a `failed`/`timed_out` run that merely carries
+          // this error code is NOT treated as a deliberate wait.
+          if (isWaitingOnReviewContinuationRun(latestRun)) {
+            const parked = await parkNoDependencyReviewWaitingIssue({
+              issue,
+              previousStatus: "in_progress",
+              latestRun,
+            });
+            if (parked) {
+              result.reviewWaitingParked += 1;
+              result.issueIds.push(issue.id);
+              continue;
+            }
           }
         }
 

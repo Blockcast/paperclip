@@ -218,6 +218,8 @@ The accepted interaction by itself is only evidence that the plan was approved. 
 
 If the live run disappears, Paperclip must repair, resume, or visibly block the existing claim. It must not leave the source issue in a state where a second run can interpret the same acceptance as fresh permission to create sibling issues again.
 
+Once decomposition completes and the umbrella's remaining work is "wait for the children to finish," the umbrella must hold a first-class waiting path — a `blocked`-by-children state, an active monitor, or an `in_review` park — not merely `in_progress` resting on `parentId` rollup. `parentId` is not a dependency, so an `in_progress` umbrella with no run, no wake, and no blockers looks stranded to recovery. If the executor instead parks the continuation as waiting-for-review, recovery converts that park into the right waiting state (see "Deliberate wait is not a lost run" under §9.2).
+
 ### Concurrent and repeat attempts
 
 Every later run that encounters the same accepted-plan fingerprint must consult the durable claim/result before creating children.
@@ -459,6 +461,18 @@ Recovery rule:
 - if that continuation wake also finishes and the issue is still stranded, Paperclip moves the issue to `blocked` and opens or updates an explicit recovery action when a bounded owner/action is known; the visible comment is evidence, not the recovery path by itself
 
 This is an active-work continuity recovery.
+
+#### Deliberate wait is not a lost run
+
+A continuation that the staleness gate cancelled with `issue_continuation_waiting_on_review` is a *deliberate park*, not a disappeared execution path: the latest run reported the issue is waiting for a reviewer or approver (for example, an umbrella issue whose work was just decomposed into sub-tasks, or a task whose next move is a human/CI review). Treating that park as a stranded run would retry it and then escalate it to `blocked` with a recovery action and an operator-facing "no live execution path" notice — even though nothing failed and there is nothing to retry.
+
+Recovery resolves a parked-for-review continuation in priority order:
+
+- if the issue has an active monitor (a future monitor re-check), it is parked `in_review` and the monitor owns the re-check
+- otherwise, if the issue has a real dependency target — open sub-tasks or existing unresolved blockers — the wait is converted into a first-class dependency wait: it is set `blocked` by those issues, the original assignee is kept, and a plain-language comment explains it resumes automatically through the normal `issue_blockers_resolved` path when they finish
+- otherwise (no monitor and no dependency to point a `blocked` state at), it is parked `in_review` — the designated "waiting on a reviewer/approver" status — with a plain-language comment, rather than escalated to `blocked` as if its execution were lost. It resumes on the next reviewer/approver response or linked pull-request update; the original assignee is preserved and no stranded-recovery issue is opened
+
+A parked-for-review continuation only falls through to the standard `blocked` escalation above when it is not actually review-parked (the cancellation carried a different error code, or the `in_review` transition is itself rejected because the issue has no reviewable evidence yet) — preserving genuine stranded-run detection.
 
 ### 9.3 Recovery model-profile lane
 
