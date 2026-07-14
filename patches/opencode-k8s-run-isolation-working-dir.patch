@@ -1,0 +1,66 @@
+diff --git a/src/server/job-manifest.test.ts b/src/server/job-manifest.test.ts
+index 6f86cd5..e0abc52 100644
+--- a/src/server/job-manifest.test.ts
++++ b/src/server/job-manifest.test.ts
+@@ -300,12 +300,19 @@ describe("buildJobManifest", () => {
+     const value = (name: string) => env.find((entry) => entry.name === name)?.value;
+     const command = container?.command?.[2] ?? "";
+     expect(result.job.metadata?.labels?.["paperclip.io/isolation-mode"]).toBe("run");
+-    expect(container?.workingDir).toBe("/runtime-cache/paperclip-runs/run123456/workspace");
++    // The source checkout must be the Kubernetes-level cwd. If workspaceRoot
++    // is used here, the runtime creates it as root before uid 1000 starts and
++    // the process cannot create sibling HOME/session/cache roots.
++    expect(container?.workingDir).toBe("/paperclip/source-worktree");
+     expect(value("HOME")).toBe("/runtime-cache/paperclip-runs/run123456/home");
+     expect(value("XDG_CONFIG_HOME")).toBe("/runtime-cache/paperclip-runs/run123456/session/xdg/config");
+     expect(value("XDG_CACHE_HOME")).toBe("/runtime-cache/paperclip-runs/run123456/cache/xdg");
+     expect(value("PAPERCLIP_WORKSPACE_CWD")).toBe("/runtime-cache/paperclip-runs/run123456/workspace");
+     expect(command).toContain("git clone --shared --no-checkout -- '/paperclip/source-worktree' '/runtime-cache/paperclip-runs/run123456/workspace'");
++    expect(command).toContain("mkdir -p '/runtime-cache/paperclip-runs/run123456/home'");
++    expect(command).toContain("failed to prepare isolated runtime roots");
++    expect(command).toContain("failed to prepare isolated workspace");
++    expect(command).not.toContain("paperclip-runs/run123456/workspace' 2>/dev/null || true");
+     expect(command).not.toContain("/paperclip/legacy-workspace");
+     expect(result.podLogPath).toBe("/paperclip/instances/default/data/run-logs/co123/agent-abc/run123456.pod.ndjson");
+     expect(result.job.spec?.template?.spec?.volumes?.find((volume) => volume.name === "opencode-db")?.emptyDir).toEqual({});
+diff --git a/src/server/job-manifest.ts b/src/server/job-manifest.ts
+index dfbf739..8c81d97 100644
+--- a/src/server/job-manifest.ts
++++ b/src/server/job-manifest.ts
+@@ -823,7 +823,14 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
+   const workspaceContext = parseObject(context.paperclipWorkspace);
+   const workspaceCwd = asString(workspaceContext.cwd, "");
+   const configuredCwd = asString(config.cwd, "");
+-  const workingDir = isolation.workspaceRoot || workspaceCwd || configuredCwd || "/paperclip";
++  // Kubernetes resolves the container workingDir before the non-root process
++  // starts. For a fresh run-scoped emptyDir that would create workspaceRoot as
++  // root and prevent uid 1000 from creating its sibling HOME/session roots.
++  // Start from the existing source checkout; workspaceSetup prepares and enters
++  // the independent clone after the container has started as uid 1000.
++  const workingDir = isolation.mode === "run"
++    ? workspaceCwd || configuredCwd || "/paperclip"
++    : isolation.workspaceRoot || workspaceCwd || configuredCwd || "/paperclip";
+ 
+   // Job naming: slug + 6-char hash for collision resistance; strip trailing hyphens
+   const agentSlug = sanitizeForK8sName(agent.id);
+@@ -1186,17 +1193,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
+     ? `mkdir -p ${[isolation.homeRoot, isolation.sessionRoot, isolation.cacheRoot, isolation.workspaceRoot, path.posix.dirname(podLogPath)]
+         .filter((p): p is string => Boolean(p))
+         .map(shellQuote)
+-        .join(" ")} 2>/dev/null || true; `
++        .join(" ")} || { echo "[paperclip] failed to prepare isolated runtime roots" >&2; exit 1; }; `
+     : "";
+   const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
+-    ? [
++    ? `{ ${[
+         `source_head=$(git -C ${shellQuote(workspaceCwd)} rev-parse HEAD)`,
+         `rm -rf ${shellQuote(isolation.workspaceRoot!)}`,
+         // Share only immutable Git objects; refs, index, locks, and worktree are run-owned.
+         `git clone --shared --no-checkout -- ${shellQuote(workspaceCwd)} ${shellQuote(isolation.workspaceRoot!)}`,
+         `git -C ${shellQuote(isolation.workspaceRoot!)} checkout --detach "$source_head"`,
+         `cd ${shellQuote(isolation.workspaceRoot!)}`,
+-      ].join(" && ") + "; "
++      ].join(" && ")}; } || { echo "[paperclip] failed to prepare isolated workspace" >&2; exit 1; }; `
+     : "";
+   // opencode-db schema-compat guard (root-caused 2026-06-21, BLO follow-up).
+   // The persistent opencode.db is keyed per (company, agent, taskKey) and reused

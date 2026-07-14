@@ -157,12 +157,12 @@ describeEmbeddedPostgres("external runtime reservations", () => {
     expect(retryClaim?.reservation).toMatchObject({
       id: firstClaim?.reservation.id,
       state: "reserved",
-      isolationMode: null,
-      isolationKey: null,
-      isolationBoundAt: null,
+      isolationMode: "pending",
+      isolationKey: `pending:${runId}`,
       releasedAt: null,
       releaseReason: null,
     });
+    expect(retryClaim?.reservation.isolationBoundAt).not.toBeNull();
     expect(retryClaim?.run.status).toBe("running");
   });
 
@@ -192,6 +192,93 @@ describeEmbeddedPostgres("external runtime reservations", () => {
     });
     expect(retry.id).toBe(first.id);
     expect(retry.isolationBoundAt).toEqual(first.isolationBoundAt);
+  });
+
+  it("marks new claims pending until workspace identity is known", async () => {
+    const [runId] = await seedQueuedRuns(1);
+    const claim = await claimRunWithExternalRuntimeSlot(db, runId, new Date("2026-07-14T00:00:00.000Z"));
+
+    expect(claim?.reservation).toMatchObject({
+      isolationMode: "pending",
+      isolationKey: `pending:${runId}`,
+      isolationBoundAt: new Date("2026-07-14T00:00:00.000Z"),
+    });
+  });
+
+  it("marks reservations inserted by a rolling-upgrade legacy server", async () => {
+    const [runId] = await seedQueuedRuns(1);
+    const reservation = await db
+      .insert(externalRuntimeReservations)
+      .values({
+        companyId,
+        agentId,
+        runId,
+        slotId: 0,
+        state: "reserved",
+      })
+      .returning()
+      .then((rows) => rows[0]);
+
+    expect(reservation).toMatchObject({
+      isolationMode: "legacy",
+      isolationKey: `legacy:${runId}`,
+    });
+    expect(reservation.isolationBoundAt).not.toBeNull();
+  });
+
+  it("defers durable writers until rolling-upgrade legacy reservations drain", async () => {
+    const [legacyRunId, newRunId] = await seedQueuedRuns(2);
+    const legacyClaim = await claimRunWithExternalRuntimeSlot(db, legacyRunId, new Date(), 0);
+    const newClaim = await claimRunWithExternalRuntimeSlot(db, newRunId, new Date(), 1);
+    await db
+      .update(externalRuntimeReservations)
+      .set({
+        isolationMode: "legacy",
+        isolationKey: `legacy:${legacyRunId}`,
+      })
+      .where(eq(externalRuntimeReservations.id, legacyClaim!.reservation.id));
+
+    await expect(bindExternalRuntimeReservationIsolation(db, {
+      runId: newRunId,
+      reservationId: newClaim!.reservation.id,
+      isolationMode: "workspace",
+      isolationKey: "workspace:workspace-1",
+    })).rejects.toMatchObject({
+      code: "external_runtime_isolation_conflict",
+      conflictingRunId: legacyRunId,
+    });
+
+    await releaseExternalRuntimeReservation(db, { runId: legacyRunId, reason: "legacy_drained" });
+    await expect(bindExternalRuntimeReservationIsolation(db, {
+      runId: newRunId,
+      reservationId: newClaim!.reservation.id,
+      isolationMode: "workspace",
+      isolationKey: "workspace:workspace-1",
+    })).resolves.toMatchObject({ isolationMode: "workspace" });
+  });
+
+  it("atomically fences a rolling legacy insert against a durable bind", async () => {
+    const [legacyRunId, newRunId] = await seedQueuedRuns(2);
+    const newClaim = await claimRunWithExternalRuntimeSlot(db, newRunId, new Date(), 1);
+
+    const results = await Promise.allSettled([
+      db.insert(externalRuntimeReservations).values({
+        companyId,
+        agentId,
+        runId: legacyRunId,
+        slotId: 0,
+        state: "reserved",
+      }),
+      bindExternalRuntimeReservationIsolation(db, {
+        runId: newRunId,
+        reservationId: newClaim!.reservation.id,
+        isolationMode: "workspace",
+        isolationKey: "workspace:workspace-race",
+      }),
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
   });
 
   it("rejects a second active writer for the same workspace key with a typed conflict", async () => {
@@ -226,6 +313,23 @@ describeEmbeddedPostgres("external runtime reservations", () => {
       isolationKey: "workspace:shared-workspace",
       conflictingRunId: firstRunId,
     });
+  });
+
+  it("keeps the launching transition idempotent across realization and adapter dispatch", async () => {
+    const [runId] = await seedQueuedRuns(1);
+    const claim = await claimRunWithExternalRuntimeSlot(db, runId, new Date());
+    await bindExternalRuntimeReservationIsolation(db, {
+      runId,
+      reservationId: claim!.reservation.id,
+      isolationMode: "workspace",
+      isolationKey: "workspace:workspace-1",
+    });
+
+    const realizing = await markExternalRuntimeReservationLaunching(db, runId);
+    const dispatching = await markExternalRuntimeReservationLaunching(db, runId);
+
+    expect(realizing?.state).toBe("launching");
+    expect(dispatching?.id).toBe(realizing?.id);
   });
 
   it("rejects the same workspace key across different agents", async () => {

@@ -876,6 +876,13 @@
       "when": 1784042508891,
       "tag": "0130_external_runtime_isolation_writer_lease",
       "breakpoints": true
+    },
+    {
+      "idx": 125,
+      "version": "7",
+      "when": 1784060000000,
+      "tag": "0131_external_runtime_rolling_isolation_fence",
+      "breakpoints": true
     }
   ]
 }

@@ -3256,6 +3256,10 @@ export function buildK8sRunIsolationDescriptor(input: {
   };
   persistedExecutionWorkspaceId?: string | null;
   effectiveExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode>;
+  isolationIdentity?: {
+    isolationMode: "shared" | "run" | "workspace";
+    isolationKey: string;
+  } | null;
 }): AdapterRunIsolationDescriptor | null {
   if (!isK8sAdapter(input.adapterType)) return null;
 
@@ -3264,16 +3268,16 @@ export function buildK8sRunIsolationDescriptor(input: {
     input.effectiveExecutionWorkspaceMode === "operator_branch" ||
     input.executionWorkspace.source === "task_session" ||
     input.executionWorkspace.strategy === "git_worktree";
-  const isolationMode = input.statelessPrReview
-    ? "run"
-    : isWorkspaceIsolated && input.persistedExecutionWorkspaceId
-      ? "workspace"
-      : "shared";
-  const isolationKey = isolationMode === "run"
-    ? `run:${input.runId}`
-    : isolationMode === "workspace"
-      ? `workspace:${input.persistedExecutionWorkspaceId}`
-      : `agent-shared:${input.agentId}`;
+  const isolationIdentity = input.isolationIdentity ?? resolveK8sRunIsolationIdentity({
+    adapterType: input.adapterType,
+    runId: input.runId,
+    agentId: input.agentId,
+    statelessPrReview: input.statelessPrReview,
+    isWorkspaceIsolated,
+    persistedExecutionWorkspaceId: input.persistedExecutionWorkspaceId,
+  });
+  if (!isolationIdentity) return null;
+  const { isolationMode, isolationKey } = isolationIdentity;
   const persistentIsolationRoot = isolationMode === "workspace"
     ? path.posix.join(
         "/paperclip/instances/default/data/k8s-isolation/workspaces",
@@ -3322,6 +3326,64 @@ export function buildK8sRunIsolationDescriptor(input: {
       isolationKey,
     },
   };
+}
+
+export function resolveK8sRunIsolationIdentity(input: {
+  adapterType: string | null | undefined;
+  runId: string;
+  agentId: string;
+  statelessPrReview: boolean;
+  isWorkspaceIsolated: boolean;
+  persistedExecutionWorkspaceId?: string | null;
+}): { isolationMode: "shared" | "run" | "workspace"; isolationKey: string } | null {
+  if (!isK8sAdapter(input.adapterType)) return null;
+  if (input.statelessPrReview) {
+    return { isolationMode: "run", isolationKey: `run:${input.runId}` };
+  }
+  if (input.isWorkspaceIsolated && input.persistedExecutionWorkspaceId) {
+    return {
+      isolationMode: "workspace",
+      isolationKey: `workspace:${input.persistedExecutionWorkspaceId}`,
+    };
+  }
+  return { isolationMode: "shared", isolationKey: `agent-shared:${input.agentId}` };
+}
+
+const K8S_ISOLATION_OWNED_ENV_KEYS = new Set([
+  "HOME",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "CLAUDE_CONFIG_DIR",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_STATE_HOME",
+  "XDG_CACHE_HOME",
+  "GOCACHE",
+  "GOMODCACHE",
+  "npm_config_cache",
+  "BUN_INSTALL_CACHE",
+  "PIP_CACHE_DIR",
+  "PLAYWRIGHT_BROWSERS_PATH",
+  "PAPERCLIP_WORKSPACE_CWD",
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_COMMON_DIR",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+]);
+
+export function stripK8sIsolationOwnedEnv(
+  config: Record<string, unknown>,
+  isolation: AdapterRunIsolationDescriptor | null,
+): Record<string, unknown> {
+  if (!isolation) return config;
+  const env = parseObject(config.env);
+  const isolatedEnv = Object.fromEntries(
+    Object.entries(env).filter(([key]) => !K8S_ISOLATION_OWNED_ENV_KEYS.has(key)),
+  );
+  return { ...config, env: isolatedEnv };
 }
 
 export function scopeSessionParamsToIsolation(
@@ -10952,11 +11014,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(externalRuntimeReservations)
       .where(eq(externalRuntimeReservations.state, "release_pending"));
     for (const reservation of pending) {
+      if (activeRunExecutions.has(reservation.runId)) continue;
       const observed = jobRunStatuses?.get(reservation.runId) ?? null;
       if (observed?.phase === "active") continue;
 
       let terminalOrMissing = Boolean(observed);
       const jobName = reservation.jobName ?? reservation.expectedJobName;
+      const isolationSetupGraceActive =
+        !jobName &&
+        (reservation.isolationMode === "shared" || reservation.isolationMode === "workspace") &&
+        Date.now() - new Date(reservation.updatedAt).getTime() < EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS;
+      if (isolationSetupGraceActive) continue;
       // Both bundled external adapters await onMeta before createNamespacedJob.
       // onMeta persists expectedJobName, so no name is durable proof that Job
       // creation was never crossed, even if the dispatcher crashed afterward.
@@ -12570,6 +12638,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       persistedExecutionWorkspaceMode === "agent_default"
         ? persistedExecutionWorkspaceMode
         : requestedExecutionWorkspaceMode;
+    const workspaceIsolationRequested =
+      effectiveExecutionWorkspaceMode === "isolated_workspace" ||
+      effectiveExecutionWorkspaceMode === "operator_branch";
+    const plannedExecutionWorkspaceId = shouldReuseExisting && existingExecutionWorkspace
+      ? existingExecutionWorkspace.id
+      : (
+          paperclipPrReview === null && workspaceIsolationRequested && executionProjectId
+            ? randomUUID()
+            : null
+        );
+    const k8sIsolationIdentity = resolveK8sRunIsolationIdentity({
+      adapterType: agent.adapterType,
+      runId: run.id,
+      agentId: agent.id,
+      statelessPrReview: paperclipPrReview !== null,
+      isWorkspaceIsolated: workspaceIsolationRequested,
+      persistedExecutionWorkspaceId: plannedExecutionWorkspaceId,
+    });
+    if (k8sIsolationIdentity) {
+      if (!externalRuntimeReservation) {
+        throw new Error(`K8s run ${run.id} has no external-runtime reservation for isolation binding`);
+      }
+      await bindExternalRuntimeReservationIsolation(db, {
+        runId: run.id,
+        reservationId: externalRuntimeReservation.id,
+        isolationMode: k8sIsolationIdentity.isolationMode,
+        isolationKey: k8sIsolationIdentity.isolationKey,
+      });
+      const realizingReservation = await markExternalRuntimeReservationLaunching(db, run.id);
+      if (!realizingReservation) {
+        throw new Error(`External runtime reservation no longer owns workspace realization for run ${run.id}`);
+      }
+    }
     const executionPolicy = { executionMode: (await instanceSettings.getGeneral()).executionMode };
     let selectedEnvironmentId = environmentResolution.environmentId;
     if (isExecutionForcedToKubernetes(executionPolicy)) {
@@ -12881,6 +12982,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
         : resolvedProjectId
           ? await executionWorkspacesSvc.create({
+              ...(plannedExecutionWorkspaceId ? { id: plannedExecutionWorkspaceId } : {}),
               companyId: agent.companyId,
               projectId: resolvedProjectId,
               projectWorkspaceId: resolvedProjectWorkspaceId,
@@ -13102,22 +13204,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       executionWorkspace,
       persistedExecutionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
       effectiveExecutionWorkspaceMode,
+      isolationIdentity: k8sIsolationIdentity,
     });
     if (k8sRunIsolation) {
-      if (!externalRuntimeReservation) {
-        throw new Error(`K8s run ${run.id} has no external-runtime reservation for isolation binding`);
-      }
-      await bindExternalRuntimeReservationIsolation(db, {
-        runId: run.id,
-        reservationId: externalRuntimeReservation.id,
-        isolationMode: k8sRunIsolation.isolationMode,
-        isolationKey: k8sRunIsolation.isolationKey,
-      });
       delete context[K8S_ISOLATION_RETRY_ATTEMPT_CONTEXT_KEY];
       delete context[K8S_ISOLATION_RETRY_AT_CONTEXT_KEY];
       context.paperclipK8sIsolation = k8sRunIsolation;
       runtimeConfig = {
-        ...runtimeConfig,
+        ...stripK8sIsolationOwnedEnv(runtimeConfig, k8sRunIsolation),
         paperclipK8sIsolation: k8sRunIsolation,
       };
     } else {
@@ -14474,7 +14568,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // re-dispatching another doomed continuation. See BLO-1498.
           const setupErrorCode =
             configurationIncompleteSetupFailure?.code ??
-            (outerErr instanceof EnvironmentRunError
+            (outerErr instanceof ExternalRuntimeIsolationConflictError
+              ? outerErr.code
+              : outerErr instanceof EnvironmentRunError
               ? outerErr.code
               : outerErr instanceof WorkspaceRepoMismatchError || outerErr instanceof WorkspaceGitSubmoduleError
                 ? outerErr.code
