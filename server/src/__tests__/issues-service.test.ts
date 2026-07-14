@@ -292,6 +292,32 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     return companyId;
   }
 
+  it("returns a typed conflict for a duplicate active alert escalation cover", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const originFingerprint = "cover:PodPendingCritical:123";
+    await svc.create(companyId, {
+      title: "First escalation cover",
+      status: "todo",
+      priority: "critical",
+      originKind: "plugin:paperclip-plugin-alertmanager:escalation",
+      originId: randomUUID(),
+      originFingerprint,
+    });
+
+    await expect(svc.create(companyId, {
+      title: "Duplicate escalation cover",
+      status: "todo",
+      priority: "critical",
+      originKind: "plugin:paperclip-plugin-alertmanager:escalation",
+      originId: randomUUID(),
+      originFingerprint,
+    })).rejects.toMatchObject({
+      status: 409,
+      message: "Alert escalation cover conflict",
+      details: { companyId, originFingerprint },
+    });
+  });
+
   function agentRow(companyId: string, input: {
     id: string;
     name: string;
