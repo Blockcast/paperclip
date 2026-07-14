@@ -8,6 +8,7 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  issues,
 } from "@paperclipai/db";
 import {
   heartbeatService,
@@ -89,24 +90,125 @@ describe("PR-review dispatch fairness", () => {
 
 describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
   let db!: ReturnType<typeof createDb>;
+  let peerDb!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-pr-review-queue-");
     db = createDb(tempDb.connectionString);
+    peerDb = createDb(tempDb.connectionString);
   }, 20_000);
 
   afterEach(async () => {
     await db.delete(heartbeatRunEvents);
+    await db.update(issues).set({ executionRunId: null });
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
   });
 
   afterAll(async () => {
+    await peerDb?.$client?.end?.({ timeout: 0 });
     await db?.$client?.end?.({ timeout: 0 });
     await tempDb?.cleanup();
+  });
+
+  it("coalesces concurrent GitHub issue follow-ups behind a running run", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runningRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Review Follow-up Race Co",
+      status: "active",
+      issuePrefix: "RFR",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "executive",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          enabled: true,
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runningRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      startedAt: new Date(),
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        taskKey: issueId,
+        wakeReason: "github_pr_review_submitted",
+      },
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Harden MCP retention",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      executionRunId: runningRunId,
+      executionAgentNameKey: "cto",
+      executionLockedAt: new Date(),
+      identifier: "RFR-1",
+    });
+
+    const closedHeartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+    const openedHeartbeat = heartbeatService(peerDb, { skipQueuedRunDispatch: true });
+    const wake = (reason: "github_pr_closed" | "github_pr_opened", deliveryId: string) => ({
+      source: "automation" as const,
+      triggerDetail: "system",
+      reason,
+      payload: { issueId, deliveryId },
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        taskKey: issueId,
+        wakeReason: reason,
+        githubDeliveryId: deliveryId,
+      },
+      idempotencyKey: `${issueId}:${reason}:${deliveryId}`,
+    });
+
+    await Promise.all([
+      closedHeartbeat.wakeup(agentId, wake("github_pr_closed", "closed-delivery")),
+      openedHeartbeat.wakeup(agentId, wake("github_pr_opened", "opened-delivery")),
+    ]);
+
+    const runs = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const wakeups = await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+
+    expect(runs.filter((run) => run.status === "running")).toEqual([
+      { id: runningRunId, status: "running" },
+    ]);
+    expect(runs.filter((run) => run.status === "queued")).toHaveLength(1);
+    expect(wakeups.filter((wakeRequest) => wakeRequest.status === "queued")).toHaveLength(1);
+    expect(wakeups.filter((wakeRequest) => wakeRequest.status === "coalesced")).toHaveLength(1);
   });
 
   it("coalesces concurrent same-task deliveries into one queued run", async () => {

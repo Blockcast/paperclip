@@ -16097,6 +16097,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return { kind: "skipped" as const };
         }
 
+        // A running execution can be owned by another API instance, so it is
+        // intentionally excluded as a local coalesce target above. Another
+        // wake may already have queued the single follow-up while this
+        // transaction waited on the issue lock; absorb into that pending task
+        // scope before inserting another follow-up.
+        const coalescedTaskScopeRun = await coalescePendingTaskScopeWake({
+          tx,
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          reason,
+          payload,
+          contextSnapshot: enrichedContextSnapshot,
+          taskKey: effectiveTaskKey,
+          requestedByActorType: opts.requestedByActorType,
+          requestedByActorId: opts.requestedByActorId,
+          idempotencyKey: opts.idempotencyKey,
+        });
+        if (coalescedTaskScopeRun) {
+          return { kind: "coalesced" as const, run: coalescedTaskScopeRun };
+        }
+
         const coalescedGithubStateRun = await coalesceQueuedGithubStateWake({
           tx,
           companyId: agent.companyId,
