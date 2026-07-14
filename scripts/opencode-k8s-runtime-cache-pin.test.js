@@ -6,7 +6,7 @@ const dockerfile = readFileSync(new URL("../Dockerfile", import.meta.url), "utf8
 const opencodeRefMatch = dockerfile.match(/^ARG OPENCODE_K8S_REF=([0-9a-f]{40})$/m);
 
 test("Dockerfile pins opencode_k8s to the merged runtime-cache adapter", () => {
-  assert.equal(opencodeRefMatch?.[1], "0a848687bcc32f175ac0b2d1699f729d49447998");
+  assert.equal(opencodeRefMatch?.[1], "82b0b0427b9d3f161a1b5d8487bdd31fd465194b");
   assert.match(dockerfile, /mount a per-agent\s*\n# \/runtime-cache emptyDir/);
   assert.match(dockerfile, /kkroo\/paperclip-adapter-opencode-k8s#29/);
   assert.match(dockerfile, /reserve the runtime-cache env keys/);
