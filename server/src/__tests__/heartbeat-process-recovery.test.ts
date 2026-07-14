@@ -1250,6 +1250,139 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.errorCode).toBe("process_lost");
   });
 
+  it("stamps a pre_adapter_job_unstamped process_loss classification on resultJson (BLO-16181)", async () => {
+    // The dominant fleet case (BLO-12292 diagnosis): reaped during setup with no
+    // adapter.invoke and no persisted Job name. The mint must durably record that
+    // no Job was navigably created so BLO-12564 reattach knows this run is
+    // unreattachable, without any extra kube round-trip.
+    const { runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null, // pre-adapter: never produced output
+      // no externalRunId -> Job name never stamped
+    });
+    await db.update(heartbeatRuns).set({ updatedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    mockListAgentJobRunStatuses.mockResolvedValueOnce(new Map());
+
+    const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+
+    expect(result.runIds).toContain(runId);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.errorCode).toBe("process_lost");
+    expect(run?.resultJson).toMatchObject({
+      processLoss: {
+        externalLifecycleRun: true,
+        preAdapter: true,
+        externalRunIdStamped: false,
+        externalRunId: null,
+        classification: "pre_adapter_job_unstamped",
+      },
+    });
+  });
+
+  it("stamps a started_job_absent process_loss classification on resultJson (BLO-16181)", async () => {
+    // Post-adapter run whose Job is absent from the live snapshot and silent past
+    // the stale floor. The mint records it as a post-adapter absence (distinct
+    // from a pre-adapter setup death) so the root-cause split can separate them.
+    const stale = new Date(Date.now() - 16 * 60 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "claude_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: stale,
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    mockListLiveAgentJobRunIds.mockResolvedValueOnce(new Set());
+
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result.runIds).toContain(runId);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.errorCode).toBe("process_lost");
+    expect(run?.resultJson).toMatchObject({
+      processLoss: {
+        externalLifecycleRun: true,
+        preAdapter: false,
+        externalRunIdStamped: false,
+        classification: "started_job_absent",
+      },
+    });
+  });
+
+  it("captures the stamped Job name in the process_loss block when a started run had one (BLO-16181)", async () => {
+    // Proves the stamped-vs-unstamped discriminator end-to-end: a started run
+    // that recorded a Job name must carry it forward (navigable for BLO-12564
+    // reattach) even when reaped as process_lost.
+    const stale = new Date(Date.now() - 16 * 60 * 1000);
+    const jobName = "agent-claude-abc12345-6789";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "claude_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: stale,
+      externalRunId: jobName,
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    mockListLiveAgentJobRunIds.mockResolvedValueOnce(new Set());
+
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result.runIds).toContain(runId);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.errorCode).toBe("process_lost");
+    expect(run?.resultJson).toMatchObject({
+      processLoss: {
+        externalLifecycleRun: true,
+        preAdapter: false,
+        externalRunIdStamped: true,
+        externalRunId: jobName,
+        classification: "started_job_absent",
+      },
+    });
+  });
+
+  it("threads the resolved pre-adapter Job liveness into the process_loss block (BLO-16181)", async () => {
+    // A pre-adapter run WITH a stamped Job name whose exact-name lookup 404s:
+    // liveness resolves "dead" (Job created then vanished during setup), a
+    // materially different failure from an unstamped run whose Job never existed.
+    const jobName = "agent-opencode-dead0001-2222";
+    const { runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null, // pre-adapter
+      externalRunId: jobName,
+    });
+    await db.update(heartbeatRuns).set({ updatedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    mockListAgentJobRunStatuses.mockResolvedValueOnce(new Map());
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+
+    expect(result.runIds).toContain(runId);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.errorCode).toBe("process_lost");
+    expect(run?.resultJson).toMatchObject({
+      processLoss: {
+        externalLifecycleRun: true,
+        preAdapter: true,
+        externalRunIdStamped: true,
+        externalRunId: jobName,
+        preAdapterJobLiveness: "dead",
+        classification: "pre_adapter_job_stamped",
+      },
+    });
+  });
+
   it("auto-cancels open stale_active_run_evaluation review when reaper finalizes the run to failed (PCL-2571)", async () => {
     // PCL-2571: the silent-run detector files a CTO review issue when an
     // active run has been silent past the suspicion threshold. There's a
