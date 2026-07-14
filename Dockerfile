@@ -197,7 +197,11 @@ WORKDIR /vendor
 # stateless review starts from the generic non-Git fallback workspace, and
 # create the isolated pod-log parent before the pipefail/tee pipeline. PR
 # kkroo/paperclip-adapter-claude-k8s#20; typecheck, 422/422 tests, and build pass.
-ARG CLAUDE_K8S_REF=288f92accd57769d61ec80478ef831ed589ff6a8
+# Bumped 2026-07-14 to 6b96224: terminate both run-isolation shell branches
+# before their `else`/`fi` control keywords. PR
+# kkroo/paperclip-adapter-claude-k8s#21; generated command parse-check,
+# typecheck, 422/422 tests, and build pass.
+ARG CLAUDE_K8S_REF=6b96224be921c7244202215693515d942520ddd5
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
