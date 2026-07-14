@@ -86,6 +86,75 @@ describe("alert escalation", () => {
     expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationComplete: true, nextEscalationAt: null }));
   });
 
+  it("creates a fresh cover after a prior owned cover was cancelled on resolution", async () => {
+    const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1 };
+    const { ctx, mocks } = sweepContext(state, null);
+    const alertIssue = {
+      id: "issue-1", identifier: "BLO-1", title: "Alert", status: "todo", priority: "critical",
+      originId: "fp-1", assigneeAgentId: "engineer", projectId: null, goalId: null,
+    };
+    mocks.issues.list = vi.fn(async (input: { originKind?: string }) =>
+      input.originKind === COVER_ORIGIN
+        ? [{ id: "old-cover", status: "cancelled" }]
+        : [alertIssue]);
+
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.create).toHaveBeenCalledWith(expect.objectContaining({ originId: "issue-1" }));
+  });
+
+  it("does not create another cover when a terminal cover sorts ahead of an active cover", async () => {
+    const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1 };
+    const { ctx, mocks } = sweepContext(state, null);
+    const alertIssue = {
+      id: "issue-1", identifier: "BLO-1", title: "Alert", status: "todo", priority: "critical",
+      originId: "fp-1", assigneeAgentId: "engineer", projectId: null, goalId: null,
+    };
+    const covers = [
+      { id: "recently-commented-terminal-cover", status: "cancelled" },
+      { id: "current-active-cover", status: "todo" },
+    ];
+    mocks.issues.list = vi.fn(async (input: { originKind?: string; limit?: number; offset?: number }) => {
+      if (input.originKind !== COVER_ORIGIN) return [alertIssue];
+      const offset = input.offset ?? 0;
+      return covers.slice(offset, offset + (input.limit ?? covers.length));
+    });
+
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.issues.list).toHaveBeenCalledWith(expect.objectContaining({
+      originKind: COVER_ORIGIN,
+      originId: "issue-1",
+      limit: 50,
+      offset: 0,
+    }));
+  });
+
+  it("checks every page of owned cover history for an active cover", async () => {
+    const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1 };
+    const { ctx, mocks } = sweepContext(state, null);
+    const alertIssue = {
+      id: "issue-1", identifier: "BLO-1", title: "Alert", status: "todo", priority: "critical",
+      originId: "fp-1", assigneeAgentId: "engineer", projectId: null, goalId: null,
+    };
+    const covers = [
+      ...Array.from({ length: 50 }, (_, index) => ({ id: `terminal-cover-${index}`, status: "cancelled" })),
+      { id: "active-cover-on-second-page", status: "in_progress" },
+    ];
+    mocks.issues.list = vi.fn(async (input: { originKind?: string; limit?: number; offset?: number }) => {
+      if (input.originKind !== COVER_ORIGIN) return [alertIssue];
+      const offset = input.offset ?? 0;
+      return covers.slice(offset, offset + (input.limit ?? covers.length));
+    });
+
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.issues.list).toHaveBeenCalledWith(expect.objectContaining({ offset: 50 }));
+  });
+
   it("clears the escalation schedule when an alert resolves", async () => {
     const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T01:00:00Z", escalationAttempt: 1 };
     const mocks = { state: { get: vi.fn(async () => state), set: vi.fn(async () => undefined) }, issues: { get: vi.fn(async () => ({ id: "issue-1", status: "todo" })), update: vi.fn(async () => ({})), createComment: vi.fn() }, events: { emit: vi.fn() }, metrics: { write: vi.fn() }, logger: { info: vi.fn(), warn: vi.fn() } };
