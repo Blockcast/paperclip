@@ -22,6 +22,7 @@ import {
   releaseExternalRuntimeReservation,
   requireExternalRuntimeLaunchOwnership,
 } from "./external-runtime-reservations.js";
+import { parseExpectedExternalRuntimeJobNameFromMetaCommand } from "./heartbeat.js";
 import {
   EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC,
   EXTERNAL_RUNTIME_RESERVATIONS_ACTIVE_METRIC,
@@ -317,5 +318,71 @@ describeEmbeddedPostgres("external runtime reservations", () => {
       .where(eq(externalRuntimeReservations.runId, retryRunId));
     expect(active).toHaveLength(1);
     expect(active[0].releasedAt).toBeNull();
+  });
+
+  it("drives the real meta.command dispatch path: valid metadata records the expected name, drifted metadata fails closed", async () => {
+    // Exercises the exact chain heartbeat.ts's onAdapterMeta ->
+    // onExternalRuntimeLaunched callbacks run, using the shared parser
+    // instead of a re-typed regex, closing the gap flagged on PR #656 where
+    // every test called recordExpectedExternalRuntimeJobName directly with a
+    // hardcoded name and never proved the meta.command parse itself worked.
+    // Two separate agents so both reservations can hold slot 0 concurrently.
+    const [validRunId] = await seedQueuedRuns(1);
+    const [driftedRunId] = await seedQueuedRuns(1);
+
+    await claimRunWithExternalRuntimeSlot(db, validRunId, new Date());
+    await markExternalRuntimeReservationLaunching(db, validRunId);
+    const parsedValid = parseExpectedExternalRuntimeJobNameFromMetaCommand("kubectl job/agent-opencode-run-9");
+    expect(parsedValid).toBe("agent-opencode-run-9");
+    await recordExpectedExternalRuntimeJobName(db, { runId: validRunId, jobName: parsedValid! });
+    const acked = await recordExternalRuntimeJobIdentity(db, {
+      runId: validRunId,
+      jobName: "agent-opencode-run-9",
+      jobUid: "uid-valid",
+    });
+    expect(acked?.state).toBe("launched");
+    expect(acked?.expectedJobName).toBe("agent-opencode-run-9");
+
+    await claimRunWithExternalRuntimeSlot(db, driftedRunId, new Date());
+    await markExternalRuntimeReservationLaunching(db, driftedRunId);
+    // Drifted adapter metadata: reports the real invoked command instead of
+    // the "kubectl job/<name>" sentinel, so nothing matches and no expected
+    // name is ever persisted.
+    const parsedDrifted = parseExpectedExternalRuntimeJobNameFromMetaCommand(
+      "kubectl apply -f /tmp/agent-opencode-run-10.yaml",
+    );
+    expect(parsedDrifted).toBeNull();
+    // The post-create identity ack must fail closed instead of silently
+    // adopting an unexpected Job.
+    await expect(
+      recordExternalRuntimeJobIdentity(db, { runId: driftedRunId, jobName: "agent-opencode-run-10", jobUid: "uid-drifted" }),
+    ).rejects.toThrow(/observed before an expected name was persisted/);
+  });
+});
+
+describe("parseExpectedExternalRuntimeJobNameFromMetaCommand", () => {
+  it("extracts the Job name from a well-formed kubectl job sentinel", () => {
+    expect(parseExpectedExternalRuntimeJobNameFromMetaCommand("kubectl job/agent-opencode-run-1")).toBe(
+      "agent-opencode-run-1",
+    );
+    expect(parseExpectedExternalRuntimeJobNameFromMetaCommand("kubectl job/a")).toBe("a");
+  });
+
+  it("rejects commands that don't match the exact sentinel format", () => {
+    expect(parseExpectedExternalRuntimeJobNameFromMetaCommand("kubectl apply -f job.yaml")).toBeNull();
+    expect(parseExpectedExternalRuntimeJobNameFromMetaCommand("kubectl Job/agent-run-1")).toBeNull();
+    expect(parseExpectedExternalRuntimeJobNameFromMetaCommand("kubectl job/Agent-Run-1")).toBeNull();
+    expect(parseExpectedExternalRuntimeJobNameFromMetaCommand("kubectl job/agent-run-1 ")).toBeNull();
+    expect(parseExpectedExternalRuntimeJobNameFromMetaCommand(" kubectl job/agent-run-1")).toBeNull();
+    expect(parseExpectedExternalRuntimeJobNameFromMetaCommand("kubectl job/-agent-run-1")).toBeNull();
+    expect(parseExpectedExternalRuntimeJobNameFromMetaCommand("kubectl job/agent-run-1-")).toBeNull();
+    expect(parseExpectedExternalRuntimeJobNameFromMetaCommand("kubectl job/agent/run-1")).toBeNull();
+    expect(parseExpectedExternalRuntimeJobNameFromMetaCommand("kubectl job/")).toBeNull();
+  });
+
+  it("rejects a Job name longer than the 63-character Kubernetes label limit", () => {
+    const tooLong = `agent-${"a".repeat(60)}`;
+    expect(tooLong.length).toBeGreaterThan(63);
+    expect(parseExpectedExternalRuntimeJobNameFromMetaCommand(`kubectl job/${tooLong}`)).toBeNull();
   });
 });

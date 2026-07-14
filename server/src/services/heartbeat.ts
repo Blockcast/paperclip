@@ -2467,6 +2467,21 @@ export function k8sCcrotateRetryDelayMs(result: { retryNotBefore?: string | null
   );
 }
 
+// The pinned claude_k8s/opencode_k8s adapters report their launch command as
+// this exact "kubectl job/<name>" sentinel (not the real invoked command) so
+// the reservation can learn the expected Job name before the post-create
+// onExternalRuntimeLaunched identity acknowledgment arrives. Exported so both
+// the dispatch call site below and tests exercise the identical match instead
+// of a re-typed copy that could silently drift from what the adapters emit.
+const EXTERNAL_RUNTIME_EXPECTED_JOB_NAME_PATTERN = /^kubectl job\/([a-z0-9]([-a-z0-9]*[a-z0-9])?)$/;
+const EXTERNAL_RUNTIME_MAX_JOB_NAME_LENGTH = 63;
+
+export function parseExpectedExternalRuntimeJobNameFromMetaCommand(command: string): string | null {
+  const jobName = command.match(EXTERNAL_RUNTIME_EXPECTED_JOB_NAME_PATTERN)?.[1];
+  if (!jobName || jobName.length > EXTERNAL_RUNTIME_MAX_JOB_NAME_LENGTH) return null;
+  return jobName;
+}
+
 function sleepMs(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -13350,8 +13365,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
         if (externalRuntimeReservation && isK8sAdapter(agent.adapterType)) {
-          const jobName = meta.command.match(/^kubectl job\/([a-z0-9]([-a-z0-9]*[a-z0-9])?)$/)?.[1];
-          if (jobName && jobName.length <= 63) {
+          const jobName = parseExpectedExternalRuntimeJobNameFromMetaCommand(meta.command);
+          if (jobName) {
             await recordExpectedExternalRuntimeJobName(db, { runId: run.id, jobName });
           }
         }
