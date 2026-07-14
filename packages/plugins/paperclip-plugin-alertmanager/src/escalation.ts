@@ -107,7 +107,7 @@ async function createCover(
   now: Date,
 ) {
   const owned = await ctx.issues.list({ companyId, originKind: COVER_ORIGIN, originId: issue.id, limit: 1 });
-  if (owned.length) return;
+  if (owned.some((cover) => cover.status !== "done" && cover.status !== "cancelled")) return;
 
   const windowMinutes = config.coverDedupWindowMinutes ?? DEFAULT_COVER_DEDUP_WINDOW_MINUTES;
   const fingerprint = coverDedupFingerprint(alertname, windowMinutes, now);

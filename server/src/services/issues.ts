@@ -3656,10 +3656,23 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
 // constraint-name matching convention used by task-watchdogs.ts's
 // `isUniqueConstraintConflict` and companies.ts's inline check.
 function isAlertEscalationCoverDedupConflict(error: unknown): boolean {
-  if (!error || typeof error !== "object") return false;
-  const maybe = error as { code?: string; constraint?: string; constraint_name?: string };
-  const constraint = maybe.constraint ?? maybe.constraint_name;
-  return maybe.code === "23505" && constraint === "issues_active_alert_escalation_cover_uq";
+  const seen = new Set<unknown>();
+  let current = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const maybe = current as {
+      code?: string;
+      constraint?: string;
+      constraint_name?: string;
+      cause?: unknown;
+    };
+    const constraint = maybe.constraint ?? maybe.constraint_name;
+    if (maybe.code === "23505" && constraint === "issues_active_alert_escalation_cover_uq") {
+      return true;
+    }
+    current = maybe.cause;
+  }
+  return false;
 }
 
 export function issueService(db: Db) {
