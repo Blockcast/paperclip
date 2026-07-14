@@ -188,7 +188,12 @@ WORKDIR /vendor
 # the Job and fails closed with k8s_job_identity_unacknowledged. PR
 # kkroo/paperclip-adapter-claude-k8s#17; focused suite 86/86 and typecheck pass.
 # Bumped 2026-07-14 for PEN-1305 PreToolUse env-guard (PR kkroo/paperclip-adapter-claude-k8s#18)
-ARG CLAUDE_K8S_REF=a1ca578f6714eeb2c769a3f5210d445b7a0c5157
+# Bumped 2026-07-14 to c10a12b (BLO-15957): prefer the server-owned runtime
+# isolation descriptor, clone stateless review worktrees with an independent
+# Git index, persist durable workspace sessions, and keep writable caches on
+# the per-Job runtime-cache emptyDir. PR kkroo/paperclip-adapter-claude-k8s#19;
+# typecheck, 422/422 tests, and build pass after rebasing onto the env guard.
+ARG CLAUDE_K8S_REF=c10a12b0b7d41ea20a40e92ffcf4c1131c404a81
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
@@ -320,7 +325,12 @@ ARG CLAUDE_K8S_REF=a1ca578f6714eeb2c769a3f5210d445b7a0c5157
 # the Job and fails closed with k8s_job_identity_unacknowledged. PR
 # kkroo/paperclip-adapter-opencode-k8s#43; focused suite 114/114 and typecheck pass.
 # Bumped 2026-07-14 for PEN-1305 permission.bash env-dump deny (PR kkroo/paperclip-adapter-opencode-k8s#44)
-ARG OPENCODE_K8S_REF=82b0b0427b9d3f161a1b5d8487bdd31fd465194b
+# Bumped 2026-07-14 to dfd13f2 (BLO-15957): consume typed run/workspace
+# isolation, separate persistent XDG/session state from ephemeral build caches,
+# force stateless OpenCode DBs onto emptyDir, and key durable DBs by workspace.
+# PR kkroo/paperclip-adapter-opencode-k8s#45; typecheck, 523/523 tests, and
+# build pass after rebasing onto the env-dump deny.
+ARG OPENCODE_K8S_REF=dfd13f28a15c02632b7b2f6378fc17c88b570856
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest

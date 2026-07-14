@@ -79,7 +79,9 @@ import {
 import { getActiveAgentIds } from "./agent-roster.js";
 import { processPendingImageBumpForAgent } from "./agent-image-bump.js";
 import {
-  claimRunWithExternalRuntimeSlot,
+  bindExternalRuntimeReservationIsolation,
+  claimRunWithExternalRuntimeSlotPool,
+  ExternalRuntimeIsolationConflictError,
   externalRuntimeReservationCanRelease,
   getActiveExternalRuntimeReservation,
   markExternalRuntimeReservationLaunching,
@@ -341,6 +343,10 @@ const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
+const K8S_ISOLATION_RETRY_ATTEMPT_CONTEXT_KEY = "paperclipK8sIsolationRetryAttempt";
+const K8S_ISOLATION_RETRY_AT_CONTEXT_KEY = "paperclipK8sIsolationRetryAt";
+const K8S_ISOLATION_RETRY_BASE_DELAY_MS = 15_000;
+const K8S_ISOLATION_RETRY_MAX_DELAY_MS = 5 * 60_000;
 // Rate-limit retries (errorFamily = "rate_limit_exhausted") use a flat short
 // delay instead of stacking exponential backoff. Rationale: rate-limit isn't
 // a transient upstream fault — it means "this account's window is closed".
@@ -3217,11 +3223,32 @@ function readK8sIsolationKeyFromContext(context: Record<string, unknown> | null 
   return readNonEmptyString(parseObject(context?.paperclipK8sIsolation).isolationKey);
 }
 
+export function computeK8sIsolationRetryDelayMs(attempt: number): number {
+  const normalizedAttempt = Math.max(1, Math.floor(attempt));
+  const exponent = Math.min(normalizedAttempt - 1, 20);
+  return Math.min(
+    K8S_ISOLATION_RETRY_BASE_DELAY_MS * (2 ** exponent),
+    K8S_ISOLATION_RETRY_MAX_DELAY_MS,
+  );
+}
+
+export function isK8sIsolationRetryDeferred(
+  context: Record<string, unknown> | null | undefined,
+  now = new Date(),
+): boolean {
+  const retryAtValue = readNonEmptyString(context?.[K8S_ISOLATION_RETRY_AT_CONTEXT_KEY]);
+  if (!retryAtValue) return false;
+  const retryAt = new Date(retryAtValue);
+  return !Number.isNaN(retryAt.getTime()) && retryAt.getTime() > now.getTime();
+}
+
 export function buildK8sRunIsolationDescriptor(input: {
   adapterType: string | null | undefined;
+  runId: string;
   companyId: string;
   agentId: string;
   taskKey: string | null;
+  statelessPrReview: boolean;
   executionWorkspace: {
     cwd: string;
     source: string;
@@ -3232,25 +3259,64 @@ export function buildK8sRunIsolationDescriptor(input: {
 }): AdapterRunIsolationDescriptor | null {
   if (!isK8sAdapter(input.adapterType)) return null;
 
-  const workspaceRoot = input.executionWorkspace.cwd;
-  const homeRoot = resolveDefaultAgentWorkspaceDir(input.agentId);
-  const cacheRoot = path.join(homeRoot, ".cache");
   const isWorkspaceIsolated =
     input.effectiveExecutionWorkspaceMode === "isolated_workspace" ||
     input.effectiveExecutionWorkspaceMode === "operator_branch" ||
     input.executionWorkspace.source === "task_session" ||
     input.executionWorkspace.strategy === "git_worktree";
-  const isolationMode = isWorkspaceIsolated ? "workspace" : "shared";
-  const isolationKey = isWorkspaceIsolated
-    ? `workspace:${input.companyId}:${input.agentId}:${input.persistedExecutionWorkspaceId ?? workspaceRoot}`
-    : `shared:${input.companyId}:${input.agentId}`;
+  const isolationMode = input.statelessPrReview
+    ? "run"
+    : isWorkspaceIsolated && input.persistedExecutionWorkspaceId
+      ? "workspace"
+      : "shared";
+  const isolationKey = isolationMode === "run"
+    ? `run:${input.runId}`
+    : isolationMode === "workspace"
+      ? `workspace:${input.persistedExecutionWorkspaceId}`
+      : `agent-shared:${input.agentId}`;
+  const persistentIsolationRoot = isolationMode === "workspace"
+    ? path.posix.join(
+        "/paperclip/instances/default/data/k8s-isolation/workspaces",
+        input.persistedExecutionWorkspaceId!,
+      )
+    : null;
+  const ephemeralIsolationRoot = isolationMode === "run"
+    ? path.posix.join("/runtime-cache/paperclip-runs", input.runId)
+    : isolationMode === "workspace"
+      ? path.posix.join("/runtime-cache/paperclip-workspaces", input.persistedExecutionWorkspaceId!)
+      : null;
+  const sharedHomeRoot = resolveDefaultAgentWorkspaceDir(input.agentId);
+  const workspaceRoot = isolationMode === "run"
+    ? path.posix.join(ephemeralIsolationRoot!, "workspace")
+    : input.executionWorkspace.cwd;
+  const homeRoot = isolationMode === "run"
+    ? path.posix.join(ephemeralIsolationRoot!, "home")
+    : isolationMode === "workspace"
+      ? path.posix.join(persistentIsolationRoot!, "home")
+      : sharedHomeRoot;
+  const sessionRoot = isolationMode === "run"
+    ? path.posix.join(ephemeralIsolationRoot!, "session")
+    : isolationMode === "workspace"
+      ? path.posix.join(persistentIsolationRoot!, "session")
+      : sharedHomeRoot;
+  const cacheRoot = isolationMode === "shared"
+    ? path.join(sharedHomeRoot, ".cache")
+    : path.posix.join(ephemeralIsolationRoot!, "cache");
+  const persistent = isolationMode === "run" ? "ephemeral" : "persistent";
 
   return {
     isolationMode,
     isolationKey,
     workspaceRoot,
     homeRoot,
+    sessionRoot,
     cacheRoot,
+    storage: {
+      workspace: isolationMode === "run" ? "ephemeral" : "persistent",
+      home: persistent,
+      session: persistent,
+      cache: isolationMode === "shared" ? "persistent" : "ephemeral",
+    },
     sessionScope: {
       taskKey: input.taskKey,
       isolationKey,
@@ -9549,6 +9615,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const context = parseObject(run.contextSnapshot);
+    if (isK8sIsolationRetryDeferred(context)) {
+      return null;
+    }
     const budgetBlock = await budgets.getInvocationBlock(run.companyId, run.agentId, {
       issueId: readNonEmptyString(context.issueId),
       projectId: readNonEmptyString(context.projectId),
@@ -9623,7 +9692,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const claimedAt = new Date();
     const claimed = hasExternalLifecycle(agent.adapterType)
-      ? (await claimRunWithExternalRuntimeSlot(db, run.id, claimedAt))?.run ?? null
+      ? (await claimRunWithExternalRuntimeSlotPool(
+          db,
+          run.id,
+          claimedAt,
+          parseHeartbeatPolicy(agent).maxConcurrentRuns,
+        ))?.run ?? null
       : await db
           .update(heartbeatRuns)
           .set({
@@ -11810,40 +11884,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       const runningCount = nonStaleRunningRuns.length;
 
-      if (runningCount > 0 && hasExternalLifecycle(agent.adapterType)) {
-        await pruneStaleQueuedMaintenanceRunsForAgent(agentId);
-        logger.debug(
-          { agentId, adapterType: agent.adapterType, runningCount },
-          "startNextQueuedRunForAgent: external-lifecycle agent already has an active run",
-        );
-        return [];
-      }
-      if (hasExternalLifecycle(agent.adapterType) && await hasActiveJobForAgent(agentId)) {
+      const externalLifecycle = hasExternalLifecycle(agent.adapterType);
+      const hasActiveExternalJob = externalLifecycle
+        ? await hasActiveJobForAgent(agentId)
+        : false;
+      // A live Job with no corresponding non-stale running row is an orphan or
+      // terminating pod. Do not allocate a new slot until the reaper/kubelet
+      // clears it. When running rows do exist, their atomic reservations define
+      // capacity and distinct isolation keys may run concurrently.
+      if (externalLifecycle && runningCount === 0 && hasActiveExternalJob) {
         await pruneStaleQueuedMaintenanceRunsForAgent(agentId);
         logger.debug(
           { agentId, adapterType: agent.adapterType },
-          "startNextQueuedRunForAgent: external-lifecycle agent still has an active Kubernetes Job or Pod",
+          "startNextQueuedRunForAgent: untracked Kubernetes Job or Pod still holds the agent",
         );
         return [];
       }
-      // BLO-13176 follow-on: external-lifecycle agents (k8s Jobs) can only run
-      // ONE Job at a time — the runningCount>0 and hasActiveJobForAgent gates
-      // above already reject any SECOND dispatch while one is active. But on an
-      // IDLE agent (runningCount 0) this loop would otherwise claim + executeRun
-      // up to maxConcurrentRuns queued runs CONCURRENTLY (one per distinct
-      // issue). Only the first to reach Job creation wins the single slot; the
-      // rest sit pre-adapter with no Job and get reaped as "process_lost before
-      // external adapter invocation" (observed 2026-07-02: BLO-12825's critical
-      // run repeatedly lost the slot to a sibling that leased ~5s earlier — the
-      // concurrent launch race is first-lease-wins, NOT priority-ordered). Cap
-      // external-lifecycle dispatch to a single run so (a) we never lease work
-      // we cannot immediately give a Job, and (b) the one slot goes to the top
-      // of the priority-sorted queue (critical wins) instead of the fastest
-      // leaser. Non-external (local child-process) adapters keep full concurrency.
-      const effectiveMaxConcurrentRuns = hasExternalLifecycle(agent.adapterType)
-        ? 1
-        : policy.maxConcurrentRuns;
-      const availableSlots = Math.max(0, effectiveMaxConcurrentRuns - runningCount);
+      const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
       if (availableSlots <= 0) return [];
 
       // BLO-8746/BLO-8827: we hold the agent start lock, orphans have been
@@ -11856,7 +11913,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // and stops a perpetually-backlogged maxConcurrentRuns=1 agent from
       // starving the bump (which previously pinned it to a stale image until
       // its queue drained to empty, i.e. never under steady automation).
-      if (hasExternalLifecycle(agent.adapterType) && agent.pendingImageBump) {
+      if (externalLifecycle && agent.pendingImageBump) {
+        // Image changes are agent-wide. Drain all active slots before applying
+        // the bump so a concurrent dispatch cannot launch an older image after
+        // the operator requested convergence.
+        if (runningCount > 0 || hasActiveExternalJob) return [];
         await processPendingImageBumpForAgent(db, agentId);
         agent = (await getAgent(agentId)) ?? agent;
       }
@@ -12003,6 +12064,101 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
+  async function deferRunForK8sIsolationConflict(
+    run: typeof heartbeatRuns.$inferSelect,
+    conflict: ExternalRuntimeIsolationConflictError,
+  ) {
+    const latestRun = await getRun(run.id);
+    if (!latestRun || latestRun.status !== "running") return null;
+
+    const now = new Date();
+    const context = parseObject(latestRun.contextSnapshot);
+    const retryAttempt = Math.max(
+      1,
+      Math.floor(asNumber(context[K8S_ISOLATION_RETRY_ATTEMPT_CONTEXT_KEY], 0)) + 1,
+    );
+    const retryAt = new Date(now.getTime() + computeK8sIsolationRetryDelayMs(retryAttempt));
+    delete context.paperclipExternalRuntimeReservation;
+    delete context.paperclipK8sIsolation;
+    context[K8S_ISOLATION_RETRY_ATTEMPT_CONTEXT_KEY] = retryAttempt;
+    context[K8S_ISOLATION_RETRY_AT_CONTEXT_KEY] = retryAt.toISOString();
+
+    const releasedReservation = await releaseExternalRuntimeReservation(db, {
+      runId: run.id,
+      reason: conflict.code,
+      now,
+    });
+    if (!releasedReservation) {
+      throw new Error(`Could not release external-runtime reservation while deferring run ${run.id}`);
+    }
+
+    const deferredRun = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "queued",
+        startedAt: null,
+        finishedAt: null,
+        error: null,
+        errorCode: null,
+        externalRunId: null,
+        processPid: null,
+        processGroupId: null,
+        processStartedAt: null,
+        contextSnapshot: context,
+        updatedAt: now,
+      })
+      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!deferredRun) return null;
+
+    await setWakeupStatus(deferredRun.wakeupRequestId, "queued", {
+      claimedAt: null,
+      finishedAt: null,
+      error: null,
+    });
+    await appendRunEvent(deferredRun, await nextRunEventSeq(deferredRun.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: "Deferred run because another active run owns its mutable K8s isolation scope",
+      payload: {
+        isolationKey: conflict.isolationKey,
+        conflictingRunId: conflict.conflictingRunId,
+        retryAttempt,
+        retryAt: retryAt.toISOString(),
+      },
+    });
+    publishLiveEvent({
+      companyId: deferredRun.companyId,
+      type: "heartbeat.run.status",
+      payload: {
+        runId: deferredRun.id,
+        agentId: deferredRun.agentId,
+        status: deferredRun.status,
+        invocationSource: deferredRun.invocationSource,
+        triggerDetail: deferredRun.triggerDetail,
+        error: null,
+        errorCode: null,
+        startedAt: null,
+        finishedAt: null,
+      },
+    });
+    publishRunLifecyclePluginEvent(deferredRun);
+    logger.info(
+      {
+        runId: deferredRun.id,
+        agentId: deferredRun.agentId,
+        isolationKey: conflict.isolationKey,
+        conflictingRunId: conflict.conflictingRunId,
+        retryAttempt,
+        retryAt: retryAt.toISOString(),
+      },
+      "deferred K8s run behind active isolation writer",
+    );
+    return deferredRun;
+  }
+
   async function executeRun(runId: string) {
     let run = await getRun(runId);
     if (!run) return;
@@ -12022,6 +12178,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     activeRunExecutions.add(run.id);
+    let deferredForK8sIsolationConflict = false;
 
     try {
     const agent = await getAgent(run.agentId);
@@ -12937,14 +13094,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(eq(heartbeatRuns.id, run.id));
     const k8sRunIsolation = buildK8sRunIsolationDescriptor({
       adapterType: agent.adapterType,
+      runId: run.id,
       companyId: agent.companyId,
       agentId: agent.id,
       taskKey,
+      statelessPrReview: paperclipPrReview !== null,
       executionWorkspace,
       persistedExecutionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
       effectiveExecutionWorkspaceMode,
     });
     if (k8sRunIsolation) {
+      if (!externalRuntimeReservation) {
+        throw new Error(`K8s run ${run.id} has no external-runtime reservation for isolation binding`);
+      }
+      await bindExternalRuntimeReservationIsolation(db, {
+        runId: run.id,
+        reservationId: externalRuntimeReservation.id,
+        isolationMode: k8sRunIsolation.isolationMode,
+        isolationKey: k8sRunIsolation.isolationKey,
+      });
+      delete context[K8S_ISOLATION_RETRY_ATTEMPT_CONTEXT_KEY];
+      delete context[K8S_ISOLATION_RETRY_AT_CONTEXT_KEY];
       context.paperclipK8sIsolation = k8sRunIsolation;
       runtimeConfig = {
         ...runtimeConfig,
@@ -14271,6 +14441,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await finalizeAgentStatus(agent.id, "failed", undefined, message);
     }
     } catch (outerErr) {
+          if (outerErr instanceof ExternalRuntimeIsolationConflictError) {
+            try {
+              const deferredRun = await deferRunForK8sIsolationConflict(run, outerErr);
+              if (deferredRun) {
+                deferredForK8sIsolationConflict = true;
+                await finalizeAgentStatus(run.agentId, "cancelled").catch(() => undefined);
+              }
+              return;
+            } catch (deferError) {
+              logger.error(
+                { err: deferError, runId, isolationKey: outerErr.isolationKey },
+                "failed to defer K8s run after isolation-writer contention",
+              );
+            }
+          }
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
           // The inner catch did not fire, so we must record the failure here.
           const message = redactCurrentUserText(
@@ -14371,7 +14556,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // pass the agent process exit code and adapter type to the hook
           // for branching (e.g. only refresh the cache on success, or only
           // for `_k8s` adapters).
-          {
+          if (!deferredForK8sIsolationConflict) {
             const latestRunForHook = await getRun(run.id).catch(() => null);
             const agentForHook = await getAgent(run.agentId).catch(() => null);
             const exitCode = (() => {

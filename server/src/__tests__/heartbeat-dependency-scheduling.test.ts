@@ -11,6 +11,7 @@ import {
   environmentLeases,
   environments,
   executionWorkspaces,
+  externalRuntimeReservations,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -688,7 +689,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     }
   });
 
-  it("keeps scoped k8s issue assignments queued behind an active webhook run", async () => {
+  it("runs an isolated k8s issue assignment alongside a differently scoped webhook run", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const activeRunId = randomUUID();
@@ -766,6 +767,10 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         contextSnapshot: {
           wakeReason: "github_pr_opened",
           prReview: "Blockcast/magma#976",
+          paperclipK8sIsolation: {
+            isolationMode: "run",
+            isolationKey: `run:${activeRunId}`,
+          },
         },
       },
       {
@@ -783,6 +788,19 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         },
       },
     ]);
+    await db.insert(externalRuntimeReservations).values({
+      companyId,
+      agentId,
+      runId: activeRunId,
+      slotId: 0,
+      state: "launched",
+      isolationMode: "run",
+      isolationKey: `run:${activeRunId}`,
+      isolationBoundAt: new Date(),
+      reservedAt: new Date(),
+      launchingAt: new Date(),
+      launchedAt: new Date(),
+    });
     await db.insert(heartbeatRunEvents).values({
       companyId,
       agentId,
@@ -801,9 +819,10 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
 
     try {
       await heartbeat.resumeQueuedRuns();
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      const scopedAdapterStarted = await waitForCondition(async () => adapterCalledForRun(scopedRunId));
+      expect(scopedAdapterStarted).toBe(true);
 
-      const [scopedRun, scopedIssue, scopedWakeup] = await Promise.all([
+      const [scopedRun, scopedIssue, scopedWakeup, scopedReservation] = await Promise.all([
         db
           .select({ status: heartbeatRuns.status })
           .from(heartbeatRuns)
@@ -822,15 +841,27 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
           .from(agentWakeupRequests)
           .where(eq(agentWakeupRequests.id, scopedWakeupRequestId))
           .then((rows) => rows[0] ?? null),
+        db
+          .select({
+            slotId: externalRuntimeReservations.slotId,
+            isolationMode: externalRuntimeReservations.isolationMode,
+            isolationKey: externalRuntimeReservations.isolationKey,
+          })
+          .from(externalRuntimeReservations)
+          .where(eq(externalRuntimeReservations.runId, scopedRunId))
+          .then((rows) => rows[0] ?? null),
       ]);
 
-      expect(scopedRun?.status).toBe("queued");
-      expect(scopedWakeup?.status).toBe("queued");
-      expect(scopedIssue).toMatchObject({
-        executionRunId: null,
-        executionLockedAt: null,
+      expect(scopedRun?.status).toBe("running");
+      expect(scopedWakeup?.status).toBe("claimed");
+      expect(scopedIssue?.executionRunId).toBe(scopedRunId);
+      expect(scopedIssue?.executionLockedAt).toBeInstanceOf(Date);
+      expect(scopedReservation).toMatchObject({
+        slotId: 1,
+        isolationMode: "shared",
+        isolationKey: `agent-shared:${agentId}`,
       });
-      expect(adapterCalledForRun(scopedRunId)).toBe(false);
+      expect(adapterCalledForRun(scopedRunId)).toBe(true);
     } finally {
       finishQueuedRun();
       await heartbeat.drainInFlightExecutions();

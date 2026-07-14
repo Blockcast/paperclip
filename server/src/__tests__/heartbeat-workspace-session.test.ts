@@ -16,9 +16,11 @@ import {
   buildRealizedExecutionWorkspaceFromPersisted,
   buildExplicitResumeSessionOverride,
   buildK8sRunIsolationDescriptor,
+  computeK8sIsolationRetryDelayMs,
   deriveTaskKeyWithHeartbeatFallback,
   evaluatePreferredProjectWorkspaceRealization,
   isNonPrimaryWorkspaceTarget,
+  isK8sIsolationRetryDeferred,
   logK8sGuardDecision,
   resolveProjectPrimaryWorkspaceId,
   extractWakeCommentIds,
@@ -1433,23 +1435,50 @@ describe("normalizeSessionParams", () => {
 describe("K8s session isolation metadata", () => {
   const isolation = {
     isolationMode: "workspace" as const,
-    isolationKey: "workspace:company-1:agent-1:workspace-1",
+    isolationKey: "workspace:workspace-1",
     workspaceRoot: "/tmp/workspace-1",
     homeRoot: "/tmp/home",
+    sessionRoot: "/tmp/session",
     cacheRoot: "/tmp/home/.cache",
+    storage: {
+      workspace: "persistent" as const,
+      home: "persistent" as const,
+      session: "persistent" as const,
+      cache: "ephemeral" as const,
+    },
     sessionScope: {
       taskKey: "issue-1",
-      isolationKey: "workspace:company-1:agent-1:workspace-1",
+      isolationKey: "workspace:workspace-1",
     },
   };
+
+  it("backs off isolation-writer contention without creating a terminal run", () => {
+    expect(computeK8sIsolationRetryDelayMs(1)).toBe(15_000);
+    expect(computeK8sIsolationRetryDelayMs(2)).toBe(30_000);
+    expect(computeK8sIsolationRetryDelayMs(6)).toBe(300_000);
+    expect(computeK8sIsolationRetryDelayMs(100)).toBe(300_000);
+
+    const now = new Date("2026-07-14T12:00:00.000Z");
+    expect(isK8sIsolationRetryDeferred({
+      paperclipK8sIsolationRetryAt: "2026-07-14T12:00:01.000Z",
+    }, now)).toBe(true);
+    expect(isK8sIsolationRetryDeferred({
+      paperclipK8sIsolationRetryAt: "2026-07-14T11:59:59.000Z",
+    }, now)).toBe(false);
+    expect(isK8sIsolationRetryDeferred({
+      paperclipK8sIsolationRetryAt: "invalid",
+    }, now)).toBe(false);
+  });
 
   it("returns null for non-K8s adapters", () => {
     expect(
       buildK8sRunIsolationDescriptor({
         adapterType: "opencode_local",
+        runId: "run-1",
         companyId: "company-1",
         agentId: "agent-1",
         taskKey: "issue-1",
+        statelessPrReview: false,
         executionWorkspace: {
           cwd: "/tmp/workspace-1",
           source: "project_primary",
@@ -1464,9 +1493,11 @@ describe("K8s session isolation metadata", () => {
     expect(
       buildK8sRunIsolationDescriptor({
         adapterType: "opencode_k8s",
+        runId: "run-1",
         companyId: "company-1",
         agentId: "agent-1",
         taskKey: "issue-1",
+        statelessPrReview: false,
         executionWorkspace: {
           cwd: "/tmp/workspace-1",
           source: "task_session",
@@ -1477,12 +1508,138 @@ describe("K8s session isolation metadata", () => {
       }),
     ).toMatchObject({
       isolationMode: "workspace",
-      isolationKey: "workspace:company-1:agent-1:execution-workspace-1",
+      isolationKey: "workspace:execution-workspace-1",
       workspaceRoot: "/tmp/workspace-1",
+      homeRoot: "/paperclip/instances/default/data/k8s-isolation/workspaces/execution-workspace-1/home",
+      sessionRoot: "/paperclip/instances/default/data/k8s-isolation/workspaces/execution-workspace-1/session",
+      cacheRoot: "/runtime-cache/paperclip-workspaces/execution-workspace-1/cache",
+      storage: {
+        workspace: "persistent",
+        home: "persistent",
+        session: "persistent",
+        cache: "ephemeral",
+      },
       sessionScope: {
         taskKey: "issue-1",
-        isolationKey: "workspace:company-1:agent-1:execution-workspace-1",
+        isolationKey: "workspace:execution-workspace-1",
       },
+    });
+  });
+
+  it("builds fully ephemeral run isolation metadata for stateless PR reviews", () => {
+    expect(
+      buildK8sRunIsolationDescriptor({
+        adapterType: "opencode_k8s",
+        runId: "run-1",
+        companyId: "company-1",
+        agentId: "agent-1",
+        taskKey: "pr-review-42",
+        statelessPrReview: true,
+        executionWorkspace: {
+          cwd: "/paperclip/worktrees/pr-42",
+          source: "task_session",
+          strategy: "git_worktree",
+        },
+        persistedExecutionWorkspaceId: "execution-workspace-1",
+        effectiveExecutionWorkspaceMode: "isolated_workspace",
+      }),
+    ).toEqual({
+      isolationMode: "run",
+      isolationKey: "run:run-1",
+      workspaceRoot: "/runtime-cache/paperclip-runs/run-1/workspace",
+      homeRoot: "/runtime-cache/paperclip-runs/run-1/home",
+      sessionRoot: "/runtime-cache/paperclip-runs/run-1/session",
+      cacheRoot: "/runtime-cache/paperclip-runs/run-1/cache",
+      storage: {
+        workspace: "ephemeral",
+        home: "ephemeral",
+        session: "ephemeral",
+        cache: "ephemeral",
+      },
+      sessionScope: {
+        taskKey: "pr-review-42",
+        isolationKey: "run:run-1",
+      },
+    });
+  });
+
+  it("does not reuse a stateless PR review session across heartbeat runs", () => {
+    const buildRunIsolation = (runId: string) => buildK8sRunIsolationDescriptor({
+      adapterType: "claude_k8s",
+      runId,
+      companyId: "company-1",
+      agentId: "agent-1",
+      taskKey: "pr-review-42",
+      statelessPrReview: true,
+      executionWorkspace: {
+        cwd: "/paperclip/worktrees/pr-42",
+        source: "task_session",
+        strategy: "git_worktree",
+      },
+      persistedExecutionWorkspaceId: "execution-workspace-1",
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+    });
+    const firstRun = buildRunIsolation("run-1");
+    const secondRun = buildRunIsolation("run-2");
+
+    expect(firstRun?.isolationKey).toBe("run:run-1");
+    expect(secondRun?.isolationKey).toBe("run:run-2");
+    expect(
+      sessionParamsMatchIsolation(
+        scopeSessionParamsToIsolation({ sessionId: "session-1" }, firstRun),
+        secondRun,
+      ),
+    ).toBe(false);
+  });
+
+  it("reuses the durable workspace and session scope across heartbeat runs", () => {
+    const buildWorkspaceIsolation = (runId: string) => buildK8sRunIsolationDescriptor({
+      adapterType: "opencode_k8s",
+      runId,
+      companyId: "company-1",
+      agentId: "agent-1",
+      taskKey: "issue-1",
+      statelessPrReview: false,
+      executionWorkspace: {
+        cwd: "/paperclip/worktrees/issue-1",
+        source: "task_session",
+        strategy: "git_worktree",
+      },
+      persistedExecutionWorkspaceId: "execution-workspace-1",
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+    });
+
+    const firstRun = buildWorkspaceIsolation("run-1");
+    const resumedRun = buildWorkspaceIsolation("run-2");
+    expect(resumedRun?.isolationKey).toBe(firstRun?.isolationKey);
+    expect(resumedRun?.workspaceRoot).toBe(firstRun?.workspaceRoot);
+    expect(resumedRun?.sessionRoot).toBe(firstRun?.sessionRoot);
+    expect(
+      sessionParamsMatchIsolation(
+        scopeSessionParamsToIsolation({ sessionId: "session-1" }, firstRun),
+        resumedRun,
+      ),
+    ).toBe(true);
+  });
+
+  it("falls back to serialized shared mode when an isolated workspace has no durable id", () => {
+    expect(buildK8sRunIsolationDescriptor({
+      adapterType: "opencode_k8s",
+      runId: "run-1",
+      companyId: "company-1",
+      agentId: "agent-1",
+      taskKey: "issue-1",
+      statelessPrReview: false,
+      executionWorkspace: {
+        cwd: "/paperclip/worktrees/unknown",
+        source: "task_session",
+        strategy: "git_worktree",
+      },
+      persistedExecutionWorkspaceId: null,
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+    })).toMatchObject({
+      isolationMode: "shared",
+      isolationKey: "agent-shared:agent-1",
     });
   });
 
@@ -1490,9 +1647,11 @@ describe("K8s session isolation metadata", () => {
     expect(
       buildK8sRunIsolationDescriptor({
         adapterType: "claude_k8s",
+        runId: "run-1",
         companyId: "company-1",
         agentId: "agent-1",
         taskKey: "issue-1",
+        statelessPrReview: false,
         executionWorkspace: {
           cwd: "/tmp/shared-workspace",
           source: "project_primary",
@@ -1502,11 +1661,11 @@ describe("K8s session isolation metadata", () => {
       }),
     ).toMatchObject({
       isolationMode: "shared",
-      isolationKey: "shared:company-1:agent-1",
+      isolationKey: "agent-shared:agent-1",
       workspaceRoot: "/tmp/shared-workspace",
       sessionScope: {
         taskKey: "issue-1",
-        isolationKey: "shared:company-1:agent-1",
+        isolationKey: "agent-shared:agent-1",
       },
     });
   });
@@ -1529,10 +1688,10 @@ describe("K8s session isolation metadata", () => {
         {
           ...isolation,
           isolationMode: "shared",
-          isolationKey: "shared:company-1:agent-1",
+          isolationKey: "agent-shared:agent-1",
           sessionScope: {
             taskKey: "issue-1",
-            isolationKey: "shared:company-1:agent-1",
+            isolationKey: "agent-shared:agent-1",
           },
         },
       ),
@@ -1544,7 +1703,7 @@ describe("K8s session isolation metadata", () => {
       sessionParamsMatchIsolation(
         {
           sessionId: "session-1",
-          paperclipIsolationKey: "workspace:company-1:agent-1:workspace-2",
+          paperclipIsolationKey: "workspace:workspace-2",
         },
         isolation,
       ),
@@ -1555,9 +1714,11 @@ describe("K8s session isolation metadata", () => {
     const spy = vi.spyOn(logger, "info").mockImplementation(() => {});
     const workspaceIsolation = buildK8sRunIsolationDescriptor({
       adapterType: "opencode_k8s",
+      runId: "run-1",
       companyId: "company-1",
       agentId: "agent-1",
       taskKey: "issue-1",
+      statelessPrReview: false,
       executionWorkspace: {
         cwd: "/tmp/workspace-1",
         source: "task_session",
@@ -1606,7 +1767,7 @@ describe("K8s session isolation metadata", () => {
         event: "k8s_guard_decision",
         decision: "allowed",
         isolation_mode: "workspace",
-        isolation_key: "workspace:company-1:agent-1:execution-workspace-1",
+        isolation_key: "workspace:execution-workspace-1",
         task_key: "issue-1",
         session_id: "session-1",
         agent_id: "agent-1",
@@ -1616,7 +1777,7 @@ describe("K8s session isolation metadata", () => {
         event: "k8s_guard_decision",
         decision: "reattached",
         isolation_mode: "workspace",
-        isolation_key: "workspace:company-1:agent-1:execution-workspace-1",
+        isolation_key: "workspace:execution-workspace-1",
         task_key: "issue-1",
         session_id: "session-1",
       }),
@@ -1625,7 +1786,7 @@ describe("K8s session isolation metadata", () => {
         decision: "requeued",
         reason: "isolation_mismatch",
         isolation_mode: "workspace",
-        isolation_key: "workspace:company-1:agent-1:execution-workspace-1",
+        isolation_key: "workspace:execution-workspace-1",
         task_key: "issue-1",
         session_id: "session-2",
       }),
@@ -1662,7 +1823,7 @@ describe("K8s session isolation metadata", () => {
         event: "k8s_guard_decision",
         decision: "allowed",
         isolation_mode: "unknown",
-        isolation_key: "workspace:company-1:agent-1:workspace-1",
+        isolation_key: "workspace:workspace-1",
         task_key: "issue-1",
         session_id: "session-1",
       }),
@@ -1691,7 +1852,7 @@ describe("K8s session isolation metadata", () => {
         event: "k8s_guard_decision",
         decision: "allowed",
         isolation_mode: "unknown",
-        isolation_key: "workspace:company-1:agent-1:workspace-1",
+        isolation_key: "workspace:workspace-1",
         task_key: "issue-1",
         session_id: "session-1",
       }),

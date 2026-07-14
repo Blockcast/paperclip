@@ -1,4 +1,4 @@
-import { and, eq, isNull, or, sql } from "drizzle-orm";
+import { and, eq, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { externalRuntimeReservations, heartbeatRuns } from "@paperclipai/db";
 import {
@@ -10,6 +10,43 @@ import { logger } from "../middleware/logger.js";
 const DEFAULT_EXTERNAL_RUNTIME_SLOT_ID = 0;
 
 export type ExternalRuntimeReservation = typeof externalRuntimeReservations.$inferSelect;
+export type ExternalRuntimeIsolationMode = "shared" | "run" | "workspace";
+
+const ACTIVE_RUNTIME_SLOT_CONSTRAINT = "external_runtime_reservations_active_slot_idx";
+const ACTIVE_ISOLATION_WRITER_CONSTRAINT = "external_runtime_reservations_active_isolation_writer_idx";
+
+export class ExternalRuntimeIsolationConflictError extends Error {
+  readonly code = "external_runtime_isolation_conflict";
+
+  constructor(
+    readonly runId: string,
+    readonly isolationKey: string,
+    readonly conflictingRunId: string | null,
+  ) {
+    super(
+      `External runtime run ${runId} cannot acquire writer ownership for ${isolationKey}`
+      + (conflictingRunId ? `; active run ${conflictingRunId} already owns it` : ""),
+    );
+    this.name = "ExternalRuntimeIsolationConflictError";
+  }
+}
+
+function isConstraintConflict(error: unknown, expectedConstraint: string): boolean {
+  let current: unknown = error;
+  for (let depth = 0; current && depth < 6; depth += 1) {
+    if (typeof current !== "object") return false;
+    const candidate = current as {
+      code?: unknown;
+      constraint?: unknown;
+      constraint_name?: unknown;
+      cause?: unknown;
+    };
+    const constraint = candidate.constraint ?? candidate.constraint_name;
+    if (candidate.code === "23505" && constraint === expectedConstraint) return true;
+    current = candidate.cause;
+  }
+  return false;
+}
 
 export function externalRuntimeReservationCanRelease(
   reservation: Pick<ExternalRuntimeReservation, "state" | "jobName" | "expectedJobName">,
@@ -60,62 +97,107 @@ export async function claimRunWithExternalRuntimeSlot(
   run: typeof heartbeatRuns.$inferSelect;
   reservation: ExternalRuntimeReservation;
 } | null> {
-  const claimed = await db.transaction(async (tx) => {
-    const run = await tx
-      .select()
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
-      .for("update")
-      .then((rows) => rows[0] ?? null);
-    if (!run || run.status !== "queued") return null;
+  let claimed: {
+    run: typeof heartbeatRuns.$inferSelect;
+    reservation: ExternalRuntimeReservation;
+  } | null;
+  try {
+    claimed = await db.transaction(async (tx) => {
+      const run = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!run || run.status !== "queued") return null;
 
-    let reservation = await tx
-      .select()
-      .from(externalRuntimeReservations)
-      .where(and(
-        eq(externalRuntimeReservations.runId, run.id),
-        isNull(externalRuntimeReservations.releasedAt),
-      ))
-      .then((rows) => rows[0] ?? null);
+      let reservation = await tx
+        .select()
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.runId, run.id))
+        .then((rows) => rows[0] ?? null);
 
-    if (!reservation) {
-      reservation = await tx
-        .insert(externalRuntimeReservations)
-        .values({
-          companyId: run.companyId,
-          agentId: run.agentId,
-          runId: run.id,
-          slotId,
-          state: "reserved",
-          reservedAt: claimedAt,
-          createdAt: claimedAt,
+      if (reservation?.releasedAt) {
+        reservation = await tx
+          .update(externalRuntimeReservations)
+          .set({
+            slotId,
+            state: "reserved",
+            expectedJobName: null,
+            jobName: null,
+            jobUid: null,
+            isolationMode: null,
+            isolationKey: null,
+            isolationBoundAt: null,
+            reservedAt: claimedAt,
+            launchingAt: null,
+            launchedAt: null,
+            releasedAt: null,
+            releaseReason: null,
+            updatedAt: claimedAt,
+          })
+          .where(and(
+            eq(externalRuntimeReservations.id, reservation.id),
+            isNotNull(externalRuntimeReservations.releasedAt),
+          ))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      } else if (!reservation) {
+        reservation = await tx
+          .insert(externalRuntimeReservations)
+          .values({
+            companyId: run.companyId,
+            agentId: run.agentId,
+            runId: run.id,
+            slotId,
+            state: "reserved",
+            reservedAt: claimedAt,
+            createdAt: claimedAt,
+            updatedAt: claimedAt,
+          })
+          .onConflictDoNothing()
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      }
+      if (!reservation) return null;
+
+      const updatedRun = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "running",
+          startedAt: run.startedAt ?? claimedAt,
           updatedAt: claimedAt,
         })
-        .onConflictDoNothing()
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
         .returning()
         .then((rows) => rows[0] ?? null);
-    }
-    if (!reservation) return null;
-
-    const updatedRun = await tx
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
-    if (!updatedRun) {
-      throw new Error(`External runtime reservation ${reservation.id} could not claim queued run ${run.id}`);
-    }
-    return { run: updatedRun, reservation };
-  });
+      if (!updatedRun) {
+        throw new Error(`External runtime reservation ${reservation.id} could not claim queued run ${run.id}`);
+      }
+      return { run: updatedRun, reservation };
+    });
+  } catch (error) {
+    if (!isConstraintConflict(error, ACTIVE_RUNTIME_SLOT_CONSTRAINT)) throw error;
+    claimed = null;
+  }
 
   recordExternalRuntimeReservationEvent(claimed ? "reserved" : "contended");
   refreshExternalRuntimeReservationMetricsBestEffort(db, claimedAt, "claim");
   return claimed;
+}
+
+export async function claimRunWithExternalRuntimeSlotPool(
+  db: Db,
+  runId: string,
+  claimedAt: Date,
+  maxSlots: number,
+) {
+  const slotCount = Math.max(1, Math.floor(maxSlots));
+  for (let slotId = 0; slotId < slotCount; slotId += 1) {
+    const claimed = await claimRunWithExternalRuntimeSlot(db, runId, claimedAt, slotId);
+    if (claimed) return claimed;
+  }
+  return null;
 }
 
 export async function getActiveExternalRuntimeReservation(
@@ -130,6 +212,92 @@ export async function getActiveExternalRuntimeReservation(
       isNull(externalRuntimeReservations.releasedAt),
     ))
     .then((rows) => rows[0] ?? null);
+}
+
+export async function bindExternalRuntimeReservationIsolation(
+  db: Db,
+  input: {
+    runId: string;
+    reservationId: string;
+    isolationMode: ExternalRuntimeIsolationMode;
+    isolationKey: string;
+    now?: Date;
+  },
+): Promise<ExternalRuntimeReservation> {
+  const now = input.now ?? new Date();
+  const existing = await getActiveExternalRuntimeReservation(db, input.runId);
+  if (!existing || existing.id !== input.reservationId) {
+    throw new Error(`External runtime reservation no longer owns isolation binding for run ${input.runId}`);
+  }
+  if (existing.state === "release_pending" || existing.state === "released") {
+    throw new Error(`External runtime reservation for run ${input.runId} is no longer active`);
+  }
+  if (existing.isolationKey || existing.isolationMode) {
+    if (existing.isolationKey === input.isolationKey && existing.isolationMode === input.isolationMode) {
+      return existing;
+    }
+    throw new Error(
+      `External runtime isolation binding drift for run ${input.runId}: `
+      + `persisted ${existing.isolationMode ?? "<none>"}/${existing.isolationKey ?? "<none>"}, `
+      + `received ${input.isolationMode}/${input.isolationKey}`,
+    );
+  }
+
+  let reservation: ExternalRuntimeReservation | null = null;
+  try {
+    reservation = await db
+      .update(externalRuntimeReservations)
+      .set({
+        isolationMode: input.isolationMode,
+        isolationKey: input.isolationKey,
+        isolationBoundAt: now,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(externalRuntimeReservations.id, input.reservationId),
+        eq(externalRuntimeReservations.runId, input.runId),
+        isNull(externalRuntimeReservations.releasedAt),
+        isNull(externalRuntimeReservations.isolationMode),
+        isNull(externalRuntimeReservations.isolationKey),
+      ))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+  } catch (error) {
+    if (!isConstraintConflict(error, ACTIVE_ISOLATION_WRITER_CONSTRAINT)) throw error;
+    const conflicting = await db
+      .select({ runId: externalRuntimeReservations.runId })
+      .from(externalRuntimeReservations)
+      .where(and(
+        eq(externalRuntimeReservations.isolationKey, input.isolationKey),
+        isNull(externalRuntimeReservations.releasedAt),
+        ne(externalRuntimeReservations.runId, input.runId),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    throw new ExternalRuntimeIsolationConflictError(
+      input.runId,
+      input.isolationKey,
+      conflicting?.runId ?? null,
+    );
+  }
+  if (reservation) return reservation;
+
+  const current = await getActiveExternalRuntimeReservation(db, input.runId);
+  if (
+    current?.id === input.reservationId
+    && current.isolationKey === input.isolationKey
+    && current.isolationMode === input.isolationMode
+  ) {
+    return current;
+  }
+  if (current?.isolationKey || current?.isolationMode) {
+    throw new Error(
+      `External runtime isolation binding drift for run ${input.runId}: `
+      + `persisted ${current.isolationMode ?? "<none>"}/${current.isolationKey ?? "<none>"}, `
+      + `received ${input.isolationMode}/${input.isolationKey}`,
+    );
+  }
+  throw new Error(`External runtime reservation no longer owns isolation binding for run ${input.runId}`);
 }
 
 export async function markExternalRuntimeReservationLaunching(

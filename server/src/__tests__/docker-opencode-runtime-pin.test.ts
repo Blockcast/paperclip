@@ -25,8 +25,8 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerfile).not.toMatch(/npm install[^\n]*\sopencode-ai(?:\s|\\)/);
   });
 
-  it("vendors the claude_k8s adapter commit with shared MCP baseline injection, resume guard, and env guard", () => {
-    expect(dockerfile).toContain("ARG CLAUDE_K8S_REF=a1ca578f6714eeb2c769a3f5210d445b7a0c5157");
+  it("vendors the claude_k8s adapter commit with runtime isolation, resume guard, and env guard", () => {
+    expect(dockerfile).toContain("ARG CLAUDE_K8S_REF=c10a12b0b7d41ea20a40e92ffcf4c1131c404a81");
     expect(dockerfile).toContain("PEN-1305 PreToolUse env-guard");
     expect(dockerfile).toContain("always materialize the shared MCP baseline");
     expect(dockerfile).toContain("Fixes BackendEngineerGo/Ally missing paperclip/hindsight/gbrain/linear/etc.");
@@ -46,10 +46,12 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerfile).toContain("Manifest suite 141/141");
     expect(dockerfile).toContain("acknowledge the created Job name");
     expect(dockerfile).toContain("k8s_job_identity_unacknowledged");
+    expect(dockerfile).toContain("server-owned runtime");
+    expect(dockerfile).toContain("independent");
   });
 
-  it("vendors the opencode_k8s adapter commit with runtime fixes and the env-dump deny", () => {
-    expect(dockerfile).toContain("ARG OPENCODE_K8S_REF=82b0b0427b9d3f161a1b5d8487bdd31fd465194b");
+  it("vendors the opencode_k8s adapter commit with runtime isolation and the env-dump deny", () => {
+    expect(dockerfile).toContain("ARG OPENCODE_K8S_REF=dfd13f28a15c02632b7b2f6378fc17c88b570856");
     expect(dockerfile).toContain("PEN-1305 permission.bash env-dump deny");
     expect(dockerfile).toContain("disable opencode's turn-zero workspace");
     expect(dockerfile).toContain("snapshot: false");
@@ -85,6 +87,8 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerfile).toContain("x-penstock-session: agent:<name>");
     expect(dockerfile).toContain("omit pod-level fsGroup from");
     expect(dockerfile).toContain("Manifest suite 113/113");
+    expect(dockerfile).toContain("typed run/workspace");
+    expect(dockerfile).toContain("key durable DBs by workspace");
   });
 
   it("routes Paperclip Docker image builds through the DIND runner pool", () => {

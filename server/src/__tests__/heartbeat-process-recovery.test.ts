@@ -25,6 +25,7 @@ import {
   environmentLeases,
   environments,
   executionWorkspaces,
+  externalRuntimeReservations,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -1831,16 +1832,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockDeleteAgentJobsForRun).toHaveBeenCalledTimes(1);
   });
 
-  it("BLO-13176 follow-on: an external-lifecycle agent claims only ONE run per dispatch (highest priority) — no over-dispatch of doomed pre-adapter runs", async () => {
-    // The over-dispatch: an idle opencode_k8s agent with maxConcurrentRuns=3 and
-    // several queued distinct-issue runs used to claim + executeRun all of them
-    // concurrently. Only the first to reach Job creation wins the single k8s Job
-    // slot (runningCount>0 / hasActiveJobForAgent gate the rest); the losers sit
-    // pre-adapter with no Job and die "before external adapter invocation"
-    // (2026-07-02: BLO-12825's critical run kept losing to a sibling that leased
-    // ~5s earlier — the race is first-lease-wins, NOT priority-ordered).
-    // external-lifecycle dispatch is now capped to a single run, and the priority
-    // sort gives that one slot to the critical issue.
+  it("allocates external-lifecycle runs across the configured slot pool in priority order", async () => {
+    // Runtime reservations now make external slots atomic, while run-scoped
+    // isolation keeps each stateless PR review's mutable state independent.
+    // With two slots and three queued reviews, the two highest-priority runs
+    // must launch and the low-priority run must remain queued.
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issuePrefix = `X${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
@@ -1858,7 +1854,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: "idle",
       adapterType: "opencode_k8s",
       adapterConfig: {},
-      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 3 } },
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 2 } },
       permissions: {},
     });
     const seedQueued = async (
@@ -1900,7 +1896,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         triggerDetail: "system",
         status: "queued",
         wakeupRequestId: wakeId,
-        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+        contextSnapshot: {
+          issueId,
+          wakeReason: "github_pr_opened",
+          reviewKind: "pr_review",
+          githubPrNumber: num,
+        },
         createdAt,
         updatedAt: createdAt,
       });
@@ -1908,13 +1909,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // Critical is the NEWEST (so the createdAt tie-break / first-lease-wins would
     // NOT pick it — only the priority sort does).
     const lowIssue = randomUUID();
+    const mediumIssue = randomUUID();
     const critIssue = randomUUID();
     const critRun = randomUUID();
-    await seedQueued(lowIssue, randomUUID(), "low", 1, new Date("2026-03-19T00:00:00.000Z"));
-    await seedQueued(randomUUID(), randomUUID(), "medium", 2, new Date("2026-03-19T00:01:00.000Z"));
-    await seedQueued(critIssue, critRun, "critical", 3, new Date("2026-03-19T00:02:00.000Z"));
+    const dispatchBaseMs = Date.now();
+    await seedQueued(lowIssue, randomUUID(), "low", 1, new Date(dispatchBaseMs - 3 * 60_000));
+    await seedQueued(mediumIssue, randomUUID(), "medium", 2, new Date(dispatchBaseMs - 2 * 60_000));
+    await seedQueued(critIssue, critRun, "critical", 3, new Date(dispatchBaseMs - 1 * 60_000));
 
-    // Hang the adapter so the single claimed run stays running and its completion
+    // Hang the adapter so both claimed runs stay running and their completion
     // can't trigger the next dispatch mid-assertion (which would muddy the count).
     let releaseExec: () => void = () => {};
     const gate = new Promise<void>((resolve) => {
@@ -1935,13 +1938,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     try {
       await heartbeat.resumeQueuedRuns();
-      // Wait until the first run has been claimed (left the queued state).
+      // Wait until both configured slots have been claimed.
       await waitForValue(async () => {
         const rows = await db
           .select()
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.agentId, agentId));
-        return rows.some((r) => r.status !== "queued") ? rows : null;
+        return rows.filter((r) => r.status !== "queued").length === 2 ? rows : null;
       });
       const rows = await db
         .select()
@@ -1949,14 +1952,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .where(eq(heartbeatRuns.agentId, agentId));
       const claimed = rows.filter((r) => r.status !== "queued");
       const queued = rows.filter((r) => r.status === "queued");
-      // THE CAP: exactly one external-lifecycle run dispatched, not three.
-      expect(claimed).toHaveLength(1);
-      expect(queued).toHaveLength(2);
-      // THE PRIORITY WIN: the single slot went to the critical issue, not the
-      // oldest-leased (low) run.
-      expect((claimed[0]?.contextSnapshot as Record<string, unknown> | null)?.issueId).toBe(
-        critIssue,
-      );
+      expect(claimed).toHaveLength(2);
+      expect(queued).toHaveLength(1);
+      expect(new Set(claimed.map((row) => (
+        row.contextSnapshot as Record<string, unknown> | null
+      )?.issueId))).toEqual(new Set([critIssue, mediumIssue]));
+      expect((queued[0]?.contextSnapshot as Record<string, unknown> | null)?.issueId).toBe(lowIssue);
+
+      const reservations = await db
+        .select({ slotId: externalRuntimeReservations.slotId })
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.agentId, agentId));
+      expect(reservations.map((reservation) => reservation.slotId).sort()).toEqual([0, 1]);
     } finally {
       releaseExec();
       await heartbeat.drainInFlightExecutions(5_000);
