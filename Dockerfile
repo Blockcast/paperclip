@@ -193,7 +193,11 @@ WORKDIR /vendor
 # Git index, persist durable workspace sessions, and keep writable caches on
 # the per-Job runtime-cache emptyDir. PR kkroo/paperclip-adapter-claude-k8s#19;
 # typecheck, 422/422 tests, and build pass after rebasing onto the env guard.
-ARG CLAUDE_K8S_REF=c10a12b0b7d41ea20a40e92ffcf4c1131c404a81
+# Bumped 2026-07-14 to 288f92a: bootstrap run-isolated jobs safely when a
+# stateless review starts from the generic non-Git fallback workspace, and
+# create the isolated pod-log parent before the pipefail/tee pipeline. PR
+# kkroo/paperclip-adapter-claude-k8s#20; typecheck, 422/422 tests, and build pass.
+ARG CLAUDE_K8S_REF=288f92accd57769d61ec80478ef831ed589ff6a8
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
