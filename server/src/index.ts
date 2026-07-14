@@ -1011,6 +1011,12 @@ export async function startServer(): Promise<StartedServer> {
     throw err;
   }
 
+  // BLO-12563: hoisted so the SIGTERM handler can quiesce run dispatch, stop the
+  // reaper/scheduler timer, and drain in-flight run setups before the process
+  // exits. Null on the API tier / when the scheduler is disabled (no-op there).
+  let workerHeartbeat: ReturnType<typeof heartbeatService> | null = null;
+  let heartbeatSchedulerTimer: ReturnType<typeof setInterval> | null = null;
+
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, {
       pluginWorkerManager,
@@ -1021,6 +1027,7 @@ export async function startServer(): Promise<StartedServer> {
       // singletons (plugins, reconciler, Linear tunnel) below.
       paperclipNodeRole: config.paperclipNodeRole,
     });
+    workerHeartbeat = heartbeat;
     const routines = routineService(db as any, { pluginWorkerManager });
 
     // Reap orphaned runs before timer ticks start so wakeups cannot coalesce
@@ -1102,7 +1109,7 @@ export async function startServer(): Promise<StartedServer> {
     })().catch((err) => {
       logger.error({ err }, "startup heartbeat recovery failed");
     });
-    setInterval(() => {
+    heartbeatSchedulerTimer = setInterval(() => {
       void heartbeat
         .tickTimers(new Date())
         .then((result) => {
@@ -1446,6 +1453,20 @@ export async function startServer(): Promise<StartedServer> {
       logShutdownSignal(signal);
       logger.info({ signal }, "Shutdown signal received — beginning graceful drain");
 
+      // 0. BLO-12563: quiesce run dispatch and stop the scheduler/reaper timer
+      //    FIRST, so this rolling worker pod neither claims new runs nor mints
+      //    process_lost for its own in-flight setups during the drain below.
+      try {
+        workerHeartbeat?.stopDispatch();
+        if (heartbeatSchedulerTimer) {
+          clearInterval(heartbeatSchedulerTimer);
+          heartbeatSchedulerTimer = null;
+        }
+      } catch (err) {
+        writeShutdownBreadcrumb(`heartbeat dispatch quiesce failed: ${err instanceof Error ? err.message : String(err)}`);
+        logger.warn({ err }, "shutdown: failed to quiesce heartbeat dispatch");
+      }
+
       // 1. Drain SSE bridge streams FIRST — emit `event: shutdown` on each,
       //    end() the socket, and await each response's 'finish' event so the
       //    shutdown frame actually hits the wire before we proceed. Order
@@ -1462,6 +1483,20 @@ export async function startServer(): Promise<StartedServer> {
         // can lose late-shutdown lines on process.exit.
         writeShutdownBreadcrumb(`sseRegistry.drain failed: ${errMsg}`);
         logger.warn({ err }, "sseRegistry.drain failed");
+      }
+
+      // 1b. BLO-12563: drain the run setup window — wait for in-flight runs to
+      //     persist their k8s Job identity so the next pod re-adopts them instead
+      //     of minting process_lost. Runs BEFORE server.close so the launching
+      //     adapter can still call back to this pod to record the Job identity.
+      try {
+        const drainResult = await workerHeartbeat?.drainInFlightRunSetup?.();
+        if (drainResult) {
+          logger.info({ ...drainResult }, "shutdown: in-flight run setup drain complete");
+        }
+      } catch (err) {
+        writeShutdownBreadcrumb(`drainInFlightRunSetup failed: ${err instanceof Error ? err.message : String(err)}`);
+        logger.warn({ err }, "shutdown: drainInFlightRunSetup failed");
       }
 
       // 2. Now stop accepting new connections. With SSEs drained, server.close

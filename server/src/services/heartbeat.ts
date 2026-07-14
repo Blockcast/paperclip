@@ -5254,6 +5254,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // ignores this set; it self-cleans via `.finally`. Drained via
   // `drainInFlightExecutions()` exposed on the service public API.
   const inFlightExecutions = new Set<Promise<unknown>>();
+  // BLO-12563: on SIGTERM (server pod rollout) stopDispatch() sets this so
+  // startNextQueuedRunForAgent stops claiming NEW runs. In-flight setups are then
+  // drained via drainInFlightRunSetup() so they persist a k8s Job identity and the
+  // next pod re-adopts them, instead of being killed mid-setup and minted
+  // process_lost by the reaper.
+  let dispatchStopped = false;
   const liveRunExecutions = {
     has(id: string) {
       return runningProcesses.has(id) || activeRunExecutions.has(id);
@@ -11241,6 +11247,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
+      // BLO-12563: if this pod is shutting down (stopDispatch() set dispatchStopped),
+      // do NOT mint process_lost for a mid-setup external-lifecycle run — the setup
+      // drain is making it adoptable and the next pod will re-adopt or reap it. This
+      // fences the reap side of the shutdown quiesce: clearInterval() cannot cancel a
+      // reaper tick that is already executing, so guard the finalize itself.
+      if (dispatchStopped && externalLifecyclePreAdapter) {
+        continue;
+      }
+
       const contextSnapshot = parseObject(run.contextSnapshot);
       const prReviewRetry = isPrReviewRetryContext(contextSnapshot);
       const shouldRetry =
@@ -11744,7 +11759,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function startNextQueuedRunForAgent(agentId: string) {
-    if (options.skipQueuedRunDispatch) return [];
+    if (options.skipQueuedRunDispatch || dispatchStopped) return [];
     // Failure-B fence (BLO-9089): the api tier never claims/executes runs — it
     // does not own the adapter lifecycle, so dispatching here resolves to the
     // process-fallback adapter and dies with "Process adapter missing command".
@@ -11994,6 +12009,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (run.status !== "queued" && run.status !== "running") return;
 
     if (run.status === "queued") {
+      // BLO-12563: never claim a NEW run once dispatch is quiesced for shutdown —
+      // leave it queued for the next pod. startNextQueuedRunForAgent is the normal
+      // choke point; this guards the direct executeRun path against a future caller.
+      if (dispatchStopped) return;
       const claimed = await claimQueuedRun(run);
       if (!claimed) {
         // claimQueuedRun can also leave the run queued when dependencies are unresolved.
@@ -17548,6 +17567,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const deadline = Date.now() + timeoutMs;
       while (inFlightExecutions.size > 0 && Date.now() < deadline) {
         await Promise.allSettled([...inFlightExecutions]);
+      }
+    },
+    /**
+     * BLO-12563: stop claiming NEW runs. Called first in the SIGTERM shutdown
+     * sequence so a rolling worker pod quiesces dispatch before draining
+     * in-flight setups. Newly-arrived wakeups still persist their durable
+     * `queued` row and are dispatched fresh by the next pod. Idempotent.
+     */
+    stopDispatch: () => {
+      dispatchStopped = true;
+    },
+    /**
+     * BLO-12563: drain the run "setup window" on shutdown. A run that has been
+     * claimed (`status: running`) but has not yet persisted its k8s Job identity
+     * (`externalRunId` still NULL) has no adoptable Job — if the pod exits now the
+     * next pod's reaper mints `process_lost`. Poll until every such
+     * external-lifecycle run has persisted `externalRunId` (so the next pod
+     * re-adopts it as `active`, no process_lost) or the bounded budget expires.
+     * Call AFTER stopDispatch() and with the HTTP server still open, because the
+     * launching adapter calls back to this pod to record the Job identity.
+     * Best-effort: a run whose provisioning outruns the budget still
+     * process_lost and is recovered by the reaper — a durable cross-restart
+     * reattach is tracked in BLO-12564.
+     */
+    drainInFlightRunSetup: async (timeoutMs = 20_000) => {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const running = await db
+          .select({ id: heartbeatRuns.id, adapterType: agents.adapterType })
+          .from(heartbeatRuns)
+          .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+          .where(and(eq(heartbeatRuns.status, "running"), isNull(heartbeatRuns.externalRunId)));
+        const midSetup = running.filter((row) => hasExternalLifecycle(row.adapterType));
+        if (midSetup.length === 0) return { drained: true, remaining: 0 };
+        if (Date.now() >= deadline) {
+          logger.warn(
+            { remaining: midSetup.length, runIds: midSetup.map((row) => row.id) },
+            "drainInFlightRunSetup: timed out with runs still mid-setup; they may be reaped as process_lost",
+          );
+          return { drained: false, remaining: midSetup.length };
+        }
+        await sleepMs(500);
       }
     },
   };
