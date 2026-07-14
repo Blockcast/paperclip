@@ -101,6 +101,13 @@ export interface AlertmanagerPluginConfig {
    */
   issueRouteMap?: IssueRouteMap;
   escalationDeadlineMinutes?: Record<string, number>;
+  /**
+   * Width (minutes) of the board-cover dedup window (BLO-15982). Concurrent
+   * same-alertname escalation ladders that reach the cover rung within the
+   * same window bucket share one retained cover instead of each opening
+   * their own. Defaults to `DEFAULT_COVER_DEDUP_WINDOW_MINUTES`.
+   */
+  coverDedupWindowMinutes?: number;
 }
 
 // ---------------------------------------------------------------------------

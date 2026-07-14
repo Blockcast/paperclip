@@ -1200,6 +1200,12 @@ export interface WorkerToHostMethods {
       originKind?: string;
       originKindPrefix?: string;
       originId?: string;
+      /**
+       * Filter by the secondary origin dedup key (see `issues.create`'s
+       * `originFingerprint`). Used to look up a cover/incident by its
+       * dedup slot rather than by the specific instance that created it.
+       */
+      originFingerprint?: string;
       status?: string;
       includePluginOperations?: boolean;
       limit?: number;
@@ -1255,6 +1261,16 @@ export interface WorkerToHostMethods {
       originKind?: string | null;
       originId?: string | null;
       originRunId?: string | null;
+      /**
+       * Secondary dedup key, orthogonal to `originId`. A partial unique
+       * index scoped to a specific `originKind` on
+       * `(companyId, originKind, originFingerprint)` lets a plugin claim a
+       * dedup slot atomically: the losing concurrent `create()` call
+       * rejects with a 23505 conflict instead of both callers reading "no
+       * existing row" and creating duplicates. Leave unset for the default
+       * `'default'` column value (excluded from every such partial index).
+       */
+      originFingerprint?: string | null;
       blockedByIssueIds?: string[];
       labelIds?: string[];
       executionWorkspaceId?: string | null;

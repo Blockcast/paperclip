@@ -1,9 +1,10 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { DEFAULT_ESCALATION_DEADLINE_MINUTES, STATE_KEYS } from "./constants.js";
+import { DEFAULT_COVER_DEDUP_WINDOW_MINUTES, DEFAULT_ESCALATION_DEADLINE_MINUTES, STATE_KEYS } from "./constants.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { ORIGIN_KIND, type AlertmanagerAlert, type AlertmanagerPluginConfig, type AlertStateRecord } from "./types.js";
 
-const COVER_ORIGIN = "plugin:paperclip-plugin-alertmanager:escalation";
+/** Origin kind stamped on board-owned "chain exhausted" cover issues. */
+export const COVER_ORIGIN = "plugin:paperclip-plugin-alertmanager:escalation";
 const MAX_ATTEMPTS = 3;
 
 export function escalationDeadlineMs(alert: AlertmanagerAlert, config: AlertmanagerPluginConfig): number | null {
@@ -38,24 +39,130 @@ function holdUntil(comments: Array<{ body: string }>): number | null {
   return latest;
 }
 
-async function createCover(ctx: PluginContext, issue: NonNullable<Awaited<ReturnType<PluginContext["issues"]["get"]>>>, companyId: string) {
-  const duplicate = await ctx.issues.list({ companyId, originKind: COVER_ORIGIN, originId: issue.id, limit: 1 });
-  if (duplicate.length) return;
+/**
+ * Bucketed dedup key for the board-cover storm-batching invariant (BLO-15982):
+ * concurrent ladders for the same alertname that reach the cover rung within
+ * the same window bucket share one cover. Deliberately NOT a rolling window
+ * — a fixed bucket is expressible as a DB unique-key equality, which is what
+ * makes the create-or-attach race safe under concurrent workers (see
+ * `createCover`). The tradeoff is a possible split right at a bucket
+ * boundary; acceptable against "at most one cover per storm."
+ */
+function coverDedupFingerprint(alertname: string, windowMinutes: number, now: Date): string {
+  const windowMs = Math.max(1, windowMinutes) * 60_000;
+  const bucket = Math.floor(now.getTime() / windowMs);
+  return `cover:${alertname}:${bucket}`;
+}
+
+/** Matches the 409 the host throws when `issues_active_alert_escalation_cover_uq` rejects a create(). */
+function isCoverDedupConflict(err: unknown): boolean {
+  const message = err instanceof Error
+    ? err.message
+    : typeof err === "object" && err !== null && typeof (err as { message?: unknown }).message === "string"
+      ? (err as { message: string }).message
+      : String(err);
+  return message.includes("Alert escalation cover conflict");
+}
+
+/**
+ * Idempotently records `siblingIssue` as sharing the retained cover, keyed
+ * off a durable marker in the comment body rather than in-memory state — a
+ * retry (crash, sweep re-run) that lands on the same sibling re-checks the
+ * marker instead of posting a second comment.
+ */
+async function attachAsSibling(
+  ctx: PluginContext,
+  companyId: string,
+  coverId: string,
+  siblingIssue: { id: string; identifier?: string | null },
+  alertname: string,
+): Promise<void> {
+  const marker = `sibling:${siblingIssue.id}`;
+  const comments = await ctx.issues.listComments(coverId, companyId);
+  if (comments.some((comment) => comment.body.includes(marker))) return;
+  await ctx.issues.createComment(
+    coverId,
+    `[alert-escalation] (${marker}) Sibling alert ${siblingIssue.identifier ?? siblingIssue.id} ("${alertname}") also exhausted its agent chain within the dedup window; tracked here instead of opening a duplicate cover.`,
+    companyId,
+  );
+}
+
+/**
+ * Creates (or joins) the board-owned "chain exhausted" cover for `issue`.
+ *
+ * Race safety: `originFingerprint` carries the alertname+window dedup key,
+ * backed by a partial unique index on the host
+ * (`issues_active_alert_escalation_cover_uq`). Two concurrent same-alertname
+ * ladders both calling `ctx.issues.create()` cannot both win — the DB
+ * constraint, not a read-then-create check here, is the source of truth. The
+ * loser catches the 409 and attaches itself to the winner's cover instead of
+ * creating a duplicate.
+ */
+async function createCover(
+  ctx: PluginContext,
+  issue: NonNullable<Awaited<ReturnType<PluginContext["issues"]["get"]>>>,
+  companyId: string,
+  alertname: string,
+  config: AlertmanagerPluginConfig,
+  now: Date,
+) {
+  const owned = await ctx.issues.list({ companyId, originKind: COVER_ORIGIN, originId: issue.id, limit: 1 });
+  if (owned.length) return;
+
+  const windowMinutes = config.coverDedupWindowMinutes ?? DEFAULT_COVER_DEDUP_WINDOW_MINUTES;
+  const fingerprint = coverDedupFingerprint(alertname, windowMinutes, now);
   const members = await ctx.access.members.list({ companyId });
   const owner = members.find((member) => member.principalType === "user" && member.status === "active" && ["owner", "admin"].includes(member.membershipRole ?? ""));
-  await ctx.issues.create({
-    companyId,
-    parentId: issue.id,
-    projectId: issue.projectId ?? undefined,
-    goalId: issue.goalId ?? undefined,
-    title: `[user-cover] unresolved alert escalation: ${issue.identifier ?? issue.title}`,
-    description: `Alert ${issue.identifier ?? issue.id} exhausted its agent chain while still firing. Board direction is required.`,
-    status: "todo",
-    priority: issue.priority,
-    assigneeUserId: owner?.principalId ?? null,
-    originKind: COVER_ORIGIN,
-    originId: issue.id,
-  });
+
+  // At most 2 attempts: the second only fires if the conflicting cover
+  // vanished between our failed create and the follow-up lookup (e.g. it was
+  // just cancelled) — in that narrow race the dedup slot is free again.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await ctx.issues.create({
+        companyId,
+        parentId: issue.id,
+        projectId: issue.projectId ?? undefined,
+        goalId: issue.goalId ?? undefined,
+        title: `[user-cover] unresolved alert escalation: ${issue.identifier ?? issue.title}`,
+        description: `Alert ${issue.identifier ?? issue.id} exhausted its agent chain while still firing. Board direction is required.`,
+        status: "todo",
+        priority: issue.priority,
+        assigneeUserId: owner?.principalId ?? null,
+        originKind: COVER_ORIGIN,
+        originId: issue.id,
+        originFingerprint: fingerprint,
+      });
+      return;
+    } catch (err) {
+      if (!isCoverDedupConflict(err)) throw err;
+      const [retained] = await ctx.issues.list({ companyId, originKind: COVER_ORIGIN, originFingerprint: fingerprint, limit: 1 });
+      if (!retained) continue;
+      await attachAsSibling(ctx, companyId, retained.id, issue, alertname);
+      return;
+    }
+  }
+}
+
+/**
+ * BLO-15982 cascade cleanup: when the source alert issue resolves, every
+ * open cover it owns (originKind=COVER_ORIGIN, originId=<alert issue id>)
+ * should close with it instead of sitting open on the board forever. Bounded
+ * to a single indexed list() call — no per-alert N+1 — and idempotent:
+ * a cover already in a terminal state is skipped, so a retried resolve
+ * neither re-comments nor re-cancels it.
+ */
+export async function cancelOpenEscalationCovers(
+  ctx: PluginContext,
+  companyId: string,
+  alertIssueId: string,
+): Promise<void> {
+  const covers = await ctx.issues.list({ companyId, originKind: COVER_ORIGIN, originId: alertIssueId, limit: 50 });
+  for (const cover of covers) {
+    if (cover.status === "done" || cover.status === "cancelled") continue;
+    await ctx.issues.createComment(cover.id, "[alert-escalation] Source alert resolved; closing cover.", companyId);
+    await ctx.issues.update(cover.id, { status: "cancelled" }, companyId);
+  }
 }
 
 export async function runAlertEscalationSweep(ctx: PluginContext, config: AlertmanagerPluginConfig, now = new Date()): Promise<void> {
@@ -97,9 +204,10 @@ async function advanceIssueLadder(
 
   if (!(attempt === 0 && current) && !(current?.reportsTo && attempt < MAX_ATTEMPTS)) {
     // Chain exhausted (or no agent owner at all): board cover. Cover creation
-    // stays ahead of the state write — it dedups via originKind/originId, so a
-    // partial failure retries next sweep instead of silently never covering.
-    await createCover(ctx, issue, companyId);
+    // stays ahead of the state write — it dedups via originKind/originId (and,
+    // cross-issue, via originFingerprint), so a partial failure retries next
+    // sweep instead of silently never covering.
+    await createCover(ctx, issue, companyId, state.alertname, config, now);
     await ctx.issues.createComment(issue.id, "[alert-escalation] Agent chain exhausted while alert remains firing; created a [user-cover] escalation.", companyId);
     await ctx.state.set(ref, { ...state, escalationAttempt: MAX_ATTEMPTS, escalationComplete: true, nextEscalationAt: null });
     return;

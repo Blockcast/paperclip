@@ -204,5 +204,20 @@ export const issues = pgTable(
           and ${table.hiddenAt} is null
           and ${table.status} not in ('done', 'cancelled')`,
       ),
+    // BLO-15982: cross-issue dedup for alertmanager board covers. originId
+    // stays the specific triggering alert issue's id (so resolve-time cover
+    // cleanup can look covers up by originId=<source alert issue id>);
+    // originFingerprint carries the alertname+dedup-window key so concurrent
+    // same-alertname ladders racing to the cover rung hit this constraint
+    // instead of a read-then-create gap — the loser catches 23505 and
+    // attaches itself to the winner's cover instead of duplicating it.
+    activeAlertEscalationCoverIdx: uniqueIndex("issues_active_alert_escalation_cover_uq")
+      .on(table.companyId, table.originKind, table.originFingerprint)
+      .where(
+        sql`${table.originKind} = 'plugin:paperclip-plugin-alertmanager:escalation'
+          and ${table.originFingerprint} <> 'default'
+          and ${table.hiddenAt} is null
+          and ${table.status} not in ('done', 'cancelled')`,
+      ),
   }),
 );
