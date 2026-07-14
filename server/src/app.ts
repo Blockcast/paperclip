@@ -56,6 +56,7 @@ import { pluginRoutes } from "./routes/plugins.js";
 import { adapterRoutes } from "./routes/adapters.js";
 import { metricsIngestRoutes } from "./routes/metrics-ingest.js";
 import { renderMetrics } from "./services/metrics.js";
+import { refreshExternalRuntimeReservationMetrics } from "./services/external-runtime-reservations.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -280,6 +281,7 @@ export async function createApp(
   // otherwise spam request logs every scrape interval.
   app.get("/metrics", async (_req, res, next) => {
     try {
+      await refreshExternalRuntimeReservationMetrics(db).catch(() => undefined);
       const { contentType, body } = await renderMetrics();
       res.status(200).set("Content-Type", contentType).send(body);
     } catch (err) {

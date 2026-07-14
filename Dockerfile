@@ -183,7 +183,11 @@ WORKDIR /vendor
 # shared paperclip-data CephFS PVC. Manifest suite 141/141, typecheck, and build
 # passed; live concurrent shared-PVC pods reached Ready without
 # VolumePermissionChangeInProgress. PR Blockcast/paperclip#653.
-ARG CLAUDE_K8S_REF=63d00ecf69dc4cdd35259772d7e10152e6145f56
+# Bumped 2026-07-14 to 5f1d027 (BLO-15956): acknowledge the created Job name
+# and UID before polling or cleanup. A missing/rejected acknowledgment deletes
+# the Job and fails closed with k8s_job_identity_unacknowledged. PR
+# kkroo/paperclip-adapter-claude-k8s#17; focused suite 86/86 and typecheck pass.
+ARG CLAUDE_K8S_REF=5f1d0276d7ebb9aac0af2f7b6de216ab5c98a300
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
@@ -310,7 +314,11 @@ ARG CLAUDE_K8S_REF=63d00ecf69dc4cdd35259772d7e10152e6145f56
 # shared paperclip-data CephFS PVC. Manifest suite 113/113, typecheck, and build
 # passed; live concurrent shared-PVC pods reached Ready without
 # VolumePermissionChangeInProgress. PR Blockcast/paperclip#653.
-ARG OPENCODE_K8S_REF=010f0e7e6f9058b887ec3e82d91e1ceb34f691ca
+# Bumped 2026-07-14 to 0a84868 (BLO-15956): acknowledge the created Job name
+# and UID before polling or cleanup. A missing/rejected acknowledgment deletes
+# the Job and fails closed with k8s_job_identity_unacknowledged. PR
+# kkroo/paperclip-adapter-opencode-k8s#43; focused suite 114/114 and typecheck pass.
+ARG OPENCODE_K8S_REF=0a848687bcc32f175ac0b2d1699f729d49447998
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest

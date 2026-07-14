@@ -34,6 +34,7 @@ export type AgentJobRunStatus = {
   // (heartbeat_runs.external_run_id). classifyAgentJobRunStatus itself does not
   // set it — it only classifies phase.
   name?: string | null;
+  uid?: string | null;
 };
 
 export type AgentJobRunStatusByName =
@@ -170,6 +171,7 @@ export async function readAgentJobRunStatusByName(
     return {
       ...classifyAgentJobRunStatus(job),
       name: job.metadata?.name ?? trimmed,
+      uid: job.metadata?.uid ?? null,
     };
   } catch (error) {
     if (isKubernetesNotFoundError(error)) {
@@ -211,6 +213,7 @@ export async function listAgentJobRunStatuses(): Promise<Map<string, AgentJobRun
         statuses.set(runId, {
           ...classifyAgentJobRunStatus(job),
           name: job.metadata?.name ?? null,
+          uid: job.metadata?.uid ?? null,
         });
       }
     }

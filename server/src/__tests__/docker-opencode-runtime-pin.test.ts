@@ -26,7 +26,7 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   });
 
   it("vendors the claude_k8s adapter commit with shared MCP baseline injection and resume guard", () => {
-    expect(dockerfile).toContain("ARG CLAUDE_K8S_REF=63d00ecf69dc4cdd35259772d7e10152e6145f56");
+    expect(dockerfile).toContain("ARG CLAUDE_K8S_REF=5f1d0276d7ebb9aac0af2f7b6de216ab5c98a300");
     expect(dockerfile).toContain("always materialize the shared MCP baseline");
     expect(dockerfile).toContain("Fixes BackendEngineerGo/Ally missing paperclip/hindsight/gbrain/linear/etc.");
     expect(dockerfile).toContain("only pass --resume to Claude when the");
@@ -43,10 +43,12 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerfile).toContain("K8S_AGENT_SESSION_POLICY");
     expect(dockerfile).toContain("omit pod-level fsGroup from");
     expect(dockerfile).toContain("Manifest suite 141/141");
+    expect(dockerfile).toContain("acknowledge the created Job name");
+    expect(dockerfile).toContain("k8s_job_identity_unacknowledged");
   });
 
   it("vendors the opencode_k8s adapter commit with crash, runtime-cache, MCP header, pod-stderr, startup-wait, opencode-db, chunkTimeout, budget-cap, compact-threshold, and turn-zero-snapshot fixes", () => {
-    expect(dockerfile).toContain("ARG OPENCODE_K8S_REF=010f0e7e6f9058b887ec3e82d91e1ceb34f691ca");
+    expect(dockerfile).toContain("ARG OPENCODE_K8S_REF=0a848687bcc32f175ac0b2d1699f729d49447998");
     expect(dockerfile).toContain("disable opencode's turn-zero workspace");
     expect(dockerfile).toContain("snapshot: false");
     expect(dockerfile).toContain("opencode config/auth writers respect XDG_*");

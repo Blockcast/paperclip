@@ -66,6 +66,9 @@ export const ISOLATED_RUN_STARTED_METRIC = "paperclip_k8s_isolated_run_started_t
  */
 export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_deferred_total";
 export const AGENT_NO_USAGE_STREAK_METRIC = "paperclip_agent_zero_token_completed_run_streak";
+export const EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC = "paperclip_external_runtime_reservation_events_total";
+export const EXTERNAL_RUNTIME_RESERVATIONS_ACTIVE_METRIC = "paperclip_external_runtime_reservations_active";
+export const EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC = "paperclip_external_runtime_reservation_oldest_age_seconds";
 
 /**
  * Bounded `reason` allow-list (mirrors the adapter-lane reasons defined in
@@ -159,6 +162,9 @@ let isolatedRunStarted: Counter<"agent_id" | "isolation_mode"> | null = null;
 let heartbeatRunFailed: Counter<"adapter" | "error_code" | "invocation_source"> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
 let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = null;
+let externalRuntimeReservationEvents: Counter<"event"> | null = null;
+let externalRuntimeReservationsActive: Gauge | null = null;
+let externalRuntimeReservationOldestAge: Gauge | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -167,6 +173,9 @@ function ensureRegistry(): {
   failedCounter: Counter<"adapter" | "error_code" | "invocation_source">;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
   zeroTokenCompletedRunStreakGauge: Gauge<"agent_id" | "adapter">;
+  externalRuntimeReservationEventsCounter: Counter<"event">;
+  externalRuntimeReservationsActiveGauge: Gauge;
+  externalRuntimeReservationOldestAgeGauge: Gauge;
 } {
   if (
     !registry
@@ -175,6 +184,9 @@ function ensureRegistry(): {
     || !heartbeatRunFailed
     || !ccrotateCapacityDeferred
     || !agentZeroTokenCompletedRunStreak
+    || !externalRuntimeReservationEvents
+    || !externalRuntimeReservationsActive
+    || !externalRuntimeReservationOldestAge
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -224,6 +236,22 @@ function ensureRegistry(): {
       labelNames: ["agent_id", "adapter"],
       registers: [registry],
     });
+    externalRuntimeReservationEvents = new Counter({
+      name: EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC,
+      help: "Count of durable external-runtime reservation lifecycle transitions.",
+      labelNames: ["event"],
+      registers: [registry],
+    });
+    externalRuntimeReservationsActive = new Gauge({
+      name: EXTERNAL_RUNTIME_RESERVATIONS_ACTIVE_METRIC,
+      help: "Current count of unreleased durable external-runtime slot reservations.",
+      registers: [registry],
+    });
+    externalRuntimeReservationOldestAge = new Gauge({
+      name: EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC,
+      help: "Age in seconds of the oldest unreleased external-runtime slot reservation.",
+      registers: [registry],
+    });
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -235,6 +263,9 @@ function ensureRegistry(): {
     failedCounter: heartbeatRunFailed,
     capacityDeferredCounter: ccrotateCapacityDeferred,
     zeroTokenCompletedRunStreakGauge: agentZeroTokenCompletedRunStreak,
+    externalRuntimeReservationEventsCounter: externalRuntimeReservationEvents,
+    externalRuntimeReservationsActiveGauge: externalRuntimeReservationsActive,
+    externalRuntimeReservationOldestAgeGauge: externalRuntimeReservationOldestAge,
   };
 }
 
@@ -372,6 +403,23 @@ export function recordAgentZeroTokenCompletedRunStreak(
   return { ...labels, streak };
 }
 
+const EXTERNAL_RUNTIME_RESERVATION_EVENTS = new Set(["reserved", "contended", "launching", "launched", "released"]);
+
+export function recordExternalRuntimeReservationEvent(event: string): string {
+  const normalized = EXTERNAL_RUNTIME_RESERVATION_EVENTS.has(event) ? event : "other";
+  ensureRegistry().externalRuntimeReservationEventsCounter.inc({ event: normalized });
+  return normalized;
+}
+
+export function setExternalRuntimeReservationMetrics(input: {
+  active: number;
+  oldestAgeSeconds: number;
+}): void {
+  const metrics = ensureRegistry();
+  metrics.externalRuntimeReservationsActiveGauge.set(Math.max(0, input.active));
+  metrics.externalRuntimeReservationOldestAgeGauge.set(Math.max(0, input.oldestAgeSeconds));
+}
+
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
   const reg = getMetricsRegistry();
   const depBlockedSnapshot = snapshotDepBlockedMetrics();
@@ -404,6 +452,9 @@ export function __resetMetricsForTest(): void {
   heartbeatRunFailed = null;
   ccrotateCapacityDeferred = null;
   agentZeroTokenCompletedRunStreak = null;
+  externalRuntimeReservationEvents = null;
+  externalRuntimeReservationsActive = null;
+  externalRuntimeReservationOldestAge = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
 }
