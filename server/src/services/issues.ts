@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, like, lt, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, exists, gt, gte, inArray, isNotNull, isNull, like, lt, lte, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -1507,8 +1507,8 @@ async function fetchEvidenceForIssue(
         isNotNull(issueComments.authorUserId),
         isNull(issueComments.authorAgentId),
         like(issueComments.body, "evidence-gate: override %"),
-        sql`${issueComments.createdAt} >= ${new Date(now.getTime() - 60 * 60 * 1000)}`,
-        sql`${issueComments.createdAt} <= ${now}`,
+        gte(issueComments.createdAt, new Date(now.getTime() - 60 * 60 * 1000)),
+        lte(issueComments.createdAt, now),
       ))
       .orderBy(desc(issueComments.createdAt)),
     dbOrTx
@@ -6685,7 +6685,7 @@ export function issueService(db: Db) {
           logger.warn(
             {
               issueId: id,
-              err: err instanceof Error ? err.message : String(err),
+              err,
             },
             "evidence-gate: evaluation failed; proceeding without verdict",
           );
