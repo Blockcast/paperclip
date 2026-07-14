@@ -460,6 +460,18 @@ Recovery rule:
 
 This is an active-work continuity recovery.
 
+#### Deliberate wait is not a lost run
+
+A continuation that the staleness gate cancelled with `issue_continuation_waiting_on_review` is a *deliberate park*, not a disappeared execution path: the latest run reported the issue is waiting for a reviewer or approver (for example, an umbrella issue whose work was just decomposed into sub-tasks, or a task whose next move is a human/CI review). Treating that park as a stranded run would retry it and then escalate it to `blocked` with a recovery action and an operator-facing "no live execution path" notice — even though nothing failed and there is nothing to retry.
+
+Recovery resolves a parked-for-review continuation in priority order:
+
+- if the issue has an active monitor (a future monitor re-check), it is parked `in_review` and the monitor owns the re-check
+- otherwise, if the issue has a real dependency target — open sub-tasks or existing unresolved blockers — the wait is converted into a first-class dependency wait: it is set `blocked` by those issues, the original assignee is kept, and a plain-language comment explains it resumes automatically through the normal `issue_blockers_resolved` path when they finish
+- otherwise (no monitor and no dependency to point a `blocked` state at), it is parked `in_review` — the designated "waiting on a reviewer/approver" status — with a plain-language comment, rather than escalated to `blocked` as if its execution were lost. It resumes on the next reviewer/approver response or linked pull-request update; the original assignee is preserved and no stranded-recovery issue is opened
+
+A parked-for-review continuation only falls through to the standard `blocked` escalation above when it is not actually review-parked (the cancellation carried a different error code, or the `in_review` transition is itself rejected because the issue has no reviewable evidence yet) — preserving genuine stranded-run detection.
+
 ### 9.3 Recovery model-profile lane
 
 Cheap model profiles are only for status-only operational recovery overhead. Paperclip may request `modelProfile: "cheap"` for bounded recovery-owner work that updates task liveness, clears bad status, records a disposition, or asks for human/manager intervention. Those wakes must carry guard context such as `allowDeliverableWork: false`, `allowDocumentUpdates: false`, and `resumeRequiresNormalModel: true`.
