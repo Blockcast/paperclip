@@ -13,7 +13,9 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
 import {
+  bindExternalRuntimeReservationIsolation,
   claimRunWithExternalRuntimeSlot,
+  ExternalRuntimeIsolationConflictError,
   externalRuntimeReservationCanRelease,
   markExternalRuntimeReservationLaunching,
   rearmExternalRuntimeReservationForRetry,
@@ -109,6 +111,159 @@ describeEmbeddedPostgres("external runtime reservations", () => {
     expect(metrics.body).toContain(`${EXTERNAL_RUNTIME_RESERVATIONS_ACTIVE_METRIC} 1`);
     expect(metrics.body).toContain(`${EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC}{event="reserved"} 1`);
     expect(metrics.body).toContain(`${EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC}{event="contended"} 1`);
+  });
+
+  it("binds writer ownership idempotently for the same run and isolation key", async () => {
+    const [runId] = await seedQueuedRuns(1);
+    const claim = await claimRunWithExternalRuntimeSlot(db, runId, new Date("2026-07-14T00:00:00.000Z"));
+
+    const first = await bindExternalRuntimeReservationIsolation(db, {
+      runId,
+      reservationId: claim!.reservation.id,
+      isolationMode: "workspace",
+      isolationKey: "workspace:workspace-1",
+      now: new Date("2026-07-14T00:00:01.000Z"),
+    });
+    const retry = await bindExternalRuntimeReservationIsolation(db, {
+      runId,
+      reservationId: claim!.reservation.id,
+      isolationMode: "workspace",
+      isolationKey: "workspace:workspace-1",
+      now: new Date("2026-07-14T00:00:02.000Z"),
+    });
+
+    expect(first).toMatchObject({
+      isolationMode: "workspace",
+      isolationKey: "workspace:workspace-1",
+      isolationBoundAt: new Date("2026-07-14T00:00:01.000Z"),
+    });
+    expect(retry.id).toBe(first.id);
+    expect(retry.isolationBoundAt).toEqual(first.isolationBoundAt);
+  });
+
+  it("rejects a second active writer for the same workspace key with a typed conflict", async () => {
+    const [firstRunId, secondRunId] = await seedQueuedRuns(2);
+    const firstClaim = await claimRunWithExternalRuntimeSlot(db, firstRunId, new Date(), 0);
+    const secondClaim = await claimRunWithExternalRuntimeSlot(db, secondRunId, new Date(), 1);
+    expect(firstClaim).not.toBeNull();
+    expect(secondClaim).not.toBeNull();
+
+    await bindExternalRuntimeReservationIsolation(db, {
+      runId: firstRunId,
+      reservationId: firstClaim!.reservation.id,
+      isolationMode: "workspace",
+      isolationKey: "workspace:shared-workspace",
+    });
+
+    let conflict: unknown;
+    try {
+      await bindExternalRuntimeReservationIsolation(db, {
+        runId: secondRunId,
+        reservationId: secondClaim!.reservation.id,
+        isolationMode: "workspace",
+        isolationKey: "workspace:shared-workspace",
+      });
+    } catch (error) {
+      conflict = error;
+    }
+    expect(conflict).toBeInstanceOf(ExternalRuntimeIsolationConflictError);
+    expect(conflict).toMatchObject({
+      code: "external_runtime_isolation_conflict",
+      runId: secondRunId,
+      isolationKey: "workspace:shared-workspace",
+      conflictingRunId: firstRunId,
+    });
+  });
+
+  it("rejects the same workspace key across different agents", async () => {
+    const [firstRunId] = await seedQueuedRuns(1);
+    const firstClaim = await claimRunWithExternalRuntimeSlot(db, firstRunId, new Date());
+    const [secondRunId] = await seedQueuedRuns(1);
+    const secondClaim = await claimRunWithExternalRuntimeSlot(db, secondRunId, new Date());
+    const isolationKey = "workspace:globally-owned-workspace";
+
+    await bindExternalRuntimeReservationIsolation(db, {
+      runId: firstRunId,
+      reservationId: firstClaim!.reservation.id,
+      isolationMode: "workspace",
+      isolationKey,
+    });
+    await expect(bindExternalRuntimeReservationIsolation(db, {
+      runId: secondRunId,
+      reservationId: secondClaim!.reservation.id,
+      isolationMode: "workspace",
+      isolationKey,
+    })).rejects.toMatchObject({
+      code: "external_runtime_isolation_conflict",
+      conflictingRunId: firstRunId,
+    });
+  });
+
+  it("allows one agent to own distinct run and workspace isolation keys", async () => {
+    const [firstRunId, secondRunId] = await seedQueuedRuns(2);
+    const firstClaim = await claimRunWithExternalRuntimeSlot(db, firstRunId, new Date(), 0);
+    const secondClaim = await claimRunWithExternalRuntimeSlot(db, secondRunId, new Date(), 1);
+
+    await expect(bindExternalRuntimeReservationIsolation(db, {
+      runId: firstRunId,
+      reservationId: firstClaim!.reservation.id,
+      isolationMode: "run",
+      isolationKey: `run:${firstRunId}`,
+    })).resolves.toMatchObject({ isolationKey: `run:${firstRunId}` });
+    await expect(bindExternalRuntimeReservationIsolation(db, {
+      runId: secondRunId,
+      reservationId: secondClaim!.reservation.id,
+      isolationMode: "workspace",
+      isolationKey: "workspace:workspace-2",
+    })).resolves.toMatchObject({ isolationKey: "workspace:workspace-2" });
+  });
+
+  it("frees writer ownership when the reservation is released", async () => {
+    const [firstRunId, secondRunId] = await seedQueuedRuns(2);
+    const firstClaim = await claimRunWithExternalRuntimeSlot(db, firstRunId, new Date(), 0);
+    const secondClaim = await claimRunWithExternalRuntimeSlot(db, secondRunId, new Date(), 1);
+    const isolationKey = "workspace:reusable-workspace";
+
+    await bindExternalRuntimeReservationIsolation(db, {
+      runId: firstRunId,
+      reservationId: firstClaim!.reservation.id,
+      isolationMode: "workspace",
+      isolationKey,
+    });
+    await releaseExternalRuntimeReservation(db, { runId: firstRunId, reason: "completed" });
+
+    await expect(bindExternalRuntimeReservationIsolation(db, {
+      runId: secondRunId,
+      reservationId: secondClaim!.reservation.id,
+      isolationMode: "workspace",
+      isolationKey,
+    })).resolves.toMatchObject({ runId: secondRunId, isolationKey });
+  });
+
+  it("rejects isolation key drift and released ownership", async () => {
+    const [runId] = await seedQueuedRuns(1);
+    const claim = await claimRunWithExternalRuntimeSlot(db, runId, new Date());
+    await bindExternalRuntimeReservationIsolation(db, {
+      runId,
+      reservationId: claim!.reservation.id,
+      isolationMode: "workspace",
+      isolationKey: "workspace:workspace-1",
+    });
+
+    await expect(bindExternalRuntimeReservationIsolation(db, {
+      runId,
+      reservationId: claim!.reservation.id,
+      isolationMode: "workspace",
+      isolationKey: "workspace:workspace-2",
+    })).rejects.toThrow(/binding drift/);
+
+    await releaseExternalRuntimeReservation(db, { runId, reason: "cancelled" });
+    await expect(bindExternalRuntimeReservationIsolation(db, {
+      runId,
+      reservationId: claim!.reservation.id,
+      isolationMode: "workspace",
+      isolationKey: "workspace:workspace-1",
+    })).rejects.toThrow(/no longer owns isolation binding/);
   });
 
   it("keeps launched capacity owned until its exact Job is terminal or missing", () => {

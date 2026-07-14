@@ -25,15 +25,22 @@ export interface AdapterRuntime {
 }
 
 export interface AdapterRunIsolationDescriptor {
-  isolationMode: "shared" | "workspace";
+  isolationMode: "shared" | "run" | "workspace";
   /**
-   * Stable server-owned scope key, e.g. `shared:${companyId}:${agentId}`
-   * or `workspace:${companyId}:${agentId}:${workspaceId}`.
+   * Stable server-owned scope key. Current forms are `run:${runId}`,
+   * `workspace:${executionWorkspaceId}`, and `agent-shared:${agentId}`.
    */
   isolationKey: string;
   workspaceRoot: string;
   homeRoot: string;
+  sessionRoot: string;
   cacheRoot: string;
+  storage: {
+    workspace: "ephemeral" | "persistent";
+    home: "ephemeral" | "persistent";
+    session: "ephemeral" | "persistent";
+    cache: "ephemeral" | "persistent";
+  };
   sessionScope: {
     taskKey: string | null;
     isolationKey: string;

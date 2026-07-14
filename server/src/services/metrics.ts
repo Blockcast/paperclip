@@ -103,7 +103,7 @@ export const KNOWN_BLOCKED_REASONS = [
  * group by those identifiers but degrade gracefully to an empty label when the
  * control plane omits them.
  */
-export const KNOWN_ISOLATION_MODES = ["shared", "workspace"] as const;
+export const KNOWN_ISOLATION_MODES = ["shared", "run", "workspace"] as const;
 
 export const UNKNOWN_ISOLATION_MODE = "unknown";
 

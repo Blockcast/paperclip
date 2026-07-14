@@ -79,6 +79,7 @@ import {
 import { getActiveAgentIds } from "./agent-roster.js";
 import { processPendingImageBumpForAgent } from "./agent-image-bump.js";
 import {
+  bindExternalRuntimeReservationIsolation,
   claimRunWithExternalRuntimeSlot,
   externalRuntimeReservationCanRelease,
   getActiveExternalRuntimeReservation,
@@ -3219,9 +3220,11 @@ function readK8sIsolationKeyFromContext(context: Record<string, unknown> | null 
 
 export function buildK8sRunIsolationDescriptor(input: {
   adapterType: string | null | undefined;
+  runId: string;
   companyId: string;
   agentId: string;
   taskKey: string | null;
+  statelessPrReview: boolean;
   executionWorkspace: {
     cwd: string;
     source: string;
@@ -3232,25 +3235,64 @@ export function buildK8sRunIsolationDescriptor(input: {
 }): AdapterRunIsolationDescriptor | null {
   if (!isK8sAdapter(input.adapterType)) return null;
 
-  const workspaceRoot = input.executionWorkspace.cwd;
-  const homeRoot = resolveDefaultAgentWorkspaceDir(input.agentId);
-  const cacheRoot = path.join(homeRoot, ".cache");
   const isWorkspaceIsolated =
     input.effectiveExecutionWorkspaceMode === "isolated_workspace" ||
     input.effectiveExecutionWorkspaceMode === "operator_branch" ||
     input.executionWorkspace.source === "task_session" ||
     input.executionWorkspace.strategy === "git_worktree";
-  const isolationMode = isWorkspaceIsolated ? "workspace" : "shared";
-  const isolationKey = isWorkspaceIsolated
-    ? `workspace:${input.companyId}:${input.agentId}:${input.persistedExecutionWorkspaceId ?? workspaceRoot}`
-    : `shared:${input.companyId}:${input.agentId}`;
+  const isolationMode = input.statelessPrReview
+    ? "run"
+    : isWorkspaceIsolated && input.persistedExecutionWorkspaceId
+      ? "workspace"
+      : "shared";
+  const isolationKey = isolationMode === "run"
+    ? `run:${input.runId}`
+    : isolationMode === "workspace"
+      ? `workspace:${input.persistedExecutionWorkspaceId}`
+      : `agent-shared:${input.agentId}`;
+  const persistentIsolationRoot = isolationMode === "workspace"
+    ? path.posix.join(
+        "/paperclip/instances/default/data/k8s-isolation/workspaces",
+        input.persistedExecutionWorkspaceId!,
+      )
+    : null;
+  const ephemeralIsolationRoot = isolationMode === "run"
+    ? path.posix.join("/runtime-cache/paperclip-runs", input.runId)
+    : isolationMode === "workspace"
+      ? path.posix.join("/runtime-cache/paperclip-workspaces", input.persistedExecutionWorkspaceId!)
+      : null;
+  const sharedHomeRoot = resolveDefaultAgentWorkspaceDir(input.agentId);
+  const workspaceRoot = isolationMode === "run"
+    ? path.posix.join(ephemeralIsolationRoot!, "workspace")
+    : input.executionWorkspace.cwd;
+  const homeRoot = isolationMode === "run"
+    ? path.posix.join(ephemeralIsolationRoot!, "home")
+    : isolationMode === "workspace"
+      ? path.posix.join(persistentIsolationRoot!, "home")
+      : sharedHomeRoot;
+  const sessionRoot = isolationMode === "run"
+    ? path.posix.join(ephemeralIsolationRoot!, "session")
+    : isolationMode === "workspace"
+      ? path.posix.join(persistentIsolationRoot!, "session")
+      : sharedHomeRoot;
+  const cacheRoot = isolationMode === "shared"
+    ? path.join(sharedHomeRoot, ".cache")
+    : path.posix.join(ephemeralIsolationRoot!, "cache");
+  const persistent = isolationMode === "run" ? "ephemeral" : "persistent";
 
   return {
     isolationMode,
     isolationKey,
     workspaceRoot,
     homeRoot,
+    sessionRoot,
     cacheRoot,
+    storage: {
+      workspace: isolationMode === "run" ? "ephemeral" : "persistent",
+      home: persistent,
+      session: persistent,
+      cache: isolationMode === "shared" ? "persistent" : "ephemeral",
+    },
     sessionScope: {
       taskKey: input.taskKey,
       isolationKey,
@@ -12918,14 +12960,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(eq(heartbeatRuns.id, run.id));
     const k8sRunIsolation = buildK8sRunIsolationDescriptor({
       adapterType: agent.adapterType,
+      runId: run.id,
       companyId: agent.companyId,
       agentId: agent.id,
       taskKey,
+      statelessPrReview: paperclipPrReview !== null,
       executionWorkspace,
       persistedExecutionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
       effectiveExecutionWorkspaceMode,
     });
     if (k8sRunIsolation) {
+      if (!externalRuntimeReservation) {
+        throw new Error(`K8s run ${run.id} has no external-runtime reservation for isolation binding`);
+      }
+      await bindExternalRuntimeReservationIsolation(db, {
+        runId: run.id,
+        reservationId: externalRuntimeReservation.id,
+        isolationMode: k8sRunIsolation.isolationMode,
+        isolationKey: k8sRunIsolation.isolationKey,
+      });
       context.paperclipK8sIsolation = k8sRunIsolation;
       runtimeConfig = {
         ...runtimeConfig,
