@@ -163,6 +163,13 @@ export interface AdapterExecutionContext {
   runtime: AdapterRuntime;
   config: Record<string, unknown>;
   context: Record<string, unknown>;
+  externalRuntime?: {
+    reservationId: string;
+    slotId: number;
+    expectedJobName?: string | null;
+    jobName?: string | null;
+    jobUid?: string | null;
+  };
   runtimeCommandSpec?: AdapterRuntimeCommandSpec | null;
   executionTarget?: AdapterExecutionTarget | null;
   /**
@@ -174,6 +181,7 @@ export interface AdapterExecutionContext {
   };
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
+  onExternalRuntimeLaunched?: (identity: { jobName: string; jobUid: string }) => Promise<void>;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
   authToken?: string;
 }
