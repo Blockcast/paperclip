@@ -604,8 +604,9 @@ function resolveEventContext(
       const action = payload.action as string | undefined;
       // Wake on the events that change reviewer expectations: opened (CI
       // starts), reopened (manual retry / renewed review signal),
-      // ready_for_review (draft -> ready), synchronize (author pushed a
-      // fixup after an earlier review), closed (merged or abandoned).
+      // ready_for_review (draft -> ready), converted_to_draft (ready -> draft),
+      // synchronize (author pushed a fixup after an earlier review), closed
+      // (merged or abandoned).
       //
       // synchronize fires once per push. We don't fan out one reviewer run per
       // push: active reviewer runs are coalesced by the PR-scoped task key, and
@@ -617,6 +618,7 @@ function resolveEventContext(
         action !== "opened" &&
         action !== "reopened" &&
         action !== "ready_for_review" &&
+        action !== "converted_to_draft" &&
         action !== "synchronize" &&
         action !== "closed"
       ) return null;
@@ -626,6 +628,7 @@ function resolveEventContext(
         opened: "github_pr_opened",
         reopened: "github_pr_reopened",
         ready_for_review: "github_pr_ready_for_review",
+        converted_to_draft: "github_pr_converted_to_draft",
         synchronize: "github_pr_synchronized",
         closed: "github_pr_closed",
       };
@@ -1074,16 +1077,19 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       prReviewerBotLogin: config.prReviewerBotLogin,
     });
 
-    // A closed PR cannot produce useful reviewer work. Retire every queued or
-    // scheduled-retry run for its stable task scope so merged/abandoned PRs do
+    // A closed or newly-drafted PR cannot produce useful reviewer work. Retire
+    // every queued or scheduled-retry run for its stable task scope so it does
     // not consume the reviewer's single external-lifecycle slot hours later.
     // Running reviews are left alone: they may already be posting a final
     // result, and forcibly deleting their Job would be more disruptive than
     // letting them finish.
     const reviewerRunsCancelled = await (async () => {
+      const reviewerWorkRetired =
+        context?.wakeReason === "github_pr_closed" ||
+        context?.wakeReason === "github_pr_converted_to_draft";
       if (
         !config.prReviewerAgentId ||
-        context?.wakeReason !== "github_pr_closed" ||
+        !reviewerWorkRetired ||
         typeof context.prNumber !== "number"
       ) {
         return 0;
@@ -1100,7 +1106,9 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       const cancelled = await heartbeat.cancelPendingRunsForTask(
         config.prReviewerAgentId,
         reviewerTaskKey,
-        `Cancelled because GitHub PR ${context.repoFullName ?? "unknown"}#${context.prNumber} closed before review dispatch`,
+        `Cancelled because GitHub PR ${context.repoFullName ?? "unknown"}#${context.prNumber} ${
+          context.wakeReason === "github_pr_closed" ? "closed" : "became a draft"
+        } before review dispatch`,
       );
       logger.info(
         {
@@ -1132,8 +1140,9 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     //   - pull_request_review.submitted — request a counter-review pass; the
     //       reviewer's OWN posted review is filtered as a self-echo (BLO-15799,
     //       see isReviewerSelfEchoReview).
-    // (pull_request.closed retires pending work above; check_run/workflow_run
-    //  are handled by the issue-assignee CI-completion path.)
+    // (pull_request.closed/converted_to_draft retire pending work above;
+    //  check_run/workflow_run are handled by the issue-assignee CI-completion
+    //  path.)
     const reviewerWakeFired = await (async () => {
       if (!config.prReviewerAgentId) return false;
       if (!shouldFirePrReviewerWake(context)) return false;
