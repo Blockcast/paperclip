@@ -6,6 +6,7 @@ import { ORIGIN_KIND, type AlertmanagerAlert, type AlertmanagerPluginConfig, typ
 /** Origin kind stamped on board-owned "chain exhausted" cover issues. */
 export const COVER_ORIGIN = "plugin:paperclip-plugin-alertmanager:escalation";
 const MAX_ATTEMPTS = 3;
+const COVER_LIST_PAGE_SIZE = 50;
 
 export function escalationDeadlineMs(alert: AlertmanagerAlert, config: AlertmanagerPluginConfig): number | null {
   const severity = alert.labels.severity ?? "unknown";
@@ -106,8 +107,17 @@ async function createCover(
   config: AlertmanagerPluginConfig,
   now: Date,
 ) {
-  const owned = await ctx.issues.list({ companyId, originKind: COVER_ORIGIN, originId: issue.id, limit: 1 });
-  if (owned.some((cover) => cover.status !== "done" && cover.status !== "cancelled")) return;
+  for (let offset = 0; ; offset += COVER_LIST_PAGE_SIZE) {
+    const owned = await ctx.issues.list({
+      companyId,
+      originKind: COVER_ORIGIN,
+      originId: issue.id,
+      limit: COVER_LIST_PAGE_SIZE,
+      offset,
+    });
+    if (owned.some((cover) => cover.status !== "done" && cover.status !== "cancelled")) return;
+    if (owned.length < COVER_LIST_PAGE_SIZE) break;
+  }
 
   const windowMinutes = config.coverDedupWindowMinutes ?? DEFAULT_COVER_DEDUP_WINDOW_MINUTES;
   const fingerprint = coverDedupFingerprint(alertname, windowMinutes, now);
