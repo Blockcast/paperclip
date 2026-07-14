@@ -1,4 +1,4 @@
-import { and, eq, isNull, ne, or, sql } from "drizzle-orm";
+import { and, eq, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { externalRuntimeReservations, heartbeatRuns } from "@paperclipai/db";
 import {
@@ -12,6 +12,7 @@ const DEFAULT_EXTERNAL_RUNTIME_SLOT_ID = 0;
 export type ExternalRuntimeReservation = typeof externalRuntimeReservations.$inferSelect;
 export type ExternalRuntimeIsolationMode = "shared" | "run" | "workspace";
 
+const ACTIVE_RUNTIME_SLOT_CONSTRAINT = "external_runtime_reservations_active_slot_idx";
 const ACTIVE_ISOLATION_WRITER_CONSTRAINT = "external_runtime_reservations_active_isolation_writer_idx";
 
 export class ExternalRuntimeIsolationConflictError extends Error {
@@ -30,7 +31,7 @@ export class ExternalRuntimeIsolationConflictError extends Error {
   }
 }
 
-function isActiveIsolationWriterConflict(error: unknown): boolean {
+function isConstraintConflict(error: unknown, expectedConstraint: string): boolean {
   let current: unknown = error;
   for (let depth = 0; current && depth < 6; depth += 1) {
     if (typeof current !== "object") return false;
@@ -41,7 +42,7 @@ function isActiveIsolationWriterConflict(error: unknown): boolean {
       cause?: unknown;
     };
     const constraint = candidate.constraint ?? candidate.constraint_name;
-    if (candidate.code === "23505" && constraint === ACTIVE_ISOLATION_WRITER_CONSTRAINT) return true;
+    if (candidate.code === "23505" && constraint === expectedConstraint) return true;
     current = candidate.cause;
   }
   return false;
@@ -96,62 +97,107 @@ export async function claimRunWithExternalRuntimeSlot(
   run: typeof heartbeatRuns.$inferSelect;
   reservation: ExternalRuntimeReservation;
 } | null> {
-  const claimed = await db.transaction(async (tx) => {
-    const run = await tx
-      .select()
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
-      .for("update")
-      .then((rows) => rows[0] ?? null);
-    if (!run || run.status !== "queued") return null;
+  let claimed: {
+    run: typeof heartbeatRuns.$inferSelect;
+    reservation: ExternalRuntimeReservation;
+  } | null;
+  try {
+    claimed = await db.transaction(async (tx) => {
+      const run = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!run || run.status !== "queued") return null;
 
-    let reservation = await tx
-      .select()
-      .from(externalRuntimeReservations)
-      .where(and(
-        eq(externalRuntimeReservations.runId, run.id),
-        isNull(externalRuntimeReservations.releasedAt),
-      ))
-      .then((rows) => rows[0] ?? null);
+      let reservation = await tx
+        .select()
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.runId, run.id))
+        .then((rows) => rows[0] ?? null);
 
-    if (!reservation) {
-      reservation = await tx
-        .insert(externalRuntimeReservations)
-        .values({
-          companyId: run.companyId,
-          agentId: run.agentId,
-          runId: run.id,
-          slotId,
-          state: "reserved",
-          reservedAt: claimedAt,
-          createdAt: claimedAt,
+      if (reservation?.releasedAt) {
+        reservation = await tx
+          .update(externalRuntimeReservations)
+          .set({
+            slotId,
+            state: "reserved",
+            expectedJobName: null,
+            jobName: null,
+            jobUid: null,
+            isolationMode: null,
+            isolationKey: null,
+            isolationBoundAt: null,
+            reservedAt: claimedAt,
+            launchingAt: null,
+            launchedAt: null,
+            releasedAt: null,
+            releaseReason: null,
+            updatedAt: claimedAt,
+          })
+          .where(and(
+            eq(externalRuntimeReservations.id, reservation.id),
+            isNotNull(externalRuntimeReservations.releasedAt),
+          ))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      } else if (!reservation) {
+        reservation = await tx
+          .insert(externalRuntimeReservations)
+          .values({
+            companyId: run.companyId,
+            agentId: run.agentId,
+            runId: run.id,
+            slotId,
+            state: "reserved",
+            reservedAt: claimedAt,
+            createdAt: claimedAt,
+            updatedAt: claimedAt,
+          })
+          .onConflictDoNothing()
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      }
+      if (!reservation) return null;
+
+      const updatedRun = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "running",
+          startedAt: run.startedAt ?? claimedAt,
           updatedAt: claimedAt,
         })
-        .onConflictDoNothing()
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
         .returning()
         .then((rows) => rows[0] ?? null);
-    }
-    if (!reservation) return null;
-
-    const updatedRun = await tx
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
-    if (!updatedRun) {
-      throw new Error(`External runtime reservation ${reservation.id} could not claim queued run ${run.id}`);
-    }
-    return { run: updatedRun, reservation };
-  });
+      if (!updatedRun) {
+        throw new Error(`External runtime reservation ${reservation.id} could not claim queued run ${run.id}`);
+      }
+      return { run: updatedRun, reservation };
+    });
+  } catch (error) {
+    if (!isConstraintConflict(error, ACTIVE_RUNTIME_SLOT_CONSTRAINT)) throw error;
+    claimed = null;
+  }
 
   recordExternalRuntimeReservationEvent(claimed ? "reserved" : "contended");
   refreshExternalRuntimeReservationMetricsBestEffort(db, claimedAt, "claim");
   return claimed;
+}
+
+export async function claimRunWithExternalRuntimeSlotPool(
+  db: Db,
+  runId: string,
+  claimedAt: Date,
+  maxSlots: number,
+) {
+  const slotCount = Math.max(1, Math.floor(maxSlots));
+  for (let slotId = 0; slotId < slotCount; slotId += 1) {
+    const claimed = await claimRunWithExternalRuntimeSlot(db, runId, claimedAt, slotId);
+    if (claimed) return claimed;
+  }
+  return null;
 }
 
 export async function getActiveExternalRuntimeReservation(
@@ -217,7 +263,7 @@ export async function bindExternalRuntimeReservationIsolation(
       .returning()
       .then((rows) => rows[0] ?? null);
   } catch (error) {
-    if (!isActiveIsolationWriterConflict(error)) throw error;
+    if (!isConstraintConflict(error, ACTIVE_ISOLATION_WRITER_CONSTRAINT)) throw error;
     const conflicting = await db
       .select({ runId: externalRuntimeReservations.runId })
       .from(externalRuntimeReservations)

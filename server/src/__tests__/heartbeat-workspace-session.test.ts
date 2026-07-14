@@ -16,9 +16,11 @@ import {
   buildRealizedExecutionWorkspaceFromPersisted,
   buildExplicitResumeSessionOverride,
   buildK8sRunIsolationDescriptor,
+  computeK8sIsolationRetryDelayMs,
   deriveTaskKeyWithHeartbeatFallback,
   evaluatePreferredProjectWorkspaceRealization,
   isNonPrimaryWorkspaceTarget,
+  isK8sIsolationRetryDeferred,
   logK8sGuardDecision,
   resolveProjectPrimaryWorkspaceId,
   extractWakeCommentIds,
@@ -1449,6 +1451,24 @@ describe("K8s session isolation metadata", () => {
       isolationKey: "workspace:workspace-1",
     },
   };
+
+  it("backs off isolation-writer contention without creating a terminal run", () => {
+    expect(computeK8sIsolationRetryDelayMs(1)).toBe(15_000);
+    expect(computeK8sIsolationRetryDelayMs(2)).toBe(30_000);
+    expect(computeK8sIsolationRetryDelayMs(6)).toBe(300_000);
+    expect(computeK8sIsolationRetryDelayMs(100)).toBe(300_000);
+
+    const now = new Date("2026-07-14T12:00:00.000Z");
+    expect(isK8sIsolationRetryDeferred({
+      paperclipK8sIsolationRetryAt: "2026-07-14T12:00:01.000Z",
+    }, now)).toBe(true);
+    expect(isK8sIsolationRetryDeferred({
+      paperclipK8sIsolationRetryAt: "2026-07-14T11:59:59.000Z",
+    }, now)).toBe(false);
+    expect(isK8sIsolationRetryDeferred({
+      paperclipK8sIsolationRetryAt: "invalid",
+    }, now)).toBe(false);
+  });
 
   it("returns null for non-K8s adapters", () => {
     expect(

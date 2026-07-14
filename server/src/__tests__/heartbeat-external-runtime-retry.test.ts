@@ -18,6 +18,10 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
+import {
+  bindExternalRuntimeReservationIsolation,
+  claimRunWithExternalRuntimeSlot,
+} from "../services/external-runtime-reservations.js";
 
 const mockAdapterExecute = vi.hoisted(() => vi.fn());
 
@@ -179,5 +183,138 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       ([ctx]) => (ctx as AdapterExecutionContext).externalRuntime?.reservationId,
     );
     expect(new Set(reservationIds)).toEqual(new Set([reservation.id]));
+  }, 30_000);
+
+  it("defers a same-scope contender without failing or invoking its adapter", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const ownerRunId = randomUUID();
+    const contenderRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "External Runtime Isolation Co",
+      issuePrefix: "ERI",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Shared Claude K8s",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          enabled: true,
+          wakeOnDemand: true,
+          maxConcurrentRuns: 2,
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: ownerRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: {},
+      },
+      {
+        id: contenderRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: {},
+      },
+    ]);
+
+    const ownerClaim = await claimRunWithExternalRuntimeSlot(db, ownerRunId, new Date(), 0);
+    expect(ownerClaim).not.toBeNull();
+    await bindExternalRuntimeReservationIsolation(db, {
+      runId: ownerRunId,
+      reservationId: ownerClaim!.reservation.id,
+      isolationMode: "shared",
+      isolationKey: `agent-shared:${agentId}`,
+    });
+
+    await heartbeat.__test_executeRunForTesting(contenderRunId);
+
+    const contender = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, contenderRunId))
+      .then((rows) => rows[0]);
+    const reservations = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.agentId, agentId));
+    const contenderReservation = reservations.find((reservation) => reservation.runId === contenderRunId);
+
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    expect(contender.status).toBe("queued");
+    expect(contender.error).toBeNull();
+    expect(contender.errorCode).toBeNull();
+    expect(contender.contextSnapshot).toMatchObject({
+      paperclipK8sIsolationRetryAttempt: 1,
+    });
+    expect(new Date(String(contender.contextSnapshot?.paperclipK8sIsolationRetryAt)).getTime()).toBeGreaterThan(
+      Date.now(),
+    );
+    expect(contenderReservation).toMatchObject({
+      state: "released",
+      releaseReason: "external_runtime_isolation_conflict",
+    });
+    expect(reservations.find((reservation) => reservation.runId === ownerRunId)?.releasedAt).toBeNull();
+
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, ownerRunId));
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          ...contender.contextSnapshot,
+          paperclipK8sIsolationRetryAt: new Date(Date.now() - 1_000).toISOString(),
+        },
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, contenderRunId));
+    mockAdapterExecute.mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      errorMessage: null,
+      summary: "serialized contender completed",
+      resultJson: { ok: true },
+      usage: { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0 },
+      provider: "test",
+      model: "test-model",
+    });
+
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainInFlightExecutions(10_000);
+
+    const completedContender = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, contenderRunId))
+      .then((rows) => rows[0]);
+    const reusedReservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, contenderRunId))
+      .then((rows) => rows[0]);
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    expect(completedContender.status).toBe("succeeded");
+    expect(reusedReservation.id).toBe(contenderReservation?.id);
+    expect(reusedReservation.isolationKey).toBe(`agent-shared:${agentId}`);
   }, 30_000);
 });

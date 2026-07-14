@@ -15,6 +15,7 @@ import {
 import {
   bindExternalRuntimeReservationIsolation,
   claimRunWithExternalRuntimeSlot,
+  claimRunWithExternalRuntimeSlotPool,
   ExternalRuntimeIsolationConflictError,
   externalRuntimeReservationCanRelease,
   markExternalRuntimeReservationLaunching,
@@ -111,6 +112,58 @@ describeEmbeddedPostgres("external runtime reservations", () => {
     expect(metrics.body).toContain(`${EXTERNAL_RUNTIME_RESERVATIONS_ACTIVE_METRIC} 1`);
     expect(metrics.body).toContain(`${EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC}{event="reserved"} 1`);
     expect(metrics.body).toContain(`${EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC}{event="contended"} 1`);
+  });
+
+  it("atomically fills a bounded slot pool without over-claiming", async () => {
+    const runIds = await seedQueuedRuns(3);
+    const now = new Date("2026-07-14T12:00:00.000Z");
+
+    const results = await Promise.all(
+      runIds.map((runId) => claimRunWithExternalRuntimeSlotPool(db, runId, now, 2)),
+    );
+
+    expect(results.filter(Boolean)).toHaveLength(2);
+    const reservations = await db
+      .select({ runId: externalRuntimeReservations.runId, slotId: externalRuntimeReservations.slotId })
+      .from(externalRuntimeReservations);
+    expect(reservations.map((reservation) => reservation.slotId).sort()).toEqual([0, 1]);
+
+    const runs = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.id, runIds));
+    expect(runs.filter((run) => run.status === "running")).toHaveLength(2);
+    expect(runs.filter((run) => run.status === "queued")).toHaveLength(1);
+  });
+
+  it("reactivates the same reservation row when a deferred run retries", async () => {
+    const [runId] = await seedQueuedRuns(1);
+    const firstClaim = await claimRunWithExternalRuntimeSlotPool(db, runId, new Date(), 2);
+    expect(firstClaim).not.toBeNull();
+    await bindExternalRuntimeReservationIsolation(db, {
+      runId,
+      reservationId: firstClaim!.reservation.id,
+      isolationMode: "shared",
+      isolationKey: `agent-shared:${agentId}`,
+    });
+    await releaseExternalRuntimeReservation(db, { runId, reason: "external_runtime_isolation_conflict" });
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "queued", startedAt: null, updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const retryClaim = await claimRunWithExternalRuntimeSlotPool(db, runId, new Date(), 2);
+
+    expect(retryClaim?.reservation).toMatchObject({
+      id: firstClaim?.reservation.id,
+      state: "reserved",
+      isolationMode: null,
+      isolationKey: null,
+      isolationBoundAt: null,
+      releasedAt: null,
+      releaseReason: null,
+    });
+    expect(retryClaim?.run.status).toBe("running");
   });
 
   it("binds writer ownership idempotently for the same run and isolation key", async () => {
