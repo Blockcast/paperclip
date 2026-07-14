@@ -3,14 +3,13 @@ import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { ResourceUpdatedNotificationSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { createHttpServer } from "./http.js";
 
 let upstream: Server; // mock Paperclip REST API
 let mcp: Server;      // our external MCP server
 let mcpUrl: string;
 let heartbeatSnapshot = { id: "run-1", status: "running", logBytes: 32, lastOutputSeq: 3 };
-let heartbeatRunReadCount = 0;
 
 beforeAll(async () => {
   // Mock Paperclip API: GET /api/agents/me → identity derived from the bearer.
@@ -33,7 +32,6 @@ beforeAll(async () => {
       return;
     }
     if (req.url === "/api/heartbeat-runs/run-1" && req.method === "GET") {
-      heartbeatRunReadCount += 1;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(heartbeatSnapshot));
       return;
@@ -64,7 +62,7 @@ beforeAll(async () => {
   mcpUrl = `http://127.0.0.1:${(mcp.address() as AddressInfo).port}/mcp`;
 });
 
-describe("heartbeat run resources", () => {
+describe("heartbeat run resources (stateless transport)", () => {
   it("reads heartbeat run resources over streamable HTTP", async () => {
     const client = new Client({ name: "test", version: "0.0.0" });
     const transport = new StreamableHTTPClientTransport(new URL(mcpUrl), {
@@ -83,124 +81,41 @@ describe("heartbeat run resources", () => {
     }
   }, 15000);
 
-  it("emits heartbeat resource update notifications over streamable HTTP", async () => {
-    heartbeatSnapshot = { id: "run-1", status: "running", logBytes: 32, lastOutputSeq: 3 };
-    const client = new Client({ name: "test", version: "0.0.0" });
-    const transport = new StreamableHTTPClientTransport(new URL(mcpUrl), {
-      requestInit: { headers: { Authorization: "Bearer pcp_X" } },
-    });
-    const updates: string[] = [];
-    client.setNotificationHandler(ResourceUpdatedNotificationSchema, (notification) => {
-      updates.push(notification.params.uri);
-    });
-    await client.connect(transport);
-    try {
-      await client.subscribeResource({ uri: "paperclip://heartbeat-runs/run-1/log" });
-      heartbeatSnapshot = { id: "run-1", status: "running", logBytes: 48, lastOutputSeq: 4 };
-      await new Promise((resolve) => setTimeout(resolve, 1_200));
-      const chunk = await client.readResource({ uri: "paperclip://heartbeat-runs/run-1/log-chunks/32?limitBytes=64" });
-      await client.unsubscribeResource({ uri: "paperclip://heartbeat-runs/run-1/log" });
-      const first = chunk.contents[0];
-      if (!first || !("text" in first)) throw new Error("Expected text resource");
-      expect(JSON.parse(first.text)).toEqual({ runId: "run-1", offset: 32, nextOffset: 37, content: "world" });
-      expect(updates).toEqual(["paperclip://heartbeat-runs/run-1/log"]);
-    } finally {
-      await client.close();
-    }
-  }, 15000);
-
-  it("delivers resource update notifications on a standalone GET SSE stream", async () => {
-    heartbeatSnapshot = { id: "run-1", status: "running", logBytes: 32, lastOutputSeq: 3 };
-    heartbeatRunReadCount = 0;
-    const init = await fetch(mcpUrl, {
+  it("never issues an mcp-session-id (any replica can serve any request)", async () => {
+    const res = await fetch(mcpUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", Authorization: "Bearer pcp_X" },
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
         method: "initialize",
-        params: {
-          protocolVersion: "2025-03-26",
-          capabilities: {},
-          clientInfo: { name: "raw-test", version: "0.0.0" },
-        },
+        params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "raw-test", version: "0.0.0" } },
       }),
     });
-    expect(init.status).toBe(200);
-    const sessionId = init.headers.get("mcp-session-id");
-    expect(sessionId).toBeTruthy();
+    expect(res.status).toBe(200);
+    // Stateless mode mints no session id, so there is no per-replica session to
+    // lose — the round-robin "Session not found" 404 cannot occur.
+    expect(res.headers.get("mcp-session-id")).toBeNull();
+    await res.body?.cancel().catch(() => undefined);
+  }, 15000);
 
-    await fetch(mcpUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json, text/event-stream",
-        Authorization: "Bearer pcp_X",
-        "mcp-session-id": sessionId!,
-      },
-      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }),
+  it("does not advertise resource push-subscriptions", async () => {
+    const client = new Client({ name: "test", version: "0.0.0" });
+    const transport = new StreamableHTTPClientTransport(new URL(mcpUrl), {
+      requestInit: { headers: { Authorization: "Bearer pcp_X" } },
     });
-
-    const abort = new AbortController();
-    const sse = await fetch(mcpUrl, {
-      method: "GET",
-      headers: { Accept: "text/event-stream", Authorization: "Bearer pcp_X", "mcp-session-id": sessionId! },
-      signal: abort.signal,
-    });
-    expect(sse.status).toBe(200);
-    const reader = sse.body?.getReader();
-    if (!reader) throw new Error("Expected SSE response body");
-    const decoder = new TextDecoder();
-
+    await client.connect(transport);
     try {
-      const subscribe = await fetch(mcpUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json, text/event-stream",
-          Authorization: "Bearer pcp_X",
-          "mcp-session-id": sessionId!,
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 2,
-          method: "resources/subscribe",
-          params: { uri: "paperclip://heartbeat-runs/run-1/log" },
-        }),
-      });
-      expect(subscribe.status).toBe(200);
-      const deadlineForInitialRead = Date.now() + 5_000;
-      while (heartbeatRunReadCount === 0 && Date.now() < deadlineForInitialRead) {
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-      expect(heartbeatRunReadCount).toBeGreaterThan(0);
-      heartbeatSnapshot = { id: "run-1", status: "running", logBytes: 64, lastOutputSeq: 5 };
-
-      let buffered = "";
-      let pendingRead: Promise<ReadableStreamReadResult<Uint8Array>> | null = null;
-      const deadline = Date.now() + 12_000;
-      while (Date.now() < deadline && !buffered.includes("notifications/resources/updated")) {
-        const remaining = Math.max(1, deadline - Date.now());
-        pendingRead ??= reader.read();
-        const result = await Promise.race([
-          pendingRead,
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), Math.min(remaining, 250))),
-        ]);
-        if (result === null) continue;
-        pendingRead = null;
-        const { value, done } = result;
-        if (done) break;
-        buffered += decoder.decode(value, { stream: true });
-      }
-      if (pendingRead) void pendingRead.catch(() => undefined);
-      buffered += decoder.decode();
-      expect(buffered).toContain("notifications/resources/updated");
-      expect(buffered).toContain("paperclip://heartbeat-runs/run-1/log");
+      // Reads/lists work statelessly; live push (resources/subscribe) does not,
+      // so the capability is gated off and a subscribe attempt is rejected.
+      expect(client.getServerCapabilities()?.resources?.subscribe).not.toBe(true);
+      await expect(
+        client.subscribeResource({ uri: "paperclip://heartbeat-runs/run-1/log" }),
+      ).rejects.toThrow();
     } finally {
-      abort.abort();
-      await reader.cancel().catch(() => undefined);
+      await client.close();
     }
-  }, 20000);
+  }, 15000);
 });
 
 afterAll(async () => {
@@ -262,31 +177,31 @@ describe("multi-tenant streamable-HTTP", () => {
   }, 15000);
 });
 
-describe("session recovery (streamable-HTTP spec)", () => {
-  it("returns 404 (not 400) for an unknown/expired session id so clients re-initialize", async () => {
-    // A non-initialize request carrying a session id the server doesn't know
-    // (e.g. after a pod restart / rollout) MUST get 404 per the spec, so the
-    // MCP client starts a fresh session. Returning 400 wedges pre-existing
-    // clients (this is what FastMCP/the Python server does — 404).
+describe("stateless transport (no session recovery needed)", () => {
+  it("ignores an unknown mcp-session-id instead of 404ing", async () => {
+    // The pre-stateless server answered an unrecognized session id with 404
+    // -32001; with >1 replica and no gateway affinity that fired on ~half of all
+    // follow-up requests (round-robin landed them on the wrong replica). Stateless
+    // mode has no sessions, so a stray id is simply ignored and the request is
+    // served — the bug cannot recur.
     const res = await fetch(mcpUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
+        Authorization: "Bearer pcp_X",
         "mcp-session-id": "does-not-exist",
       },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "raw-test", version: "0.0.0" } },
+      }),
     });
-    expect(res.status).toBe(404);
-  }, 15000);
-
-  it("still 400s a non-initialize request that carries no session id at all", async () => {
-    const res = await fetch(mcpUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
-    });
-    expect(res.status).toBe(400);
+    expect(res.status).not.toBe(404);
+    expect(res.status).toBe(200);
+    await res.body?.cancel().catch(() => undefined);
   }, 15000);
 });
 
