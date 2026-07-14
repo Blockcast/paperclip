@@ -47,7 +47,7 @@ export const externalRuntimeReservations = pgTable(
     ),
     isolationModeCheck: check(
       "external_runtime_reservations_isolation_mode_check",
-      sql`${table.isolationMode} is null or ${table.isolationMode} in ('shared', 'run', 'workspace')`,
+      sql`${table.isolationMode} is null or ${table.isolationMode} in ('legacy', 'pending', 'shared', 'run', 'workspace')`,
     ),
     isolationBindingCheck: check(
       "external_runtime_reservations_isolation_binding_check",

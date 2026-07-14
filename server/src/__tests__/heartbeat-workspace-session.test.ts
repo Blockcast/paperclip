@@ -33,6 +33,7 @@ import {
   computeSessionCompactionReason,
   countConsecutiveFailedOrZeroTokenResumes,
   resolveNextSessionState,
+  resolveK8sRunIsolationIdentity,
   requiresPushCapabilityPreflight,
   resolveWorkspaceAfterLowTrustPreflight,
   resolveRuntimeSessionParamsForWorkspace,
@@ -40,6 +41,7 @@ import {
   sessionParamsMatchIsolation,
   shouldDeferFollowupWakeForSameIssue,
   stripHostWorkspaceProvisionForLowTrustSandbox,
+  stripK8sIsolationOwnedEnv,
   stripWorkspaceRuntimeFromExecutionRunConfig,
   shouldResetTaskSessionForModelChange,
   stripConfiguredModelFromSessionParams,
@@ -1523,6 +1525,36 @@ describe("K8s session isolation metadata", () => {
         taskKey: "issue-1",
         isolationKey: "workspace:execution-workspace-1",
       },
+    });
+  });
+
+  it("derives a durable writer key from a preallocated execution workspace id", () => {
+    expect(resolveK8sRunIsolationIdentity({
+      adapterType: "opencode_k8s",
+      runId: "run-1",
+      agentId: "agent-1",
+      statelessPrReview: false,
+      isWorkspaceIsolated: true,
+      persistedExecutionWorkspaceId: "planned-workspace-1",
+    })).toEqual({
+      isolationMode: "workspace",
+      isolationKey: "workspace:planned-workspace-1",
+    });
+  });
+
+  it("removes user-controlled mutable paths before K8s adapter dispatch", () => {
+    expect(stripK8sIsolationOwnedEnv({
+      env: {
+        API_TOKEN: "preserved",
+        HOME: "/paperclip/shared-home",
+        XDG_CACHE_HOME: "/paperclip/shared-cache",
+        GOCACHE: "/paperclip/shared-go-cache",
+        TMPDIR: "/paperclip/shared-tmp",
+        GIT_INDEX_FILE: "/paperclip/sibling/.git/index",
+        GIT_WORK_TREE: "/paperclip/sibling",
+      },
+    }, isolation)).toEqual({
+      env: { API_TOKEN: "preserved" },
     });
   });
 

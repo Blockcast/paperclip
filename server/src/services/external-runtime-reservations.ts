@@ -126,9 +126,9 @@ export async function claimRunWithExternalRuntimeSlot(
             expectedJobName: null,
             jobName: null,
             jobUid: null,
-            isolationMode: null,
-            isolationKey: null,
-            isolationBoundAt: null,
+            isolationMode: "pending",
+            isolationKey: `pending:${run.id}`,
+            isolationBoundAt: claimedAt,
             reservedAt: claimedAt,
             launchingAt: null,
             launchedAt: null,
@@ -151,6 +151,9 @@ export async function claimRunWithExternalRuntimeSlot(
             runId: run.id,
             slotId,
             state: "reserved",
+            isolationMode: "pending",
+            isolationKey: `pending:${run.id}`,
+            isolationBoundAt: claimedAt,
             reservedAt: claimedAt,
             createdAt: claimedAt,
             updatedAt: claimedAt,
@@ -225,43 +228,96 @@ export async function bindExternalRuntimeReservationIsolation(
   },
 ): Promise<ExternalRuntimeReservation> {
   const now = input.now ?? new Date();
-  const existing = await getActiveExternalRuntimeReservation(db, input.runId);
-  if (!existing || existing.id !== input.reservationId) {
-    throw new Error(`External runtime reservation no longer owns isolation binding for run ${input.runId}`);
-  }
-  if (existing.state === "release_pending" || existing.state === "released") {
-    throw new Error(`External runtime reservation for run ${input.runId} is no longer active`);
-  }
-  if (existing.isolationKey || existing.isolationMode) {
-    if (existing.isolationKey === input.isolationKey && existing.isolationMode === input.isolationMode) {
-      return existing;
-    }
-    throw new Error(
-      `External runtime isolation binding drift for run ${input.runId}: `
-      + `persisted ${existing.isolationMode ?? "<none>"}/${existing.isolationKey ?? "<none>"}, `
-      + `received ${input.isolationMode}/${input.isolationKey}`,
-    );
-  }
-
-  let reservation: ExternalRuntimeReservation | null = null;
   try {
-    reservation = await db
-      .update(externalRuntimeReservations)
-      .set({
-        isolationMode: input.isolationMode,
-        isolationKey: input.isolationKey,
-        isolationBoundAt: now,
-        updatedAt: now,
-      })
-      .where(and(
-        eq(externalRuntimeReservations.id, input.reservationId),
-        eq(externalRuntimeReservations.runId, input.runId),
-        isNull(externalRuntimeReservations.releasedAt),
-        isNull(externalRuntimeReservations.isolationMode),
-        isNull(externalRuntimeReservations.isolationKey),
-      ))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    return await db.transaction(async (tx) => {
+      if (input.isolationMode !== "run") {
+        await tx.execute(sql`select pg_advisory_xact_lock(748293011)`);
+      }
+      const existing = await tx
+        .select()
+        .from(externalRuntimeReservations)
+        .where(and(
+          eq(externalRuntimeReservations.id, input.reservationId),
+          eq(externalRuntimeReservations.runId, input.runId),
+          isNull(externalRuntimeReservations.releasedAt),
+        ))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!existing) {
+        throw new Error(`External runtime reservation no longer owns isolation binding for run ${input.runId}`);
+      }
+      if (existing.state === "release_pending" || existing.state === "released") {
+        throw new Error(`External runtime reservation for run ${input.runId} is no longer active`);
+      }
+      const pendingIsolationKey = `pending:${input.runId}`;
+      const replaceableBinding =
+        (existing.isolationMode === "pending" && existing.isolationKey === pendingIsolationKey) ||
+        (existing.isolationMode === "legacy" && existing.isolationKey === `legacy:${input.runId}`);
+      if (!replaceableBinding && (existing.isolationKey || existing.isolationMode)) {
+        if (existing.isolationKey === input.isolationKey && existing.isolationMode === input.isolationMode) {
+          return existing;
+        }
+        throw new Error(
+          `External runtime isolation binding drift for run ${input.runId}: `
+          + `persisted ${existing.isolationMode ?? "<none>"}/${existing.isolationKey ?? "<none>"}, `
+          + `received ${input.isolationMode}/${input.isolationKey}`,
+        );
+      }
+      if (input.isolationMode !== "run") {
+        const legacyWriter = await tx
+          .select({ runId: externalRuntimeReservations.runId })
+          .from(externalRuntimeReservations)
+          .where(and(
+            eq(externalRuntimeReservations.isolationMode, "legacy"),
+            isNull(externalRuntimeReservations.releasedAt),
+            ne(externalRuntimeReservations.runId, input.runId),
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (legacyWriter) {
+          throw new ExternalRuntimeIsolationConflictError(
+            input.runId,
+            input.isolationKey,
+            legacyWriter.runId,
+          );
+        }
+      }
+
+      const reservation = await tx
+        .update(externalRuntimeReservations)
+        .set({
+          isolationMode: input.isolationMode,
+          isolationKey: input.isolationKey,
+          isolationBoundAt: now,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(externalRuntimeReservations.id, input.reservationId),
+          eq(externalRuntimeReservations.runId, input.runId),
+          isNull(externalRuntimeReservations.releasedAt),
+          or(
+            and(
+              eq(externalRuntimeReservations.isolationMode, "pending"),
+              eq(externalRuntimeReservations.isolationKey, pendingIsolationKey),
+            ),
+            and(
+              eq(externalRuntimeReservations.isolationMode, "legacy"),
+              eq(externalRuntimeReservations.isolationKey, `legacy:${input.runId}`),
+            ),
+          ),
+          or(
+            eq(externalRuntimeReservations.state, "reserved"),
+            eq(externalRuntimeReservations.state, "launching"),
+            eq(externalRuntimeReservations.state, "launched"),
+          ),
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!reservation) {
+        throw new Error(`External runtime reservation no longer owns isolation binding for run ${input.runId}`);
+      }
+      return reservation;
+    });
   } catch (error) {
     if (!isConstraintConflict(error, ACTIVE_ISOLATION_WRITER_CONSTRAINT)) throw error;
     const conflicting = await db
@@ -280,24 +336,6 @@ export async function bindExternalRuntimeReservationIsolation(
       conflicting?.runId ?? null,
     );
   }
-  if (reservation) return reservation;
-
-  const current = await getActiveExternalRuntimeReservation(db, input.runId);
-  if (
-    current?.id === input.reservationId
-    && current.isolationKey === input.isolationKey
-    && current.isolationMode === input.isolationMode
-  ) {
-    return current;
-  }
-  if (current?.isolationKey || current?.isolationMode) {
-    throw new Error(
-      `External runtime isolation binding drift for run ${input.runId}: `
-      + `persisted ${current.isolationMode ?? "<none>"}/${current.isolationKey ?? "<none>"}, `
-      + `received ${input.isolationMode}/${input.isolationKey}`,
-    );
-  }
-  throw new Error(`External runtime reservation no longer owns isolation binding for run ${input.runId}`);
 }
 
 export async function markExternalRuntimeReservationLaunching(
@@ -319,8 +357,12 @@ export async function markExternalRuntimeReservationLaunching(
     ))
     .returning()
     .then((rows) => rows[0] ?? null);
-  if (reservation) recordExternalRuntimeReservationEvent("launching");
-  return reservation;
+  if (reservation) {
+    recordExternalRuntimeReservationEvent("launching");
+    return reservation;
+  }
+  const active = await getActiveExternalRuntimeReservation(db, runId);
+  return active?.state === "launching" ? active : null;
 }
 
 export async function rearmExternalRuntimeReservationForRetry(
