@@ -3589,6 +3589,187 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).toBe(true);
   });
 
+  // BLO-16182: process_lost is reclassified as transient_infra (3 attempts +
+  // 60s backoff). These two guard the COMBINED attempt cap end-to-end through
+  // reconcileStrandedAssignedIssues: the continuation sweep and the in-reaper
+  // enqueueProcessLossRetry must share one budget.
+  async function seedPriorProcessLostRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    retryReason: "issue_continuation_needed" | "process_lost";
+    createdAt: Date;
+    processLossRetryCount?: number;
+  }) {
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "failed",
+      errorCode: "process_lost",
+      error: "Process lost before external adapter invocation -- server may have restarted",
+      contextSnapshot: { issueId: input.issueId, retryReason: input.retryReason },
+      processLossRetryCount: input.processLossRetryCount ?? 0,
+      createdAt: input.createdAt,
+      startedAt: input.createdAt,
+      finishedAt: new Date(input.createdAt.getTime() + 1_000),
+      updatedAt: new Date(input.createdAt.getTime() + 1_000),
+    });
+  }
+
+  it("escalates a process_lost issue at the COMBINED budget: 2 continuation + 1 in-reaper retry (BLO-16182)", async () => {
+    // Latest run is a continuation retry (the sweep classifies it); history adds
+    // one earlier continuation retry + one in-reaper process_lost retry. All three
+    // process_lost. Combined = 3 >= maxAttempts(3) → escalate, NOT a fresh 3.
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "process_lost",
+      runError: "Process lost before external adapter invocation -- server may have restarted",
+    });
+    await seedPriorProcessLostRun({
+      companyId,
+      agentId,
+      issueId,
+      retryReason: "issue_continuation_needed",
+      createdAt: new Date("2026-03-18T00:02:00.000Z"),
+    });
+    await seedPriorProcessLostRun({
+      companyId,
+      agentId,
+      issueId,
+      retryReason: "process_lost", // in-reaper enqueueProcessLossRetry (engine B)
+      processLossRetryCount: 1,
+      createdAt: new Date("2026-03-18T00:00:00.000Z"),
+    });
+
+    heartbeat = heartbeatService(db, { penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(1);
+    expect(result.continuationRequeued).toBe(0);
+    const issue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+  });
+
+  it("still grants process_lost its full transient budget before escalating: 2 continuation retries → requeue (BLO-16182)", async () => {
+    // Reclassify gives 3 attempts; with only 2 consecutive continuation retries
+    // (and no in-reaper retry) the sweep must re-dispatch, not escalate.
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "process_lost",
+      runError: "Process lost before external adapter invocation -- server may have restarted",
+    });
+    await seedPriorProcessLostRun({
+      companyId,
+      agentId,
+      issueId,
+      retryReason: "issue_continuation_needed",
+      createdAt: new Date("2026-03-18T00:00:00.000Z"),
+    });
+
+    heartbeat = heartbeatService(db, { penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    expect(result.continuationRequeued).toBe(1);
+    const issue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+  });
+
+  it("escalates when the LATEST terminal run is the in-reaper (engine B) process_lost retry (BLO-16182)", async () => {
+    // The combined cap must ENTER even when the newest run is engine B's retry
+    // (retryReason 'process_lost'), not only when a continuation run is latest —
+    // otherwise that interleaving skips the cap and re-dispatches uncapped.
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "process_lost",
+      runError: "Process lost before external adapter invocation -- server may have restarted",
+    });
+    // Re-anchor the fixture's continuation run as the OLDEST in the chain.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        createdAt: new Date("2026-03-18T00:00:00.000Z"),
+        finishedAt: new Date("2026-03-18T00:00:30.000Z"),
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    // A middle continuation retry, then the in-reaper engine-B retry as the NEWEST.
+    await seedPriorProcessLostRun({
+      companyId,
+      agentId,
+      issueId,
+      retryReason: "issue_continuation_needed",
+      createdAt: new Date("2026-03-18T00:01:00.000Z"),
+    });
+    await seedPriorProcessLostRun({
+      companyId,
+      agentId,
+      issueId,
+      retryReason: "process_lost", // engine B; newest → becomes latestRun
+      processLossRetryCount: 1,
+      createdAt: new Date("2026-03-18T00:02:00.000Z"),
+    });
+
+    heartbeat = heartbeatService(db, { penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // Combined budget = 3 (2 continuation + 1 engine-B) → escalate, not a fresh 3.
+    expect(result.escalated).toBe(1);
+    expect(result.continuationRequeued).toBe(0);
+    const issue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+  });
+
+  it("defers a process_lost continuation still inside its 60s backoff window instead of re-dispatching (BLO-16182)", async () => {
+    // One continuation attempt (consecutive=1 < 3) that JUST finished: the
+    // transient 60s backoff must hold the re-dispatch, proving the reclassify's
+    // backoff half actually throttles (not merely caps) the storm.
+    const { issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "process_lost",
+      runError: "Process lost before external adapter invocation -- server may have restarted",
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ finishedAt: new Date(Date.now() - 5_000) })
+      .where(eq(heartbeatRuns.id, runId));
+
+    heartbeat = heartbeatService(db, { penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // Deferred by backoff — neither escalated nor re-dispatched this tick.
+    expect(result.escalated).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    const issue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+  });
+
   it("clears the detached warning when the run reports activity again", async () => {
     const { runId } = await seedRunFixture({
       includeIssue: false,

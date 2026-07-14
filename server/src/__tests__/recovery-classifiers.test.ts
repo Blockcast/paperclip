@@ -15,6 +15,10 @@ import {
   isZeroTokenSessionResetRetryRun,
   parseIssueGraphLivenessIncidentKey,
 } from "../services/recovery/index.js";
+import {
+  classifyContinuationFailure,
+  isContinuationAttemptRetryReason,
+} from "../services/recovery/service.js";
 
 const companyId = "company-1";
 const agentId = "agent-1";
@@ -336,6 +340,62 @@ describe("zero-token session-reset retry marker (BLO-10889 / BLO-10866 WS2)", ()
     expect(isZeroTokenSessionResetRetryRun({ contextSnapshot: null })).toBe(false);
     expect(isZeroTokenSessionResetRetryRun(null)).toBe(false);
     expect(isZeroTokenSessionResetRetryRun(undefined)).toBe(false);
+  });
+});
+
+describe("classifyContinuationFailure — process_lost reclassify (BLO-16182)", () => {
+  it("classifies process_lost as retryable transient-infra (3 attempts + 60s backoff), not default", () => {
+    const c = classifyContinuationFailure({ errorCode: "process_lost" } as never);
+    expect(c.kind).toBe("transient_infra");
+    expect(c.maxAttempts).toBe(3);
+    expect(c.baseBackoffMs).toBe(60_000);
+  });
+
+  it("keeps the pre-existing transient-infra codes classified as transient", () => {
+    for (const code of ["adapter_failed", "timeout", "codex_transient_upstream", "claude_transient_upstream"]) {
+      expect(classifyContinuationFailure({ errorCode: code } as never).kind).toBe("transient_infra");
+    }
+  });
+
+  it("still classifies an unknown code as default (1 attempt, no backoff)", () => {
+    const c = classifyContinuationFailure({ errorCode: "some_unknown_code" } as never);
+    expect(c.kind).toBe("default");
+    expect(c.maxAttempts).toBe(1);
+    expect(c.baseBackoffMs).toBe(0);
+  });
+
+  it("still classifies a genuinely non-retryable code as non_retryable", () => {
+    expect(classifyContinuationFailure({ errorCode: "budget_exhausted" } as never).kind).toBe("non_retryable");
+  });
+});
+
+describe("isContinuationAttemptRetryReason — combined process_lost attempt cap (BLO-16182)", () => {
+  // process_lost has two automatic retry engines: the continuation sweep
+  // (retryReason 'issue_continuation_needed') and the in-reaper
+  // enqueueProcessLossRetry (retryReason 'process_lost'). Once process_lost is
+  // reclassified as transient_infra (3 attempts), both engines' retries must
+  // count toward the SAME bounded budget — otherwise the sweep would grant a
+  // fresh 3 attempts on top of the reaper's retry, tripling re-dispatch during
+  // an infra storm.
+  it("counts continuation-sweep retries toward any matched error code's budget", () => {
+    expect(isContinuationAttemptRetryReason("issue_continuation_needed", "process_lost")).toBe(true);
+    expect(isContinuationAttemptRetryReason("issue_continuation_needed", "adapter_failed")).toBe(true);
+    expect(isContinuationAttemptRetryReason("issue_continuation_needed", null)).toBe(true);
+  });
+
+  it("counts in-reaper process_lost retries toward the process_lost budget", () => {
+    expect(isContinuationAttemptRetryReason("process_lost", "process_lost")).toBe(true);
+  });
+
+  it("does NOT let a process_lost-reason retry shorten a different error code's separate budget", () => {
+    expect(isContinuationAttemptRetryReason("process_lost", "adapter_failed")).toBe(false);
+    expect(isContinuationAttemptRetryReason("process_lost", null)).toBe(false);
+  });
+
+  it("does not count first-generation or unrelated retry reasons", () => {
+    expect(isContinuationAttemptRetryReason(null, "process_lost")).toBe(false);
+    expect(isContinuationAttemptRetryReason("assignment_recovery", "process_lost")).toBe(false);
+    expect(isContinuationAttemptRetryReason("zero_token_session_reset", "process_lost")).toBe(false);
   });
 });
 
