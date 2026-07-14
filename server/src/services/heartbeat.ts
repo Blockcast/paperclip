@@ -79,6 +79,10 @@ import {
 import { getActiveAgentIds } from "./agent-roster.js";
 import { processPendingImageBumpForAgent } from "./agent-image-bump.js";
 import {
+  buildProcessLossCapture,
+  type ProcessLossJobLiveness,
+} from "./process-loss-classification.js";
+import {
   bindExternalRuntimeReservationIsolation,
   claimRunWithExternalRuntimeSlotPool,
   ExternalRuntimeIsolationConflictError,
@@ -11152,6 +11156,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? await hasAdapterInvocationEvent(run.id)
         : false;
       const externalLifecyclePreAdapter = externalLifecycleRun && !externalLifecycleStarted;
+      // BLO-16181: retain the pre-adapter Job liveness the loop resolves below so
+      // the process_lost mint can persist whether the Job was confirmed dead vs
+      // merely unconfirmable (kube unavailable). Stays null for started runs.
+      let preAdapterJobLiveness: ProcessLossJobLiveness = null;
       if (externalLifecyclePreAdapter) {
         // Within the short pre-adapter grace, always skip: the run just created
         // its DB row + k8s Job and has not had time to reach adapter.invoke.
@@ -11176,6 +11184,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           jobRunStatuses,
           liveJobRunIds,
         );
+        preAdapterJobLiveness = preAdapterLiveness;
         if (preAdapterLiveness === "alive") {
           // Job is alive: leave a still-provisioning run alone. The one
           // exception is a run wedged pre-adapter past the hard ceiling (45 min)
@@ -11412,6 +11421,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? "Process lost before external adapter invocation -- k8s job terminated or server restarted"
         : buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
 
+      // BLO-16181: durably record what the reap loop already knows about the
+      // backing k8s Job at process_lost mint time -- whether a Job name was ever
+      // stamped, whether we were pre- or post-adapter, and the resolved Job
+      // liveness -- so the fleet-wide process_lost split (BLO-12292) and reattach
+      // feasibility (BLO-12564) can be measured without re-deriving it. No extra
+      // kube round-trip: every signal below is already in hand here. (A confirmed
+      // exact-name 404 never lands here -- that path finalizes as job_missing.)
+      const processLossCapture = buildProcessLossCapture({
+        externalLifecycleRun,
+        preAdapter: externalLifecyclePreAdapter,
+        externalRunId: run.externalRunId,
+        preAdapterJobLiveness,
+      });
+
       let finalizedRun = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
@@ -11420,7 +11443,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           { adapterType, adapterConfig },
           "failed",
           {
-            resultJson: parseObject(run.resultJson),
+            resultJson: { ...parseObject(run.resultJson), processLoss: processLossCapture },
             errorCode: "process_lost",
             errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
           },
