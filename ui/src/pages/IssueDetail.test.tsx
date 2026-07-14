@@ -319,8 +319,24 @@ vi.mock("../components/ScrollToBottom", () => ({
 }));
 
 vi.mock("../components/StatusIcon", () => ({
-  StatusIcon: ({ status, blockerAttention }: { status: string; blockerAttention?: Issue["blockerAttention"] }) => (
-    <span data-status-icon-state={blockerAttention?.state}>{status}</span>
+  StatusIcon: ({
+    status,
+    blockerAttention,
+    onChange,
+  }: {
+    status: string;
+    blockerAttention?: Issue["blockerAttention"];
+    onChange?: (status: string) => void;
+  }) => (
+    <span data-status-icon-state={blockerAttention?.state}>
+      {status}
+      {onChange ? (
+        <>
+          <button type="button" aria-label="Set status to in progress" onClick={() => onChange("in_progress")} />
+          <button type="button" aria-label="Set status to done" onClick={() => onChange("done")} />
+        </>
+      ) : null}
+    </span>
   ),
 }));
 
@@ -889,6 +905,14 @@ async function flushReact() {
   });
 }
 
+async function setTextareaValue(textarea: HTMLTextAreaElement, value: string) {
+  const valueSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+  await act(async () => {
+    valueSetter?.call(textarea, value);
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
 async function waitForAssertion(assertion: () => void, attempts = 20) {
   let lastError: unknown;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -910,6 +934,7 @@ describe("IssueDetail", () => {
   let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
+    vi.clearAllMocks();
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -1001,6 +1026,134 @@ describe("IssueDetail", () => {
         String(call[0]).includes("React has detected a change in the order of Hooks"),
       ),
     ).toBe(false);
+  });
+
+  it("submits request-changes decisions with the required comment atomically", async () => {
+    const reviewIssue = createIssue({
+      status: "in_review",
+      assigneeUserId: "user-1",
+      executionState: {
+        status: "pending",
+        currentStageId: "review-stage-1",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "user", userId: "user-1", agentId: null },
+        returnAssignee: { type: "agent", agentId: "agent-1", userId: null },
+        reviewRequest: { instructions: "Verify the replacement PR." },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
+    });
+    mockIssuesApi.get.mockResolvedValue(reviewIssue);
+    mockIssuesApi.update.mockResolvedValue(createIssue({ status: "in_progress", assigneeAgentId: "agent-1" }));
+    mockAuthApi.getSession.mockResolvedValue({
+      session: { userId: "user-1" },
+      user: { id: "user-1" },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const controls = container.querySelector('[data-testid="issue-review-decision-controls"]');
+    expect(controls?.textContent).toContain("Review requested");
+    expect(controls?.textContent).toContain("Verify the replacement PR.");
+
+    const requestChangesButton = Array.from(controls?.querySelectorAll("button") ?? [])
+      .find((button) => button.textContent?.trim() === "Request changes");
+    expect(requestChangesButton).toBeTruthy();
+    await act(async () => {
+      requestChangesButton!.click();
+    });
+    await flushReact();
+
+    const dialog = container.querySelector('[data-slot="dialog-content"]');
+    const textarea = dialog?.querySelector("textarea") as HTMLTextAreaElement | null;
+    const submitButton = Array.from(dialog?.querySelectorAll("button") ?? [])
+      .find((button) => button.textContent?.trim() === "Request changes") as HTMLButtonElement | undefined;
+    expect(textarea).toBeTruthy();
+    expect(submitButton?.disabled).toBe(true);
+
+    await setTextareaValue(textarea!, "Rebase the PR and restore passing checks.");
+    expect(submitButton?.disabled).toBe(false);
+    await act(async () => {
+      submitButton!.click();
+    });
+    await waitForAssertion(() => {
+      expect(mockIssuesApi.update).toHaveBeenCalledWith("PAP-1", {
+        status: "in_progress",
+        comment: "Rebase the PR and restore passing checks.",
+      });
+    });
+  });
+
+  it("routes review-stage status approval through the required-comment dialog", async () => {
+    const reviewIssue = createIssue({
+      status: "in_review",
+      assigneeUserId: "user-1",
+      executionState: {
+        status: "pending",
+        currentStageId: "approval-stage-1",
+        currentStageIndex: 0,
+        currentStageType: "approval",
+        currentParticipant: { type: "user", userId: "user-1", agentId: null },
+        returnAssignee: { type: "agent", agentId: "agent-1", userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
+    });
+    mockIssuesApi.get.mockResolvedValue(reviewIssue);
+    mockIssuesApi.update.mockResolvedValue(createIssue({ status: "done" }));
+    mockAuthApi.getSession.mockResolvedValue({
+      session: { userId: "user-1" },
+      user: { id: "user-1" },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(container.textContent).toContain("Approval requested");
+    const setDoneButton = container.querySelector('button[aria-label="Set status to done"]') as HTMLButtonElement | null;
+    expect(setDoneButton).toBeTruthy();
+    await act(async () => {
+      setDoneButton!.click();
+    });
+    await flushReact();
+    expect(mockIssuesApi.update).not.toHaveBeenCalled();
+
+    const dialog = container.querySelector('[data-slot="dialog-content"]');
+    expect(dialog?.querySelector("h2")?.textContent).toBe("Approve");
+    const textarea = dialog?.querySelector("textarea") as HTMLTextAreaElement | null;
+    await setTextareaValue(textarea!, "Checks and review evidence are complete.");
+    const approveButton = Array.from(dialog?.querySelectorAll("button") ?? [])
+      .find((button) => button.textContent?.trim() === "Approve");
+    await act(async () => {
+      approveButton!.click();
+    });
+    await waitForAssertion(() => {
+      expect(mockIssuesApi.update).toHaveBeenCalledWith("PAP-1", {
+        status: "done",
+        comment: "Checks and review evidence are complete.",
+      });
+    });
   });
 
   it("hides the plan decomposition panel by default", async () => {

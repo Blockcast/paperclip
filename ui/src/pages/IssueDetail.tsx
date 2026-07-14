@@ -207,6 +207,7 @@ type ActionableIssueThreadInteraction =
   | RequestConfirmationInteraction
   | RequestCheckboxConfirmationInteraction;
 type ResolveRecoveryActionOutcome = "restored" | "false_positive" | "blocked" | "cancelled";
+type ReviewDecisionAction = "approve" | "request_changes";
 type IssueDetailComment = (IssueComment | OptimisticIssueComment) & {
   runId?: string | null;
   runAgentId?: string | null;
@@ -1341,6 +1342,8 @@ export function IssueDetail() {
   const [treeControlReason, setTreeControlReason] = useState("");
   const [treeControlWakeAgentsOnResume, setTreeControlWakeAgentsOnResume] = useState(false);
   const [treeControlCancelConfirmed, setTreeControlCancelConfirmed] = useState(false);
+  const [reviewDecisionAction, setReviewDecisionAction] = useState<ReviewDecisionAction | null>(null);
+  const [reviewDecisionComment, setReviewDecisionComment] = useState("");
   const [optimisticComments, setOptimisticComments] = useState<OptimisticIssueComment[]>([]);
   const [locallyQueuedCommentRunIds, setLocallyQueuedCommentRunIds] = useState<Map<string, string>>(() => new Map());
   const [pendingCommentComposerFocusKey, setPendingCommentComposerFocusKey] = useState(0);
@@ -1526,6 +1529,16 @@ export function IssueDetail() {
     enabled: !!selectedCompanyId,
   });
   const currentUserId = session?.user?.id ?? session?.session?.userId ?? null;
+  const activeExecutionStage = issue?.executionState?.status === "pending"
+    ? issue.executionState
+    : null;
+  const canCurrentUserDecideExecutionStage = Boolean(
+    issue?.status === "in_review"
+    && currentUserId
+    && activeExecutionStage?.currentStageType
+    && activeExecutionStage.currentParticipant?.type === "user"
+    && activeExecutionStage.currentParticipant.userId === currentUserId,
+  );
   const { data: boardAccess } = useQuery({
     queryKey: queryKeys.access.currentBoardAccess,
     queryFn: () => accessApi.getCurrentBoardAccess(),
@@ -1884,10 +1897,22 @@ export function IssueDetail() {
 
       return { previousDetailQueries, previousList, selectedCompanyId };
     },
-    onSuccess: ({ comment: _comment, ...nextIssue }) => {
+    onSuccess: ({ comment, ...nextIssue }) => {
       const issueRefs = new Set<string>([issueId!, nextIssue.id]);
       if (nextIssue.identifier) issueRefs.add(nextIssue.identifier);
       mergeIssueResponseIntoCaches(issueRefs, nextIssue);
+      if (comment) {
+        queryClient.setQueryData<InfiniteData<IssueComment[], string | null>>(
+          queryKeys.issues.comments(issueId!),
+          (current) => current ? {
+            ...current,
+            pages: upsertIssueCommentInPages(current.pages, comment),
+          } : {
+            pageParams: [null],
+            pages: upsertIssueCommentInPages(undefined, comment),
+          },
+        );
+      }
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.activity(issueId!) });
       invalidateIssueCollections();
     },
@@ -1911,6 +1936,34 @@ export function IssueDetail() {
       }
     },
   });
+  const beginReviewDecision = useCallback((action: ReviewDecisionAction) => {
+    setReviewDecisionComment("");
+    setReviewDecisionAction(action);
+  }, []);
+  const handleIssueStatusChange = useCallback((status: string) => {
+    if (canCurrentUserDecideExecutionStage && status !== "in_review") {
+      beginReviewDecision(status === "done" ? "approve" : "request_changes");
+      return;
+    }
+    updateIssue.mutate({ status });
+  }, [beginReviewDecision, canCurrentUserDecideExecutionStage, updateIssue.mutate]);
+  const submitReviewDecision = useCallback(() => {
+    const comment = reviewDecisionComment.trim();
+    if (!reviewDecisionAction || !comment || updateIssue.isPending) return;
+
+    updateIssue.mutate(
+      {
+        status: reviewDecisionAction === "approve" ? "done" : "in_progress",
+        comment,
+      },
+      {
+        onSuccess: () => {
+          setReviewDecisionAction(null);
+          setReviewDecisionComment("");
+        },
+      },
+    );
+  }, [reviewDecisionAction, reviewDecisionComment, updateIssue.isPending, updateIssue.mutate]);
   const resolveRecoveryAction = useMutation({
     mutationFn: (data: {
       actionId?: string;
@@ -3651,7 +3704,7 @@ export function IssueDetail() {
           <StatusIcon
             status={issue.status}
             blockerAttention={issue.blockerAttention}
-            onChange={(status) => updateIssue.mutate({ status })}
+            onChange={handleIssueStatusChange}
           />
           <PriorityIcon
             priority={issue.priority}
@@ -3981,6 +4034,45 @@ export function IssueDetail() {
             await uploadAttachment.mutateAsync(file);
           }}
         />
+
+        {canCurrentUserDecideExecutionStage ? (
+          <div
+            data-testid="issue-review-decision-controls"
+            className="flex flex-col gap-3 rounded-md border border-border bg-muted/30 p-3 sm:flex-row sm:items-center sm:justify-between"
+          >
+            <div className="min-w-0 space-y-1">
+              <p className="text-sm font-medium">
+                {activeExecutionStage?.currentStageType === "approval"
+                  ? "Approval requested"
+                  : "Review requested"}
+              </p>
+              {activeExecutionStage?.reviewRequest?.instructions ? (
+                <p className="whitespace-pre-wrap text-xs leading-5 text-muted-foreground">
+                  {activeExecutionStage.reviewRequest.instructions}
+                </p>
+              ) : null}
+            </div>
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => beginReviewDecision("request_changes")}
+              >
+                <XCircle className="mr-1.5 h-4 w-4" />
+                Request changes
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                onClick={() => beginReviewDecision("approve")}
+              >
+                <Check className="mr-1.5 h-4 w-4" />
+                Approve
+              </Button>
+            </div>
+          </div>
+        ) : null}
       </div>
 
       <PluginSlotOutlet
@@ -4322,6 +4414,67 @@ export function IssueDetail() {
           </TabsContent>
         )}
       </Tabs>
+
+      <Dialog
+        open={reviewDecisionAction !== null}
+        onOpenChange={(open) => {
+          if (!open && !updateIssue.isPending) {
+            setReviewDecisionAction(null);
+            setReviewDecisionComment("");
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-[520px]">
+          <DialogHeader>
+            <DialogTitle>
+              {reviewDecisionAction === "approve" ? "Approve" : "Request changes"}
+            </DialogTitle>
+            <DialogDescription>
+              {reviewDecisionAction === "approve"
+                ? "Record why this work is ready to advance."
+                : "Describe what must change before this work can advance."}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-1.5 py-2">
+            <label htmlFor="issue-review-decision-comment" className="text-sm font-medium">
+              Comment <span className="text-destructive">*</span>
+            </label>
+            <Textarea
+              id="issue-review-decision-comment"
+              value={reviewDecisionComment}
+              onChange={(event) => setReviewDecisionComment(event.target.value)}
+              placeholder={reviewDecisionAction === "approve"
+                ? "Summarize the approval evidence..."
+                : "List the required changes..."}
+              className="min-h-[112px]"
+              autoFocus
+              disabled={updateIssue.isPending}
+            />
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={updateIssue.isPending}
+              onClick={() => {
+                setReviewDecisionAction(null);
+                setReviewDecisionComment("");
+              }}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              disabled={!reviewDecisionComment.trim() || updateIssue.isPending}
+              onClick={submitReviewDecision}
+            >
+              {updateIssue.isPending
+                ? "Saving..."
+                : reviewDecisionAction === "approve" ? "Approve" : "Request changes"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={treeControlOpen} onOpenChange={setTreeControlOpen}>
         <DialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-[560px]">
