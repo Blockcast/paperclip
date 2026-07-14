@@ -104,17 +104,12 @@ async function readSubscriptionSnapshot(client: PaperclipApiClient, uri: string)
   return client.requestJson<HeartbeatRunSnapshot>("GET", `/heartbeat-runs/${encodeURIComponent(parsed.runId)}`);
 }
 
-export function registerHeartbeatRunResources(server: McpServer, client: PaperclipApiClient) {
-  const subscriptions = createHeartbeatRunSubscriptions({
-    server,
-    readSnapshot: (uri) => readSubscriptionSnapshot(client, uri),
-  });
-
-  const previousOnClose = server.server.onclose;
-  server.server.onclose = () => {
-    subscriptions.close();
-    previousOnClose?.();
-  };
+export function registerHeartbeatRunResources(
+  server: McpServer,
+  client: PaperclipApiClient,
+  options: { enableSubscriptions?: boolean } = {},
+) {
+  const enableSubscriptions = options.enableSubscriptions ?? true;
 
   server.registerResource(
     "paperclip-heartbeat-run",
@@ -147,6 +142,19 @@ export function registerHeartbeatRunResources(server: McpServer, client: Papercl
     async (uri) => jsonContents(uri.toString(), await readHeartbeatRunResource(client, uri.toString())),
   );
 
+  if (!enableSubscriptions) return;
+
+  // Stateful-only: live push-subscriptions delivered over the standing SSE
+  // stream. Requires a session, so it is wired only for stateful transports.
+  const subscriptions = createHeartbeatRunSubscriptions({
+    server,
+    readSnapshot: (uri) => readSubscriptionSnapshot(client, uri),
+  });
+  const previousOnClose = server.server.onclose;
+  server.server.onclose = () => {
+    subscriptions.close();
+    previousOnClose?.();
+  };
   server.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
   server.server.setRequestHandler(SubscribeRequestSchema, async (request) => {
     await subscriptions.subscribe(request.params.uri);
