@@ -604,8 +604,9 @@ function resolveEventContext(
       const action = payload.action as string | undefined;
       // Wake on the events that change reviewer expectations: opened (CI
       // starts), reopened (manual retry / renewed review signal),
-      // ready_for_review (draft -> ready), synchronize (author pushed a
-      // fixup after an earlier review), closed (merged or abandoned).
+      // ready_for_review (draft -> ready), converted_to_draft (ready -> draft),
+      // synchronize (author pushed a fixup after an earlier review), closed
+      // (merged or abandoned).
       //
       // synchronize fires once per push. We don't fan out one reviewer run per
       // push: active reviewer runs are coalesced by the PR-scoped task key, and
@@ -617,6 +618,7 @@ function resolveEventContext(
         action !== "opened" &&
         action !== "reopened" &&
         action !== "ready_for_review" &&
+        action !== "converted_to_draft" &&
         action !== "synchronize" &&
         action !== "closed"
       ) return null;
@@ -626,6 +628,7 @@ function resolveEventContext(
         opened: "github_pr_opened",
         reopened: "github_pr_reopened",
         ready_for_review: "github_pr_ready_for_review",
+        converted_to_draft: "github_pr_converted_to_draft",
         synchronize: "github_pr_synchronized",
         closed: "github_pr_closed",
       };
@@ -1074,15 +1077,19 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       prReviewerBotLogin: config.prReviewerBotLogin,
     });
 
-    // A closed PR cannot produce useful reviewer work. Retire every queued
-    // run for its stable task scope so merged/abandoned PRs do not consume the
-    // reviewer's single external-lifecycle slot hours later. Running reviews
-    // are left alone: they may already be posting a final result, and forcibly
-    // deleting their Job would be more disruptive than letting them finish.
+    // A closed or newly-drafted PR cannot produce useful reviewer work. Retire
+    // every queued or scheduled-retry run for its stable task scope so it does
+    // not consume the reviewer's single external-lifecycle slot hours later.
+    // Running reviews are left alone: they may already be posting a final
+    // result, and forcibly deleting their Job would be more disruptive than
+    // letting them finish.
     const reviewerRunsCancelled = await (async () => {
+      const reviewerWorkRetired =
+        context?.wakeReason === "github_pr_closed" ||
+        context?.wakeReason === "github_pr_converted_to_draft";
       if (
         !config.prReviewerAgentId ||
-        context?.wakeReason !== "github_pr_closed" ||
+        !reviewerWorkRetired ||
         typeof context.prNumber !== "number"
       ) {
         return 0;
@@ -1096,20 +1103,23 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         pluginWorkerManager: config.pluginWorkerManager,
         ...config.heartbeatOptions,
       });
-      const cancelled = await heartbeat.cancelQueuedRunsForTask(
+      const cancelled = await heartbeat.cancelPendingRunsForTask(
         config.prReviewerAgentId,
         reviewerTaskKey,
-        `Cancelled because GitHub PR ${context.repoFullName ?? "unknown"}#${context.prNumber} closed before review dispatch`,
+        `Cancelled because GitHub PR ${context.repoFullName ?? "unknown"}#${context.prNumber} ${
+          context.wakeReason === "github_pr_closed" ? "closed" : "became a draft"
+        } before review dispatch`,
       );
       logger.info(
         {
           deliveryId,
           repoFullName: context.repoFullName,
           prNumber: context.prNumber,
+          wakeReason: context.wakeReason,
           reviewerTaskKey,
           cancelled,
         },
-        "github webhook retired queued reviewer runs for closed PR",
+        "github webhook retired pending reviewer runs for PR lifecycle transition",
       );
       return cancelled;
     })();
@@ -1131,8 +1141,9 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     //   - pull_request_review.submitted — request a counter-review pass; the
     //       reviewer's OWN posted review is filtered as a self-echo (BLO-15799,
     //       see isReviewerSelfEchoReview).
-    // (pull_request.closed retires queued work above; check_run/workflow_run
-    //  are handled by the issue-assignee CI-completion path.)
+    // (pull_request.closed/converted_to_draft retire pending work above;
+    //  check_run/workflow_run are handled by the issue-assignee CI-completion
+    //  path.)
     const reviewerWakeFired = await (async () => {
       if (!config.prReviewerAgentId) return false;
       if (!shouldFirePrReviewerWake(context)) return false;
@@ -1482,15 +1493,16 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       (recoveryInstance ??= recoveryService(db, { enqueueWakeup: heartbeat.wakeup }));
     const actionableReviewFeedback = isActionableReviewFeedbackContext(context);
 
-    // pull_request.synchronize is a reviewer-only signal. The reviewer wake
-    // above is PR-scoped: active runs coalesce on taskKey, and duplicate request
-    // rows are skipped by the idempotency precheck. The author-assignee wake
-    // below is deliberately not driven by synchronize: the assignee is the one
-    // who just pushed, so waking them per push would be redundant and would fan
-    // out one author run per push. The author still gets woken by
-    // check_run/workflow_run on terminal CI and by review-submitted/@ally
-    // feedback, as before.
+    // synchronize and converted_to_draft are reviewer-lifecycle signals. The
+    // reviewer wake above is PR-scoped: active runs coalesce on taskKey, and
+    // duplicate request rows are skipped by the idempotency precheck. The
+    // author-assignee wake below is deliberately not driven by either event:
+    // the author just pushed or drafted the PR, so waking them would be
+    // redundant. The author still gets woken by check_run/workflow_run on
+    // terminal CI and by review-submitted/@ally feedback, as before.
     const synchronizeReviewerOnly = context.wakeReason === "github_pr_synchronized";
+    const suppressAuthorWake =
+      synchronizeReviewerOnly || context.wakeReason === "github_pr_converted_to_draft";
     if (
       eventName === "pull_request" &&
       synchronizeReviewerOnly &&
@@ -1507,7 +1519,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       );
     }
 
-    for (const issue of synchronizeReviewerOnly ? [] : matched) {
+    for (const issue of suppressAuthorWake ? [] : matched) {
       // Terminal-status issues don't need to wake -- the assignee
       // shouldn't reopen `done`/`cancelled` work just because a stale
       // CI ping arrived.

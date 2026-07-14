@@ -177,11 +177,116 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
     expect(wakeups.filter((wake) => wake.status === "coalesced")).toHaveLength(11);
   });
 
-  it("waits for an in-flight enqueue before retiring a closed PR task scope", async () => {
+  it("coalesces with a scheduled retry created while the enqueue waits for the agent lock", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const scheduledRunId = randomUUID();
+    const taskKey = "pr_review:Blockcast/penstock-vault-node:191";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Review Retry Race Co",
+      status: "active",
+      issuePrefix: "RRR",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Ally",
+      role: "reviewer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    let announceRetryLock!: () => void;
+    let releaseRetryLock!: () => void;
+    const retryLockHeld = new Promise<void>((resolve) => {
+      announceRetryLock = resolve;
+    });
+    const retryMayCommit = new Promise<void>((resolve) => {
+      releaseRetryLock = resolve;
+    });
+
+    const inFlightRetry = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select id from agents where id = ${agentId} and company_id = ${companyId} for update`,
+      );
+      announceRetryLock();
+      await retryMayCommit;
+
+      await tx.insert(heartbeatRuns).values({
+        id: scheduledRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "scheduled_retry",
+        scheduledRetryAt: new Date(Date.now() + 5 * 60 * 1000),
+        scheduledRetryReason: "ccrotate_capacity",
+        contextSnapshot: {
+          taskKey,
+          reviewKind: "pr_review",
+          wakeReason: "github_pr_synchronized",
+          githubHeadSha: "old-head",
+        },
+      });
+    });
+
+    await retryLockHeld;
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+    const enqueue = heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "github_pr_review_requested",
+      payload: { taskKey, deliveryId: "review-request-delivery" },
+      contextSnapshot: {
+        taskKey,
+        reviewKind: "pr_review",
+        wakeReason: "github_pr_review_requested",
+        githubHeadSha: "new-head",
+      },
+      idempotencyKey: `${taskKey}:github_pr_review_requested`,
+    });
+
+    const outcomeBeforeCommit = await Promise.race([
+      enqueue.then(() => "enqueued" as const),
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100)),
+    ]);
+    releaseRetryLock();
+    expect(outcomeBeforeCommit).toBe("blocked");
+
+    await inFlightRetry;
+    const result = await enqueue;
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const wakeups = await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.id).toBe(scheduledRunId);
+    expect(runs[0]?.status).toBe("scheduled_retry");
+    expect(runs[0]?.contextSnapshot).toMatchObject({
+      wakeReason: "github_pr_review_requested",
+      githubHeadSha: "new-head",
+    });
+    expect(result?.id).toBe(scheduledRunId);
+    expect(wakeups.filter((wake) => wake.status === "coalesced")).toHaveLength(1);
+  });
+
+  it("waits for in-flight pending work before retiring a closed PR task scope", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const wakeupId = randomUUID();
     const runId = randomUUID();
+    const scheduledRunId = randomUUID();
     const taskKey = "pr_review:Blockcast/penstock-vault-node:190";
 
     await db.insert(companies).values({
@@ -243,11 +348,26 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
           wakeReason: "github_pr_synchronized",
         },
       });
+      await tx.insert(heartbeatRuns).values({
+        id: scheduledRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "scheduled_retry",
+        scheduledRetryAt: new Date(Date.now() + 5 * 60 * 1000),
+        scheduledRetryReason: "ccrotate_capacity",
+        contextSnapshot: {
+          taskKey,
+          reviewKind: "pr_review",
+          wakeReason: "github_pr_synchronized",
+        },
+      });
     });
 
     await enqueueLockHeld;
     const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
-    const cancellation = heartbeat.cancelQueuedRunsForTask(
+    const cancellation = heartbeat.cancelPendingRunsForTask(
       agentId,
       taskKey,
       "PR closed during enqueue",
@@ -261,17 +381,18 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
     expect(outcomeBeforeCommit).toBe("blocked");
 
     await inFlightEnqueue;
-    await expect(cancellation).resolves.toBe(1);
+    await expect(cancellation).resolves.toBe(2);
 
-    const [run] = await db
+    const retiredRuns = await db
       .select({ status: heartbeatRuns.status })
       .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId));
+      .where(eq(heartbeatRuns.agentId, agentId));
     const [wakeup] = await db
       .select({ status: agentWakeupRequests.status })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.id, wakeupId));
-    expect(run?.status).toBe("cancelled");
+    expect(retiredRuns).toHaveLength(2);
+    expect(retiredRuns.every((run) => run.status === "cancelled")).toBe(true);
     expect(wakeup?.status).toBe("cancelled");
   });
 });

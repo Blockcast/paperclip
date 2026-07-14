@@ -239,11 +239,27 @@ describe("github-webhook pure helpers", () => {
       },
       repository: { full_name: "Blockcast/paperclip" },
     });
+    const converted = __test_resolveEventContext("pull_request", {
+      action: "converted_to_draft",
+      pull_request: {
+        number: 201,
+        title: "Draft queue work",
+        draft: true,
+        html_url: "https://github.com/Blockcast/paperclip/pull/201",
+        head: { ref: "draft/reviewer-queue", sha: "draft-again-sha" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
 
     expect(openedDraft).toMatchObject({ prDraft: true, wakeReason: "github_pr_opened" });
     expect(__test_shouldFirePrReviewerWake(openedDraft)).toBe(false);
     expect(ready).toMatchObject({ prDraft: false, wakeReason: "github_pr_ready_for_review" });
     expect(__test_shouldFirePrReviewerWake(ready)).toBe(true);
+    expect(converted).toMatchObject({
+      prDraft: true,
+      wakeReason: "github_pr_converted_to_draft",
+    });
+    expect(__test_shouldFirePrReviewerWake(converted)).toBe(false);
   });
 
   it("extracts the PR author login from pull_request.opened for the self-review-skip gate (BLO-9293)", () => {
@@ -1163,6 +1179,84 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .where(eq(agentWakeupRequests.agentId, agentId));
     expect(runs.map((run) => run.status)).toEqual(["cancelled", "cancelled"]);
     expect(wakeups.map((wake) => wake.status)).toEqual(["cancelled", "cancelled"]);
+  });
+
+  it("cancels pending reviewer work when the PR becomes a draft", async () => {
+    const { companyId, agentId: authorAgentId } = await seedIssueWithIdentifier("BLO-982");
+    const reviewerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const taskKey = "pr_review:Blockcast/paperclip:982";
+    const runId = randomUUID();
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: reviewerAgentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 5 * 60 * 1000),
+      scheduledRetryReason: "ccrotate_capacity",
+      contextSnapshot: {
+        taskKey,
+        reviewKind: "pr_review",
+        wakeReason: "github_pr_synchronized",
+        githubPrNumber: 982,
+        githubRepoFullName: "Blockcast/paperclip",
+      },
+    });
+
+    const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+    const payload = {
+      action: "converted_to_draft",
+      pull_request: {
+        number: 982,
+        title: "BLO-982 Pause reviewer work",
+        body: null,
+        draft: true,
+        html_url: "https://github.com/Blockcast/paperclip/pull/982",
+        merged: false,
+        head: { ref: "draft/reviewer-queue", sha: "head-sha" },
+        user: { login: "codex" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const response = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-pr-converted-to-draft")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      wakes: [],
+      reviewerRunsCancelled: 1,
+    });
+
+    const [run] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("cancelled");
+
+    const authorWakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, authorAgentId));
+    expect(authorWakes).toEqual([]);
   });
 
   it("does not permanently block reviewer wakes once a dispatch retry chain is exhausted (BLO-14395 regression)", async () => {

@@ -313,6 +313,7 @@ const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
+const TASK_SCOPE_COALESCIBLE_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
@@ -4298,7 +4299,7 @@ async function coalesceQueuedGithubStateWake(input: {
   return mergedRun;
 }
 
-async function coalesceQueuedTaskScopeWake(input: {
+async function coalescePendingTaskScopeWake(input: {
   tx: WakeCoalescingDb;
   companyId: string;
   agentId: string;
@@ -4321,7 +4322,7 @@ async function coalesceQueuedTaskScopeWake(input: {
       and(
         eq(heartbeatRuns.companyId, input.companyId),
         eq(heartbeatRuns.agentId, input.agentId),
-        eq(heartbeatRuns.status, "queued"),
+        inArray(heartbeatRuns.status, TASK_SCOPE_COALESCIBLE_RUN_STATUSES),
         eq(heartbeatRuns.contextTaskKey, input.taskKey),
       ),
     )
@@ -4344,7 +4345,12 @@ async function coalesceQueuedTaskScopeWake(input: {
       contextSnapshot: mergedContextSnapshot,
       updatedAt: now,
     })
-    .where(and(eq(heartbeatRuns.id, existingRun.id), eq(heartbeatRuns.status, "queued")))
+    .where(
+      and(
+        eq(heartbeatRuns.id, existingRun.id),
+        inArray(heartbeatRuns.status, TASK_SCOPE_COALESCIBLE_RUN_STATUSES),
+      ),
+    )
     .returning()
     .then((rows) => rows[0] ?? existingRun);
 
@@ -4382,7 +4388,7 @@ async function coalesceQueuedTaskScopeWake(input: {
       taskKey: input.taskKey,
       wakeReason: input.reason,
     },
-    "task-scoped wake coalesced into queued heartbeat run under agent lock",
+    "task-scoped wake coalesced into pending heartbeat run under agent lock",
   );
 
   return mergedRun;
@@ -16216,10 +16222,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
 
       // The optimistic same-scope lookup above avoids taking the lock in the
-      // common case. Re-check after acquiring it so two API replicas handling
-      // the same delivery cannot both observe an empty queue and insert two
-      // heartbeat runs. Keep a coalesced wake row for audit, but only one run.
-      const coalescedTaskScopeRun = await coalesceQueuedTaskScopeWake({
+      // common case. Re-check after acquiring it so a queued run or a
+      // capacity-deferred scheduled retry that appeared meanwhile absorbs the
+      // new wake. Keep a coalesced wake row for audit, but only one run.
+      const coalescedTaskScopeRun = await coalescePendingTaskScopeWake({
         tx,
         companyId: agent.companyId,
         agentId,
@@ -16659,7 +16665,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     eventPayload?: Record<string, unknown>;
   };
 
-  async function cancelQueuedRunsForTaskInternal(
+  async function cancelPendingRunsForTaskInternal(
     agentId: string,
     taskKey: string,
     reason: string,
@@ -16686,7 +16692,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(
           and(
             eq(heartbeatRuns.agentId, agentId),
-            eq(heartbeatRuns.status, "queued"),
+            inArray(heartbeatRuns.status, TASK_SCOPE_COALESCIBLE_RUN_STATUSES),
             eq(heartbeatRuns.contextTaskKey, taskKey),
           ),
         )
@@ -16733,7 +16739,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: "queued task-scoped run cancelled",
+        message: "pending task-scoped run cancelled",
         payload: { taskKey },
       });
     }
@@ -17414,8 +17420,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) => cancelRunInternal(runId, reason, options),
 
-    cancelQueuedRunsForTask: (agentId: string, taskKey: string, reason: string) =>
-      cancelQueuedRunsForTaskInternal(agentId, taskKey, reason),
+    cancelPendingRunsForTask: (agentId: string, taskKey: string, reason: string) =>
+      cancelPendingRunsForTaskInternal(agentId, taskKey, reason),
 
     cancelActiveForAgent: (agentId: string, reason?: string) => cancelActiveForAgentInternal(agentId, reason),
 
