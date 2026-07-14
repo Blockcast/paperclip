@@ -347,6 +347,10 @@ interface ResolvedEventContext {
   // gate can confirm an intentional self-review skip is on a genuinely
   // bot-authored PR. Distinct from reviewAuthorLogin (the review *event* author).
   prAuthorLogin?: string | null;
+  // pull_request events only. Drafts are not reviewable until GitHub emits
+  // ready_for_review, so opened/reopened/synchronize must not consume a
+  // reviewer slot while this is true.
+  prDraft?: boolean;
   // issue_comment.created only -- drives reviewer reruns requested by
   // an operator via "@ally" in a PR comment.
   commentId?: number | null;
@@ -637,6 +641,7 @@ function resolveEventContext(
         eventUrl: collected.url,
         headSha: collected.headSha,
         prAuthorLogin: collected.authorLogin,
+        prDraft: pr?.draft === true,
         // Merge metadata for forward-capture. additions/deletions are present
         // on the pull_request payload; per-file authored-LOC needs a follow-up
         // pulls/{n}/files fetch (enrichment), so it is not read here.
@@ -737,6 +742,7 @@ function isReviewerSelfEchoReview(
 
 function shouldFirePrReviewerWake(context: ResolvedEventContext | null): context is ResolvedEventContext & { prNumber: number } {
   if (!context || !context.wakeReason || typeof context.prNumber !== "number") return false;
+  if (context.prDraft && context.wakeReason !== "github_pr_ready_for_review") return false;
   return new Set([
     "github_pr_opened",
     "github_pr_reopened",
@@ -1068,6 +1074,46 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       prReviewerBotLogin: config.prReviewerBotLogin,
     });
 
+    // A closed PR cannot produce useful reviewer work. Retire every queued
+    // run for its stable task scope so merged/abandoned PRs do not consume the
+    // reviewer's single external-lifecycle slot hours later. Running reviews
+    // are left alone: they may already be posting a final result, and forcibly
+    // deleting their Job would be more disruptive than letting them finish.
+    const reviewerRunsCancelled = await (async () => {
+      if (
+        !config.prReviewerAgentId ||
+        context?.wakeReason !== "github_pr_closed" ||
+        typeof context.prNumber !== "number"
+      ) {
+        return 0;
+      }
+
+      const reviewerTaskKey = buildPrReviewerTaskKey({
+        ...context,
+        prNumber: context.prNumber,
+      });
+      const heartbeat = heartbeatService(db, {
+        pluginWorkerManager: config.pluginWorkerManager,
+        ...config.heartbeatOptions,
+      });
+      const cancelled = await heartbeat.cancelQueuedRunsForTask(
+        config.prReviewerAgentId,
+        reviewerTaskKey,
+        `Cancelled because GitHub PR ${context.repoFullName ?? "unknown"}#${context.prNumber} closed before review dispatch`,
+      );
+      logger.info(
+        {
+          deliveryId,
+          repoFullName: context.repoFullName,
+          prNumber: context.prNumber,
+          reviewerTaskKey,
+          cancelled,
+        },
+        "github webhook retired queued reviewer runs for closed PR",
+      );
+      return cancelled;
+    })();
+
     // PR-review wake fires independently of the identifier-matching
     // issue-assignee wake below: it targets a dedicated reviewer agent so
     // PRs without a paperclip identifier in the branch/title/body still
@@ -1077,15 +1123,16 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     //   - pull_request.reopened        — explicit retry / renewed review signal
     //   - pull_request.ready_for_review — draft promoted to ready
     //   - pull_request.synchronize     — author pushed a fixup after a review;
-    //       active reviewer runs are coalesced by the stable PR-scoped taskKey,
-    //       and duplicate wake requests are skipped by the PR+reason
-    //       idempotency precheck, so rapid pushes don't fan out per push.
+    //       reviewer runs are coalesced by the stable PR-scoped taskKey under
+    //       the same per-agent lock used by close retirement, and duplicate
+    //       wake requests are skipped by the PR+reason idempotency precheck, so
+    //       rapid pushes don't fan out per push.
     //   - issue_comment.created with @ally — explicit operator re-review request
     //   - pull_request_review.submitted — request a counter-review pass; the
     //       reviewer's OWN posted review is filtered as a self-echo (BLO-15799,
     //       see isReviewerSelfEchoReview).
-    // (We deliberately skip pull_request.closed and check_run/workflow_run —
-    //  those are post-merge signals or duplicate the CI-completion path.)
+    // (pull_request.closed retires queued work above; check_run/workflow_run
+    //  are handled by the issue-assignee CI-completion path.)
     const reviewerWakeFired = await (async () => {
       if (!config.prReviewerAgentId) return false;
       if (!shouldFirePrReviewerWake(context)) return false;
@@ -1292,6 +1339,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         ok: true,
         ignored: "no_paperclip_identifier",
         reviewerWakeFired,
+        reviewerRunsCancelled,
         dependabotWakeFired,
       });
       return;
@@ -1668,6 +1716,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       wakes,
       skipped,
       reopened,
+      reviewerRunsCancelled,
       ...(backLinked.length ? { backLinked } : {}),
       ...(escalated.length ? { escalated } : {}),
     });

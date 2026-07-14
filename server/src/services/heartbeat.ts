@@ -283,6 +283,7 @@ const STALE_QUEUED_MAINTENANCE_WAKE_REASONS = [
   "provider_quota_exhausted_recovered",
   "transient_failure_retry",
 ] as const;
+export const PR_REVIEW_QUEUE_FAIRNESS_MAX_WAIT_MS = 10 * 60 * 1000;
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
@@ -582,6 +583,37 @@ function isPrReviewRetryContext(contextSnapshot: Record<string, unknown>) {
   if (reviewKind === "pr_review") return true;
   const taskKey = readNonEmptyString(contextSnapshot.taskKey);
   return taskKey?.startsWith("pr_review:") === true;
+}
+
+type PrReviewFairnessRun = Pick<
+  typeof heartbeatRuns.$inferSelect,
+  "id" | "createdAt" | "contextSnapshot"
+>;
+
+export function selectAgedPrReviewRunForFairDispatch(
+  queuedRuns: PrReviewFairnessRun[],
+  lastStartedRun: Pick<PrReviewFairnessRun, "contextSnapshot"> | null,
+  now = new Date(),
+) {
+  if (
+    lastStartedRun &&
+    isPrReviewRetryContext(parseObject(lastStartedRun.contextSnapshot))
+  ) {
+    return null;
+  }
+
+  const cutoff = now.getTime() - PR_REVIEW_QUEUE_FAIRNESS_MAX_WAIT_MS;
+  return queuedRuns
+    .filter(
+      (run) =>
+        run.createdAt.getTime() <= cutoff &&
+        isPrReviewRetryContext(parseObject(run.contextSnapshot)),
+    )
+    .sort(
+      (left, right) =>
+        left.createdAt.getTime() - right.createdAt.getTime() ||
+        left.id.localeCompare(right.id),
+    )[0]?.id ?? null;
 }
 
 /**
@@ -4233,6 +4265,96 @@ async function coalesceQueuedGithubStateWake(input: {
       coalescedEventCount,
     },
     "github state-change wake coalesced into existing queued heartbeat run",
+  );
+
+  return mergedRun;
+}
+
+async function coalesceQueuedTaskScopeWake(input: {
+  tx: WakeCoalescingDb;
+  companyId: string;
+  agentId: string;
+  source: string;
+  triggerDetail: string | null;
+  reason: string | null;
+  payload: Record<string, unknown> | null;
+  contextSnapshot: Record<string, unknown>;
+  taskKey: string | null;
+  requestedByActorType: WakeupOptions["requestedByActorType"] | null | undefined;
+  requestedByActorId: WakeupOptions["requestedByActorId"] | null | undefined;
+  idempotencyKey: string | null | undefined;
+}) {
+  if (!input.taskKey) return null;
+
+  const existingRun = await input.tx
+    .select()
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+        eq(heartbeatRuns.status, "queued"),
+        eq(heartbeatRuns.contextTaskKey, input.taskKey),
+      ),
+    )
+    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+
+  if (!existingRun) return null;
+
+  const now = new Date();
+  const mergedContextSnapshot = mergeCoalescedContextSnapshot(
+    existingRun.contextSnapshot,
+    input.contextSnapshot,
+  );
+  const mergedRun = await input.tx
+    .update(heartbeatRuns)
+    .set({
+      invocationSource: input.source,
+      triggerDetail: input.triggerDetail,
+      contextSnapshot: mergedContextSnapshot,
+      updatedAt: now,
+    })
+    .where(and(eq(heartbeatRuns.id, existingRun.id), eq(heartbeatRuns.status, "queued")))
+    .returning()
+    .then((rows) => rows[0] ?? existingRun);
+
+  if (mergedRun.wakeupRequestId) {
+    await input.tx
+      .update(agentWakeupRequests)
+      .set({
+        coalescedCount: sql`coalesce(${agentWakeupRequests.coalescedCount}, 0) + 1`,
+        updatedAt: now,
+      })
+      .where(eq(agentWakeupRequests.id, mergedRun.wakeupRequestId));
+  }
+
+  await input.tx.insert(agentWakeupRequests).values({
+    companyId: input.companyId,
+    agentId: input.agentId,
+    source: input.source,
+    triggerDetail: input.triggerDetail,
+    reason: "task_scope_queued_coalesced",
+    payload: input.payload,
+    status: "coalesced",
+    coalescedCount: 1,
+    requestedByActorType: input.requestedByActorType ?? null,
+    requestedByActorId: input.requestedByActorId ?? null,
+    idempotencyKey: input.idempotencyKey ?? null,
+    runId: mergedRun.id,
+    finishedAt: now,
+  });
+
+  logger.info(
+    {
+      companyId: input.companyId,
+      agentId: input.agentId,
+      runId: mergedRun.id,
+      taskKey: input.taskKey,
+      wakeReason: input.reason,
+    },
+    "task-scoped wake coalesced into queued heartbeat run under agent lock",
   );
 
   return mergedRun;
@@ -11644,7 +11766,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       const issueById = new Map(issueRows.map((row) => [row.id, row]));
       const companyAgents = await listCompanyAgentOrgRows(agent.companyId);
+      const hasAgedPrReview = queuedRuns.some(
+        (run) =>
+          run.createdAt.getTime() <=
+            dispatchNow.getTime() - PR_REVIEW_QUEUE_FAIRNESS_MAX_WAIT_MS &&
+          isPrReviewRetryContext(parseObject(run.contextSnapshot)),
+      );
+      const lastStartedRun = hasAgedPrReview
+        ? await db
+          .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.agentId, agentId),
+              isNotNull(heartbeatRuns.startedAt),
+            ),
+          )
+          .orderBy(desc(heartbeatRuns.startedAt), desc(heartbeatRuns.createdAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+        : null;
+      // Issue work remains the normal priority order. Once a PR review has
+      // waited ten minutes, let exactly one aged review jump the queue unless
+      // the previous dispatch was already a review. This alternates under
+      // sustained load instead of starving either issue execution or review.
+      const fairnessPromotedPrReviewRunId = selectAgedPrReviewRunForFairDispatch(
+        queuedRuns,
+        lastStartedRun,
+        dispatchNow,
+      );
       const prioritizedRuns = [...queuedRuns].sort((left, right) => {
+        if (left.id === fairnessPromotedPrReviewRunId && right.id !== fairnessPromotedPrReviewRunId) {
+          return -1;
+        }
+        if (right.id === fairnessPromotedPrReviewRunId && left.id !== fairnessPromotedPrReviewRunId) {
+          return 1;
+        }
         const leftIssueId = readNonEmptyString(parseObject(left.contextSnapshot).issueId);
         const rightIssueId = readNonEmptyString(parseObject(right.contextSnapshot).issueId);
         const leftReadiness = leftIssueId ? dependencyReadiness.get(leftIssueId) : null;
@@ -15880,6 +16037,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
       );
 
+      // The optimistic same-scope lookup above avoids taking the lock in the
+      // common case. Re-check after acquiring it so two API replicas handling
+      // the same delivery cannot both observe an empty queue and insert two
+      // heartbeat runs. Keep a coalesced wake row for audit, but only one run.
+      const coalescedTaskScopeRun = await coalesceQueuedTaskScopeWake({
+        tx,
+        companyId: agent.companyId,
+        agentId,
+        source,
+        triggerDetail,
+        reason,
+        payload,
+        contextSnapshot: enrichedContextSnapshot,
+        taskKey: effectiveTaskKey,
+        requestedByActorType: opts.requestedByActorType,
+        requestedByActorId: opts.requestedByActorId,
+        idempotencyKey: opts.idempotencyKey,
+      });
+      if (coalescedTaskScopeRun) {
+        return { kind: "coalesced" as const, run: coalescedTaskScopeRun };
+      }
+
       const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, policy, {}, tx);
       if (dailyCapBlock) {
         const now = new Date();
@@ -16301,6 +16480,90 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     eventMessage?: string;
     eventPayload?: Record<string, unknown>;
   };
+
+  async function cancelQueuedRunsForTaskInternal(
+    agentId: string,
+    taskKey: string,
+    reason: string,
+  ) {
+    const finishedAt = new Date();
+    const cancelledRuns = await db.transaction(async (tx) => {
+      // Serialize task-scope retirement with wakeup's enqueue re-check. Without
+      // the shared agent lock, a concurrent webhook could hold the enqueue
+      // lock, insert after this UPDATE observed no rows, and leave review work
+      // queued for a PR that has already closed.
+      await tx.execute(
+        sql`select id from agents where id = ${agentId} for update`,
+      );
+
+      const runs = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "cancelled",
+          finishedAt,
+          error: reason,
+          errorCode: "task_scope_cancelled",
+          updatedAt: finishedAt,
+        })
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.status, "queued"),
+            eq(heartbeatRuns.contextTaskKey, taskKey),
+          ),
+        )
+        .returning();
+
+      const wakeupRequestIds = runs
+        .map((run) => run.wakeupRequestId)
+        .filter((id): id is string => Boolean(id));
+      if (wakeupRequestIds.length > 0) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            status: "cancelled",
+            finishedAt,
+            error: reason,
+            updatedAt: finishedAt,
+          })
+          .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
+      }
+
+      return runs;
+    });
+
+    if (cancelledRuns.length === 0) return 0;
+
+    for (const run of cancelledRuns) {
+      publishLiveEvent({
+        companyId: run.companyId,
+        type: "heartbeat.run.status",
+        payload: {
+          runId: run.id,
+          agentId: run.agentId,
+          status: run.status,
+          invocationSource: run.invocationSource,
+          triggerDetail: run.triggerDetail,
+          error: run.error ?? null,
+          errorCode: run.errorCode ?? null,
+          startedAt: run.startedAt ? new Date(run.startedAt).toISOString() : null,
+          finishedAt: run.finishedAt ? new Date(run.finishedAt).toISOString() : null,
+        },
+      });
+      publishRunLifecyclePluginEvent(run);
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "queued task-scoped run cancelled",
+        payload: { taskKey },
+      });
+    }
+
+    await finalizeAgentStatus(agentId, "cancelled");
+    await startNextQueuedRunForAgent(agentId);
+    return cancelledRuns.length;
+  }
 
   async function cancelRunInternal(runId: string, reason = "Cancelled by control plane", options: CancelRunOptions = {}) {
     const run = await getRun(runId);
@@ -16972,6 +17235,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) => cancelRunInternal(runId, reason, options),
+
+    cancelQueuedRunsForTask: (agentId: string, taskKey: string, reason: string) =>
+      cancelQueuedRunsForTaskInternal(agentId, taskKey, reason),
 
     cancelActiveForAgent: (agentId: string, reason?: string) => cancelActiveForAgentInternal(agentId, reason),
 
