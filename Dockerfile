@@ -187,7 +187,8 @@ WORKDIR /vendor
 # and UID before polling or cleanup. A missing/rejected acknowledgment deletes
 # the Job and fails closed with k8s_job_identity_unacknowledged. PR
 # kkroo/paperclip-adapter-claude-k8s#17; focused suite 86/86 and typecheck pass.
-ARG CLAUDE_K8S_REF=5f1d0276d7ebb9aac0af2f7b6de216ab5c98a300
+# Bumped 2026-07-14 for PEN-1305 PreToolUse env-guard (PR kkroo/paperclip-adapter-claude-k8s#18)
+ARG CLAUDE_K8S_REF=a1ca578f6714eeb2c769a3f5210d445b7a0c5157
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
@@ -318,7 +319,8 @@ ARG CLAUDE_K8S_REF=5f1d0276d7ebb9aac0af2f7b6de216ab5c98a300
 # and UID before polling or cleanup. A missing/rejected acknowledgment deletes
 # the Job and fails closed with k8s_job_identity_unacknowledged. PR
 # kkroo/paperclip-adapter-opencode-k8s#43; focused suite 114/114 and typecheck pass.
-ARG OPENCODE_K8S_REF=0a848687bcc32f175ac0b2d1699f729d49447998
+# Bumped 2026-07-14 for PEN-1305 permission.bash env-dump deny (PR kkroo/paperclip-adapter-opencode-k8s#44)
+ARG OPENCODE_K8S_REF=82b0b0427b9d3f161a1b5d8487bdd31fd465194b
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
