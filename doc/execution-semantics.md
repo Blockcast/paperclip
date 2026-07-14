@@ -218,6 +218,8 @@ The accepted interaction by itself is only evidence that the plan was approved. 
 
 If the live run disappears, Paperclip must repair, resume, or visibly block the existing claim. It must not leave the source issue in a state where a second run can interpret the same acceptance as fresh permission to create sibling issues again.
 
+Once decomposition completes and the umbrella's remaining work is "wait for the children to finish," the umbrella must hold a first-class waiting path — a `blocked`-by-children state, an active monitor, or an `in_review` park — not merely `in_progress` resting on `parentId` rollup. `parentId` is not a dependency, so an `in_progress` umbrella with no run, no wake, and no blockers looks stranded to recovery. If the executor instead parks the continuation as waiting-for-review, recovery converts that park into the right waiting state (see "Deliberate wait is not a lost run" under §9.2).
+
 ### Concurrent and repeat attempts
 
 Every later run that encounters the same accepted-plan fingerprint must consult the durable claim/result before creating children.
