@@ -1448,6 +1448,8 @@ export interface PluginIssuesClient {
     originKind?: PluginIssueOriginKind;
     originKindPrefix?: string;
     originId?: string;
+    /** Filter by the secondary origin dedup key — see `create`'s `originFingerprint`. */
+    originFingerprint?: string;
     status?: Issue["status"];
     includePluginOperations?: boolean;
     limit?: number;
@@ -1494,6 +1496,16 @@ export interface PluginIssuesClient {
     originKind?: PluginIssueOriginKind;
     originId?: string | null;
     originRunId?: string | null;
+    /**
+     * Secondary dedup key, orthogonal to `originId`. Some origin kinds carry
+     * a partial unique DB index on `(companyId, originKind,
+     * originFingerprint)`; a `create()` call that collides with an existing
+     * open row for that slot rejects with a 409 conflict (message includes
+     * "conflict") instead of silently racing a duplicate into existence.
+     * Omit to use the `'default'` column value, which every such index
+     * excludes.
+     */
+    originFingerprint?: string | null;
     blockedByIssueIds?: string[];
     labelIds?: string[];
     executionWorkspaceId?: string | null;

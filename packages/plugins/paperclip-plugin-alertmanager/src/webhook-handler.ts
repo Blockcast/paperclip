@@ -19,7 +19,7 @@ import {
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { resolveAssigneeUserId } from "./owner-resolver.js";
-import { escalationDeadlineMs } from "./escalation.js";
+import { cancelOpenEscalationCovers, escalationDeadlineMs } from "./escalation.js";
 import {
   ORIGIN_KIND,
   type AlertStateRecord,
@@ -366,6 +366,19 @@ export async function handleResolved(
   } catch (err) {
     ctx.logger.warn(
       `Failed to apply resolution to issue ${existing.paperclipIssueId}: ${String(err)}`,
+    );
+  }
+
+  // BLO-15982: cascade-cancel any open board covers this alert issue owns.
+  // Runs unconditionally (independent of autoCloseOnResolve) — the ladder
+  // exhausted because the alert kept firing, not because the underlying
+  // issue's status policy says so, so a resolved alert means the cover's
+  // reason to exist is gone either way.
+  try {
+    await cancelOpenEscalationCovers(ctx, existing.paperclipCompanyId, existing.paperclipIssueId);
+  } catch (err) {
+    ctx.logger.warn(
+      `Failed to cancel escalation covers for issue ${existing.paperclipIssueId}: ${String(err)}`,
     );
   }
 

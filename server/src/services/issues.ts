@@ -396,6 +396,7 @@ export interface IssueFilters {
   originKind?: string;
   originKindPrefix?: string;
   originId?: string;
+  originFingerprint?: string;
   includeRoutineExecutions?: boolean;
   excludeRoutineExecutions?: boolean;
   includePluginOperations?: boolean;
@@ -3471,6 +3472,7 @@ async function blockedInboxIssueConditions(
   if (filters?.originKind) conditions.push(eq(issues.originKind, filters.originKind));
   if (filters?.originKindPrefix) conditions.push(like(issues.originKind, `${filters.originKindPrefix}%`));
   if (filters?.originId) conditions.push(eq(issues.originId, filters.originId));
+  if (filters?.originFingerprint) conditions.push(eq(issues.originFingerprint, filters.originFingerprint));
   if (filters?.hasPlanDocument !== undefined) {
     conditions.push(hasPlanDocumentCondition(companyId, filters.hasPlanDocument));
   }
@@ -3646,6 +3648,18 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
     ) return count;
     return count + 1;
   }, 0);
+}
+
+// BLO-15982: matches a 23505 violation of `issues_active_alert_escalation_cover_uq`
+// (partial unique index on companyId+originKind+originFingerprint, scoped to
+// the alertmanager plugin's escalation-cover origin kind). Mirrors the
+// constraint-name matching convention used by task-watchdogs.ts's
+// `isUniqueConstraintConflict` and companies.ts's inline check.
+function isAlertEscalationCoverDedupConflict(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const maybe = error as { code?: string; constraint?: string; constraint_name?: string };
+  const constraint = maybe.constraint ?? maybe.constraint_name;
+  return maybe.code === "23505" && constraint === "issues_active_alert_escalation_cover_uq";
 }
 
 export function issueService(db: Db) {
@@ -4817,6 +4831,7 @@ export function issueService(db: Db) {
       if (filters?.originKind) conditions.push(eq(issues.originKind, filters.originKind));
       if (filters?.originKindPrefix) conditions.push(like(issues.originKind, `${filters.originKindPrefix}%`));
       if (filters?.originId) conditions.push(eq(issues.originId, filters.originId));
+      if (filters?.originFingerprint) conditions.push(eq(issues.originFingerprint, filters.originFingerprint));
       if (filters?.hasPlanDocument !== undefined) {
         conditions.push(hasPlanDocumentCondition(companyId, filters.hasPlanDocument));
       }
@@ -4987,6 +5002,7 @@ export function issueService(db: Db) {
       if (filters?.originKind) conditions.push(eq(issues.originKind, filters.originKind));
       if (filters?.originKindPrefix) conditions.push(like(issues.originKind, `${filters.originKindPrefix}%`));
       if (filters?.originId) conditions.push(eq(issues.originId, filters.originId));
+      if (filters?.originFingerprint) conditions.push(eq(issues.originFingerprint, filters.originFingerprint));
       if (filters?.hasPlanDocument !== undefined) {
         conditions.push(hasPlanDocumentCondition(companyId, filters.hasPlanDocument));
       }
@@ -6426,6 +6442,17 @@ export function issueService(db: Db) {
               // via the route layer. Cleanup failure is a known soft drop.
             },
           );
+        }
+        if (isAlertEscalationCoverDedupConflict(err)) {
+          // BLO-15982: the partial unique index on (companyId, originKind,
+          // originFingerprint) rejects a concurrent create for a dedup slot
+          // another caller already claimed. Surface as a typed 409 so the
+          // alertmanager plugin can distinguish "I lost the race" from a
+          // real failure and attach itself to the winning cover instead.
+          throw conflict("Alert escalation cover conflict", {
+            companyId,
+            originFingerprint: issueData.originFingerprint,
+          });
         }
         throw err;
       }
