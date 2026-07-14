@@ -89,6 +89,8 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerfile).toContain("Manifest suite 113/113");
     expect(dockerfile).toContain("typed run/workspace");
     expect(dockerfile).toContain("key durable DBs by workspace");
+    expect(dockerfile).toContain("opencode-k8s-run-isolation-working-dir.patch");
+    expect(dockerfile).toContain("git apply /vendor/opencode-k8s-run-isolation-working-dir.patch");
   });
 
   it("routes Paperclip Docker image builds through the DIND runner pool", () => {

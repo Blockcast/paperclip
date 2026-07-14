@@ -330,6 +330,10 @@ ARG CLAUDE_K8S_REF=c10a12b0b7d41ea20a40e92ffcf4c1131c404a81
 # force stateless OpenCode DBs onto emptyDir, and key durable DBs by workspace.
 # PR kkroo/paperclip-adapter-opencode-k8s#45; typecheck, 523/523 tests, and
 # build pass after rebasing onto the env-dump deny.
+# Paperclip applies a narrow follow-up patch because the GitHub integration
+# cannot push to the personal adapter repository. It keeps Kubernetes from
+# creating a fresh run workspace as root before the uid-1000 process starts,
+# and fails isolation setup immediately instead of hiding EACCES.
 ARG OPENCODE_K8S_REF=dfd13f28a15c02632b7b2f6378fc17c88b570856
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
@@ -353,6 +357,7 @@ ARG OPENCODE_K8S_REF=dfd13f28a15c02632b7b2f6378fc17c88b570856
 # original extends `../../tsconfig.base.json`, which doesn't resolve
 # here since we only copied the package, not the monorepo).
 COPY packages/adapter-utils /vendor/adapter-utils-src
+COPY patches/opencode-k8s-run-isolation-working-dir.patch /vendor/opencode-k8s-run-isolation-working-dir.patch
 RUN cd /vendor/adapter-utils-src \
   && rm -rf node_modules \
   && printf '%s\n' '{' \
@@ -404,7 +409,9 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     GH="$(cat /run/secrets/gh_token)" \
  && git -c "url.https://x-access-token:${GH}@github.com/.insteadOf=https://github.com/" \
       clone https://github.com/kkroo/paperclip-adapter-opencode-k8s.git opencode-k8s \
-  && cd opencode-k8s && git checkout "${OPENCODE_K8S_REF}" && rm -rf .git \
+  && cd opencode-k8s && git checkout "${OPENCODE_K8S_REF}" \
+  && git apply /vendor/opencode-k8s-run-isolation-working-dir.patch \
+  && rm -rf .git \
   && npm ci \
   && npm install --no-save /vendor/adapter-utils.tgz \
   && npm run build \

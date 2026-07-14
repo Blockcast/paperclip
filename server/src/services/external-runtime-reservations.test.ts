@@ -157,12 +157,12 @@ describeEmbeddedPostgres("external runtime reservations", () => {
     expect(retryClaim?.reservation).toMatchObject({
       id: firstClaim?.reservation.id,
       state: "reserved",
-      isolationMode: null,
-      isolationKey: null,
-      isolationBoundAt: null,
+      isolationMode: "pending",
+      isolationKey: `pending:${runId}`,
       releasedAt: null,
       releaseReason: null,
     });
+    expect(retryClaim?.reservation.isolationBoundAt).not.toBeNull();
     expect(retryClaim?.run.status).toBe("running");
   });
 
