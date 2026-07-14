@@ -55,13 +55,14 @@ function alertmanagerManifest(): PaperclipPluginManifestV1 {
 }
 
 /**
- * BLO-16120: proves the migration this PR ships (`packages/plugins/paperclip-plugin-alertmanager/migrations/001_escalation_cover_membership.sql`)
- * applies cleanly through the production migration validator, and that the
- * atomic claim UPDATE `escalation.ts` uses to decide "who gets to post the
- * one resolution comment and run the terminal transition" is genuinely
- * race-safe against REAL concurrent Postgres connections — not just a JS
- * mock's cooperative-scheduling approximation (see the plugin's own
- * escalation.test.ts for that faster-running complement).
+ * BLO-16120: proves the migrations this PR ships
+ * (`packages/plugins/paperclip-plugin-alertmanager/migrations/001_escalation_cover_membership.sql`,
+ * `.../002_cover_closing_claim.sql`) apply cleanly through the production
+ * migration validator, and that the atomic claim UPDATE `escalation.ts` uses
+ * to decide "who gets to run the resolution comment and terminal transition"
+ * is genuinely race-safe against REAL concurrent Postgres connections — not
+ * just a JS mock's cooperative-scheduling approximation (see the plugin's
+ * own escalation.test.ts for that faster-running complement).
  */
 describeEmbeddedPostgres("alert escalation cover membership (BLO-16120)", () => {
   let db!: ReturnType<typeof createDb>;
@@ -150,9 +151,9 @@ describeEmbeddedPostgres("alert escalation cover membership (BLO-16120)", () => 
     return pluginDb().execute(
       pluginId,
       `UPDATE ${coversTable()} AS c
-       SET resolution_comment_posted_at = now(), updated_at = now()
+       SET closing_claimed_at = now(), updated_at = now()
        WHERE c.cover_issue_id = $1
-         AND c.resolution_comment_posted_at IS NULL
+         AND c.closing_claimed_at IS NULL
          AND c.cancelled_at IS NULL
          AND NOT EXISTS (
            SELECT 1 FROM ${membersTable()} m
@@ -213,11 +214,12 @@ describeEmbeddedPostgres("alert escalation cover membership (BLO-16120)", () => 
     for (let i = 0; i < STUCK_COUNT; i += 1) {
       const coverIssueId = await seedIssue(cid, `[user-cover] stuck ${i}`);
       await insertCover(coverIssueId, cid, `cover:Stuck:${i}`);
-      // Claimed (comment posted) but never finalized — the exact "durable
-      // retry work" state a crash between comment and cancel leaves behind.
+      // Claimed but never finalized — the exact "durable retry work" state a
+      // crash (or a failed createComment, BLO-16120 PR #662 review) between
+      // claim and cancel leaves behind.
       await pluginDb().execute(
         pluginId,
-        `UPDATE ${coversTable()} SET resolution_comment_posted_at = now() WHERE cover_issue_id = $1`,
+        `UPDATE ${coversTable()} SET closing_claimed_at = now() WHERE cover_issue_id = $1`,
         [coverIssueId],
       );
     }
@@ -226,7 +228,7 @@ describeEmbeddedPostgres("alert escalation cover membership (BLO-16120)", () => 
       await insertCover(coverIssueId, cid, `cover:Noise:${i}`);
       await pluginDb().execute(
         pluginId,
-        `UPDATE ${coversTable()} SET resolution_comment_posted_at = now(), cancelled_at = now() WHERE cover_issue_id = $1`,
+        `UPDATE ${coversTable()} SET closing_claimed_at = now(), resolution_comment_posted_at = now(), cancelled_at = now() WHERE cover_issue_id = $1`,
         [coverIssueId],
       );
     }
@@ -234,7 +236,7 @@ describeEmbeddedPostgres("alert escalation cover membership (BLO-16120)", () => 
     // Mirrors `reconcileStuckCovers`'s query exactly (LIMIT 200 there).
     const stuck = await pluginDb().query<{ cover_issue_id: string }>(
       pluginId,
-      `SELECT cover_issue_id FROM ${coversTable()} WHERE company_id = $1 AND resolution_comment_posted_at IS NOT NULL AND cancelled_at IS NULL LIMIT 200`,
+      `SELECT cover_issue_id FROM ${coversTable()} WHERE company_id = $1 AND closing_claimed_at IS NOT NULL AND cancelled_at IS NULL LIMIT 200`,
       [cid],
     );
     expect(stuck).toHaveLength(STUCK_COUNT);

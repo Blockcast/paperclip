@@ -34,7 +34,7 @@ const config = (overrides: Partial<AlertmanagerPluginConfig> = {}): Alertmanager
 function buildFakeAlertmanagerStore() {
   const coverIssuesById = new Map<string, { id: string; status: string; originId?: string; identifier?: string }>();
   const openCoverIdByFingerprint = new Map<string, string>();
-  const covers = new Map<string, { cover_issue_id: string; company_id: string; dedup_fingerprint: string; resolution_comment_posted_at: string | null; cancelled_at: string | null }>();
+  const covers = new Map<string, { cover_issue_id: string; company_id: string; dedup_fingerprint: string; closing_claimed_at: string | null; resolution_comment_posted_at: string | null; cancelled_at: string | null }>();
   const members = new Map<string, { id: string; cover_issue_id: string; alert_issue_id: string; resolved_at: string | null }>();
   let seq = 0;
 
@@ -92,14 +92,21 @@ function buildFakeAlertmanagerStore() {
       if (text.includes("ON CONFLICT (cover_issue_id) DO NOTHING")) {
         const [coverIssueId, companyId, fingerprint] = params as [string, string, string];
         if (covers.has(coverIssueId)) return { rowCount: 0 };
-        covers.set(coverIssueId, { cover_issue_id: coverIssueId, company_id: companyId, dedup_fingerprint: fingerprint, resolution_comment_posted_at: null, cancelled_at: null });
+        covers.set(coverIssueId, { cover_issue_id: coverIssueId, company_id: companyId, dedup_fingerprint: fingerprint, closing_claimed_at: null, resolution_comment_posted_at: null, cancelled_at: null });
         return { rowCount: 1 };
       }
       if (text.includes("NOT EXISTS")) {
         const [coverIssueId] = params as [string];
         const cover = covers.get(coverIssueId);
-        if (!cover || cover.resolution_comment_posted_at !== null || cover.cancelled_at !== null) return { rowCount: 0 };
+        if (!cover || cover.closing_claimed_at !== null || cover.cancelled_at !== null) return { rowCount: 0 };
         if (openMemberCount(coverIssueId) > 0) return { rowCount: 0 };
+        cover.closing_claimed_at = new Date().toISOString();
+        return { rowCount: 1 };
+      }
+      if (text.includes("SET resolution_comment_posted_at = now()")) {
+        const [coverIssueId] = params as [string];
+        const cover = covers.get(coverIssueId);
+        if (!cover || cover.resolution_comment_posted_at !== null) return { rowCount: 0 };
         cover.resolution_comment_posted_at = new Date().toISOString();
         return { rowCount: 1 };
       }
@@ -110,7 +117,7 @@ function buildFakeAlertmanagerStore() {
         for (const m of members.values()) {
           if (m.alert_issue_id !== alertIssueId) continue;
           const cover = covers.get(m.cover_issue_id);
-          if (!cover || cover.cancelled_at !== null) continue;
+          if (!cover || cover.cancelled_at !== null || cover.closing_claimed_at !== null) continue;
           m.resolved_at = null;
           count += 1;
         }
@@ -143,15 +150,15 @@ function buildFakeAlertmanagerStore() {
         for (const m of members.values()) if (m.alert_issue_id === alertIssueId) ids.add(m.cover_issue_id);
         return [...ids].map((cover_issue_id) => ({ cover_issue_id })) as T[];
       }
-      if (text.startsWith("SELECT resolution_comment_posted_at, cancelled_at")) {
+      if (text.startsWith("SELECT closing_claimed_at, resolution_comment_posted_at, cancelled_at")) {
         const [coverIssueId] = params as [string];
         const cover = covers.get(coverIssueId);
-        return cover ? [{ resolution_comment_posted_at: cover.resolution_comment_posted_at, cancelled_at: cover.cancelled_at }] as T[] : [];
+        return cover ? [{ closing_claimed_at: cover.closing_claimed_at, resolution_comment_posted_at: cover.resolution_comment_posted_at, cancelled_at: cover.cancelled_at }] as T[] : [];
       }
-      if (text.includes("resolution_comment_posted_at IS NOT NULL AND cancelled_at IS NULL")) {
+      if (text.includes("closing_claimed_at IS NOT NULL AND cancelled_at IS NULL")) {
         const [companyId] = params as [string];
         return [...covers.values()]
-          .filter((c) => c.company_id === companyId && c.resolution_comment_posted_at !== null && c.cancelled_at === null)
+          .filter((c) => c.company_id === companyId && c.closing_claimed_at !== null && c.cancelled_at === null)
           .map((c) => ({ cover_issue_id: c.cover_issue_id })) as T[];
       }
       throw new Error(`fake db: unrecognized query statement: ${text}`);
@@ -234,7 +241,7 @@ describe("alert escalation", () => {
   it("creates a fresh cover once the prior cover for this alert is cancelled", async () => {
     const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1 };
     const store = buildFakeAlertmanagerStore();
-    store.covers.set("old-cover", { cover_issue_id: "old-cover", company_id: "company-1", dedup_fingerprint: "cover:SyntheticAlert:stale", resolution_comment_posted_at: "2026-07-10T00:00:00Z", cancelled_at: "2026-07-10T00:00:00Z" });
+    store.covers.set("old-cover", { cover_issue_id: "old-cover", company_id: "company-1", dedup_fingerprint: "cover:SyntheticAlert:stale", closing_claimed_at: "2026-07-10T00:00:00Z", resolution_comment_posted_at: "2026-07-10T00:00:00Z", cancelled_at: "2026-07-10T00:00:00Z" });
     store.members.set("old-cover:issue-1", { id: randomUUID(), cover_issue_id: "old-cover", alert_issue_id: "issue-1", resolved_at: "2026-07-10T00:00:00Z" });
     const { ctx, mocks } = sweepContext(state, null, store);
 
@@ -248,7 +255,7 @@ describe("alert escalation", () => {
     const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1 };
     const store = buildFakeAlertmanagerStore();
     store.coverIssuesById.set("cover-existing", { id: "cover-existing", status: "todo" });
-    store.covers.set("cover-existing", { cover_issue_id: "cover-existing", company_id: "company-1", dedup_fingerprint: "cover:SyntheticAlert:current", resolution_comment_posted_at: null, cancelled_at: null });
+    store.covers.set("cover-existing", { cover_issue_id: "cover-existing", company_id: "company-1", dedup_fingerprint: "cover:SyntheticAlert:current", closing_claimed_at: null, resolution_comment_posted_at: null, cancelled_at: null });
     store.members.set("cover-existing:issue-1", { id: randomUUID(), cover_issue_id: "cover-existing", alert_issue_id: "issue-1", resolved_at: "2026-07-10T00:00:00Z" });
     const { ctx, mocks } = sweepContext(state, null, store);
 
@@ -257,6 +264,37 @@ describe("alert escalation", () => {
     expect(mocks.issues.create).not.toHaveBeenCalled();
     // the reopen path un-resolves the existing membership since the alert is firing again
     expect(store.members.get("cover-existing:issue-1")?.resolved_at).toBeNull();
+  });
+
+  it("does not reopen membership on a cover that has already claimed to close (BLO-16120 PR #662 review) — falls through to a fresh cover instead of racing the finalize", async () => {
+    const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1 };
+    const store = buildFakeAlertmanagerStore();
+    store.coverIssuesById.set("cover-closing", { id: "cover-closing", status: "todo" });
+    // Cover already won the closing claim (mid `closeCoverIfEligible` /
+    // `finalizeCoverCancellation`, or sitting in the stuck-reconcile window)
+    // but hasn't cancelled yet; this alert's own membership on it already
+    // resolved, then it re-fired — racing the finalize.
+    store.covers.set("cover-closing", { cover_issue_id: "cover-closing", company_id: "company-1", dedup_fingerprint: "cover:SyntheticAlert:stale-claim", closing_claimed_at: "2026-07-11T00:55:00Z", resolution_comment_posted_at: null, cancelled_at: null });
+    store.members.set("cover-closing:issue-1", { id: randomUUID(), cover_issue_id: "cover-closing", alert_issue_id: "issue-1", resolved_at: "2026-07-10T00:00:00Z" });
+    const { ctx, mocks } = sweepContext(state, null, store);
+
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+    // must NOT silently reopen membership on the closing cover —
+    // `finalizeCoverCancellation` never re-checks membership before
+    // cancelling, so a reopen here would let the cover close anyway and
+    // orphan this re-fire from any cover. Instead membership stays resolved,
+    // so the old cover is free to finalize on its own (via this same sweep's
+    // reconcile pass, since it has no other unresolved members) —
+    // legitimately, since the re-fired alert is no longer tracked there.
+    expect(store.members.get("cover-closing:issue-1")?.resolved_at).not.toBeNull();
+    expect(store.covers.get("cover-closing")?.cancelled_at).not.toBeNull();
+    // instead the re-fire falls through to createCover's normal create-or-join path
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.create).toHaveBeenCalledWith(expect.objectContaining({ originId: "issue-1" }));
+    const [newCoverRow] = [...store.covers.values()].filter((c) => c.cover_issue_id !== "cover-closing");
+    expect(newCoverRow).toBeDefined();
+    expect(store.members.get(`${newCoverRow!.cover_issue_id}:issue-1`)?.resolved_at).toBeNull();
   });
 
   it("clears the escalation schedule when an alert resolves", async () => {
@@ -317,7 +355,7 @@ describe("BLO-16120 aggregate-aware cover cleanup on resolve", () => {
   function coverContext(memberAlertIssueIds: string[]) {
     const store = buildFakeAlertmanagerStore();
     const coverId = "cover-1";
-    store.covers.set(coverId, { cover_issue_id: coverId, company_id: "company-1", dedup_fingerprint: "cover:SyntheticAlert:1", resolution_comment_posted_at: null, cancelled_at: null });
+    store.covers.set(coverId, { cover_issue_id: coverId, company_id: "company-1", dedup_fingerprint: "cover:SyntheticAlert:1", closing_claimed_at: null, resolution_comment_posted_at: null, cancelled_at: null });
     for (const alertIssueId of memberAlertIssueIds) {
       store.members.set(`${coverId}:${alertIssueId}`, { id: randomUUID(), cover_issue_id: coverId, alert_issue_id: alertIssueId, resolved_at: null });
     }
@@ -395,6 +433,29 @@ describe("BLO-16120 aggregate-aware cover cleanup on resolve", () => {
     expect(store.covers.get(coverId)?.cancelled_at).not.toBeNull();
   });
 
+  it("failure-injection (BLO-16120 PR #662 review): createComment itself fails during close — the claim is won but the comment stays unposted, so reconciliation retries it instead of silently finalizing", async () => {
+    const { ctx, mocks, store, coverId } = coverContext(["alert-A"]);
+    mocks.issues.createComment = vi.fn(async () => { throw new Error("transient: paperclip API 503"); });
+
+    await expect(recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A")).rejects.toThrow("transient");
+    // the claim was won (exactly one closer) but the comment never durably landed
+    expect(store.covers.get(coverId)?.closing_claimed_at).not.toBeNull();
+    expect(store.covers.get(coverId)?.resolution_comment_posted_at).toBeNull();
+    expect(store.covers.get(coverId)?.cancelled_at).toBeNull();
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+
+    // reconciliation must retry the comment (not skip straight to cancelling
+    // with no audit trail) and only then finish the terminal transition
+    mocks.issues.createComment = vi.fn(async () => ({}));
+    mocks.issues.update = vi.fn(async () => ({}));
+    await runAlertEscalationSweep(ctx as any, config(), new Date("2026-07-11T01:00:00Z"));
+
+    expect(mocks.issues.createComment).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.update).toHaveBeenCalledWith(coverId, { status: "cancelled" }, "company-1");
+    expect(store.covers.get(coverId)?.resolution_comment_posted_at).not.toBeNull();
+    expect(store.covers.get(coverId)?.cancelled_at).not.toBeNull();
+  });
+
   it("concurrency: two siblings resolving at once yield exactly one comment and one terminal transition", async () => {
     const { ctx, mocks, store, coverId } = coverContext(["alert-A", "alert-B"]);
     await Promise.all([
@@ -421,7 +482,7 @@ describe("BLO-16120 aggregate-aware cover cleanup on resolve", () => {
 describe("BLO-16120 sweep reconciliation backstop for stuck covers", () => {
   it("finalizes a cover whose comment claim succeeded but whose cancel never ran, without re-posting", async () => {
     const store = buildFakeAlertmanagerStore();
-    store.covers.set("cover-stuck", { cover_issue_id: "cover-stuck", company_id: "company-1", dedup_fingerprint: "cover:X:1", resolution_comment_posted_at: "2026-07-11T00:00:00Z", cancelled_at: null });
+    store.covers.set("cover-stuck", { cover_issue_id: "cover-stuck", company_id: "company-1", dedup_fingerprint: "cover:X:1", closing_claimed_at: "2026-07-11T00:00:00Z", resolution_comment_posted_at: "2026-07-11T00:00:00Z", cancelled_at: null });
     const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: "2026-07-10T00:00:00Z", escalationComplete: true, nextEscalationAt: null, escalationAttempt: 3 };
     const { ctx, mocks } = sweepContext(state, null, store);
     mocks.issues.get = vi.fn(async () => ({ id: "cover-stuck", status: "todo" }));
@@ -435,7 +496,7 @@ describe("BLO-16120 sweep reconciliation backstop for stuck covers", () => {
 
   it("leaves an eligible-but-unclaimed cover alone — reconciliation only resumes already-claimed covers", async () => {
     const store = buildFakeAlertmanagerStore();
-    store.covers.set("cover-open", { cover_issue_id: "cover-open", company_id: "company-1", dedup_fingerprint: "cover:X:1", resolution_comment_posted_at: null, cancelled_at: null });
+    store.covers.set("cover-open", { cover_issue_id: "cover-open", company_id: "company-1", dedup_fingerprint: "cover:X:1", closing_claimed_at: null, resolution_comment_posted_at: null, cancelled_at: null });
     store.members.set("cover-open:alert-A", { id: randomUUID(), cover_issue_id: "cover-open", alert_issue_id: "alert-A", resolved_at: null });
     const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: "2026-07-10T00:00:00Z", escalationComplete: true, nextEscalationAt: null, escalationAttempt: 3 };
     const { ctx, mocks } = sweepContext(state, null, store);
