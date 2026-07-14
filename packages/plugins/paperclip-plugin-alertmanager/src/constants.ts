@@ -36,6 +36,15 @@ export const DEFAULT_ESCALATION_DEADLINE_MINUTES: Record<string, number> = {
   warning: 240,
 };
 
+/**
+ * Default width of the board-cover dedup window (BLO-15982). Concurrent or
+ * near-simultaneous escalation ladders for the same alertname that reach the
+ * cover rung within the same window bucket land on one retained cover
+ * instead of one each. Operators can override via
+ * `config.coverDedupWindowMinutes`.
+ */
+export const DEFAULT_COVER_DEDUP_WINDOW_MINUTES = 120;
+
 /** Default owner routes shipped with the bundled Blockcast Alertmanager plugin. */
 export const DEFAULT_OWNER_MAP: OwnerMap = {
   class: {
@@ -88,11 +97,18 @@ export const DEFAULT_ISSUE_ROUTE_MAP: IssueRouteMap = {
       assigneeAgentId: BLOCKCAST_PHYSICAL_INFRA_AGENT_ID,
       status: "todo",
     },
+    // BLO-15219: 2026-07-11 prod incident — daemonset pods joining a node
+    // produced 7 simultaneous PodPendingCritical alerts that self-healed by
+    // ~15:35Z, but the critical default (30m/rung) walked the ladder to the
+    // CEO in 90 minutes. pod_pending's noise profile is churn-then-self-heal,
+    // not a real outage signal, so it gets a slower rung than the critical
+    // default.
     pod_pending: {
       projectId: BLOCKCAST_PHYSICAL_INFRA_PROJECT_ID,
       goalId: BLOCKCAST_PHYSICAL_INFRA_GOAL_ID,
       assigneeAgentId: BLOCKCAST_PHYSICAL_INFRA_AGENT_ID,
       status: "todo",
+      escalationDeadlineMinutes: 240,
     },
     pod_init_stuck: {
       projectId: BLOCKCAST_PHYSICAL_INFRA_PROJECT_ID,
@@ -181,6 +197,7 @@ export const DEFAULT_CONFIG: AlertmanagerPluginConfig = {
   ownerMap: DEFAULT_OWNER_MAP,
   issueRouteMap: DEFAULT_ISSUE_ROUTE_MAP,
   escalationDeadlineMinutes: DEFAULT_ESCALATION_DEADLINE_MINUTES,
+  coverDedupWindowMinutes: DEFAULT_COVER_DEDUP_WINDOW_MINUTES,
 };
 
 /**
