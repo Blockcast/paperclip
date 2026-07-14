@@ -281,11 +281,12 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
     expect(wakeups.filter((wake) => wake.status === "coalesced")).toHaveLength(1);
   });
 
-  it("waits for an in-flight enqueue before retiring a closed PR task scope", async () => {
+  it("waits for in-flight pending work before retiring a closed PR task scope", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const wakeupId = randomUUID();
     const runId = randomUUID();
+    const scheduledRunId = randomUUID();
     const taskKey = "pr_review:Blockcast/penstock-vault-node:190";
 
     await db.insert(companies).values({
@@ -347,11 +348,26 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
           wakeReason: "github_pr_synchronized",
         },
       });
+      await tx.insert(heartbeatRuns).values({
+        id: scheduledRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "scheduled_retry",
+        scheduledRetryAt: new Date(Date.now() + 5 * 60 * 1000),
+        scheduledRetryReason: "ccrotate_capacity",
+        contextSnapshot: {
+          taskKey,
+          reviewKind: "pr_review",
+          wakeReason: "github_pr_synchronized",
+        },
+      });
     });
 
     await enqueueLockHeld;
     const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
-    const cancellation = heartbeat.cancelQueuedRunsForTask(
+    const cancellation = heartbeat.cancelPendingRunsForTask(
       agentId,
       taskKey,
       "PR closed during enqueue",
@@ -365,17 +381,18 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
     expect(outcomeBeforeCommit).toBe("blocked");
 
     await inFlightEnqueue;
-    await expect(cancellation).resolves.toBe(1);
+    await expect(cancellation).resolves.toBe(2);
 
-    const [run] = await db
+    const retiredRuns = await db
       .select({ status: heartbeatRuns.status })
       .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId));
+      .where(eq(heartbeatRuns.agentId, agentId));
     const [wakeup] = await db
       .select({ status: agentWakeupRequests.status })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.id, wakeupId));
-    expect(run?.status).toBe("cancelled");
+    expect(retiredRuns).toHaveLength(2);
+    expect(retiredRuns.every((run) => run.status === "cancelled")).toBe(true);
     expect(wakeup?.status).toBe("cancelled");
   });
 });

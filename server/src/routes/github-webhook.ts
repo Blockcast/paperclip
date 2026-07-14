@@ -1074,11 +1074,12 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       prReviewerBotLogin: config.prReviewerBotLogin,
     });
 
-    // A closed PR cannot produce useful reviewer work. Retire every queued
-    // run for its stable task scope so merged/abandoned PRs do not consume the
-    // reviewer's single external-lifecycle slot hours later. Running reviews
-    // are left alone: they may already be posting a final result, and forcibly
-    // deleting their Job would be more disruptive than letting them finish.
+    // A closed PR cannot produce useful reviewer work. Retire every queued or
+    // scheduled-retry run for its stable task scope so merged/abandoned PRs do
+    // not consume the reviewer's single external-lifecycle slot hours later.
+    // Running reviews are left alone: they may already be posting a final
+    // result, and forcibly deleting their Job would be more disruptive than
+    // letting them finish.
     const reviewerRunsCancelled = await (async () => {
       if (
         !config.prReviewerAgentId ||
@@ -1096,7 +1097,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         pluginWorkerManager: config.pluginWorkerManager,
         ...config.heartbeatOptions,
       });
-      const cancelled = await heartbeat.cancelQueuedRunsForTask(
+      const cancelled = await heartbeat.cancelPendingRunsForTask(
         config.prReviewerAgentId,
         reviewerTaskKey,
         `Cancelled because GitHub PR ${context.repoFullName ?? "unknown"}#${context.prNumber} closed before review dispatch`,
@@ -1131,7 +1132,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     //   - pull_request_review.submitted — request a counter-review pass; the
     //       reviewer's OWN posted review is filtered as a self-echo (BLO-15799,
     //       see isReviewerSelfEchoReview).
-    // (pull_request.closed retires queued work above; check_run/workflow_run
+    // (pull_request.closed retires pending work above; check_run/workflow_run
     //  are handled by the issue-assignee CI-completion path.)
     const reviewerWakeFired = await (async () => {
       if (!config.prReviewerAgentId) return false;

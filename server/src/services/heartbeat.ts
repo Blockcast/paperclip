@@ -16487,7 +16487,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     eventPayload?: Record<string, unknown>;
   };
 
-  async function cancelQueuedRunsForTaskInternal(
+  async function cancelPendingRunsForTaskInternal(
     agentId: string,
     taskKey: string,
     reason: string,
@@ -16514,7 +16514,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(
           and(
             eq(heartbeatRuns.agentId, agentId),
-            eq(heartbeatRuns.status, "queued"),
+            inArray(heartbeatRuns.status, TASK_SCOPE_COALESCIBLE_RUN_STATUSES),
             eq(heartbeatRuns.contextTaskKey, taskKey),
           ),
         )
@@ -16561,7 +16561,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: "queued task-scoped run cancelled",
+        message: "pending task-scoped run cancelled",
         payload: { taskKey },
       });
     }
@@ -17242,8 +17242,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) => cancelRunInternal(runId, reason, options),
 
-    cancelQueuedRunsForTask: (agentId: string, taskKey: string, reason: string) =>
-      cancelQueuedRunsForTaskInternal(agentId, taskKey, reason),
+    cancelPendingRunsForTask: (agentId: string, taskKey: string, reason: string) =>
+      cancelPendingRunsForTaskInternal(agentId, taskKey, reason),
 
     cancelActiveForAgent: (agentId: string, reason?: string) => cancelActiveForAgentInternal(agentId, reason),
 
