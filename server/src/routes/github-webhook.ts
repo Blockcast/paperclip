@@ -163,6 +163,39 @@ function hasAllyConsolidatedReviewHeader(body: string | null | undefined): boole
   return typeof body === "string" && /\bAlly\s*(?:—|-|:)\s*Consolidated\s+PR\s+Review\b/i.test(body);
 }
 
+// Negation cues that flip an otherwise-actionable bare phrase into a confirmation
+// that nothing is required — e.g. Ally's COMMENTED, zero-finding review 4682219268
+// on TC PR #1115 said "Clean. No changes requested from this lens", which the bare
+// `changes\s+requested` phrase match flagged as actionable and bounced a fully
+// approved PR back to the implementer (BLO-15942). Scanned in the text immediately
+// preceding a match, bounded to NEGATION_LOOKBACK_WORDS words and stopping at
+// sentence punctuation, so a genuine, later occurrence of the phrase elsewhere in
+// the body still counts, and an unrelated earlier negation in the same long
+// sentence (e.g. "The docs aren't complete, changes requested for section 3.")
+// doesn't suppress it.
+const NEGATION_CUE_REGEX =
+  /\b(?:no|not|zero|none|never|without|isn't|aren't|doesn't|didn't|won't|cannot)\b/i;
+const NEGATION_LOOKBACK_WORDS = 8;
+
+// Returns true if `pattern` matches `text` at least once outside a negated context
+// (see NEGATION_CUE_REGEX). Used for bare-phrase heuristics ("changes requested")
+// that read very differently as "no changes requested" vs "please make the changes
+// requested".
+function hasNonNegatedMatch(text: string, pattern: RegExp): boolean {
+  const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+  const regex = new RegExp(pattern.source, flags);
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(text)) !== null) {
+    const preceding = text.slice(0, match.index);
+    const sentenceStart = Math.max(preceding.lastIndexOf("."), preceding.lastIndexOf("\n")) + 1;
+    const sentenceLocal = preceding.slice(sentenceStart);
+    const lookback = sentenceLocal.trim().split(/\s+/).slice(-NEGATION_LOOKBACK_WORDS).join(" ");
+    if (!NEGATION_CUE_REGEX.test(lookback)) return true;
+    if (regex.lastIndex === match.index) regex.lastIndex += 1;
+  }
+  return false;
+}
+
 function hasActionablePrReviewFeedback(body: string | null | undefined, state?: string | null): boolean {
   const normalizedState = state?.trim().toLowerCase();
   if (normalizedState === "changes_requested" || normalizedState === "changes-requested") return true;
@@ -185,8 +218,8 @@ function hasActionablePrReviewFeedback(body: string | null | undefined, state?: 
   // cannot mask a later uncounted findings section.
   if (/\b(?:Critical|Important)\s+Issues\b(?!\s*\()/i.test(text)) return true;
   if (/^[ \t]*decision[ \t]*:[ \t]*changes_requested[ \t]*$/im.test(text)) return true;
-  if (/\bchanges\s+requested\b/i.test(text)) return true;
-  if (/\brequest(?:ed|s)?\s+changes\b/i.test(text)) return true;
+  if (hasNonNegatedMatch(text, /\bchanges\s+requested\b/i)) return true;
+  if (hasNonNegatedMatch(text, /\brequest(?:ed|s)?\s+changes\b/i)) return true;
   // Match "before merge" and its inflections ("before merging/merged/merges").
   // The bare `\bmerge\b` form silently missed "before merging" (#973).
   if (/\bRecommended\s+Action\b[\s\S]{0,400}\bfix\b[\s\S]{0,400}\bbefore\s+merg(?:e|es|ed|ing)\b/i.test(text)) return true;
@@ -314,6 +347,10 @@ interface ResolvedEventContext {
   // gate can confirm an intentional self-review skip is on a genuinely
   // bot-authored PR. Distinct from reviewAuthorLogin (the review *event* author).
   prAuthorLogin?: string | null;
+  // pull_request events only. Drafts are not reviewable until GitHub emits
+  // ready_for_review, so opened/reopened/synchronize must not consume a
+  // reviewer slot while this is true.
+  prDraft?: boolean;
   // issue_comment.created only -- drives reviewer reruns requested by
   // an operator via "@ally" in a PR comment.
   commentId?: number | null;
@@ -604,6 +641,7 @@ function resolveEventContext(
         eventUrl: collected.url,
         headSha: collected.headSha,
         prAuthorLogin: collected.authorLogin,
+        prDraft: pr?.draft === true,
         // Merge metadata for forward-capture. additions/deletions are present
         // on the pull_request payload; per-file authored-LOC needs a follow-up
         // pulls/{n}/files fetch (enrichment), so it is not read here.
@@ -704,6 +742,7 @@ function isReviewerSelfEchoReview(
 
 function shouldFirePrReviewerWake(context: ResolvedEventContext | null): context is ResolvedEventContext & { prNumber: number } {
   if (!context || !context.wakeReason || typeof context.prNumber !== "number") return false;
+  if (context.prDraft && context.wakeReason !== "github_pr_ready_for_review") return false;
   return new Set([
     "github_pr_opened",
     "github_pr_reopened",
@@ -1035,6 +1074,46 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       prReviewerBotLogin: config.prReviewerBotLogin,
     });
 
+    // A closed PR cannot produce useful reviewer work. Retire every queued
+    // run for its stable task scope so merged/abandoned PRs do not consume the
+    // reviewer's single external-lifecycle slot hours later. Running reviews
+    // are left alone: they may already be posting a final result, and forcibly
+    // deleting their Job would be more disruptive than letting them finish.
+    const reviewerRunsCancelled = await (async () => {
+      if (
+        !config.prReviewerAgentId ||
+        context?.wakeReason !== "github_pr_closed" ||
+        typeof context.prNumber !== "number"
+      ) {
+        return 0;
+      }
+
+      const reviewerTaskKey = buildPrReviewerTaskKey({
+        ...context,
+        prNumber: context.prNumber,
+      });
+      const heartbeat = heartbeatService(db, {
+        pluginWorkerManager: config.pluginWorkerManager,
+        ...config.heartbeatOptions,
+      });
+      const cancelled = await heartbeat.cancelQueuedRunsForTask(
+        config.prReviewerAgentId,
+        reviewerTaskKey,
+        `Cancelled because GitHub PR ${context.repoFullName ?? "unknown"}#${context.prNumber} closed before review dispatch`,
+      );
+      logger.info(
+        {
+          deliveryId,
+          repoFullName: context.repoFullName,
+          prNumber: context.prNumber,
+          reviewerTaskKey,
+          cancelled,
+        },
+        "github webhook retired queued reviewer runs for closed PR",
+      );
+      return cancelled;
+    })();
+
     // PR-review wake fires independently of the identifier-matching
     // issue-assignee wake below: it targets a dedicated reviewer agent so
     // PRs without a paperclip identifier in the branch/title/body still
@@ -1044,15 +1123,16 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     //   - pull_request.reopened        — explicit retry / renewed review signal
     //   - pull_request.ready_for_review — draft promoted to ready
     //   - pull_request.synchronize     — author pushed a fixup after a review;
-    //       active reviewer runs are coalesced by the stable PR-scoped taskKey,
-    //       and duplicate wake requests are skipped by the PR+reason
-    //       idempotency precheck, so rapid pushes don't fan out per push.
+    //       reviewer runs are coalesced by the stable PR-scoped taskKey under
+    //       the same per-agent lock used by close retirement, and duplicate
+    //       wake requests are skipped by the PR+reason idempotency precheck, so
+    //       rapid pushes don't fan out per push.
     //   - issue_comment.created with @ally — explicit operator re-review request
     //   - pull_request_review.submitted — request a counter-review pass; the
     //       reviewer's OWN posted review is filtered as a self-echo (BLO-15799,
     //       see isReviewerSelfEchoReview).
-    // (We deliberately skip pull_request.closed and check_run/workflow_run —
-    //  those are post-merge signals or duplicate the CI-completion path.)
+    // (pull_request.closed retires queued work above; check_run/workflow_run
+    //  are handled by the issue-assignee CI-completion path.)
     const reviewerWakeFired = await (async () => {
       if (!config.prReviewerAgentId) return false;
       if (!shouldFirePrReviewerWake(context)) return false;
@@ -1259,6 +1339,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         ok: true,
         ignored: "no_paperclip_identifier",
         reviewerWakeFired,
+        reviewerRunsCancelled,
         dependabotWakeFired,
       });
       return;
@@ -1635,6 +1716,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       wakes,
       skipped,
       reopened,
+      reviewerRunsCancelled,
       ...(backLinked.length ? { backLinked } : {}),
       ...(escalated.length ? { escalated } : {}),
     });

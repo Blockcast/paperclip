@@ -2112,6 +2112,57 @@ export function issueRoutes(
     return decision.allowed;
   }
 
+  // BLO-15942: a review/approval stage can be pinned to a participant whose
+  // mandate excludes stage decisions (e.g. a PR-webhook-only reviewer bot),
+  // which otherwise deadlocks the stage forever — only the participant can
+  // advance it, and no role-based actor can force a re-route. This lets an
+  // actor with tasks:override_execution_stage (an org-chain manager of the
+  // pinned participant, a legacy agent-creator such as the CTO, or a granted
+  // board user) force-complete or request-changes on the stage without the
+  // participant acting. Only checked (and only pays the extra `access.decide`
+  // round trip) when the PATCH is actually attempting to advance a pending
+  // stage the actor doesn't already hold authority over.
+  async function hasExecutionStageOverrideAuthorization(
+    req: Request,
+    existing: { id: string; companyId: string; executionState: unknown; assigneeAgentId: string | null; assigneeUserId: string | null },
+    actor: { actorType: "user" | "agent"; actorId: string },
+    requestedStatus: string | undefined,
+  ): Promise<boolean> {
+    if (requestedStatus === undefined || requestedStatus === "in_review") return false;
+    const existingState = parseIssueExecutionState(existing.executionState);
+    if (existingState?.status !== "pending" || !existingState.currentParticipant) return false;
+    if (actorMatchesExecutionParticipant(actor, existingState.currentParticipant)) return false;
+    const participant = existingState.currentParticipant;
+    const participantAgentId = participant.type === "agent" ? participant.agentId : null;
+    const participantUserId = participant.type === "user" ? participant.userId : null;
+    // BLO-15942 review: resolve the override grant against the stage's actual
+    // currentParticipant, not the issue's assigneeAgentId/assigneeUserId. Those
+    // normally track each other, but this override exists precisely for the
+    // "state got weird" path where a prior reassignment or bug could let them
+    // diverge — in which case a manager of the *assignee* must not gain
+    // authority over a different *participant*.
+    if (
+      (participantAgentId && participantAgentId !== existing.assigneeAgentId) ||
+      (participantUserId && participantUserId !== existing.assigneeUserId)
+    ) {
+      logger.warn(
+        { issueId: existing.id, participantAgentId, participantUserId, assigneeAgentId: existing.assigneeAgentId, assigneeUserId: existing.assigneeUserId },
+        "execution-stage override: currentParticipant diverges from issue assignee",
+      );
+    }
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "tasks:override_execution_stage",
+      resource: {
+        type: "issue",
+        companyId: existing.companyId,
+        assigneeAgentId: participantAgentId,
+        assigneeUserId: participantUserId,
+      },
+    });
+    return decision.allowed;
+  }
+
   function isBlockedCorrectionPatchBody(body: unknown) {
     if (!body || typeof body !== "object" || Array.isArray(body)) return false;
     const patch = body as Record<string, unknown>;
@@ -6192,11 +6243,19 @@ export function issueRoutes(
       req.body.executionPolicy !== undefined && monitorChanged,
     );
 
+    const requestedExecutionStageStatus = typeof updateFields.status === "string" ? updateFields.status : undefined;
+    const overrideAuthorized = await hasExecutionStageOverrideAuthorization(
+      req,
+      existing,
+      actor,
+      requestedExecutionStageStatus,
+    );
+
     const transition = applyIssueExecutionPolicyTransition({
       issue: existing,
       policy: nextExecutionPolicy,
       previousPolicy: previousExecutionPolicy,
-      requestedStatus: typeof updateFields.status === "string" ? updateFields.status : undefined,
+      requestedStatus: requestedExecutionStageStatus,
       requestedAssigneePatch: {
         assigneeAgentId: normalizedAssigneeAgentId,
         assigneeUserId:
@@ -6213,6 +6272,7 @@ export function issueRoutes(
       commentBody,
       reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
       monitorExplicitlyUpdated: req.body.executionPolicy !== undefined && monitorChanged,
+      overrideAuthorized,
     });
     const decisionId = transition.decision ? randomUUID() : null;
     if (decisionId) {

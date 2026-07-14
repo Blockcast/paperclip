@@ -95,6 +95,8 @@ export const issues = pgTable(
       missing: string[];
       evidenceFound: string[];
       unlabeledFallback: boolean;
+      overridden?: boolean;
+      overrideReason?: string;
       evaluatedAt: string;
     }>(),
     // Materialized from lastEvidenceVerdict.evaluatedAt when the evidence gate

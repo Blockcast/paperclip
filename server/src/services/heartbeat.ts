@@ -49,6 +49,7 @@ import {
   issueDocuments,
   heartbeatRunEvents,
   heartbeatRuns,
+  externalRuntimeReservations,
   issueApprovals,
   issueComments,
   issuePlanDecompositions,
@@ -77,6 +78,18 @@ import {
 } from "./k8s-job-liveness.js";
 import { getActiveAgentIds } from "./agent-roster.js";
 import { processPendingImageBumpForAgent } from "./agent-image-bump.js";
+import {
+  claimRunWithExternalRuntimeSlot,
+  externalRuntimeReservationCanRelease,
+  getActiveExternalRuntimeReservation,
+  markExternalRuntimeReservationLaunching,
+  rearmExternalRuntimeReservationForRetry,
+  recordExpectedExternalRuntimeJobName,
+  recordExternalRuntimeJobIdentity,
+  releaseExternalRuntimeReservation,
+  requireExternalRuntimeLaunchOwnership,
+  refreshExternalRuntimeReservationMetrics,
+} from "./external-runtime-reservations.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
 import type {
   AdapterRunIsolationDescriptor,
@@ -283,6 +296,7 @@ const STALE_QUEUED_MAINTENANCE_WAKE_REASONS = [
   "provider_quota_exhausted_recovered",
   "transient_failure_retry",
 ] as const;
+export const PR_REVIEW_QUEUE_FAIRNESS_MAX_WAIT_MS = 10 * 60 * 1000;
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
@@ -582,6 +596,37 @@ function isPrReviewRetryContext(contextSnapshot: Record<string, unknown>) {
   if (reviewKind === "pr_review") return true;
   const taskKey = readNonEmptyString(contextSnapshot.taskKey);
   return taskKey?.startsWith("pr_review:") === true;
+}
+
+type PrReviewFairnessRun = Pick<
+  typeof heartbeatRuns.$inferSelect,
+  "id" | "createdAt" | "contextSnapshot"
+>;
+
+export function selectAgedPrReviewRunForFairDispatch(
+  queuedRuns: PrReviewFairnessRun[],
+  lastStartedRun: Pick<PrReviewFairnessRun, "contextSnapshot"> | null,
+  now = new Date(),
+) {
+  if (
+    lastStartedRun &&
+    isPrReviewRetryContext(parseObject(lastStartedRun.contextSnapshot))
+  ) {
+    return null;
+  }
+
+  const cutoff = now.getTime() - PR_REVIEW_QUEUE_FAIRNESS_MAX_WAIT_MS;
+  return queuedRuns
+    .filter(
+      (run) =>
+        run.createdAt.getTime() <= cutoff &&
+        isPrReviewRetryContext(parseObject(run.contextSnapshot)),
+    )
+    .sort(
+      (left, right) =>
+        left.createdAt.getTime() - right.createdAt.getTime() ||
+        left.id.localeCompare(right.id),
+    )[0]?.id ?? null;
 }
 
 /**
@@ -2422,6 +2467,21 @@ export function k8sCcrotateRetryDelayMs(result: { retryNotBefore?: string | null
   );
 }
 
+// The pinned claude_k8s/opencode_k8s adapters report their launch command as
+// this exact "kubectl job/<name>" sentinel (not the real invoked command) so
+// the reservation can learn the expected Job name before the post-create
+// onExternalRuntimeLaunched identity acknowledgment arrives. Exported so both
+// the dispatch call site below and tests exercise the identical match instead
+// of a re-typed copy that could silently drift from what the adapters emit.
+const EXTERNAL_RUNTIME_EXPECTED_JOB_NAME_PATTERN = /^kubectl job\/([a-z0-9]([-a-z0-9]*[a-z0-9])?)$/;
+const EXTERNAL_RUNTIME_MAX_JOB_NAME_LENGTH = 63;
+
+export function parseExpectedExternalRuntimeJobNameFromMetaCommand(command: string): string | null {
+  const jobName = command.match(EXTERNAL_RUNTIME_EXPECTED_JOB_NAME_PATTERN)?.[1];
+  if (!jobName || jobName.length > EXTERNAL_RUNTIME_MAX_JOB_NAME_LENGTH) return null;
+  return jobName;
+}
+
 function sleepMs(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -4233,6 +4293,96 @@ async function coalesceQueuedGithubStateWake(input: {
       coalescedEventCount,
     },
     "github state-change wake coalesced into existing queued heartbeat run",
+  );
+
+  return mergedRun;
+}
+
+async function coalesceQueuedTaskScopeWake(input: {
+  tx: WakeCoalescingDb;
+  companyId: string;
+  agentId: string;
+  source: string;
+  triggerDetail: string | null;
+  reason: string | null;
+  payload: Record<string, unknown> | null;
+  contextSnapshot: Record<string, unknown>;
+  taskKey: string | null;
+  requestedByActorType: WakeupOptions["requestedByActorType"] | null | undefined;
+  requestedByActorId: WakeupOptions["requestedByActorId"] | null | undefined;
+  idempotencyKey: string | null | undefined;
+}) {
+  if (!input.taskKey) return null;
+
+  const existingRun = await input.tx
+    .select()
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+        eq(heartbeatRuns.status, "queued"),
+        eq(heartbeatRuns.contextTaskKey, input.taskKey),
+      ),
+    )
+    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+
+  if (!existingRun) return null;
+
+  const now = new Date();
+  const mergedContextSnapshot = mergeCoalescedContextSnapshot(
+    existingRun.contextSnapshot,
+    input.contextSnapshot,
+  );
+  const mergedRun = await input.tx
+    .update(heartbeatRuns)
+    .set({
+      invocationSource: input.source,
+      triggerDetail: input.triggerDetail,
+      contextSnapshot: mergedContextSnapshot,
+      updatedAt: now,
+    })
+    .where(and(eq(heartbeatRuns.id, existingRun.id), eq(heartbeatRuns.status, "queued")))
+    .returning()
+    .then((rows) => rows[0] ?? existingRun);
+
+  if (mergedRun.wakeupRequestId) {
+    await input.tx
+      .update(agentWakeupRequests)
+      .set({
+        coalescedCount: sql`coalesce(${agentWakeupRequests.coalescedCount}, 0) + 1`,
+        updatedAt: now,
+      })
+      .where(eq(agentWakeupRequests.id, mergedRun.wakeupRequestId));
+  }
+
+  await input.tx.insert(agentWakeupRequests).values({
+    companyId: input.companyId,
+    agentId: input.agentId,
+    source: input.source,
+    triggerDetail: input.triggerDetail,
+    reason: "task_scope_queued_coalesced",
+    payload: input.payload,
+    status: "coalesced",
+    coalescedCount: 1,
+    requestedByActorType: input.requestedByActorType ?? null,
+    requestedByActorId: input.requestedByActorId ?? null,
+    idempotencyKey: input.idempotencyKey ?? null,
+    runId: mergedRun.id,
+    finishedAt: now,
+  });
+
+  logger.info(
+    {
+      companyId: input.companyId,
+      agentId: input.agentId,
+      runId: mergedRun.id,
+      taskKey: input.taskKey,
+      wakeReason: input.reason,
+    },
+    "task-scoped wake coalesced into queued heartbeat run under agent lock",
   );
 
   return mergedRun;
@@ -6729,6 +6879,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // and we never want a bump-retry error to surface as a heartbeat error
       // since the run itself finished cleanly.
       if (TERMINAL_RUN_STATUSES.has(updated.status)) {
+        void refreshExternalRuntimeReservationMetrics(db).catch((err) => {
+          logger.warn({ err, runId: updated.id }, "failed to refresh external-runtime reservation metrics");
+        });
         const agentIdForBump = updated.agentId;
         const runIdForBump = updated.id;
         void processPendingImageBumpForAgent(db, agentIdForBump).catch((err) => {
@@ -6776,6 +6929,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
       publishRunLifecyclePluginEvent(updated);
+      if (TERMINAL_RUN_STATUSES.has(updated.status)) {
+        void refreshExternalRuntimeReservationMetrics(db).catch((err) => {
+          logger.warn({ err, runId: updated.id }, "failed to refresh external-runtime reservation metrics");
+        });
+      }
       return { run: updated, updated: true as const };
     }
 
@@ -9451,16 +9609,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const claimedAt = new Date();
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const claimed = hasExternalLifecycle(agent.adapterType)
+      ? (await claimRunWithExternalRuntimeSlot(db, run.id, claimedAt))?.run ?? null
+      : await db
+          .update(heartbeatRuns)
+          .set({
+            status: "running",
+            startedAt: run.startedAt ?? claimedAt,
+            updatedAt: claimedAt,
+          })
+          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+          .returning()
+          .then((rows) => rows[0] ?? null);
     if (!claimed) return null;
 
     publishLiveEvent({
@@ -10697,6 +10857,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return cleanedRunIds;
   }
 
+  async function reconcileReleasePendingExternalRuntimeReservations(
+    jobRunStatuses: Map<string, AgentJobRunStatus> | null,
+  ) {
+    const pending = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.state, "release_pending"));
+    for (const reservation of pending) {
+      const observed = jobRunStatuses?.get(reservation.runId) ?? null;
+      if (observed?.phase === "active") continue;
+
+      let terminalOrMissing = Boolean(observed);
+      const jobName = reservation.jobName ?? reservation.expectedJobName;
+      // Both bundled external adapters await onMeta before createNamespacedJob.
+      // onMeta persists expectedJobName, so no name is durable proof that Job
+      // creation was never crossed, even if the dispatcher crashed afterward.
+      if (!jobName && externalRuntimeReservationCanRelease(reservation, null, true)) {
+        terminalOrMissing = true;
+      }
+      if (!terminalOrMissing && jobName) {
+        const exact = await readAgentJobRunStatusByName(jobName);
+        terminalOrMissing = Boolean(exact && exact.phase !== "active");
+      }
+      if (!terminalOrMissing) continue;
+
+      await releaseExternalRuntimeReservation(db, {
+        runId: reservation.runId,
+        reason: reservation.releaseReason ?? "job_terminal_or_missing",
+      });
+    }
+  }
+
+  async function releaseExternalRuntimeReservationIfQuiesced(runId: string, reason: string) {
+    const reservation = await getActiveExternalRuntimeReservation(db, runId);
+    if (!reservation) return null;
+
+    const jobName = reservation.jobName ?? reservation.expectedJobName;
+    const status = jobName ? await readAgentJobRunStatusByName(jobName) : null;
+    if (!externalRuntimeReservationCanRelease(reservation, status?.phase ?? null, true)) return null;
+
+    return releaseExternalRuntimeReservation(db, { runId, reason });
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; suppressDispatchAfterReap?: boolean }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -10729,18 +10932,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // actually changed, so this adds no write churn on a steady fleet.
     if (jobRunStatuses) {
       for (const { run } of activeRuns) {
-        const jobName = jobRunStatuses.get(run.id)?.name ?? null;
-        if (jobName && run.externalRunId !== jobName) {
-          await db
-            .update(heartbeatRuns)
-            .set({ externalRunId: jobName })
-            .where(eq(heartbeatRuns.id, run.id));
+        const jobStatus = jobRunStatuses.get(run.id);
+        const jobName = jobStatus?.name ?? null;
+        if (jobName) {
+          let identityAccepted = true;
+          try {
+            await recordExternalRuntimeJobIdentity(db, {
+              runId: run.id,
+              jobName,
+              jobUid: jobStatus?.uid ?? null,
+              now,
+            });
+          } catch (error) {
+            identityAccepted = false;
+            logger.error(
+              { runId: run.id, jobName, jobUid: jobStatus?.uid ?? null, error },
+              "external-runtime reservation Job identity mismatch",
+            );
+          }
+          if (identityAccepted && run.externalRunId !== jobName) {
+            await db
+              .update(heartbeatRuns)
+              .set({ externalRunId: jobName })
+              .where(eq(heartbeatRuns.id, run.id));
+          }
         }
       }
     }
 
     const cleanedTerminalJobRunIds = await cleanupTerminalExternalLifecycleJobs(jobRunStatuses, now);
     reaped.push(...cleanedTerminalJobRunIds);
+    await reconcileReleasePendingExternalRuntimeReservations(jobRunStatuses);
     const liveJobRunIds =
       jobRunStatuses !== null
         ? new Set(
@@ -11644,7 +11866,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       const issueById = new Map(issueRows.map((row) => [row.id, row]));
       const companyAgents = await listCompanyAgentOrgRows(agent.companyId);
+      const hasAgedPrReview = queuedRuns.some(
+        (run) =>
+          run.createdAt.getTime() <=
+            dispatchNow.getTime() - PR_REVIEW_QUEUE_FAIRNESS_MAX_WAIT_MS &&
+          isPrReviewRetryContext(parseObject(run.contextSnapshot)),
+      );
+      const lastStartedRun = hasAgedPrReview
+        ? await db
+          .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.agentId, agentId),
+              isNotNull(heartbeatRuns.startedAt),
+            ),
+          )
+          .orderBy(desc(heartbeatRuns.startedAt), desc(heartbeatRuns.createdAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+        : null;
+      // Issue work remains the normal priority order. Once a PR review has
+      // waited ten minutes, let exactly one aged review jump the queue unless
+      // the previous dispatch was already a review. This alternates under
+      // sustained load instead of starving either issue execution or review.
+      const fairnessPromotedPrReviewRunId = selectAgedPrReviewRunForFairDispatch(
+        queuedRuns,
+        lastStartedRun,
+        dispatchNow,
+      );
       const prioritizedRuns = [...queuedRuns].sort((left, right) => {
+        if (left.id === fairnessPromotedPrReviewRunId && right.id !== fairnessPromotedPrReviewRunId) {
+          return -1;
+        }
+        if (right.id === fairnessPromotedPrReviewRunId && left.id !== fairnessPromotedPrReviewRunId) {
+          return 1;
+        }
         const leftIssueId = readNonEmptyString(parseObject(left.contextSnapshot).issueId);
         const rightIssueId = readNonEmptyString(parseObject(right.contextSnapshot).issueId);
         const leftReadiness = leftIssueId ? dependencyReadiness.get(leftIssueId) : null;
@@ -11783,6 +12040,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const runtime = await ensureRuntimeState(agent);
     const context = parseObject(run.contextSnapshot);
+    const externalRuntimeLifecycle = hasExternalLifecycle(agent.adapterType);
+    const externalRuntimeReservation = externalRuntimeLifecycle
+      ? await getActiveExternalRuntimeReservation(db, run.id)
+      : null;
+    if (externalRuntimeLifecycle && !externalRuntimeReservation) {
+      const latestRun = await getRun(run.id);
+      if (!latestRun || TERMINAL_RUN_STATUSES.has(latestRun.status)) return;
+      throw new Error(`External runtime run ${run.id} has no executable-capacity reservation`);
+    }
+    if (externalRuntimeReservation) {
+      context.paperclipExternalRuntimeReservation = {
+        id: externalRuntimeReservation.id,
+        runId: externalRuntimeReservation.runId,
+        agentId: externalRuntimeReservation.agentId,
+        slotId: externalRuntimeReservation.slotId,
+        expectedJobName: externalRuntimeReservation.expectedJobName,
+        jobName: externalRuntimeReservation.jobName,
+        jobUid: externalRuntimeReservation.jobUid,
+        state: externalRuntimeReservation.state,
+      };
+    }
     const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     const issueId = readNonEmptyString(context.issueId);
@@ -13086,6 +13364,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             if (key in meta.env) meta.env[key] = "***REDACTED***";
           }
         }
+        if (externalRuntimeReservation && isK8sAdapter(agent.adapterType)) {
+          const jobName = parseExpectedExternalRuntimeJobNameFromMetaCommand(meta.command);
+          if (jobName) {
+            await recordExpectedExternalRuntimeJobName(db, { runId: run.id, jobName });
+          }
+        }
         const modelProfileMetadata = modelProfileRunMetadata(modelProfileApplication);
         await appendRunEvent(currentRun, seq++, {
           eventType: "adapter.invoke",
@@ -13227,14 +13511,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             } as Awaited<ReturnType<typeof adapter.execute>>;
             await recordWorkspaceFinalize("failed", { errorMessage });
           } else {
+            if (externalRuntimeReservation) {
+              const launchingReservation = await markExternalRuntimeReservationLaunching(db, run.id);
+              if (!launchingReservation) {
+                throw new Error(`External runtime reservation no longer owns launch for run ${run.id}`);
+              }
+            }
             let ccrotateRetryAttempt = 0;
             while (true) {
+              if (externalRuntimeReservation) {
+                await requireExternalRuntimeLaunchOwnership(db, {
+                  runId: run.id,
+                  reservationId: externalRuntimeReservation.id,
+                });
+              }
               adapterResult = await adapter.execute({
                 runId: run.id,
                 agent,
                 runtime: runtimeForAdapter,
                 config: runtimeConfig,
                 context,
+                externalRuntime: externalRuntimeReservation
+                  ? {
+                      reservationId: externalRuntimeReservation.id,
+                      slotId: externalRuntimeReservation.slotId,
+                      expectedJobName: externalRuntimeReservation.expectedJobName,
+                      jobName: externalRuntimeReservation.jobName,
+                      jobUid: externalRuntimeReservation.jobUid,
+                    }
+                  : undefined,
                 runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
                 executionTarget,
                 executionTransport: remoteExecution
@@ -13242,6 +13547,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   : undefined,
                 onLog,
                 onMeta: onAdapterMeta,
+                onExternalRuntimeLaunched: externalRuntimeReservation
+                  ? async ({ jobName, jobUid }) => {
+                      await recordExternalRuntimeJobIdentity(db, {
+                        runId: run.id,
+                        jobName,
+                        jobUid,
+                      });
+                      await db
+                        .update(heartbeatRuns)
+                        .set({ externalRunId: jobName, updatedAt: new Date() })
+                        .where(eq(heartbeatRuns.id, run.id));
+                    }
+                  : undefined,
                 onSpawn: async (meta) => {
                   await persistRunProcessMetadata(run.id, {
                     pid: meta.pid,
@@ -13282,6 +13600,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 `[paperclip] Retryable ccrotate throttle before model progress; retrying in ${Math.ceil(retryDelayMs / 1000)}s (${ccrotateRetryAttempt}/${K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS}).\n`,
               );
               await sleepMs(retryDelayMs);
+              if (externalRuntimeReservation) {
+                const rearmedReservation = await rearmExternalRuntimeReservationForRetry(db, {
+                  runId: run.id,
+                  reservationId: externalRuntimeReservation.id,
+                });
+                if (!rearmedReservation) {
+                  throw new Error(`External runtime reservation no longer owns retry launch for run ${run.id}`);
+                }
+              }
             }
             // Adapter returned cleanly, which means its workspace-restore finally
             // block also ran without throwing. Record the workspace_finalize
@@ -13996,6 +14323,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         } finally {
           const latestRun = await getRun(run.id).catch(() => null);
+          if (latestRun && TERMINAL_RUN_STATUSES.has(latestRun.status)) {
+            await releaseExternalRuntimeReservationIfQuiesced(
+              run.id,
+              latestRun.errorCode ?? latestRun.status,
+            ).catch((error) => {
+              logger.error({ error, runId: run.id }, "failed to release external-runtime reservation after execution");
+            });
+          }
           await releaseEnvironmentLeasesForRun({
             runId: run.id,
             companyId: run.companyId,
@@ -15880,6 +16215,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
       );
 
+      // The optimistic same-scope lookup above avoids taking the lock in the
+      // common case. Re-check after acquiring it so two API replicas handling
+      // the same delivery cannot both observe an empty queue and insert two
+      // heartbeat runs. Keep a coalesced wake row for audit, but only one run.
+      const coalescedTaskScopeRun = await coalesceQueuedTaskScopeWake({
+        tx,
+        companyId: agent.companyId,
+        agentId,
+        source,
+        triggerDetail,
+        reason,
+        payload,
+        contextSnapshot: enrichedContextSnapshot,
+        taskKey: effectiveTaskKey,
+        requestedByActorType: opts.requestedByActorType,
+        requestedByActorId: opts.requestedByActorId,
+        idempotencyKey: opts.idempotencyKey,
+      });
+      if (coalescedTaskScopeRun) {
+        return { kind: "coalesced" as const, run: coalescedTaskScopeRun };
+      }
+
       const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, policy, {}, tx);
       if (dailyCapBlock) {
         const now = new Date();
@@ -16301,6 +16658,90 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     eventMessage?: string;
     eventPayload?: Record<string, unknown>;
   };
+
+  async function cancelQueuedRunsForTaskInternal(
+    agentId: string,
+    taskKey: string,
+    reason: string,
+  ) {
+    const finishedAt = new Date();
+    const cancelledRuns = await db.transaction(async (tx) => {
+      // Serialize task-scope retirement with wakeup's enqueue re-check. Without
+      // the shared agent lock, a concurrent webhook could hold the enqueue
+      // lock, insert after this UPDATE observed no rows, and leave review work
+      // queued for a PR that has already closed.
+      await tx.execute(
+        sql`select id from agents where id = ${agentId} for update`,
+      );
+
+      const runs = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "cancelled",
+          finishedAt,
+          error: reason,
+          errorCode: "task_scope_cancelled",
+          updatedAt: finishedAt,
+        })
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.status, "queued"),
+            eq(heartbeatRuns.contextTaskKey, taskKey),
+          ),
+        )
+        .returning();
+
+      const wakeupRequestIds = runs
+        .map((run) => run.wakeupRequestId)
+        .filter((id): id is string => Boolean(id));
+      if (wakeupRequestIds.length > 0) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            status: "cancelled",
+            finishedAt,
+            error: reason,
+            updatedAt: finishedAt,
+          })
+          .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
+      }
+
+      return runs;
+    });
+
+    if (cancelledRuns.length === 0) return 0;
+
+    for (const run of cancelledRuns) {
+      publishLiveEvent({
+        companyId: run.companyId,
+        type: "heartbeat.run.status",
+        payload: {
+          runId: run.id,
+          agentId: run.agentId,
+          status: run.status,
+          invocationSource: run.invocationSource,
+          triggerDetail: run.triggerDetail,
+          error: run.error ?? null,
+          errorCode: run.errorCode ?? null,
+          startedAt: run.startedAt ? new Date(run.startedAt).toISOString() : null,
+          finishedAt: run.finishedAt ? new Date(run.finishedAt).toISOString() : null,
+        },
+      });
+      publishRunLifecyclePluginEvent(run);
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "queued task-scoped run cancelled",
+        payload: { taskKey },
+      });
+    }
+
+    await finalizeAgentStatus(agentId, "cancelled");
+    await startNextQueuedRunForAgent(agentId);
+    return cancelledRuns.length;
+  }
 
   async function cancelRunInternal(runId: string, reason = "Cancelled by control plane", options: CancelRunOptions = {}) {
     const run = await getRun(runId);
@@ -16972,6 +17413,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) => cancelRunInternal(runId, reason, options),
+
+    cancelQueuedRunsForTask: (agentId: string, taskKey: string, reason: string) =>
+      cancelQueuedRunsForTaskInternal(agentId, taskKey, reason),
 
     cancelActiveForAgent: (agentId: string, reason?: string) => cancelActiveForAgentInternal(agentId, reason),
 

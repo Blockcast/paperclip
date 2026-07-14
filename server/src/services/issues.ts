@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, like, lt, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, exists, gt, gte, inArray, isNotNull, isNull, like, lt, lte, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -97,7 +97,6 @@ import {
 import { runEvidenceGate, type EvidenceFetchResult } from "./evidence-gate-wiring.js";
 import { countDoneWhenBullets } from "./evidence-gate.js";
 import { shouldBlockNarratedDone } from "./done-gate.js";
-import { shouldBlockUnreviewableInReview } from "./in-review-gate.js";
 import {
   parseIssueGraphLivenessIncidentKey,
   RECOVERY_ORIGIN_KINDS,
@@ -1473,17 +1472,18 @@ async function withIssueLabels(dbOrTx: any, rows: IssueRow[]): Promise<IssueWith
 
 /**
  * Evidence-gate fetcher (BLO-4824 / BLO-4461). Loads the data the pure
- * evaluator needs: issue labels, the 10 most-recent comments, and any
- * work_products. Caller supplies the description (already on the existing
- * row in the PATCH handler, no need to re-select).
+ * evaluator needs: issue labels, the 10 most-recent comments, any recent
+ * operator overrides, and any work_products. Caller supplies the description
+ * (already on the existing row in the PATCH handler, no need to re-select).
  */
 async function fetchEvidenceForIssue(
   dbOrTx: any,
   issueId: string,
   description: string | null,
   previousDescription: string | null = description,
+  now: Date = new Date(),
 ): Promise<EvidenceFetchResult> {
-  const [recentComments, workProductRows, labelsByIssueId, descriptionHistory] = await Promise.all([
+  const [recentComments, operatorOverrideComments, workProductRows, labelsByIssueId, descriptionHistory] = await Promise.all([
     dbOrTx
       .select({
         body: issueComments.body,
@@ -1495,6 +1495,23 @@ async function fetchEvidenceForIssue(
       .where(eq(issueComments.issueId, issueId))
       .orderBy(desc(issueComments.createdAt))
       .limit(10),
+    dbOrTx
+      .select({
+        body: issueComments.body,
+        authorAgentId: issueComments.authorAgentId,
+        authorUserId: issueComments.authorUserId,
+        createdAt: issueComments.createdAt,
+      })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.issueId, issueId),
+        isNotNull(issueComments.authorUserId),
+        isNull(issueComments.authorAgentId),
+        like(issueComments.body, "evidence-gate: override %"),
+        gte(issueComments.createdAt, new Date(now.getTime() - 60 * 60 * 1000)),
+        lte(issueComments.createdAt, now),
+      ))
+      .orderBy(desc(issueComments.createdAt)),
     dbOrTx
       .select({
         type: issueWorkProducts.type,
@@ -1528,6 +1545,7 @@ async function fetchEvidenceForIssue(
       countDoneWhenBullets(description ?? "") === 0 && hadPriorDoneWhenBullets,
     labels: issueLabels.map((l: { name: string }) => ({ name: l.name })),
     comments: recentComments as EvidenceFetchResult["comments"],
+    operatorOverrideComments: operatorOverrideComments as EvidenceFetchResult["operatorOverrideComments"],
     workProducts: workProductRows as EvidenceFetchResult["workProducts"],
   };
 }
@@ -6531,11 +6549,12 @@ export function issueService(db: Db) {
       if (experimental.enableDoneExecutionGate && shouldBlockNarratedDone(doneGateInput)) {
         try {
           doneTransitionEvidenceVerdict = await runEvidenceGate(
-            (issueId) => fetchEvidenceForIssue(
+            (issueId, now) => fetchEvidenceForIssue(
               dbOrTx,
               issueId,
               issueData.description !== undefined ? issueData.description : existing.description,
               existing.description,
+              now,
             ),
             id,
           );
@@ -6654,16 +6673,8 @@ export function issueService(db: Db) {
 
       applyStatusSideEffects(issueData.status, patch);
 
-      // Phase-1 warn-only evidence gate (BLO-4824 / BLO-4461). Records the
-      // gate's verdict but never throws on its own — Phase 2 (BLO-4828) will
-      // flip `block` to a 422. Errors during evaluation are swallowed so a
-      // misbehaving gate can't break the PATCH; production runs surface
-      // them via the warn log.
-      //
-      // The flag-gated in_review enforcement below intentionally lives
-      // OUTSIDE the try/catch: an evaluation failure yields verdict == null
-      // (gate fails open), while a successfully-computed non-pass verdict
-      // throws without being swallowed.
+      // Evaluation failures remain fail-open, but a computed block verdict
+      // rejects every new transition to in_review.
       if (
         issueData.status === "in_review" &&
         existing.status !== "in_review"
@@ -6671,11 +6682,12 @@ export function issueService(db: Db) {
         let inReviewVerdict: Awaited<ReturnType<typeof runEvidenceGate>> | null = null;
         try {
           const verdict = await runEvidenceGate(
-            (issueId) => fetchEvidenceForIssue(
+            (issueId, now) => fetchEvidenceForIssue(
               dbOrTx,
               issueId,
               issueData.description !== undefined ? issueData.description : existing.description,
               existing.description,
+              now,
             ),
             id,
           );
@@ -6691,6 +6703,8 @@ export function issueService(db: Db) {
               evidenceFound: verdict.evidenceFound,
               unlabeledFallback: verdict.unlabeledFallback,
               diagnostics: verdict.diagnostics,
+              overridden: verdict.overridden,
+              overrideReason: verdict.overrideReason,
             },
             `evidence-gate: ${verdict.verdict} on in_review transition`,
           );
@@ -6698,38 +6712,19 @@ export function issueService(db: Db) {
           logger.warn(
             {
               issueId: id,
-              err: err instanceof Error ? err.message : String(err),
+              err,
             },
             "evidence-gate: evaluation failed; proceeding without verdict",
           );
         }
 
-        // In-review evidence gate (narrated-review hardening, instance flag
-        // `enableInReviewEvidenceGate`, default off). Blocks an agent
-        // flipping an issue to `in_review` when the evidence gate found
-        // nothing reviewable — the failure mode where an agent does
-        // analysis-only work and narrates in_review with no PR, branch, or
-        // commits. Never gates human actors. See
-        // server/src/services/in-review-gate.ts.
-        if (
-          experimental.enableInReviewEvidenceGate &&
-          shouldBlockUnreviewableInReview({
-            fromStatus: existing.status,
-            toStatus: issueData.status,
-            isAgentActor: actorAgentId != null,
-            verdict: inReviewVerdict,
-          })
-        ) {
-          throw unprocessable(
-            "Issue cannot be moved to in_review without reviewable evidence " +
-              `(missing: ${inReviewVerdict?.missing.join(", ") || "unknown"})`,
-            {
-              reason: "in_review_without_reviewable_evidence",
-              issueId: id,
-              missing: inReviewVerdict?.missing ?? [],
-            },
-          );
+        if (inReviewVerdict?.verdict === "block") {
+          throw unprocessable("missing-evidence", {
+            code: "missing-evidence",
+            missing: inReviewVerdict.missing,
+          });
         }
+
       }
 
       if (issueData.status && issueData.status !== "done") {
