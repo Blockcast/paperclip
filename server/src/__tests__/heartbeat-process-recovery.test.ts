@@ -6,6 +6,12 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { and, asc, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  PROCESS_LOST_LIVENESS_NULL_METRIC,
+  PROCESS_LOST_TOTAL_METRIC,
+  __resetMetricsForTest,
+  renderMetrics,
+} from "../services/metrics.js";
+import {
   activityLog,
   agents,
   agentTaskSessions,
@@ -1381,6 +1387,50 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         classification: "pre_adapter_job_stamped",
       },
     });
+  });
+
+  it("emits the paperclip_process_lost_total numerator with bounded labels when it mints process_lost (BLO-16184)", async () => {
+    __resetMetricsForTest();
+    const { runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null, // pre-adapter, unstamped -> classification pre_adapter_job_unstamped
+    });
+    await db.update(heartbeatRuns).set({ updatedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    mockListAgentJobRunStatuses.mockResolvedValueOnce(new Map());
+
+    const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+
+    expect(result.runIds).toContain(runId);
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${PROCESS_LOST_TOTAL_METRIC}{adapter="opencode_k8s",error_bucket="pre_adapter",classification="pre_adapter_job_unstamped"} 1`,
+    );
+  });
+
+  it("increments the paperclip_process_lost_liveness_null denominator when kube liveness is fully unavailable (BLO-16184)", async () => {
+    __resetMetricsForTest();
+    // A fresh (in-grace) external-lifecycle run: NOT reaped, but it makes the
+    // reaper have external candidates. Both the status list and the live-id
+    // fallback default to null (kube unavailable) -> the reaper is fully blind.
+    const { runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      // lastOutputAt defaults to "now" -> not silent, stays running.
+    });
+    // Defaults: mockListAgentJobRunStatuses -> null, mockListLiveAgentJobRunIds -> null.
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).not.toContain(runId);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${PROCESS_LOST_LIVENESS_NULL_METRIC} 1`);
   });
 
   it("auto-cancels open stale_active_run_evaluation review when reaper finalizes the run to failed (PCL-2571)", async () => {

@@ -327,6 +327,18 @@ prometheusRule:
   backoffLimitExceededWindow: 5m
   # -- How long the BackoffLimitExceeded rate condition must persist before firing.
   backoffLimitExceededFor: 2m
+  # -- Warn when process_lost reaps exceed this many per rolling 24h (BLO-16184 numerator).
+  processLostWarnPerDay: 20
+  # -- How long the elevated process_lost daily count must persist before warning.
+  processLostElevatedFor: 10m
+  # -- Page when process_lost reaps exceed this many per rolling 24h.
+  processLostPagePerDay: 40
+  # -- How long the high process_lost daily count must be sustained before paging.
+  processLostPageFor: 2h
+  # -- Warn when the reaper gets more than this many null kube Job-status lists in 15m (blind-to-kube denominator guard: a low process_lost count is untrustworthy while this fires).
+  processLostLivenessNullWindowCount: 5
+  # -- How long the reaper-blind-to-kube condition must persist before warning.
+  processLostSignalBlindFor: 15m
   # -- Additional PrometheusRule groups appended verbatim.
   additionalGroups: []
 

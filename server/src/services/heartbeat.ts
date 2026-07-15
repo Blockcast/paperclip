@@ -187,6 +187,9 @@ import {
   recordAgentZeroTokenCompletedRunStreak,
   recordCcrotateCapacityDeferred,
   recordHeartbeatRunFailed,
+  recordProcessLost,
+  recordProcessLostLivenessNull,
+  setExternalLifecycleRunningRuns,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
@@ -11083,6 +11086,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const hasExternalCandidates = activeRuns.some((row) => hasExternalLifecycle(row.adapterType));
     const jobRunStatuses = await listAgentJobRunStatuses();
 
+    // BLO-16184: emit the process_lost run-volume DENOMINATOR every reap cycle so
+    // a "0 process_lost" reading can never be silently trusted at low run volume.
+    // Set reset-then-set so a genuine drop to 0 is written explicitly, not stale.
+    // (The kube-null-blindness denominator is emitted below once liveJobRunIds is
+    // resolved, so it reflects true blindness rather than a recovered primary miss.)
+    const externalRunningByAdapter: Record<string, number> = {};
+    for (const { adapterType } of activeRuns) {
+      if (hasExternalLifecycle(adapterType)) {
+        externalRunningByAdapter[adapterType] = (externalRunningByAdapter[adapterType] ?? 0) + 1;
+      }
+    }
+    setExternalLifecycleRunningRuns(externalRunningByAdapter);
+
     // BLO-8746/BLO-8827 Phase A: stamp the backing k8s Job name onto each
     // running external-lifecycle run's external_run_id so the run row is
     // self-describing — run→Job is navigable without a live kube query, and
@@ -11132,6 +11148,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : hasExternalCandidates
           ? await listLiveAgentJobRunIds()
           : null;
+
+    // BLO-16184 DENOMINATOR #2: the reaper is truly blind only when it has no
+    // live-Job data at all for this cycle -- the primary status list AND the
+    // fallback live-id list both returned null (kube API unavailable). Keying on
+    // liveJobRunIds (not jobRunStatuses) avoids a false SignalBlind when the
+    // primary miss is recovered by the fallback call. While blind the reaper
+    // falls back to the staleness heuristic, so any concurrent low process_lost
+    // count is unreliable.
+    if (hasExternalCandidates && liveJobRunIds === null) {
+      recordProcessLostLivenessNull();
+    }
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
       if (runningProcesses.has(run.id)) continue;
@@ -11434,7 +11461,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         externalRunId: run.externalRunId,
         preAdapterJobLiveness,
       });
-
+      // BLO-16184: numerator of the process_lost trigger monitor, emitted below
+      // once the mint is committed (so a failed/aborted setRunStatus never
+      // over-counts). Split by adapter + error-string bucket + the durable
+      // classification, all bounded.
       let finalizedRun = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
@@ -11455,6 +11485,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       if (!finalizedRun) finalizedRun = await getRun(run.id);
       if (!finalizedRun) continue;
+      // BLO-16184: the process_lost mint is now committed for this run -- count it
+      // (bounded adapter + error-string bucket + durable classification).
+      recordProcessLost({
+        adapter: adapterType,
+        errorString: baseMessage,
+        classification: processLossCapture.classification,
+      });
       finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
       // PCL-2571: cancel any open stale_active_run_evaluation review for
       // this run now that the silence is explained by process_lost. The
