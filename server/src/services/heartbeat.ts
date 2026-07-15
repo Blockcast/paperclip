@@ -3313,6 +3313,9 @@ export function buildK8sRunIsolationDescriptor(input: {
   const cacheRoot = isolationMode === "shared"
     ? path.join(sharedHomeRoot, ".cache")
     : path.posix.join(ephemeralIsolationRoot!, "cache");
+  const tmpRoot = isolationMode === "shared"
+    ? path.join(sharedHomeRoot, ".cache", "tmp")
+    : path.posix.join(ephemeralIsolationRoot!, "tmp");
   const persistent = isolationMode === "run" ? "ephemeral" : "persistent";
 
   return {
@@ -3322,6 +3325,7 @@ export function buildK8sRunIsolationDescriptor(input: {
     homeRoot,
     sessionRoot,
     cacheRoot,
+    tmpRoot,
     storage: {
       workspace: isolationMode === "run" ? "ephemeral" : "persistent",
       home: persistent,
