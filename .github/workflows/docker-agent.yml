@@ -1,10 +1,8 @@
 name: Docker (agent base)
 
-# Builds the paperclip-agent base image — the paperclip server image with
-# build-essential + Go + Rust + Python dev + Docker CLI + kubectl + helm +
-# kind + kubelogin layered on top. Used as the container image for agent
-# Job pods (set via the adapter's `config.image`); the heavy toolchain
-# stays out of the paperclip-server image.
+# Builds a thin per-commit paperclip-agent overlay. The expensive toolchain is
+# published separately under a content-derived tag and reused until its inputs
+# or the stable runtime beneath it change.
 #
 # Triggered after the main Docker workflow lands a server image with the
 # matching sha — `workflow_run` ensures we always build paperclip-agent on
@@ -48,7 +46,7 @@ jobs:
           username: ${{ secrets.HARBOR_USERNAME }}
           password: ${{ secrets.HARBOR_PASSWORD }}
 
-      # Dockerfile.agent's `COPY --from=registry.blockcast.net/blockcast/
+      # Dockerfile.agent-toolchain's `COPY --from=registry.blockcast.net/blockcast/
       # pim-multicast-gateway/ffmpeg-publisher@sha256:...` (BLO-8717/BLO-8719)
       # pulls the moq_mmt ffmpeg build from the LAN-local cache registry. That
       # digest is published to registry.blockcast.net + Docker Hub but is NOT
@@ -81,6 +79,107 @@ jobs:
           short=$(printf '%s' "$TRIGGERING_SHA" | cut -c1-7)
           echo "short=${short}" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve stable base images
+        id: bases
+        run: |
+          set -euo pipefail
+          runtime_base_ref="harbor.blockcast.net/paperclip/node:lts-trixie-slim"
+          runtime_base_digest=""
+          for attempt in 1 2 3 4 5; do
+            if runtime_base_digest="$(docker buildx imagetools inspect "$runtime_base_ref" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"')" \
+              && [ -n "$runtime_base_digest" ]; then
+              break
+            fi
+            echo "Runtime base manifest lookup attempt ${attempt}/5 failed" >&2
+            sleep $((attempt * 2))
+          done
+          if [ -z "$runtime_base_digest" ]; then
+            echo "Unable to resolve ${runtime_base_ref} from Harbor" >&2
+            exit 1
+          fi
+          runtime_base_image="${runtime_base_ref%:*}@${runtime_base_digest}"
+          runtime_tag="$(scripts/container-base-tag.sh runtime "$runtime_base_image")"
+          runtime_image="harbor.blockcast.net/paperclip/paperclip-runtime:${runtime_tag}"
+          ffmpeg_ref="registry.blockcast.net/blockcast/pim-multicast-gateway/ffmpeg-publisher:stable"
+          ffmpeg_digest=""
+          for attempt in 1 2 3 4 5; do
+            if ffmpeg_digest="$(docker buildx imagetools inspect "$ffmpeg_ref" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"')" \
+              && [ -n "$ffmpeg_digest" ]; then
+              break
+            fi
+            echo "FFmpeg manifest lookup attempt ${attempt}/5 failed" >&2
+            sleep $((attempt * 2))
+          done
+          if [ -z "$ffmpeg_digest" ]; then
+            echo "Unable to resolve ${ffmpeg_ref} from the LAN registry" >&2
+            exit 1
+          fi
+          ffmpeg_image="${ffmpeg_ref%:*}@${ffmpeg_digest}"
+          toolchain_tag="$(scripts/container-base-tag.sh agent-toolchain "$runtime_image" "$ffmpeg_image")"
+          toolchain_image="harbor.blockcast.net/paperclip-agent/paperclip-agent-toolchain:${toolchain_tag}"
+          if docker buildx imagetools inspect "$runtime_image" >/dev/null 2>&1; then
+            runtime_exists=true
+          else
+            runtime_exists=false
+          fi
+          if docker buildx imagetools inspect "$toolchain_image" >/dev/null 2>&1; then
+            toolchain_exists=true
+            echo "Using existing agent toolchain ${toolchain_image}"
+          else
+            toolchain_exists=false
+            echo "Agent toolchain ${toolchain_image} is missing; it will be built"
+          fi
+          {
+            echo "runtime_base_image=${runtime_base_image}"
+            echo "runtime_image=${runtime_image}"
+            echo "runtime_exists=${runtime_exists}"
+            echo "ffmpeg_image=${ffmpeg_image}"
+            echo "toolchain_image=${toolchain_image}"
+            echo "toolchain_exists=${toolchain_exists}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Normally the successful server workflow already created this exact
+      # runtime. Keep workflow_dispatch self-contained for recovery/bootstrap.
+      - name: Build and push stable runtime image
+        if: steps.bases.outputs.runtime_exists != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.runtime
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          build-args: |
+            RUNTIME_BASE_IMAGE=${{ steps.bases.outputs.runtime_base_image }}
+          cache-from: type=registry,ref=harbor.blockcast.net/paperclip/paperclip-runtime:latest
+          cache-to: type=inline
+          tags: |
+            ${{ steps.bases.outputs.runtime_image }}
+            harbor.blockcast.net/paperclip/paperclip-runtime:latest
+
+      - name: Build and push stable agent toolchain
+        if: steps.bases.outputs.toolchain_exists != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.agent-toolchain
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          build-args: |
+            RUNTIME_IMAGE=${{ steps.bases.outputs.runtime_image }}
+            FFMPEG_IMAGE=${{ steps.bases.outputs.ffmpeg_image }}
+          # This Dockerfile is also linear. Inline cache metadata avoids
+          # uploading the 7 GB toolchain through image and cache exporters at
+          # the same time, while :latest remains usable as cache-from.
+          cache-from: type=registry,ref=harbor.blockcast.net/paperclip-agent/paperclip-agent-toolchain:latest
+          cache-to: type=inline
+          tags: |
+            ${{ steps.bases.outputs.toolchain_image }}
+            harbor.blockcast.net/paperclip-agent/paperclip-agent-toolchain:latest
+
       # Mirror the server image's tag scheme: `sha-<7>-k8s-vendored` per
       # commit + `latest-k8s-vendored` floating tag on master. The
       # adapter's `config.image` will pin a specific sha tag; `latest` is
@@ -102,8 +201,8 @@ jobs:
           file: Dockerfile.agent
           platforms: linux/amd64
           push: true
-          # Pin BASE_IMAGE to the just-built server image at this exact sha
-          # so paperclip-agent:sha-<X> always extends paperclip:sha-<X>.
+          # Copy /app from the just-built server image at this exact sha while
+          # reusing the content-addressed toolchain beneath the final image.
           # Falling back to `latest` here would race with concurrent server
           # builds and produce drifted layers.
           #
@@ -115,17 +214,18 @@ jobs:
           # parallel-pushes the server image to both registries, so the
           # sha tag exists on harbor when this workflow runs.
           build-args: |
-            BASE_IMAGE=harbor.blockcast.net/paperclip/paperclip:sha-${{ steps.sha.outputs.short }}-k8s-vendored
+            SERVER_IMAGE=harbor.blockcast.net/paperclip/paperclip:sha-${{ steps.sha.outputs.short }}-k8s-vendored
+            TOOLCHAIN_IMAGE=${{ steps.bases.outputs.toolchain_image }}
           # Same containerd-EOF-on-attestation-manifest reasoning as the
           # server image's Docker workflow.
           provenance: false
           sbom: false
           # Registry-backed cache on harbor (was zot pre-2026-05-17;
-          # moved alongside BASE_IMAGE so any small cache blob can't
+          # moved alongside the server image so any small cache blob can't
           # trip the same Ceph RGW zero-byte truncation that the FROM
           # blob hit).
-          cache-from: type=registry,ref=harbor.blockcast.net/paperclip-agent/paperclip-agent:buildcache-v6
-          cache-to: type=registry,ref=harbor.blockcast.net/paperclip-agent/paperclip-agent:buildcache-v6,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
+          cache-from: type=registry,ref=harbor.blockcast.net/paperclip-agent/paperclip-agent:buildcache-v7
+          cache-to: type=registry,ref=harbor.blockcast.net/paperclip-agent/paperclip-agent:buildcache-v7,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
