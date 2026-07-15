@@ -1053,6 +1053,10 @@ export async function startServer(): Promise<StartedServer> {
         }
       }
 
+      const reattachedExternalRuns = await heartbeat.resumeRunningExternalRuntimeRuns();
+      if (reattachedExternalRuns > 0) {
+        logger.info({ reattachedExternalRuns }, "reattached running external-runtime Jobs after restart");
+      }
       const promotion = await heartbeat.promoteDueScheduledRetries();
       await heartbeat.resumeQueuedRuns();
       const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
