@@ -24,6 +24,7 @@ const K8S_JOB_LIVENESS_TIMEOUT_SECONDS = Math.max(
 // job-manifest.ts for the source of truth.
 const AGENT_JOB_LABEL_SELECTOR = "app.kubernetes.io/managed-by=paperclip";
 const RUN_ID_LABEL = "paperclip.io/run-id";
+const AGENT_ID_LABEL = "paperclip.io/agent-id";
 
 export type AgentJobRunStatus = {
   phase: "active" | "succeeded" | "failed";
@@ -45,6 +46,21 @@ export type AgentJobRunStatusByName =
       message?: string | null;
       name: string;
     };
+
+export type ManagedAgentJob = AgentJobRunStatus & {
+  runId: string | null;
+  agentId: string | null;
+  name: string;
+  uid: string;
+  createdAt: Date | null;
+};
+
+export type ExactAgentJobIdentity = {
+  runId: string;
+  agentId: string;
+  name: string;
+  uid: string;
+};
 
 type ClientState =
   | { kind: "uninitialized" }
@@ -194,7 +210,7 @@ export async function readAgentJobRunStatusByName(
  * Returns the current Kubernetes Job phase by heartbeat run ID for managed
  * external-lifecycle agent Jobs, or null when the kube API cannot be queried.
  */
-export async function listAgentJobRunStatuses(): Promise<Map<string, AgentJobRunStatus> | null> {
+export async function listManagedAgentJobs(): Promise<ManagedAgentJob[] | null> {
   const state = initClient();
   if (state.kind !== "ready") return null;
   try {
@@ -206,18 +222,25 @@ export async function listAgentJobRunStatuses(): Promise<Map<string, AgentJobRun
       },
       requestOptionsWithTimeout(),
     );
-    const statuses = new Map<string, AgentJobRunStatus>();
+    const jobs: ManagedAgentJob[] = [];
     for (const job of list.items ?? []) {
-      const runId = job.metadata?.labels?.[RUN_ID_LABEL];
-      if (typeof runId === "string" && runId.length > 0) {
-        statuses.set(runId, {
-          ...classifyAgentJobRunStatus(job),
-          name: job.metadata?.name ?? null,
-          uid: job.metadata?.uid ?? null,
-        });
-      }
+      const name = job.metadata?.name?.trim();
+      const uid = job.metadata?.uid?.trim();
+      if (!name || !uid) continue;
+      const runId = job.metadata?.labels?.[RUN_ID_LABEL]?.trim() || null;
+      const agentId = job.metadata?.labels?.[AGENT_ID_LABEL]?.trim() || null;
+      const createdAtRaw = job.metadata?.creationTimestamp;
+      const createdAt = createdAtRaw ? new Date(createdAtRaw) : null;
+      jobs.push({
+        ...classifyAgentJobRunStatus(job),
+        runId,
+        agentId,
+        name,
+        uid,
+        createdAt: createdAt && Number.isFinite(createdAt.getTime()) ? createdAt : null,
+      });
     }
-    return statuses;
+    return jobs;
   } catch (error) {
     logger.warn(
       { error: error instanceof Error ? error.message : String(error) },
@@ -225,6 +248,53 @@ export async function listAgentJobRunStatuses(): Promise<Map<string, AgentJobRun
     );
     return null;
   }
+}
+
+/**
+ * Compatibility view for callers that consume one status per run. Duplicate
+ * run labels are intentionally omitted: ambiguity is not a liveness signal.
+ */
+export async function listAgentJobRunStatuses(): Promise<Map<string, AgentJobRunStatus> | null> {
+  const jobs = await listManagedAgentJobs();
+  if (jobs === null) return null;
+  return indexUniqueAgentJobRunStatuses(jobs);
+}
+
+export function indexUniqueAgentJobRunStatuses(
+  jobs: readonly ManagedAgentJob[],
+): Map<string, AgentJobRunStatus> {
+  const byRun = new Map<string, ManagedAgentJob[]>();
+  for (const job of jobs) {
+    if (!job.runId) continue;
+    const candidates = byRun.get(job.runId) ?? [];
+    candidates.push(job);
+    byRun.set(job.runId, candidates);
+  }
+  const statuses = new Map<string, AgentJobRunStatus>();
+  for (const [runId, candidates] of byRun) {
+    if (candidates.length !== 1) {
+      logger.error(
+        { runId, jobs: candidates.map(({ name, uid }) => ({ name, uid })) },
+        "k8s Job inventory contains duplicate run labels; refusing to select a Job",
+      );
+      continue;
+    }
+    statuses.set(runId, candidates[0]);
+  }
+  return statuses;
+}
+
+export function matchExactAgentJob(
+  jobs: readonly ManagedAgentJob[],
+  identity: ExactAgentJobIdentity,
+): { kind: "exact"; job: ManagedAgentJob } | { kind: "missing" } | { kind: "ambiguous"; jobs: ManagedAgentJob[] } {
+  const candidates = jobs.filter((job) => job.runId === identity.runId);
+  const exact = candidates.filter((job) =>
+    job.agentId === identity.agentId && job.name === identity.name && job.uid === identity.uid
+  );
+  if (candidates.length === 1 && exact.length === 1) return { kind: "exact", job: exact[0] };
+  if (candidates.length === 0) return { kind: "missing" };
+  return { kind: "ambiguous", jobs: candidates };
 }
 
 /**
@@ -303,11 +373,58 @@ export async function deleteAgentJobsForRun(runId: string): Promise<number | nul
   }
 }
 
+export async function deleteAgentJobExact(
+  identity: ExactAgentJobIdentity,
+): Promise<"deleted" | "missing" | "mismatch" | null> {
+  const state = initClient();
+  if (state.kind !== "ready") return null;
+  try {
+    const job = await state.batchApi.readNamespacedJob(
+      { name: identity.name, namespace: PAPERCLIP_K8S_NAMESPACE },
+      requestOptionsWithTimeout(),
+    );
+    const labels = job.metadata?.labels;
+    if (
+      job.metadata?.uid !== identity.uid
+      || labels?.[RUN_ID_LABEL] !== identity.runId
+      || labels?.[AGENT_ID_LABEL] !== identity.agentId
+    ) {
+      logger.error(
+        {
+          identity,
+          observed: {
+            uid: job.metadata?.uid ?? null,
+            runId: labels?.[RUN_ID_LABEL] ?? null,
+            agentId: labels?.[AGENT_ID_LABEL] ?? null,
+          },
+        },
+        "refusing to delete k8s Job whose persisted identity does not match",
+      );
+      return "mismatch";
+    }
+    await state.batchApi.deleteNamespacedJob(
+      {
+        name: identity.name,
+        namespace: PAPERCLIP_K8S_NAMESPACE,
+        propagationPolicy: "Background",
+        body: { preconditions: { uid: identity.uid } },
+      },
+      requestOptionsWithTimeout(),
+    );
+    return "deleted";
+  } catch (error) {
+    if (isKubernetesNotFoundError(error)) return "missing";
+    logger.warn(
+      { identity, error: error instanceof Error ? error.message : String(error) },
+      "exact k8s Job deletion failed",
+    );
+    return null;
+  }
+}
+
 // Verified against production Job pod labels (kubectl get pods -l app.kubernetes.io/managed-by=paperclip)
 // and adapter sources at paperclip-adapter-{claude,opencode}-k8s/src/server/job-manifest.ts
 // which set "paperclip.io/agent-id" (hyphen) on every agent Job.
-const AGENT_ID_LABEL = "paperclip.io/agent-id";
-
 export function isActiveOrTerminatingAgentPod(pod: k8s.V1Pod): boolean {
   if (pod.metadata?.deletionTimestamp) return true;
   const phase = pod.status?.phase;

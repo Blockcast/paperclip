@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { and, eq, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { externalRuntimeReservations, heartbeatRuns } from "@paperclipai/db";
@@ -121,6 +122,7 @@ export async function claimRunWithExternalRuntimeSlot(
         reservation = await tx
           .update(externalRuntimeReservations)
           .set({
+            id: randomUUID(),
             slotId,
             state: "reserved",
             expectedJobName: null,
@@ -134,6 +136,7 @@ export async function claimRunWithExternalRuntimeSlot(
             launchedAt: null,
             releasedAt: null,
             releaseReason: null,
+            createdAt: claimedAt,
             updatedAt: claimedAt,
           })
           .where(and(
@@ -407,6 +410,32 @@ export async function requireExternalRuntimeLaunchOwnership(
   return reservation;
 }
 
+export async function requireExternalRuntimeExecutionOwnership(
+  db: Db,
+  input: {
+    runId: string;
+    reservationId: string;
+    jobName?: string | null;
+    jobUid?: string | null;
+  },
+): Promise<ExternalRuntimeReservation> {
+  const reservation = await getActiveExternalRuntimeReservation(db, input.runId);
+  if (reservation?.id !== input.reservationId) {
+    throw new Error(`External runtime reservation no longer owns execution for run ${input.runId}`);
+  }
+  if (reservation.state === "launching") return reservation;
+  if (
+    reservation.state === "launched"
+    && reservation.jobName
+    && reservation.jobUid
+    && reservation.jobName === input.jobName
+    && reservation.jobUid === input.jobUid
+  ) {
+    return reservation;
+  }
+  throw new Error(`External runtime reservation has no exact executable Job for run ${input.runId}`);
+}
+
 export async function releaseExternalRuntimeReservation(
   db: Db,
   input: { runId: string; reason: string; now?: Date },
@@ -435,7 +464,13 @@ export async function releaseExternalRuntimeReservation(
 
 export async function recordExpectedExternalRuntimeJobName(
   db: Db,
-  input: { runId: string; jobName: string; now?: Date },
+  input: {
+    runId: string;
+    jobName: string;
+    reservationId?: string;
+    slotId?: number;
+    now?: Date;
+  },
 ): Promise<ExternalRuntimeReservation | null> {
   const now = input.now ?? new Date();
   const reservation = await db
@@ -444,10 +479,22 @@ export async function recordExpectedExternalRuntimeJobName(
     .where(and(
       eq(externalRuntimeReservations.runId, input.runId),
       isNull(externalRuntimeReservations.releasedAt),
-      eq(externalRuntimeReservations.state, "launching"),
+      input.reservationId ? eq(externalRuntimeReservations.id, input.reservationId) : sql`true`,
+      input.slotId !== undefined ? eq(externalRuntimeReservations.slotId, input.slotId) : sql`true`,
       or(
-        isNull(externalRuntimeReservations.expectedJobName),
-        eq(externalRuntimeReservations.expectedJobName, input.jobName),
+        and(
+          eq(externalRuntimeReservations.state, "launching"),
+          or(
+            isNull(externalRuntimeReservations.expectedJobName),
+            eq(externalRuntimeReservations.expectedJobName, input.jobName),
+          ),
+        ),
+        and(
+          eq(externalRuntimeReservations.state, "launched"),
+          eq(externalRuntimeReservations.expectedJobName, input.jobName),
+          eq(externalRuntimeReservations.jobName, input.jobName),
+          isNotNull(externalRuntimeReservations.jobUid),
+        ),
       ),
     ))
     .returning()
@@ -466,75 +513,78 @@ export async function recordExpectedExternalRuntimeJobName(
 
 export async function recordExternalRuntimeJobIdentity(
   db: Db,
-  input: { runId: string; jobName: string; jobUid?: string | null; now?: Date },
+  input: {
+    runId: string;
+    jobName: string;
+    jobUid?: string | null;
+    reservationId?: string;
+    slotId?: number;
+    now?: Date;
+  },
 ): Promise<ExternalRuntimeReservation | null> {
   const now = input.now ?? new Date();
-  const existing = await getActiveExternalRuntimeReservation(db, input.runId);
-  if (!existing) return null;
-  if (!existing.expectedJobName) {
-    throw new Error(`External runtime Job identity observed before an expected name was persisted for run ${input.runId}`);
-  }
-  if (
-    (existing.expectedJobName && existing.expectedJobName !== input.jobName)
-    || (existing.jobName && existing.jobName !== input.jobName)
-    || (input.jobUid && existing.jobUid && existing.jobUid !== input.jobUid)
-  ) {
-    throw new Error(
-      `External runtime Job identity mismatch for run ${input.runId}: `
-      + `persisted ${existing.jobName ?? existing.expectedJobName ?? "<none>"}/${existing.jobUid ?? "<none>"}, `
-      + `received ${input.jobName}/${input.jobUid ?? "<none>"}`,
-    );
-  }
-  if (existing.state === "launched" && existing.jobName && (!input.jobUid || existing.jobUid === input.jobUid)) {
-    return existing;
-  }
-
-  const reservation = await db
-    .update(externalRuntimeReservations)
-    .set({
-      state: "launched",
-      expectedJobName: sql`coalesce(${externalRuntimeReservations.expectedJobName}, ${input.jobName})`,
-      jobName: input.jobName,
-      jobUid: sql`coalesce(${externalRuntimeReservations.jobUid}, ${input.jobUid ?? null})`,
-      launchedAt: sql`coalesce(${externalRuntimeReservations.launchedAt}, ${now.toISOString()}::timestamptz)`,
-      updatedAt: now,
-    })
-    .where(and(
-      eq(externalRuntimeReservations.runId, input.runId),
-      isNull(externalRuntimeReservations.releasedAt),
-      or(
-        eq(externalRuntimeReservations.state, "launching"),
-        eq(externalRuntimeReservations.state, "launched"),
-      ),
-      or(
-        isNull(externalRuntimeReservations.expectedJobName),
-        eq(externalRuntimeReservations.expectedJobName, input.jobName),
-      ),
-      or(isNull(externalRuntimeReservations.jobName), eq(externalRuntimeReservations.jobName, input.jobName)),
-      input.jobUid
-        ? or(isNull(externalRuntimeReservations.jobUid), eq(externalRuntimeReservations.jobUid, input.jobUid))
-        : sql`true`,
-    ))
-    .returning()
-    .then((rows) => rows[0] ?? null);
-
-  if (!reservation) {
-    const active = await getActiveExternalRuntimeReservation(db, input.runId);
-    if (active && (
-      active.expectedJobName !== input.jobName
-      || active.jobName !== input.jobName
-      || (input.jobUid && active.jobUid !== input.jobUid)
-    )) {
+  const reservation = await db.transaction(async (tx) => {
+    const existing = await tx
+      .select()
+      .from(externalRuntimeReservations)
+      .where(and(
+        eq(externalRuntimeReservations.runId, input.runId),
+        isNull(externalRuntimeReservations.releasedAt),
+      ))
+      .for("update")
+      .then((rows) => rows[0] ?? null);
+    if (!existing) return null;
+    if (!existing.expectedJobName) {
+      throw new Error(`External runtime Job identity observed before an expected name was persisted for run ${input.runId}`);
+    }
+    if (
+      (input.reservationId && existing.id !== input.reservationId)
+      || (input.slotId !== undefined && existing.slotId !== input.slotId)
+      || existing.expectedJobName !== input.jobName
+      || (existing.jobName && existing.jobName !== input.jobName)
+      || (input.jobUid && existing.jobUid && existing.jobUid !== input.jobUid)
+    ) {
       throw new Error(
         `External runtime Job identity mismatch for run ${input.runId}: `
-        + `persisted ${active.jobName ?? "<none>"}/${active.jobUid ?? "<none>"}, `
+        + `persisted reservation ${existing.id}/slot ${existing.slotId}/`
+        + `${existing.jobName ?? existing.expectedJobName}/${existing.jobUid ?? "<none>"}, `
         + `received ${input.jobName}/${input.jobUid ?? "<none>"}`,
       );
     }
-    return active;
-  }
+    if (existing.state === "launched" && existing.jobName && (!input.jobUid || existing.jobUid === input.jobUid)) {
+      await tx
+        .update(heartbeatRuns)
+        .set({ externalRunId: input.jobName, updatedAt: now })
+        .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.status, "running")));
+      return existing;
+    }
+    if (existing.state !== "launching" && existing.state !== "launched") {
+      throw new Error(`External runtime reservation for run ${input.runId} is not launchable from ${existing.state}`);
+    }
 
-  recordExternalRuntimeReservationEvent("launched");
-  refreshExternalRuntimeReservationMetricsBestEffort(db, now, "launch");
+    const updated = await tx
+      .update(externalRuntimeReservations)
+      .set({
+        state: "launched",
+        jobName: input.jobName,
+        jobUid: sql`coalesce(${externalRuntimeReservations.jobUid}, ${input.jobUid ?? null})`,
+        launchedAt: sql`coalesce(${externalRuntimeReservations.launchedAt}, ${now.toISOString()}::timestamptz)`,
+        updatedAt: now,
+      })
+      .where(eq(externalRuntimeReservations.id, existing.id))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!updated) return null;
+    await tx
+      .update(heartbeatRuns)
+      .set({ externalRunId: input.jobName, updatedAt: now })
+      .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.status, "running")));
+    return updated;
+  });
+
+  if (reservation) {
+    recordExternalRuntimeReservationEvent("launched");
+    refreshExternalRuntimeReservationMetricsBestEffort(db, now, "launch");
+  }
   return reservation;
 }

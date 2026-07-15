@@ -1038,9 +1038,13 @@ export async function startServer(): Promise<StartedServer> {
     workerHeartbeat = heartbeat;
     const routines = routineService(db as any, { pluginWorkerManager });
 
-    // Reap orphaned runs before timer ticks start so wakeups cannot coalesce
-    // into a dead "running" row during startup recovery.
+    // Reattach persisted external Jobs before any destructive stale-run reap.
+    // The same ordering is repeated by the periodic reconciler below.
     void (async () => {
+      const reattachedExternalRuns = await heartbeat.resumeRunningExternalRuntimeRuns();
+      if (reattachedExternalRuns > 0) {
+        logger.info({ reattachedExternalRuns }, "reattached running external-runtime Jobs after restart");
+      }
       for (let attempt = 1; attempt <= 2; attempt++) {
         try {
           const result = await heartbeat.reapOrphanedRuns();
@@ -1143,7 +1147,8 @@ export async function startServer(): Promise<StartedServer> {
       // Periodically reap orphaned runs (5-min staleness threshold) and make sure
       // persisted queued work is still being driven forward.
       void heartbeat
-        .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
+        .resumeRunningExternalRuntimeRuns()
+        .then(() => heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 }))
         .then(() => heartbeat.promoteDueScheduledRetries())
         .then(async (promotion) => {
           await heartbeat.resumeQueuedRuns();
