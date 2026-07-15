@@ -31,6 +31,10 @@ const mockListManagedAgentJobs = vi.hoisted(() => vi.fn(async () => null));
 const mockReadAgentJobRunStatusByName = vi.hoisted(() => vi.fn(async () => null));
 const mockDeleteAgentJobExact = vi.hoisted(() => vi.fn(async () => "deleted" as const));
 const mockHasActiveJobForAgent = vi.hoisted(() => vi.fn(async () => false));
+// Passthrough by default -- only the reconciliation-loop race test below
+// overrides this once to inject a release between the reservation read and
+// the identity stamp, mirroring the production race this module documents.
+const mockGetActiveExternalRuntimeReservation = vi.hoisted(() => vi.fn());
 
 vi.mock("../telemetry.ts", () => ({
   getTelemetryClient: () => ({ track: vi.fn() }),
@@ -43,14 +47,38 @@ vi.mock("@paperclipai/shared/telemetry", async () => {
   return { ...actual, trackAgentFirstHeartbeat: vi.fn() };
 });
 
-vi.mock("../services/k8s-job-liveness.ts", () => ({
-  listAgentJobRunStatuses: mockListAgentJobRunStatuses,
-  listLiveAgentJobRunIds: mockListLiveAgentJobRunIds,
-  listManagedAgentJobs: mockListManagedAgentJobs,
-  readAgentJobRunStatusByName: mockReadAgentJobRunStatusByName,
-  deleteAgentJobExact: mockDeleteAgentJobExact,
-  hasActiveJobForAgent: mockHasActiveJobForAgent,
+vi.mock("../services/k8s-job-liveness.ts", async () => {
+  // Spread actual so pure helpers (indexUniqueAgentJobRunStatuses,
+  // matchExactAgentJob) stay real -- the reconciliation-loop race test below
+  // needs them to index/match a synthetic managedJobs list.
+  const actual = await vi.importActual<typeof import("../services/k8s-job-liveness.ts")>(
+    "../services/k8s-job-liveness.ts",
+  );
+  return {
+    ...actual,
+    listAgentJobRunStatuses: mockListAgentJobRunStatuses,
+    listLiveAgentJobRunIds: mockListLiveAgentJobRunIds,
+    listManagedAgentJobs: mockListManagedAgentJobs,
+    readAgentJobRunStatusByName: mockReadAgentJobRunStatusByName,
+    deleteAgentJobExact: mockDeleteAgentJobExact,
+    hasActiveJobForAgent: mockHasActiveJobForAgent,
+  };
+});
+
+const actualExternalRuntimeReservationsRef = vi.hoisted(() => ({
+  current: null as unknown as typeof import("../services/external-runtime-reservations.ts"),
 }));
+vi.mock("../services/external-runtime-reservations.ts", async () => {
+  actualExternalRuntimeReservationsRef.current = await vi.importActual<
+    typeof import("../services/external-runtime-reservations.ts")
+  >("../services/external-runtime-reservations.ts");
+  return {
+    ...actualExternalRuntimeReservationsRef.current,
+    getActiveExternalRuntimeReservation: (...args: Parameters<
+      typeof actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation
+    >) => mockGetActiveExternalRuntimeReservation(...args),
+  };
+});
 
 vi.mock("../adapters/index.ts", async () => {
   const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
@@ -87,6 +115,15 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
         _resetForTesting() {},
       },
     });
+    // afterEach only re-arms the passthrough for the *next* test -- without
+    // this, the very first test in the file runs with
+    // mockGetActiveExternalRuntimeReservation unconfigured (resolves
+    // undefined instead of delegating), which silently starves every
+    // production call site of that function, not just the reconciliation
+    // loop this mock exists for.
+    mockGetActiveExternalRuntimeReservation.mockImplementation((...args: Parameters<
+      typeof actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation
+    >) => actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation(...args));
   }, 30_000);
 
   afterEach(async () => {
@@ -97,6 +134,11 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     mockReadAgentJobRunStatusByName.mockReset().mockResolvedValue(null);
     mockDeleteAgentJobExact.mockReset().mockResolvedValue("deleted");
     mockHasActiveJobForAgent.mockReset().mockResolvedValue(false);
+    mockGetActiveExternalRuntimeReservation
+      .mockReset()
+      .mockImplementation((...args: Parameters<
+        typeof actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation
+      >) => actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation(...args));
     await cleanupHeartbeatTestState(db, heartbeat);
   }, 30_000);
 
@@ -706,5 +748,111 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       .where(eq(heartbeatRuns.id, siblingRunId))
       .then((rows) => rows[0]);
     expect(siblingRun?.status).toBe("succeeded");
+  }, 30_000);
+
+  it("compensates by deleting the exact Job when the periodic reconciliation loop loses the create/stamp race", async () => {
+    // Ally review on PR #690 (BLO-16269) flagged that both new race tests above
+    // drive ctx.onExternalRuntimeLaunched directly, covering only the primary
+    // stamp path -- the periodic external-runtime reconciliation loop (the
+    // "secondary stamp path" over already-observed live Jobs, heartbeat.ts
+    // ~line 11448) had the identical compensating-delete branch but no direct
+    // coverage. This exercises that loop by calling reapOrphanedRuns directly
+    // with a synthetic managedJobs snapshot (the Job the adapter already
+    // created in-cluster) while getActiveExternalRuntimeReservation is
+    // intercepted once to release the reservation between the loop's read and
+    // its stamp attempt -- reproducing the exact race window without needing
+    // real concurrency.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const jobName = "agent-claude-race-lost-reconcile";
+    const jobUid = "reconcile-race-uid";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "External Runtime Reconcile Co",
+      issuePrefix: "ERC",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Claude K8s Reconcile",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          enabled: true,
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      startedAt: new Date(),
+      contextSnapshot: {},
+    });
+    // Mirrors the state left behind once onMeta has parsed the expected Job
+    // name but before the adapter has reported the launched identity back
+    // in-process -- exactly the window createNamespacedJob's success can race
+    // against a reap/release from elsewhere.
+    await db.insert(externalRuntimeReservations).values({
+      companyId,
+      agentId,
+      runId,
+      slotId: 0,
+      state: "launching",
+      expectedJobName: jobName,
+      isolationMode: "run",
+      isolationKey: `run:${runId}`,
+      isolationBoundAt: new Date(),
+      reservedAt: new Date(),
+      launchingAt: new Date(),
+    });
+
+    mockListManagedAgentJobs.mockResolvedValue([
+      {
+        phase: "active",
+        reason: null,
+        message: null,
+        runId,
+        agentId,
+        name: jobName,
+        uid: jobUid,
+        createdAt: new Date(),
+      },
+    ]);
+    mockGetActiveExternalRuntimeReservation.mockImplementationOnce(async (dbArg, runIdArg) => {
+      const reservation = await actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation(
+        dbArg,
+        runIdArg,
+      );
+      // Simulate a concurrent reap tick releasing the reservation in the
+      // window between this read and the loop's subsequent stamp attempt.
+      await releaseExternalRuntimeReservation(db, { runId: runIdArg, reason: "process_lost" });
+      return reservation;
+    });
+
+    await heartbeat.reapOrphanedRuns();
+
+    expect(mockDeleteAgentJobExact).toHaveBeenCalledWith({ runId, agentId, name: jobName, uid: jobUid });
+
+    const reservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, runId))
+      .then((rows) => rows[0]);
+    expect(reservation.state).toBe("released");
+    expect(reservation.jobName).toBeNull();
+    expect(reservation.jobUid).toBeNull();
   }, 30_000);
 });
