@@ -339,6 +339,10 @@ prometheusRule:
   processLostLivenessNullWindowCount: 5
   # -- How long the reaper-blind-to-kube condition must persist before warning.
   processLostSignalBlindFor: 15m
+  # -- Warn when more than this many ac-* agent pods are Unschedulable for unschedulableFor (node-pool scheduling starvation, BLO-16224). Reuses agentJobNameRegex to match agent pods.
+  unschedulablePodThreshold: 0
+  # -- How long agent pods must stay Unschedulable before warning (transient blips self-resolve; this catches sustained starvation).
+  unschedulableFor: 15m
   # -- Additional PrometheusRule groups appended verbatim.
   additionalGroups: []
 

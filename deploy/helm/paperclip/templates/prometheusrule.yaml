@@ -31,6 +31,14 @@ spec:
           annotations:
             summary: "Paperclip agent Kubernetes Jobs are hitting BackoffLimitExceeded"
             description: "One or more ac-* Paperclip agent Jobs in namespace {{`{{ $labels.namespace }}`}} are failing with BackoffLimitExceeded, or this cluster's kube-state-metrics omits Job failure reason labels and an ac-* Job failed. Check the matching Job/Pod logs and the zero-token streak alert for poisoned-session loops."
+        - alert: PaperclipAgentPodUnschedulable
+          expr: count(kube_pod_status_unschedulable{pod=~{{ .Values.prometheusRule.agentJobNameRegex | quote }}} == 1) > {{ .Values.prometheusRule.unschedulablePodThreshold }}
+          for: {{ .Values.prometheusRule.unschedulableFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip agent pods stuck Unschedulable (node-pool scheduling starvation)"
+            description: "More than {{ .Values.prometheusRule.unschedulablePodThreshold }} ac-* agent pod(s) have been Unschedulable for {{ .Values.prometheusRule.unschedulableFor }} (BLO-16224). Agent-Job pods request 1 CPU each and affinity-pin to the shared arc-runner-host pool, which bin-packs on requests, so sustained Unschedulable means the pool is requests-saturated (not usage-saturated). Remediate by adding pool capacity or right-sizing the agent-Job CPU request (observed usage runs well under the 1-core request). Transient blips self-resolve; this fires only on sustained starvation. Requires kube-state-metrics."
     - name: paperclip-process-lost
       rules:
         - alert: PaperclipProcessLostElevated
