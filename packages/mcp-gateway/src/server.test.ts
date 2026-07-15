@@ -511,7 +511,7 @@ describe("mcp gateway lifecycle compatibility", () => {
     }
   });
 
-  it("does not inject control-plane credentials into tenant-node routes", async () => {
+  it("forwards only MCP protocol headers to tenant-node routes", async () => {
     const upstream = await createStrictMcpUpstream();
     const state: GatewayState = {
       upstreams: {
@@ -533,12 +533,30 @@ describe("mcp gateway lifecycle compatibility", () => {
     try {
       const response = await fetch(url, {
         method: "POST",
-        headers: jsonHeaders(),
+        headers: {
+          ...jsonHeaders(),
+          accept: "application/json, text/event-stream",
+          authorization: "Bearer caller-secret",
+          cookie: "session=caller-secret",
+          "mcp-protocol-version": "2025-06-18",
+          "x-api-key": "caller-secret",
+          "x-penstock-node": "attacker-node",
+          "x-penstock-tenant": "attacker-tenant",
+        },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
       });
 
       expect(response.status).toBe(200);
-      expect(upstream.receivedHeaders[0]?.authorization).toBeUndefined();
+      expect(upstream.receivedHeaders[0]).toMatchObject({
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+        "mcp-protocol-version": "2025-06-18",
+      });
+      expect(upstream.receivedHeaders[0]).not.toHaveProperty("authorization");
+      expect(upstream.receivedHeaders[0]).not.toHaveProperty("cookie");
+      expect(upstream.receivedHeaders[0]).not.toHaveProperty("x-api-key");
+      expect(upstream.receivedHeaders[0]).not.toHaveProperty("x-penstock-node");
+      expect(upstream.receivedHeaders[0]).not.toHaveProperty("x-penstock-tenant");
     } finally {
       if (previous === undefined) delete process.env.TEST_MCP_TOKEN;
       else process.env.TEST_MCP_TOKEN = previous;

@@ -434,6 +434,13 @@ function buildForwardHeaders(
   upstreamConfig?: UpstreamConfig,
 ): Record<string, string> {
   const headers: Record<string, string> = {};
+  if (upstreamConfig?.execution === "tenant_node") {
+    copyHeader(headers, inboundHeaders, "accept");
+    copyHeader(headers, inboundHeaders, "content-type");
+    copyHeader(headers, inboundHeaders, "last-event-id");
+    copyHeader(headers, inboundHeaders, "mcp-protocol-version");
+    return headers;
+  }
   if (credentialToken) {
     copyHeader(headers, inboundHeaders, "accept");
     copyHeader(headers, inboundHeaders, "content-type");
