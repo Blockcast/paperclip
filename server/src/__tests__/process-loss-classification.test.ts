@@ -138,3 +138,56 @@ describe("buildProcessLossCapture (BLO-16181)", () => {
     expect(capture.classification).toBe("pre_adapter_kube_unknown");
   });
 });
+
+describe("pre-adapter <-> classification invariant (BLO-16185 non-goal tripwire)", () => {
+  // The "checkpoint/resume is a non-goal" decision (docs/plans/2026-07-14-
+  // process-loss-recovery-non-goal.md) rests on the classifier faithfully mapping
+  // the pre/post-adapter boundary onto its bucket family: pre-adapter reaps carry
+  // no work product, started reaps are the small tail. If adapter.invoke ever
+  // moves earlier the runtime `preAdapter` share shifts (visible on the BLO-16184
+  // metric split) -- but the classifier must never blur the mapping itself, or
+  // that tripwire reads the wrong bucket. This pins the mapping across every
+  // combination of the other inputs.
+  const livenesses: ProcessLossJobLiveness[] = ["alive", "dead", "unknown", null];
+
+  it("maps every external pre-adapter signal set to a pre_adapter_* bucket", () => {
+    for (const externalRunIdStamped of [true, false]) {
+      for (const preAdapterJobLiveness of livenesses) {
+        const c = classifyProcessLoss({
+          externalLifecycleRun: true,
+          preAdapter: true,
+          externalRunIdStamped,
+          preAdapterJobLiveness,
+        });
+        expect(c.startsWith("pre_adapter_")).toBe(true);
+      }
+    }
+  });
+
+  it("never maps an external started (post-adapter) signal set to a pre_adapter_* bucket", () => {
+    for (const externalRunIdStamped of [true, false]) {
+      for (const preAdapterJobLiveness of livenesses) {
+        const c = classifyProcessLoss({
+          externalLifecycleRun: true,
+          preAdapter: false,
+          externalRunIdStamped,
+          preAdapterJobLiveness,
+        });
+        expect(c.startsWith("pre_adapter_")).toBe(false);
+        expect(c).toBe("started_job_absent");
+      }
+    }
+  });
+
+  it("never maps a non-external reap to a pre_adapter_* or started bucket", () => {
+    for (const preAdapter of [true, false]) {
+      const c = classifyProcessLoss({
+        externalLifecycleRun: false,
+        preAdapter,
+        externalRunIdStamped: false,
+        preAdapterJobLiveness: null,
+      });
+      expect(c).toBe("local");
+    }
+  });
+});
