@@ -5,7 +5,7 @@ import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { MCP_SESSION_HEADER } from "./session-keepalive.js";
-import { buildInitializeReplayHeaders, createGatewayServer, type GatewayState } from "./server.js";
+import { buildInitializeReplayHeaders, createGatewayServer, loadGatewayConfig, type GatewayState } from "./server.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 import {
   DEFAULT_CREDENTIAL_CUSTODY_TOKEN_CACHE_MAX_ENTRIES,
@@ -412,6 +412,34 @@ describe("buildInitializeReplayHeaders", () => {
   });
 });
 
+describe("OAuth discovery", () => {
+  it("requires the public resource and authorization server together", () => {
+    expect(() => loadGatewayConfig({ PAPERCLIP_MCP_PUBLIC_URL: "https://tenant.example" })).toThrow(/configured together/);
+  });
+
+  it("serves protected-resource metadata and redirects authorization discovery", async () => {
+    const upstream = await createStrictMcpUpstream();
+    const gateway = await createGateway(upstream.url);
+    gateway.state.oauthDiscovery = {
+      resource: "https://tenant.example/mcp",
+      authorizationServer: "https://auth.example",
+    };
+    const baseUrl = gateway.url.replace(/\/k8s-admin\/mcp$/, "");
+
+    const protectedResource = await fetch(`${baseUrl}/.well-known/oauth-protected-resource/mcp`);
+    expect(protectedResource.status).toBe(200);
+    expect(await protectedResource.json()).toEqual({
+      resource: "https://tenant.example/mcp",
+      authorization_servers: ["https://auth.example"],
+      bearer_methods_supported: ["header"],
+    });
+
+    const authorization = await fetch(`${baseUrl}/.well-known/oauth-authorization-server`, { redirect: "manual" });
+    expect(authorization.status).toBe(307);
+    expect(authorization.headers.get("location")).toBe("https://auth.example/.well-known/oauth-authorization-server");
+  });
+});
+
 describe("loadCredentialCustodyState", () => {
   it("loads the Figma custody token cache bound with a safe default and env override", () => {
     expect(loadCredentialCustodyState({}).maxTokenCacheEntries).toBe(
@@ -443,6 +471,22 @@ describe("mcp gateway lifecycle compatibility", () => {
       upstreamCallCounts: new Map(),
       upstreamTimeoutMs: 60_000,
       breaker: new CircuitBreaker({ failureThreshold: 5, openCooldownMs: 30_000, halfOpenMaxProbes: 1 }),
+      credentialCustody: {
+        configs: {
+          github: {
+            prefix: "github",
+            app: "github",
+            leaseUrl: "https://control-plane.invalid/leases",
+            credentialBaseUrl: "https://control-plane.invalid/credentials",
+            controlPlaneTimeoutMs: 60_000,
+            leaseMode: "exclusive",
+            leaseTtlMs: 60_000,
+            upstreamAuthorizationScheme: "Bearer",
+          },
+        },
+        tokenCache: new Map(),
+        maxTokenCacheEntries: DEFAULT_CREDENTIAL_CUSTODY_TOKEN_CACHE_MAX_ENTRIES,
+      },
     };
     const previous = process.env.TEST_MCP_TOKEN;
     const previousAllowlist = process.env.PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS;
@@ -464,6 +508,40 @@ describe("mcp gateway lifecycle compatibility", () => {
       else process.env.TEST_MCP_TOKEN = previous;
       if (previousAllowlist === undefined) delete process.env.PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS;
       else process.env.PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS = previousAllowlist;
+    }
+  });
+
+  it("does not inject control-plane credentials into tenant-node routes", async () => {
+    const upstream = await createStrictMcpUpstream();
+    const state: GatewayState = {
+      upstreams: {
+        github: {
+          url: upstream.url,
+          execution: "tenant_node",
+          credentialHeaders: [{ header: "authorization", env: "TEST_MCP_TOKEN", scheme: "Bearer" }],
+        },
+      },
+      sessions: new Map(),
+      upstreamCallCounts: new Map(),
+      upstreamTimeoutMs: 60_000,
+      breaker: new CircuitBreaker({ failureThreshold: 5, openCooldownMs: 30_000, halfOpenMaxProbes: 1 }),
+    };
+    const previous = process.env.TEST_MCP_TOKEN;
+    process.env.TEST_MCP_TOKEN = "must-stay-on-node";
+    const server = createGatewayServer(state);
+    const url = (await listen(server)).replace(/\/mcp$/, "/github/mcp");
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(upstream.receivedHeaders[0]?.authorization).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.TEST_MCP_TOKEN;
+      else process.env.TEST_MCP_TOKEN = previous;
     }
   });
 

@@ -54,6 +54,26 @@ describe("parseUpstreamMap", () => {
     ).toThrow(/credential value/);
   });
 
+  it("retains tenant-node credential key names as non-custodial metadata", () => {
+    const map = parseUpstreamMap(
+      JSON.stringify({
+        upstreams: [{
+          prefix: "github",
+          url: "https://tenant-channel.example/mcp/github",
+          execution: "tenant_node",
+          authorizationEnv: "GITHUB_TOKEN",
+        }],
+      }),
+      "test",
+    );
+
+    expect(map.github).toEqual({
+      url: "https://tenant-channel.example/mcp/github",
+      execution: "tenant_node",
+      credentialHeaders: [{ header: "authorization", env: "GITHUB_TOKEN", scheme: "Bearer" }],
+    });
+  });
+
   it("rejects non-object roots", () => {
     expect(() => parseUpstreamMap("[1,2]", "test")).toThrow(/JSON object/);
     expect(() => parseUpstreamMap('"foo"', "test")).toThrow(/JSON object/);
@@ -123,6 +143,19 @@ describe("buildCredentialHeaders", () => {
     );
 
     expect(headers).toEqual({ authorization: "Bearer serve-token", "x-api-key": "api-key" });
+  });
+
+  it("never reads or injects credential values for a tenant-node route", () => {
+    const headers = buildCredentialHeaders(
+      {
+        url: "https://tenant-channel.example/mcp/github",
+        execution: "tenant_node",
+        credentialHeaders: [{ header: "authorization", env: "GITHUB_TOKEN", scheme: "Bearer" }],
+      },
+      { GITHUB_TOKEN: "must-stay-on-node" },
+    );
+
+    expect(headers).toEqual({});
   });
 
   it("rejects credential env names that are not allowlisted", () => {
@@ -226,5 +259,25 @@ describe("loadUpstreams", () => {
       }),
     ).rejects.toThrow(/not listed in PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS/);
     expect(fs.existsSync(cacheFile)).toBe(false);
+  });
+
+  it("does not require control-plane env allowlisting for tenant-node credential keys", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-upstreams-"));
+    const cacheFile = path.join(dir, "lkg.json");
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      upstreams: [{
+        prefix: "github",
+        url: "https://tenant-channel.example/mcp/github",
+        execution: "tenant_node",
+        authorizationEnv: "GITHUB_TOKEN",
+      }],
+    }), { status: 200 })));
+
+    const map = await loadUpstreams({
+      PAPERCLIP_MCP_UPSTREAMS_STATE_URL: "https://penstock.example/mcp-upstreams",
+      PAPERCLIP_MCP_UPSTREAMS_CACHE_FILE: cacheFile,
+    });
+
+    expect(map.github.execution).toBe("tenant_node");
   });
 });

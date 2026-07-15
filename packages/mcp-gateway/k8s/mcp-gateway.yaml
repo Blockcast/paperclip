@@ -10,8 +10,9 @@
 # Routes incoming requests by path prefix to upstream MCP servers. Upstream
 # metadata comes from penstock state, scoped by the gateway state token's
 # principal/tenant identity. Credential values do not enter penstock state:
-# the state payload names env vars, and this deployment sources those values
-# from Kubernetes Secrets.
+# the state payload names env vars. This deployment sources values for house
+# servers from Kubernetes Secrets; tenant_node entries are relayed through the
+# existing tenant channel and never resolve credentials in this pod.
 #
 # Agents should target one logical MCP endpoint at /mcp. The gateway aggregates
 # upstream tools, rewrites names as <prefix>__<tool>, and routes tools/call back
@@ -95,9 +96,9 @@ spec:
             - name: NODE_ENV
               value: production
           envFrom:
-            # Contains only upstream credential values. Penstock state stores
-            # the matching env-var names (for example CCROTATE_SERVE_TOKEN),
-            # never the values themselves.
+            # Contains only house-server credential values. Penstock state
+            # stores matching env-var names (for example CCROTATE_SERVE_TOKEN),
+            # never values. Tenant tool credentials must not be added here.
             - secretRef:
                 name: paperclip-mcp-upstream-credentials
           volumeMounts:
