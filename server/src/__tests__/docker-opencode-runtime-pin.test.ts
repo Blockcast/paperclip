@@ -26,7 +26,7 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   });
 
   it("vendors the claude_k8s adapter commit with runtime isolation bootstrap, resume guard, and env guard", () => {
-    expect(dockerfile).toContain("ARG CLAUDE_K8S_REF=288f92accd57769d61ec80478ef831ed589ff6a8");
+    expect(dockerfile).toContain("ARG CLAUDE_K8S_REF=6b96224be921c7244202215693515d942520ddd5");
     expect(dockerfile).toContain("PEN-1305 PreToolUse env-guard");
     expect(dockerfile).toContain("always materialize the shared MCP baseline");
     expect(dockerfile).toContain("Fixes BackendEngineerGo/Ally missing paperclip/hindsight/gbrain/linear/etc.");
