@@ -35,6 +35,7 @@ export interface AdapterRunIsolationDescriptor {
   homeRoot: string;
   sessionRoot: string;
   cacheRoot: string;
+  tmpRoot: string;
   storage: {
     workspace: "ephemeral" | "persistent";
     home: "ephemeral" | "persistent";

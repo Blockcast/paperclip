@@ -204,7 +204,14 @@ WORKDIR /vendor
 # Bumped 2026-07-15 to d44eb4e: preserve Penstock's structured `resume_at`
 # capacity hint as adapter `retryNotBefore`, avoiding blind 90-second retries.
 # PR kkroo/paperclip-adapter-claude-k8s#22; typecheck and 425/425 tests pass.
-ARG CLAUDE_K8S_REF=d44eb4e2acfeb3c5f0adafccdc36bd06da3f8060
+# Bumped 2026-07-15 to ec788a7 (BLO-16219): set TMPDIR/TMP/TEMP to a
+# tmpRoot sibling of homeRoot/sessionRoot/cacheRoot/workspaceRoot for run and
+# workspace isolation modes — previously unset, so concurrent stateless Jobs
+# shared the image's /tmp. Shared mode is unchanged. Pushed directly to
+# kkroo/paperclip-adapter-claude-k8s master (PR creation unavailable to the
+# GitHub App integration on this personal repo); typecheck and 426/426 tests
+# pass.
+ARG CLAUDE_K8S_REF=ec788a7f0ea2bb5707852149e49676374c8d9498
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
@@ -341,12 +348,14 @@ ARG CLAUDE_K8S_REF=d44eb4e2acfeb3c5f0adafccdc36bd06da3f8060
 # force stateless OpenCode DBs onto emptyDir, and key durable DBs by workspace.
 # PR kkroo/paperclip-adapter-opencode-k8s#45; typecheck, 523/523 tests, and
 # build pass after rebasing onto the env-dump deny.
-# Paperclip applies a narrow follow-up patch because the GitHub integration
-# cannot push to the personal adapter repository. It keeps Kubernetes from
-# creating a fresh run workspace as root before the uid-1000 process starts,
-# and fails isolation setup immediately instead of hiding EACCES. Paperclip
-# follow-up: Blockcast/paperclip#671.
-ARG OPENCODE_K8S_REF=dfd13f28a15c02632b7b2f6378fc17c88b570856
+# Bumped 2026-07-15 to 4aca4ad (BLO-16219): fold in the previously
+# build-time-patched run-isolation working-dir fix (now pushed directly to
+# kkroo/paperclip-adapter-opencode-k8s master — the separate build-time patch
+# file + git-apply step formerly below are retired) and set TMPDIR/TMP/TEMP
+# to a new tmpRoot sibling of homeRoot/sessionRoot/cacheRoot/workspaceRoot
+# for run and workspace isolation modes. Shared mode is unchanged. typecheck
+# and 524/524 tests pass, build clean.
+ARG OPENCODE_K8S_REF=4aca4ad6f690f68dee925960129f153f0e438439
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
@@ -369,7 +378,6 @@ ARG OPENCODE_K8S_REF=dfd13f28a15c02632b7b2f6378fc17c88b570856
 # original extends `../../tsconfig.base.json`, which doesn't resolve
 # here since we only copied the package, not the monorepo).
 COPY packages/adapter-utils /vendor/adapter-utils-src
-COPY patches/opencode-k8s-run-isolation-working-dir.patch /vendor/opencode-k8s-run-isolation-working-dir.patch
 RUN cd /vendor/adapter-utils-src \
   && rm -rf node_modules \
   && printf '%s\n' '{' \
@@ -422,7 +430,6 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
  && git -c "url.https://x-access-token:${GH}@github.com/.insteadOf=https://github.com/" \
       clone https://github.com/kkroo/paperclip-adapter-opencode-k8s.git opencode-k8s \
   && cd opencode-k8s && git checkout "${OPENCODE_K8S_REF}" \
-  && git apply /vendor/opencode-k8s-run-isolation-working-dir.patch \
   && rm -rf .git \
   && npm ci \
   && npm install --no-save /vendor/adapter-utils.tgz \

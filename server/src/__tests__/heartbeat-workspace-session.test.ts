@@ -1442,6 +1442,7 @@ describe("K8s session isolation metadata", () => {
     homeRoot: "/tmp/home",
     sessionRoot: "/tmp/session",
     cacheRoot: "/tmp/home/.cache",
+    tmpRoot: "/tmp/home/.cache/tmp",
     storage: {
       workspace: "persistent" as const,
       home: "persistent" as const,
@@ -1515,6 +1516,7 @@ describe("K8s session isolation metadata", () => {
       homeRoot: "/paperclip/instances/default/data/k8s-isolation/workspaces/execution-workspace-1/home",
       sessionRoot: "/paperclip/instances/default/data/k8s-isolation/workspaces/execution-workspace-1/session",
       cacheRoot: "/runtime-cache/paperclip-workspaces/execution-workspace-1/cache",
+      tmpRoot: "/runtime-cache/paperclip-workspaces/execution-workspace-1/tmp",
       storage: {
         workspace: "persistent",
         home: "persistent",
@@ -1582,6 +1584,7 @@ describe("K8s session isolation metadata", () => {
       homeRoot: "/runtime-cache/paperclip-runs/run-1/home",
       sessionRoot: "/runtime-cache/paperclip-runs/run-1/session",
       cacheRoot: "/runtime-cache/paperclip-runs/run-1/cache",
+      tmpRoot: "/runtime-cache/paperclip-runs/run-1/tmp",
       storage: {
         workspace: "ephemeral",
         home: "ephemeral",

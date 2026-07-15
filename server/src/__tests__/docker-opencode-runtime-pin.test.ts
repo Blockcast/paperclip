@@ -26,7 +26,7 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   });
 
   it("vendors the claude_k8s adapter commit with runtime isolation and Penstock retry hints", () => {
-    expect(dockerfile).toContain("ARG CLAUDE_K8S_REF=d44eb4e2acfeb3c5f0adafccdc36bd06da3f8060");
+    expect(dockerfile).toContain("ARG CLAUDE_K8S_REF=ec788a7f0ea2bb5707852149e49676374c8d9498");
     expect(dockerfile).toContain("PEN-1305 PreToolUse env-guard");
     expect(dockerfile).toContain("always materialize the shared MCP baseline");
     expect(dockerfile).toContain("Fixes BackendEngineerGo/Ally missing paperclip/hindsight/gbrain/linear/etc.");
@@ -51,10 +51,12 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerfile).toContain("generic non-Git fallback workspace");
     expect(dockerfile).toContain("isolated pod-log parent");
     expect(dockerfile).toContain("preserve Penstock's structured `resume_at`");
+    expect(dockerfile).toContain("BLO-16219");
+    expect(dockerfile).toContain("tmpRoot sibling of homeRoot/sessionRoot/cacheRoot/workspaceRoot");
   });
 
   it("vendors the opencode_k8s adapter commit with runtime isolation and the env-dump deny", () => {
-    expect(dockerfile).toContain("ARG OPENCODE_K8S_REF=dfd13f28a15c02632b7b2f6378fc17c88b570856");
+    expect(dockerfile).toContain("ARG OPENCODE_K8S_REF=4aca4ad6f690f68dee925960129f153f0e438439");
     expect(dockerfile).toContain("PEN-1305 permission.bash env-dump deny");
     expect(dockerfile).toContain("disable opencode's turn-zero workspace");
     expect(dockerfile).toContain("snapshot: false");
@@ -92,8 +94,10 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerfile).toContain("Manifest suite 113/113");
     expect(dockerfile).toContain("typed run/workspace");
     expect(dockerfile).toContain("key durable DBs by workspace");
-    expect(dockerfile).toContain("opencode-k8s-run-isolation-working-dir.patch");
-    expect(dockerfile).toContain("git apply /vendor/opencode-k8s-run-isolation-working-dir.patch");
+    expect(dockerfile).toContain("BLO-16219");
+    expect(dockerfile).toContain("run-isolation working-dir fix");
+    expect(dockerfile).not.toContain("opencode-k8s-run-isolation-working-dir.patch");
+    expect(dockerfile).not.toContain("git apply /vendor/opencode-k8s-run-isolation-working-dir.patch");
   });
 
   it("routes Paperclip Docker image builds through the DIND runner pool", () => {
