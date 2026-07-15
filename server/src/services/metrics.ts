@@ -109,6 +109,17 @@ export const PROCESS_LOST_LIVENESS_NULL_METRIC = "paperclip_process_lost_livenes
  *   visible after isolated concurrency lands.
  * - `unknown_isolation_blocked`: a live Job carried missing or malformed
  *   isolation metadata, so the guard fail-closed and refused an isolated start.
+ *
+ * BLO-15959 adds three bounded-external-lifecycle-concurrency admission
+ * reasons, emitted from the server-side dispatch gate in heartbeat.ts (as
+ * opposed to the adapter-lane reasons above):
+ * - `concurrency_disabled`: the agent is at its (fallback) one-run cap
+ *   because `heartbeat.concurrencyEnabled` is false/absent.
+ * - `max_concurrent_runs`: concurrency is enabled but the agent is at its
+ *   configured `maxConcurrentRuns` ceiling.
+ * - `external_slot_capacity`: concurrency is enabled but the agent is at the
+ *   operational `EXTERNAL_LIFECYCLE_SLOT_CAPACITY` ceiling (independent of,
+ *   and possibly lower than, its configured `maxConcurrentRuns`).
  */
 export const KNOWN_BLOCKED_REASONS = [
   "live_job_for_active_run",
@@ -116,6 +127,9 @@ export const KNOWN_BLOCKED_REASONS = [
   "live_job_for_terminated_run",
   "shared_mode_serialized",
   "unknown_isolation_blocked",
+  "concurrency_disabled",
+  "max_concurrent_runs",
+  "external_slot_capacity",
 ] as const;
 
 /**

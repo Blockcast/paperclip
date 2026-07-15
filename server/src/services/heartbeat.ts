@@ -189,6 +189,7 @@ import {
   normalizeIsolationMode,
   recordAgentZeroTokenCompletedRunStreak,
   recordCcrotateCapacityDeferred,
+  recordConcurrentRunBlocked,
   recordHeartbeatRunFailed,
   recordProcessLost,
   recordProcessLostLivenessNull,
@@ -302,6 +303,14 @@ const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
+/**
+ * Operational ceiling on simultaneous external-lifecycle (k8s) slots per
+ * agent, applied on top of `maxConcurrentRuns` whenever `concurrencyEnabled`
+ * is true (BLO-15959). Independent of the per-agent policy value so a
+ * misconfigured `maxConcurrentRuns` cannot alone blow past what the cluster
+ * is provisioned to run for one agent concurrently.
+ */
+const EXTERNAL_LIFECYCLE_SLOT_CAPACITY = 5;
 const STALE_QUEUED_MAINTENANCE_WAKE_MAX_AGE_MS = 30 * 60 * 1000;
 const STALE_QUEUED_MAINTENANCE_WAKE_BATCH_SIZE = 250;
 const STALE_QUEUED_MAINTENANCE_WAKE_REASONS = [
@@ -2096,6 +2105,11 @@ type ParsedHeartbeatPolicy = {
   wakeOnDemand: boolean;
   cooldownSec: number;
   maxConcurrentRuns: number;
+  /**
+   * Default-off eligibility gate for external-lifecycle (k8s) concurrency
+   * (BLO-15959). See {@link resolveExternalLifecycleConcurrency}.
+   */
+  concurrencyEnabled: boolean;
   idleAutoPauseAfter: number;
   adapterFailedAutoPauseAfter: number;
   skipTimerWhenNoActionableWork: boolean;
@@ -2123,6 +2137,10 @@ export function resolveHeartbeatPolicyForRuntimeConfig(runtimeConfigValue: unkno
     heartbeat.maxConcurrentRuns,
     presetConfig?.maxConcurrentRuns ?? HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT,
   );
+  // BLO-15959: deliberately NOT influenced by preset — a preset tunes
+  // interval/cooldown/maxConcurrentRuns, but opting an agent into actual
+  // external-lifecycle concurrency must be an explicit, separate decision.
+  const concurrencyEnabled = asBoolean(heartbeat.concurrencyEnabled, false);
   const desiredCooldownSec = normalizeHeartbeatCooldownSec(heartbeat.cooldownSec, presetConfig?.cooldownSec ?? 0);
   const cooldownSec = enabled ? Math.min(desiredCooldownSec, intervalSec) : desiredCooldownSec;
   const idleAutoPauseAfter = Math.max(0, asNumber(heartbeat.idleAutoPauseAfter, 0));
@@ -2138,11 +2156,48 @@ export function resolveHeartbeatPolicyForRuntimeConfig(runtimeConfigValue: unkno
     wakeOnDemand,
     cooldownSec,
     maxConcurrentRuns,
+    concurrencyEnabled,
     idleAutoPauseAfter,
     adapterFailedAutoPauseAfter,
     skipTimerWhenNoActionableWork,
     maxDailyRuns,
     maxDailyCostCents,
+  };
+}
+
+/**
+ * Resolve the admitted concurrency ceiling for external-lifecycle (k8s)
+ * adapters (BLO-15959). This is a separate, default-off eligibility gate on
+ * top of the per-agent `maxConcurrentRuns` policy value:
+ *
+ * - Disabled (default): every external-lifecycle agent is held to exactly
+ *   one concurrent run, regardless of what `maxConcurrentRuns` is configured
+ *   to. This is the fallback/rollback posture — flipping the flag back off
+ *   restores it immediately with no migration or data repair, because it is
+ *   computed fresh from policy on every dispatch rather than persisted.
+ * - Enabled: the effective ceiling is `min(maxConcurrentRuns,
+ *   EXTERNAL_LIFECYCLE_SLOT_CAPACITY)` — the operator's configured value,
+ *   further bounded by the operational slot ceiling so a high
+ *   `maxConcurrentRuns` cannot alone exceed what the cluster is provisioned
+ *   for one agent.
+ *
+ * Serialization of shared-workspace / same-isolation-key runs is a distinct,
+ * already-enforced invariant (the unique active-isolation-writer constraint
+ * in external_runtime_reservations, BLO-15956/BLO-15958) and is unaffected by
+ * this gate either way.
+ */
+export function resolveExternalLifecycleConcurrency(
+  policy: Pick<ParsedHeartbeatPolicy, "concurrencyEnabled" | "maxConcurrentRuns">,
+): { effectiveMaxConcurrentRuns: number; concurrencyEnabled: boolean } {
+  if (!policy.concurrencyEnabled) {
+    return { effectiveMaxConcurrentRuns: 1, concurrencyEnabled: false };
+  }
+  return {
+    effectiveMaxConcurrentRuns: Math.max(
+      1,
+      Math.min(policy.maxConcurrentRuns, EXTERNAL_LIFECYCLE_SLOT_CAPACITY),
+    ),
+    concurrencyEnabled: true,
   };
 }
 
@@ -9830,7 +9885,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           db,
           run.id,
           claimedAt,
-          parseHeartbeatPolicy(agent).maxConcurrentRuns,
+          resolveExternalLifecycleConcurrency(parseHeartbeatPolicy(agent)).effectiveMaxConcurrentRuns,
         ))?.run ?? null
       : await db
           .update(heartbeatRuns)
@@ -12391,6 +12446,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const runningCount = nonStaleRunningRuns.length;
 
       const externalLifecycle = hasExternalLifecycle(agent.adapterType);
+      const externalConcurrency = resolveExternalLifecycleConcurrency(policy);
+      const effectiveMaxConcurrentRuns = externalLifecycle
+        ? externalConcurrency.effectiveMaxConcurrentRuns
+        : policy.maxConcurrentRuns;
       const hasActiveExternalJob = externalLifecycle
         ? await hasActiveJobForAgent(agentId)
         : false;
@@ -12406,8 +12465,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
         return [];
       }
-      const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
-      if (availableSlots <= 0) return [];
+      const availableSlots = Math.max(0, effectiveMaxConcurrentRuns - runningCount);
+      if (availableSlots <= 0) {
+        if (externalLifecycle) {
+          const reason = !externalConcurrency.concurrencyEnabled
+            ? "concurrency_disabled"
+            : effectiveMaxConcurrentRuns < policy.maxConcurrentRuns
+            ? "external_slot_capacity"
+            : "max_concurrent_runs";
+          recordConcurrentRunBlocked({
+            agentId,
+            reason,
+            knownAgentIds: await getActiveAgentIds(db, agent.companyId),
+          });
+        }
+        return [];
+      }
+      if (externalLifecycle) {
+        logger.debug(
+          {
+            agentId,
+            concurrencyEnabled: externalConcurrency.concurrencyEnabled,
+            maxConcurrentRuns: policy.maxConcurrentRuns,
+            effectiveMaxConcurrentRuns,
+            runningCount,
+            availableSlots,
+          },
+          "startNextQueuedRunForAgent: external-lifecycle admission decision (BLO-15959)",
+        );
+      }
 
       // BLO-8746/BLO-8827: we hold the agent start lock, orphans have been
       // reaped, and (for external-lifecycle agents) the early return above

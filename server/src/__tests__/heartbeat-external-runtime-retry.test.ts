@@ -291,6 +291,10 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
           enabled: true,
           wakeOnDemand: true,
           maxConcurrentRuns: 2,
+          // BLO-15959: this test exercises isolation-key serialization across
+          // two slots (not just the fallback one-run cap), so it must opt
+          // into concurrency to reach the isolation-conflict path.
+          concurrencyEnabled: true,
         },
       },
       permissions: {},
