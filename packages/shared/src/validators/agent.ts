@@ -66,6 +66,14 @@ export const heartbeatPolicySchema = z
     wakeOnDemand: z.boolean().optional(),
     cooldownSec: z.number().int().optional(),
     maxConcurrentRuns: z.number().int().optional(),
+    /**
+     * Default-off eligibility gate for external-lifecycle (k8s) concurrency
+     * (BLO-15959). When false/absent, external-lifecycle adapters are held to
+     * one run regardless of `maxConcurrentRuns`. Only when explicitly true
+     * does `maxConcurrentRuns` (bounded further by the operational slot
+     * ceiling) take effect for those adapters.
+     */
+    concurrencyEnabled: z.boolean().optional(),
   })
   .passthrough()
   .superRefine((value, ctx) => {

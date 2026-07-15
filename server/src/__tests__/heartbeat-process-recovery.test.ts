@@ -2702,7 +2702,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: "idle",
       adapterType: "opencode_k8s",
       adapterConfig: {},
-      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 2 } },
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 2, concurrencyEnabled: true } },
       permissions: {},
     });
     const seedQueued = async (

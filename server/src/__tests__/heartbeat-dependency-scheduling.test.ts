@@ -732,6 +732,9 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         heartbeat: {
           wakeOnDemand: true,
           maxConcurrentRuns: 3,
+          // BLO-15959: bounded external-lifecycle concurrency is default-off;
+          // this test exercises >1 concurrent slot for the same agent.
+          concurrencyEnabled: true,
         },
       },
       permissions: {},
