@@ -2267,7 +2267,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
   }
 
   it("drives a remediation wake for a critical dependabot alert", async () => {
-    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
     const app = buildApp({ dependabotAgentId: agentId });
 
     const res = await postDependabot(app, dependabotPayload("critical"));
@@ -2283,7 +2283,8 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(1);
-    expect(runs[0]!.contextSnapshot).toMatchObject({
+    const contextSnapshot = runs[0]!.contextSnapshot as Record<string, unknown>;
+    expect(contextSnapshot).toMatchObject({
       taskKey: "github-dependabot:Blockcast/paperclip#58",
       wakeReason: "github_dependabot_alert",
       dependabotAlertNumber: 58,
@@ -2294,6 +2295,32 @@ describeEmbeddedPostgres("github-webhook route", () => {
       dependabotPatchedVersion: "3.2.6",
       dependabotManifestPath: "packages/mcp-gateway/package.json",
     });
+
+    // BLO-16319: the wake must be scoped to a real, assigned Paperclip issue
+    // so PAPERCLIP_TASK_ID and the task markdown are populated instead of an
+    // empty task that falls back to whatever workspace was last used.
+    const issueId = contextSnapshot.issueId as string | undefined;
+    expect(typeof issueId).toBe("string");
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId!)));
+    expect(issue).toBeTruthy();
+    expect(issue!.status).toBe("todo");
+    expect(issue!.assigneeAgentId).toBe(agentId);
+    expect(issue!.originKind).toBe("github_dependabot_alert");
+    expect(issue!.originId).toBe("github-dependabot:Blockcast/paperclip#58");
+    expect(issue!.title).toContain("Blockcast/paperclip#58");
+    expect(issue!.description).toContain("Blockcast/paperclip");
+    expect(issue!.description).toContain("#58");
+    expect(issue!.description).toContain("vitest");
+    expect(issue!.description).toContain("GHSA-5xrq-8626-4rwp");
+    expect(issue!.description).toContain("CVE-2026-47429");
+    expect(issue!.description).toContain("critical");
+    expect(issue!.description).toContain("< 3.2.6");
+    expect(issue!.description).toContain("3.2.6");
+    expect(issue!.description).toContain("packages/mcp-gateway/package.json");
+    expect(issue!.description).toContain("security/dependabot/58");
   });
 
   it("does not wake below the severity floor (default high)", async () => {
@@ -2347,6 +2374,95 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakes).toHaveLength(1);
+  });
+
+  it("reuses the open issue when a reintroduced alert redelivers for the same alert number", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    const created = await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+    expect(created.body).toMatchObject({ dependabotWakeFired: true });
+
+    const reintroduced = await postDependabot(
+      app,
+      dependabotPayload("critical", "reintroduced"),
+      "delivery-reintroduced",
+    );
+    expect(reintroduced.body).toMatchObject({ dependabotWakeFired: true });
+
+    // One issue per alert (BLO-16319 verifying signal: "replaying the fixture
+    // yields a scoped issue ... that the Release Engineer can ... dedupe").
+    const alertIssues = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originKind, "github_dependabot_alert"));
+    expect(alertIssues).toHaveLength(1);
+
+    // The reintroduced wake shares the alert's taskKey with the still-queued
+    // "created" run, so enqueueWakeup's generic task-scope coalescing
+    // (coalescePendingTaskScopeWake) merges it into that one heartbeat run
+    // rather than queuing a second -- the same de-duplication every other
+    // taskKey-scoped wake gets. `dependabotWakeFired: true` above confirms
+    // both deliveries were processed; what matters here is that the run(s)
+    // that do exist all point at the single reused issue.
+    const runs = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.length).toBeGreaterThanOrEqual(1);
+    for (const run of runs) {
+      expect((run.contextSnapshot as Record<string, unknown>).issueId).toBe(alertIssues[0]!.id);
+    }
+  });
+
+  it("records a durable diagnostic instead of silently dropping a malformed alert payload", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    const res = await postDependabot(
+      app,
+      { action: "created", alert: {}, repository: { full_name: "Blockcast/paperclip" } },
+      "delivery-malformed",
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ dependabotWakeFired: false });
+
+    const runs = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(0);
+
+    const diagnostics = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "github_dependabot_webhook_diagnostic")));
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]!.assigneeAgentId).toBe(agentId);
+    expect(diagnostics[0]!.description).toContain("dependabot_alert");
+    expect(diagnostics[0]!.description).toContain("delivery-malformed");
+    expect(diagnostics[0]!.description).toContain("Blockcast/paperclip");
+  });
+
+  it("records a durable diagnostic when the alert payload has no repository", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    const payloadWithoutRepo: Record<string, unknown> = { ...dependabotPayload("critical") };
+    delete payloadWithoutRepo.repository;
+    const res = await postDependabot(app, payloadWithoutRepo, "delivery-no-repo");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ dependabotWakeFired: false });
+
+    const diagnostics = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "github_dependabot_webhook_diagnostic")));
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]!.description).toContain("#58");
+    expect(diagnostics[0]!.description).toContain("delivery-no-repo");
   });
 });
 
