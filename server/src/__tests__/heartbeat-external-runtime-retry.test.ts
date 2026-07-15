@@ -598,6 +598,8 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
           enabled: true,
           wakeOnDemand: true,
           maxConcurrentRuns: 2,
+          // This case requires two independent run-isolated reservations.
+          concurrencyEnabled: true,
         },
       },
       permissions: {},
