@@ -59,6 +59,12 @@ export interface GatewayConfig {
   upstreamTimeoutMs: number;
   breaker: CircuitBreakerConfig;
   sessionPersistenceFile: string | null;
+  oauthDiscovery: OAuthDiscoveryConfig | null;
+}
+
+export interface OAuthDiscoveryConfig {
+  resource: string;
+  authorizationServer: string;
 }
 
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
@@ -68,6 +74,11 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
 }
 
 export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig {
+  const publicUrl = env.PAPERCLIP_MCP_PUBLIC_URL?.trim().replace(/\/+$/, "");
+  const authorizationServer = env.PAPERCLIP_MCP_AUTHORIZATION_SERVER?.trim().replace(/\/+$/, "");
+  if ((publicUrl && !authorizationServer) || (!publicUrl && authorizationServer)) {
+    throw new Error("PAPERCLIP_MCP_PUBLIC_URL and PAPERCLIP_MCP_AUTHORIZATION_SERVER must be configured together");
+  }
   return {
     upstreamTimeoutMs: parsePositiveInt(env.PAPERCLIP_MCP_UPSTREAM_TIMEOUT_MS, DEFAULT_UPSTREAM_TIMEOUT_MS),
     breaker: {
@@ -85,6 +96,9 @@ export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): Gateway
       ),
     },
     sessionPersistenceFile: env.PAPERCLIP_MCP_SESSION_STORE_FILE?.trim() || null,
+    oauthDiscovery: publicUrl && authorizationServer
+      ? { resource: `${publicUrl}/mcp`, authorizationServer }
+      : null,
   };
 }
 
@@ -95,6 +109,7 @@ export interface GatewayState {
   breaker: CircuitBreaker;
   upstreamTimeoutMs: number;
   credentialCustody?: CredentialCustodyState;
+  oauthDiscovery?: OAuthDiscoveryConfig | null;
   sessionPersistenceFile?: string | null;
   sessionPersistenceLoaded?: boolean;
   sessionPersistenceWrite?: Promise<void>;
@@ -481,9 +496,12 @@ async function handleRequest(
   state: GatewayState,
 ): Promise<void> {
   const url = req.url ?? "/";
+  const pathName = url.split("?", 1)[0] ?? "/";
+
+  if (serveOAuthDiscovery(pathName, res, state.oauthDiscovery)) return;
 
   // Health endpoint.
-  if (url === "/" || url === "/healthz") {
+  if (pathName === "/" || pathName === "/healthz") {
     res.statusCode = 200;
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify({
@@ -498,24 +516,24 @@ async function handleRequest(
     return;
   }
 
-  if (url === "/mcp" || url.startsWith("/mcp/")) {
+  if (pathName === "/mcp" || pathName.startsWith("/mcp/")) {
     await handleAggregateRequest(req, res, state);
     return;
   }
 
-  const matched = matchUpstream(url, state.upstreams);
+  const matched = matchUpstream(pathName, state.upstreams);
   if (!matched) {
     res.statusCode = 404;
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify({
       error: "no upstream matched",
-      path: url,
+      path: pathName,
       knownPrefixes: Object.keys(state.upstreams),
     }));
     return;
   }
   const prefix = (() => {
-    const trimmed = url.startsWith("/") ? url.slice(1) : url;
+    const trimmed = pathName.startsWith("/") ? pathName.slice(1) : pathName;
     const slashIdx = trimmed.indexOf("/");
     return slashIdx === -1 ? trimmed : trimmed.slice(0, slashIdx);
   })();
@@ -554,7 +572,7 @@ async function handleRequest(
       bodyText,
       clientSessionId,
       state.upstreamTimeoutMs,
-      matchedCustodyConfig(state.credentialCustody, prefix),
+      matchedCustodyConfig(state.credentialCustody, prefix, matched.config),
       () => persistSessions(state),
     );
     if (status >= 500) state.breaker.recordFailure(prefix);
@@ -602,7 +620,7 @@ async function handleAggregateRequest(
           req.headers,
           clientSessionId,
           initializePayload,
-          matchedCustodyConfig(state.credentialCustody, prefix),
+          matchedCustodyConfig(state.credentialCustody, prefix, upstream),
         );
         if (upstreamSessionId) state.breaker.recordSuccess(prefix);
         else state.breaker.recordFailure(prefix);
@@ -645,7 +663,7 @@ async function handleAggregateRequest(
           body,
           clientSessionId,
           initializePayload,
-          matchedCustodyConfig(state.credentialCustody, prefix),
+          matchedCustodyConfig(state.credentialCustody, prefix, upstream),
         );
         if (!result) {
           state.breaker.recordFailure(prefix);
@@ -708,7 +726,7 @@ async function handleAggregateRequest(
       rewritten,
       clientSessionId,
       initializePayload,
-      matchedCustodyConfig(state.credentialCustody, prefix),
+      matchedCustodyConfig(state.credentialCustody, prefix, upstream),
     );
     if (!result) {
       state.breaker.recordFailure(prefix);
@@ -895,9 +913,36 @@ interface MatchedCustodyConfig {
 function matchedCustodyConfig(
   state: CredentialCustodyState | undefined,
   prefix: string,
+  upstream: UpstreamConfig,
 ): MatchedCustodyConfig | undefined {
+  if (upstream.execution === "tenant_node") return undefined;
   const config = configForPrefix(state, prefix);
   return state && config ? { state, config } : undefined;
+}
+
+function serveOAuthDiscovery(
+  pathName: string,
+  res: http.ServerResponse,
+  config: OAuthDiscoveryConfig | null | undefined,
+): boolean {
+  if (!config) return false;
+  if (pathName === "/.well-known/oauth-protected-resource" || pathName === "/.well-known/oauth-protected-resource/mcp") {
+    res.statusCode = 200;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({
+      resource: config.resource,
+      authorization_servers: [config.authorizationServer],
+      bearer_methods_supported: ["header"],
+    }));
+    return true;
+  }
+  if (pathName === "/.well-known/oauth-authorization-server" || pathName === "/.well-known/openid-configuration") {
+    res.statusCode = 307;
+    res.setHeader("location", `${config.authorizationServer}${pathName}`);
+    res.end();
+    return true;
+  }
+  return false;
 }
 
 async function resolveMatchedCustodyToken(
@@ -965,6 +1010,7 @@ async function main(): Promise<void> {
     breaker: new CircuitBreaker(config.breaker),
     upstreamTimeoutMs: config.upstreamTimeoutMs,
     credentialCustody: loadCredentialCustodyState(),
+    oauthDiscovery: config.oauthDiscovery,
     sessionPersistenceFile: config.sessionPersistenceFile,
   };
   await loadPersistedSessions(state);

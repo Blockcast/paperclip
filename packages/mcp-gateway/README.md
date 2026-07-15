@@ -61,6 +61,30 @@ The state response may be either a legacy `prefix -> URL` object or metadata:
 }
 ```
 
+Credential-bearing tenant routes use the same schema with an explicit execution
+class. Their URL is the MCP worker route exposed through the existing PEN-629
+tenant-node channel, not a second tunnel:
+
+```json
+{
+  "upstreams": [
+    {
+      "prefix": "github",
+      "url": "https://tenant-channel.example/mcp/github",
+      "execution": "tenant_node",
+      "authorizationEnv": "GITHUB_TOKEN"
+    }
+  ]
+}
+```
+
+For `tenant_node` entries, credential key names remain visible registry metadata,
+but the central gateway never reads or injects their values. The tenant-node
+worker resolves those names from its local environment before calling the real
+MCP server. House servers omit `execution` (or set it to `house`) and retain the
+existing central Kubernetes Secret injection path. This package routes approved
+HTTP MCP servers only; it does not host customer-supplied server code.
+
 Credential values are not valid state. State may only name the gateway env var
 that holds a credential. Kubernetes Secrets remain the source of truth for those
 values; the gateway injects them as upstream headers at request time. A state
@@ -130,10 +154,29 @@ exclusive lease acquisition during ordinary session traffic and is invalidated
 when the upstream Figma server returns `401`. Cache keys hash caller authorization
 values instead of storing raw caller bearer tokens.
 
+### OAuth discovery
+
+Set both variables to publish discovery for the tenant's logical MCP URL:
+
+```sh
+PAPERCLIP_MCP_PUBLIC_URL=https://tenant.example \
+PAPERCLIP_MCP_AUTHORIZATION_SERVER=https://auth.example \
+  node dist/server.js
+```
+
+The gateway serves RFC 9728 protected-resource metadata at both
+`/.well-known/oauth-protected-resource` and
+`/.well-known/oauth-protected-resource/mcp`. It redirects the authorization
+server and OpenID discovery probes to the configured issuer. Discovery is
+disabled unless both variables are present; partial configuration fails startup.
+
 ## Endpoints
 
 - `GET /healthz` — health check; returns `{ ok: true, upstreams, upstreamCallCounts, breakers, sessions }`.
 - `GET /` — same as `/healthz`.
+- `GET /.well-known/oauth-protected-resource[/mcp]` — tenant MCP OAuth protected-resource metadata when configured.
+- `GET /.well-known/oauth-authorization-server` — redirect to the configured authorization server's discovery document.
+- `GET /.well-known/openid-configuration` — redirect to the configured OpenID issuer discovery document.
 - `<METHOD> /mcp` — aggregate MCP endpoint; exposes one stable tool list with `<prefix>__<toolName>` names.
 - `<METHOD> /<prefix>/mcp` — proxied to the upstream URL for `<prefix>`.
 - `<METHOD> /<prefix>/mcp/<rest...>` — preserves the trailing path.

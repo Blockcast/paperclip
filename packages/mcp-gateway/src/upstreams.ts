@@ -24,6 +24,7 @@ export interface UpstreamConfig {
   name?: string;
   url: string;
   credentialHeaders: UpstreamCredentialHeader[];
+  execution?: "house" | "tenant_node";
 }
 
 export type UpstreamMap = Record<string, UpstreamConfig>;
@@ -167,10 +168,15 @@ function parseUpstreamConfig(prefix: string, value: unknown): UpstreamConfig {
   if (typeof record.url !== "string" || record.url.length === 0) {
     throw new Error(`upstreams: prefix "${prefix}" metadata must include a non-empty url string`);
   }
+  const execution = record.execution ?? record.executionKind;
+  if (execution !== undefined && execution !== "house" && execution !== "tenant_node") {
+    throw new Error(`upstreams: prefix "${prefix}" execution must be "house" or "tenant_node"`);
+  }
   return {
     name: typeof record.name === "string" && record.name.length > 0 ? record.name : undefined,
     url: record.url,
     credentialHeaders: parseCredentialHeaders(record),
+    ...(execution ? { execution } : {}),
   };
 }
 
@@ -225,6 +231,10 @@ function firstString(...values: unknown[]): string | undefined {
 }
 
 export function buildCredentialHeaders(config: UpstreamConfig, env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  // Tenant tool credentials are resolved by the tenant-node worker behind this
+  // route. Even an accidentally populated control-plane env must never inject
+  // them before the request crosses the existing tenant channel.
+  if (config.execution === "tenant_node") return {};
   validateCredentialEnvNames({ upstream: config }, env);
   const headers: Record<string, string> = {};
   for (const credential of config.credentialHeaders) {
@@ -238,6 +248,7 @@ export function buildCredentialHeaders(config: UpstreamConfig, env: NodeJS.Proce
 function validateCredentialEnvNames(upstreams: UpstreamMap, env: NodeJS.ProcessEnv): void {
   const allowed = parseCredentialEnvAllowlist(env);
   for (const [prefix, config] of Object.entries(upstreams)) {
+    if (config.execution === "tenant_node") continue;
     for (const credential of config.credentialHeaders) {
       if (!allowed.has(credential.env)) {
         throw new Error(
