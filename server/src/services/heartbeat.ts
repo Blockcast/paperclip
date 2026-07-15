@@ -726,6 +726,17 @@ const EXTERNAL_LIFECYCLE_PRE_ADAPTER_STALE_MS = 5 * 60 * 1000;
 // indefinitely regardless of what else is queued.
 const STARVATION_STATUS_BOOST_MS = 30 * 60 * 1000;
 const STARVATION_FULL_ESCALATION_MS = 2 * 60 * 60 * 1000;
+// BLO-16253 follow-up: a recovery/wake_owner run (contextSnapshot.recoveryActionId
+// set — see recovery/service.ts enqueueWakeup calls) represents an ALREADY-DETECTED
+// failure that needs the owner's attention now, not routine backlog grooming. The
+// routine STARVATION_FULL_ESCALATION_MS floor (2h) is appropriate for "eventually
+// get to this todo," but far too slow for "your assigned recovery is broken" —
+// observed live: BLO-15871's stranded_assigned_issue recovery (owner CTO) sat
+// unacted for ~2h48m because it competed for CTO's single dispatch slot on the
+// exact same terms as routine low-priority backlog, only escalating once it
+// crossed the routine 2h floor. Recovery wakes get a much shorter floor so they
+// jump the queue quickly instead of waiting behind ordinary work.
+const STARVATION_RECOVERY_ESCALATION_MS = 10 * 60 * 1000;
 // If another process has just finalized a run while its k8s Job is still
 // visible, do not immediately delete that live Job. The adapter process may
 // still be awaiting/synchronizing the Job and should be allowed to finish.
@@ -12509,16 +12520,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // This lets high-priority todo (rank 3) beat low-priority in_progress
         // (rank 6) while preserving the in_progress bonus within a tier.
         // BLO-16253: aging term prevents indefinite starvation of a `todo`
-        // run — see STARVATION_* constants above.
+        // run — see STARVATION_* constants above. Recovery/wake_owner runs
+        // get a much shorter escalation floor (STARVATION_RECOVERY_ESCALATION_MS)
+        // since they represent already-detected breakage, not routine backlog.
         const dispatchRank = (
           issue: { status: string; priority: string | null } | null | undefined,
           ready: boolean,
           hasId: boolean,
           waitedMs: number,
+          isRecoveryWake: boolean,
         ): number => {
           if (!hasId) return 10;
           if (!ready) return 12 + issueRunPriorityRank(issue?.priority);
-          if (waitedMs >= STARVATION_FULL_ESCALATION_MS) return 0;
+          const escalationFloorMs = isRecoveryWake
+            ? STARVATION_RECOVERY_ESCALATION_MS
+            : STARVATION_FULL_ESCALATION_MS;
+          if (waitedMs >= escalationFloorMs) return 0;
           const priorityRank = issueRunPriorityRank(issue?.priority);
           const statusBonus =
             issue?.status === "in_progress" || waitedMs >= STARVATION_STATUS_BOOST_MS ? 0 : 1;
@@ -12526,8 +12543,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
         const leftWaitedMs = dispatchNow.getTime() - left.createdAt.getTime();
         const rightWaitedMs = dispatchNow.getTime() - right.createdAt.getTime();
-        const leftRank = dispatchRank(leftIssue, leftReady, !!leftIssueId, leftWaitedMs);
-        const rightRank = dispatchRank(rightIssue, rightReady, !!rightIssueId, rightWaitedMs);
+        const leftIsRecoveryWake = Boolean(
+          readNonEmptyString(parseObject(left.contextSnapshot).recoveryActionId),
+        );
+        const rightIsRecoveryWake = Boolean(
+          readNonEmptyString(parseObject(right.contextSnapshot).recoveryActionId),
+        );
+        const leftRank = dispatchRank(leftIssue, leftReady, !!leftIssueId, leftWaitedMs, leftIsRecoveryWake);
+        const rightRank = dispatchRank(rightIssue, rightReady, !!rightIssueId, rightWaitedMs, rightIsRecoveryWake);
         return leftRank !== rightRank
           ? leftRank - rightRank
           : left.createdAt.getTime() - right.createdAt.getTime();

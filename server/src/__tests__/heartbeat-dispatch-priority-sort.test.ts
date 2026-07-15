@@ -618,4 +618,174 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       .then((rows) => rows[0] ?? null);
     expect(starvedRun?.status).not.toBe("queued");
   });
+
+  it("dispatches a recovery/wake_owner run ahead of a fresh in_progress run well before the routine starvation floor (BLO-16253 follow-up)", async () => {
+    // Follow-up regression: a recovery-sourced queued run (contextSnapshot.
+    // recoveryActionId set — see recovery/service.ts enqueueWakeup calls for
+    // stranded_assigned_issue) represents an already-detected failure that
+    // needs the owner's attention now, not routine backlog. Before this fix
+    // it used the same STARVATION_FULL_ESCALATION_MS (2h) floor as ordinary
+    // `todo` work. Observed live: BLO-15871's stranded_assigned_issue
+    // recovery (owner CTO) sat unacted for ~2h48m because it only escalated
+    // once it crossed that routine 2h floor. This test queues a recovery
+    // run for 15 minutes (well past the new 10-minute
+    // STARVATION_RECOVERY_ESCALATION_MS floor, but far short of the routine
+    // 2h floor or even the 30-minute status-boost tier) against a fresh
+    // in_progress run that would otherwise win outright.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const recoveryIssueId = randomUUID();
+    const freshInProgressIssueId = randomUUID();
+    const issuePrefix = `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "RecoveryTestCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "RecoveryTestAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    await db.insert(issues).values([
+      // Recovery-target issue: low priority, blocked (as stranded_assigned_issue
+      // recovery leaves the source issue) — same disadvantaged tier a routine
+      // todo run would occupy under the un-aged formula.
+      {
+        id: recoveryIssueId,
+        companyId,
+        title: "Stranded issue awaiting recovery",
+        status: "blocked",
+        priority: "low",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      // Fresh issue: low priority, in_progress — wins on the un-aged formula
+      // and would still win under the routine (non-recovery) aging curve for
+      // another ~1h45m.
+      {
+        id: freshInProgressIssueId,
+        companyId,
+        title: "Fresh low priority in-progress work",
+        status: "in_progress",
+        priority: "low",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+        startedAt: new Date(),
+      },
+    ]);
+
+    // Recovery run's createdAt is past STARVATION_RECOVERY_ESCALATION_MS (10 min)
+    // but nowhere near STARVATION_STATUS_BOOST_MS (30 min) or
+    // STARVATION_FULL_ESCALATION_MS (2h).
+    const recoveryCreatedAt = new Date(Date.now() - 15 * 60 * 1000);
+    const freshCreatedAt = new Date();
+
+    const recoveryWakeId = randomUUID();
+    const recoveryRunId = randomUUID();
+    const freshWakeId = randomUUID();
+    const freshRunId = randomUUID();
+
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: recoveryWakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "source_scoped_recovery_action",
+        payload: { issueId: recoveryIssueId, recoveryActionId: randomUUID() },
+        status: "queued",
+        runId: recoveryRunId,
+        requestedAt: recoveryCreatedAt,
+        updatedAt: recoveryCreatedAt,
+      },
+      {
+        id: freshWakeId,
+        companyId,
+        agentId,
+        source: "heartbeat",
+        triggerDetail: "timer",
+        reason: "heartbeat_timer",
+        payload: { issueId: freshInProgressIssueId },
+        status: "queued",
+        runId: freshRunId,
+        requestedAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: recoveryRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: recoveryWakeId,
+        contextSnapshot: {
+          issueId: recoveryIssueId,
+          wakeReason: "source_scoped_recovery_action",
+          recoveryActionId: randomUUID(),
+        },
+        createdAt: recoveryCreatedAt,
+        updatedAt: recoveryCreatedAt,
+      },
+      {
+        id: freshRunId,
+        companyId,
+        agentId,
+        invocationSource: "heartbeat",
+        triggerDetail: "timer",
+        status: "queued",
+        wakeupRequestId: freshWakeId,
+        contextSnapshot: { issueId: freshInProgressIssueId, wakeReason: "heartbeat_timer" },
+        createdAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
+      },
+    ]);
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    // Dispatch: only 1 slot available (maxConcurrentRuns: 1, 0 running).
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, recoveryRunId);
+
+    // REGRESSION GUARD: the recovery wake must win the single slot far
+    // sooner than a routine `todo` run would, despite being ranked worse
+    // than the fresh in_progress run under the un-aged formula.
+    expect(dispatchedRunIds[0]).toBe(recoveryRunId);
+
+    const recoveryRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, recoveryRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(recoveryRun?.status).not.toBe("queued");
+  });
 });
