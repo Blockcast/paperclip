@@ -1433,6 +1433,134 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(body).toContain(`${PROCESS_LOST_LIVENESS_NULL_METRIC} 1`);
   });
 
+  // BLO-12564: cold-boot reattach guard. On a fresh worker boot the in-cluster
+  // kube client may not be serving yet, so the reaper can run fully kube-blind
+  // (both liveness lists null — the recordProcessLostLivenessNull() signal). A
+  // running external-lifecycle Job survives the worker restart (owned by its own
+  // k8s controller), so within the cold-boot grace we HOLD process_lost while
+  // blind and let a warm tick reattach it. Past the grace, the legitimate-lost
+  // reap resumes — the steady-state contract pinned by the sibling tests that
+  // construct the reaper with the grace OFF (default). These four pin both halves
+  // (within-grace shields, past-grace still reaps) across the started and
+  // pre-adapter paths. The grace is passed explicitly so the tests are hermetic
+  // w.r.t. the production constant.
+  const COLD_BOOT_GRACE_MS = 5 * 60 * 1000;
+
+  it("BLO-12564: within the cold-boot grace, a fully kube-blind STARTED run is NOT process_lost (reattach) even when silent past the staleness floor", async () => {
+    const coldBootHeartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: allowPenstockGate,
+      coldBootReattachGraceMs: COLD_BOOT_GRACE_MS,
+      workerBootAt: new Date(), // just booted -> inside the grace
+    });
+    // 16 min silent: past EXTERNAL_LIFECYCLE_STALE_MS (15m). Started (adapter.invoke).
+    const stale = new Date(Date.now() - 16 * 60 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "claude_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: stale,
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    // Defaults: both liveness lists null -> reaper fully kube-blind. The sibling
+    // steady-state test ("reaps external-lifecycle runs whose Job has gone silent
+    // past the staleness window") shows this exact scenario mints process_lost
+    // with the grace OFF; here the grace holds it.
+
+    const result = await coldBootHeartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).not.toContain(runId);
+    const run = await coldBootHeartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).toBeNull();
+  });
+
+  it("BLO-12564: past the cold-boot grace, a fully kube-blind STARTED run still reaps as process_lost (no permanent shield / no steady-state regression)", async () => {
+    const coldBootHeartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: allowPenstockGate,
+      coldBootReattachGraceMs: COLD_BOOT_GRACE_MS,
+      // Booted well past the grace -> the guard's time window has closed.
+      workerBootAt: new Date(Date.now() - (COLD_BOOT_GRACE_MS + 5 * 60 * 1000)),
+    });
+    const stale = new Date(Date.now() - 16 * 60 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "claude_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: stale,
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+
+    const result = await coldBootHeartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    const run = await coldBootHeartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+  });
+
+  it("BLO-12564: within the cold-boot grace, a fully kube-blind PRE-ADAPTER run is NOT process_lost (reattach) even past the pre-adapter stale floor", async () => {
+    const coldBootHeartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: allowPenstockGate,
+      coldBootReattachGraceMs: COLD_BOOT_GRACE_MS,
+      workerBootAt: new Date(),
+    });
+    const jobName = "agent-claude-coldboot-preadapter-0001";
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null, // pre-adapter: never produced output
+      externalRunId: jobName,
+    });
+    // No adapter.invoke -> pre-adapter. Age to 20 min: past the 5m pre-adapter
+    // floor, under the 45m hard ceiling (ref-time keys on startedAt/createdAt).
+    const twentyMinAgo = new Date(Date.now() - 20 * 60 * 1000);
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt: twentyMinAgo, createdAt: twentyMinAgo })
+      .where(eq(heartbeatRuns.id, runId));
+    // Defaults: both liveness lists null -> fully blind, liveness resolves "unknown".
+
+    const result = await coldBootHeartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).not.toContain(runId);
+    const run = await coldBootHeartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).toBeNull();
+  });
+
+  it("BLO-12564: past the cold-boot grace, a fully kube-blind PRE-ADAPTER run still reaps as process_lost", async () => {
+    const coldBootHeartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: allowPenstockGate,
+      coldBootReattachGraceMs: COLD_BOOT_GRACE_MS,
+      workerBootAt: new Date(Date.now() - (COLD_BOOT_GRACE_MS + 5 * 60 * 1000)),
+    });
+    const jobName = "agent-claude-coldboot-preadapter-0002";
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null,
+      externalRunId: jobName,
+    });
+    const twentyMinAgo = new Date(Date.now() - 20 * 60 * 1000);
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt: twentyMinAgo, createdAt: twentyMinAgo })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const result = await coldBootHeartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    const run = await coldBootHeartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+  });
+
   it("does NOT process_lost a live pre-adapter run past the pre-adapter stale floor but under the hard ceiling (BLO-16183, guards 9c1bde19)", async () => {
     // The mid-run over-reap class (killing live '2/2 Running' pre-adapter pods --
     // the class where work IS lost) was closed by 9c1bde19 "keep live k8s runs out

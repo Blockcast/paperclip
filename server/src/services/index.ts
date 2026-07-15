@@ -51,7 +51,7 @@ export { secretService } from "./secrets.js";
 export { routineService } from "./routines.js";
 export { costService } from "./costs.js";
 export { financeService } from "./finance.js";
-export { heartbeatService } from "./heartbeat.js";
+export { heartbeatService, EXTERNAL_LIFECYCLE_COLD_BOOT_REATTACH_GRACE_MS } from "./heartbeat.js";
 export {
   productivityReviewService,
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
