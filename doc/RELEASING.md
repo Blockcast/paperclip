@@ -297,6 +297,28 @@ If the grep returns `0` while the deployed image is known to contain the symbol,
 ConfigMap is shadowing the image — that is the BLO-8222 failure mode (the k8s-write remediation
 is tracked on BLO-8222 / BLO-8223; this runbook note is the durable guardrail from BLO-8224).
 
+## On-Prem Container Build Layers
+
+The Blockcast workflows separate stable tooling from per-commit application payloads:
+
+- `Dockerfile.runtime` publishes `paperclip-runtime:runtime-<content-hash>` with OS packages,
+  pinned agent CLIs, browser libraries, wrappers, and the production entrypoint.
+- `Dockerfile` adds vendored adapters and `/app` to that runtime for the per-commit server tag.
+- `Dockerfile.agent-toolchain` publishes
+  `paperclip-agent-toolchain:toolchain-<content-hash>` with Go, Rust, Python, container/Kubernetes
+  tools, browser test dependencies, and the MMTP FFmpeg build.
+- `Dockerfile.agent` copies the matching server `/app`, bundled adapters, and GitHub MCP binary
+  onto that toolchain for the per-commit agent tag.
+
+`scripts/container-base-tag.sh` hashes each stable Dockerfile and its copied inputs. The agent
+workflow also resolves the LAN registry's MMTP FFmpeg `:stable` tag to a digest and includes that
+digest in the toolchain tag. The Docker workflows inspect Harbor first and build a stable image
+only when the derived tag is absent. To roll a runtime dependency, update its pinned version or
+Dockerfile input; do not add an unpinned installer to a per-commit Dockerfile. The first build
+after such a change is intentionally cold, while ordinary source-only builds reuse the existing
+stable images. Stable images use inline cache metadata to avoid simultaneous full image and
+registry-cache exports.
+
 ## Related Files
 
 - [`scripts/release.sh`](../scripts/release.sh)

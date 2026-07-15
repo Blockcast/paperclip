@@ -1,67 +1,9 @@
 # syntax=harbor.blockcast.net/dockerfile/dockerfile:1.20
-# Mirrored from docker.io/library/node:lts-trixie-slim to avoid Docker Hub
-# anonymous rate limits on self-hosted BuildKit runners.
-FROM harbor.blockcast.net/paperclip/node:lts-trixie-slim AS base
-ARG USER_UID=1000
-ARG USER_GID=1000
-# Disable Debian's auto-clean of apt cache so the BuildKit cache mount
-# below actually retains downloaded .deb files between builds. Without
-# this the docker-clean apt hook nukes /var/cache/apt after each install,
-# defeating the cache mount.
-RUN rm -f /etc/apt/apt.conf.d/docker-clean \
-  && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-  apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates gosu curl gh git wget ripgrep python3 \
-  && corepack enable
-
-# Wrap `gh` so it reads the live GitHub App installation token from the
-# kubelet-refreshed secret-volume file (PAPERCLIP_GITHUB_TOKEN_FILE, default
-# /paperclip/.secrets/github-token/token) on every invocation, instead of
-# falling back to ~/.config/gh/hosts.yml (BLO-13241: nothing refreshes that
-# file — it went stale ~10 days after a one-off write and broke `gh api`/
-# `gh auth status` for every agent pod, unnoticed because SSH git kept
-# working). A `/paperclip/.local/bin` wrapper with the same job already
-# exists (statefulset seed script, BLO-10448-adjacent), fed by a PATH
-# override in values.blockcast.yaml — but that override lives only on the
-# long-running server pod's env and does not reliably reach ephemeral agent
-# Job pods, which inherit this base image directly. Wrapping the binary at
-# its canonical PATH location closes that gap for every pod. Falls back to
-# the unmodified binary (existing hosts.yml/env auth) when the token file
-# isn't present, so non-agent uses of this image are unaffected.
-#
-# The wrapper is checked in at scripts/gh-token-wrapper.sh (single source of
-# truth, exercised directly by scripts/gh-token-wrapper.test.mjs) rather than
-# inlined here.
-COPY scripts/gh-token-wrapper.sh /usr/bin/gh-token-wrapper.sh
-RUN mv /usr/bin/gh /usr/bin/gh.real \
-  && ln -s /usr/bin/gh-token-wrapper.sh /usr/bin/gh \
-  && chmod 0755 /usr/bin/gh-token-wrapper.sh
-
-# Chromium runtime libs (BLO-3663) — required so headless Playwright works
-# inside agent Job pods. Job pods inherit this base image (the heavier
-# Dockerfile.agent toolchain isn't deployed for adapter Jobs), so the libs
-# must live here. Without them, `mcp__playwright__browser_navigate` fails
-# with `libglib-2.0.so.0: cannot open shared object file`, which is what
-# blocks UXDesigner's visual STOP gate on BLO-3979 every run.
-# Canonical list from `npx playwright install-deps chromium --dry-run` on
-# trixie; `t64` suffixes are Debian 13's time_t-64 transition packages.
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-  apt-get update \
-  && apt-get install -y --no-install-recommends \
-       libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
-       libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 \
-       libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 \
-       libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 \
-       libxfixes3 libxkbcommon0 libxrandr2 \
-       fonts-liberation fonts-noto-color-emoji
-
-# Modify the existing node user/group to have the specified UID/GID to match host user
-RUN usermod -u $USER_UID --non-unique node \
-  && groupmod -g $USER_GID --non-unique node \
-  && usermod -g $USER_GID -d /paperclip node
+# Build stages use the same stable runtime as production, but explicitly reset
+# NODE_ENV so dependency installers include development/build dependencies.
+ARG RUNTIME_IMAGE=harbor.blockcast.net/paperclip/paperclip-runtime:latest
+FROM ${RUNTIME_IMAGE} AS base
+ENV NODE_ENV=development
 
 FROM base AS deps
 WORKDIR /app
@@ -462,11 +404,10 @@ RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" &
 # of silently shipping an image where the seed quietly skips.
 RUN test -f packages/mcp-server/dist/stdio.js || (echo "ERROR: mcp-server stdio bridge missing" && exit 1)
 
-FROM base AS production
+FROM ${RUNTIME_IMAGE} AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
 WORKDIR /app
-COPY --chown=node:node --from=build /app /app
 # The kkroo forks of paperclip-adapter-claude-k8s /
 # paperclip-adapter-opencode-k8s are built from source in the `vendor` stage
 # above and installed here.
@@ -487,55 +428,13 @@ COPY --from=vendor /vendor/paperclip-adapter-opencode-k8s.tgz /tmp/paperclip-bun
 # falling back to whatever npm publishes today.
 COPY --from=vendor /vendor/adapter-utils.tgz /tmp/paperclip-bundled-adapters/
 COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-server
-# Pin OpenCode for k8s agent pods (BLO-10651). opencode_k8s runs inside this
-# image, so `opencode-ai@latest` lets unrelated rebuilds pick up parser/runtime
-# changes that can crash every OpenCode-backed agent. Bump only after adapter
-# smoke/regression tests pass.
-# Bumped 2026-06-20 to 1.15.12: opencode 1.4.3 fails OpenAI Responses streams
-# that include reasoning output items before the assistant message, surfacing as
-# UnknownError/exit 1 in opencode_k8s review runs while ccrotate returned 200.
-ARG OPENCODE_AI_VERSION=1.15.12
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
-    --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    npm install --global --omit=dev --cache /root/.npm @anthropic-ai/claude-code@latest @openai/codex@latest "opencode-ai@${OPENCODE_AI_VERSION}" @google/gemini-cli@latest \
-  && test "$(opencode --version)" = "${OPENCODE_AI_VERSION}" \
-  && apt-get update \
-  && apt-get install -y --no-install-recommends openssh-client rsync jq zsh \
-  && mkdir -p /paperclip /paperclip/.local/bin /opt/paperclip-bundled-adapters \
-  && npm install --prefix /opt/paperclip-bundled-adapters --omit=dev --no-save --legacy-peer-deps --cache /root/.npm /tmp/paperclip-bundled-adapters/*.tgz \
+  npm install --prefix /opt/paperclip-bundled-adapters --omit=dev --no-save --legacy-peer-deps --cache /root/.npm /tmp/paperclip-bundled-adapters/*.tgz \
   && rm -rf /tmp/paperclip-bundled-adapters \
-  && ln -sf /usr/local/bin/claude /paperclip/.local/bin/claude \
-  && chown -R node:node /paperclip /opt/paperclip-bundled-adapters
+  && chown -R node:node /opt/paperclip-bundled-adapters
 
-COPY scripts/docker-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+# Keep the large, frequently-changing app payload last. Ordinary source edits
+# can now reuse both the runtime and bundled-adapter install layers.
+COPY --chown=node:node --from=build /app /app
 
-# Codex 2nd-opinion CLI wrapper for claude_k8s agents (BLO-2413).
-# Lets a claude session shell out to `paperclip-consult-codex "<prompt>"`
-# and get back codex's JSONL — used by the gstack /codex skill for external
-# review. Production no longer installs a local ccrotate CLI, so this wrapper
-# uses whatever Codex auth the pod already has.
-COPY scripts/paperclip-consult-codex.sh /usr/local/bin/paperclip-consult-codex
-RUN chmod +x /usr/local/bin/paperclip-consult-codex
-
-ENV NODE_ENV=production \
-  HOME=/paperclip \
-  HOST=0.0.0.0 \
-  PORT=3100 \
-  SERVE_UI=true \
-  PAPERCLIP_HOME=/paperclip \
-  PAPERCLIP_INSTANCE_ID=default \
-  USER_UID=${USER_UID} \
-  USER_GID=${USER_GID} \
-  PAPERCLIP_CONFIG=/paperclip/instances/default/config.json \
-  PAPERCLIP_DEPLOYMENT_MODE=authenticated \
-  PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
-  OPENCODE_ALLOW_ALL_MODELS=true \
-  GEMINI_SANDBOX=false
-
-VOLUME ["/paperclip"]
-EXPOSE 3100
-
-ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]
+ENV USER_UID=${USER_UID} USER_GID=${USER_GID}

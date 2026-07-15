@@ -94,6 +94,44 @@ jobs:
           # ephemeral builder per run breaks the loop.
           cleanup: true
 
+      # Runtime packages and global CLIs change far less often than /app.
+      # Address the base by its inputs and only build it when that exact image
+      # is absent. The first merge bootstraps the image before Dockerfile uses
+      # it, so there is no manual ordering dependency.
+      - name: Resolve stable runtime image
+        id: runtime
+        run: |
+          set -euo pipefail
+          tag="$(scripts/container-base-tag.sh runtime)"
+          image="harbor.blockcast.net/paperclip/paperclip-runtime:${tag}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Using existing runtime image ${image}"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Runtime image ${image} is missing; it will be built"
+          fi
+
+      - name: Build and push stable runtime image
+        if: steps.runtime.outputs.exists != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.runtime
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          # The runtime is a single linear stage, so inline cache metadata is
+          # sufficient and avoids a second concurrent registry exporter.
+          cache-from: type=registry,ref=harbor.blockcast.net/paperclip/paperclip-runtime:latest
+          cache-to: type=inline
+          tags: |
+            ${{ steps.runtime.outputs.image }}
+            harbor.blockcast.net/paperclip/paperclip-runtime:latest
+
       # Tag scheme matches values.blockcast.yaml's expectation:
       #   - `sha-<7>-k8s-vendored` per-commit tag the deploy step pins to
       #   - `latest-k8s-vendored` floating tag for ad-hoc pulls
@@ -127,6 +165,8 @@ jobs:
           # reliably serve attestation manifests.
           provenance: false
           sbom: false
+          build-args: |
+            RUNTIME_IMAGE=${{ steps.runtime.outputs.image }}
           # Registry-backed cache instead of GHA cache. The GHA backend
           # bottlenecked on a single ~675 s layer upload (full export 720+ s
           # vs. ~74 s for the actual build+push). Self-hosted runner has
