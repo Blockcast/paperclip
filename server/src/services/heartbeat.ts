@@ -11551,19 +11551,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
           continue;
         }
-        if (preAdapterLiveness === "unknown") {
-          const reservation = await getActiveExternalRuntimeReservation(db, run.id);
-          const durableJobName = reservation?.jobName
-            ?? reservation?.expectedJobName
-            ?? run.externalRunId?.trim()
-            ?? null;
-          // API failure is not evidence that a named launch was lost. An old
-          // pre-launch run with no durable Job identity, however, is explicitly
-          // unreattachable and must converge through process_lost.
-          if (durableJobName) continue;
-        }
-        // Only positive evidence that the exact Job is absent or terminal may
-        // fall through to process_lost for a pre-adapter reservation.
+        // Unknown kube state is protected only by the bounded cold-boot grace
+        // below. Once that expires, an old pre-adapter run must converge.
       }
       let confirmedMissingExternalJob = false;
       if (externalLifecycleRun && externalLifecycleStarted) {

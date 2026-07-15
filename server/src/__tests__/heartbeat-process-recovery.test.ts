@@ -1518,7 +1518,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(releasedReservation?.releasedAt).not.toBeNull();
   });
 
-  it("preserves a pre-adapter reservation when kube status cannot prove its Job is gone", async () => {
+  it("reaps a stale pre-adapter reservation after the kube-blind grace is unavailable", async () => {
     // Observed in prod 2026-06-03: a MulticastEngineer opencode_k8s run sat
     // `running` for 4h+ with no backing Job and no adapter.invoke event (a
     // pre-adapter orphan from a pod rollout). The silent-active-run /
@@ -1540,15 +1540,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // ancient (fixture default). Simulate review-machinery churn bumping
     // updatedAt to "now" within the staleness/grace windows.
     await db.update(heartbeatRuns).set({ updatedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
-    // Both kube inventory calls remain unavailable. A durable launched
-    // identity must be preserved until the exact Job can be classified.
+    // Both kube inventory calls remain unavailable and this service has no
+    // cold-boot grace configured, so the stale reservation must converge.
 
     const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
 
-    expect(result.runIds).not.toContain(runId);
+    expect(result.runIds).toContain(runId);
     const run = await heartbeat.getRun(runId);
-    expect(run?.status).toBe("running");
-    expect(run?.errorCode).toBeNull();
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
   });
 
   it("does not reap external-lifecycle runs whose kube-API Job is live but output is silent", async () => {
