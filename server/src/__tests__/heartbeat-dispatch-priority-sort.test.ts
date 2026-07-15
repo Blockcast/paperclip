@@ -739,6 +739,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
         contextSnapshot: {
           issueId: recoveryIssueId,
           wakeReason: "source_scoped_recovery_action",
+          source: "issue_recovery_action",
           recoveryActionId: randomUUID(),
         },
         createdAt: recoveryCreatedAt,

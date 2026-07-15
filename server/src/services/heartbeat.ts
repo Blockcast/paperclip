@@ -12543,12 +12543,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
         const leftWaitedMs = dispatchNow.getTime() - left.createdAt.getTime();
         const rightWaitedMs = dispatchNow.getTime() - right.createdAt.getTime();
-        const leftIsRecoveryWake = Boolean(
-          readNonEmptyString(parseObject(left.contextSnapshot).recoveryActionId),
-        );
-        const rightIsRecoveryWake = Boolean(
-          readNonEmptyString(parseObject(right.contextSnapshot).recoveryActionId),
-        );
+        // Require both recoveryActionId AND source:"issue_recovery_action" (every
+        // enqueueWakeup call in recovery/service.ts stamps both together) so this
+        // stays an explicit, narrowly-scoped coupling rather than any future wake
+        // path inheriting the fast track by incidentally reusing the bare field.
+        const isRecoveryWakeContext = (contextSnapshot: unknown) => {
+          const parsed = parseObject(contextSnapshot);
+          return (
+            Boolean(readNonEmptyString(parsed.recoveryActionId)) &&
+            parsed.source === "issue_recovery_action"
+          );
+        };
+        const leftIsRecoveryWake = isRecoveryWakeContext(left.contextSnapshot);
+        const rightIsRecoveryWake = isRecoveryWakeContext(right.contextSnapshot);
         const leftRank = dispatchRank(leftIssue, leftReady, !!leftIssueId, leftWaitedMs, leftIsRecoveryWake);
         const rightRank = dispatchRank(rightIssue, rightReady, !!rightIssueId, rightWaitedMs, rightIsRecoveryWake);
         return leftRank !== rightRank
