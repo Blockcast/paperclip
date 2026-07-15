@@ -23,6 +23,7 @@ import {
   recordExpectedExternalRuntimeJobName,
   recordExternalRuntimeJobIdentity,
   releaseExternalRuntimeReservation,
+  requireExternalRuntimeExecutionOwnership,
   requireExternalRuntimeLaunchOwnership,
 } from "./external-runtime-reservations.js";
 import { parseExpectedExternalRuntimeJobNameFromMetaCommand } from "./heartbeat.js";
@@ -136,7 +137,7 @@ describeEmbeddedPostgres("external runtime reservations", () => {
     expect(runs.filter((run) => run.status === "queued")).toHaveLength(1);
   });
 
-  it("reactivates the same reservation row when a deferred run retries", async () => {
+  it("rotates reservation identity when a deferred run retries", async () => {
     const [runId] = await seedQueuedRuns(1);
     const firstClaim = await claimRunWithExternalRuntimeSlotPool(db, runId, new Date(), 2);
     expect(firstClaim).not.toBeNull();
@@ -155,13 +156,13 @@ describeEmbeddedPostgres("external runtime reservations", () => {
     const retryClaim = await claimRunWithExternalRuntimeSlotPool(db, runId, new Date(), 2);
 
     expect(retryClaim?.reservation).toMatchObject({
-      id: firstClaim?.reservation.id,
       state: "reserved",
       isolationMode: "pending",
       isolationKey: `pending:${runId}`,
       releasedAt: null,
       releaseReason: null,
     });
+    expect(retryClaim?.reservation.id).not.toBe(firstClaim?.reservation.id);
     expect(retryClaim?.reservation.isolationBoundAt).not.toBeNull();
     expect(retryClaim?.run.status).toBe("running");
   });
@@ -473,6 +474,24 @@ describeEmbeddedPostgres("external runtime reservations", () => {
     expect(first?.expectedJobName).toBe("agent-opencode-run-1");
     expect(retry?.id).toBe(first?.id);
     expect(missingUidObservation?.jobUid).toBe("uid-1");
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(run.externalRunId).toBe("agent-opencode-run-1");
+    await expect(requireExternalRuntimeExecutionOwnership(db, {
+      runId,
+      reservationId: first!.id,
+      jobName: "agent-opencode-run-1",
+      jobUid: "uid-1",
+    })).resolves.toMatchObject({ state: "launched", slotId: first!.slotId });
+    await expect(requireExternalRuntimeExecutionOwnership(db, {
+      runId,
+      reservationId: first!.id,
+      jobName: "agent-opencode-run-1",
+      jobUid: "replacement-uid",
+    })).rejects.toThrow(/no exact executable Job/);
     await expect(recordExternalRuntimeJobIdentity(db, {
       runId,
       jobName: "agent-opencode-run-2",
@@ -562,7 +581,7 @@ describeEmbeddedPostgres("external runtime reservations", () => {
       runId,
       jobName: "agent-opencode-run-1",
       jobUid: "uid-after-cancel",
-    })).rejects.toThrow(/identity mismatch/);
+    })).rejects.toThrow(/not launchable from release_pending/);
   });
 
   it("releases a not-yet-launched reservation for every terminal run status", async () => {

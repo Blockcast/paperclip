@@ -69,10 +69,13 @@ import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
-  deleteAgentJobsForRun,
+  deleteAgentJobExact,
   hasActiveJobForAgent,
+  indexUniqueAgentJobRunStatuses,
   listAgentJobRunStatuses,
+  listManagedAgentJobs,
   listLiveAgentJobRunIds,
+  matchExactAgentJob,
   readAgentJobRunStatusByName,
   type AgentJobRunStatus,
 } from "./k8s-job-liveness.js";
@@ -93,7 +96,7 @@ import {
   recordExpectedExternalRuntimeJobName,
   recordExternalRuntimeJobIdentity,
   releaseExternalRuntimeReservation,
-  requireExternalRuntimeLaunchOwnership,
+  requireExternalRuntimeExecutionOwnership,
   refreshExternalRuntimeReservationMetrics,
 } from "./external-runtime-reservations.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
@@ -5421,6 +5424,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
   const activeRunExecutions = new Set<string>();
+  const reattachingExternalRuns = new Set<string>();
   // Tracks the promises spawned by `void executeRun(...)` calls in the
   // dispatcher (startNextQueuedRunForAgent) so tests can await
   // fire-and-forget chains before TRUNCATE-based cleanup. Without this
@@ -10760,6 +10764,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return null;
   }
 
+  async function deleteExactExternalRuntimeJob(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "agentId">,
+  ) {
+    const reservation = await getActiveExternalRuntimeReservation(db, run.id);
+    if (!reservation?.jobName || !reservation.jobUid) {
+      logger.error(
+        { runId: run.id, reservationId: reservation?.id ?? null },
+        "refusing external-runtime Job deletion without persisted name and UID",
+      );
+      return "mismatch" as const;
+    }
+    return deleteAgentJobExact({
+      runId: run.id,
+      agentId: run.agentId,
+      name: reservation.jobName,
+      uid: reservation.jobUid,
+    });
+  }
+
   async function finalizeExternalLifecycleTerminalRun(input: {
     run: typeof heartbeatRuns.$inferSelect;
     adapterType: string;
@@ -10802,6 +10825,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
 
     let finalizedRun: Awaited<ReturnType<typeof setRunStatus>>;
+    let terminalJobQuiesced = Boolean(input.jobStatus && input.jobStatus.phase !== "active");
     if (input.staleKill) {
       // BLO-13176: claim the run terminally BEFORE the destructive Job delete.
       // The force-kill deleted the Job first and only then set status, so two
@@ -10825,9 +10849,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // the slot (and node CPU) is reclaimed and the dispatcher's
       // hasActiveJobForAgent gate stops blocking newly-queued high-priority work.
       try {
-        const deleted = await deleteAgentJobsForRun(input.run.id);
+        const deleted = await deleteExactExternalRuntimeJob(input.run);
+        terminalJobQuiesced = deleted === "deleted" || deleted === "missing";
         logger.warn(
-          { runId: input.run.id, adapterType: input.adapterType, deletedJobs: deleted },
+          { runId: input.run.id, adapterType: input.adapterType, deletionResult: deleted },
           "reapOrphanedRuns: force-killed live-but-silent external-lifecycle Job (hard-stale)",
         );
       } catch (error) {
@@ -10841,12 +10866,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       }
     } else {
-      finalizedRun = await setRunStatus(input.run.id, terminalOutcome.status, {
+      const claim = await setRunStatusIfRunning(input.run.id, terminalOutcome.status, {
         error: terminalOutcome.error,
         errorCode: terminalOutcome.errorCode,
         finishedAt: input.now,
         resultJson,
       });
+      if (!claim.updated) return false;
+      finalizedRun = claim.run;
     }
     await setWakeupStatus(input.run.wakeupRequestId, terminalOutcome.wakeupStatus, {
       finishedAt: input.now,
@@ -10886,6 +10913,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       status: finalizedRun.status,
       failureReason: finalizedRun.error ?? undefined,
     });
+    if (terminalJobQuiesced) {
+      await releaseExternalRuntimeReservation(db, {
+        runId: finalizedRun.id,
+        reason: terminalOutcome.errorCode ?? terminalOutcome.status,
+      });
+    }
     await finalizeAgentStatus(input.run.agentId, terminalOutcome.status);
     const promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun);
     await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
@@ -11019,6 +11052,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const cleanedRunIds: string[] = [];
     for (const { run, adapterType } of terminalRuns) {
       if (!hasExternalLifecycle(adapterType)) continue;
+      const reservation = await getActiveExternalRuntimeReservation(db, run.id);
+      const observed = jobRunStatuses.get(run.id);
+      if (
+        !reservation?.jobName
+        || !reservation.jobUid
+        || observed?.name !== reservation.jobName
+        || observed.uid !== reservation.jobUid
+      ) {
+        logger.error(
+          { runId: run.id, reservationId: reservation?.id ?? null, observed },
+          "refusing terminal Job cleanup because exact reservation identity did not reconcile",
+        );
+        continue;
+      }
       if (isExternalLifecycleRunInRecentGrace(run, now)) {
         logger.debug(
           { runId: run.id, status: run.status, adapterType },
@@ -11027,10 +11074,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         continue;
       }
       try {
-        const deleted = await deleteAgentJobsForRun(run.id);
+        const deleted = await deleteExactExternalRuntimeJob(run);
+        if (deleted !== "deleted" && deleted !== "missing") continue;
         cleanedRunIds.push(run.id);
         logger.warn(
-          { runId: run.id, status: run.status, adapterType, deletedJobs: deleted },
+          { runId: run.id, status: run.status, adapterType, deletionResult: deleted },
           "reapOrphanedRuns: deleted live external-lifecycle Job for terminal heartbeat run",
         );
         await appendRunEvent(run, await nextRunEventSeq(run.id), {
@@ -11060,6 +11108,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function reconcileReleasePendingExternalRuntimeReservations(
     jobRunStatuses: Map<string, AgentJobRunStatus> | null,
+    ambiguousRunIds: ReadonlySet<string> = new Set(),
   ) {
     const pending = await db
       .select()
@@ -11067,10 +11116,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(eq(externalRuntimeReservations.state, "release_pending"));
     for (const reservation of pending) {
       if (activeRunExecutions.has(reservation.runId)) continue;
+      if (ambiguousRunIds.has(reservation.runId)) continue;
       const observed = jobRunStatuses?.get(reservation.runId) ?? null;
+      const launchedIdentityMatches = Boolean(
+        reservation.jobName
+        && reservation.jobUid
+        && observed?.name === reservation.jobName
+        && observed.uid === reservation.jobUid,
+      );
+      if (observed && reservation.jobName && !launchedIdentityMatches) {
+        logger.error(
+          { reservationId: reservation.id, runId: reservation.runId, observed },
+          "refusing reservation release because observed Job identity does not match",
+        );
+        continue;
+      }
       if (observed?.phase === "active") continue;
 
-      let terminalOrMissing = Boolean(observed);
+      let terminalOrMissing = launchedIdentityMatches;
       const jobName = reservation.jobName ?? reservation.expectedJobName;
       const isolationSetupGraceActive =
         !jobName &&
@@ -11085,7 +11148,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       if (!terminalOrMissing && jobName) {
         const exact = await readAgentJobRunStatusByName(jobName);
-        terminalOrMissing = Boolean(exact && exact.phase !== "active");
+        terminalOrMissing = Boolean(
+          exact
+          && exact.phase !== "active"
+          && (
+            !reservation.jobUid
+            || exact.phase === "missing"
+            || exact.uid === reservation.jobUid
+          ),
+        );
       }
       if (!terminalOrMissing) continue;
 
@@ -11096,15 +11167,99 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  async function cleanupManagedJobsWithoutRun(now: Date, inventory?: Awaited<ReturnType<typeof listManagedAgentJobs>>) {
+    const jobs = inventory === undefined ? await listManagedAgentJobs() : inventory;
+    if (!jobs) return [];
+    const graceMs = 5 * 60 * 1000;
+    const oldJobs = jobs
+      .filter((job) =>
+        job.runId
+        && job.agentId
+        && job.createdAt
+        && now.getTime() - job.createdAt.getTime() >= graceMs
+      )
+      .sort((a, b) => a.createdAt!.getTime() - b.createdAt!.getTime())
+      .slice(0, 100);
+    const runIds = [...new Set(oldJobs.map((job) => job.runId).filter((runId): runId is string => Boolean(runId)))];
+    if (runIds.length === 0) return [];
+    const existingRunIds = new Set(
+      await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, runIds))
+        .then((rows) => rows.map((row) => row.id)),
+    );
+    const candidates = oldJobs
+      .filter((job) => job.runId && !existingRunIds.has(job.runId))
+      .slice(0, 25);
+    const deleted: string[] = [];
+    for (const job of candidates) {
+      const result = await deleteAgentJobExact({
+        runId: job.runId!,
+        agentId: job.agentId!,
+        name: job.name,
+        uid: job.uid,
+      });
+      if (result === "deleted" || result === "missing") deleted.push(job.name);
+    }
+    return deleted;
+  }
+
   async function releaseExternalRuntimeReservationIfQuiesced(runId: string, reason: string) {
     const reservation = await getActiveExternalRuntimeReservation(db, runId);
     if (!reservation) return null;
 
     const jobName = reservation.jobName ?? reservation.expectedJobName;
     const status = jobName ? await readAgentJobRunStatusByName(jobName) : null;
+    if (
+      reservation.jobUid
+      && status
+      && status.phase !== "missing"
+      && status.uid !== reservation.jobUid
+    ) return null;
     if (!externalRuntimeReservationCanRelease(reservation, status?.phase ?? null, true)) return null;
 
     return releaseExternalRuntimeReservation(db, { runId, reason });
+  }
+
+  async function resumeRunningExternalRuntimeRuns() {
+    const jobs = await listManagedAgentJobs();
+    const rows = await db
+      .select({ run: heartbeatRuns, adapterType: agents.adapterType })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(eq(heartbeatRuns.status, "running"));
+    let resumed = 0;
+    for (const { run, adapterType } of rows) {
+      if (
+        !hasExternalLifecycle(adapterType)
+        || activeRunExecutions.has(run.id)
+        || reattachingExternalRuns.has(run.id)
+      ) continue;
+      const reservation = await getActiveExternalRuntimeReservation(db, run.id);
+      if (reservation?.state !== "launched" || !reservation.jobName || !reservation.jobUid) continue;
+      const reconciled = jobs === null
+        ? null
+        : matchExactAgentJob(jobs, {
+            runId: run.id,
+            agentId: run.agentId,
+            name: reservation.jobName,
+            uid: reservation.jobUid,
+          });
+      if (reconciled && reconciled.kind !== "exact") continue;
+      const observed = reconciled?.kind === "exact"
+        ? reconciled.job
+        : await readAgentJobRunStatusByName(reservation.jobName);
+      if (observed?.phase !== "active" || observed.uid !== reservation.jobUid) continue;
+      resumed += 1;
+      reattachingExternalRuns.add(run.id);
+      void executeRun(run.id)
+        .catch((error) => {
+          logger.error({ error, runId: run.id }, "failed to reattach external-runtime execution");
+        })
+        .finally(() => reattachingExternalRuns.delete(run.id));
+    }
+    return resumed;
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; suppressDispatchAfterReap?: boolean }) {
@@ -11129,7 +11284,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // Jobs that would otherwise keep blocking future dispatches. Returns null
     // when the API is unavailable (local dev, RBAC missing, transient failure).
     const hasExternalCandidates = activeRuns.some((row) => hasExternalLifecycle(row.adapterType));
-    const jobRunStatuses = await listAgentJobRunStatuses();
+    const managedJobs = await listManagedAgentJobs();
+    const jobRunStatuses = managedJobs !== null
+      ? indexUniqueAgentJobRunStatuses(managedJobs)
+      : await listAgentJobRunStatuses();
+    await cleanupManagedJobsWithoutRun(now, managedJobs);
+    const ambiguousExternalRunIds = new Set<string>();
+    if (managedJobs) {
+      const jobsByRun = new Map<string, typeof managedJobs>();
+      for (const job of managedJobs) {
+        if (!job.runId) continue;
+        const candidates = jobsByRun.get(job.runId) ?? [];
+        candidates.push(job);
+        jobsByRun.set(job.runId, candidates);
+      }
+      for (const [runId, candidates] of jobsByRun) {
+        if (candidates.length !== 1) ambiguousExternalRunIds.add(runId);
+      }
+    }
     const activeReservations = activeRuns.length > 0
       ? await db
         .select()
@@ -11176,35 +11348,51 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // actually changed, so this adds no write churn on a steady fleet.
     if (jobRunStatuses) {
       for (const { run } of activeRuns) {
+        if (ambiguousExternalRunIds.has(run.id)) continue;
         const jobStatus = jobRunStatuses.get(run.id);
         const jobName = jobStatus?.name ?? null;
+        const jobUid = jobStatus?.uid ?? null;
         // A recently re-armed reservation means an owner consumed and deleted
         // a terminal attempt before preparing the same run id's replacement.
         // Do not let a stale namespace snapshot bind that old Job back onto the
         // reservation. Live Jobs and stale ownerless recovery remain unchanged.
         const terminalAttemptStillOwned =
           jobStatus?.phase !== "active" && replacementPendingRunIds.has(run.id);
-        if (jobName && !terminalAttemptStillOwned) {
-          let identityAccepted = true;
+        if (jobStatus && (!jobName || !jobUid)) {
+          logger.error(
+            { runId: run.id, jobName, jobUid },
+            "refusing unidentifiable external-runtime Job status",
+          );
+          ambiguousExternalRunIds.add(run.id);
+          jobRunStatuses.delete(run.id);
+        } else if (jobName && jobUid && !terminalAttemptStillOwned) {
           try {
+            if (managedJobs) {
+              const exact = matchExactAgentJob(managedJobs, {
+                runId: run.id,
+                agentId: run.agentId,
+                name: jobName,
+                uid: jobUid,
+              });
+              if (exact.kind !== "exact") throw new Error(`Managed Job identity is ${exact.kind}`);
+            }
+            const reservation = await getActiveExternalRuntimeReservation(db, run.id);
+            if (!reservation) throw new Error(`No active external-runtime reservation for run ${run.id}`);
             await recordExternalRuntimeJobIdentity(db, {
               runId: run.id,
+              reservationId: reservation.id,
+              slotId: reservation.slotId,
               jobName,
-              jobUid: jobStatus?.uid ?? null,
+              jobUid,
               now,
             });
           } catch (error) {
-            identityAccepted = false;
             logger.error(
               { runId: run.id, jobName, jobUid: jobStatus?.uid ?? null, error },
               "external-runtime reservation Job identity mismatch",
             );
-          }
-          if (identityAccepted && run.externalRunId !== jobName) {
-            await db
-              .update(heartbeatRuns)
-              .set({ externalRunId: jobName })
-              .where(eq(heartbeatRuns.id, run.id));
+            ambiguousExternalRunIds.add(run.id);
+            jobRunStatuses.delete(run.id);
           }
         }
       }
@@ -11212,7 +11400,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const cleanedTerminalJobRunIds = await cleanupTerminalExternalLifecycleJobs(jobRunStatuses, now);
     reaped.push(...cleanedTerminalJobRunIds);
-    await reconcileReleasePendingExternalRuntimeReservations(jobRunStatuses);
+    await reconcileReleasePendingExternalRuntimeReservations(jobRunStatuses, ambiguousExternalRunIds);
     const liveJobRunIds =
       jobRunStatuses !== null
         ? new Set(
@@ -11237,6 +11425,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
       if (runningProcesses.has(run.id)) continue;
+      if (ambiguousExternalRunIds.has(run.id)) continue;
 
       // External-lifecycle adapters (k8s Jobs etc.) manage their own run
       // completion once adapter invocation has actually started. A claimed
@@ -11313,9 +11502,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
           continue;
         }
-        // preAdapterLiveness === "dead" (Job confirmed absent/terminal) or
-        // "unknown" (kube status unavailable / unconfirmable snapshot miss):
-        // fall through to the pre-existing process_lost reap below.
+        if (preAdapterLiveness === "unknown") {
+          const reservation = await getActiveExternalRuntimeReservation(db, run.id);
+          const durableJobName = reservation?.jobName
+            ?? reservation?.expectedJobName
+            ?? run.externalRunId?.trim()
+            ?? null;
+          // API failure is not evidence that a named launch was lost. An old
+          // pre-launch run with no durable Job identity, however, is explicitly
+          // unreattachable and must converge through process_lost.
+          if (durableJobName) continue;
+        }
+        // Only positive evidence that the exact Job is absent or terminal may
+        // fall through to process_lost for a pre-adapter reservation.
       }
       let confirmedMissingExternalJob = false;
       if (externalLifecycleRun && externalLifecycleStarted) {
@@ -12413,6 +12612,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let run = await getRun(runId);
     if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
+    if (activeRunExecutions.has(run.id)) return;
 
     if (run.status === "queued") {
       // BLO-12563: never claim a NEW run once dispatch is quiesced for shutdown —
@@ -12474,7 +12674,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const runtime = await ensureRuntimeState(agent);
     const context = parseObject(run.contextSnapshot);
     const externalRuntimeLifecycle = hasExternalLifecycle(agent.adapterType);
-    const externalRuntimeReservation = externalRuntimeLifecycle
+    let externalRuntimeReservation = externalRuntimeLifecycle
       ? await getActiveExternalRuntimeReservation(db, run.id)
       : null;
     if (externalRuntimeLifecycle && !externalRuntimeReservation) {
@@ -12848,9 +13048,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         isolationMode: k8sIsolationIdentity.isolationMode,
         isolationKey: k8sIsolationIdentity.isolationKey,
       });
-      const realizingReservation = await markExternalRuntimeReservationLaunching(db, run.id);
-      if (!realizingReservation) {
-        throw new Error(`External runtime reservation no longer owns workspace realization for run ${run.id}`);
+      if (externalRuntimeReservation.state !== "launched") {
+        const realizingReservation = await markExternalRuntimeReservationLaunching(db, run.id);
+        if (!realizingReservation) {
+          throw new Error(`External runtime reservation no longer owns workspace realization for run ${run.id}`);
+        }
       }
     }
     const executionPolicy = { executionMode: (await instanceSettings.getGeneral()).executionMode };
@@ -13839,7 +14041,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (externalRuntimeReservation && isK8sAdapter(agent.adapterType)) {
           const jobName = parseExpectedExternalRuntimeJobNameFromMetaCommand(meta.command);
           if (jobName) {
-            await recordExpectedExternalRuntimeJobName(db, { runId: run.id, jobName });
+            await recordExpectedExternalRuntimeJobName(db, {
+              runId: run.id,
+              reservationId: externalRuntimeReservation.id,
+              slotId: externalRuntimeReservation.slotId,
+              jobName,
+            });
           }
         }
         const modelProfileMetadata = modelProfileRunMetadata(modelProfileApplication);
@@ -13984,17 +14191,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             await recordWorkspaceFinalize("failed", { errorMessage });
           } else {
             if (externalRuntimeReservation) {
-              const launchingReservation = await markExternalRuntimeReservationLaunching(db, run.id);
-              if (!launchingReservation) {
-                throw new Error(`External runtime reservation no longer owns launch for run ${run.id}`);
+              if (externalRuntimeReservation.state !== "launched") {
+                const launchingReservation = await markExternalRuntimeReservationLaunching(db, run.id);
+                if (!launchingReservation) {
+                  throw new Error(`External runtime reservation no longer owns launch for run ${run.id}`);
+                }
               }
             }
             let ccrotateRetryAttempt = 0;
             while (true) {
-              if (externalRuntimeReservation) {
-                await requireExternalRuntimeLaunchOwnership(db, {
+              const executionReservation = externalRuntimeReservation;
+              if (executionReservation) {
+                await requireExternalRuntimeExecutionOwnership(db, {
                   runId: run.id,
-                  reservationId: externalRuntimeReservation.id,
+                  reservationId: executionReservation.id,
+                  jobName: executionReservation.jobName,
+                  jobUid: executionReservation.jobUid,
                 });
               }
               adapterResult = await adapter.execute({
@@ -14003,13 +14215,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 runtime: runtimeForAdapter,
                 config: runtimeConfig,
                 context,
-                externalRuntime: externalRuntimeReservation
+                externalRuntime: executionReservation
                   ? {
-                      reservationId: externalRuntimeReservation.id,
-                      slotId: externalRuntimeReservation.slotId,
-                      expectedJobName: externalRuntimeReservation.expectedJobName,
-                      jobName: externalRuntimeReservation.jobName,
-                      jobUid: externalRuntimeReservation.jobUid,
+                      reservationId: executionReservation.id,
+                      slotId: executionReservation.slotId,
+                      expectedJobName: executionReservation.expectedJobName,
+                      jobName: executionReservation.jobName,
+                      jobUid: executionReservation.jobUid,
                     }
                   : undefined,
                 runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
@@ -14019,18 +14231,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   : undefined,
                 onLog,
                 onMeta: onAdapterMeta,
-                onExternalRuntimeLaunched: externalRuntimeReservation
+                onExternalRuntimeLaunched: executionReservation
                   ? async ({ jobName, jobUid }) => {
-                      await recordExternalRuntimeJobIdentity(db, {
-                        runId: run.id,
-                        jobName,
-                        jobUid,
-                      });
-                      await db
-                        .update(heartbeatRuns)
-                        .set({ externalRunId: jobName, updatedAt: new Date() })
-                        .where(eq(heartbeatRuns.id, run.id));
-                    }
+                       await recordExternalRuntimeJobIdentity(db, {
+                         runId: run.id,
+                         reservationId: executionReservation.id,
+                         slotId: executionReservation.slotId,
+                         jobName,
+                         jobUid,
+                       });
+                     }
                   : undefined,
                 onSpawn: async (meta) => {
                   await persistRunProcessMetadata(run.id, {
@@ -14065,6 +14275,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 if (!rearmedReservation) {
                   throw new Error(`External runtime reservation no longer owns retry launch for run ${run.id}`);
                 }
+                externalRuntimeReservation = rearmedReservation;
               }
               const retryPayload = {
                 attempt: ccrotateRetryAttempt,
@@ -17367,9 +17578,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // Job so the slot frees up. Best-effort.
     if (agent && hasExternalLifecycle(agent.adapterType)) {
       try {
-        const deleted = await deleteAgentJobsForRun(run.id);
+        const deleted = await deleteExactExternalRuntimeJob(run);
         logger.info(
-          { runId: run.id, deletedJobs: deleted },
+          { runId: run.id, deletionResult: deleted },
           "cancelRun: cascaded Job deletion for external-lifecycle adapter",
         );
       } catch (error) {
@@ -17428,9 +17639,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // also release the k8s Job slot for external-lifecycle runs.
       if (agent && hasExternalLifecycle(agent.adapterType)) {
         try {
-          const deleted = await deleteAgentJobsForRun(run.id);
+          const deleted = await deleteExactExternalRuntimeJob(run);
           logger.info(
-            { runId: run.id, deletedJobs: deleted },
+            { runId: run.id, deletionResult: deleted },
             "cancelActiveForAgent: cascaded Job deletion for external-lifecycle adapter",
           );
         } catch (error) {
@@ -17762,6 +17973,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reportRunActivity: clearDetachedRunWarning,
 
     reapOrphanedRuns,
+    resumeRunningExternalRuntimeRuns,
 
     /**
      * Test-only handle on the in-process await tracking Set populated by
