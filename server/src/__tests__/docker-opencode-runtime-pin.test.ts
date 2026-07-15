@@ -25,8 +25,8 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerfile).not.toMatch(/npm install[^\n]*\sopencode-ai(?:\s|\\)/);
   });
 
-  it("vendors the claude_k8s adapter commit with runtime isolation bootstrap, resume guard, and env guard", () => {
-    expect(dockerfile).toContain("ARG CLAUDE_K8S_REF=6b96224be921c7244202215693515d942520ddd5");
+  it("vendors the claude_k8s adapter commit with runtime isolation and Penstock retry hints", () => {
+    expect(dockerfile).toContain("ARG CLAUDE_K8S_REF=d44eb4e2acfeb3c5f0adafccdc36bd06da3f8060");
     expect(dockerfile).toContain("PEN-1305 PreToolUse env-guard");
     expect(dockerfile).toContain("always materialize the shared MCP baseline");
     expect(dockerfile).toContain("Fixes BackendEngineerGo/Ally missing paperclip/hindsight/gbrain/linear/etc.");
@@ -50,6 +50,7 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerfile).toContain("independent");
     expect(dockerfile).toContain("generic non-Git fallback workspace");
     expect(dockerfile).toContain("isolated pod-log parent");
+    expect(dockerfile).toContain("preserve Penstock's structured `resume_at`");
   });
 
   it("vendors the opencode_k8s adapter commit with runtime isolation and the env-dump deny", () => {

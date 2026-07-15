@@ -234,11 +234,10 @@ spec:
                   chown 1000:1000 "${BASE}/adapter-plugins.json" 2>/dev/null || true
                 fi
               fi
-              # Remove legacy local-ccrotate Claude hooks from the shared PVC.
-              # Paperclip production routes provider traffic through
-              # ccrotate-serve/state now; keeping these hooks lets old PVC files
-              # invoke a stale local rotator and move agents onto exhausted
-              # accounts.
+              # Remove legacy local-ccrotate artifacts from the shared PVC.
+              # Blockcast production routes provider traffic through Penstock;
+              # keeping these hooks lets old PVC files invoke a stale local
+              # rotator and move agents onto exhausted accounts.
               CLAUDE_DIR="${BASE}/.claude"
               HOOKS_DIR="${CLAUDE_DIR}/hooks"
               SETTINGS="${CLAUDE_DIR}/settings.json"
@@ -299,6 +298,17 @@ spec:
                 "${HOOKS_DIR}/ccrotate-on-limit.sh" \
                 "${HOOKS_DIR}/ccrotate-check-tier.sh" \
                 "${HOOKS_DIR}/ccrotate-preemptive.sh" 2>/dev/null || true
+              # A read-only devbox wrapper was seeded before the Penstock
+              # migration. It implements only when/tier-cache/list, so the k8s
+              # adapter's `ccrotate next` preflight silently fails and reads a
+              # stale file cache. Remove only that fingerprinted wrapper; do
+              # not delete an operator-installed full ccrotate CLI.
+              LEGACY_CCROTATE_WRAPPER="${BASE}/bin/ccrotate"
+              if [ -f "${LEGACY_CCROTATE_WRAPPER}" ] && \
+                 grep -Fq "unsupported read-only devbox ccrotate command" "${LEGACY_CCROTATE_WRAPPER}"; then
+                rm -f "${LEGACY_CCROTATE_WRAPPER}"
+                echo "seed: removed legacy read-only ccrotate wrapper"
+              fi
 
               # Install GitHub command wrappers into the shared Paperclip home.
               # Agent Job pods mount the same PVC and inherit the Secret volume
