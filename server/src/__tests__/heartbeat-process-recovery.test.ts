@@ -1968,7 +1968,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // as external_lifecycle_stale_killed, never process_lost. Pins the ceiling so
     // a refactor that drops the hard-stale force-kill (or mislabels it) fails CI.
     const jobName = "agent-claude-live-pasthard-0002";
-    const { runId } = await seedRunFixture({
+    const { companyId, agentId, runId } = await seedRunFixture({
       adapterType: "claude_k8s",
       processPid: null,
       processGroupId: null,
@@ -1976,6 +1976,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       lastOutputAt: null,
       externalRunId: jobName,
     });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
     const fiftyMinAgo = new Date(Date.now() - 50 * 60 * 1000);
     await db
       .update(heartbeatRuns)
@@ -2436,7 +2437,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
   });
 
-  it("fails closed when duplicate Jobs claim one launched run", async () => {
+  it("deletes an exact duplicate Job while preserving the launched owner", async () => {
     const stale = new Date(Date.now() - 50 * 60 * 1000);
     const { companyId, agentId, runId } = await seedRunFixture({
       adapterType: "opencode_k8s",
@@ -2472,7 +2473,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     expect(result.runIds).not.toContain(runId);
     expect((await heartbeat.getRun(runId))?.status).toBe("running");
-    expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
+    expect(mockDeleteAgentJobsForRun).toHaveBeenCalledWith({
+      runId,
+      agentId,
+      name: `${reservation.jobName}-duplicate`,
+      uid: `${reservation.jobUid}-duplicate`,
+    });
   });
 
   it("BLO-12996: force-kills a hard-stale live external-lifecycle Job (kube status snapshot active) to unblock dispatch", async () => {
