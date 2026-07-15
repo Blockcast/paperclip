@@ -42,6 +42,7 @@ import {
   feedbackService,
   backfillPrincipalAccessCompatibility,
   bootstrapExecutionPolicyFromEnv,
+  EXTERNAL_LIFECYCLE_COLD_BOOT_REATTACH_GRACE_MS,
   heartbeatService,
   instanceSettingsService,
   reconcileCloudUpstreamRunsOnStartup,
@@ -1026,6 +1027,13 @@ export async function startServer(): Promise<StartedServer> {
       // missing command". Mirrors the !== "api" gating used for the other
       // singletons (plugins, reconciler, Linear tunnel) below.
       paperclipNodeRole: config.paperclipNodeRole,
+      // BLO-12564: the long-lived worker owns the startup reap (below) and the
+      // periodic reaper. On a fresh boot the in-cluster kube client may not be
+      // serving yet, so hold process_lost for external-lifecycle runs while fully
+      // kube-blind within this grace, letting a still-Running Job reattach across
+      // the restart instead of being zeroed. Off (0) for every other, short-lived
+      // per-request heartbeatService() construction.
+      coldBootReattachGraceMs: EXTERNAL_LIFECYCLE_COLD_BOOT_REATTACH_GRACE_MS,
     });
     workerHeartbeat = heartbeat;
     const routines = routineService(db as any, { pluginWorkerManager });

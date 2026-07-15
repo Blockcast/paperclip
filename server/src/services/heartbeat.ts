@@ -726,6 +726,21 @@ const EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS = 5 * 60 * 1000;
 // quiet gap (which bumps lastUsefulActionAt) while still reclaiming the slot
 // and node CPU long before the multi-hour manual-reap point.
 const EXTERNAL_LIFECYCLE_HARD_STALE_MS = 45 * 60 * 1000;
+// BLO-12564: cold-boot reattach grace. On a fresh worker boot the in-cluster
+// kube client may not be serving yet, so the startup reap (server/src/index.ts)
+// and the first periodic ticks can run with BOTH listAgentJobRunStatuses() and
+// listLiveAgentJobRunIds() returning null (fully kube-blind — the same signal
+// that drives recordProcessLostLivenessNull()). A running external-lifecycle Job
+// survives the worker restart (it is owned by its own k8s controller), so minting
+// process_lost while blind would zero a run whose Job is very likely still
+// Running. This grace — measured from worker boot — holds the reap while fully
+// blind so the next warm tick can resolve "alive" (reattach) or "dead" (reap).
+// Past the grace, a persistent kube outage still reaps after the silence floor:
+// no permanent shield, no regression to the legitimate-lost path. Symmetric to
+// the BLO-12563 shutdown-side drain guard. Wired only on the long-lived worker
+// (server/src/index.ts); the factory default is 0 (off) so route/service
+// per-request constructions and the steady-state test contract stay unchanged.
+export const EXTERNAL_LIFECYCLE_COLD_BOOT_REATTACH_GRACE_MS = 5 * 60 * 1000;
 const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 const SESSION_ISOLATION_KEY_PARAM = "paperclipIsolationKey";
 
@@ -5366,6 +5381,22 @@ export interface HeartbeatServiceOptions {
    * callers and tests are unaffected.
    */
   paperclipNodeRole?: "api" | "worker" | "all";
+  /**
+   * BLO-12564: cold-boot reattach grace in ms. While the worker has been up for
+   * less than this AND the reaper is fully kube-blind (both liveness lists null),
+   * an external-lifecycle run that would otherwise be minted process_lost is left
+   * running instead, so a warm tick can reattach a still-Running Job across a
+   * server restart. Defaults to 0 (off) so only the long-lived worker
+   * (server/src/index.ts) opts in; route/service per-request constructions and
+   * the test suite's steady-state null-liveness reap contract stay unchanged.
+   */
+  coldBootReattachGraceMs?: number;
+  /**
+   * BLO-12564: injectable worker-boot timestamp for the cold-boot grace above.
+   * Defaults to the service construction time (≈ worker boot). Tests set it to
+   * age past the grace deterministically.
+   */
+  workerBootAt?: Date;
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
@@ -5404,6 +5435,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // next pod re-adopts them, instead of being killed mid-setup and minted
   // process_lost by the reaper.
   let dispatchStopped = false;
+  // BLO-12564: captured once at service construction (≈ worker boot) so the
+  // reaper can hold process_lost during the post-restart kube-blind window. The
+  // grace is off (0) unless the long-lived worker opts in via options.
+  const workerBootAt = options.workerBootAt ?? new Date();
+  const coldBootReattachGraceMs = options.coldBootReattachGraceMs ?? 0;
   const liveRunExecutions = {
     has(id: string) {
       return runningProcesses.has(id) || activeRunExecutions.has(id);
@@ -11485,6 +11521,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // fences the reap side of the shutdown quiesce: clearInterval() cannot cancel a
       // reaper tick that is already executing, so guard the finalize itself.
       if (dispatchStopped && externalLifecyclePreAdapter) {
+        continue;
+      }
+
+      // BLO-12564: symmetric boot-side guard to the BLO-12563 shutdown guard
+      // above. On a fresh worker boot the kube client may not be serving yet, so
+      // the startup reap and first periodic ticks can run fully kube-blind
+      // (liveJobRunIds === null — the same signal that drove
+      // recordProcessLostLivenessNull() above). A running external-lifecycle Job
+      // survives the worker restart (it is owned by its own k8s controller), so
+      // minting process_lost while blind would zero a run whose Job is very
+      // likely still Running. Within the cold-boot grace, hold the reap: leave
+      // the run running so the next warm tick resolves "alive" (reattach via the
+      // continue-paths above) or "dead" (reap). Past the grace a persistent kube
+      // outage still reaps after the silence floor — no permanent shield, no
+      // regression to the legitimate-lost path. Covers both pre-adapter and
+      // started external runs (both reach this mint when blind). Gated on the
+      // injected grace (default 0) so only the long-lived worker opts in.
+      if (
+        externalLifecycleRun &&
+        liveJobRunIds === null &&
+        coldBootReattachGraceMs > 0 &&
+        now.getTime() - workerBootAt.getTime() < coldBootReattachGraceMs
+      ) {
+        logger.info(
+          {
+            runId: run.id,
+            adapterType,
+            msSinceWorkerBoot: now.getTime() - workerBootAt.getTime(),
+            coldBootReattachGraceMs,
+          },
+          "reapOrphanedRuns: holding process_lost during cold-boot kube-blind grace so a live Job can reattach (BLO-12564)",
+        );
         continue;
       }
 
