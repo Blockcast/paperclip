@@ -30,7 +30,14 @@ import {
   type CredentialCustodyState,
   type CredentialCustodyToken,
 } from "./credential-custody.js";
-import { buildCredentialHeaders, loadUpstreams, matchUpstream, type UpstreamConfig, type UpstreamMap } from "./upstreams.js";
+import {
+  buildCredentialHeaders,
+  loadUpstreams,
+  matchUpstream,
+  upstreamsPrincipalHash,
+  type UpstreamConfig,
+  type UpstreamMap,
+} from "./upstreams.js";
 import { CircuitBreaker, type CircuitBreakerConfig } from "./circuit-breaker.js";
 import {
   MCP_SESSION_HEADER,
@@ -113,10 +120,13 @@ export interface GatewayState {
   sessionPersistenceFile?: string | null;
   sessionPersistenceLoaded?: boolean;
   sessionPersistenceWrite?: Promise<void>;
+  routingPrincipalHash?: string;
 }
 
 interface PersistedSessionSnapshot {
-  version: 1;
+  version: 2;
+  principalHash: string;
+  routeBindings: Record<string, string>;
   prefixes: Record<string, PersistedSessionRecord[]>;
 }
 
@@ -171,9 +181,19 @@ async function loadPersistedSessions(state: GatewayState): Promise<void> {
   } catch {
     return;
   }
-  if (!parsed || parsed.version !== 1 || !parsed.prefixes || typeof parsed.prefixes !== "object") return;
+  if (
+    !parsed ||
+    parsed.version !== 2 ||
+    parsed.principalHash !== (state.routingPrincipalHash ?? "") ||
+    !parsed.routeBindings ||
+    typeof parsed.routeBindings !== "object" ||
+    !parsed.prefixes ||
+    typeof parsed.prefixes !== "object"
+  ) return;
   for (const [prefix, records] of Object.entries(parsed.prefixes)) {
     if (!Array.isArray(records)) continue;
+    const upstream = state.upstreams[prefix];
+    if (!upstream || parsed.routeBindings[prefix] !== routeBinding(upstream)) continue;
     getOrCreateStore(state, prefix).restore(records);
   }
 }
@@ -199,7 +219,11 @@ async function persistSessionsNow(state: GatewayState): Promise<void> {
   // the upstream session on the next aggregate call.
   await loadPersistedSessions(state);
   const snapshot: PersistedSessionSnapshot = {
-    version: 1,
+    version: 2,
+    principalHash: state.routingPrincipalHash ?? "",
+    routeBindings: Object.fromEntries(
+      Object.entries(state.upstreams).map(([prefix, upstream]) => [prefix, routeBinding(upstream)]),
+    ),
     prefixes: Object.fromEntries(Array.from(state.sessions.entries()).map(([prefix, store]) => [prefix, store.snapshot()])),
   };
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
@@ -216,6 +240,10 @@ async function persistSessionsNow(state: GatewayState): Promise<void> {
     // eslint-disable-next-line no-console
     console.warn(`[mcp-gateway] failed to persist session store: ${(e as Error).message}`);
   }
+}
+
+function routeBinding(upstream: UpstreamConfig): string {
+  return `${upstream.execution ?? "house"}\0${upstream.routeId ?? ""}\0${upstream.url}\0${upstream.registryRevision ?? ""}`;
 }
 
 async function readBody(req: http.IncomingMessage): Promise<Buffer> {
@@ -412,6 +440,7 @@ async function forward(
   const init: RequestInit = {
     method,
     headers,
+    redirect: upstreamConfig?.execution === "tenant_node" ? "manual" : "follow",
     // Bound the call: abort a hung upstream instead of holding the connection
     // and buffered body until undici's ~300s default timeouts fire. A fired
     // timeout rejects with a TimeoutError, surfaced as 504 by safeOnError.
@@ -439,6 +468,10 @@ function buildForwardHeaders(
     copyHeader(headers, inboundHeaders, "content-type");
     copyHeader(headers, inboundHeaders, "last-event-id");
     copyHeader(headers, inboundHeaders, "mcp-protocol-version");
+    if (!upstreamConfig.relayAuthorization) {
+      throw new Error("tenant-node route is missing authenticated relay authorization");
+    }
+    headers.authorization = upstreamConfig.relayAuthorization;
     return headers;
   }
   if (credentialToken) {
@@ -1019,6 +1052,7 @@ async function main(): Promise<void> {
     credentialCustody: loadCredentialCustodyState(),
     oauthDiscovery: config.oauthDiscovery,
     sessionPersistenceFile: config.sessionPersistenceFile,
+    routingPrincipalHash: upstreamsPrincipalHash(),
   };
   await loadPersistedSessions(state);
   state.sessionPersistenceLoaded = true;
