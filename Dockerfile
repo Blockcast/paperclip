@@ -390,14 +390,18 @@ FROM base AS build
 WORKDIR /app
 COPY --from=deps /app /app
 COPY . .
-RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/plugin-sdk build
-RUN pnpm --filter @kkroo/paperclip-plugin-gbrain build
-RUN pnpm --filter @kkroo/paperclip-plugin-linear build
-RUN pnpm --filter paperclip-plugin-alertmanager build
-RUN pnpm --filter paperclip-plugin-slack build
-RUN pnpm --filter @paperclipai/mcp-server build
-RUN pnpm --filter @paperclipai/server build
+# The UI is the longest independent build. Run it beside the server/plugin
+# chain while keeping that chain serial to avoid a large memory spike on ARC.
+RUN set -eu; \
+  pnpm --filter @paperclipai/ui build & ui_pid=$!; \
+  pnpm --filter @kkroo/paperclip-plugin-gbrain build; \
+  pnpm --filter @kkroo/paperclip-plugin-linear build; \
+  pnpm --filter paperclip-plugin-alertmanager build; \
+  pnpm --filter paperclip-plugin-slack build; \
+  pnpm --filter @paperclipai/mcp-server build; \
+  pnpm --filter @paperclipai/server build; \
+  wait "$ui_pid"
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
 # The seed-init in the helm chart looks for this file to decide whether
 # to write /paperclip/.mcp.json. Fail the build if it's missing instead
@@ -436,8 +440,10 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
   && rm -rf /tmp/paperclip-bundled-adapters \
   && chown -R node:node /opt/paperclip-bundled-adapters
 
-# Keep the large, frequently-changing app payload last. Ordinary source edits
-# can now reuse both the runtime and bundled-adapter install layers.
-COPY --chown=node:node --from=build /app /app
+# Keep dependency trees in their own stable layer. Ordinary source edits only
+# replace the much smaller source/compiled payload and do not re-upload pnpm's
+# node_modules tree as part of every per-commit image.
+COPY --chown=node:node --from=deps /app /app
+COPY --chown=node:node --from=build --exclude=node_modules --exclude=**/node_modules /app /app
 
 ENV USER_UID=${USER_UID} USER_GID=${USER_GID}

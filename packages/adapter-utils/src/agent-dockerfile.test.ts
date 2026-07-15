@@ -61,15 +61,41 @@ describe("paperclip agent Dockerfile", () => {
     expect(dockerfileRuntime).not.toContain("@latest");
   });
 
-  it("installs server adapters before copying the changing app payload", () => {
+  it("installs server adapters and stable dependencies before the changing app payload", () => {
     const installIndex = dockerfileServer.indexOf(
       "npm install --prefix /opt/paperclip-bundled-adapters",
     );
-    const appCopyIndex = dockerfileServer.lastIndexOf("COPY --chown=node:node --from=build /app /app");
+    const dependencyCopyIndex = dockerfileServer.lastIndexOf(
+      "COPY --chown=node:node --from=deps /app /app",
+    );
+    const appCopyIndex = dockerfileServer.lastIndexOf(
+      "COPY --chown=node:node --from=build --exclude=node_modules --exclude=**/node_modules /app /app",
+    );
 
     expect(installIndex).toBeGreaterThan(-1);
+    expect(dependencyCopyIndex).toBeGreaterThan(installIndex);
     expect(appCopyIndex).toBeGreaterThan(-1);
-    expect(installIndex).toBeLessThan(appCopyIndex);
+    expect(dependencyCopyIndex).toBeLessThan(appCopyIndex);
+    expect(dockerfileServer).not.toContain("COPY --chown=node:node --from=build /app /app");
+    expect(dockerfileServer).not.toContain("find /app -name node_modules");
+  });
+
+  it("builds the UI concurrently with the serial server/plugin chain", () => {
+    const sdkBuildIndex = dockerfileServer.indexOf(
+      "RUN pnpm --filter @paperclipai/plugin-sdk build",
+    );
+    const concurrentBuildIndex = dockerfileServer.indexOf(
+      "pnpm --filter @paperclipai/ui build & ui_pid=$!",
+    );
+    const serverBuildIndex = dockerfileServer.indexOf(
+      "pnpm --filter @paperclipai/server build;",
+    );
+    const waitIndex = dockerfileServer.indexOf('wait "$ui_pid"');
+
+    expect(sdkBuildIndex).toBeGreaterThan(-1);
+    expect(concurrentBuildIndex).toBeGreaterThan(sdkBuildIndex);
+    expect(serverBuildIndex).toBeGreaterThan(concurrentBuildIndex);
+    expect(waitIndex).toBeGreaterThan(serverBuildIndex);
   });
 
   it("keeps the per-commit agent image as a toolchain overlay", () => {
