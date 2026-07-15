@@ -1433,6 +1433,75 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(body).toContain(`${PROCESS_LOST_LIVENESS_NULL_METRIC} 1`);
   });
 
+  it("does NOT process_lost a live pre-adapter run past the pre-adapter stale floor but under the hard ceiling (BLO-16183, guards 9c1bde19)", async () => {
+    // The mid-run over-reap class (killing live '2/2 Running' pre-adapter pods --
+    // the class where work IS lost) was closed by 9c1bde19 "keep live k8s runs out
+    // of orphan reaper" (166 rows 6/03-6/26, 0 since). This pins the invariant: a
+    // pre-adapter external-lifecycle run whose backing Job is ALIVE must not be
+    // reaped merely for being silent past EXTERNAL_LIFECYCLE_PRE_ADAPTER_STALE_MS
+    // (5m), as long as it is under the hard ceiling (EXTERNAL_LIFECYCLE_HARD_STALE_MS,
+    // 45m). A refactor that collapses the pre-adapter alive-guard fails here.
+    const jobName = "agent-claude-live-underhard-0001";
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null, // pre-adapter: never produced output
+      externalRunId: jobName,
+    });
+    // No adapter.invoke event -> pre-adapter. Age the run to 20m: past the 5m
+    // pre-adapter stale floor, well under the 45m hard ceiling. ref-time keys on
+    // startedAt/createdAt for a pre-adapter run (lastOutputAt is null).
+    const twentyMinAgo = new Date(Date.now() - 20 * 60 * 1000);
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt: twentyMinAgo, createdAt: twentyMinAgo })
+      .where(eq(heartbeatRuns.id, runId));
+    // Stub liveness "alive": the backing Job is live in the kube snapshot.
+    mockListLiveAgentJobRunIds.mockResolvedValueOnce(new Set([runId]));
+
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result.runIds).not.toContain(runId);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).toBeNull();
+    expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
+  });
+
+  it("stale-kills (NOT process_lost) a live pre-adapter run past the hard ceiling (BLO-16183)", async () => {
+    // Mirror of the above at the other side of the 45m hard ceiling: a live
+    // pre-adapter Job wedged past EXTERNAL_LIFECYCLE_HARD_STALE_MS is a stuck
+    // zombie holding the agent's dispatch slot, so it IS force-terminated -- but
+    // as external_lifecycle_stale_killed, never process_lost. Pins the ceiling so
+    // a refactor that drops the hard-stale force-kill (or mislabels it) fails CI.
+    const jobName = "agent-claude-live-pasthard-0002";
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null,
+      externalRunId: jobName,
+    });
+    const fiftyMinAgo = new Date(Date.now() - 50 * 60 * 1000);
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt: fiftyMinAgo, createdAt: fiftyMinAgo })
+      .where(eq(heartbeatRuns.id, runId));
+    mockListLiveAgentJobRunIds.mockResolvedValueOnce(new Set([runId]));
+
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result.runIds).toContain(runId);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("external_lifecycle_stale_killed");
+    // Force-kill deletes the live Job so its dispatch slot unwedges.
+    expect(mockDeleteAgentJobsForRun).toHaveBeenCalled();
+  });
+
   it("auto-cancels open stale_active_run_evaluation review when reaper finalizes the run to failed (PCL-2571)", async () => {
     // PCL-2571: the silent-run detector files a CTO review issue when an
     // active run has been silent past the suspicion threshold. There's a
