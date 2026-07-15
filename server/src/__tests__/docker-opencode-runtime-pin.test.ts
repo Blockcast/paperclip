@@ -114,6 +114,14 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerAgentWorkflow).toContain("timeout-minutes: 90");
   });
 
+  it("includes resolved upstream image digests in stable image identities", () => {
+    expect(dockerWorkflow).toContain('RUNTIME_BASE_IMAGE=${{ steps.runtime.outputs.base_image }}');
+    expect(dockerAgentWorkflow).toContain(
+      'RUNTIME_BASE_IMAGE=${{ steps.bases.outputs.runtime_base_image }}',
+    );
+    expect(dockerAgentWorkflow).toContain('FFMPEG_IMAGE=${{ steps.bases.outputs.ffmpeg_image }}');
+  });
+
   it("publishes agent runtime images to a GHCR owner this repo token can write", () => {
     expect(agentRuntimeImagesWorkflow).toContain("REGISTRY: ${{ vars.AGENT_RUNTIME_REGISTRY || 'ghcr.io/blockcast' }}");
     expect(agentRuntimeImagesWorkflow).toContain("password: ${{ secrets.GITHUB_TOKEN }}");

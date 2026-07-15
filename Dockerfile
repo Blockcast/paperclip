@@ -405,6 +405,9 @@ RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" &
 RUN test -f packages/mcp-server/dist/stdio.js || (echo "ERROR: mcp-server stdio bridge missing" && exit 1)
 
 FROM ${RUNTIME_IMAGE} AS production
+# Preserve the documented local-build defaults. docker-entrypoint.sh compares
+# these values with the inherited passwd entry and remaps node at startup when
+# a caller supplies custom USER_UID/USER_GID build args.
 ARG USER_UID=1000
 ARG USER_GID=1000
 WORKDIR /app

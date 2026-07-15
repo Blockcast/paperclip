@@ -83,7 +83,22 @@ jobs:
         id: bases
         run: |
           set -euo pipefail
-          runtime_tag="$(scripts/container-base-tag.sh runtime)"
+          runtime_base_ref="harbor.blockcast.net/paperclip/node:lts-trixie-slim"
+          runtime_base_digest=""
+          for attempt in 1 2 3 4 5; do
+            if runtime_base_digest="$(docker buildx imagetools inspect "$runtime_base_ref" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"')" \
+              && [ -n "$runtime_base_digest" ]; then
+              break
+            fi
+            echo "Runtime base manifest lookup attempt ${attempt}/5 failed" >&2
+            sleep $((attempt * 2))
+          done
+          if [ -z "$runtime_base_digest" ]; then
+            echo "Unable to resolve ${runtime_base_ref} from Harbor" >&2
+            exit 1
+          fi
+          runtime_base_image="${runtime_base_ref%:*}@${runtime_base_digest}"
+          runtime_tag="$(scripts/container-base-tag.sh runtime "$runtime_base_image")"
           runtime_image="harbor.blockcast.net/paperclip/paperclip-runtime:${runtime_tag}"
           ffmpeg_ref="registry.blockcast.net/blockcast/pim-multicast-gateway/ffmpeg-publisher:stable"
           ffmpeg_digest=""
@@ -115,6 +130,7 @@ jobs:
             echo "Agent toolchain ${toolchain_image} is missing; it will be built"
           fi
           {
+            echo "runtime_base_image=${runtime_base_image}"
             echo "runtime_image=${runtime_image}"
             echo "runtime_exists=${runtime_exists}"
             echo "ffmpeg_image=${ffmpeg_image}"
@@ -134,6 +150,8 @@ jobs:
           push: true
           provenance: false
           sbom: false
+          build-args: |
+            RUNTIME_BASE_IMAGE=${{ steps.bases.outputs.runtime_base_image }}
           cache-from: type=registry,ref=harbor.blockcast.net/paperclip/paperclip-runtime:latest
           cache-to: type=inline
           tags: |

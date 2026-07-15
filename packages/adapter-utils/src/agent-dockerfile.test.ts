@@ -52,6 +52,8 @@ describe("paperclip agent Dockerfile", () => {
   });
 
   it("keeps runtime CLIs pinned in the content-addressed image", () => {
+    expect(dockerfileRuntime).toContain("ARG RUNTIME_BASE_IMAGE=");
+    expect(dockerfileRuntime).toContain("FROM ${RUNTIME_BASE_IMAGE}");
     expect(dockerfileRuntime).toContain("ARG CLAUDE_CODE_VERSION=2.1.210");
     expect(dockerfileRuntime).toContain("ARG CODEX_CLI_VERSION=0.144.4");
     expect(dockerfileRuntime).toContain("ARG OPENCODE_AI_VERSION=1.15.12");
@@ -89,10 +91,16 @@ describe("paperclip agent Dockerfile", () => {
 
   it("derives stable image tags from their declared inputs", () => {
     const script = path.join(repoRoot, "scripts/container-base-tag.sh");
-    const runtimeTag = execFileSync("bash", [script, "runtime"], {
+    const runtimeBaseImage = `harbor.blockcast.net/paperclip/node@sha256:${"c".repeat(64)}`;
+    const runtimeTag = execFileSync("bash", [script, "runtime", runtimeBaseImage], {
       cwd: repoRoot,
       encoding: "utf8",
     }).trim();
+    const changedRuntimeBaseTag = execFileSync(
+      "bash",
+      [script, "runtime", `harbor.blockcast.net/paperclip/node@sha256:${"d".repeat(64)}`],
+      { cwd: repoRoot, encoding: "utf8" },
+    ).trim();
     const runtimeImage = `harbor.blockcast.net/paperclip/paperclip-runtime:${runtimeTag}`;
     const ffmpegImage = `registry.blockcast.net/blockcast/pim-multicast-gateway/ffmpeg-publisher@sha256:${"a".repeat(64)}`;
     const toolchainTag = execFileSync("bash", [script, "agent-toolchain", runtimeImage, ffmpegImage], {
@@ -106,6 +114,7 @@ describe("paperclip agent Dockerfile", () => {
     ).trim();
 
     expect(runtimeTag).toMatch(/^runtime-[a-f0-9]{20}$/);
+    expect(changedRuntimeBaseTag).not.toBe(runtimeTag);
     expect(toolchainTag).toMatch(/^toolchain-[a-f0-9]{20}$/);
     expect(changedFfmpegTag).not.toBe(toolchainTag);
   });

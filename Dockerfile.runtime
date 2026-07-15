@@ -1,11 +1,15 @@
 # syntax=harbor.blockcast.net/dockerfile/dockerfile:1.20
 # Stable Paperclip runtime. CI publishes this image under a content-derived
-# tag and rebuilds it only when this file or one of its copied scripts changes.
+# tag and rebuilds it only when this file, a copied script, or the resolved
+# upstream base image changes.
 # Per-commit server images add vendored adapters and /app on top.
 
 # Mirrored from docker.io/library/node:lts-trixie-slim to avoid Docker Hub
-# anonymous rate limits on self-hosted BuildKit runners.
-FROM harbor.blockcast.net/paperclip/node:lts-trixie-slim
+# anonymous rate limits on self-hosted BuildKit runners. CI resolves this tag
+# to a digest before deriving the runtime tag so Node/Debian security updates
+# produce a new immutable runtime automatically.
+ARG RUNTIME_BASE_IMAGE=harbor.blockcast.net/paperclip/node:lts-trixie-slim
+FROM ${RUNTIME_BASE_IMAGE}
 
 ARG USER_UID=1000
 ARG USER_GID=1000

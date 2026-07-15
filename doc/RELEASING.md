@@ -310,14 +310,15 @@ The Blockcast workflows separate stable tooling from per-commit application payl
 - `Dockerfile.agent` copies the matching server `/app`, bundled adapters, and GitHub MCP binary
   onto that toolchain for the per-commit agent tag.
 
-`scripts/container-base-tag.sh` hashes each stable Dockerfile and its copied inputs. The agent
-workflow also resolves the LAN registry's MMTP FFmpeg `:stable` tag to a digest and includes that
-digest in the toolchain tag. The Docker workflows inspect Harbor first and build a stable image
-only when the derived tag is absent. To roll a runtime dependency, update its pinned version or
-Dockerfile input; do not add an unpinned installer to a per-commit Dockerfile. The first build
-after such a change is intentionally cold, while ordinary source-only builds reuse the existing
-stable images. Stable images use inline cache metadata to avoid simultaneous full image and
-registry-cache exports.
+`scripts/container-base-tag.sh` hashes each stable Dockerfile and its copied inputs. The workflows
+resolve the mirrored Node base to a digest and include it in the runtime tag, so upstream Node or
+Debian security updates produce a new runtime automatically. The agent workflow likewise resolves
+the LAN registry's MMTP FFmpeg `:stable` tag to a digest and includes that digest in the toolchain
+tag. The Docker workflows inspect Harbor first and build a stable image only when the derived tag
+is absent. To roll a pinned runtime dependency, update its version or Dockerfile input; do not add
+an unpinned installer to a per-commit Dockerfile. The first build after such a change is
+intentionally cold, while ordinary source-only builds reuse the existing stable images. Stable
+images use inline cache metadata to avoid simultaneous full image and registry-cache exports.
 
 ## Related Files
 

@@ -102,17 +102,36 @@ jobs:
         id: runtime
         run: |
           set -euo pipefail
-          tag="$(scripts/container-base-tag.sh runtime)"
+          base_ref="harbor.blockcast.net/paperclip/node:lts-trixie-slim"
+          base_digest=""
+          for attempt in 1 2 3 4 5; do
+            if base_digest="$(docker buildx imagetools inspect "$base_ref" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"')" \
+              && [ -n "$base_digest" ]; then
+              break
+            fi
+            echo "Runtime base manifest lookup attempt ${attempt}/5 failed" >&2
+            sleep $((attempt * 2))
+          done
+          if [ -z "$base_digest" ]; then
+            echo "Unable to resolve ${base_ref} from Harbor" >&2
+            exit 1
+          fi
+          base_image="${base_ref%:*}@${base_digest}"
+          tag="$(scripts/container-base-tag.sh runtime "$base_image")"
           image="harbor.blockcast.net/paperclip/paperclip-runtime:${tag}"
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "image=${image}" >> "$GITHUB_OUTPUT"
           if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
+            exists=true
             echo "Using existing runtime image ${image}"
           else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exists=false
             echo "Runtime image ${image} is missing; it will be built"
           fi
+          {
+            echo "base_image=${base_image}"
+            echo "tag=${tag}"
+            echo "image=${image}"
+            echo "exists=${exists}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build and push stable runtime image
         if: steps.runtime.outputs.exists != 'true'
@@ -124,6 +143,8 @@ jobs:
           push: true
           provenance: false
           sbom: false
+          build-args: |
+            RUNTIME_BASE_IMAGE=${{ steps.runtime.outputs.base_image }}
           # The runtime is a single linear stage, so inline cache metadata is
           # sufficient and avoids a second concurrent registry exporter.
           cache-from: type=registry,ref=harbor.blockcast.net/paperclip/paperclip-runtime:latest
