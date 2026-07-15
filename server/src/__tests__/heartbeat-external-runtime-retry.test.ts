@@ -21,6 +21,7 @@ import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-stat
 import {
   bindExternalRuntimeReservationIsolation,
   claimRunWithExternalRuntimeSlot,
+  releaseExternalRuntimeReservation,
 } from "../services/external-runtime-reservations.js";
 
 const mockAdapterExecute = vi.hoisted(() => vi.fn());
@@ -397,5 +398,313 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(completedContender.status).toBe("succeeded");
     expect(reusedReservation.id).not.toBe(contenderReservation?.id);
     expect(reusedReservation.isolationKey).toBe(`agent-shared:${agentId}`);
+  }, 30_000);
+
+  // BLO-16269: `createNamespacedJob` happens inside the bundled k8s adapter
+  // (outside this repo) and can land in-cluster even after the reservation
+  // gating it has been reaped/released -- observed live as two same-agent
+  // runs finalized `process_lost` (`pre_adapter_job_unstamped`) right before
+  // Kubernetes created their Jobs, leaving one Job leaked because the later
+  // cleanup pass could not reconcile it against an already-released
+  // reservation ("refusing terminal Job cleanup ... reservationId:null").
+  it("compensates by deleting the exact Job when its reservation is reaped before the launched identity arrives", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const jobName = "agent-claude-race-lost";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "External Runtime Race Co",
+      issuePrefix: "ERX",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Claude K8s Race",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          enabled: true,
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      contextSnapshot: {},
+    });
+
+    let allowStampToProceed!: () => void;
+    const stampGate = new Promise<void>((resolve) => { allowStampToProceed = resolve; });
+    mockAdapterExecute.mockImplementation(async (ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> => {
+      await ctx.onMeta?.({ adapterType: "claude_k8s", command: `kubectl job/${jobName}` });
+      // createNamespacedJob has already succeeded in-cluster at this point;
+      // hold before reporting it back so the test can reap/release the
+      // reservation out from under the in-flight launch.
+      await stampGate;
+      await ctx.onExternalRuntimeLaunched?.({ jobName, jobUid: "race-lost-uid" });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "job launched after its reservation was reaped",
+        resultJson: { ok: true },
+        usage: { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const execution = heartbeat.__test_executeRunForTesting(runId);
+
+    let reservationBeforeReap: typeof externalRuntimeReservations.$inferSelect | undefined;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      reservationBeforeReap = await db
+        .select()
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.runId, runId))
+        .then((rows) => rows[0]);
+      if (reservationBeforeReap?.state === "launching" && reservationBeforeReap.expectedJobName === jobName) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(reservationBeforeReap).toMatchObject({
+      state: "launching",
+      expectedJobName: jobName,
+      jobName: null,
+      jobUid: null,
+    });
+
+    // Simulate the reap tick: mint process_lost on the run and release its
+    // reservation -- the exact "pre_adapter_job_unstamped" path from
+    // BLO-16269 -- while createNamespacedJob is still in flight for it.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "failed", errorCode: "process_lost", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+    await releaseExternalRuntimeReservation(db, { runId, reason: "process_lost" });
+
+    allowStampToProceed();
+    await execution;
+
+    expect(mockDeleteAgentJobExact).toHaveBeenCalledWith({
+      runId,
+      agentId,
+      name: jobName,
+      uid: "race-lost-uid",
+    });
+
+    const reservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, runId))
+      .then((rows) => rows[0]);
+    expect(reservation.state).toBe("released");
+    expect(reservation.jobName).toBeNull();
+    expect(reservation.jobUid).toBeNull();
+
+    const run = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(run).toMatchObject({ status: "failed", errorCode: "process_lost" });
+  }, 30_000);
+
+  it("does not touch a sibling run's live Job when only one run's create/stamp race is lost", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const losingRunId = randomUUID();
+    const siblingRunId = randomUUID();
+    const losingJobName = "agent-claude-race-lost-sibling";
+    const siblingJobName = "agent-claude-race-survivor-sibling";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "External Runtime Sibling Co",
+      issuePrefix: "ERS",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Claude K8s Sibling",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          enabled: true,
+          wakeOnDemand: true,
+          maxConcurrentRuns: 2,
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: losingRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        // Stateless PR-review runs get "run" isolation (independent per run
+        // id) instead of the default single-writer-per-agent "shared" mode --
+        // matching the production BLO-16269 repro of two run-isolated
+        // heartbeats for the same agent. prRole: "author" keeps this out of
+        // the reviewer-evidence gate (BLO-8215), which is irrelevant here.
+        contextSnapshot: {
+          wakeReason: "github_pr_review_requested",
+          reviewKind: "pr_review",
+          githubPrNumber: 501,
+          prRole: "author",
+        },
+      },
+      {
+        id: siblingRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: {
+          wakeReason: "github_pr_review_requested",
+          reviewKind: "pr_review",
+          githubPrNumber: 502,
+          prRole: "author",
+        },
+      },
+    ]);
+
+    let allowLosingStampToProceed!: () => void;
+    const losingStampGate = new Promise<void>((resolve) => { allowLosingStampToProceed = resolve; });
+    let allowSiblingStampToProceed!: () => void;
+    const siblingStampGate = new Promise<void>((resolve) => { allowSiblingStampToProceed = resolve; });
+
+    mockAdapterExecute.mockImplementation(async (ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> => {
+      const isLosingRun = ctx.runId === losingRunId;
+      const jobName = isLosingRun ? losingJobName : siblingJobName;
+      await ctx.onMeta?.({ adapterType: "claude_k8s", command: `kubectl job/${jobName}` });
+      await (isLosingRun ? losingStampGate : siblingStampGate);
+      await ctx.onExternalRuntimeLaunched?.({
+        jobName,
+        jobUid: isLosingRun ? "race-lost-uid-sibling" : "survivor-uid-sibling",
+      });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: isLosingRun ? "reaped run's job launched after the race" : "sibling job launched normally",
+        resultJson: { ok: true },
+        usage: { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const losingExecution = heartbeat.__test_executeRunForTesting(losingRunId);
+    const siblingExecution = heartbeat.__test_executeRunForTesting(siblingRunId);
+
+    let losingReservation: typeof externalRuntimeReservations.$inferSelect | undefined;
+    let siblingReservation: typeof externalRuntimeReservations.$inferSelect | undefined;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      [losingReservation, siblingReservation] = await Promise.all([
+        db.select().from(externalRuntimeReservations).where(eq(externalRuntimeReservations.runId, losingRunId)).then((rows) => rows[0]),
+        db.select().from(externalRuntimeReservations).where(eq(externalRuntimeReservations.runId, siblingRunId)).then((rows) => rows[0]),
+      ]);
+      if (
+        losingReservation?.state === "launching" && losingReservation.expectedJobName === losingJobName &&
+        siblingReservation?.state === "launching" && siblingReservation.expectedJobName === siblingJobName
+      ) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(losingReservation).toMatchObject({ state: "launching", expectedJobName: losingJobName });
+    expect(siblingReservation).toMatchObject({ state: "launching", expectedJobName: siblingJobName });
+    expect(losingReservation?.id).not.toBe(siblingReservation?.id);
+
+    // Only the losing run gets reaped and its reservation released; the
+    // sibling's reservation is left completely alone.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "failed", errorCode: "process_lost", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, losingRunId));
+    await releaseExternalRuntimeReservation(db, { runId: losingRunId, reason: "process_lost" });
+
+    allowLosingStampToProceed();
+    await losingExecution;
+
+    // The sibling's Job identity hasn't landed yet -- its reservation must
+    // still be intact and unreleased while the losing run's compensation runs.
+    const siblingReservationMidRace = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, siblingRunId))
+      .then((rows) => rows[0]);
+    expect(siblingReservationMidRace.releasedAt).toBeNull();
+    expect(siblingReservationMidRace.state).toBe("launching");
+
+    allowSiblingStampToProceed();
+    await siblingExecution;
+
+    expect(mockDeleteAgentJobExact).toHaveBeenCalledWith({
+      runId: losingRunId,
+      agentId,
+      name: losingJobName,
+      uid: "race-lost-uid-sibling",
+    });
+    expect(mockDeleteAgentJobExact).not.toHaveBeenCalledWith(expect.objectContaining({ runId: siblingRunId }));
+    expect(mockDeleteAgentJobExact).not.toHaveBeenCalledWith(expect.objectContaining({ name: siblingJobName }));
+    expect(mockDeleteAgentJobExact).not.toHaveBeenCalledWith(expect.objectContaining({ uid: "survivor-uid-sibling" }));
+
+    const losingReservationFinal = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, losingRunId))
+      .then((rows) => rows[0]);
+    expect(losingReservationFinal.state).toBe("released");
+    expect(losingReservationFinal.jobName).toBeNull();
+    expect(losingReservationFinal.jobUid).toBeNull();
+
+    const siblingReservationFinal = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, siblingRunId))
+      .then((rows) => rows[0]);
+    // The sibling completed on its own (unrelated to the losing run's race) and
+    // is progressing through its own normal launched -> release_pending -> released
+    // lifecycle; what matters here is that its Job identity was never disturbed
+    // and it was never released/deleted by the losing run's compensation.
+    expect(siblingReservationFinal).toMatchObject({
+      state: "release_pending",
+      jobName: siblingJobName,
+      jobUid: "survivor-uid-sibling",
+    });
+    expect(siblingReservationFinal.releasedAt).toBeNull();
+
+    const siblingRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, siblingRunId))
+      .then((rows) => rows[0]);
+    expect(siblingRun?.status).toBe("succeeded");
   }, 30_000);
 });

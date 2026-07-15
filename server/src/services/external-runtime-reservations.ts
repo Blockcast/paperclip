@@ -511,6 +511,20 @@ export async function recordExpectedExternalRuntimeJobName(
   return null;
 }
 
+/**
+ * Stamps the observed Job name/UID onto the run's active reservation. This is
+ * the "did we win or lose the create/stamp race" checkpoint: `createNamespacedJob`
+ * happens in an external adapter package (outside this repo) and can succeed
+ * even after the reservation gating it has been released -- reaped as
+ * `process_lost` (pre-adapter, unstamped) or reclaimed by a fresh dispatch of
+ * the same run id. A `null` return means EXACTLY that: no active
+ * (`releasedAt IS NULL`) reservation existed for this run when the stamp
+ * arrived. The caller MUST treat the reported Job as orphaned and delete it by
+ * its exact observed name/UID (+ run/agent-id labels) -- never by reservation
+ * state, which is by definition gone in this branch. Any other disagreement
+ * (missing expectedJobName, identity mismatch, wrong state) throws instead of
+ * returning null, since those indicate a real bug rather than a benign race.
+ */
 export async function recordExternalRuntimeJobIdentity(
   db: Db,
   input: {
