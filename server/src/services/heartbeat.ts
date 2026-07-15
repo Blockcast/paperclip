@@ -11452,7 +11452,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
             const reservation = await getActiveExternalRuntimeReservation(db, run.id);
             if (!reservation) throw new Error(`No active external-runtime reservation for run ${run.id}`);
-            await recordExternalRuntimeJobIdentity(db, {
+            const stamped = await recordExternalRuntimeJobIdentity(db, {
               runId: run.id,
               reservationId: reservation.id,
               slotId: reservation.slotId,
@@ -11460,6 +11460,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               jobUid,
               now,
             });
+            if (!stamped) {
+              // Lost the create/stamp race between the read above and the
+              // stamp: the reservation was released out from under this exact
+              // observed Job. Compensate immediately rather than letting the
+              // Job leak until a later terminal-cleanup pass, which can only
+              // reconcile through a reservation that no longer exists.
+              const compensated = await deleteAgentJobExact({
+                runId: run.id,
+                agentId: run.agentId,
+                name: jobName,
+                uid: jobUid,
+              });
+              logger.error(
+                { runId: run.id, agentId: run.agentId, jobName, jobUid, compensated },
+                "external-runtime reservation was gone when reconciling an observed launched Job; deleted the exact Job to prevent a post-terminal orphan",
+              );
+              ambiguousExternalRunIds.add(run.id);
+              jobRunStatuses.delete(run.id);
+            }
           } catch (error) {
             logger.error(
               { runId: run.id, jobName, jobUid: jobStatus?.uid ?? null, error },
@@ -14329,13 +14348,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 onMeta: onAdapterMeta,
                 onExternalRuntimeLaunched: executionReservation
                   ? async ({ jobName, jobUid }) => {
-                       await recordExternalRuntimeJobIdentity(db, {
+                       const stamped = await recordExternalRuntimeJobIdentity(db, {
                          runId: run.id,
                          reservationId: executionReservation.id,
                          slotId: executionReservation.slotId,
                          jobName,
                          jobUid,
                        });
+                       if (!stamped) {
+                         // The reservation was released (reaped process_lost, or
+                         // reclaimed) between the ownership check that gated this
+                         // launch and the adapter reporting the created Job back
+                         // here. The Job is real and already running in-cluster
+                         // with nothing pointing at it now -- compensate by
+                         // deleting it via its exact observed name+UID+labels so
+                         // it can never be mistaken for a sibling run's Job or
+                         // linger as an orphan `k8s_concurrent_run_blocked` cause.
+                         const compensated = await deleteAgentJobExact({
+                           runId: run.id,
+                           agentId: agent.id,
+                           name: jobName,
+                           uid: jobUid,
+                         });
+                         logger.error(
+                           { runId: run.id, agentId: agent.id, jobName, jobUid, compensated },
+                           "external-runtime reservation was gone when the launched Job identity arrived; deleted the exact Job to prevent a post-terminal orphan",
+                         );
+                       }
                      }
                   : undefined,
                 onSpawn: async (meta) => {
