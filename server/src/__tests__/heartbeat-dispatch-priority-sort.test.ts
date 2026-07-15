@@ -185,8 +185,11 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     // Insert two queued runs. The in_progress run is OLDER (createdAt) so it
     // would win the old sort's createdAt-ASC tie-break within its status rank.
     // With the new priority-first sort the todo/high run should still win.
-    const olderTime = new Date("2026-01-01T00:00:00Z");
-    const newerTime = new Date("2026-01-01T00:01:00Z");
+    // Both timestamps are recent (well under the BLO-16253 starvation-aging
+    // thresholds) so this test isolates priority ordering — see the
+    // dedicated BLO-16253 test below for the aging behavior itself.
+    const olderTime = new Date(Date.now() - 2 * 60 * 1000);
+    const newerTime = new Date(Date.now() - 60 * 1000);
 
     const inProgressWakeId = randomUUID();
     const inProgressRunId = randomUUID();
@@ -454,5 +457,165 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       .where(eq(heartbeatRuns.id, todoRunId))
       .then((rows) => rows[0] ?? null);
     expect(todoRun?.status).not.toBe("queued");
+  });
+
+  it("dispatches a long-starved low-priority todo run ahead of a fresh in_progress run (BLO-16253)", async () => {
+    // Regression for BLO-16253: dispatchRank had no time component, so a
+    // `todo` queued run could be starved forever behind a busy agent's
+    // constantly-refreshed `in_progress` follow-up dispatches, even at equal
+    // or lower priority — external-lifecycle agents dispatch exactly one
+    // winner per tick, so a perpetual loser never got a turn. Observed live
+    // on BLO-15871 (low priority, todo): its queued run sat unpromoted for
+    // 4+ hours because the same agent's in_progress issues kept winning the
+    // single dispatch slot every tick. Without the STARVATION_* aging term,
+    // the fresh low-priority in_progress run below (rank 6) would always
+    // beat the old low-priority todo run (rank 7), no matter how long it
+    // waited.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const starvedTodoIssueId = randomUUID();
+    const freshInProgressIssueId = randomUUID();
+    const issuePrefix = `V${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "StarvationTestCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "StarvationTestAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    await db.insert(issues).values([
+      // Starved issue: low priority, todo — same tier the aging term must rescue.
+      {
+        id: starvedTodoIssueId,
+        companyId,
+        title: "Long-starved low priority todo work",
+        status: "todo",
+        priority: "low",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      // Fresh issue: low priority, in_progress — wins on the un-aged formula
+      // (rank 6 vs rank 7) despite being queued far more recently.
+      {
+        id: freshInProgressIssueId,
+        companyId,
+        title: "Fresh low priority in-progress work",
+        status: "in_progress",
+        priority: "low",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+        startedAt: new Date(),
+      },
+    ]);
+
+    // Starved run's createdAt is well past STARVATION_FULL_ESCALATION_MS (2h).
+    const starvedCreatedAt = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    const freshCreatedAt = new Date();
+
+    const starvedWakeId = randomUUID();
+    const starvedRunId = randomUUID();
+    const freshWakeId = randomUUID();
+    const freshRunId = randomUUID();
+
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: starvedWakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: starvedTodoIssueId },
+        status: "queued",
+        runId: starvedRunId,
+        requestedAt: starvedCreatedAt,
+        updatedAt: starvedCreatedAt,
+      },
+      {
+        id: freshWakeId,
+        companyId,
+        agentId,
+        source: "heartbeat",
+        triggerDetail: "timer",
+        reason: "heartbeat_timer",
+        payload: { issueId: freshInProgressIssueId },
+        status: "queued",
+        runId: freshRunId,
+        requestedAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: starvedRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: starvedWakeId,
+        contextSnapshot: { issueId: starvedTodoIssueId, wakeReason: "issue_assigned" },
+        createdAt: starvedCreatedAt,
+        updatedAt: starvedCreatedAt,
+      },
+      {
+        id: freshRunId,
+        companyId,
+        agentId,
+        invocationSource: "heartbeat",
+        triggerDetail: "timer",
+        status: "queued",
+        wakeupRequestId: freshWakeId,
+        contextSnapshot: { issueId: freshInProgressIssueId, wakeReason: "heartbeat_timer" },
+        createdAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
+      },
+    ]);
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    // Dispatch: only 1 slot available (maxConcurrentRuns: 1, 0 running).
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, starvedRunId);
+
+    // REGRESSION GUARD: the long-starved todo run must win the single slot
+    // despite being lower-ranked than the fresh in_progress run under the
+    // un-aged formula.
+    expect(dispatchedRunIds[0]).toBe(starvedRunId);
+
+    const starvedRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, starvedRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(starvedRun?.status).not.toBe("queued");
   });
 });
