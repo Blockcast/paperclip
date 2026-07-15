@@ -79,6 +79,17 @@ describe("isClaudeTransientUpstreamError", () => {
     ).toBe(true);
   });
 
+  it("classifies Penstock capacity_retry_exhausted envelopes as transient", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          is_error: true,
+          result: '{"code":"capacity_retry_exhausted"}',
+        },
+      }),
+    ).toBe(true);
+  });
+
   it("classifies the subscription 5-hour / weekly limit wording", () => {
     expect(
       isClaudeTransientUpstreamError({
@@ -415,6 +426,30 @@ describe("extractClaudeRetryNotBefore", () => {
       now,
     );
     expect(extracted?.toISOString()).toBe("2026-04-23T03:15:00.000Z");
+  });
+
+  it("extracts Penstock resume_at from an embedded Claude API error", () => {
+    const extracted = extractClaudeRetryNotBefore({
+      parsed: {
+        is_error: true,
+        result:
+          'API Error: Request rejected (429) · {"error":"BYOS provider capacity for \'anthropic\' is temporarily unavailable; capacity may reset at 2026-07-15T01:59:59.883Z; retry in 1448s","code":"capacity_retry_exhausted","resume_at":"2026-07-15T01:59:59.883Z"}',
+      },
+    });
+
+    expect(extracted?.toISOString()).toBe("2026-07-15T01:59:59.883Z");
+  });
+
+  it("uses a relative retry-in hint when no absolute recovery time is present", () => {
+    const now = new Date("2026-07-15T01:35:51.883Z");
+    const extracted = extractClaudeRetryNotBefore(
+      {
+        errorMessage: "capacity_retry_exhausted: retry in 1448s",
+      },
+      now,
+    );
+
+    expect(extracted?.toISOString()).toBe("2026-07-15T01:59:59.883Z");
   });
 
   it("returns null when no reset hint is present", () => {
