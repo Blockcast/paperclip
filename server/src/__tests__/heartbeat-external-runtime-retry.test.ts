@@ -24,6 +24,11 @@ import {
 } from "../services/external-runtime-reservations.js";
 
 const mockAdapterExecute = vi.hoisted(() => vi.fn());
+const mockListAgentJobRunStatuses = vi.hoisted(() => vi.fn(async () => null));
+const mockListLiveAgentJobRunIds = vi.hoisted(() => vi.fn(async () => null));
+const mockReadAgentJobRunStatusByName = vi.hoisted(() => vi.fn(async () => null));
+const mockDeleteAgentJobsForRun = vi.hoisted(() => vi.fn(async () => 1));
+const mockHasActiveJobForAgent = vi.hoisted(() => vi.fn(async () => false));
 
 vi.mock("../telemetry.ts", () => ({
   getTelemetryClient: () => ({ track: vi.fn() }),
@@ -35,6 +40,14 @@ vi.mock("@paperclipai/shared/telemetry", async () => {
   );
   return { ...actual, trackAgentFirstHeartbeat: vi.fn() };
 });
+
+vi.mock("../services/k8s-job-liveness.ts", () => ({
+  listAgentJobRunStatuses: mockListAgentJobRunStatuses,
+  listLiveAgentJobRunIds: mockListLiveAgentJobRunIds,
+  readAgentJobRunStatusByName: mockReadAgentJobRunStatusByName,
+  deleteAgentJobsForRun: mockDeleteAgentJobsForRun,
+  hasActiveJobForAgent: mockHasActiveJobForAgent,
+}));
 
 vi.mock("../adapters/index.ts", async () => {
   const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
@@ -75,6 +88,11 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
 
   afterEach(async () => {
     mockAdapterExecute.mockReset();
+    mockListAgentJobRunStatuses.mockReset().mockResolvedValue(null);
+    mockListLiveAgentJobRunIds.mockReset().mockResolvedValue(null);
+    mockReadAgentJobRunStatusByName.mockReset().mockResolvedValue(null);
+    mockDeleteAgentJobsForRun.mockReset().mockResolvedValue(1);
+    mockHasActiveJobForAgent.mockReset().mockResolvedValue(false);
     await cleanupHeartbeatTestState(db, heartbeat);
   }, 30_000);
 
@@ -139,7 +157,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
           timedOut: false,
           errorMessage: null,
           summary: "provider throttled before progress",
-          resultJson: { api_error_status: 429, retry_after_seconds: 0 },
+          resultJson: { api_error_status: 429, retry_after_seconds: 2 },
           usage: { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 },
           provider: "test",
           model: "test-model",
@@ -159,7 +177,64 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       };
     });
 
-    await heartbeat.__test_executeRunForTesting(runId);
+    const execution = heartbeat.__test_executeRunForTesting(runId);
+    let retryReservation: typeof externalRuntimeReservations.$inferSelect | undefined;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      retryReservation = await db
+        .select()
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.runId, runId))
+        .then((rows) => rows[0]);
+      if (
+        mockAdapterExecute.mock.calls.length === 1 &&
+        retryReservation?.state === "launching" &&
+        retryReservation.expectedJobName === null &&
+        retryReservation.jobName === null &&
+        retryReservation.jobUid === null
+      ) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(retryReservation).toMatchObject({
+      state: "launching",
+      expectedJobName: null,
+      jobName: null,
+      jobUid: null,
+    });
+
+    // Simulate the periodic watcher holding a stale snapshot of the failed
+    // first Job while executeRun is intentionally waiting to launch attempt 2.
+    mockListAgentJobRunStatuses.mockResolvedValue(new Map([
+      [runId, {
+        phase: "failed" as const,
+        reason: "BackoffLimitExceeded",
+        message: "Job has reached the specified backoff limit",
+        name: jobName,
+        uid: "job-uid-1",
+      }],
+    ]));
+    const reaped = await heartbeat.reapOrphanedRuns();
+    const runDuringRetry = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    const reservationDuringRetry = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, runId))
+      .then((rows) => rows[0]);
+    expect(reaped).not.toContain(runId);
+    expect(runDuringRetry?.status).toBe("running");
+    expect(reservationDuringRetry).toMatchObject({
+      state: "launching",
+      expectedJobName: null,
+      jobName: null,
+      jobUid: null,
+    });
+
+    await execution;
 
     const run = await db
       .select({ status: heartbeatRuns.status, error: heartbeatRuns.error })

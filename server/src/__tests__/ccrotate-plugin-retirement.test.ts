@@ -36,4 +36,13 @@ describe("ccrotate plugin retirement", () => {
       app.indexOf(".then(() => loader.loadAll())"),
     );
   });
+
+  it("removes only the fingerprinted read-only ccrotate PVC wrapper", () => {
+    const statefulSet = readRepoFile("deploy/helm/paperclip/templates/statefulset.yaml");
+
+    expect(statefulSet).toContain('LEGACY_CCROTATE_WRAPPER="${BASE}/bin/ccrotate"');
+    expect(statefulSet).toContain("unsupported read-only devbox ccrotate command");
+    expect(statefulSet).toContain('rm -f "${LEGACY_CCROTATE_WRAPPER}"');
+    expect(statefulSet).toContain("not delete an operator-installed full ccrotate CLI");
+  });
 });

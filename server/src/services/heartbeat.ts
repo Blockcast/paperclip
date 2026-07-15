@@ -11085,6 +11085,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // when the API is unavailable (local dev, RBAC missing, transient failure).
     const hasExternalCandidates = activeRuns.some((row) => hasExternalLifecycle(row.adapterType));
     const jobRunStatuses = await listAgentJobRunStatuses();
+    const activeReservations = activeRuns.length > 0
+      ? await db
+        .select()
+        .from(externalRuntimeReservations)
+        .where(and(
+          inArray(externalRuntimeReservations.runId, activeRuns.map(({ run }) => run.id)),
+          isNull(externalRuntimeReservations.releasedAt),
+        ))
+      : [];
+    const replacementPendingRunIds = new Set(
+      activeReservations
+        .filter((reservation) => {
+          const updatedAt = new Date(reservation.updatedAt).getTime();
+          return (
+            reservation.state === "launching" &&
+            reservation.jobName === null &&
+            reservation.jobUid === null &&
+            reservation.launchedAt === null &&
+            Number.isFinite(updatedAt) &&
+            now.getTime() - updatedAt < EXTERNAL_LIFECYCLE_STALE_MS
+          );
+        })
+        .map((reservation) => reservation.runId),
+    );
 
     // BLO-16184: emit the process_lost run-volume DENOMINATOR every reap cycle so
     // a "0 process_lost" reading can never be silently trusted at low run volume.
@@ -11109,7 +11133,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       for (const { run } of activeRuns) {
         const jobStatus = jobRunStatuses.get(run.id);
         const jobName = jobStatus?.name ?? null;
-        if (jobName) {
+        // A recently re-armed reservation means an owner consumed and deleted
+        // a terminal attempt before preparing the same run id's replacement.
+        // Do not let a stale namespace snapshot bind that old Job back onto the
+        // reservation. Live Jobs and stale ownerless recovery remain unchanged.
+        const terminalAttemptStillOwned =
+          jobStatus?.phase !== "active" && replacementPendingRunIds.has(run.id);
+        if (jobName && !terminalAttemptStillOwned) {
           let identityAccepted = true;
           try {
             await recordExternalRuntimeJobIdentity(db, {
@@ -11271,6 +11301,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
 
           if (jobStatus && jobStatus.phase !== "active") {
+            // A terminal Job is usually authoritative, but the owning adapter
+            // still needs a short window to parse final output, classify a
+            // provider throttle, and launch an in-run replacement. The Ally
+            // canaries exposed the reaper finalizing BackoffLimitExceeded while
+            // executeRun was deliberately sleeping between those attempts.
+            // The cleared reservation identity is durable proof that the owner
+            // consumed this terminal attempt and is preparing its replacement.
+            // Normal terminal Jobs remain immediately authoritative.
+            if (replacementPendingRunIds.has(run.id)) {
+              logger.debug(
+                { runId: run.id, jobName: jobStatus.name ?? persistedJobName, jobPhase: jobStatus.phase },
+                "reapOrphanedRuns: deferring terminal external Job to active adapter owner",
+              );
+              continue;
+            }
             const finalized = await finalizeExternalLifecycleTerminalRun({
               run,
               adapterType,
@@ -13931,6 +13976,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               }
               ccrotateRetryAttempt += 1;
               const retryDelayMs = k8sCcrotateRetryDelayMs(adapterResult);
+              if (externalRuntimeReservation) {
+                // The completed Job belongs to the attempt that just returned.
+                // Clear its durable identity before yielding to event writes or
+                // the retry sleep so the lifecycle reaper cannot mistake that
+                // terminal Job for the state of the upcoming replacement.
+                const rearmedReservation = await rearmExternalRuntimeReservationForRetry(db, {
+                  runId: run.id,
+                  reservationId: externalRuntimeReservation.id,
+                });
+                if (!rearmedReservation) {
+                  throw new Error(`External runtime reservation no longer owns retry launch for run ${run.id}`);
+                }
+              }
               const retryPayload = {
                 attempt: ccrotateRetryAttempt,
                 maxAttempts: K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS,
@@ -13950,15 +14008,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 `[paperclip] Retryable ccrotate throttle before model progress; retrying in ${Math.ceil(retryDelayMs / 1000)}s (${ccrotateRetryAttempt}/${K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS}).\n`,
               );
               await sleepMs(retryDelayMs);
-              if (externalRuntimeReservation) {
-                const rearmedReservation = await rearmExternalRuntimeReservationForRetry(db, {
-                  runId: run.id,
-                  reservationId: externalRuntimeReservation.id,
-                });
-                if (!rearmedReservation) {
-                  throw new Error(`External runtime reservation no longer owns retry launch for run ${run.id}`);
-                }
-              }
             }
             // Adapter returned cleanly, which means its workspace-restore finally
             // block also ran without throwing. Record the workspace_finalize

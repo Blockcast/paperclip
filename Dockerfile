@@ -201,7 +201,10 @@ WORKDIR /vendor
 # before their `else`/`fi` control keywords. PR
 # kkroo/paperclip-adapter-claude-k8s#21; generated command parse-check,
 # typecheck, 422/422 tests, and build pass.
-ARG CLAUDE_K8S_REF=6b96224be921c7244202215693515d942520ddd5
+# Bumped 2026-07-15 to d44eb4e: preserve Penstock's structured `resume_at`
+# capacity hint as adapter `retryNotBefore`, avoiding blind 90-second retries.
+# PR kkroo/paperclip-adapter-claude-k8s#22; typecheck and 425/425 tests pass.
+ARG CLAUDE_K8S_REF=d44eb4e2acfeb3c5f0adafccdc36bd06da3f8060
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
