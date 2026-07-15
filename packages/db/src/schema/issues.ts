@@ -219,5 +219,18 @@ export const issues = pgTable(
           and ${table.hiddenAt} is null
           and ${table.status} not in ('done', 'cancelled')`,
       ),
+    // BLO-16319: one open issue per Dependabot alert. originId is the stable
+    // `github-dependabot:<repoFullName>#<alertNumber>` key (the same key the
+    // webhook route already uses for the wake idempotency key), so a
+    // `reintroduced`/`reopened` redelivery for an alert with an already-open
+    // issue reuses it instead of spawning a duplicate remediation run.
+    activeDependabotAlertIdx: uniqueIndex("issues_active_dependabot_alert_uq")
+      .on(table.companyId, table.originKind, table.originId)
+      .where(
+        sql`${table.originKind} = 'github_dependabot_alert'
+          and ${table.originId} is not null
+          and ${table.hiddenAt} is null
+          and ${table.status} not in ('done', 'cancelled')`,
+      ),
   }),
 );

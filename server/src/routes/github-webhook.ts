@@ -27,9 +27,10 @@
  */
 import { Router } from "express";
 import crypto from "node:crypto";
-import { type Db, agentWakeupRequests, companies, issueComments, issues } from "@paperclipai/db";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { type Db, agents, agentWakeupRequests, companies, issueComments, issues } from "@paperclipai/db";
+import { and, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
+import { issueService } from "../services/issues.js";
 import { logger } from "../middleware/logger.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { extractPaperclipIdentifiers } from "../services/paperclip-identifiers.js";
@@ -684,14 +685,23 @@ type DependabotAlertContext = {
   alertUrl: string | null;
 };
 
+// created: brand-new advisory match; reintroduced: a previously-fixed alert
+// came back (regression); reopened: a human reversed a dismissal. The
+// terminal actions (fixed / dismissed / auto_dismissed) need no work. Exported
+// as a standalone predicate (rather than folded into resolveDependabotAlertContext)
+// so the webhook route can tell "not actionable" (silently ignore) apart from
+// "actionable but the payload didn't parse" (durable diagnostic, BLO-16319).
+function isActionableDependabotAlertAction(
+  action: string | undefined,
+): action is "created" | "reintroduced" | "reopened" {
+  return action === "created" || action === "reintroduced" || action === "reopened";
+}
+
 function resolveDependabotAlertContext(
   payload: Record<string, unknown>,
 ): DependabotAlertContext | null {
   const action = payload.action as string | undefined;
-  // created: brand-new advisory match; reintroduced: a previously-fixed alert
-  // came back (regression); reopened: a human reversed a dismissal. The
-  // terminal actions (fixed / dismissed / auto_dismissed) need no work.
-  if (action !== "created" && action !== "reintroduced" && action !== "reopened") return null;
+  if (!isActionableDependabotAlertAction(action)) return null;
   const alert = payload.alert as Record<string, unknown> | undefined;
   if (!alert || typeof alert.number !== "number") return null;
   const advisory = alert.security_advisory as Record<string, unknown> | undefined;
@@ -719,6 +729,219 @@ function resolveDependabotAlertContext(
     patchedVersion: (firstPatched?.identifier as string | undefined) ?? null,
     alertUrl: (alert.html_url as string | undefined) ?? null,
   };
+}
+
+// BLO-16319: the dependabot wake used to fire with rich alert data buried in
+// contextSnapshot fields that nothing ever rendered into the agent's prompt —
+// no Paperclip issue meant no PAPERCLIP_TASK_ID, no `getIssueExecutionContext`
+// lookup, and no task markdown, so the agent woke with an empty task and fell
+// back to whatever workspace its last session happened to leave behind. Every
+// actionable alert now gets (or reuses) a real, assigned Paperclip issue whose
+// title/description carry every field GitHub gave us, and the wake sets
+// contextSnapshot.issueId so the existing issue-wake plumbing takes over.
+const GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND = "github_dependabot_alert";
+const GITHUB_DEPENDABOT_WEBHOOK_DIAGNOSTIC_ORIGIN_KIND = "github_dependabot_webhook_diagnostic";
+
+const DEPENDABOT_SEVERITY_TO_ISSUE_PRIORITY: Record<string, "critical" | "high" | "medium" | "low"> = {
+  critical: "critical",
+  high: "high",
+  medium: "medium",
+  low: "low",
+};
+
+async function getAgentCompanyId(db: Db, agentId: string): Promise<string | null> {
+  return db
+    .select({ companyId: agents.companyId })
+    .from(agents)
+    .where(eq(agents.id, agentId))
+    .then((rows) => rows[0]?.companyId ?? null);
+}
+
+function buildDependabotAlertIssueBody(input: {
+  repoFullName: string;
+  alert: DependabotAlertContext;
+}): string {
+  const { repoFullName, alert } = input;
+  const advisory = [alert.ghsaId, alert.cveId].filter(Boolean).join(" / ") || "unknown";
+  const alertUrl = alert.alertUrl ?? `https://github.com/${repoFullName}/security/dependabot/${alert.alertNumber}`;
+  return [
+    `A Dependabot security alert (\`${alert.action}\`) fired on \`${repoFullName}\`.`,
+    "",
+    "## Alert",
+    `- Repository: \`${repoFullName}\``,
+    `- Alert number: #${alert.alertNumber}`,
+    `- Alert URL: ${alertUrl}`,
+    `- Severity: ${alert.severity}`,
+    `- Package: ${alert.packageName ?? "unknown"}${alert.ecosystem ? ` (${alert.ecosystem})` : ""}`,
+    `- Manifest path: ${alert.manifestPath ?? "unknown"}`,
+    `- Advisory: ${advisory}`,
+    `- Vulnerable range: ${alert.vulnerableRange ?? "unknown"}`,
+    `- Patched version: ${alert.patchedVersion ?? "unknown"}`,
+    ...(alert.summary ? ["", alert.summary] : []),
+    "",
+    "## Acceptance criteria",
+    `- The vulnerable ${alert.packageName ?? "dependency"} in \`${repoFullName}\` is bumped to ${alert.patchedVersion ?? "a patched version"} (or the alert is explicitly dismissed with a documented reason), landed via a merged PR.`,
+    "- The Dependabot alert's state on GitHub moves to `fixed` or `dismissed`.",
+    "",
+    "## Verifying signal",
+    `- ${alertUrl} shows \`state: fixed\` or \`state: dismissed\`, or the remediation PR merges into the default branch.`,
+    "",
+    "All fields above come directly from the GitHub webhook payload for this delivery — do NOT call the GitHub Dependabot Alerts REST API to re-derive them. Some repositories return `403 Dependabot alerts are disabled for this repository` on that endpoint even though the webhook still fires; treat that 403 as expected and work from this issue instead of chasing the API.",
+  ].join("\n");
+}
+
+function isUniqueDependabotAlertConflict(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as {
+    code?: string;
+    constraint?: string;
+    constraint_name?: string;
+    message?: string;
+    cause?: unknown;
+  };
+  const direct =
+    typeof candidate.code === "string" ||
+    typeof candidate.constraint === "string" ||
+    typeof candidate.constraint_name === "string"
+      ? candidate
+      : candidate.cause && typeof candidate.cause === "object"
+        ? (candidate.cause as typeof candidate)
+        : null;
+  if (!direct) return false;
+  return (
+    direct.code === "23505" &&
+    (direct.constraint === "issues_active_dependabot_alert_uq" ||
+      direct.constraint_name === "issues_active_dependabot_alert_uq" ||
+      (typeof direct.message === "string" && direct.message.includes("issues_active_dependabot_alert_uq")))
+  );
+}
+
+async function findOpenDependabotAlertIssue(db: Db, companyId: string, originId: string) {
+  return db
+    .select()
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, companyId),
+        eq(issues.originKind, GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND),
+        eq(issues.originId, originId),
+        isNull(issues.hiddenAt),
+        notInArray(issues.status, ["done", "cancelled"]),
+      ),
+    )
+    .orderBy(desc(issues.createdAt))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+}
+
+// Finds the open issue for this alert (originId is the stable
+// `github-dependabot:<repo>#<alertNumber>` key), or creates one. A
+// `reintroduced`/`reopened` redelivery for an alert that already has an open
+// issue reuses it rather than spawning a duplicate remediation run — the
+// Release Engineer sees one issue per alert to comment on and dedupe against,
+// per BLO-16319's verifying signal.
+async function resolveDependabotAlertIssue(
+  db: Db,
+  input: {
+    companyId: string;
+    assigneeAgentId: string;
+    originId: string;
+    repoFullName: string;
+    alert: DependabotAlertContext;
+  },
+): Promise<{ id: string; identifier: string | null; reused: boolean }> {
+  const existing = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
+  if (existing) return { id: existing.id, identifier: existing.identifier, reused: true };
+
+  const priority = DEPENDABOT_SEVERITY_TO_ISSUE_PRIORITY[input.alert.severity] ?? "medium";
+  const title = `Dependabot ${input.alert.severity} alert: ${input.alert.packageName ?? "unknown package"} in ${input.repoFullName}#${input.alert.alertNumber}`;
+  const description = buildDependabotAlertIssueBody({ repoFullName: input.repoFullName, alert: input.alert });
+
+  try {
+    const created = await issueService(db).create(input.companyId, {
+      title,
+      description,
+      status: "todo",
+      priority,
+      assigneeAgentId: input.assigneeAgentId,
+      originKind: GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND,
+      originId: input.originId,
+      originFingerprint: input.originId,
+    });
+    return { id: created.id, identifier: created.identifier, reused: false };
+  } catch (error) {
+    if (!isUniqueDependabotAlertConflict(error)) throw error;
+    const raced = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
+    if (raced) return { id: raced.id, identifier: raced.identifier, reused: true };
+    throw error;
+  }
+}
+
+// Records a durable diagnostic when a `dependabot_alert` delivery can't be
+// resolved into a scoped alert (malformed/missing `alert` fields, or no
+// `repository.full_name`) for an otherwise-actionable action. Without this the
+// event was silently dropped -- exactly the "fails invisibly" failure mode
+// BLO-16319 called out. Best-effort: a raced concurrent insert just logs
+// rather than fighting over a second uniqueness index for a path this rare.
+async function recordDependabotWebhookDiagnostic(
+  db: Db,
+  input: {
+    companyId: string;
+    assigneeAgentId: string;
+    event: string;
+    deliveryId: string | null;
+    action: string | undefined;
+    repoFullName: string | null;
+    reason: string;
+    alertNumber?: number | null;
+  },
+): Promise<void> {
+  const originId = `${input.event}:${input.deliveryId ?? "no-delivery"}`;
+  const existing = await db
+    .select({ id: issues.id })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, input.companyId),
+        eq(issues.originKind, GITHUB_DEPENDABOT_WEBHOOK_DIAGNOSTIC_ORIGIN_KIND),
+        eq(issues.originId, originId),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (existing) return;
+
+  const title = `Dependabot webhook payload could not be scoped (${input.repoFullName ?? "unknown repo"})`;
+  const description = [
+    `A \`dependabot_alert\` webhook delivery could not be resolved into a scoped alert. ${input.reason}`,
+    "",
+    "## What's known",
+    `- Event: \`${input.event}\``,
+    `- Delivery id: \`${input.deliveryId ?? "unknown"}\``,
+    `- Action: \`${input.action ?? "unknown"}\``,
+    `- Repository: \`${input.repoFullName ?? "unknown"}\``,
+    ...(input.alertNumber != null ? [`- Alert number: #${input.alertNumber}`] : []),
+    "",
+    "This is a webhook-processing gap, not a specific vulnerability to remediate. If it recurs, the Dependabot webhook payload shape likely changed upstream -- escalate to the CTO.",
+  ].join("\n");
+
+  try {
+    await issueService(db).create(input.companyId, {
+      title,
+      description,
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: input.assigneeAgentId,
+      originKind: GITHUB_DEPENDABOT_WEBHOOK_DIAGNOSTIC_ORIGIN_KIND,
+      originId,
+      originFingerprint: originId,
+    });
+  } catch (error) {
+    logger.error(
+      { err: error, deliveryId: input.deliveryId },
+      "github webhook dependabot diagnostic issue insert failed",
+    );
+  }
 }
 
 // BLO-15799: self-echo guard for the reviewer wake. The reviewer posts its
@@ -1248,17 +1471,64 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     // dedicated agent and fires independently of paperclip identifiers (a
     // security advisory never references one). One wake per alert: `created`
     // is keyed on the alert alone, while `reintroduced`/`reopened` are scoped
-    // to the delivery so a recurring regression can wake the agent again.
+    // to the delivery so a recurring regression can wake the agent again. The
+    // wake always creates or reuses a scoped Paperclip issue first (BLO-16319)
+    // so the run has a real PAPERCLIP_TASK_ID instead of an empty task.
     const dependabotWakeFired = await (async () => {
       if (eventName !== "dependabot_alert" || !config.dependabotAgentId) return false;
+      const action = payload.action as string | undefined;
+      if (!isActionableDependabotAlertAction(action)) return false;
+
+      const repository = payload.repository as Record<string, unknown> | undefined;
+      const alertRepoFullName = (repository?.full_name as string | undefined) ?? null;
+
       const alert = resolveDependabotAlertContext(payload);
-      if (!alert) return false;
+      if (!alert) {
+        logger.error(
+          { event: eventName, deliveryId, action, repoFullName: alertRepoFullName },
+          "github webhook dependabot_alert payload missing/malformed alert fields",
+        );
+        const companyId = await getAgentCompanyId(db, config.dependabotAgentId);
+        if (companyId) {
+          await recordDependabotWebhookDiagnostic(db, {
+            companyId,
+            assigneeAgentId: config.dependabotAgentId,
+            event: eventName,
+            deliveryId,
+            action,
+            repoFullName: alertRepoFullName,
+            reason: "The `alert` object was missing or its `number` field wasn't numeric.",
+          });
+        }
+        return false;
+      }
+
       const floor =
         DEPENDABOT_SEVERITY_RANK[config.dependabotMinSeverity ?? "high"] ?? DEPENDABOT_SEVERITY_RANK.high;
       if ((DEPENDABOT_SEVERITY_RANK[alert.severity] ?? -1) < floor) return false;
-      const repository = payload.repository as Record<string, unknown> | undefined;
-      const alertRepoFullName = (repository?.full_name as string | undefined) ?? null;
-      const taskKey = `github-dependabot:${alertRepoFullName ?? "unknown"}#${alert.alertNumber}`;
+
+      if (!alertRepoFullName) {
+        logger.error(
+          { event: eventName, deliveryId, action, alertNumber: alert.alertNumber },
+          "github webhook dependabot_alert payload missing repository.full_name",
+        );
+        const companyId = await getAgentCompanyId(db, config.dependabotAgentId);
+        if (companyId) {
+          await recordDependabotWebhookDiagnostic(db, {
+            companyId,
+            assigneeAgentId: config.dependabotAgentId,
+            event: eventName,
+            deliveryId,
+            action,
+            repoFullName: null,
+            alertNumber: alert.alertNumber,
+            reason: "The payload had no `repository.full_name`, so the alert can't be scoped to a repo.",
+          });
+        }
+        return false;
+      }
+
+      const taskKey = `github-dependabot:${alertRepoFullName}#${alert.alertNumber}`;
       const idempotencyKey =
         alert.action === "created"
           ? `${taskKey}:created`
@@ -1290,6 +1560,23 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           .then((rows) => rows[0] ?? null);
         if (existingWake) return false;
 
+        const companyId = await getAgentCompanyId(db, config.dependabotAgentId);
+        if (!companyId) {
+          logger.error(
+            { agentId: config.dependabotAgentId, event: eventName, alertNumber: alert.alertNumber, repoFullName: alertRepoFullName },
+            "github webhook dependabot wake failed: remediation agent has no company",
+          );
+          return false;
+        }
+
+        const issue = await resolveDependabotAlertIssue(db, {
+          companyId,
+          assigneeAgentId: config.dependabotAgentId,
+          originId: taskKey,
+          repoFullName: alertRepoFullName,
+          alert,
+        });
+
         const heartbeat = heartbeatService(db, {
           pluginWorkerManager: config.pluginWorkerManager,
           ...config.heartbeatOptions,
@@ -1305,9 +1592,11 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             deliveryId,
             repoFullName: alertRepoFullName,
             dependabotAlert: alert,
+            issueId: issue.id,
           },
           contextSnapshot: {
             taskKey,
+            issueId: issue.id,
             wakeReason: "github_dependabot_alert",
             wakeSource: "automation",
             wakeTriggerDetail: "system",
