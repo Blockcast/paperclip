@@ -32,13 +32,20 @@ spec:
             summary: "Paperclip agent Kubernetes Jobs are hitting BackoffLimitExceeded"
             description: "One or more ac-* Paperclip agent Jobs in namespace {{`{{ $labels.namespace }}`}} are failing with BackoffLimitExceeded, or this cluster's kube-state-metrics omits Job failure reason labels and an ac-* Job failed. Check the matching Job/Pod logs and the zero-token streak alert for poisoned-session loops."
         - alert: PaperclipAgentPodUnschedulable
-          expr: count(kube_pod_status_unschedulable{pod=~{{ .Values.prometheusRule.agentJobNameRegex | quote }}} == 1) > {{ .Values.prometheusRule.unschedulablePodThreshold }}
+          # BLO-16224: keys on kube_pod_status_scheduled{condition="false"} (PodScheduled=False
+          # -- the scheduler has not placed the pod) rather than kube_pod_status_unschedulable,
+          # which many kube-state-metrics builds/allowlists do NOT expose (confirmed absent on
+          # the Blockcast cluster's KSM, 2026-07-15). scheduled{condition="false"} is a core,
+          # always-emitted KSM series; with the `for` window it captures sustained node-pool
+          # starvation while ignoring pods still mid-scheduling. Post-scheduling waits
+          # (image pull, PVC bind) keep PodScheduled=True, so they do not false-fire this.
+          expr: count(kube_pod_status_scheduled{condition="false",pod=~{{ .Values.prometheusRule.agentJobNameRegex | quote }}} == 1) > {{ .Values.prometheusRule.unschedulablePodThreshold }}
           for: {{ .Values.prometheusRule.unschedulableFor }}
           labels:
             severity: warning
           annotations:
             summary: "Paperclip agent pods stuck Unschedulable (node-pool scheduling starvation)"
-            description: "More than {{ .Values.prometheusRule.unschedulablePodThreshold }} ac-* agent pod(s) have been Unschedulable for {{ .Values.prometheusRule.unschedulableFor }} (BLO-16224). Agent-Job pods request 1 CPU each and affinity-pin to the shared arc-runner-host pool, which bin-packs on requests, so sustained Unschedulable means the pool is requests-saturated (not usage-saturated). Remediate by adding pool capacity or right-sizing the agent-Job CPU request (observed usage runs well under the 1-core request). Transient blips self-resolve; this fires only on sustained starvation. Requires kube-state-metrics."
+            description: "More than {{ .Values.prometheusRule.unschedulablePodThreshold }} ac-* agent pod(s) have had PodScheduled=false (unschedulable) for {{ .Values.prometheusRule.unschedulableFor }} (BLO-16224). Agent-Job pods request 1 CPU each and affinity-pin to the shared arc-runner-host pool, which bin-packs on requests, so sustained unschedulable means the pool is requests-saturated (not usage-saturated). Remediate by adding pool capacity or right-sizing the agent-Job CPU request (observed usage runs well under the 1-core request). Transient blips self-resolve; this fires only on sustained starvation. Requires kube-state-metrics (kube_pod_status_scheduled)."
     - name: paperclip-process-lost
       rules:
         - alert: PaperclipProcessLostElevated

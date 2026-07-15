@@ -62,3 +62,40 @@ test("prometheusRule.enabled=true still renders the PrometheusRule (flag remains
   assert.match(rendered, /kind: PrometheusRule/);
   assert.match(rendered, /name: paperclip-runtime-alerts/);
 });
+
+test("PaperclipAgentPodUnschedulable keys on kube_pod_status_scheduled, not the non-portable kube_pod_status_unschedulable (BLO-16224)", () => {
+  // kube_pod_status_unschedulable is not exposed by many kube-state-metrics
+  // builds/allowlists (confirmed absent on the Blockcast cluster's KSM), so the
+  // original expr was permanently no-data there. kube_pod_status_scheduled
+  // {condition="false"} is a core, always-emitted KSM series. Pin the portable
+  // metric so a future edit can't silently regress the alert to no-data.
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.match(rendered, /alert: PaperclipAgentPodUnschedulable/);
+  assert.match(
+    rendered,
+    /expr: count\(kube_pod_status_scheduled\{condition="false"/,
+    "PodUnschedulable alert must key on kube_pod_status_scheduled{condition=false}",
+  );
+  assert.doesNotMatch(
+    rendered,
+    /kube_pod_status_unschedulable/,
+    "kube_pod_status_unschedulable is not portable across kube-state-metrics builds; do not reintroduce it",
+  );
+});
