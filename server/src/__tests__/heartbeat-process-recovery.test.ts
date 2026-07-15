@@ -1252,38 +1252,144 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await waitForRunToSettle(heartbeat, runId);
   });
 
-  it("refuses restart reattachment when two Jobs claim the same run", async () => {
+  it("retries restart reattachment after Kubernetes inventory recovers", async () => {
     const { companyId, agentId, runId } = await seedRunFixture({
       adapterType: "opencode_k8s",
       includeIssue: false,
     });
     const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
-    mockListManagedAgentJobs.mockResolvedValueOnce([
-      {
-        phase: "active",
-        reason: null,
-        message: null,
-        runId,
-        agentId,
-        name: reservation.jobName!,
-        uid: reservation.jobUid!,
-        createdAt: new Date(),
-      },
-      {
-        phase: "active",
-        reason: null,
-        message: null,
-        runId,
-        agentId,
-        name: `${reservation.jobName}-duplicate`,
-        uid: `${reservation.jobUid}-duplicate`,
-        createdAt: new Date(),
-      },
-    ]);
+    const owner = {
+      phase: "active" as const,
+      reason: null,
+      message: null,
+      runId,
+      agentId,
+      name: reservation.jobName!,
+      uid: reservation.jobUid!,
+      createdAt: new Date(),
+    };
+    mockListManagedAgentJobs
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce([owner]);
+    let finishExecution!: () => void;
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { finishExecution = resolve; });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Reattached after Kubernetes recovered.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
 
     expect(await heartbeat.resumeRunningExternalRuntimeRuns()).toBe(0);
-    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    expect(await heartbeat.resumeRunningExternalRuntimeRuns()).toBe(1);
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    finishExecution();
+    await waitForRunToSettle(heartbeat, runId);
+  });
+
+  it("protects a hard-stale active Job when startup reattachment precedes reap", async () => {
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      includeIssue: false,
+      lastOutputAt: new Date(Date.now() - 60 * 60 * 1000),
+    });
+    const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+    const owner = {
+      phase: "active",
+      reason: null,
+      message: null,
+      runId,
+      agentId,
+      name: reservation.jobName!,
+      uid: reservation.jobUid!,
+      createdAt: new Date(Date.now() - 60 * 60 * 1000),
+    } as const;
+    mockListManagedAgentJobs
+      .mockResolvedValueOnce([owner])
+      .mockResolvedValueOnce([owner]);
+    let finishExecution!: () => void;
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { finishExecution = resolve; });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Reattached before startup reap.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    expect(await heartbeat.resumeRunningExternalRuntimeRuns()).toBe(1);
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result.runIds).not.toContain(runId);
+    expect((await heartbeat.getRun(runId))?.status).toBe("running");
+    expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    finishExecution();
+    await waitForRunToSettle(heartbeat, runId);
+  });
+
+  it("deletes a duplicate Job by exact UID before reattaching the persisted owner", async () => {
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      includeIssue: false,
+    });
+    const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+    const owner = {
+      phase: "active" as const,
+      reason: null,
+      message: null,
+      runId,
+      agentId,
+      name: reservation.jobName!,
+      uid: reservation.jobUid!,
+      createdAt: new Date(),
+    };
+    const duplicate = {
+      ...owner,
+      name: `${reservation.jobName}-duplicate`,
+      uid: `${reservation.jobUid}-duplicate`,
+    };
+    mockListManagedAgentJobs
+      .mockResolvedValueOnce([owner, duplicate])
+      .mockResolvedValueOnce([owner, duplicate])
+      .mockResolvedValueOnce([owner]);
+    let finishExecution!: () => void;
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { finishExecution = resolve; });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Reattached persisted owner after duplicate cleanup.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    expect(await heartbeat.resumeRunningExternalRuntimeRuns()).toBe(0);
+    const reaped = await heartbeat.reapOrphanedRuns();
+    expect(reaped.runIds).not.toContain(runId);
+    expect(mockDeleteAgentJobsForRun).toHaveBeenCalledWith({
+      runId,
+      agentId,
+      name: duplicate.name,
+      uid: duplicate.uid,
+    });
+    expect(await heartbeat.resumeRunningExternalRuntimeRuns()).toBe(1);
+    await vi.waitFor(() => expect(finishExecution).toBeTypeOf("function"), { timeout: 10_000 });
     expect(mockReadAgentJobRunStatusByName).not.toHaveBeenCalled();
+    finishExecution();
+    await waitForRunToSettle(heartbeat, runId);
   });
 
   it("deletes an old managed Job with no heartbeat run by exact UID", async () => {
@@ -1310,6 +1416,61 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("finds an orphan Job after more than 100 older Jobs with valid run rows", async () => {
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      includeIssue: false,
+    });
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    const validRunIds = [runId, ...Array.from({ length: 100 }, () => randomUUID())];
+    await db.insert(heartbeatRuns).values(validRunIds.slice(1).map((id) => ({
+      id,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed" as const,
+      contextSnapshot: {},
+      startedAt: new Date(Date.now() - 30 * 60 * 1000),
+      finishedAt: new Date(Date.now() - 29 * 60 * 1000),
+      createdAt: new Date(Date.now() - 30 * 60 * 1000),
+      updatedAt: new Date(Date.now() - 29 * 60 * 1000),
+    })));
+    const oldCreatedAt = new Date(Date.now() - 20 * 60 * 1000);
+    const orphanRunId = randomUUID();
+    mockListManagedAgentJobs.mockResolvedValueOnce([
+      ...validRunIds.map((validRunId, index) => ({
+        phase: "succeeded" as const,
+        reason: null,
+        message: null,
+        runId: validRunId,
+        agentId,
+        name: `valid-job-${index}`,
+        uid: `valid-uid-${index}`,
+        createdAt: oldCreatedAt,
+      })),
+      {
+        phase: "active" as const,
+        reason: null,
+        message: null,
+        runId: orphanRunId,
+        agentId,
+        name: "orphan-after-valid-jobs",
+        uid: "orphan-after-valid-jobs-uid",
+        createdAt: new Date(Date.now() - 10 * 60 * 1000),
+      },
+    ]);
+
+    await heartbeat.reapOrphanedRuns();
+
+    expect(mockDeleteAgentJobsForRun).toHaveBeenCalledWith({
+      runId: orphanRunId,
+      agentId,
+      name: "orphan-after-valid-jobs",
+      uid: "orphan-after-valid-jobs-uid",
+    });
+  });
+
   it("reaps a silent external-lifecycle run when its persisted Job name is confirmed missing", async () => {
     // Helm rollouts can delete an active k8s-backed agent Job while the
     // heartbeat run still has an issue/agent dispatch lock. A namespace-wide
@@ -1327,6 +1488,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       externalRunId: jobName,
     });
     await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    const reservation = await seedLaunchedReservation({
+      companyId,
+      agentId,
+      runId,
+      jobName,
+      jobUid: "missing-job-uid",
+    });
     mockListAgentJobRunStatuses.mockResolvedValueOnce(new Map());
     mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
       phase: "missing",
@@ -1342,6 +1510,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const run = await heartbeat.getRun(runId);
     expect(run?.status).toBe("failed");
     expect(run?.errorCode).toBe("job_missing");
+    const releasedReservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.id, reservation.id))
+      .then((rows) => rows[0]);
+    expect(releasedReservation?.releasedAt).not.toBeNull();
   });
 
   it("preserves a pre-adapter reservation when kube status cannot prove its Job is gone", async () => {

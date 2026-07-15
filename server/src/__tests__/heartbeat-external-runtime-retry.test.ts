@@ -26,8 +26,9 @@ import {
 const mockAdapterExecute = vi.hoisted(() => vi.fn());
 const mockListAgentJobRunStatuses = vi.hoisted(() => vi.fn(async () => null));
 const mockListLiveAgentJobRunIds = vi.hoisted(() => vi.fn(async () => null));
+const mockListManagedAgentJobs = vi.hoisted(() => vi.fn(async () => null));
 const mockReadAgentJobRunStatusByName = vi.hoisted(() => vi.fn(async () => null));
-const mockDeleteAgentJobsForRun = vi.hoisted(() => vi.fn(async () => 1));
+const mockDeleteAgentJobExact = vi.hoisted(() => vi.fn(async () => "deleted" as const));
 const mockHasActiveJobForAgent = vi.hoisted(() => vi.fn(async () => false));
 
 vi.mock("../telemetry.ts", () => ({
@@ -44,8 +45,9 @@ vi.mock("@paperclipai/shared/telemetry", async () => {
 vi.mock("../services/k8s-job-liveness.ts", () => ({
   listAgentJobRunStatuses: mockListAgentJobRunStatuses,
   listLiveAgentJobRunIds: mockListLiveAgentJobRunIds,
+  listManagedAgentJobs: mockListManagedAgentJobs,
   readAgentJobRunStatusByName: mockReadAgentJobRunStatusByName,
-  deleteAgentJobsForRun: mockDeleteAgentJobsForRun,
+  deleteAgentJobExact: mockDeleteAgentJobExact,
   hasActiveJobForAgent: mockHasActiveJobForAgent,
 }));
 
@@ -90,8 +92,9 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     mockAdapterExecute.mockReset();
     mockListAgentJobRunStatuses.mockReset().mockResolvedValue(null);
     mockListLiveAgentJobRunIds.mockReset().mockResolvedValue(null);
+    mockListManagedAgentJobs.mockReset().mockResolvedValue(null);
     mockReadAgentJobRunStatusByName.mockReset().mockResolvedValue(null);
-    mockDeleteAgentJobsForRun.mockReset().mockResolvedValue(1);
+    mockDeleteAgentJobExact.mockReset().mockResolvedValue("deleted");
     mockHasActiveJobForAgent.mockReset().mockResolvedValue(false);
     await cleanupHeartbeatTestState(db, heartbeat);
   }, 30_000);
@@ -139,8 +142,11 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       contextSnapshot: {},
     });
 
+    let allowReplacementLaunch!: () => void;
+    const replacementLaunchGate = new Promise<void>((resolve) => { allowReplacementLaunch = resolve; });
     mockAdapterExecute.mockImplementation(async (ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> => {
       const attempt = mockAdapterExecute.mock.calls.length;
+      if (attempt === 2) await replacementLaunchGate;
       await ctx.onMeta?.({
         adapterType: "claude_k8s",
         command: `kubectl job/${jobName}`,
@@ -229,11 +235,11 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(runDuringRetry?.status).toBe("running");
     expect(reservationDuringRetry).toMatchObject({
       state: "launching",
-      expectedJobName: null,
       jobName: null,
       jobUid: null,
     });
 
+    allowReplacementLaunch();
     await execution;
 
     const run = await db
@@ -389,7 +395,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       .then((rows) => rows[0]);
     expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
     expect(completedContender.status).toBe("succeeded");
-    expect(reusedReservation.id).toBe(contenderReservation?.id);
+    expect(reusedReservation.id).not.toBe(contenderReservation?.id);
     expect(reusedReservation.isolationKey).toBe(`agent-shared:${agentId}`);
   }, 30_000);
 });

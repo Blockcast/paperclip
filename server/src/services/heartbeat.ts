@@ -5425,6 +5425,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const workspaceOperationsSvc = workspaceOperationService(db);
   const activeRunExecutions = new Set<string>();
   const reattachingExternalRuns = new Set<string>();
+  const externalRunReattachedAt = new Map<string, number>();
   // Tracks the promises spawned by `void executeRun(...)` calls in the
   // dispatcher (startNextQueuedRunForAgent) so tests can await
   // fire-and-forget chains before TRUNCATE-based cleanup. Without this
@@ -10825,7 +10826,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
 
     let finalizedRun: Awaited<ReturnType<typeof setRunStatus>>;
-    let terminalJobQuiesced = Boolean(input.jobStatus && input.jobStatus.phase !== "active");
+    let terminalJobQuiesced = input.jobStatus?.phase !== "active";
     if (input.staleKill) {
       // BLO-13176: claim the run terminally BEFORE the destructive Job delete.
       // The force-kill deleted the Job first and only then set status, so two
@@ -10938,6 +10939,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     runningProcesses.delete(input.run.id);
     activeRunExecutions.delete(input.run.id);
+    externalRunReattachedAt.delete(input.run.id);
     await environmentsSvc.releaseLeasesForRun(
       input.run.id,
       terminalOutcome.status === "succeeded" ? "released" : "failed",
@@ -10962,7 +10964,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   function externalLifecycleRecentRefTime(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "lastOutputAt" | "startedAt" | "createdAt" | "finishedAt"
+      "id" | "lastOutputAt" | "startedAt" | "createdAt" | "finishedAt"
     >,
   ): number {
     return Math.max(
@@ -10970,13 +10972,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runTimestampMs(run.finishedAt),
       runTimestampMs(run.startedAt),
       runTimestampMs(run.createdAt),
+      externalRunReattachedAt.get(run.id) ?? 0,
     );
   }
 
   function isExternalLifecycleRunInRecentGrace(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "lastOutputAt" | "updatedAt" | "startedAt" | "createdAt" | "finishedAt"
+      "id" | "lastOutputAt" | "updatedAt" | "startedAt" | "createdAt" | "finishedAt"
     >,
     now: Date,
     graceMs = EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS,
@@ -11178,8 +11181,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         && job.createdAt
         && now.getTime() - job.createdAt.getTime() >= graceMs
       )
-      .sort((a, b) => a.createdAt!.getTime() - b.createdAt!.getTime())
-      .slice(0, 100);
+      .sort((a, b) => a.createdAt!.getTime() - b.createdAt!.getTime());
     const runIds = [...new Set(oldJobs.map((job) => job.runId).filter((runId): runId is string => Boolean(runId)))];
     if (runIds.length === 0) return [];
     const existingRunIds = new Set(
@@ -11253,6 +11255,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (observed?.phase !== "active" || observed.uid !== reservation.jobUid) continue;
       resumed += 1;
       reattachingExternalRuns.add(run.id);
+      externalRunReattachedAt.set(run.id, Date.now());
       void executeRun(run.id)
         .catch((error) => {
           logger.error({ error, runId: run.id }, "failed to reattach external-runtime execution");
@@ -11284,11 +11287,65 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // Jobs that would otherwise keep blocking future dispatches. Returns null
     // when the API is unavailable (local dev, RBAC missing, transient failure).
     const hasExternalCandidates = activeRuns.some((row) => hasExternalLifecycle(row.adapterType));
-    const managedJobs = await listManagedAgentJobs();
+    let managedJobs = await listManagedAgentJobs();
+    await cleanupManagedJobsWithoutRun(now, managedJobs);
+    const activeReservations = activeRuns.length > 0
+      ? await db
+        .select()
+        .from(externalRuntimeReservations)
+        .where(and(
+          inArray(externalRuntimeReservations.runId, activeRuns.map(({ run }) => run.id)),
+          isNull(externalRuntimeReservations.releasedAt),
+        ))
+      : [];
+    const reservationsByRunId = new Map(activeReservations.map((reservation) => [reservation.runId, reservation]));
+    const duplicateJobsCleanedRunIds = new Set<string>();
+
+    // A persisted launched reservation is the sole authority for which Job may
+    // drive a run. Delete duplicate non-owners one at a time with their observed
+    // UID, then rebuild the inventory view without Jobs confirmed gone.
+    if (managedJobs) {
+      const jobsByRun = new Map<string, typeof managedJobs>();
+      for (const job of managedJobs) {
+        if (!job.runId) continue;
+        jobsByRun.set(job.runId, [...(jobsByRun.get(job.runId) ?? []), job]);
+      }
+      const removedJobUids = new Set<string>();
+      for (const [runId, candidates] of jobsByRun) {
+        if (candidates.length <= 1) continue;
+        const reservation = reservationsByRunId.get(runId);
+        if (
+          reservation?.state !== "launched"
+          || !reservation.jobName
+          || !reservation.jobUid
+        ) continue;
+        const owner = candidates.find((job) =>
+          job.agentId === reservation.agentId
+          && job.name === reservation.jobName
+          && job.uid === reservation.jobUid
+        );
+        for (const candidate of candidates) {
+          if (candidate === owner || !candidate.agentId) continue;
+          const deleted = await deleteAgentJobExact({
+            runId,
+            agentId: candidate.agentId,
+            name: candidate.name,
+            uid: candidate.uid,
+          });
+          if (deleted === "deleted" || deleted === "missing") {
+            removedJobUids.add(candidate.uid);
+            duplicateJobsCleanedRunIds.add(runId);
+          }
+        }
+      }
+      if (removedJobUids.size > 0) {
+        managedJobs = managedJobs.filter((job) => !removedJobUids.has(job.uid));
+      }
+    }
+
     const jobRunStatuses = managedJobs !== null
       ? indexUniqueAgentJobRunStatuses(managedJobs)
       : await listAgentJobRunStatuses();
-    await cleanupManagedJobsWithoutRun(now, managedJobs);
     const ambiguousExternalRunIds = new Set<string>();
     if (managedJobs) {
       const jobsByRun = new Map<string, typeof managedJobs>();
@@ -11302,15 +11359,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (candidates.length !== 1) ambiguousExternalRunIds.add(runId);
       }
     }
-    const activeReservations = activeRuns.length > 0
-      ? await db
-        .select()
-        .from(externalRuntimeReservations)
-        .where(and(
-          inArray(externalRuntimeReservations.runId, activeRuns.map(({ run }) => run.id)),
-          isNull(externalRuntimeReservations.releasedAt),
-        ))
-      : [];
     const replacementPendingRunIds = new Set(
       activeReservations
         .filter((reservation) => {
@@ -11426,6 +11474,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
       if (runningProcesses.has(run.id)) continue;
       if (ambiguousExternalRunIds.has(run.id)) continue;
+      if (duplicateJobsCleanedRunIds.has(run.id)) continue;
 
       // External-lifecycle adapters (k8s Jobs etc.) manage their own run
       // completion once adapter invocation has actually started. A claimed
@@ -11518,13 +11567,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       let confirmedMissingExternalJob = false;
       if (externalLifecycleRun && externalLifecycleStarted) {
-        const lastSignalRef = run.lastUsefulActionAt
+        const persistedSignalRef = run.lastUsefulActionAt
           ? new Date(run.lastUsefulActionAt).getTime()
           : run.lastOutputAt
           ? new Date(run.lastOutputAt).getTime()
           : run.startedAt
           ? new Date(run.startedAt).getTime()
           : 0;
+        const lastSignalRef = Math.max(
+          persistedSignalRef,
+          externalRunReattachedAt.get(run.id) ?? 0,
+        );
         const isSilent = !lastSignalRef || now.getTime() - lastSignalRef >= EXTERNAL_LIFECYCLE_STALE_MS;
         // BLO-12996: a much longer floor that gates the *destructive* kill of a
         // still-active Job (vs. isSilent, which only gates non-destructive
@@ -15076,6 +15129,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
           }
           activeRunExecutions.delete(run.id);
+          externalRunReattachedAt.delete(run.id);
           // Skip dispatch when this run was cancelled. `cancelRunInternal`
           // already calls `startNextQueuedRunForAgent` when it cancels a run,
           // so the finally-block dispatch is a duplicate that races with the
