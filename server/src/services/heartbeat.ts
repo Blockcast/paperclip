@@ -711,6 +711,21 @@ const EXTERNAL_LIFECYCLE_STALE_MS = 15 * 60 * 1000;
 // is appended. Startup and periodic reapers can overlap that setup window;
 // give slow pre-run hooks and kube Job creation time to reach adapter.invoke.
 const EXTERNAL_LIFECYCLE_PRE_ADAPTER_STALE_MS = 5 * 60 * 1000;
+// BLO-16253: dispatchRank (priorityRank * 2 + statusBonus) has no time
+// component, so a `todo` queued run can be starved forever behind a busy
+// agent's constantly-refreshed `in_progress` follow-up dispatches, even at
+// equal or lower priority — the availableSlots gate caps external-lifecycle
+// dispatch to exactly one winner per tick (see BLO-13176 note below), so a
+// perpetual loser never gets a turn. Observed 2026-07-15 on BLO-15871 (low
+// priority, todo): its queued run sat unpromoted for 4+ hours while the same
+// agent's low/high-priority in_progress issues kept winning the single slot
+// every tick. Aging closes this in two bounded steps: after
+// STARVATION_STATUS_BOOST_MS waited, forgive the todo/in_progress status
+// penalty (lets it tie same-priority in_progress work); after
+// STARVATION_FULL_ESCALATION_MS, force top-of-queue so it cannot be starved
+// indefinitely regardless of what else is queued.
+const STARVATION_STATUS_BOOST_MS = 30 * 60 * 1000;
+const STARVATION_FULL_ESCALATION_MS = 2 * 60 * 60 * 1000;
 // If another process has just finalized a run while its k8s Job is still
 // visible, do not immediately delete that live Job. The adapter process may
 // still be awaiting/synchronizing the Job and should be allowed to finish.
@@ -12493,17 +12508,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         //   not-ready  → 12 + priorityRank
         // This lets high-priority todo (rank 3) beat low-priority in_progress
         // (rank 6) while preserving the in_progress bonus within a tier.
+        // BLO-16253: aging term prevents indefinite starvation of a `todo`
+        // run — see STARVATION_* constants above.
         const dispatchRank = (
           issue: { status: string; priority: string | null } | null | undefined,
           ready: boolean,
           hasId: boolean,
+          waitedMs: number,
         ): number => {
           if (!hasId) return 10;
           if (!ready) return 12 + issueRunPriorityRank(issue?.priority);
-          return issueRunPriorityRank(issue?.priority) * 2 + (issue?.status === "in_progress" ? 0 : 1);
+          if (waitedMs >= STARVATION_FULL_ESCALATION_MS) return 0;
+          const priorityRank = issueRunPriorityRank(issue?.priority);
+          const statusBonus =
+            issue?.status === "in_progress" || waitedMs >= STARVATION_STATUS_BOOST_MS ? 0 : 1;
+          return priorityRank * 2 + statusBonus;
         };
-        const leftRank = dispatchRank(leftIssue, leftReady, !!leftIssueId);
-        const rightRank = dispatchRank(rightIssue, rightReady, !!rightIssueId);
+        const leftWaitedMs = dispatchNow.getTime() - left.createdAt.getTime();
+        const rightWaitedMs = dispatchNow.getTime() - right.createdAt.getTime();
+        const leftRank = dispatchRank(leftIssue, leftReady, !!leftIssueId, leftWaitedMs);
+        const rightRank = dispatchRank(rightIssue, rightReady, !!rightIssueId, rightWaitedMs);
         return leftRank !== rightRank
           ? leftRank - rightRank
           : left.createdAt.getTime() - right.createdAt.getTime();
