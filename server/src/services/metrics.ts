@@ -69,6 +69,33 @@ export const AGENT_NO_USAGE_STREAK_METRIC = "paperclip_agent_zero_token_complete
 export const EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC = "paperclip_external_runtime_reservation_events_total";
 export const EXTERNAL_RUNTIME_RESERVATIONS_ACTIVE_METRIC = "paperclip_external_runtime_reservations_active";
 export const EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC = "paperclip_external_runtime_reservation_oldest_age_seconds";
+/**
+ * process_lost reap counter (BLO-16184, parent BLO-12292). Incremented once at
+ * the reaper's `process_lost` mint, labeled by bounded `adapter`
+ * (claude_k8s/opencode_k8s/other), `error_bucket` (the fixed reaper failure
+ * string collapsed to a category), and `classification` (the durable
+ * resultJson.processLoss bucket added in BLO-16181). This is the NUMERATOR of
+ * the trigger monitor: warn >20/day, page >40/day sustained 2h. Worst-case
+ * series = 3 adapters x 5 buckets x 6 classifications = 90, roster-independent.
+ */
+export const PROCESS_LOST_TOTAL_METRIC = "paperclip_process_lost_total";
+/**
+ * External-lifecycle running-run volume gauge (BLO-16184 DENOMINATOR #1). Set
+ * every reap cycle from the live `activeRuns` snapshot, reset-then-set so a
+ * genuine drop to 0 is written explicitly rather than going stale. A
+ * `process_lost`-count of 0 is only trustworthy as "healthy" when this gauge is
+ * above a floor — otherwise the 0 just means there were no external runs to lose.
+ */
+export const EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC = "paperclip_external_lifecycle_running_runs";
+/**
+ * Kube-liveness-null counter (BLO-16184 DENOMINATOR #2). Incremented once per
+ * reap cycle when the reaper had external-lifecycle candidates but
+ * `listAgentJobRunStatuses()` returned null (kube API unavailable) — the exact
+ * degradation the data-plane review flagged as previously unobservable (only a
+ * `logger.warn` existed). A rising rate means the reaper is flying blind, so any
+ * concurrent low `process_lost` count is UNRELIABLE, not healthy.
+ */
+export const PROCESS_LOST_LIVENESS_NULL_METRIC = "paperclip_process_lost_liveness_null_total";
 
 /**
  * Bounded `reason` allow-list (mirrors the adapter-lane reasons defined in
@@ -156,6 +183,70 @@ export function normalizeAgentId(
   return UNKNOWN_AGENT_ID;
 }
 
+/**
+ * External-lifecycle adapter allow-list for the process_lost monitor (BLO-16184).
+ * Anything else (local adapters, future types) collapses to "other" so the
+ * `adapter` label can never be inflated by an unexpected value.
+ */
+export const KNOWN_EXTERNAL_LIFECYCLE_ADAPTERS = ["claude_k8s", "opencode_k8s"] as const;
+export const UNKNOWN_EXTERNAL_ADAPTER = "other";
+const knownExternalLifecycleAdapterSet: ReadonlySet<string> = new Set(KNOWN_EXTERNAL_LIFECYCLE_ADAPTERS);
+
+/**
+ * process_lost error-string buckets. Derived from the FIXED failure strings the
+ * reaper stamps (heartbeat.ts buildProcessLossMessage + the pre-adapter mint) so
+ * the raw (pid-bearing, unbounded) message never becomes a label. Unmatched
+ * strings collapse to "other".
+ */
+export const KNOWN_PROCESS_LOST_BUCKETS = [
+  "pre_adapter",
+  "child_pid",
+  "process_group",
+  "server_restart",
+] as const;
+export const UNKNOWN_PROCESS_LOST_BUCKET = "other";
+
+/**
+ * The 5 durable ProcessLossClassification values (process-loss-classification.ts,
+ * BLO-16181). Anything else collapses to "unknown" — notably historical rows
+ * minted before BLO-16181 have no classification and land here.
+ */
+export const KNOWN_PROCESS_LOSS_CLASSIFICATIONS = [
+  "pre_adapter_job_unstamped",
+  "pre_adapter_job_stamped",
+  "pre_adapter_kube_unknown",
+  "started_job_absent",
+  "local",
+] as const;
+export const UNKNOWN_PROCESS_LOSS_CLASSIFICATION = "unknown";
+const knownProcessLossClassificationSet: ReadonlySet<string> = new Set(KNOWN_PROCESS_LOSS_CLASSIFICATIONS);
+
+export function normalizeExternalAdapter(adapter: string | null | undefined): string {
+  return typeof adapter === "string" && knownExternalLifecycleAdapterSet.has(adapter)
+    ? adapter
+    : UNKNOWN_EXTERNAL_ADAPTER;
+}
+
+/**
+ * Map a raw process_lost failure message to a bounded bucket by matching the
+ * fixed substrings the reaper stamps. Order matters only in that each substring
+ * is unique to one bucket. Never returns the raw string (unbounded cardinality).
+ */
+export function normalizeProcessLostBucket(errorString: string | null | undefined): string {
+  const s = typeof errorString === "string" ? errorString : "";
+  if (s.includes("before external adapter invocation")) return "pre_adapter";
+  if (s.includes("child pid")) return "child_pid";
+  if (s.includes("process group")) return "process_group";
+  if (s.includes("server may have restarted")) return "server_restart";
+  return UNKNOWN_PROCESS_LOST_BUCKET;
+}
+
+export function normalizeProcessLossClassification(classification: string | null | undefined): string {
+  return typeof classification === "string" && knownProcessLossClassificationSet.has(classification)
+    ? classification
+    : UNKNOWN_PROCESS_LOSS_CLASSIFICATION;
+}
+
 let registry: Registry | null = null;
 let concurrentRunBlocked: Counter<"agent_id" | "reason" | "isolation_mode"> | null = null;
 let isolatedRunStarted: Counter<"agent_id" | "isolation_mode"> | null = null;
@@ -165,6 +256,9 @@ let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = nul
 let externalRuntimeReservationEvents: Counter<"event"> | null = null;
 let externalRuntimeReservationsActive: Gauge | null = null;
 let externalRuntimeReservationOldestAge: Gauge | null = null;
+let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
+let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
+let processLostLivenessNull: Counter | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -176,6 +270,9 @@ function ensureRegistry(): {
   externalRuntimeReservationEventsCounter: Counter<"event">;
   externalRuntimeReservationsActiveGauge: Gauge;
   externalRuntimeReservationOldestAgeGauge: Gauge;
+  processLostTotalCounter: Counter<"adapter" | "error_bucket" | "classification">;
+  externalLifecycleRunningRunsGauge: Gauge<"adapter">;
+  processLostLivenessNullCounter: Counter;
 } {
   if (
     !registry
@@ -187,6 +284,9 @@ function ensureRegistry(): {
     || !externalRuntimeReservationEvents
     || !externalRuntimeReservationsActive
     || !externalRuntimeReservationOldestAge
+    || !processLostTotal
+    || !externalLifecycleRunningRuns
+    || !processLostLivenessNull
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -252,6 +352,37 @@ function ensureRegistry(): {
       help: "Age in seconds of the oldest unreleased external-runtime slot reservation.",
       registers: [registry],
     });
+    processLostTotal = new Counter({
+      name: PROCESS_LOST_TOTAL_METRIC,
+      help:
+        "Count of heartbeat runs reaped as process_lost (BLO-16184/BLO-12292), labeled by "
+        + "bounded adapter (claude_k8s/opencode_k8s/other), error_bucket (fixed reaper failure "
+        + "string collapsed to a category), and classification (the durable resultJson.processLoss "
+        + "bucket from BLO-16181). NUMERATOR of the trigger monitor; read against "
+        + EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC + " and " + PROCESS_LOST_LIVENESS_NULL_METRIC
+        + " so a 0 count is only trusted at real volume with kube liveness intact.",
+      labelNames: ["adapter", "error_bucket", "classification"],
+      registers: [registry],
+    });
+    externalLifecycleRunningRuns = new Gauge({
+      name: EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC,
+      help:
+        "Current count of running external-lifecycle heartbeat runs by adapter, snapshotted "
+        + "each reap cycle (reset-then-set so a true drop to 0 is written explicitly, not stale). "
+        + "DENOMINATOR for " + PROCESS_LOST_TOTAL_METRIC + ": a 0 process_lost count is only "
+        + "'healthy' when this is above a floor — otherwise there were simply no runs to lose.",
+      labelNames: ["adapter"],
+      registers: [registry],
+    });
+    processLostLivenessNull = new Counter({
+      name: PROCESS_LOST_LIVENESS_NULL_METRIC,
+      help:
+        "Count of reap cycles that had external-lifecycle candidates but got a null kube "
+        + "Job-status list (kube API unavailable), i.e. the reaper fell back to the staleness "
+        + "heuristic while blind. DENOMINATOR guard: a rising rate makes any concurrent low "
+        + PROCESS_LOST_TOTAL_METRIC + " reading unreliable rather than healthy (BLO-16184).",
+      registers: [registry],
+    });
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -266,6 +397,9 @@ function ensureRegistry(): {
     externalRuntimeReservationEventsCounter: externalRuntimeReservationEvents,
     externalRuntimeReservationsActiveGauge: externalRuntimeReservationsActive,
     externalRuntimeReservationOldestAgeGauge: externalRuntimeReservationOldestAge,
+    processLostTotalCounter: processLostTotal,
+    externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
+    processLostLivenessNullCounter: processLostLivenessNull,
   };
 }
 
@@ -420,6 +554,56 @@ export function setExternalRuntimeReservationMetrics(input: {
   metrics.externalRuntimeReservationOldestAgeGauge.set(Math.max(0, input.oldestAgeSeconds));
 }
 
+/**
+ * Record one process_lost reap (BLO-16184 numerator). All three labels are
+ * normalized to bounded allow-lists before touching the registry. Returns the
+ * resolved label set (useful for assertions / structured logs).
+ */
+export function recordProcessLost(input: {
+  adapter: string | null | undefined;
+  errorString: string | null | undefined;
+  classification: string | null | undefined;
+}): { adapter: string; error_bucket: string; classification: string } {
+  const labels = {
+    adapter: normalizeExternalAdapter(input.adapter),
+    error_bucket: normalizeProcessLostBucket(input.errorString),
+    classification: normalizeProcessLossClassification(input.classification),
+  };
+  ensureRegistry().processLostTotalCounter.inc(labels);
+  return labels;
+}
+
+/**
+ * Snapshot the external-lifecycle running-run volume (BLO-16184 denominator #1).
+ * Reset-then-set so a true drop to 0 for an adapter is written explicitly rather
+ * than leaving a stale non-zero series (the classic stale-gauge masking trap).
+ * Unknown/future external adapters collapse into the "other" series.
+ */
+export function setExternalLifecycleRunningRuns(byAdapter: Record<string, number>): void {
+  const gauge = ensureRegistry().externalLifecycleRunningRunsGauge;
+  gauge.reset();
+  let other = 0;
+  for (const [adapter, count] of Object.entries(byAdapter)) {
+    const value = Math.max(0, count);
+    if (knownExternalLifecycleAdapterSet.has(adapter)) {
+      gauge.set({ adapter }, value);
+    } else {
+      other += value;
+    }
+  }
+  // Always write an explicit 0 for each known adapter that had no running runs,
+  // so a drop to 0 is observable rather than an absent series.
+  for (const adapter of KNOWN_EXTERNAL_LIFECYCLE_ADAPTERS) {
+    if (!(adapter in byAdapter)) gauge.set({ adapter }, 0);
+  }
+  if (other > 0) gauge.set({ adapter: UNKNOWN_EXTERNAL_ADAPTER }, other);
+}
+
+/** Record one reap cycle that was blind to kube (BLO-16184 denominator #2). */
+export function recordProcessLostLivenessNull(): void {
+  ensureRegistry().processLostLivenessNullCounter.inc();
+}
+
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
   const reg = getMetricsRegistry();
   const depBlockedSnapshot = snapshotDepBlockedMetrics();
@@ -455,6 +639,9 @@ export function __resetMetricsForTest(): void {
   externalRuntimeReservationEvents = null;
   externalRuntimeReservationsActive = null;
   externalRuntimeReservationOldestAge = null;
+  processLostTotal = null;
+  externalLifecycleRunningRuns = null;
+  processLostLivenessNull = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
 }
