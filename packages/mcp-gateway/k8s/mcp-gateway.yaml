@@ -82,6 +82,10 @@ spec:
               value: "8080"
             - name: PAPERCLIP_MCP_UPSTREAMS_STATE_URL
               value: https://api.penstock.run/v1/mcp/upstreams
+            # tenant_node targets are canonical paths beneath this authenticated
+            # public relay origin; registry responses cannot provide URLs.
+            - name: PAPERCLIP_MCP_TENANT_RELAY_ORIGIN
+              value: https://api.penstock.run
             - name: PAPERCLIP_MCP_UPSTREAMS_CACHE_FILE
               value: /cache/upstreams-lkg.json
             - name: PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS

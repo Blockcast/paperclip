@@ -13,6 +13,8 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
+import { isIP } from "node:net";
 
 export interface UpstreamCredentialHeader {
   header: string;
@@ -25,12 +27,27 @@ export interface UpstreamConfig {
   url: string;
   credentialHeaders: UpstreamCredentialHeader[];
   execution?: "house" | "tenant_node";
+  routeId?: string;
+  relayAuthorization?: string;
+  registryRevision?: string;
 }
 
 export type UpstreamMap = Record<string, UpstreamConfig>;
 
 const DEFAULT_UPSTREAMS_CACHE_FILE = "/cache/upstreams-lkg.json";
 const CREDENTIAL_ENV_ALLOWLIST = "PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS";
+
+interface LastKnownGoodEnvelope {
+  version: 1;
+  principalHash: string;
+  stateUrl: string;
+  payload: string;
+}
+
+interface TenantRelayContext {
+  origin: string;
+  authorization: string;
+}
 
 export async function loadUpstreams(env: NodeJS.ProcessEnv = process.env): Promise<UpstreamMap> {
   const stateUrl = env.PAPERCLIP_MCP_UPSTREAMS_STATE_URL?.trim();
@@ -57,52 +74,74 @@ export function loadLocalUpstreams(env: NodeJS.ProcessEnv = process.env): Upstre
 
 async function loadStateUpstreams(stateUrl: string, env: NodeJS.ProcessEnv): Promise<UpstreamMap> {
   const cacheFile = env.PAPERCLIP_MCP_UPSTREAMS_CACHE_FILE?.trim() || DEFAULT_UPSTREAMS_CACHE_FILE;
+  const token = env.PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN?.trim();
+  const principalHash = upstreamsPrincipalHash(env);
+  const relayContext = tenantRelayContext(env, token, stateUrl);
   let raw: string;
   try {
     const headers: Record<string, string> = { accept: "application/json" };
-    const token = env.PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN?.trim();
     if (token) headers.authorization = `Bearer ${token}`;
-    const response = await fetch(stateUrl, { headers });
+    const response = await fetch(stateUrl, { headers, redirect: "error" });
     if (!response.ok) {
       throw new Error(`status=${response.status}`);
     }
     raw = await response.text();
   } catch (e) {
-    const cachedRaw = readLastKnownGood(cacheFile);
+    const cachedRaw = readLastKnownGood(cacheFile, principalHash, stateUrl);
     if (cachedRaw) {
       // eslint-disable-next-line no-console
       console.warn(`[mcp-gateway] state config unavailable; using last-known-good cache: ${(e as Error).message}`);
-      const cachedUpstreams = parseUpstreamMap(cachedRaw, `last-known-good ${cacheFile}`);
+      const cachedUpstreams = parseUpstreamMap(cachedRaw, `last-known-good ${cacheFile}`, relayContext);
+      bindRegistryRevision(cachedUpstreams, cachedRaw);
       validateCredentialEnvNames(cachedUpstreams, env);
       return cachedUpstreams;
     }
     throw new Error(`upstreams: failed to load penstock state and no last-known-good cache is available: ${(e as Error).message}`);
   }
-  const upstreams = parseUpstreamMap(raw, "PAPERCLIP_MCP_UPSTREAMS_STATE_URL");
+  const upstreams = parseUpstreamMap(
+    raw,
+    "PAPERCLIP_MCP_UPSTREAMS_STATE_URL",
+    relayContext,
+  );
+  bindRegistryRevision(upstreams, raw);
   validateCredentialEnvNames(upstreams, env);
-  writeLastKnownGood(cacheFile, raw);
+  writeLastKnownGood(cacheFile, { version: 1, principalHash, stateUrl, payload: raw });
   return upstreams;
 }
 
-function writeLastKnownGood(cacheFile: string, raw: string): void {
+function bindRegistryRevision(upstreams: UpstreamMap, raw: string): void {
+  const revision = createHash("sha256").update(raw).digest("hex");
+  for (const upstream of Object.values(upstreams)) upstream.registryRevision = revision;
+}
+
+function writeLastKnownGood(cacheFile: string, envelope: LastKnownGoodEnvelope): void {
   try {
     fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
-    fs.writeFileSync(cacheFile, raw, { encoding: "utf8", mode: 0o600 });
+    fs.writeFileSync(cacheFile, JSON.stringify(envelope), { encoding: "utf8", mode: 0o600 });
   } catch (e) {
     // eslint-disable-next-line no-console
     console.warn(`[mcp-gateway] failed to write upstream last-known-good cache: ${(e as Error).message}`);
   }
 }
 
-function readLastKnownGood(cacheFile: string): string | null {
+function readLastKnownGood(cacheFile: string, principalHash: string, stateUrl: string): string | null {
   try {
-    return fs.readFileSync(cacheFile, "utf8");
+    const parsed = JSON.parse(fs.readFileSync(cacheFile, "utf8")) as Partial<LastKnownGoodEnvelope>;
+    if (
+      parsed.version !== 1 ||
+      parsed.principalHash !== principalHash ||
+      parsed.stateUrl !== stateUrl ||
+      typeof parsed.payload !== "string"
+    ) {
+      return null;
+    }
+    return parsed.payload;
   } catch {
     return null;
   }
 }
 
-export function parseUpstreamMap(raw: string, source: string): UpstreamMap {
+export function parseUpstreamMap(raw: string, source: string, tenantRelay?: TenantRelayContext): UpstreamMap {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -120,7 +159,7 @@ export function parseUpstreamMap(raw: string, source: string): UpstreamMap {
     if (prefix.includes("__")) {
       throw new Error(`upstreams: prefix "${prefix}" must not contain "__"; aggregate tool names reserve it as a separator`);
     }
-    const config = parseUpstreamConfig(prefix, value);
+    const config = parseUpstreamConfig(prefix, value, tenantRelay);
     if (!/^https?:\/\//.test(config.url)) {
       throw new Error(`upstreams: prefix "${prefix}" URL must start with http:// or https://`);
     }
@@ -153,7 +192,7 @@ function upstreamEntries(parsed: object): Array<[string, unknown]> {
   return Object.entries(parsed as Record<string, unknown>);
 }
 
-function parseUpstreamConfig(prefix: string, value: unknown): UpstreamConfig {
+function parseUpstreamConfig(prefix: string, value: unknown, tenantRelay?: TenantRelayContext): UpstreamConfig {
   if (typeof value === "string") {
     if (value.length === 0) {
       throw new Error(`upstreams: prefix "${prefix}" must map to a non-empty URL string`);
@@ -165,12 +204,29 @@ function parseUpstreamConfig(prefix: string, value: unknown): UpstreamConfig {
   }
   rejectCredentialValues(prefix, value);
   const record = value as Record<string, unknown>;
-  if (typeof record.url !== "string" || record.url.length === 0) {
-    throw new Error(`upstreams: prefix "${prefix}" metadata must include a non-empty url string`);
-  }
   const execution = record.execution ?? record.executionKind;
   if (execution !== undefined && execution !== "house" && execution !== "tenant_node") {
     throw new Error(`upstreams: prefix "${prefix}" execution must be "house" or "tenant_node"`);
+  }
+  if (execution === "tenant_node") {
+    const routeId = firstString(record.routeId, record.route_id);
+    if (!tenantRelay) {
+      throw new Error(`upstreams: prefix "${prefix}" tenant_node route requires authenticated relay configuration`);
+    }
+    if (routeId !== prefix) {
+      throw new Error(`upstreams: prefix "${prefix}" tenant_node routeId must equal its registry prefix`);
+    }
+    return {
+      name: typeof record.name === "string" && record.name.length > 0 ? record.name : undefined,
+      url: `${tenantRelay.origin}/v1/mcp/apps/${encodeURIComponent(routeId)}/mcp`,
+      credentialHeaders: parseCredentialHeaders(record),
+      execution,
+      routeId,
+      relayAuthorization: tenantRelay.authorization,
+    };
+  }
+  if (typeof record.url !== "string" || record.url.length === 0) {
+    throw new Error(`upstreams: prefix "${prefix}" metadata must include a non-empty url string`);
   }
   return {
     name: typeof record.name === "string" && record.name.length > 0 ? record.name : undefined,
@@ -178,6 +234,46 @@ function parseUpstreamConfig(prefix: string, value: unknown): UpstreamConfig {
     credentialHeaders: parseCredentialHeaders(record),
     ...(execution ? { execution } : {}),
   };
+}
+
+function tenantRelayContext(
+  env: NodeJS.ProcessEnv,
+  token: string | undefined,
+  stateUrl: string,
+): TenantRelayContext | undefined {
+  const configuredOrigin = env.PAPERCLIP_MCP_TENANT_RELAY_ORIGIN?.trim();
+  if (!configuredOrigin) return undefined;
+  if (!token) {
+    throw new Error("upstreams: PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN is required for tenant relay routes");
+  }
+  const relay = new URL(configuredOrigin);
+  const hostname = relay.hostname.toLowerCase();
+  const ipHostname = hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+  if (
+    relay.protocol !== "https:" ||
+    relay.username ||
+    relay.password ||
+    (relay.port && relay.port !== "443") ||
+    relay.pathname !== "/" ||
+    relay.search ||
+    relay.hash ||
+    isIP(ipHostname) !== 0 ||
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    hostname.endsWith(".local") ||
+    hostname.endsWith(".internal") ||
+    relay.origin !== new URL(stateUrl).origin
+  ) {
+    throw new Error(
+      "upstreams: PAPERCLIP_MCP_TENANT_RELAY_ORIGIN must be the state service's public HTTPS origin on the default port",
+    );
+  }
+  return { origin: relay.origin, authorization: `Bearer ${token}` };
+}
+
+export function upstreamsPrincipalHash(env: NodeJS.ProcessEnv = process.env): string {
+  const token = env.PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN?.trim() ?? "";
+  return createHash("sha256").update(token).digest("hex");
 }
 
 function rejectCredentialValues(prefix: string, value: unknown): void {
