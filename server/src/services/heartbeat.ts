@@ -4452,8 +4452,13 @@ async function coalescePendingTaskScopeWake(input: {
   requestedByActorType: WakeupOptions["requestedByActorType"] | null | undefined;
   requestedByActorId: WakeupOptions["requestedByActorId"] | null | undefined;
   idempotencyKey: string | null | undefined;
+  includeRunning?: boolean;
 }) {
   if (!input.taskKey) return null;
+
+  const coalescibleStatuses = input.includeRunning
+    ? EXECUTION_PATH_HEARTBEAT_RUN_STATUSES
+    : TASK_SCOPE_COALESCIBLE_RUN_STATUSES;
 
   const existingRun = await input.tx
     .select()
@@ -4462,7 +4467,7 @@ async function coalescePendingTaskScopeWake(input: {
       and(
         eq(heartbeatRuns.companyId, input.companyId),
         eq(heartbeatRuns.agentId, input.agentId),
-        inArray(heartbeatRuns.status, TASK_SCOPE_COALESCIBLE_RUN_STATUSES),
+        inArray(heartbeatRuns.status, coalescibleStatuses),
         eq(heartbeatRuns.contextTaskKey, input.taskKey),
       ),
     )
@@ -4488,7 +4493,7 @@ async function coalescePendingTaskScopeWake(input: {
     .where(
       and(
         eq(heartbeatRuns.id, existingRun.id),
-        inArray(heartbeatRuns.status, TASK_SCOPE_COALESCIBLE_RUN_STATUSES),
+        inArray(heartbeatRuns.status, coalescibleStatuses),
       ),
     )
     .returning()
@@ -16707,6 +16712,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         requestedByActorType: opts.requestedByActorType,
         requestedByActorId: opts.requestedByActorId,
         idempotencyKey: opts.idempotencyKey,
+        // If the unlocked snapshot saw no running candidate, a same-task run
+        // found after taking the agent lock was created while this enqueue was
+        // waiting. It is therefore a live concurrency race, not a pre-existing
+        // zombie. Merge into it unless this wake intentionally needs a new run
+        // boundary (for example, an issue-comment follow-up).
+        includeRunning: !sameScopeRunningRun && !shouldQueueFollowupForRunningWake,
       });
       if (coalescedTaskScopeRun) {
         return { kind: "coalesced" as const, run: coalescedTaskScopeRun };

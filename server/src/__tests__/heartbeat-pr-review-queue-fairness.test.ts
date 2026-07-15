@@ -279,6 +279,107 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
     expect(wakeups.filter((wake) => wake.status === "coalesced")).toHaveLength(11);
   });
 
+  it("coalesces when a same-task run starts while enqueue waits for the agent lock", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runningRunId = randomUUID();
+    const taskKey = "pr_review:Blockcast/penstock-llm-proxy-core:691";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Review Running Race Co",
+      status: "active",
+      issuePrefix: "RRN",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Ally",
+      role: "reviewer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    let announceRunLock!: () => void;
+    let releaseRunLock!: () => void;
+    const runLockHeld = new Promise<void>((resolve) => {
+      announceRunLock = resolve;
+    });
+    const runMayCommit = new Promise<void>((resolve) => {
+      releaseRunLock = resolve;
+    });
+
+    const inFlightRun = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select id from agents where id = ${agentId} and company_id = ${companyId} for update`,
+      );
+      announceRunLock();
+      await runMayCommit;
+
+      await tx.insert(heartbeatRuns).values({
+        id: runningRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "running",
+        startedAt: new Date(),
+        contextSnapshot: {
+          taskKey,
+          reviewKind: "pr_review",
+          wakeReason: "github_pr_ready_for_review",
+          githubRepoFullName: "Blockcast/penstock-llm-proxy-core",
+          githubPrNumber: 691,
+          githubHeadSha: "d75ddd3322c4599a09233a909aa05905ae9571da",
+        },
+      });
+    });
+
+    await runLockHeld;
+    const heartbeat = heartbeatService(peerDb, { skipQueuedRunDispatch: true });
+    const enqueue = heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "github_pr_review_requested",
+      payload: { taskKey, deliveryId: "review-request-delivery" },
+      contextSnapshot: {
+        taskKey,
+        reviewKind: "pr_review",
+        wakeReason: "github_pr_review_requested",
+        githubRepoFullName: "Blockcast/penstock-llm-proxy-core",
+        githubPrNumber: 691,
+      },
+      idempotencyKey: `${taskKey}:github_pr_review_requested`,
+    });
+
+    const outcomeBeforeCommit = await Promise.race([
+      enqueue.then(() => "enqueued" as const),
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100)),
+    ]);
+    expect(outcomeBeforeCommit).toBe("blocked");
+
+    releaseRunLock();
+    await inFlightRun;
+    const result = await enqueue;
+
+    const runs = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toEqual([{ id: runningRunId, status: "running" }]);
+    expect(result?.id).toBe(runningRunId);
+
+    const wakeups = await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups).toEqual([{ status: "coalesced", runId: runningRunId }]);
+  });
+
   it("coalesces with a scheduled retry created while the enqueue waits for the agent lock", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
