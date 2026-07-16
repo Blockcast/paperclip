@@ -70,6 +70,7 @@ import { publishLiveEvent } from "./live-events.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
   deleteAgentJobExact,
+  deleteAgentJobsForRun,
   hasActiveJobForAgent,
   indexUniqueAgentJobRunStatuses,
   listAgentJobRunStatuses,
@@ -11136,20 +11137,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const cleanedRunIds: string[] = [];
     for (const { run, adapterType } of terminalRuns) {
       if (!hasExternalLifecycle(adapterType)) continue;
-      const reservation = await getActiveExternalRuntimeReservation(db, run.id);
-      const observed = jobRunStatuses.get(run.id);
-      if (
-        !reservation?.jobName
-        || !reservation.jobUid
-        || observed?.name !== reservation.jobName
-        || observed.uid !== reservation.jobUid
-      ) {
-        logger.error(
-          { runId: run.id, reservationId: reservation?.id ?? null, observed },
-          "refusing terminal Job cleanup because exact reservation identity did not reconcile",
-        );
-        continue;
-      }
       if (isExternalLifecycleRunInRecentGrace(run, now)) {
         logger.debug(
           { runId: run.id, status: run.status, adapterType },
@@ -11157,19 +11144,76 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
         continue;
       }
+      const reservation = await getActiveExternalRuntimeReservation(db, run.id);
+      const observed = jobRunStatuses.get(run.id);
+      const reservationReconciles =
+        Boolean(reservation?.jobName)
+        && Boolean(reservation?.jobUid)
+        && observed?.name === reservation?.jobName
+        && observed?.uid === reservation?.jobUid;
+
+      if (reservationReconciles) {
+        try {
+          const deleted = await deleteExactExternalRuntimeJob(run);
+          if (deleted !== "deleted" && deleted !== "missing") continue;
+          cleanedRunIds.push(run.id);
+          logger.warn(
+            { runId: run.id, status: run.status, adapterType, deletionResult: deleted },
+            "reapOrphanedRuns: deleted live external-lifecycle Job for terminal heartbeat run",
+          );
+          await appendRunEvent(run, await nextRunEventSeq(run.id), {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: "Deleted live external-lifecycle Job because heartbeat run is already terminal",
+            payload: {
+              status: run.status,
+              adapterType,
+            },
+          });
+        } catch (error) {
+          logger.warn(
+            {
+              runId: run.id,
+              status: run.status,
+              adapterType,
+              error: error instanceof Error ? error.message : String(error),
+            },
+            "reapOrphanedRuns: failed to delete live external-lifecycle Job for terminal heartbeat run",
+          );
+        }
+        continue;
+      }
+
+      // BLO-16473: the exact reservation identity is gone or stale (e.g. an
+      // earlier finalize-time delete threw, or the reservation was already
+      // released without the Job actually being torn down) — the loop above
+      // used to just log an error and give up forever here, leaking the Job
+      // (and its Pod) indefinitely. That live-but-terminal Job then permanently
+      // holds `hasActiveJobForAgent` true, so the agent's dispatcher wedges:
+      // `startNextQueuedRunForAgent` sees runningCount === 0 but an active Job
+      // and refuses to claim any new queued run, forever. Fall back to
+      // deleting by the Job's `paperclip.io/run-id` label, which is stamped at
+      // creation and immutable — as safe an identity check as the reservation
+      // row, but independent of that row still existing.
+      logger.warn(
+        { runId: run.id, reservationId: reservation?.id ?? null, observed },
+        "terminal Job cleanup: reservation identity did not reconcile; falling back to run-id label match",
+      );
       try {
-        const deleted = await deleteExactExternalRuntimeJob(run);
-        if (deleted !== "deleted" && deleted !== "missing") continue;
+        const deletedCount = await deleteAgentJobsForRun(run.id);
+        if (!deletedCount) continue;
         cleanedRunIds.push(run.id);
         logger.warn(
-          { runId: run.id, status: run.status, adapterType, deletionResult: deleted },
-          "reapOrphanedRuns: deleted live external-lifecycle Job for terminal heartbeat run",
+          { runId: run.id, status: run.status, adapterType, deletedCount },
+          "reapOrphanedRuns: deleted live external-lifecycle Job for terminal heartbeat run (run-id fallback)",
         );
         await appendRunEvent(run, await nextRunEventSeq(run.id), {
           eventType: "lifecycle",
           stream: "system",
           level: "warn",
-          message: "Deleted live external-lifecycle Job because heartbeat run is already terminal",
+          message:
+            "Deleted live external-lifecycle Job via run-id fallback because heartbeat run is already terminal and no reservation identity reconciled",
           payload: {
             status: run.status,
             adapterType,
@@ -11183,7 +11227,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             adapterType,
             error: error instanceof Error ? error.message : String(error),
           },
-          "reapOrphanedRuns: failed to delete live external-lifecycle Job for terminal heartbeat run",
+          "reapOrphanedRuns: failed to delete live external-lifecycle Job via run-id fallback for terminal heartbeat run",
         );
       }
     }
