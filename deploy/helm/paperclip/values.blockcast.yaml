@@ -131,16 +131,6 @@ env:
       value: "true"
     - name: PAPERCLIP_RUNTIME_API_CANDIDATES_JSON
       value: '["https://paperclip.blockcast.net"]'
-    # Agent run JWTs are minted once at Job dispatch (heartbeat executeRun)
-    # and injected as a static PAPERCLIP_API_KEY — nothing refreshes them.
-    # The 1h default TTL is shorter than routine k8s implementation runs
-    # (2-8h observed), so any run crossing the TTL loses every Paperclip
-    # API call mid-run: comments/status PATCH 401, escalate_to_human 403,
-    # completed work never persists and the issue re-dispatches in a loop
-    # (BLO-16449). 12h covers observed run durations; tokens stay
-    # run-scoped and signed with the per-company derived key.
-    - name: PAPERCLIP_AGENT_JWT_TTL_SECONDS
-      value: "43200"
     # Designated PR reviewer agent (Ally). The github-webhook route fires
     # an additional wake here on `pull_request.opened`,
     # `pull_request.ready_for_review`, and `pull_request_review.submitted`
