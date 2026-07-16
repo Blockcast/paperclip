@@ -2,6 +2,7 @@
 // API/worker split. Verifies env parsing + the implicit override that
 // forces heartbeatSchedulerEnabled=false on the API tier.
 
+import { readFileSync } from "node:fs";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { loadConfig } from "../config.js";
 import {
@@ -74,6 +75,13 @@ describe("PAPERCLIP_NODE_ROLE", () => {
     process.env.HEARTBEAT_SCHEDULER_ENABLED = "false";
     const config = loadConfig();
     expect(config.heartbeatSchedulerEnabled).toBe(false);
+  });
+
+  it("forwards the node role to GitHub webhook heartbeat services", () => {
+    const appSource = readFileSync(new URL("../app.ts", import.meta.url), "utf8");
+    expect(appSource).toContain(
+      "heartbeatOptions: { paperclipNodeRole: appConfig.paperclipNodeRole },",
+    );
   });
 });
 

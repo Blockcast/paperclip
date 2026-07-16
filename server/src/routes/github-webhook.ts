@@ -125,10 +125,13 @@ export interface GithubWebhookConfig {
    */
   dependabotMinSeverity?: "low" | "medium" | "high" | "critical";
   /**
-   * Test/service override for heartbeat dispatch behavior. Production callers
-   * normally leave this unset so queued webhook wakes dispatch immediately.
+   * Dispatch ownership and test overrides for heartbeat wakes. Split-tier
+   * production forwards its node role so API handlers enqueue for the worker.
    */
-  heartbeatOptions?: Pick<HeartbeatServiceOptions, "penstockAvailabilityGate" | "skipQueuedRunDispatch">;
+  heartbeatOptions?: Pick<
+    HeartbeatServiceOptions,
+    "paperclipNodeRole" | "penstockAvailabilityGate" | "skipQueuedRunDispatch"
+  >;
 }
 
 // Identifier extraction (`extractPaperclipIdentifiers`) lives in

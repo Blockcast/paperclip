@@ -879,6 +879,45 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(res.body).toMatchObject({ ignored: "no_matching_issue", identifiers: ["UNKNOWN-1234"] });
   });
 
+  it("leaves reviewer wakes queued when the webhook runs on the API tier", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Ally" });
+    const app = buildApp({
+      prReviewerAgentId: agentId,
+      heartbeatOptions: {
+        paperclipNodeRole: "api",
+        skipQueuedRunDispatch: false,
+      },
+    });
+    const payload = {
+      action: "opened",
+      pull_request: {
+        number: 977,
+        title: "Fence API-tier reviewer dispatch",
+        body: null,
+        head: { ref: "fix/api-reviewer-dispatch-fence", sha: "api-fence-head" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-api-reviewer-fence")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ reviewerWakeFired: true });
+
+    const runs = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.status).toBe("queued");
+  });
+
   it("does not coalesce reviewer PR wakes into a thin null-scope automation run (BLO-7457)", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Ally" });
     const activeRunId = randomUUID();

@@ -567,6 +567,10 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     githubWebhookRoutes(db, {
       webhookSecret: appConfig.githubWebhookSecret || null,
       pluginWorkerManager: workerManager,
+      // Webhooks land on the API tier in split deployments. Forward the node
+      // role so short-lived route services enqueue only; the singleton worker
+      // owns adapter execution and external-runtime reattachment.
+      heartbeatOptions: { paperclipNodeRole: appConfig.paperclipNodeRole },
       prReviewerAgentIds: appConfig.githubPrReviewerAgentIds,
       prReviewerBotLogin: appConfig.prReviewerBotLogin || null,
       // PR→issue back-link (BLO-13353). Absolute public origin used to build the
