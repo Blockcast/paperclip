@@ -419,6 +419,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       "../services/local-service-supervisor.js",
     );
     mockTerminateLocalService.mockImplementation(localServiceSupervisor.terminateLocalService);
+    mockHasActiveJobForAgent.mockImplementation(async () => false);
     mockAdapterExecute.mockImplementation(async () => ({
       exitCode: 0,
       signal: null,
