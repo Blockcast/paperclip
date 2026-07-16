@@ -12881,6 +12881,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     activeRunExecutions.add(run.id);
     let deferredForK8sIsolationConflict = false;
+    // BLO-16537: set when this invocation discovers its own run-scoped Job is
+    // still alive after the adapter refused to (re)launch it (see the guard
+    // below). The run/reservation/lease are intentionally left untouched, so
+    // the finally block below must not treat this exit as a completion.
+    let abandonedForLiveOwnJob = false;
 
     try {
     const agent = await getAgent(run.agentId);
@@ -14613,6 +14618,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         throw adapterErr;
       }
+      // BLO-16537: the k8s adapter reports `k8s_concurrent_run_blocked` when it
+      // finds a Job already alive for this run's identity instead of
+      // (re)launching one. A competing admission/reconciliation path for the
+      // SAME run — most commonly a post-restart reattach (resumeRunningExternal-
+      // RuntimeRuns) racing the still-live original launch — loses that race at
+      // the adapter layer but, before this guard, still won it at the DB layer:
+      // the outcome pipeline below would finalize this invocation's failure as
+      // the run's terminal state while the run's own Job kept executing and
+      // emitting output (the Ally canary NO-GO, BLO-15961/BLO-15962). Re-verify
+      // the reservation's bound Job directly against the cluster before
+      // accepting the adapter's refusal as authoritative: a confirmed-alive Job
+      // means this invocation lost a benign race against itself and must be
+      // abandoned without any run/reservation/lease mutation, never finalized
+      // as blocked. An unconfirmed (null) or non-active read is NOT treated as
+      // alive, so a genuine block still finalizes exactly as before.
+      if (
+        adapterResult.errorCode === "k8s_concurrent_run_blocked" &&
+        externalRuntimeReservation?.state === "launched" &&
+        externalRuntimeReservation.jobName &&
+        externalRuntimeReservation.jobUid
+      ) {
+        const ownJobStatus = await readAgentJobRunStatusByName(externalRuntimeReservation.jobName);
+        if (ownJobStatus?.phase === "active" && ownJobStatus.uid === externalRuntimeReservation.jobUid) {
+          logK8sGuardDecision({
+            decision: "blocked",
+            reason: "live_job_for_active_run",
+            isolation: k8sRunIsolation,
+            taskKey,
+            sessionId: runtimeForAdapter.sessionId,
+            agentId: agent.id,
+            runId: run.id,
+          });
+          recordConcurrentRunBlocked({
+            agentId: agent.id,
+            reason: "live_job_for_active_run",
+            isolationMode: k8sRunIsolation?.isolationMode ?? null,
+            knownAgentIds: await getActiveAgentIds(db, agent.companyId),
+          });
+          abandonedForLiveOwnJob = true;
+          return;
+        }
+      }
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
         ? await persistAdapterManagedRuntimeServices({
             db,
@@ -15338,7 +15385,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // pass the agent process exit code and adapter type to the hook
           // for branching (e.g. only refresh the cache on success, or only
           // for `_k8s` adapters).
-          if (!deferredForK8sIsolationConflict) {
+          if (!deferredForK8sIsolationConflict && !abandonedForLiveOwnJob) {
             const latestRunForHook = await getRun(run.id).catch(() => null);
             const agentForHook = await getAgent(run.agentId).catch(() => null);
             const exitCode = (() => {
