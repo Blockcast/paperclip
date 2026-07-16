@@ -57,7 +57,7 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   });
 
   it("vendors the opencode_k8s adapter commit with runtime isolation and the env-dump deny", () => {
-    expect(serverDockerfile).toContain("ARG OPENCODE_K8S_REF=4aca4ad6f690f68dee925960129f153f0e438439");
+    expect(serverDockerfile).toContain("ARG OPENCODE_K8S_REF=f4ca4a604f78387244661fddc1f5cd23e37cf35a");
     expect(serverDockerfile).toContain("PEN-1305 permission.bash env-dump deny");
     expect(serverDockerfile).toContain("disable opencode's turn-zero workspace");
     expect(serverDockerfile).toContain("snapshot: false");
