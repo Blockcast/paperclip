@@ -19,7 +19,7 @@ import {
   issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import {
   __test_backLinkAbsoluteUrl,
   __test_buildIssueBackLinkBody,
@@ -1295,6 +1295,99 @@ describeEmbeddedPostgres("github-webhook route", () => {
       status: "coalesced",
       idempotencyKey: "pr_review:Blockcast/magma:976:github_pr_synchronized",
     }));
+  });
+
+  it("serializes concurrent first events for the same PR before assigning a reviewer", async () => {
+    const { companyId, agentId: firstReviewerId } = await seedCompanyAndAgent({
+      agentName: "Ally",
+    });
+    const secondReviewerId = randomUUID();
+    const reviewerAgentIds = [firstReviewerId, secondReviewerId];
+    await db.insert(agents).values({
+      id: secondReviewerId,
+      companyId,
+      name: "Ally 2",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const taskKey = "pr_review:Blockcast/magma:978";
+    let reportLockAcquired!: () => void;
+    let releaseLock!: () => void;
+    const lockAcquired = new Promise<void>((resolve) => {
+      reportLockAcquired = resolve;
+    });
+    const releaseSignal = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const lockHolder = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`,
+      );
+      reportLockAcquired();
+      await releaseSignal;
+    });
+    await lockAcquired;
+
+    const app = buildApp({ prReviewerAgentIds: reviewerAgentIds });
+    const send = (action: "opened" | "synchronize", deliveryId: string, headSha: string) => {
+      const signed = signedRequest({
+        action,
+        pull_request: {
+          number: 978,
+          title: "Serialize reviewer assignment",
+          body: null,
+          html_url: "https://github.com/Blockcast/magma/pull/978",
+          head: { ref: "review-pool-concurrency", sha: headSha },
+        },
+        repository: { full_name: "Blockcast/magma" },
+      });
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signed.signature)
+        .set("x-github-delivery", deliveryId)
+        .set("content-type", "application/json")
+        .send(signed.body);
+    };
+    const responsesPromise = Promise.all([
+      send("opened", "delivery-review-pool-concurrent-opened", "first-head"),
+      send("synchronize", "delivery-review-pool-concurrent-sync", "second-head"),
+    ]);
+
+    try {
+      const completedBeforeRelease = await Promise.race([
+        responsesPromise.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 250)),
+      ]);
+      expect(completedBeforeRelease).toBe(false);
+    } finally {
+      releaseLock();
+      await lockHolder;
+    }
+
+    const responses = await responsesPromise;
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(responses.every((response) => response.body.reviewerWakeFired === true)).toBe(true);
+
+    const runs = await db
+      .select({ agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.agentId, reviewerAgentIds));
+    expect(runs).toHaveLength(1);
+
+    const wakes = await db
+      .select({ agentId: agentWakeupRequests.agentId })
+      .from(agentWakeupRequests)
+      .where(inArray(agentWakeupRequests.agentId, reviewerAgentIds));
+    expect(wakes).toHaveLength(2);
+    expect(new Set(wakes.map((wake) => wake.agentId))).toEqual(
+      new Set([runs[0]?.agentId]),
+    );
   });
 
   it("dedupes rapid pull_request.synchronize pushes and suppresses only synchronize author wakes", async () => {

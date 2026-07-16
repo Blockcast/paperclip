@@ -53,6 +53,12 @@ import {
   type RecordMergedPullRequestInput,
 } from "../services/issue-pull-requests.js";
 
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
+
+const PR_REVIEWER_TASK_LOCK_TIMEOUT_MS = 30_000;
+const PR_REVIEWER_TASK_LOCK_RETRY_MS = 25;
+
 export interface GithubWebhookConfig {
   /**
    * Shared secret configured on the GitHub webhook. When null/empty,
@@ -1044,7 +1050,7 @@ function configuredPrReviewerAgentIds(config: GithubWebhookConfig): string[] {
 }
 
 async function selectPrReviewerAgentId(
-  db: Db,
+  db: PrReviewerSelectionDb,
   configuredAgentIds: readonly string[],
   taskKey: string,
 ): Promise<string | null> {
@@ -1092,7 +1098,7 @@ async function selectPrReviewerAgentId(
 }
 
 async function findActivePrReviewerForTask(
-  db: Db,
+  db: PrReviewerSelectionDb,
   configuredAgentIds: readonly string[],
   taskKey: string,
 ): Promise<string | null> {
@@ -1113,6 +1119,38 @@ async function findActivePrReviewerForTask(
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
     .limit(1)
     .then((rows) => rows[0]?.agentId ?? null);
+}
+
+async function withPrReviewerTaskLock<T>(
+  db: Db,
+  taskKey: string,
+  action: (tx: DbTransaction) => Promise<T>,
+): Promise<T> {
+  const deadline = Date.now() + PR_REVIEWER_TASK_LOCK_TIMEOUT_MS;
+
+  while (true) {
+    // Do not block a pooled connection while another request owns the lock:
+    // the winner needs a second connection for heartbeat's enqueue transaction.
+    const outcome = await db.transaction(async (tx) => {
+      const rows = await tx.execute(
+        sql`select pg_try_advisory_xact_lock(hashtextextended(${taskKey}, 0)) as acquired`,
+      );
+      const row = Array.isArray(rows) ? rows[0] : null;
+      if (
+        !row ||
+        typeof row !== "object" ||
+        (row as Record<string, unknown>).acquired !== true
+      ) {
+        return { acquired: false as const };
+      }
+      return { acquired: true as const, value: await action(tx) };
+    });
+    if (outcome.acquired) return outcome.value;
+    if (Date.now() >= deadline) {
+      throw new Error("timed out acquiring PR reviewer task assignment lock");
+    }
+    await new Promise((resolve) => setTimeout(resolve, PR_REVIEWER_TASK_LOCK_RETRY_MS));
+  }
 }
 
 function prFeedbackBody(context: ResolvedEventContext): string | null {
@@ -1497,80 +1535,86 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         // taskKey scopes active-run coalescing; idempotencyKey scopes duplicate
         // request rows for the same PR+reason before enqueueing.
         const idempotencyKey = buildPrReviewerWakeIdempotencyKey(context, deliveryId);
-        const existingWake = await db
-          .select({ id: agentWakeupRequests.id })
-          .from(agentWakeupRequests)
-          .where(
-            and(
-              inArray(agentWakeupRequests.agentId, reviewerAgentIds),
-              eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
-              inArray(agentWakeupRequests.status, IDEMPOTENT_REVIEWER_WAKE_STATUSES),
-            ),
-          )
-          .limit(1)
-          .then((rows) => rows[0] ?? null);
-        if (existingWake) return false;
+        return await withPrReviewerTaskLock(db, reviewerTaskKey, async (tx) => {
+          // The wake insert commits through heartbeat's own transaction. Keep
+          // this transaction-scoped lock held until that commit is visible so
+          // concurrent first events for one PR re-check affinity instead of
+          // assigning the same task to different reviewers.
+          const existingWake = await tx
+            .select({ id: agentWakeupRequests.id })
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                inArray(agentWakeupRequests.agentId, reviewerAgentIds),
+                eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+                inArray(agentWakeupRequests.status, IDEMPOTENT_REVIEWER_WAKE_STATUSES),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (existingWake) return false;
 
-        const reviewerAgentId =
-          (await findActivePrReviewerForTask(db, reviewerAgentIds, reviewerTaskKey)) ??
-          (await selectPrReviewerAgentId(db, reviewerAgentIds, reviewerTaskKey));
-        if (!reviewerAgentId) {
-          logger.warn(
-            {
-              configuredReviewerCount: reviewerAgentIds.length,
+          const reviewerAgentId =
+            (await findActivePrReviewerForTask(tx, reviewerAgentIds, reviewerTaskKey)) ??
+            (await selectPrReviewerAgentId(tx, reviewerAgentIds, reviewerTaskKey));
+          if (!reviewerAgentId) {
+            logger.warn(
+              {
+                configuredReviewerCount: reviewerAgentIds.length,
+                event: eventName,
+                prNumber: context.prNumber,
+                repoFullName: context.repoFullName,
+              },
+              "github webhook reviewer wake skipped: no configured reviewer is active",
+            );
+            return false;
+          }
+
+          await heartbeat.wakeup(reviewerAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: context.wakeReason,
+            payload: {
+              taskKey: reviewerTaskKey,
+              source: "github",
               event: eventName,
+              deliveryId,
               prNumber: context.prNumber,
               repoFullName: context.repoFullName,
+              prUrl: context.prUrl,
+              eventUrl: context.eventUrl,
+              headSha: context.headSha,
+              paperclipIdentifiers: context.identifiers,
+              commentId: context.commentId,
+              commentAuthorLogin: context.commentAuthorLogin,
+              reviewKind: "pr_review",
             },
-            "github webhook reviewer wake skipped: no configured reviewer is active",
-          );
-          return false;
-        }
-
-        await heartbeat.wakeup(reviewerAgentId, {
-          source: "automation",
-          triggerDetail: "system",
-          reason: context.wakeReason,
-          payload: {
-            taskKey: reviewerTaskKey,
-            source: "github",
-            event: eventName,
-            deliveryId,
-            prNumber: context.prNumber,
-            repoFullName: context.repoFullName,
-            prUrl: context.prUrl,
-            eventUrl: context.eventUrl,
-            headSha: context.headSha,
-            paperclipIdentifiers: context.identifiers,
-            commentId: context.commentId,
-            commentAuthorLogin: context.commentAuthorLogin,
-            reviewKind: "pr_review",
-          },
-          contextSnapshot: {
-            taskKey: reviewerTaskKey,
-            wakeReason: context.wakeReason,
-            wakeSource: "automation",
-            wakeTriggerDetail: "system",
-            commentSource: "github",
-            githubEvent: eventName,
-            githubDeliveryId: deliveryId,
-            githubPrNumber: context.prNumber,
-            githubRepoFullName: context.repoFullName,
-            ...githubContextMetadata(context),
-            ...(context.commentId ? { githubCommentId: context.commentId } : {}),
-            ...(context.commentAuthorLogin
-              ? { githubPrReviewRequestAuthorLogin: context.commentAuthorLogin }
-              : {}),
-            ...(context.commentBody ? { githubPrReviewRequestBody: context.commentBody } : {}),
-            reviewKind: "pr_review",
-            prRole: "reviewer",
-          },
-          // Open/ready/review-submitted events stay one wake per PR+reason.
-          // @ally comment requests are scoped to the GitHub comment id so a
-          // later explicit re-review comment can wake Ally again.
-          idempotencyKey,
+            contextSnapshot: {
+              taskKey: reviewerTaskKey,
+              wakeReason: context.wakeReason,
+              wakeSource: "automation",
+              wakeTriggerDetail: "system",
+              commentSource: "github",
+              githubEvent: eventName,
+              githubDeliveryId: deliveryId,
+              githubPrNumber: context.prNumber,
+              githubRepoFullName: context.repoFullName,
+              ...githubContextMetadata(context),
+              ...(context.commentId ? { githubCommentId: context.commentId } : {}),
+              ...(context.commentAuthorLogin
+                ? { githubPrReviewRequestAuthorLogin: context.commentAuthorLogin }
+                : {}),
+              ...(context.commentBody ? { githubPrReviewRequestBody: context.commentBody } : {}),
+              reviewKind: "pr_review",
+              prRole: "reviewer",
+            },
+            // Open/ready/review-submitted events stay one wake per PR+reason.
+            // @ally comment requests are scoped to the GitHub comment id so a
+            // later explicit re-review comment can wake Ally again.
+            idempotencyKey,
+          });
+          return true;
         });
-        return true;
       } catch (err) {
         logger.error(
           {
