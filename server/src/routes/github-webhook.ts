@@ -56,7 +56,10 @@ import {
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
 
-const PR_REVIEWER_TASK_LOCK_TIMEOUT_MS = 30_000;
+// Keep lock contention well below GitHub's webhook timeout. The winner holds
+// one pooled connection while heartbeat commits through another; createDb's
+// default pool satisfies the required minimum of two connections.
+const PR_REVIEWER_TASK_LOCK_TIMEOUT_MS = 2_000;
 const PR_REVIEWER_TASK_LOCK_RETRY_MS = 25;
 
 export interface GithubWebhookConfig {
