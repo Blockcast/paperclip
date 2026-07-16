@@ -297,7 +297,12 @@ ARG CLAUDE_K8S_REF=ec788a7f0ea2bb5707852149e49676374c8d9498
 # to a new tmpRoot sibling of homeRoot/sessionRoot/cacheRoot/workspaceRoot
 # for run and workspace isolation modes. Shared mode is unchanged. typecheck
 # and 524/524 tests pass, build clean.
-ARG OPENCODE_K8S_REF=4aca4ad6f690f68dee925960129f153f0e438439
+# Bumped 2026-07-16 to f4ca4a6 (#46): default reattachOrphanedJobs=true so a
+# same-task opencode Job orphaned by a paperclip-0 restart is reattached
+# (stream + await) instead of failing new runs with k8s_concurrent_run_blocked
+# (observed: Players-Engineer run 8d35d883 blocked after a paperclip-0 restart).
+# PR kkroo/paperclip-adapter-opencode-k8s#46; adapter suite 118/118, typecheck clean.
+ARG OPENCODE_K8S_REF=f4ca4a604f78387244661fddc1f5cd23e37cf35a
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
