@@ -141,7 +141,7 @@ env:
     # Keep this to approved, active agent IDs only. The server also accepts the
     # legacy singular PAPERCLIP_PR_REVIEWER_AGENT_ID for older deployments.
     - name: PAPERCLIP_PR_REVIEWER_AGENT_IDS
-      value: "e0a5011d-5c94-4801-be52-64c14f98ac26"
+      value: "e0a5011d-5c94-4801-be52-64c14f98ac26,2e7fbdf3-b9a7-41f6-9c71-2b79009e8785"
     # Designated Dependabot remediation agent (Release Engineer). The
     # github-webhook route wakes this agent on `dependabot_alert`
     # created/reintroduced/reopened events at or above the severity floor
