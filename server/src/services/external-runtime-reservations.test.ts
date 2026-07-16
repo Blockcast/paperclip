@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, isNull } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
@@ -135,6 +135,230 @@ describeEmbeddedPostgres("external runtime reservations", () => {
       .where(inArray(heartbeatRuns.id, runIds));
     expect(runs.filter((run) => run.status === "running")).toHaveLength(2);
     expect(runs.filter((run) => run.status === "queued")).toHaveLength(1);
+  });
+
+  it("keeps two same-agent runs progressing through intentionally skewed launches", async () => {
+    const [slowRunId, fastRunId] = await seedQueuedRuns(2);
+    const claimedAt = new Date("2026-07-15T12:00:00.000Z");
+    const [slowClaim, fastClaim] = await Promise.all([
+      claimRunWithExternalRuntimeSlotPool(db, slowRunId, claimedAt, 2),
+      claimRunWithExternalRuntimeSlotPool(db, fastRunId, claimedAt, 2),
+    ]);
+
+    expect(slowClaim).not.toBeNull();
+    expect(fastClaim).not.toBeNull();
+    expect(slowClaim!.reservation.slotId).not.toBe(fastClaim!.reservation.slotId);
+
+    // Launch the second claimant first to preserve the pre-Job skew that used
+    // to make the slower sibling look lost.
+    await bindExternalRuntimeReservationIsolation(db, {
+      runId: fastRunId,
+      reservationId: fastClaim!.reservation.id,
+      isolationMode: "run",
+      isolationKey: `run:${fastRunId}`,
+    });
+    await markExternalRuntimeReservationLaunching(db, fastRunId);
+    await recordExpectedExternalRuntimeJobName(db, { runId: fastRunId, jobName: "agent-fast" });
+    await recordExternalRuntimeJobIdentity(db, {
+      runId: fastRunId,
+      jobName: "agent-fast",
+      jobUid: "uid-fast",
+    });
+
+    const slowBeforeLaunch = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, slowRunId))
+      .then((rows) => rows[0]);
+    expect(slowBeforeLaunch).toMatchObject({ state: "reserved", releasedAt: null });
+
+    await bindExternalRuntimeReservationIsolation(db, {
+      runId: slowRunId,
+      reservationId: slowClaim!.reservation.id,
+      isolationMode: "run",
+      isolationKey: `run:${slowRunId}`,
+    });
+    await markExternalRuntimeReservationLaunching(db, slowRunId);
+    await recordExpectedExternalRuntimeJobName(db, { runId: slowRunId, jobName: "agent-slow" });
+    await recordExternalRuntimeJobIdentity(db, {
+      runId: slowRunId,
+      jobName: "agent-slow",
+      jobUid: "uid-slow",
+    });
+
+    const active = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(isNull(externalRuntimeReservations.releasedAt));
+    expect(active).toHaveLength(2);
+    expect(active.map((reservation) => reservation.state).sort()).toEqual(["launched", "launched"]);
+
+    await releaseExternalRuntimeReservation(db, { runId: slowRunId, reason: "succeeded" });
+    await releaseExternalRuntimeReservation(db, { runId: fastRunId, reason: "succeeded" });
+    expect(await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(isNull(externalRuntimeReservations.releasedAt))).toHaveLength(0);
+  });
+
+  it("contains pre-launch sibling failure and releases only the failed slot", async () => {
+    const [failedRunId, healthyRunId] = await seedQueuedRuns(2);
+    const failedClaim = await claimRunWithExternalRuntimeSlotPool(db, failedRunId, new Date(), 2);
+    const healthyClaim = await claimRunWithExternalRuntimeSlotPool(db, healthyRunId, new Date(), 2);
+
+    await bindExternalRuntimeReservationIsolation(db, {
+      runId: healthyRunId,
+      reservationId: healthyClaim!.reservation.id,
+      isolationMode: "run",
+      isolationKey: `run:${healthyRunId}`,
+    });
+    await markExternalRuntimeReservationLaunching(db, healthyRunId);
+    await recordExpectedExternalRuntimeJobName(db, { runId: healthyRunId, jobName: "healthy-job" });
+    await recordExternalRuntimeJobIdentity(db, {
+      runId: healthyRunId,
+      jobName: "healthy-job",
+      jobUid: "healthy-uid",
+    });
+
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "failed", errorCode: "launch_failed", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, failedRunId));
+
+    const [failedReservation, healthyReservation] = await Promise.all([
+      db.select().from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.id, failedClaim!.reservation.id))
+        .then((rows) => rows[0]),
+      db.select().from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.id, healthyClaim!.reservation.id))
+        .then((rows) => rows[0]),
+    ]);
+    expect(failedReservation).toMatchObject({ state: "released", releaseReason: "launch_failed" });
+    expect(healthyReservation).toMatchObject({ state: "launched", releasedAt: null });
+
+    await releaseExternalRuntimeReservation(db, { runId: healthyRunId, reason: "succeeded" });
+    expect(await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(isNull(externalRuntimeReservations.releasedAt))).toHaveLength(0);
+  });
+
+  it("reattaches exact sibling Jobs idempotently and cleans up cancellation independently", async () => {
+    const [cancelledRunId, healthyRunId] = await seedQueuedRuns(2);
+    const cancelledClaim = await claimRunWithExternalRuntimeSlotPool(db, cancelledRunId, new Date(), 2);
+    const healthyClaim = await claimRunWithExternalRuntimeSlotPool(db, healthyRunId, new Date(), 2);
+
+    for (const [runId, claim, jobName, jobUid] of [
+      [cancelledRunId, cancelledClaim!, "cancelled-job", "cancelled-uid"],
+      [healthyRunId, healthyClaim!, "healthy-job", "healthy-uid"],
+    ] as const) {
+      await bindExternalRuntimeReservationIsolation(db, {
+        runId,
+        reservationId: claim.reservation.id,
+        isolationMode: "run",
+        isolationKey: `run:${runId}`,
+      });
+      await markExternalRuntimeReservationLaunching(db, runId);
+      await recordExpectedExternalRuntimeJobName(db, { runId, jobName });
+      await recordExternalRuntimeJobIdentity(db, { runId, jobName, jobUid });
+    }
+
+    // A restarted server observes the same identities again. Reattachment is
+    // idempotent and cannot replace one sibling's Job with the other's UID.
+    const reattached = await Promise.all([
+      recordExternalRuntimeJobIdentity(db, {
+        runId: cancelledRunId,
+        jobName: "cancelled-job",
+        jobUid: "cancelled-uid",
+      }),
+      recordExternalRuntimeJobIdentity(db, {
+        runId: healthyRunId,
+        jobName: "healthy-job",
+        jobUid: "healthy-uid",
+      }),
+    ]);
+    expect(reattached.map((reservation) => reservation?.id).sort()).toEqual(
+      [cancelledClaim!.reservation.id, healthyClaim!.reservation.id].sort(),
+    );
+
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, cancelledRunId));
+    expect(await db.select().from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, cancelledRunId))
+      .then((rows) => rows[0])).toMatchObject({ state: "release_pending" });
+    expect(await requireExternalRuntimeExecutionOwnership(db, {
+      runId: healthyRunId,
+      reservationId: healthyClaim!.reservation.id,
+      jobName: "healthy-job",
+      jobUid: "healthy-uid",
+    })).toMatchObject({ state: "launched" });
+
+    await releaseExternalRuntimeReservation(db, { runId: cancelledRunId, reason: "job_missing" });
+    await releaseExternalRuntimeReservation(db, { runId: healthyRunId, reason: "succeeded" });
+    expect(await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(isNull(externalRuntimeReservations.releasedAt))).toHaveLength(0);
+  });
+
+  it("enforces RWX logical isolation, RWO writer fencing, and shared-mode serialization", async () => {
+    const runIds = await seedQueuedRuns(6);
+    const [rwxFirstRunId, rwxSecondRunId, rwoFirstRunId, rwoSecondRunId, sharedFirstRunId, sharedSecondRunId] = runIds;
+    const claims = new Map<string, NonNullable<Awaited<ReturnType<typeof claimRunWithExternalRuntimeSlotPool>>>>();
+    for (const runId of runIds) {
+      const claim = await claimRunWithExternalRuntimeSlotPool(db, runId, new Date(), 6);
+      expect(claim).not.toBeNull();
+      claims.set(runId, claim!);
+    }
+
+    // RWX only makes the volume mountable by multiple Jobs. Mutable state is
+    // still isolated by distinct run keys.
+    for (const runId of [rwxFirstRunId, rwxSecondRunId]) {
+      await expect(bindExternalRuntimeReservationIsolation(db, {
+        runId,
+        reservationId: claims.get(runId)!.reservation.id,
+        isolationMode: "run",
+        isolationKey: `run:${runId}`,
+      })).resolves.toMatchObject({ isolationKey: `run:${runId}` });
+    }
+
+    const rwoKey = "workspace:rwo-backed-workspace";
+    await bindExternalRuntimeReservationIsolation(db, {
+      runId: rwoFirstRunId,
+      reservationId: claims.get(rwoFirstRunId)!.reservation.id,
+      isolationMode: "workspace",
+      isolationKey: rwoKey,
+    });
+    await expect(bindExternalRuntimeReservationIsolation(db, {
+      runId: rwoSecondRunId,
+      reservationId: claims.get(rwoSecondRunId)!.reservation.id,
+      isolationMode: "workspace",
+      isolationKey: rwoKey,
+    })).rejects.toMatchObject({ code: "external_runtime_isolation_conflict" });
+
+    const sharedKey = `agent-shared:${agentId}`;
+    await bindExternalRuntimeReservationIsolation(db, {
+      runId: sharedFirstRunId,
+      reservationId: claims.get(sharedFirstRunId)!.reservation.id,
+      isolationMode: "shared",
+      isolationKey: sharedKey,
+    });
+    await expect(bindExternalRuntimeReservationIsolation(db, {
+      runId: sharedSecondRunId,
+      reservationId: claims.get(sharedSecondRunId)!.reservation.id,
+      isolationMode: "shared",
+      isolationKey: sharedKey,
+    })).rejects.toMatchObject({ code: "external_runtime_isolation_conflict" });
+
+    for (const runId of claims.keys()) {
+      await releaseExternalRuntimeReservation(db, { runId, reason: "scenario_cleanup" });
+    }
+    expect(await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(isNull(externalRuntimeReservations.releasedAt))).toHaveLength(0);
   });
 
   it("rotates reservation identity when a deferred run retries", async () => {

@@ -1627,6 +1627,50 @@ describe("K8s session isolation metadata", () => {
     ).toBe(false);
   });
 
+  it("gives concurrent stateless runs disjoint mutable roots on shared RWX storage", () => {
+    const buildRunIsolation = (runId: string) => buildK8sRunIsolationDescriptor({
+      adapterType: "opencode_k8s",
+      runId,
+      companyId: "company-1",
+      agentId: "agent-1",
+      taskKey: "pr-review-42",
+      statelessPrReview: true,
+      executionWorkspace: {
+        cwd: "/paperclip/worktrees/pr-42",
+        source: "task_session",
+        strategy: "git_worktree",
+      },
+      persistedExecutionWorkspaceId: "execution-workspace-1",
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+    });
+    const firstRun = buildRunIsolation("run-1");
+    const secondRun = buildRunIsolation("run-2");
+
+    expect(firstRun).not.toBeNull();
+    expect(secondRun).not.toBeNull();
+    expect(firstRun?.storage).toEqual({
+      workspace: "ephemeral",
+      home: "ephemeral",
+      session: "ephemeral",
+      cache: "ephemeral",
+    });
+    const firstRoots = new Set([
+      firstRun!.workspaceRoot,
+      firstRun!.homeRoot,
+      firstRun!.sessionRoot,
+      firstRun!.cacheRoot,
+      firstRun!.tmpRoot,
+    ]);
+    const secondRoots = [
+      secondRun!.workspaceRoot,
+      secondRun!.homeRoot,
+      secondRun!.sessionRoot,
+      secondRun!.cacheRoot,
+      secondRun!.tmpRoot,
+    ];
+    expect(secondRoots.every((root) => !firstRoots.has(root))).toBe(true);
+  });
+
   it("reuses the durable workspace and session scope across heartbeat runs", () => {
     const buildWorkspaceIsolation = (runId: string) => buildK8sRunIsolationDescriptor({
       adapterType: "opencode_k8s",
