@@ -6,6 +6,7 @@ describe("agent local JWT", () => {
   const secretEnv = "PAPERCLIP_AGENT_JWT_SECRET";
   const betterAuthSecretEnv = "BETTER_AUTH_SECRET";
   const ttlEnv = "PAPERCLIP_AGENT_JWT_TTL_SECONDS";
+  const runMaxDurationEnv = "PAPERCLIP_AGENT_RUN_MAX_DURATION_SECONDS";
   const issuerEnv = "PAPERCLIP_AGENT_JWT_ISSUER";
   const audienceEnv = "PAPERCLIP_AGENT_JWT_AUDIENCE";
   const disableLegacyFallbackEnv = "PAPERCLIP_AGENT_JWT_DISABLE_LEGACY_FALLBACK";
@@ -14,6 +15,7 @@ describe("agent local JWT", () => {
     secret: process.env[secretEnv],
     betterAuthSecret: process.env[betterAuthSecretEnv],
     ttl: process.env[ttlEnv],
+    runMaxDuration: process.env[runMaxDurationEnv],
     issuer: process.env[issuerEnv],
     audience: process.env[audienceEnv],
     disableLegacyFallback: process.env[disableLegacyFallbackEnv],
@@ -23,6 +25,7 @@ describe("agent local JWT", () => {
     process.env[secretEnv] = "test-secret";
     delete process.env[betterAuthSecretEnv];
     process.env[ttlEnv] = "3600";
+    delete process.env[runMaxDurationEnv];
     delete process.env[issuerEnv];
     delete process.env[audienceEnv];
     delete process.env[disableLegacyFallbackEnv];
@@ -37,6 +40,8 @@ describe("agent local JWT", () => {
     else process.env[betterAuthSecretEnv] = originalEnv.betterAuthSecret;
     if (originalEnv.ttl === undefined) delete process.env[ttlEnv];
     else process.env[ttlEnv] = originalEnv.ttl;
+    if (originalEnv.runMaxDuration === undefined) delete process.env[runMaxDurationEnv];
+    else process.env[runMaxDurationEnv] = originalEnv.runMaxDuration;
     if (originalEnv.issuer === undefined) delete process.env[issuerEnv];
     else process.env[issuerEnv] = originalEnv.issuer;
     if (originalEnv.audience === undefined) delete process.env[audienceEnv];
@@ -91,6 +96,38 @@ describe("agent local JWT", () => {
 
     vi.setSystemTime(new Date("2026-01-01T00:00:05.000Z"));
     expect(verifyLocalAgentJwt(token!)).toBeNull();
+  });
+
+  it("defaults token lifetime to run-max-duration (24h) plus the 15m persistence margin", () => {
+    delete process.env[ttlEnv];
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    const token = createLocalAgentJwt("agent-1", "company-1", "opencode_k8s", "run-1");
+
+    const claims = verifyLocalAgentJwt(token!);
+    expect(claims).not.toBeNull();
+    expect(claims!.exp - claims!.iat).toBe(24 * 60 * 60 + 15 * 60);
+  });
+
+  it("derives token lifetime from PAPERCLIP_AGENT_RUN_MAX_DURATION_SECONDS plus the margin", () => {
+    delete process.env[ttlEnv];
+    process.env[runMaxDurationEnv] = "7200";
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    const token = createLocalAgentJwt("agent-1", "company-1", "opencode_k8s", "run-1");
+
+    const claims = verifyLocalAgentJwt(token!);
+    expect(claims).not.toBeNull();
+    expect(claims!.exp - claims!.iat).toBe(7200 + 15 * 60);
+  });
+
+  it("lets an explicit PAPERCLIP_AGENT_JWT_TTL_SECONDS override the run-duration derivation", () => {
+    process.env[ttlEnv] = "3600";
+    process.env[runMaxDurationEnv] = "7200";
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    const token = createLocalAgentJwt("agent-1", "company-1", "opencode_k8s", "run-1");
+
+    const claims = verifyLocalAgentJwt(token!);
+    expect(claims).not.toBeNull();
+    expect(claims!.exp - claims!.iat).toBe(3600);
   });
 
   it("rejects issuer/audience mismatch", () => {
@@ -159,14 +196,6 @@ describe("agent local JWT", () => {
     });
   });
 
-  it("defaults TTL to 1h when PAPERCLIP_AGENT_JWT_TTL_SECONDS is unset", () => {
-    delete process.env[ttlEnv];
-    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
-    const token = createLocalAgentJwt("agent-1", "company-1", "claude_local", "run-1");
-    const claims = verifyLocalAgentJwt(token!);
-    expect(claims).not.toBeNull();
-    expect(claims!.exp - claims!.iat).toBe(60 * 60);
-  });
 
   // Helper: hand-craft a token signed with the raw master secret (legacy path).
   function craftLegacyMasterSecretToken(masterSecret: string, companyId: string) {
