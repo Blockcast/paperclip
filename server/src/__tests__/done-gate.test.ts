@@ -40,6 +40,25 @@ describe("shouldBlockNarratedDone", () => {
     ).toBe(false);
   });
 
+  it("allows done when a pr-link was detected but is not a required shape for this issue's labels (BLO-16325)", () => {
+    // Mirrors the real evidence-gate.ts shape: `evidenceFound` is
+    // `required ∩ detected` and omits pr-link whenever it isn't required
+    // (unlabeled issues, `infra`/`backend`-labeled issues, etc.), while
+    // `allDetected` is every shape the evaluator actually found. A real
+    // pasted GitHub PR URL must still unblock `done` in that case.
+    expect(
+      shouldBlockNarratedDone({
+        ...base,
+        fromStatus: "blocked",
+        lastEvidenceVerdict: {
+          verdict: "warn",
+          evidenceFound: [],
+          allDetected: ["pr-link"],
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("does nothing for non-done transitions", () => {
     expect(shouldBlockNarratedDone({ ...base, toStatus: "in_review" })).toBe(false);
     expect(shouldBlockNarratedDone({ ...base, toStatus: undefined })).toBe(false);
