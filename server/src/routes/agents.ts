@@ -1417,13 +1417,19 @@ export function agentRoutes(
     }
 
     const adapterConfig = asRecord(agent.adapterConfig) ?? {};
+    const requestedFiles = input?.files;
+    const hasRequestedFiles = Boolean(requestedFiles) && Object.keys(requestedFiles!).length > 0;
     const hasExplicitInstructionsBundle =
       Boolean(asNonEmptyString(adapterConfig.instructionsBundleMode))
       || Boolean(asNonEmptyString(adapterConfig.instructionsRootPath))
       || Boolean(asNonEmptyString(adapterConfig.instructionsEntryFile))
       || Boolean(asNonEmptyString(adapterConfig.instructionsFilePath))
       || Boolean(asNonEmptyString(adapterConfig.agentsMdPath));
-    if (hasExplicitInstructionsBundle) {
+    // A caller-supplied instructionsBundle.files payload must always be materialized, even when
+    // adapterConfig already declares instructions* fields (e.g. an adapterConfig template cloned
+    // from another agent's role). Otherwise the requested content is silently dropped and the
+    // agent is left with bundle metadata pointing at a bundle that was never written.
+    if (hasExplicitInstructionsBundle && !hasRequestedFiles) {
       const nextAdapterConfig = { ...adapterConfig };
       const hadLegacyPrompt =
         Object.prototype.hasOwnProperty.call(nextAdapterConfig, "promptTemplate")
@@ -1436,7 +1442,7 @@ export function agentRoutes(
       return (updated as T | null) ?? { ...agent, adapterConfig: nextAdapterConfig };
     }
 
-    const files = input?.files
+    const files = requestedFiles
       ?? await loadDefaultAgentInstructionsBundle(resolveDefaultAgentInstructionsBundleRole(agent.role));
     const materialized = await instructions.materializeManagedBundle(
       agent,
