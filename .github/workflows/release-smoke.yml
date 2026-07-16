@@ -37,7 +37,7 @@ on:
 
 jobs:
   smoke:
-    runs-on: ubuntu-latest
+    runs-on: arc-dind
     timeout-minutes: 45
 
     steps:
@@ -58,9 +58,7 @@ jobs:
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Verify runner Chrome
-        # Release smoke also runs headless on GitHub's Ubuntu image, so use the
-        # runner's preinstalled Chrome instead of a Playwright browser download.
+      - name: Verify ARC runner Chrome
         run: google-chrome --version
 
       - name: Launch Docker smoke harness

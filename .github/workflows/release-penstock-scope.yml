@@ -34,7 +34,7 @@ permissions:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: arc-deploy
     environment: npm-penstock-scope # optional manual-approval gate; configure in repo settings
     steps:
       - name: Checkout

@@ -38,6 +38,7 @@
     "release:bootstrap-package": "node scripts/bootstrap-npm-package.mjs",
     "check:tokens": "node scripts/check-forbidden-tokens.mjs",
     "check:relay-ssl-multicert": "node scripts/check-relay-ssl-multicert.mjs",
+    "check:github-runner-labels": "node scripts/check-github-runner-labels.mjs",
     "check:no-git-push": "node scripts/check-no-git-push.mjs",
     "test:check-no-git-push": "node --test scripts/check-no-git-push.test.mjs",
     "test:security-audit-overrides": "node scripts/security-audit-overrides.test.js",

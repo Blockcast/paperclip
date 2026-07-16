@@ -29,7 +29,7 @@ jobs:
   verify_canary_typecheck:
     name: Canary typecheck
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 25
     permissions:
       contents: read
@@ -69,7 +69,7 @@ jobs:
   verify_canary_general_tests:
     name: Canary general tests (${{ matrix.group_label }})
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 25
     permissions:
       contents: read
@@ -137,7 +137,7 @@ jobs:
   verify_canary_serialized_server:
     name: Canary serialized server suites (${{ matrix.shard_label }})
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 25
     permissions:
       contents: read
@@ -188,7 +188,7 @@ jobs:
   verify_canary_build:
     name: Canary build
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 25
     permissions:
       contents: read
@@ -232,7 +232,7 @@ jobs:
       - verify_canary_general_tests
       - verify_canary_serialized_server
       - verify_canary_build
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 5
     permissions:
       contents: read
@@ -261,7 +261,7 @@ jobs:
     # verify_canary but skip publish cleanly.
     if: github.event_name == 'push' && github.repository == 'paperclipai/paperclip'
     needs: verify_canary
-    runs-on: ubuntu-latest
+    runs-on: arc-deploy
     timeout-minutes: 45
     environment: npm-canary
     permissions:
@@ -315,7 +315,7 @@ jobs:
 
   verify_stable:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: self-hosted
+    runs-on: default
     timeout-minutes: 30
     permissions:
       contents: read
@@ -356,7 +356,7 @@ jobs:
   preview_stable:
     if: github.event_name == 'workflow_dispatch' && inputs.dry_run
     needs: verify_stable
-    runs-on: self-hosted
+    runs-on: default
     timeout-minutes: 45
     permissions:
       contents: read
@@ -402,7 +402,7 @@ jobs:
     # would hit ENEEDAUTH if they ever trigger this job manually.
     if: github.event_name == 'workflow_dispatch' && !inputs.dry_run && github.repository == 'paperclipai/paperclip'
     needs: verify_stable
-    runs-on: ubuntu-latest
+    runs-on: arc-deploy
     timeout-minutes: 45
     environment: npm-stable
     permissions:

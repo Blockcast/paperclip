@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   review:
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 5
     env:
       # Blockcast does not provision the upstream commitperclip bot key. Skip
