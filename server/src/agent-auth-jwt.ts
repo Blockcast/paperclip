@@ -37,11 +37,43 @@ function jwtConfig() {
 
   return {
     secret,
-    ttlSeconds: parseNumber(process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS, 60 * 60),
+    ttlSeconds: parseNumber(process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS, defaultRunJwtTtlSeconds()),
     issuer: process.env.PAPERCLIP_AGENT_JWT_ISSUER ?? "paperclip",
     audience: process.env.PAPERCLIP_AGENT_JWT_AUDIENCE ?? "paperclip-api",
     disableLegacyFallback: parseBooleanEnv(process.env.PAPERCLIP_AGENT_JWT_DISABLE_LEGACY_FALLBACK),
   };
+}
+
+/**
+ * How long a dispatched agent run is allowed to live, in seconds. Nothing
+ * enforces this as a hard run deadline today (external-lifecycle runs are
+ * bounded only by the silence watchdog) — it exists so the run JWT's `exp`
+ * is derived from run-lifetime semantics instead of an arbitrary constant.
+ */
+const DEFAULT_RUN_MAX_DURATION_SECONDS = 24 * 60 * 60;
+
+/**
+ * Extra token lifetime past the run's max duration so a run that lives right
+ * up to the bound can still persist its final writes (issue comment, status
+ * transition, escalation) with a valid token.
+ */
+const RUN_JWT_EXP_MARGIN_SECONDS = 15 * 60;
+
+/**
+ * The run JWT is minted ONCE at Job dispatch and injected as a static
+ * PAPERCLIP_API_KEY — nothing refreshes it mid-run. A TTL shorter than the
+ * run's lifetime therefore cuts the agent off from every Paperclip API call
+ * partway through (writes 401, escalations 403, completed work never
+ * persists — BLO-16449). Derive the default from the run's max allowed
+ * duration plus a persistence margin; PAPERCLIP_AGENT_JWT_TTL_SECONDS
+ * remains an explicit operator override.
+ */
+function defaultRunJwtTtlSeconds() {
+  const runMaxDurationSeconds = parseNumber(
+    process.env.PAPERCLIP_AGENT_RUN_MAX_DURATION_SECONDS,
+    DEFAULT_RUN_MAX_DURATION_SECONDS,
+  );
+  return runMaxDurationSeconds + RUN_JWT_EXP_MARGIN_SECONDS;
 }
 
 /**
@@ -143,8 +175,9 @@ export function verifyLocalAgentJwt(token: string): LocalAgentJwtClaims | null {
   // outstanding tokens (TTL bounds the legacy window naturally).
   //
   // Operators should set `PAPERCLIP_AGENT_JWT_DISABLE_LEGACY_FALLBACK=true`
-  // approximately one JWT TTL (~1h by default, see PAPERCLIP_AGENT_JWT_TTL_SECONDS)
-  // after deploying per-company signing. Once set, the master-secret fallback
+  // approximately one JWT TTL (run-max-duration + margin — ~24h15m by default —
+  // or the explicit PAPERCLIP_AGENT_JWT_TTL_SECONDS override) after deploying
+  // per-company signing. Once set, the master-secret fallback
   // is disabled and only tokens validating under the per-company derived key
   // are accepted — closing the window in which a leaked master secret could
   // be used to forge tokens with arbitrary future `exp` values for any tenant.
