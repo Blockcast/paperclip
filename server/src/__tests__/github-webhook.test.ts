@@ -1039,6 +1039,52 @@ describeEmbeddedPostgres("github-webhook route", () => {
     });
   });
 
+  it("uses a task-scoped tie-break when active reviewers have equal load", async () => {
+    const { companyId, agentId: firstReviewerId } = await seedCompanyAndAgent({
+      agentName: "Ally",
+    });
+    const secondReviewerId = randomUUID();
+    await db.insert(agents).values({
+      id: secondReviewerId,
+      companyId,
+      name: "Ally 2",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const app = buildApp({ prReviewerAgentIds: [firstReviewerId, secondReviewerId] });
+    const payload = {
+      action: "opened",
+      pull_request: {
+        number: 977,
+        title: "Spread equal-load reviews",
+        body: null,
+        head: { ref: "review-pool-tie-break" },
+      },
+      repository: { full_name: "Blockcast/magma" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-review-pool-tie-break")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.reviewerWakeFired).toBe(true);
+    const runs = await db
+      .select({ agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.agentId, [firstReviewerId, secondReviewerId]));
+    expect(runs).toEqual([{ agentId: secondReviewerId }]);
+  });
+
   it("does not assign PR review wakes to a terminated reviewer", async () => {
     const { companyId, agentId: activeReviewerId } = await seedCompanyAndAgent({
       agentName: "Ally",

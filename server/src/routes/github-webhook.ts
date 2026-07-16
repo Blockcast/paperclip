@@ -1046,6 +1046,7 @@ function configuredPrReviewerAgentIds(config: GithubWebhookConfig): string[] {
 async function selectPrReviewerAgentId(
   db: Db,
   configuredAgentIds: readonly string[],
+  taskKey: string,
 ): Promise<string | null> {
   if (configuredAgentIds.length === 0) return null;
 
@@ -1075,12 +1076,19 @@ async function selectPrReviewerAgentId(
   const loadByAgent = new Map(
     loadRows.map((row) => [row.agentId, Number(row.count)]),
   );
+  const minimumLoad = Math.min(
+    ...activeAgentIds.map((agentId) => loadByAgent.get(agentId) ?? 0),
+  );
+  const leastLoadedAgentIds = activeAgentIds.filter(
+    (agentId) => (loadByAgent.get(agentId) ?? 0) === minimumLoad,
+  );
 
-  return activeAgentIds.reduce((selected, candidate) => {
-    const selectedLoad = loadByAgent.get(selected) ?? 0;
-    const candidateLoad = loadByAgent.get(candidate) ?? 0;
-    return candidateLoad < selectedLoad ? candidate : selected;
-  });
+  // Concurrent webhook deliveries can observe the same load snapshot. A
+  // task-scoped tie-break spreads those PRs instead of biasing every tie to
+  // the first configured reviewer, while duplicate events for one PR still
+  // select the same reviewer and coalesce under that agent's task lock.
+  const tieBreak = crypto.createHash("sha256").update(taskKey).digest().readUInt32BE(0);
+  return leastLoadedAgentIds[tieBreak % leastLoadedAgentIds.length] ?? null;
 }
 
 async function findActivePrReviewerForTask(
@@ -1505,7 +1513,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
 
         const reviewerAgentId =
           (await findActivePrReviewerForTask(db, reviewerAgentIds, reviewerTaskKey)) ??
-          (await selectPrReviewerAgentId(db, reviewerAgentIds));
+          (await selectPrReviewerAgentId(db, reviewerAgentIds, reviewerTaskKey));
         if (!reviewerAgentId) {
           logger.warn(
             {
