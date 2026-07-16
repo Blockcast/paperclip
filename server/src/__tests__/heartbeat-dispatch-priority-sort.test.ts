@@ -58,13 +58,19 @@ vi.mock("../adapters/index.ts", async () => {
   };
 });
 
-vi.mock("../services/k8s-job-liveness.ts", () => ({
-  listLiveAgentJobRunIds: vi.fn(async () => null),
-  listAgentJobRunStatuses: vi.fn(async () => null),
-  readAgentJobRunStatusByName: vi.fn(async () => null),
-  deleteAgentJobsForRun: vi.fn(async () => 1),
-  hasActiveJobForAgent: vi.fn(async () => false),
-}));
+vi.mock("../services/k8s-job-liveness.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/k8s-job-liveness.ts")>();
+  return {
+    ...actual,
+    listLiveAgentJobRunIds: vi.fn(async () => null),
+    listAgentJobRunStatuses: vi.fn(async () => null),
+    listManagedAgentJobs: vi.fn(async () => null),
+    readAgentJobRunStatusByName: vi.fn(async () => null),
+    deleteAgentJobsForRun: vi.fn(async () => 1),
+    deleteAgentJobExact: vi.fn(async () => "deleted" as const),
+    hasActiveJobForAgent: vi.fn(async () => false),
+  };
+});
 
 vi.mock("../telemetry.ts", () => ({
   getTelemetryClient: () => ({ track: vi.fn() }),
@@ -788,5 +794,150 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       .where(eq(heartbeatRuns.id, recoveryRunId))
       .then((rows) => rows[0] ?? null);
     expect(recoveryRun?.status).not.toBe("queued");
+  });
+
+  it("dispatches a long-starved queued run as soon as the single external-lifecycle slot frees (BLO-16554)", async () => {
+    // Regression for BLO-16554: MulticastEngineer (opencode_k8s, external
+    // lifecycle) had a queued retry sit `startedAt: null` for ~9.5h despite
+    // being far past STARVATION_FULL_ESCALATION_MS (2h) and the agent's
+    // single slot cycling other work in that window. External-lifecycle
+    // agents default to effectiveMaxConcurrentRuns = 1 regardless of the
+    // configured maxConcurrentRuns (BLO-15959, concurrencyEnabled defaults
+    // false) -- this test pins the exact "one non-stale running run holds
+    // the only slot" shape and asserts the starved run is claimed the
+    // instant that slot frees, not merely eventually.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runningIssueId = randomUUID();
+    const starvedIssueId = randomUUID();
+    const issuePrefix = `X${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "ExternalSlotStarvationCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "ExternalLifecycleAgent",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      // maxConcurrentRuns is intentionally > 1 to prove effectiveMaxConcurrentRuns
+      // collapses to 1 anyway (concurrencyEnabled omitted -> defaults false).
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 3 } },
+      permissions: {},
+    });
+
+    await db.insert(issues).values([
+      {
+        id: runningIssueId,
+        companyId,
+        title: "Other backlog work currently occupying the single slot",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+        startedAt: new Date(),
+      },
+      {
+        id: starvedIssueId,
+        companyId,
+        title: "Long-starved retry work",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+        startedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+      },
+    ]);
+
+    const runningRunId = randomUUID();
+    const starvedRunId = randomUUID();
+    const starvedCreatedAt = new Date(Date.now() - 3 * 60 * 60 * 1000);
+
+    await db.insert(heartbeatRuns).values([
+      // Occupies the agent's one effective slot: fresh (non-stale) running run.
+      {
+        id: runningRunId,
+        companyId,
+        agentId,
+        invocationSource: "heartbeat",
+        triggerDetail: "timer",
+        status: "running",
+        contextSnapshot: { issueId: runningIssueId, wakeReason: "heartbeat_timer" },
+        startedAt: new Date(),
+        lastOutputAt: new Date(),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+      // Retry/continuation run, well past STARVATION_FULL_ESCALATION_MS (2h).
+      {
+        id: starvedRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: {
+          issueId: starvedIssueId,
+          wakeReason: "issue_continuation_needed",
+          source: "issue.continuation_recovery",
+        },
+        createdAt: starvedCreatedAt,
+        updatedAt: starvedCreatedAt,
+      },
+    ]);
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    // First tick: the single effective slot is occupied by the fresh running
+    // run, so the starved queued run must NOT be dispatched yet.
+    await heartbeat.resumeQueuedRuns();
+    const stillQueued = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, starvedRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(stillQueued?.status).toBe("queued");
+    expect(dispatchedRunIds).not.toContain(starvedRunId);
+
+    // The occupying run finishes, freeing the agent's one effective slot.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runningRunId));
+
+    // Next slot-available tick: the long-starved run must be claimed now,
+    // not left queued indefinitely.
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, starvedRunId);
+
+    expect(dispatchedRunIds[0]).toBe(starvedRunId);
+
+    const starvedRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, starvedRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(starvedRun?.status).not.toBe("queued");
   });
 });
