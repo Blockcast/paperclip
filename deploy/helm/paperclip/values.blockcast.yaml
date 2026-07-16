@@ -131,17 +131,19 @@ env:
       value: "true"
     - name: PAPERCLIP_RUNTIME_API_CANDIDATES_JSON
       value: '["https://paperclip.blockcast.net"]'
-    # Approved PR reviewer pool. The github-webhook route assigns each review
-    # to the least-loaded active agent on `pull_request.opened`,
-    # `pull_request.ready_for_review`, and `pull_request_review.submitted`
-    # so PRs without a paperclip identifier still get reviewed. Reviewers run
+    # Approved PR reviewer. The github-webhook route assigns reviews on
+    # `pull_request.opened`, `pull_request.ready_for_review`, and
+    # `pull_request_review.submitted`, including PRs without a Paperclip id.
+    # The original Ally keeps one continuous review history and runs
     # both `/pr-review-toolkit:review-pr` and `/gstack:codex review` per
-    # wake and post one consolidated comment. The webhook coalesces by
+    # wake, posting one consolidated comment. The webhook coalesces by
     # repo+pr+reason so burst events don't queue redundant reviews.
-    # Keep this to approved, active agent IDs only. The server also accepts the
-    # legacy singular PAPERCLIP_PR_REVIEWER_AGENT_ID for older deployments.
+    # Concurrency is provided by Ally's isolated external-runtime slots rather
+    # than separate reviewer identities, so expertise and session history stay
+    # attached to one agent. The server also accepts the legacy singular
+    # PAPERCLIP_PR_REVIEWER_AGENT_ID for older deployments.
     - name: PAPERCLIP_PR_REVIEWER_AGENT_IDS
-      value: "e0a5011d-5c94-4801-be52-64c14f98ac26,2e7fbdf3-b9a7-41f6-9c71-2b79009e8785"
+      value: "e0a5011d-5c94-4801-be52-64c14f98ac26"
     # Designated Dependabot remediation agent (Release Engineer). The
     # github-webhook route wakes this agent on `dependabot_alert`
     # created/reintroduced/reopened events at or above the severity floor

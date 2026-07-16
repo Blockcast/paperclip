@@ -153,7 +153,12 @@ WORKDIR /vendor
 # kkroo/paperclip-adapter-claude-k8s master (PR creation unavailable to the
 # GitHub App integration on this personal repo); typecheck and 426/426 tests
 # pass.
-ARG CLAUDE_K8S_REF=ec788a7f0ea2bb5707852149e49676374c8d9498
+# Bumped 2026-07-16 to 888840a (BLO-12558): emit isolated-start and
+# concurrent-block decisions with isolation mode/key, task key, and session ID;
+# fail closed on live Jobs with unknown isolation metadata; label server-owned
+# shared descriptors for later guard decisions. PR
+# kkroo/paperclip-adapter-claude-k8s#23; typecheck, build, and 430/430 tests pass.
+ARG CLAUDE_K8S_REF=888840a8229c8a73a3543f5a93b33793e86e0bcc
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
