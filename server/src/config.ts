@@ -141,11 +141,12 @@ export interface Config {
   // route refuses every request -- accepting unsigned webhooks would
   // let any caller drive paperclip wakes by impersonating GitHub.
   githubWebhookSecret: string;
-  // Agent ID that receives an additional wake on `pull_request.opened`,
+  // Agent IDs that receive additional wakes on `pull_request.opened`,
   // `pull_request.ready_for_review`, and `pull_request_review.submitted`
-  // events to drive PR review automation. When unset, the github-webhook
+  // events to drive PR review automation. New reviews are assigned to the
+  // least-loaded active agent. When empty, the github-webhook
   // route only wakes the issue assignee (legacy behavior).
-  githubPrReviewerAgentId: string;
+  githubPrReviewerAgentIds: string[];
   githubDependabotAgentId: string;
   githubDependabotMinSeverity: string;
   // GitHub App creds (from the `paperclip-github-app-creds` secret) used to mint
@@ -453,14 +454,26 @@ export function loadConfig(): Config {
       process.env.PAPERCLIP_LINEAR_REDIRECT_URI ??
       `http://localhost:${Number(process.env.PORT) || fileConfig?.server.port || 3100}/api/auth/linear/callback`,
     githubWebhookSecret: process.env.GITHUB_WEBHOOK_SECRET ?? "",
-    // Agent ID that receives an additional wake on `pull_request.opened`,
+    // Agent IDs that receive additional wakes on `pull_request.opened`,
     // `pull_request.ready_for_review`, and `pull_request_review.submitted`
     // events to drive PR review automation. When unset, the github-webhook
     // route only wakes the issue assignee (legacy behavior). The reviewer
     // wake fires regardless of whether the PR branch references a paperclip
     // identifier, so PRs without a BLO-XXX in the branch/title/body still
-    // get reviewed.
-    githubPrReviewerAgentId: process.env.PAPERCLIP_PR_REVIEWER_AGENT_ID ?? "",
+    // get reviewed. The plural CSV setting takes precedence; the singular
+    // setting remains supported for existing deployments.
+    githubPrReviewerAgentIds: [
+      ...new Set(
+        (
+          process.env.PAPERCLIP_PR_REVIEWER_AGENT_IDS ??
+          process.env.PAPERCLIP_PR_REVIEWER_AGENT_ID ??
+          ""
+        )
+          .split(",")
+          .map((value) => value.trim())
+          .filter(Boolean),
+      ),
+    ],
     githubDependabotAgentId: process.env.PAPERCLIP_DEPENDABOT_AGENT_ID ?? "",
     githubDependabotMinSeverity: process.env.PAPERCLIP_DEPENDABOT_MIN_SEVERITY ?? "high",
     // GitHub App creds for server-side installation-token minting (PR-review

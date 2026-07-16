@@ -567,7 +567,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     githubWebhookRoutes(db, {
       webhookSecret: appConfig.githubWebhookSecret || null,
       pluginWorkerManager: workerManager,
-      prReviewerAgentId: appConfig.githubPrReviewerAgentId || null,
+      prReviewerAgentIds: appConfig.githubPrReviewerAgentIds,
       prReviewerBotLogin: appConfig.prReviewerBotLogin || null,
       // PR→issue back-link (BLO-13353). Absolute public origin used to build the
       // issue URL posted onto PRs; null (unset PAPERCLIP_PUBLIC_URL) disables it.
