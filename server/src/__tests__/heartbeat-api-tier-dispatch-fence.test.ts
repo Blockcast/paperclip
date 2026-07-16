@@ -35,6 +35,7 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("heartbeat API-tier dispatch fence", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  const originalNodeRole = process.env.PAPERCLIP_NODE_ROLE;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-api-tier-dispatch-fence-");
@@ -42,6 +43,11 @@ describeEmbeddedPostgres("heartbeat API-tier dispatch fence", () => {
   });
 
   afterEach(async () => {
+    if (originalNodeRole === undefined) {
+      delete process.env.PAPERCLIP_NODE_ROLE;
+    } else {
+      process.env.PAPERCLIP_NODE_ROLE = originalNodeRole;
+    }
     await db.delete(heartbeatRunEvents);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
@@ -116,6 +122,27 @@ describeEmbeddedPostgres("heartbeat API-tier dispatch fence", () => {
     expect(run?.status).toBe("queued");
 
     // And it must not have spawned any execution events for the run.
+    const events = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.agentId, agentId));
+    expect(events).toHaveLength(0);
+  });
+
+  it("inherits the API dispatch fence from PAPERCLIP_NODE_ROLE when the caller omits options", async () => {
+    process.env.PAPERCLIP_NODE_ROLE = "api";
+    const { agentId, runId } = await seedAgentWithQueuedRun();
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(run?.status).toBe("queued");
+
     const events = await db
       .select()
       .from(heartbeatRunEvents)

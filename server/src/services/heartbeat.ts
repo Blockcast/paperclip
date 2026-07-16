@@ -5462,8 +5462,10 @@ export interface HeartbeatServiceOptions {
    * so executing a run there resolves every external adapter to the `process`
    * fallback and dies with "Process adapter missing command", launching no
    * agent pod (BLO-9089 incident). Only the "worker"/"all" tiers dispatch.
-   * Defaults to "all" (single-pod, pre-split behavior) when unset, so existing
-   * callers and tests are unaffected.
+   * When omitted, the service inherits PAPERCLIP_NODE_ROLE from the process
+   * environment. This keeps route-local service instances on API pods fenced
+   * even when their caller does not forward the parsed application config.
+   * Falls back to "all" only when neither source contains a recognized role.
    */
   paperclipNodeRole?: "api" | "worker" | "all";
   /**
@@ -5485,6 +5487,10 @@ export interface HeartbeatServiceOptions {
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
+  const envNodeRole = process.env.PAPERCLIP_NODE_ROLE;
+  const paperclipNodeRole =
+    options.paperclipNodeRole ??
+    (envNodeRole === "api" || envNodeRole === "worker" ? envNodeRole : "all");
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -12476,9 +12482,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // the run queued for it. Worker stays a singleton until an atomic per-run
     // claim (FOR UPDATE SKIP LOCKED / leader election) is added — do NOT scale
     // workers >1 before then, or N workers will double-dispatch.
-    if (options.paperclipNodeRole === "api") {
+    if (paperclipNodeRole === "api") {
       logger.debug(
-        { agentId, role: options.paperclipNodeRole },
+        { agentId, role: paperclipNodeRole },
         "startNextQueuedRunForAgent: dispatch fenced off on the API tier (workers tier owns run execution)",
       );
       return [];
