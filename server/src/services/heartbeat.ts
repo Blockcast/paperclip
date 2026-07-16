@@ -11202,7 +11202,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
       try {
         const deletedCount = await deleteAgentJobsForRun(run.id);
-        if (!deletedCount) continue;
+        if (deletedCount === null) continue;
         cleanedRunIds.push(run.id);
         logger.warn(
           { runId: run.id, status: run.status, adapterType, deletedCount },
