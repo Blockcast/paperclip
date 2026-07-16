@@ -15371,14 +15371,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               logger.error({ error, runId: run.id }, "failed to release external-runtime reservation after execution");
             });
           }
-          await releaseEnvironmentLeasesForRun({
-            runId: run.id,
-            companyId: run.companyId,
-            agentId: run.agentId,
-            status: latestRun?.status,
-            failureReason: latestRun?.error ?? undefined,
-          });
-          await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          // BLO-16537: both calls below are keyed by run.id, not by invocation.
+          // This invocation acquired its own environment lease (envOrchestrator.
+          // acquireForRun) and may hold adapter-managed runtime service leases
+          // before it ever reaches the k8s-liveness guard above. When
+          // abandonedForLiveOwnJob is set, the run's own Job is confirmed alive
+          // and still depends on those leases/services — releasing (and, for
+          // runtime services, actually stopping) them here would tear down
+          // resources out from under the still-running original invocation.
+          // Skip both so only the invocation that actually owns the terminal
+          // outcome performs this cleanup.
+          if (!abandonedForLiveOwnJob) {
+            await releaseEnvironmentLeasesForRun({
+              runId: run.id,
+              companyId: run.companyId,
+              agentId: run.agentId,
+              status: latestRun?.status,
+              failureReason: latestRun?.error ?? undefined,
+            });
+            await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          }
           // Post-run lifecycle hook (instance setting `general.postRunCmd`).
           // Fire-and-forget — does not block run finalization or release of
           // the next queued run. Latest run + agent are read here so we can

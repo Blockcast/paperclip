@@ -41,7 +41,12 @@ identity and is still `active`:
 
 - The invocation is abandoned with **no** mutation to the run row, the
   reservation, or the environment lease's terminal disposition — it is
-  simply a lost race against itself, not a failure.
+  simply a lost race against itself, not a failure. This also means the
+  `executeRun` `finally` block skips releasing this invocation's own
+  environment lease and adapter-managed runtime services: both are keyed by
+  `run.id`, not by invocation, and the still-live original launch may depend
+  on the very same lease/services this invocation acquired on its way to the
+  guard.
 - A `k8s_guard_decision` log line and a
   `claude_k8s_concurrent_run_blocked_total{reason="live_job_for_active_run"}`
   increment record the suppressed transition for observability.

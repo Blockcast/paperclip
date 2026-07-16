@@ -1319,7 +1319,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // The first reattach's fire-and-forget `executeRun` may still be
     // unwinding its own `finally` block (clearing `activeRunExecutions` /
     // `reattachingExternalRuns`) at this point, so poll instead of asserting
-    // a single call resumes it.
+    // a single call resumes it. Resolution here is also the only reliable
+    // signal that the FIRST reattach's `finally` block (including lease/
+    // runtime-service release calls) has fully settled: `reattachingExternalRuns`
+    // is only cleared by the `.finally()` wrapping the entire first
+    // `executeRun` call, and `resumeRunningExternalRuntimeRuns` skips
+    // dispatch entirely while that flag is still set. `drainInFlightExecutions`
+    // does NOT cover this fire-and-forget reattach path, so it cannot be used
+    // as that barrier.
     mockAdapterExecute.mockImplementationOnce(async () => ({
       exitCode: 1,
       signal: null,
@@ -1335,6 +1342,24 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       },
       { timeout: 10_000 },
     );
+
+    // Now that the first reattach's `finally` block is confirmed complete,
+    // assert its environment lease (acquired via `envOrchestrator.acquireForRun`
+    // before the k8s-liveness guard was ever reached, keyed by run.id — the
+    // same key the still-live original launch's lease uses) was never
+    // released. `releaseRunLeases` releases every active lease row for a
+    // runId, so an ungated call here would tear resources out from under the
+    // still-running original Job.
+    const leasesForRun = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.heartbeatRunId, runId));
+    expect(leasesForRun.length).toBeGreaterThan(0);
+    for (const lease of leasesForRun) {
+      expect(lease.status).toBe("active");
+      expect(lease.releasedAt).toBeNull();
+    }
+
     await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(2), { timeout: 10_000 });
     await heartbeat.drainInFlightExecutions(10_000);
     const runAfterSecondAttempt = await heartbeat.getRun(runId);
