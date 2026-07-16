@@ -32,7 +32,9 @@ jobs:
 
       - name: Resolve Playwright version
         id: playwright_version
-        run: echo "version=$(node -p \"require('@playwright/test/package.json').version\")" >> "$GITHUB_OUTPUT"
+        run: |
+          version="$(node -p "require('@playwright/test/package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Cache Playwright browser
         id: playwright_cache

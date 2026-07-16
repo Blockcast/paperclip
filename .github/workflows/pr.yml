@@ -150,6 +150,7 @@ jobs:
     timeout-minutes: 20
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
           - group: general-server
@@ -265,11 +266,12 @@ jobs:
 
   verify_serialized_server:
     name: Verify serialized server suites (${{ matrix.shard_label }})
-    needs: [policy]
+    needs: [policy, general_tests]
     runs-on: default
     timeout-minutes: 20
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
           - shard_index: 0
@@ -400,7 +402,9 @@ jobs:
 
       - name: Resolve Playwright version
         id: playwright_version
-        run: echo "version=$(node -p \"require('@playwright/test/package.json').version\")" >> "$GITHUB_OUTPUT"
+        run: |
+          version="$(node -p "require('@playwright/test/package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Cache Playwright browser
         id: playwright_cache
