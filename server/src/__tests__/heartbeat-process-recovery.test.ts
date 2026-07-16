@@ -104,6 +104,9 @@ const mockDeleteAgentJobsForRun = vi.hoisted(() =>
     async () => "deleted",
   ),
 );
+const mockDeleteAgentJobsByRunId = vi.hoisted(() =>
+  vi.fn<(runId: string) => Promise<number | null>>(async () => 1),
+);
 const mockListManagedAgentJobs = vi.hoisted(() =>
   vi.fn<() => Promise<Array<{
     phase: "active" | "succeeded" | "failed";
@@ -191,6 +194,7 @@ vi.mock("../services/k8s-job-liveness.ts", () => ({
   },
   readAgentJobRunStatusByName: mockReadAgentJobRunStatusByName,
   deleteAgentJobExact: mockDeleteAgentJobsForRun,
+  deleteAgentJobsForRun: mockDeleteAgentJobsByRunId,
   hasActiveJobForAgent: mockHasActiveJobForAgent,
 }));
 vi.mock("../services/local-service-supervisor.js", async () => {
@@ -415,6 +419,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       "../services/local-service-supervisor.js",
     );
     mockTerminateLocalService.mockImplementation(localServiceSupervisor.terminateLocalService);
+    mockHasActiveJobForAgent.mockImplementation(async () => false);
     mockAdapterExecute.mockImplementation(async () => ({
       exitCode: 0,
       signal: null,
@@ -2272,6 +2277,88 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.reaped).toBe(1);
     expect(result.runIds).toEqual([runId]);
     expect(mockDeleteAgentJobsForRun).toHaveBeenCalledWith(expect.objectContaining({ runId }));
+  });
+
+  it("deletes a terminal run's live Job by run-id label when its reservation is missing and unblocks dispatch", async () => {
+    const stale = new Date(Date.now() - 6 * 60 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      runStatus: "failed",
+      runErrorCode: "process_lost",
+      runError: "Terminal run retained a live Job after its reservation disappeared",
+      lastOutputAt: stale,
+    });
+    const queuedWakeupId = randomUUID();
+    const queuedRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: queuedWakeupId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: {},
+      status: "queued",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: queuedWakeupId,
+      contextSnapshot: {},
+      createdAt: new Date(Date.now() + 1000),
+      updatedAt: new Date(Date.now() + 1000),
+    });
+
+    let liveJobExists = true;
+    mockListAgentJobRunStatuses.mockResolvedValueOnce(new Map([[
+      runId,
+      { phase: "active", name: `agent-job-${runId.slice(0, 8)}`, uid: `uid-${runId}` },
+    ]]));
+    mockDeleteAgentJobsByRunId.mockImplementationOnce(async (deletedRunId) => {
+      expect(deletedRunId).toBe(runId);
+      liveJobExists = false;
+      return 1;
+    });
+    mockHasActiveJobForAgent.mockImplementation(async () => liveJobExists);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+    expect(mockDeleteAgentJobsByRunId).toHaveBeenCalledWith(runId);
+    expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
+
+    await heartbeat.resumeQueuedRuns();
+    expect((await heartbeat.getRun(queuedRunId))?.status).not.toBe("queued");
+  });
+
+  it("records a terminal run as cleaned when its run-id-labeled Job already disappeared", async () => {
+    const { runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      runStatus: "failed",
+      runErrorCode: "process_lost",
+      runError: "Terminal run retained a live Job after its reservation disappeared",
+      lastOutputAt: new Date(Date.now() - 6 * 60 * 1000),
+    });
+    mockListAgentJobRunStatuses.mockResolvedValueOnce(new Map([[
+      runId,
+      { phase: "active", name: `agent-job-${runId.slice(0, 8)}`, uid: `uid-${runId}` },
+    ]]));
+    mockDeleteAgentJobsByRunId.mockResolvedValueOnce(0);
+
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+    expect(mockDeleteAgentJobsByRunId).toHaveBeenCalledWith(runId);
   });
 
   it("finalizes a completed external-lifecycle Job as succeeded and starts the next queued same-agent run", async () => {
