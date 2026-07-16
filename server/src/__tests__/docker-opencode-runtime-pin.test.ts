@@ -27,7 +27,7 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   });
 
   it("vendors the claude_k8s adapter commit with runtime isolation and Penstock retry hints", () => {
-    expect(serverDockerfile).toContain("ARG CLAUDE_K8S_REF=ec788a7f0ea2bb5707852149e49676374c8d9498");
+    expect(serverDockerfile).toContain("ARG CLAUDE_K8S_REF=e2bc98321155d857ac3ee545ff2952c3dd4a6617");
     expect(serverDockerfile).toContain("PEN-1305 PreToolUse env-guard");
     expect(serverDockerfile).toContain("always materialize the shared MCP baseline");
     expect(serverDockerfile).toContain("Fixes BackendEngineerGo/Ally missing paperclip/hindsight/gbrain/linear/etc.");
@@ -54,6 +54,10 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(serverDockerfile).toContain("preserve Penstock's structured `resume_at`");
     expect(serverDockerfile).toContain("BLO-16219");
     expect(serverDockerfile).toContain("tmpRoot sibling of homeRoot/sessionRoot/cacheRoot/workspaceRoot");
+    expect(serverDockerfile).toContain("emit isolated-start and");
+    expect(serverDockerfile).toContain("fail closed on live Jobs with unknown isolation metadata");
+    expect(serverDockerfile).toContain("keep telemetry non-fatal");
+    expect(serverDockerfile).toContain("map legacy `isolated` labels");
   });
 
   it("vendors the opencode_k8s adapter commit with runtime isolation and the env-dump deny", () => {
