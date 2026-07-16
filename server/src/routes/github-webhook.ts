@@ -27,7 +27,15 @@
  */
 import { Router } from "express";
 import crypto from "node:crypto";
-import { type Db, agents, agentWakeupRequests, companies, issueComments, issues } from "@paperclipai/db";
+import {
+  type Db,
+  agents,
+  agentWakeupRequests,
+  companies,
+  heartbeatRuns,
+  issueComments,
+  issues,
+} from "@paperclipai/db";
 import { and, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
@@ -45,6 +53,15 @@ import {
   type RecordMergedPullRequestInput,
 } from "../services/issue-pull-requests.js";
 
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
+
+// Keep lock contention well below GitHub's webhook timeout. The winner holds
+// one pooled connection while heartbeat commits through another; createDb's
+// default pool satisfies the required minimum of two connections.
+const PR_REVIEWER_TASK_LOCK_TIMEOUT_MS = 2_000;
+const PR_REVIEWER_TASK_LOCK_RETRY_MS = 25;
+
 export interface GithubWebhookConfig {
   /**
    * Shared secret configured on the GitHub webhook. When null/empty,
@@ -55,13 +72,18 @@ export interface GithubWebhookConfig {
   webhookSecret: string | null;
   pluginWorkerManager?: PluginWorkerManager;
   /**
-   * Agent ID that receives an additional wake on PR-shaped events
+   * Agent IDs that receive additional wakes on PR-shaped events. New reviews
+   * are assigned to the least-loaded active reviewer. The singular option is
+   * retained for callers that have not migrated to the pool configuration.
+   *
+   * Review-driving events are
    * (`pull_request.opened`, `pull_request.reopened`,
    * `pull_request.ready_for_review`, `pull_request_review.submitted`). Drives automated PR review. The
    * reviewer wake fires independently of the issue-assignee wake and
    * does NOT require the PR branch/title/body to reference a paperclip
    * identifier. When null, only the legacy issue-assignee wake fires.
    */
+  prReviewerAgentIds?: readonly string[] | null;
   prReviewerAgentId?: string | null;
   /**
    * GitHub login for the automated PR reviewer bot. Used to recognize
@@ -103,10 +125,13 @@ export interface GithubWebhookConfig {
    */
   dependabotMinSeverity?: "low" | "medium" | "high" | "critical";
   /**
-   * Test/service override for heartbeat dispatch behavior. Production callers
-   * normally leave this unset so queued webhook wakes dispatch immediately.
+   * Dispatch ownership and test overrides for heartbeat wakes. Split-tier
+   * production forwards its node role so API handlers enqueue for the worker.
    */
-  heartbeatOptions?: Pick<HeartbeatServiceOptions, "penstockAvailabilityGate" | "skipQueuedRunDispatch">;
+  heartbeatOptions?: Pick<
+    HeartbeatServiceOptions,
+    "paperclipNodeRole" | "penstockAvailabilityGate" | "skipQueuedRunDispatch"
+  >;
 }
 
 // Identifier extraction (`extractPaperclipIdentifiers`) lives in
@@ -1020,6 +1045,120 @@ function buildPrReviewerTaskKey(context: ResolvedEventContext & { prNumber: numb
   return `pr_review:${repo}:${context.prNumber}`;
 }
 
+function configuredPrReviewerAgentIds(config: GithubWebhookConfig): string[] {
+  return [
+    ...new Set(
+      [...(config.prReviewerAgentIds ?? []), config.prReviewerAgentId ?? ""]
+        .map((agentId) => agentId.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+async function selectPrReviewerAgentId(
+  db: PrReviewerSelectionDb,
+  configuredAgentIds: readonly string[],
+  taskKey: string,
+): Promise<string | null> {
+  if (configuredAgentIds.length === 0) return null;
+
+  const activeRows = await db
+    .select({ id: agents.id })
+    .from(agents)
+    .where(
+      and(
+        inArray(agents.id, [...configuredAgentIds]),
+        inArray(agents.status, ["idle", "running"]),
+      ),
+    );
+  const activeSet = new Set(activeRows.map((row) => row.id));
+  const activeAgentIds = configuredAgentIds.filter((agentId) => activeSet.has(agentId));
+  if (activeAgentIds.length === 0) return null;
+
+  const loadRows = await db
+    .select({ agentId: heartbeatRuns.agentId, count: sql<number>`count(*)::int` })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        inArray(heartbeatRuns.agentId, activeAgentIds),
+        inArray(heartbeatRuns.status, ["queued", "running"]),
+      ),
+    )
+    .groupBy(heartbeatRuns.agentId);
+  const loadByAgent = new Map(
+    loadRows.map((row) => [row.agentId, Number(row.count)]),
+  );
+  const minimumLoad = Math.min(
+    ...activeAgentIds.map((agentId) => loadByAgent.get(agentId) ?? 0),
+  );
+  const leastLoadedAgentIds = activeAgentIds.filter(
+    (agentId) => (loadByAgent.get(agentId) ?? 0) === minimumLoad,
+  );
+
+  // Concurrent webhook deliveries can observe the same load snapshot. A
+  // task-scoped tie-break spreads those PRs instead of biasing every tie to
+  // the first configured reviewer, while duplicate events for one PR still
+  // select the same reviewer and coalesce under that agent's task lock.
+  const tieBreak = crypto.createHash("sha256").update(taskKey).digest().readUInt32BE(0);
+  return leastLoadedAgentIds[tieBreak % leastLoadedAgentIds.length] ?? null;
+}
+
+async function findActivePrReviewerForTask(
+  db: PrReviewerSelectionDb,
+  configuredAgentIds: readonly string[],
+  taskKey: string,
+): Promise<string | null> {
+  if (configuredAgentIds.length === 0) return null;
+
+  return db
+    .select({ agentId: heartbeatRuns.agentId })
+    .from(heartbeatRuns)
+    .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
+    .where(
+      and(
+        inArray(heartbeatRuns.agentId, [...configuredAgentIds]),
+        inArray(heartbeatRuns.status, ["queued", "running"]),
+        inArray(agents.status, ["idle", "running"]),
+        eq(heartbeatRuns.contextTaskKey, taskKey),
+      ),
+    )
+    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+    .limit(1)
+    .then((rows) => rows[0]?.agentId ?? null);
+}
+
+async function withPrReviewerTaskLock<T>(
+  db: Db,
+  taskKey: string,
+  action: (tx: DbTransaction) => Promise<T>,
+): Promise<T> {
+  const deadline = Date.now() + PR_REVIEWER_TASK_LOCK_TIMEOUT_MS;
+
+  while (true) {
+    // Do not block a pooled connection while another request owns the lock:
+    // the winner needs a second connection for heartbeat's enqueue transaction.
+    const outcome = await db.transaction(async (tx) => {
+      const rows = await tx.execute(
+        sql`select pg_try_advisory_xact_lock(hashtextextended(${taskKey}, 0)) as acquired`,
+      );
+      const row = Array.isArray(rows) ? rows[0] : null;
+      if (
+        !row ||
+        typeof row !== "object" ||
+        (row as Record<string, unknown>).acquired !== true
+      ) {
+        return { acquired: false as const };
+      }
+      return { acquired: true as const, value: await action(tx) };
+    });
+    if (outcome.acquired) return outcome.value;
+    if (Date.now() >= deadline) {
+      throw new Error("timed out acquiring PR reviewer task assignment lock");
+    }
+    await new Promise((resolve) => setTimeout(resolve, PR_REVIEWER_TASK_LOCK_RETRY_MS));
+  }
+}
+
 function prFeedbackBody(context: ResolvedEventContext): string | null {
   return context.reviewBody ?? context.commentBody ?? null;
 }
@@ -1307,11 +1446,12 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     // result, and forcibly deleting their Job would be more disruptive than
     // letting them finish.
     const reviewerRunsCancelled = await (async () => {
+      const reviewerAgentIds = configuredPrReviewerAgentIds(config);
       const reviewerWorkRetired =
         context?.wakeReason === "github_pr_closed" ||
         context?.wakeReason === "github_pr_converted_to_draft";
       if (
-        !config.prReviewerAgentId ||
+        reviewerAgentIds.length === 0 ||
         !reviewerWorkRetired ||
         typeof context.prNumber !== "number"
       ) {
@@ -1326,13 +1466,17 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         pluginWorkerManager: config.pluginWorkerManager,
         ...config.heartbeatOptions,
       });
-      const cancelled = await heartbeat.cancelPendingRunsForTask(
-        config.prReviewerAgentId,
-        reviewerTaskKey,
-        `Cancelled because GitHub PR ${context.repoFullName ?? "unknown"}#${context.prNumber} ${
-          context.wakeReason === "github_pr_closed" ? "closed" : "became a draft"
-        } before review dispatch`,
-      );
+      const reason = `Cancelled because GitHub PR ${context.repoFullName ?? "unknown"}#${context.prNumber} ${
+        context.wakeReason === "github_pr_closed" ? "closed" : "became a draft"
+      } before review dispatch`;
+      let cancelled = 0;
+      for (const reviewerAgentId of reviewerAgentIds) {
+        cancelled += await heartbeat.cancelPendingRunsForTask(
+          reviewerAgentId,
+          reviewerTaskKey,
+          reason,
+        );
+      }
       logger.info(
         {
           deliveryId,
@@ -1340,6 +1484,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           prNumber: context.prNumber,
           wakeReason: context.wakeReason,
           reviewerTaskKey,
+          reviewerCount: reviewerAgentIds.length,
           cancelled,
         },
         "github webhook retired pending reviewer runs for PR lifecycle transition",
@@ -1368,7 +1513,8 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     //  check_run/workflow_run are handled by the issue-assignee CI-completion
     //  path.)
     const reviewerWakeFired = await (async () => {
-      if (!config.prReviewerAgentId) return false;
+      const reviewerAgentIds = configuredPrReviewerAgentIds(config);
+      if (reviewerAgentIds.length === 0) return false;
       if (!shouldFirePrReviewerWake(context)) return false;
       // BLO-15799: don't enqueue a reviewer wake for the reviewer's own posted
       // review — that's a self-echo, not new review work (see
@@ -1395,68 +1541,91 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         // taskKey scopes active-run coalescing; idempotencyKey scopes duplicate
         // request rows for the same PR+reason before enqueueing.
         const idempotencyKey = buildPrReviewerWakeIdempotencyKey(context, deliveryId);
-        const existingWake = await db
-          .select({ id: agentWakeupRequests.id })
-          .from(agentWakeupRequests)
-          .where(
-            and(
-              eq(agentWakeupRequests.agentId, config.prReviewerAgentId),
-              eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
-              inArray(agentWakeupRequests.status, IDEMPOTENT_REVIEWER_WAKE_STATUSES),
-            ),
-          )
-          .limit(1)
-          .then((rows) => rows[0] ?? null);
-        if (existingWake) return false;
-        await heartbeat.wakeup(config.prReviewerAgentId, {
-          source: "automation",
-          triggerDetail: "system",
-          reason: context.wakeReason,
-          payload: {
-            taskKey: reviewerTaskKey,
-            source: "github",
-            event: eventName,
-            deliveryId,
-            prNumber: context.prNumber,
-            repoFullName: context.repoFullName,
-            prUrl: context.prUrl,
-            eventUrl: context.eventUrl,
-            headSha: context.headSha,
-            paperclipIdentifiers: context.identifiers,
-            commentId: context.commentId,
-            commentAuthorLogin: context.commentAuthorLogin,
-            reviewKind: "pr_review",
-          },
-          contextSnapshot: {
-            taskKey: reviewerTaskKey,
-            wakeReason: context.wakeReason,
-            wakeSource: "automation",
-            wakeTriggerDetail: "system",
-            commentSource: "github",
-            githubEvent: eventName,
-            githubDeliveryId: deliveryId,
-            githubPrNumber: context.prNumber,
-            githubRepoFullName: context.repoFullName,
-            ...githubContextMetadata(context),
-            ...(context.commentId ? { githubCommentId: context.commentId } : {}),
-            ...(context.commentAuthorLogin
-              ? { githubPrReviewRequestAuthorLogin: context.commentAuthorLogin }
-              : {}),
-            ...(context.commentBody ? { githubPrReviewRequestBody: context.commentBody } : {}),
-            reviewKind: "pr_review",
-            prRole: "reviewer",
-          },
-          // Open/ready/review-submitted events stay one wake per PR+reason.
-          // @ally comment requests are scoped to the GitHub comment id so a
-          // later explicit re-review comment can wake Ally again.
-          idempotencyKey,
+        return await withPrReviewerTaskLock(db, reviewerTaskKey, async (tx) => {
+          // The wake insert commits through heartbeat's own transaction. Keep
+          // this transaction-scoped lock held until that commit is visible so
+          // concurrent first events for one PR re-check affinity instead of
+          // assigning the same task to different reviewers.
+          const existingWake = await tx
+            .select({ id: agentWakeupRequests.id })
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                inArray(agentWakeupRequests.agentId, reviewerAgentIds),
+                eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+                inArray(agentWakeupRequests.status, IDEMPOTENT_REVIEWER_WAKE_STATUSES),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (existingWake) return false;
+
+          const reviewerAgentId =
+            (await findActivePrReviewerForTask(tx, reviewerAgentIds, reviewerTaskKey)) ??
+            (await selectPrReviewerAgentId(tx, reviewerAgentIds, reviewerTaskKey));
+          if (!reviewerAgentId) {
+            logger.warn(
+              {
+                configuredReviewerCount: reviewerAgentIds.length,
+                event: eventName,
+                prNumber: context.prNumber,
+                repoFullName: context.repoFullName,
+              },
+              "github webhook reviewer wake skipped: no configured reviewer is active",
+            );
+            return false;
+          }
+
+          await heartbeat.wakeup(reviewerAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: context.wakeReason,
+            payload: {
+              taskKey: reviewerTaskKey,
+              source: "github",
+              event: eventName,
+              deliveryId,
+              prNumber: context.prNumber,
+              repoFullName: context.repoFullName,
+              prUrl: context.prUrl,
+              eventUrl: context.eventUrl,
+              headSha: context.headSha,
+              paperclipIdentifiers: context.identifiers,
+              commentId: context.commentId,
+              commentAuthorLogin: context.commentAuthorLogin,
+              reviewKind: "pr_review",
+            },
+            contextSnapshot: {
+              taskKey: reviewerTaskKey,
+              wakeReason: context.wakeReason,
+              wakeSource: "automation",
+              wakeTriggerDetail: "system",
+              commentSource: "github",
+              githubEvent: eventName,
+              githubDeliveryId: deliveryId,
+              githubPrNumber: context.prNumber,
+              githubRepoFullName: context.repoFullName,
+              ...githubContextMetadata(context),
+              ...(context.commentId ? { githubCommentId: context.commentId } : {}),
+              ...(context.commentAuthorLogin
+                ? { githubPrReviewRequestAuthorLogin: context.commentAuthorLogin }
+                : {}),
+              ...(context.commentBody ? { githubPrReviewRequestBody: context.commentBody } : {}),
+              reviewKind: "pr_review",
+              prRole: "reviewer",
+            },
+            // Open/ready/review-submitted events stay one wake per PR+reason.
+            // @ally comment requests are scoped to the GitHub comment id so a
+            // later explicit re-review comment can wake Ally again.
+            idempotencyKey,
+          });
+          return true;
         });
-        return true;
       } catch (err) {
         logger.error(
           {
             err,
-            agentId: config.prReviewerAgentId,
+            agentIds: reviewerAgentIds,
             event: eventName,
             prNumber: context?.prNumber,
             repoFullName: context?.repoFullName,

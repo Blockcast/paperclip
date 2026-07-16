@@ -19,7 +19,7 @@ import {
   issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import {
   __test_backLinkAbsoluteUrl,
   __test_buildIssueBackLinkBody,
@@ -705,7 +705,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     await tempDb?.cleanup();
   }, 60_000);
 
-  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentId" | "prReviewerBotLogin" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions"> = {}) {
+  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions"> = {}) {
     const app = express();
     app.use(express.json({
       verify: (req, _res, buf) => {
@@ -879,6 +879,45 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(res.body).toMatchObject({ ignored: "no_matching_issue", identifiers: ["UNKNOWN-1234"] });
   });
 
+  it("leaves reviewer wakes queued when the webhook runs on the API tier", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Ally" });
+    const app = buildApp({
+      prReviewerAgentId: agentId,
+      heartbeatOptions: {
+        paperclipNodeRole: "api",
+        skipQueuedRunDispatch: false,
+      },
+    });
+    const payload = {
+      action: "opened",
+      pull_request: {
+        number: 977,
+        title: "Fence API-tier reviewer dispatch",
+        body: null,
+        head: { ref: "fix/api-reviewer-dispatch-fence", sha: "api-fence-head" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-api-reviewer-fence")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ reviewerWakeFired: true });
+
+    const runs = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.status).toBe("queued");
+  });
+
   it("does not coalesce reviewer PR wakes into a thin null-scope automation run (BLO-7457)", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Ally" });
     const activeRunId = randomUUID();
@@ -979,6 +1018,415 @@ describeEmbeddedPostgres("github-webhook route", () => {
         reviewKind: "pr_review",
       }),
     }));
+  });
+
+  it("assigns PR review wakes to the least-loaded active reviewer", async () => {
+    const { companyId, agentId: busyReviewerId } = await seedCompanyAndAgent({
+      agentName: "Ally",
+    });
+    const idleReviewerId = randomUUID();
+    await db.insert(agents).values({
+      id: idleReviewerId,
+      companyId,
+      name: "Ally 2",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: busyReviewerId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      contextSnapshot: { taskKey: "pr_review:Blockcast/magma:975" },
+    });
+
+    const app = buildApp({ prReviewerAgentIds: [busyReviewerId, idleReviewerId] });
+    const payload = {
+      action: "opened",
+      pull_request: {
+        number: 976,
+        title: "Load-balanced review",
+        body: null,
+        head: { ref: "review-pool" },
+      },
+      repository: { full_name: "Blockcast/magma" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-review-pool-load")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.reviewerWakeFired).toBe(true);
+    const assigned = await db
+      .select({ agentId: heartbeatRuns.agentId, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, idleReviewerId));
+    expect(assigned).toHaveLength(1);
+    expect(assigned[0]?.contextSnapshot).toMatchObject({
+      taskKey: "pr_review:Blockcast/magma:976",
+      githubPrNumber: 976,
+    });
+  });
+
+  it("uses a task-scoped tie-break when active reviewers have equal load", async () => {
+    const { companyId, agentId: firstReviewerId } = await seedCompanyAndAgent({
+      agentName: "Ally",
+    });
+    const secondReviewerId = randomUUID();
+    await db.insert(agents).values({
+      id: secondReviewerId,
+      companyId,
+      name: "Ally 2",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const app = buildApp({ prReviewerAgentIds: [firstReviewerId, secondReviewerId] });
+    const payload = {
+      action: "opened",
+      pull_request: {
+        number: 977,
+        title: "Spread equal-load reviews",
+        body: null,
+        head: { ref: "review-pool-tie-break" },
+      },
+      repository: { full_name: "Blockcast/magma" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-review-pool-tie-break")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.reviewerWakeFired).toBe(true);
+    const runs = await db
+      .select({ agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.agentId, [firstReviewerId, secondReviewerId]));
+    expect(runs).toEqual([{ agentId: secondReviewerId }]);
+  });
+
+  it("does not assign PR review wakes to a terminated reviewer", async () => {
+    const { companyId, agentId: activeReviewerId } = await seedCompanyAndAgent({
+      agentName: "Ally",
+    });
+    const terminatedReviewerId = randomUUID();
+    await db.insert(agents).values({
+      id: terminatedReviewerId,
+      companyId,
+      name: "Ally 2",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: activeReviewerId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      contextSnapshot: { taskKey: "pr_review:Blockcast/magma:975" },
+    });
+
+    const app = buildApp({
+      prReviewerAgentIds: [activeReviewerId, terminatedReviewerId],
+    });
+    const payload = {
+      action: "opened",
+      pull_request: {
+        number: 976,
+        title: "Active reviewer only",
+        body: null,
+        head: { ref: "review-pool-active" },
+      },
+      repository: { full_name: "Blockcast/magma" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-review-pool-active")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.reviewerWakeFired).toBe(true);
+    const activeRuns = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, activeReviewerId));
+    expect(activeRuns).toHaveLength(2);
+    expect(activeRuns).toContainEqual(
+      expect.objectContaining({
+        contextSnapshot: expect.objectContaining({
+          taskKey: "pr_review:Blockcast/magma:976",
+        }),
+      }),
+    );
+    const terminatedRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, terminatedReviewerId));
+    expect(terminatedRuns).toHaveLength(0);
+  });
+
+  it("dedupes a replayed reviewer delivery across the whole reviewer pool", async () => {
+    const { companyId, agentId: firstReviewerId } = await seedCompanyAndAgent({
+      agentName: "Ally",
+    });
+    const secondReviewerId = randomUUID();
+    await db.insert(agents).values({
+      id: secondReviewerId,
+      companyId,
+      name: "Ally 2",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const app = buildApp({ prReviewerAgentIds: [firstReviewerId, secondReviewerId] });
+    const payload = {
+      action: "opened",
+      pull_request: {
+        number: 976,
+        title: "Pool-wide dedupe",
+        body: null,
+        head: { ref: "review-pool-dedupe" },
+      },
+      repository: { full_name: "Blockcast/magma" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const send = () =>
+      request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-review-pool-dedupe")
+        .set("content-type", "application/json")
+        .send(body);
+
+    const first = await send();
+    const replay = await send();
+
+    expect(first.status).toBe(200);
+    expect(first.body.reviewerWakeFired).toBe(true);
+    expect(replay.status).toBe(200);
+    expect(replay.body.reviewerWakeFired).toBe(false);
+    const runs = await db
+      .select({ agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.agentId, [firstReviewerId, secondReviewerId]));
+    expect(runs).toHaveLength(1);
+  });
+
+  it("keeps follow-up PR review wakes with the reviewer already handling that PR", async () => {
+    const { companyId, agentId: firstReviewerId } = await seedCompanyAndAgent({
+      agentName: "Ally",
+    });
+    const secondReviewerId = randomUUID();
+    await db.insert(agents).values({
+      id: secondReviewerId,
+      companyId,
+      name: "Ally 2",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const app = buildApp({ prReviewerAgentIds: [firstReviewerId, secondReviewerId] });
+    const pullRequest = {
+      number: 976,
+      title: "Keep reviewer affinity",
+      body: null,
+      html_url: "https://github.com/Blockcast/magma/pull/976",
+      head: { ref: "review-pool-affinity", sha: "first-head" },
+    };
+    const opened = signedRequest({
+      action: "opened",
+      pull_request: pullRequest,
+      repository: { full_name: "Blockcast/magma" },
+    });
+    const openedRes = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", opened.signature)
+      .set("x-github-delivery", "delivery-review-pool-affinity-opened")
+      .set("content-type", "application/json")
+      .send(opened.body);
+
+    const synchronized = signedRequest({
+      action: "synchronize",
+      pull_request: {
+        ...pullRequest,
+        head: { ...pullRequest.head, sha: "second-head" },
+      },
+      repository: { full_name: "Blockcast/magma" },
+    });
+    const synchronizedRes = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", synchronized.signature)
+      .set("x-github-delivery", "delivery-review-pool-affinity-synchronized")
+      .set("content-type", "application/json")
+      .send(synchronized.body);
+
+    expect(openedRes.status).toBe(200);
+    expect(openedRes.body.reviewerWakeFired).toBe(true);
+    expect(synchronizedRes.status).toBe(200);
+    expect(synchronizedRes.body.reviewerWakeFired).toBe(true);
+
+    const runs = await db
+      .select({
+        agentId: heartbeatRuns.agentId,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.agentId, [firstReviewerId, secondReviewerId]));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      agentId: firstReviewerId,
+      contextSnapshot: expect.objectContaining({
+        taskKey: "pr_review:Blockcast/magma:976",
+        githubPrNumber: 976,
+        githubHeadSha: "second-head",
+      }),
+    });
+
+    const wakes = await db
+      .select({
+        agentId: agentWakeupRequests.agentId,
+        status: agentWakeupRequests.status,
+        idempotencyKey: agentWakeupRequests.idempotencyKey,
+      })
+      .from(agentWakeupRequests)
+      .where(inArray(agentWakeupRequests.agentId, [firstReviewerId, secondReviewerId]));
+    expect(wakes).toHaveLength(2);
+    expect(wakes.every((wake) => wake.agentId === firstReviewerId)).toBe(true);
+    expect(wakes).toContainEqual(expect.objectContaining({
+      status: "coalesced",
+      idempotencyKey: "pr_review:Blockcast/magma:976:github_pr_synchronized",
+    }));
+  });
+
+  it("serializes concurrent first events for the same PR before assigning a reviewer", async () => {
+    const { companyId, agentId: firstReviewerId } = await seedCompanyAndAgent({
+      agentName: "Ally",
+    });
+    const secondReviewerId = randomUUID();
+    const reviewerAgentIds = [firstReviewerId, secondReviewerId];
+    await db.insert(agents).values({
+      id: secondReviewerId,
+      companyId,
+      name: "Ally 2",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const taskKey = "pr_review:Blockcast/magma:978";
+    let reportLockAcquired!: () => void;
+    let releaseLock!: () => void;
+    const lockAcquired = new Promise<void>((resolve) => {
+      reportLockAcquired = resolve;
+    });
+    const releaseSignal = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const lockHolder = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`,
+      );
+      reportLockAcquired();
+      await releaseSignal;
+    });
+    await lockAcquired;
+
+    const app = buildApp({ prReviewerAgentIds: reviewerAgentIds });
+    const send = (action: "opened" | "synchronize", deliveryId: string, headSha: string) => {
+      const signed = signedRequest({
+        action,
+        pull_request: {
+          number: 978,
+          title: "Serialize reviewer assignment",
+          body: null,
+          html_url: "https://github.com/Blockcast/magma/pull/978",
+          head: { ref: "review-pool-concurrency", sha: headSha },
+        },
+        repository: { full_name: "Blockcast/magma" },
+      });
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signed.signature)
+        .set("x-github-delivery", deliveryId)
+        .set("content-type", "application/json")
+        .send(signed.body);
+    };
+    const responsesPromise = Promise.all([
+      send("opened", "delivery-review-pool-concurrent-opened", "first-head"),
+      send("synchronize", "delivery-review-pool-concurrent-sync", "second-head"),
+    ]);
+
+    try {
+      const completedBeforeRelease = await Promise.race([
+        responsesPromise.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 250)),
+      ]);
+      expect(completedBeforeRelease).toBe(false);
+    } finally {
+      releaseLock();
+      await lockHolder;
+    }
+
+    const responses = await responsesPromise;
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(responses.every((response) => response.body.reviewerWakeFired === true)).toBe(true);
+
+    const runs = await db
+      .select({ agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.agentId, reviewerAgentIds));
+    expect(runs).toHaveLength(1);
+
+    const wakes = await db
+      .select({ agentId: agentWakeupRequests.agentId })
+      .from(agentWakeupRequests)
+      .where(inArray(agentWakeupRequests.agentId, reviewerAgentIds));
+    expect(wakes).toHaveLength(2);
+    expect(new Set(wakes.map((wake) => wake.agentId))).toEqual(
+      new Set([runs[0]?.agentId]),
+    );
   });
 
   it("dedupes rapid pull_request.synchronize pushes and suppresses only synchronize author wakes", async () => {
@@ -1106,8 +1554,23 @@ describeEmbeddedPostgres("github-webhook route", () => {
     });
   });
 
-  it("cancels queued reviewer runs when the PR closes", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Ally" });
+  it("cancels queued reviewer runs across the reviewer pool when the PR closes", async () => {
+    const { companyId, agentId: firstReviewerId } = await seedCompanyAndAgent({
+      agentName: "Ally",
+    });
+    const secondReviewerId = randomUUID();
+    const reviewerAgentIds = [firstReviewerId, secondReviewerId];
+    await db.insert(agents).values({
+      id: secondReviewerId,
+      companyId,
+      name: "Ally 2",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
     const taskKey = "pr_review:Blockcast/paperclip:981";
     const wakeupIds = [randomUUID(), randomUUID()];
     const runIds = [randomUUID(), randomUUID()];
@@ -1116,7 +1579,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       wakeupIds.map((id, index) => ({
         id,
         companyId,
-        agentId,
+        agentId: reviewerAgentIds[index],
         source: "automation",
         triggerDetail: "system",
         reason: "github_pr_synchronized",
@@ -1128,7 +1591,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       runIds.map((id, index) => ({
         id,
         companyId,
-        agentId,
+        agentId: reviewerAgentIds[index],
         invocationSource: "automation",
         triggerDetail: "system",
         status: "queued",
@@ -1143,7 +1606,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       })),
     );
 
-    const app = buildApp({ prReviewerAgentId: agentId });
+    const app = buildApp({ prReviewerAgentIds: reviewerAgentIds });
     const payload = {
       action: "closed",
       pull_request: {
@@ -1174,13 +1637,15 @@ describeEmbeddedPostgres("github-webhook route", () => {
     });
 
     const runs = await db
-      .select({ status: heartbeatRuns.status })
+      .select({ agentId: heartbeatRuns.agentId, status: heartbeatRuns.status })
       .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.agentId, agentId));
+      .where(inArray(heartbeatRuns.agentId, reviewerAgentIds));
     const wakeups = await db
-      .select({ status: agentWakeupRequests.status })
+      .select({ agentId: agentWakeupRequests.agentId, status: agentWakeupRequests.status })
       .from(agentWakeupRequests)
-      .where(eq(agentWakeupRequests.agentId, agentId));
+      .where(inArray(agentWakeupRequests.agentId, reviewerAgentIds));
+    expect(new Set(runs.map((run) => run.agentId))).toEqual(new Set(reviewerAgentIds));
+    expect(new Set(wakeups.map((wake) => wake.agentId))).toEqual(new Set(reviewerAgentIds));
     expect(runs.map((run) => run.status)).toEqual(["cancelled", "cancelled"]);
     expect(wakeups.map((wake) => wake.status)).toEqual(["cancelled", "cancelled"]);
   });
