@@ -36,9 +36,15 @@ import {
   issueComments,
   issues,
 } from "@paperclipai/db";
-import { and, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
+import {
+  GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND,
+  GITHUB_DEPENDABOT_WEBHOOK_DIAGNOSTIC_ORIGIN_KIND,
+  findOpenDependabotAlertIssue,
+  recordDependabotWebhookDiagnostic,
+} from "../services/dependabot-alert-issues.js";
 import { logger } from "../middleware/logger.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { extractPaperclipIdentifiers } from "../services/paperclip-identifiers.js";
@@ -764,8 +770,9 @@ function resolveDependabotAlertContext(
 // actionable alert now gets (or reuses) a real, assigned Paperclip issue whose
 // title/description carry every field GitHub gave us, and the wake sets
 // contextSnapshot.issueId so the existing issue-wake plumbing takes over.
-const GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND = "github_dependabot_alert";
-const GITHUB_DEPENDABOT_WEBHOOK_DIAGNOSTIC_ORIGIN_KIND = "github_dependabot_webhook_diagnostic";
+// GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND / GITHUB_DEPENDABOT_WEBHOOK_DIAGNOSTIC_ORIGIN_KIND
+// and the diagnostic-issue helper live in dependabot-alert-issues.ts (BLO-16446:
+// shared with heartbeat.ts's stale-wake backfill).
 
 const DEPENDABOT_SEVERITY_TO_ISSUE_PRIORITY: Record<string, "critical" | "high" | "medium" | "low"> = {
   critical: "critical",
@@ -841,24 +848,6 @@ function isUniqueDependabotAlertConflict(error: unknown): boolean {
   );
 }
 
-async function findOpenDependabotAlertIssue(db: Db, companyId: string, originId: string) {
-  return db
-    .select()
-    .from(issues)
-    .where(
-      and(
-        eq(issues.companyId, companyId),
-        eq(issues.originKind, GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND),
-        eq(issues.originId, originId),
-        isNull(issues.hiddenAt),
-        notInArray(issues.status, ["done", "cancelled"]),
-      ),
-    )
-    .orderBy(desc(issues.createdAt))
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-}
-
 // Finds the open issue for this alert (originId is the stable
 // `github-dependabot:<repo>#<alertNumber>` key), or creates one. A
 // `reintroduced`/`reopened` redelivery for an alert that already has an open
@@ -904,70 +893,9 @@ async function resolveDependabotAlertIssue(
 
 // Records a durable diagnostic when a `dependabot_alert` delivery can't be
 // resolved into a scoped alert (malformed/missing `alert` fields, or no
-// `repository.full_name`) for an otherwise-actionable action. Without this the
-// event was silently dropped -- exactly the "fails invisibly" failure mode
-// BLO-16319 called out. Best-effort: a raced concurrent insert just logs
-// rather than fighting over a second uniqueness index for a path this rare.
-async function recordDependabotWebhookDiagnostic(
-  db: Db,
-  input: {
-    companyId: string;
-    assigneeAgentId: string;
-    event: string;
-    deliveryId: string | null;
-    action: string | undefined;
-    repoFullName: string | null;
-    reason: string;
-    alertNumber?: number | null;
-  },
-): Promise<void> {
-  const originId = `${input.event}:${input.deliveryId ?? "no-delivery"}`;
-  const existing = await db
-    .select({ id: issues.id })
-    .from(issues)
-    .where(
-      and(
-        eq(issues.companyId, input.companyId),
-        eq(issues.originKind, GITHUB_DEPENDABOT_WEBHOOK_DIAGNOSTIC_ORIGIN_KIND),
-        eq(issues.originId, originId),
-      ),
-    )
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-  if (existing) return;
-
-  const title = `Dependabot webhook payload could not be scoped (${input.repoFullName ?? "unknown repo"})`;
-  const description = [
-    `A \`dependabot_alert\` webhook delivery could not be resolved into a scoped alert. ${input.reason}`,
-    "",
-    "## What's known",
-    `- Event: \`${input.event}\``,
-    `- Delivery id: \`${input.deliveryId ?? "unknown"}\``,
-    `- Action: \`${input.action ?? "unknown"}\``,
-    `- Repository: \`${input.repoFullName ?? "unknown"}\``,
-    ...(input.alertNumber != null ? [`- Alert number: #${input.alertNumber}`] : []),
-    "",
-    "This is a webhook-processing gap, not a specific vulnerability to remediate. If it recurs, the Dependabot webhook payload shape likely changed upstream -- escalate to the CTO.",
-  ].join("\n");
-
-  try {
-    await issueService(db).create(input.companyId, {
-      title,
-      description,
-      status: "todo",
-      priority: "high",
-      assigneeAgentId: input.assigneeAgentId,
-      originKind: GITHUB_DEPENDABOT_WEBHOOK_DIAGNOSTIC_ORIGIN_KIND,
-      originId,
-      originFingerprint: originId,
-    });
-  } catch (error) {
-    logger.error(
-      { err: error, deliveryId: input.deliveryId },
-      "github webhook dependabot diagnostic issue insert failed",
-    );
-  }
-}
+// `repository.full_name`) for an otherwise-actionable action -- see
+// dependabot-alert-issues.ts's recordDependabotWebhookDiagnostic (imported
+// above), shared with heartbeat.ts's BLO-16446 stale-wake backfill.
 
 // BLO-15799: self-echo guard for the reviewer wake. The reviewer posts its
 // review through the configured bot identity (allyblockcast[bot]; historically

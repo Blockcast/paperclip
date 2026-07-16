@@ -157,6 +157,7 @@ import {
   WorkspaceRepoMismatchError,
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
+import { resolveStaleDependabotAlertWakeIssue } from "./dependabot-alert-issues.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -12941,7 +12942,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
-    const issueId = readNonEmptyString(context.issueId);
+    let issueId = readNonEmptyString(context.issueId);
+    if (!issueId && readNonEmptyString(context.wakeReason) === "github_dependabot_alert") {
+      // BLO-16446: a backlog of dependabot_alert wakes enqueued before the
+      // BLO-16319 scoping fix shipped is still draining through dispatch with
+      // contextSnapshot frozen at its pre-fix shape (no issueId). Backfill a
+      // real issue now, from whatever taskKey survived, instead of launching
+      // another unscoped run.
+      const backfilled = await resolveStaleDependabotAlertWakeIssue(db, {
+        companyId: agent.companyId,
+        assigneeAgentId: agent.id,
+        taskKey: readNonEmptyString(context.taskKey) ?? taskKey,
+      });
+      if (backfilled) {
+        issueId = backfilled.issueId;
+        context.issueId = backfilled.issueId;
+        if (readNonEmptyString(context.taskId)) context.taskId = backfilled.issueId;
+      }
+    }
     let issueContext = issueId ? await getIssueExecutionContext(agent.companyId, issueId) : null;
     const issueDependencyReadiness = issueId
       ? await issuesSvc.listDependencyReadiness(agent.companyId, [issueId]).then((rows) => rows.get(issueId) ?? null)
