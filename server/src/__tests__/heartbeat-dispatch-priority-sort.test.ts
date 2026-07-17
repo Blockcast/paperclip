@@ -15,9 +15,16 @@
  * EXTERNAL_LIFECYCLE_STALE_MS (15 min). Before the fix, stale runs counted as
  * "running" and blocked all dispatch for external-lifecycle agents via the hard
  * early-return gate — even when the k8s Job was already gone.
+ *
+ * BLO-16554: extends the escalation-floor coverage below to the
+ * effectiveMaxConcurrentRuns = 1 external-lifecycle case (BLO-15959
+ * concurrencyEnabled default-off) -- a long-starved queued run must beat a
+ * fresher, better-un-aged-rank contender for the agent's single slot the
+ * instant that slot frees, not just dispatch because it was the only
+ * candidate in the queue.
  */
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -796,20 +803,29 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     expect(recoveryRun?.status).not.toBe("queued");
   });
 
-  it("dispatches a long-starved queued run as soon as the single external-lifecycle slot frees (BLO-16554)", async () => {
+  it("dispatches a long-starved queued run ahead of a fresher critical-priority contender once the single external-lifecycle slot frees (BLO-16554)", async () => {
     // Regression for BLO-16554: MulticastEngineer (opencode_k8s, external
     // lifecycle) had a queued retry sit `startedAt: null` for ~9.5h despite
     // being far past STARVATION_FULL_ESCALATION_MS (2h) and the agent's
     // single slot cycling other work in that window. External-lifecycle
     // agents default to effectiveMaxConcurrentRuns = 1 regardless of the
     // configured maxConcurrentRuns (BLO-15959, concurrencyEnabled defaults
-    // false) -- this test pins the exact "one non-stale running run holds
-    // the only slot" shape and asserts the starved run is claimed the
-    // instant that slot frees, not merely eventually.
+    // false).
+    //
+    // This pins the "one non-stale running run holds the only slot" shape
+    // AND genuinely exercises the rank-0 escalation floor + createdAt
+    // tie-break for that shape: a second, fresher queued run at
+    // critical priority (the best possible un-aged rank, 0) is queued
+    // alongside the starved run. Without the escalation floor the starved
+    // run (medium priority, un-aged rank 4) would lose outright to the
+    // fresh critical run. With the floor it ties the fresh run at rank 0
+    // and must win the createdAt-ascending tie-break as the older run --
+    // proving this isn't just "the only candidate gets the free slot".
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runningIssueId = randomUUID();
     const starvedIssueId = randomUUID();
+    const freshIssueId = randomUUID();
     const issuePrefix = `X${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
     await db.insert(companies).values({
@@ -824,7 +840,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       companyId,
       name: "ExternalLifecycleAgent",
       role: "engineer",
-      status: "running",
+      status: "idle",
       adapterType: "claude_k8s",
       adapterConfig: {},
       // maxConcurrentRuns is intentionally > 1 to prove effectiveMaxConcurrentRuns
@@ -856,11 +872,28 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
         identifier: `${issuePrefix}-2`,
         startedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
       },
+      // Fresh contender: critical priority (un-aged rank 0, the best
+      // possible score) and just queued -- would beat the starved run
+      // outright on priority alone if the escalation floor didn't force
+      // the starved run's rank to 0 too and let it win on createdAt.
+      {
+        id: freshIssueId,
+        companyId,
+        title: "Fresh critical-priority contender",
+        status: "in_progress",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 3,
+        identifier: `${issuePrefix}-3`,
+        startedAt: new Date(),
+      },
     ]);
 
     const runningRunId = randomUUID();
     const starvedRunId = randomUUID();
+    const freshRunId = randomUUID();
     const starvedCreatedAt = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    const freshCreatedAt = new Date();
 
     await db.insert(heartbeatRuns).values([
       // Occupies the agent's one effective slot: fresh (non-stale) running run.
@@ -893,6 +926,18 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
         createdAt: starvedCreatedAt,
         updatedAt: starvedCreatedAt,
       },
+      // Fresh critical-priority contender queued alongside the starved run.
+      {
+        id: freshRunId,
+        companyId,
+        agentId,
+        invocationSource: "heartbeat",
+        triggerDetail: "timer",
+        status: "queued",
+        contextSnapshot: { issueId: freshIssueId, wakeReason: "heartbeat_timer" },
+        createdAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
+      },
     ]);
 
     const dispatchedRunIds: string[] = [];
@@ -910,15 +955,14 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     });
 
     // First tick: the single effective slot is occupied by the fresh running
-    // run, so the starved queued run must NOT be dispatched yet.
+    // run, so neither queued contender must be dispatched yet.
     await heartbeat.resumeQueuedRuns();
     const stillQueued = await db
-      .select({ status: heartbeatRuns.status })
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
       .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, starvedRunId))
-      .then((rows) => rows[0] ?? null);
-    expect(stillQueued?.status).toBe("queued");
-    expect(dispatchedRunIds).not.toContain(starvedRunId);
+      .where(inArray(heartbeatRuns.id, [starvedRunId, freshRunId]));
+    expect(stillQueued.every((row) => row.status === "queued")).toBe(true);
+    expect(dispatchedRunIds).toHaveLength(0);
 
     // The occupying run finishes, freeing the agent's one effective slot.
     await db
@@ -926,12 +970,20 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
       .where(eq(heartbeatRuns.id, runningRunId));
 
-    // Next slot-available tick: the long-starved run must be claimed now,
-    // not left queued indefinitely.
+    // Next slot-available tick: the long-starved run must win the single
+    // slot over the fresher critical-priority contender, not the other
+    // way around. (The mock adapter resolves instantly, so the fresh
+    // contender may also get dispatched once the starved run's slot frees
+    // again during drain -- the regression guard is ORDER, matching the
+    // BLO-12990 test above: the starved run must be claimed FIRST.)
     await heartbeat.resumeQueuedRuns();
     await waitForRunToSettle(heartbeat, starvedRunId);
 
     expect(dispatchedRunIds[0]).toBe(starvedRunId);
+    const freshDispatchIdx = dispatchedRunIds.indexOf(freshRunId);
+    if (freshDispatchIdx !== -1) {
+      expect(freshDispatchIdx).toBeGreaterThan(0);
+    }
 
     const starvedRun = await db
       .select({ status: heartbeatRuns.status })
