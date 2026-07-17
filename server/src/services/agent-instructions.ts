@@ -621,14 +621,30 @@ export function agentInstructionsService() {
     }
 
     const prepared = await ensureWritableBundle(agent, options);
-    const absolutePath = resolvePathWithinRoot(prepared.state.rootPath!, relativePath);
+    const rootPath = prepared.state.rootPath!;
+    const normalizedPath = normalizeRelativeFilePath(relativePath);
+    const absolutePath = resolvePathWithinRoot(rootPath, normalizedPath);
     await fs.mkdir(path.dirname(absolutePath), { recursive: true });
     await fs.writeFile(absolutePath, content, "utf8");
     const nextAgent = { ...agent, adapterConfig: prepared.adapterConfig };
-    const [bundle, file] = await Promise.all([
-      getBundle(nextAgent),
-      readFile(nextAgent, relativePath),
-    ]);
+    // Build the file detail from the write we just performed against `prepared.state`
+    // (guaranteed writable by ensureWritableBundle) instead of re-deriving bundle state a
+    // second time via readFile(). Re-deriving independently is redundant and, if managed
+    // metadata already existed but pointed somewhere `recoverManagedBundleState` classifies
+    // differently (e.g. a legacy external path), could disagree with the state actually used
+    // for the write and incorrectly report the bundle as not configured.
+    const file: AgentInstructionsFileDetail = {
+      path: normalizedPath,
+      size: Buffer.byteLength(content, "utf8"),
+      language: inferLanguage(normalizedPath),
+      markdown: isMarkdown(normalizedPath),
+      isEntryFile: normalizedPath === prepared.state.entryFile,
+      editable: true,
+      deprecated: false,
+      virtual: false,
+      content,
+    };
+    const bundle = await getBundle(nextAgent);
     return { bundle, file, adapterConfig: prepared.adapterConfig };
   }
 
