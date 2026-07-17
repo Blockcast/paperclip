@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   policy:
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 5
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
@@ -56,6 +56,9 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 24
+
+      - name: Validate ARC runner labels
+        run: node ./scripts/check-github-runner-labels.mjs
 
       - name: Validate Dockerfile deps stage
         run: node ./scripts/check-docker-deps-stage.mjs
@@ -106,7 +109,7 @@ jobs:
   typecheck_release_registry:
     name: Typecheck + Release Registry
     needs: [policy]
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 20
 
     steps:
@@ -143,10 +146,11 @@ jobs:
   general_tests:
     name: General tests (${{ matrix.group_label }})
     needs: [policy]
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 20
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
           - group: general-server
@@ -212,7 +216,7 @@ jobs:
     name: verify
     if: ${{ always() }}
     needs: [typecheck_release_registry, general_tests, build]
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 5
 
     steps:
@@ -229,7 +233,7 @@ jobs:
   build:
     name: Build
     needs: [policy]
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 20
 
     steps:
@@ -262,11 +266,12 @@ jobs:
 
   verify_serialized_server:
     name: Verify serialized server suites (${{ matrix.shard_label }})
-    needs: [policy]
-    runs-on: ubuntu-latest
+    needs: [policy, general_tests]
+    runs-on: default
     timeout-minutes: 20
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
           - shard_index: 0
@@ -313,7 +318,7 @@ jobs:
   canary_dry_run:
     name: Canary Dry Run
     needs: [policy]
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 20
 
     steps:
@@ -367,7 +372,7 @@ jobs:
 
   e2e:
     needs: [policy]
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 30
 
     steps:
@@ -386,13 +391,6 @@ jobs:
           name: pr-lockfile
           path: .
 
-      # Pinned to Node 22 LTS instead of the workflow-default 24 because
-      # `playwright install`'s ZIP extraction step hangs indefinitely on
-      # Node 24 with @playwright/test 1.58.2 (verified via DEBUG=pw:install:
-      # download succeeds in 1s, extraction never finishes). Self-hosted
-      # runners pre-extracted the binary and so masked this for months.
-      # Node 22 is LTS through April 2027 and is the recommended baseline
-      # for Playwright 1.58.x.
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
@@ -402,27 +400,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # 7f2eeae5f switched e2e from self-hosted to ubuntu-latest, where
-      # Playwright is not pre-baked. The combined `npx playwright install
-      # --with-deps chromium` step then started hanging ~30s after the Chrome
-      # binary finished downloading — orphan `MainThread` workers got
-      # SIGKILL'd at the 30-minute job timeout. Three changes below:
-      #   1. Cache ~/.cache/ms-playwright/ keyed on the Playwright version so
-      #      successful installs are reused across runs (skips both download
-      #      and the hang on cache hit).
-      #   2. Run `apt-get install` for the browser's system deps explicitly,
-      #      so `playwright install` only does the browser binary work
-      #      (avoids `--with-deps`'s combined apt+browser flow).
-      #   3. Bound the browser install step with its own 8-minute timeout so
-      #      any future regression surfaces as a clean failure instead of
-      #      burning the full 30-minute job budget.
       - name: Resolve Playwright version
         id: playwright_version
         run: |
-          v="$(node -p "require('@playwright/test/package.json').version")"
-          printf 'version=%s\n' "$v" >> "$GITHUB_OUTPUT"
+          version="$(node -p "require('@playwright/test/package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Cache Playwright browsers
+      - name: Cache Playwright browser
         id: playwright_cache
         uses: actions/cache@v4
         with:
@@ -430,42 +414,10 @@ jobs:
           key: playwright-${{ runner.os }}-${{ steps.playwright_version.outputs.version }}
 
       - name: Install Playwright system dependencies
-        if: steps.playwright_cache.outputs.cache-hit != 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 \
-            libcups2 libdrm2 libxkbcommon0 libatspi2.0-0 libxcomposite1 \
-            libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 \
-            libcairo2 libasound2t64 \
-            fonts-liberation fonts-noto-color-emoji
+        run: pnpm exec playwright install-deps chromium
 
-      - name: Diagnose runner pre-install state
-        if: steps.playwright_cache.outputs.cache-hit != 'true'
-        run: |
-          echo "::group::disk free"
-          df -h /home/runner /tmp
-          echo "::endgroup::"
-          echo "::group::cache dir before install"
-          mkdir -p ~/.cache/ms-playwright
-          ls -la ~/.cache/ms-playwright/ || true
-          echo "::endgroup::"
-          echo "::group::playwright binary location"
-          ls -la node_modules/.bin/playwright || true
-          which node
-          node --version
-          echo "::endgroup::"
-
-      # Use `pnpm exec` (matches the rest of the workflow's pnpm-based
-      # execution) instead of `npx`, which can take an odd dependency
-      # resolution path in pnpm-style monorepos. Add `DEBUG=pw:install` so
-      # the next regression surfaces with concrete signal instead of 8
-      # minutes of silence.
       - name: Install Playwright browser
         if: steps.playwright_cache.outputs.cache-hit != 'true'
-        timeout-minutes: 6
-        env:
-          DEBUG: pw:install
         run: pnpm exec playwright install chromium
 
       - name: Generate Paperclip config
@@ -486,7 +438,6 @@ jobs:
       - name: Run e2e tests
         env:
           PAPERCLIP_E2E_SKIP_LLM: "true"
-          PAPERCLIP_PLAYWRIGHT_CHANNEL: "chrome"
         run: pnpm run test:e2e
 
       - name: Upload Playwright report

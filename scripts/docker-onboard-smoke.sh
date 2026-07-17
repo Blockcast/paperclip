@@ -280,6 +280,7 @@ COOKIE_JAR="$TMP_DIR/cookies.txt"
 
 if ! wait_for_http "$PAPERCLIP_PUBLIC_URL/api/health" 90 1; then
   echo "Smoke bootstrap failed: server did not become ready at $PAPERCLIP_PUBLIC_URL/api/health" >&2
+  docker logs "$CONTAINER_NAME" >&2 || true
   exit 1
 fi
 
