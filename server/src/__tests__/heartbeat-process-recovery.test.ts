@@ -1257,6 +1257,115 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await waitForRunToSettle(heartbeat, runId);
   });
 
+  it("does not terminalize a run as k8s_concurrent_run_blocked while its own Job is still live (BLO-16537)", async () => {
+    // Reproduces the Ally canary NO-GO (BLO-15961/BLO-15962): a restart
+    // reattach (a competing admission/reconciliation path for a run whose
+    // Job is already `launched` and alive) raced the still-live original
+    // launch. The adapter discovered "existing Job(s) still running for this
+    // run" and refused with `k8s_concurrent_run_blocked`, and the reattach
+    // invocation used to accept that refusal as ITS OWN terminal outcome —
+    // marking the run `failed` while the run's own Job kept executing and
+    // emitting output. The fix re-verifies the reservation's bound Job
+    // against the cluster before accepting the refusal, and abandons the
+    // duplicate invocation without mutating run/reservation state when the
+    // Job is confirmed alive.
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "claude_k8s",
+      includeIssue: false,
+    });
+    const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+    mockReadAgentJobRunStatusByName.mockResolvedValue({
+      phase: "active",
+      name: reservation.jobName!,
+      uid: reservation.jobUid!,
+    });
+    mockAdapterExecute.mockImplementationOnce(async (ctx) => {
+      expect(ctx.externalRuntime).toMatchObject({
+        reservationId: reservation.id,
+        slotId: reservation.slotId,
+        jobName: reservation.jobName,
+        jobUid: reservation.jobUid,
+      });
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: "existing Job(s) still running for this run",
+        errorCode: "k8s_concurrent_run_blocked",
+        summary: "k8s isolation metadata missing",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    expect(await heartbeat.resumeRunningExternalRuntimeRuns()).toBe(1);
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    await heartbeat.drainInFlightExecutions(10_000);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).toBeNull();
+
+    const [persistedReservation] = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.id, reservation.id));
+    expect(persistedReservation?.state).toBe("launched");
+    expect(persistedReservation?.releasedAt).toBeNull();
+    expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
+
+    // A later reconciliation tick can try the (still-doomed, in this test)
+    // reattach again — it must remain a no-op rather than a one-shot fluke.
+    // The first reattach's fire-and-forget `executeRun` may still be
+    // unwinding its own `finally` block (clearing `activeRunExecutions` /
+    // `reattachingExternalRuns`) at this point, so poll instead of asserting
+    // a single call resumes it. Resolution here is also the only reliable
+    // signal that the FIRST reattach's `finally` block (including lease/
+    // runtime-service release calls) has fully settled: `reattachingExternalRuns`
+    // is only cleared by the `.finally()` wrapping the entire first
+    // `executeRun` call, and `resumeRunningExternalRuntimeRuns` skips
+    // dispatch entirely while that flag is still set. `drainInFlightExecutions`
+    // does NOT cover this fire-and-forget reattach path, so it cannot be used
+    // as that barrier.
+    mockAdapterExecute.mockImplementationOnce(async () => ({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "existing Job(s) still running for this run",
+      errorCode: "k8s_concurrent_run_blocked",
+      provider: "test",
+      model: "test-model",
+    }));
+    await vi.waitFor(
+      async () => {
+        expect(await heartbeat.resumeRunningExternalRuntimeRuns()).toBe(1);
+      },
+      { timeout: 10_000 },
+    );
+
+    // Now that the first reattach's `finally` block is confirmed complete,
+    // assert its environment lease (acquired via `envOrchestrator.acquireForRun`
+    // before the k8s-liveness guard was ever reached, keyed by run.id — the
+    // same key the still-live original launch's lease uses) was never
+    // released. `releaseRunLeases` releases every active lease row for a
+    // runId, so an ungated call here would tear resources out from under the
+    // still-running original Job.
+    const leasesForRun = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.heartbeatRunId, runId));
+    expect(leasesForRun.length).toBeGreaterThan(0);
+    for (const lease of leasesForRun) {
+      expect(lease.status).toBe("active");
+      expect(lease.releasedAt).toBeNull();
+    }
+
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(2), { timeout: 10_000 });
+    await heartbeat.drainInFlightExecutions(10_000);
+    const runAfterSecondAttempt = await heartbeat.getRun(runId);
+    expect(runAfterSecondAttempt?.status).toBe("running");
+  });
+
   it("retries restart reattachment after Kubernetes inventory recovers", async () => {
     const { companyId, agentId, runId } = await seedRunFixture({
       adapterType: "opencode_k8s",
