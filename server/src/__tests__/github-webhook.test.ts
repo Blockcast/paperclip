@@ -1868,6 +1868,76 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(queuedWakes[0]?.payload).toMatchObject({ headSha: "newhead" });
   });
 
+  it("does not let a completed opened wake suppress a fresh delivery and still dedupes its replay", async () => {
+    const reviewerAgentId = randomUUID();
+    const { companyId } = await seedCompanyAndAgent();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const idempotencyKey = "pr_review:Blockcast/magma:1368:github_pr_opened";
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: reviewerAgentId,
+      source: "github",
+      reason: "github_pr_opened",
+      idempotencyKey,
+      status: "completed",
+      payload: { taskKey: "pr_review:Blockcast/magma:1368" },
+    });
+
+    const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+    const payload = {
+      action: "opened",
+      pull_request: {
+        number: 1368,
+        title: "RELAY Wave 0",
+        body: null,
+        head: { ref: "relay-wave-0", sha: "opened-head-sha" },
+      },
+      repository: { full_name: "Blockcast/magma" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const sendDelivery = () =>
+      request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-opened-fresh")
+        .set("content-type", "application/json")
+        .send(body);
+
+    const first = await sendDelivery();
+    const duplicate = await sendDelivery();
+
+    expect(first.status).toBe(200);
+    expect(first.body).toMatchObject({
+      ignored: "no_paperclip_identifier",
+      reviewerWakeFired: true,
+    });
+    expect(duplicate.status).toBe(200);
+    expect(duplicate.body).toMatchObject({
+      ignored: "no_paperclip_identifier",
+      reviewerWakeFired: false,
+    });
+
+    const reviewerWakes = await db
+      .select({ status: agentWakeupRequests.status, idempotencyKey: agentWakeupRequests.idempotencyKey })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, reviewerAgentId));
+    expect(reviewerWakes.filter((wake) => wake.status === "queued")).toEqual([
+      expect.objectContaining({ idempotencyKey }),
+    ]);
+  });
+
   it("still defers to a pending or resolved dispatch-retry row (dispatch_failed / dispatch_recovered / dispatch_superseded)", async () => {
     const reviewerAgentId = randomUUID();
     const { companyId } = await seedCompanyAndAgent();

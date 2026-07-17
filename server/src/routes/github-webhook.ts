@@ -1442,7 +1442,21 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     //  path.)
     const reviewerWakeFired = await (async () => {
       const reviewerAgentIds = configuredPrReviewerAgentIds(config);
-      if (reviewerAgentIds.length === 0) return false;
+      if (reviewerAgentIds.length === 0) {
+        if (shouldFirePrReviewerWake(context)) {
+          logger.warn(
+            {
+              event: eventName,
+              deliveryId,
+              wakeReason: context.wakeReason,
+              prNumber: context.prNumber,
+              repoFullName: context.repoFullName,
+            },
+            "github webhook reviewer wake skipped: reviewer agent not configured",
+          );
+        }
+        return false;
+      }
       if (!shouldFirePrReviewerWake(context)) return false;
       // BLO-15799: don't enqueue a reviewer wake for the reviewer's own posted
       // review — that's a self-echo, not new review work (see
@@ -1475,7 +1489,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           // concurrent first events for one PR re-check affinity instead of
           // assigning the same task to different reviewers.
           const existingWake = await tx
-            .select({ id: agentWakeupRequests.id })
+            .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
             .from(agentWakeupRequests)
             .where(
               and(
@@ -1486,7 +1500,22 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             )
             .limit(1)
             .then((rows) => rows[0] ?? null);
-          if (existingWake) return false;
+          if (existingWake) {
+            logger.info(
+              {
+                existingWakeId: existingWake.id,
+                existingWakeStatus: existingWake.status,
+                idempotencyKey,
+                event: eventName,
+                deliveryId,
+                wakeReason: context.wakeReason,
+                prNumber: context.prNumber,
+                repoFullName: context.repoFullName,
+              },
+              "github webhook reviewer wake skipped: duplicate idempotency key",
+            );
+            return false;
+          }
 
           const reviewerAgentId =
             (await findActivePrReviewerForTask(tx, reviewerAgentIds, reviewerTaskKey)) ??
