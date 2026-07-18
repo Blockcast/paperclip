@@ -756,6 +756,100 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(siblingRun?.status).toBe("succeeded");
   }, 30_000);
 
+  it("gives two concurrent non-PR coding runs independent run-isolated reservations", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runIdA = randomUUID();
+    const runIdB = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "External Runtime Concurrency Co",
+      issuePrefix: "ERC",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Opencode K8s Concurrent",
+      role: "engineer",
+      status: "active",
+      adapterType: "opencode_k8s",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          enabled: true,
+          wakeOnDemand: true,
+          maxConcurrentRuns: 2,
+          concurrencyEnabled: true,
+        },
+      },
+      permissions: {},
+    });
+    // Plain assignment runs -- NO pr_review context -- so isolation must come
+    // from the concurrency branch, not the stateless-PR-review branch.
+    await db.insert(heartbeatRuns).values([
+      {
+        id: runIdA,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { wakeReason: "assignment" },
+      },
+      {
+        id: runIdB,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { wakeReason: "assignment" },
+      },
+    ]);
+
+    mockAdapterExecute.mockImplementation(
+      async (ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> => {
+        const jobName = `agent-opencode-${ctx.runId.slice(0, 8)}`;
+        await ctx.onMeta?.({ adapterType: "opencode_k8s", command: `kubectl job/${jobName}` });
+        await ctx.onExternalRuntimeLaunched?.({
+          jobName,
+          jobUid: `uid-${ctx.runId.slice(0, 8)}`,
+        });
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "coding run launched",
+          resultJson: { ok: true },
+          usage: { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0 },
+          provider: "test",
+          model: "test-model",
+        };
+      },
+    );
+
+    await Promise.all([
+      heartbeat.__test_executeRunForTesting(runIdA),
+      heartbeat.__test_executeRunForTesting(runIdB),
+    ]);
+
+    const [reservationA, reservationB] = await Promise.all([
+      db.select().from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.runId, runIdA)).then((rows) => rows[0]),
+      db.select().from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.runId, runIdB)).then((rows) => rows[0]),
+    ]);
+
+    expect(reservationA?.isolationMode).toBe("run");
+    expect(reservationB?.isolationMode).toBe("run");
+    expect(reservationA?.isolationKey).toBe(`run:${runIdA}`);
+    expect(reservationB?.isolationKey).toBe(`run:${runIdB}`);
+    expect(reservationA?.isolationKey).not.toBe(reservationB?.isolationKey);
+  }, 30_000);
+
   it("compensates by deleting the exact Job when the periodic reconciliation loop loses the create/stamp race", async () => {
     // Ally review on PR #690 (BLO-16269) flagged that both new race tests above
     // drive ctx.onExternalRuntimeLaunched directly, covering only the primary
