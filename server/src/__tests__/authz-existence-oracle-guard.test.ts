@@ -33,6 +33,7 @@ const ROUTES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "routes")
 // discovered resource — no existence oracle to close. Add new entries only
 // when the value cannot reveal whether a cross-tenant resource exists.
 const REQUEST_INPUT_ALLOWLIST = new Set([
+  "agent-image-bump.ts:body", // company id supplied and validated in req.body
   "companies.ts:target", // import target chosen by the caller (req.body.target)
   "plugins.ts:runContext", // run context supplied in the request body
 ]);

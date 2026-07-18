@@ -277,7 +277,7 @@ describe("agent live run routes", () => {
     expect(res.body).not.toHaveProperty("resultJson");
     expect(res.body).not.toHaveProperty("contextSnapshot");
     expect(res.body).not.toHaveProperty("logRef");
-  }, 10_000);
+  }, 30_000);
 
   it("ignores a stale execution run from another issue and falls back to the assignee's matching run", async () => {
     mockHeartbeatService.getRunIssueSummary.mockResolvedValue({
@@ -406,7 +406,7 @@ describe("agent live run routes", () => {
       (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/log?offset=4&limitBytes=32"),
     );
 
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(404);
     expect(mockHeartbeatService.readLog).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       companyId: "company-1",

@@ -34,6 +34,7 @@ const apiPrefixes: Record<string, string> = {
   "file-resources.ts": "/api",
   "folders.ts": "/api",
   "goals.ts": "/api",
+  "github-webhook.ts": "/api/webhooks/github",
   "health.ts": "/api/health",
   "inbox-agent-policy.ts": "/api",
   "inbox-dismissals.ts": "/api",

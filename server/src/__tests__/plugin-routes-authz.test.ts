@@ -143,6 +143,7 @@ const agentA = "44444444-4444-4444-8444-444444444444";
 const runA = "55555555-5555-4555-8555-555555555555";
 const projectA = "66666666-6666-4666-8666-666666666666";
 const pluginId = "11111111-1111-4111-8111-111111111111";
+const pluginActionRpcTimeoutMs = 15 * 60 * 1_000;
 const secretId = "77777777-7777-4777-8777-777777777777";
 
 function boardActor(overrides: Record<string, unknown> = {}) {

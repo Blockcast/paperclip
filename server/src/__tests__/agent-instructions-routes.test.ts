@@ -125,7 +125,12 @@ async function createApp(actor: Record<string, unknown> = boardActor()) {
     (req as any).actor = actor;
     next();
   });
-  app.use("/api", agentRoutes({} as any));
+  const db = {
+    update: () => ({
+      set: () => ({ where: async () => [] }),
+    }),
+  };
+  app.use("/api", agentRoutes(db as any));
   app.use(errorHandler);
   return app;
 }

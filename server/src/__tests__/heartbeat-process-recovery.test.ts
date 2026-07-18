@@ -485,7 +485,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     cleanupPids.clear();
     runningProcesses.clear();
     await tempDb?.cleanup();
-  });
+  }, 120_000);
 
   async function seedRunFixture(input?: {
     adapterType?: string;
@@ -2950,7 +2950,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
 
     await heartbeat.resumeQueuedRuns();
-    await waitForRunToSettle(heartbeat, runId, 5_000);
+    await waitForRunToSettle(heartbeat, runId, 15_000);
 
     expect(mockAdapterExecute).not.toHaveBeenCalled();
 

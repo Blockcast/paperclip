@@ -5,19 +5,15 @@ import {
   activityLog,
   agents,
   agentWakeupRequests,
-  agentRuntimeState,
   budgetPolicies,
   companies,
   companyMemberships,
-  companySkills,
   costEvents,
   createDb,
   executionWorkspaces,
-  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueRelations,
-  issueTreeHoldMembers,
   issueTreeHolds,
   issues,
   projects,
@@ -28,6 +24,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -84,50 +81,20 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
+  let heartbeatSvc: ReturnType<typeof heartbeatService>;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-issue-liveness-");
     db = createDb(tempDb.connectionString);
+    heartbeatSvc = heartbeatService(db);
   });
 
   afterEach(async () => {
     vi.clearAllMocks();
     runningProcesses.clear();
-    let idlePolls = 0;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const runs = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns);
-      const hasActiveRun = runs.some((run) => run.status === "queued" || run.status === "running");
-      if (!hasActiveRun) {
-        idlePolls += 1;
-        if (idlePolls >= 3) break;
-      } else {
-        idlePolls = 0;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await db.delete(activityLog);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(costEvents);
-    await db.delete(workspaceOperations);
-    await db.delete(issueComments);
-    await db.delete(issueTreeHoldMembers);
-    await db.delete(issueTreeHolds);
-    await db.delete(issueRelations);
-    await db.delete(issues);
-    await db.delete(executionWorkspaces);
-    await db.delete(projectWorkspaces);
-    await db.delete(projects);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(budgetPolicies);
-    await db.delete(agents);
-    await db.delete(companyMemberships);
-    await db.delete(companySkills);
-    await db.delete(companies);
+    await cleanupHeartbeatTestState(db, heartbeatSvc, {
+      errorLabel: "heartbeat issue liveness escalation test cleanup",
+    });
     await instanceSettingsService(db).updateExperimental({
       enableIssueGraphLivenessAutoRecovery: false,
       enableIsolatedWorkspaces: false,
@@ -137,7 +104,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
-  }, 30_000);
+  });
 
   async function enableAutoRecovery() {
     await instanceSettingsService(db).updateExperimental({
@@ -374,7 +341,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       enableIssueGraphLivenessAutoRecovery: false,
     });
     const { companyId } = await seedBlockedChain();
-    const heartbeat = heartbeatService(db);
+    const heartbeat = heartbeatSvc;
 
     const result = await heartbeat.reconcileIssueGraphLiveness();
 
@@ -394,7 +361,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     const { companyId, agentId, blockedIssueId, blockerIssueId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
 
-    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
 
     expect(result.autoRecoveryEnabled).toBe(false);
     expect(result.dependencyWakesHealed).toBe(1);
@@ -432,7 +399,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     const { companyId, agentId, blockedIssueId, blockerIssueId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
 
-    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
 
     expect(result.findings).toBe(0);
     expect(result.dependencyWakesHealed).toBe(1);
@@ -465,7 +432,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   it("reconciles a resolved blocked dependency after the assignee-null window closes", async () => {
     const { agentId, blockedIssueId, blockerIssueId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "none", assignee: null });
-    const heartbeat = heartbeatService(db);
+    const heartbeat = heartbeatSvc;
 
     const beforeAssignment = await heartbeat.reconcileIssueGraphLiveness();
 
@@ -518,7 +485,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       idempotencyKey,
     });
 
-    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
 
     expect(result.dependencyWakesHealed).toBe(1);
     expect(result.dependencyWakeExistingSkipped).toBe(0);
@@ -543,7 +510,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     await enableAutoRecovery();
     const { companyId, agentId, blockedIssueId, blockerIssueId, executionWorkspaceId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "not_finalized" });
-    const heartbeat = heartbeatService(db);
+    const heartbeat = heartbeatSvc;
 
     const beforeFinalize = await heartbeat.reconcileIssueGraphLiveness();
 
@@ -627,7 +594,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       idempotencyKey: `issue_blockers_resolved:${blockedIssueId}:${blockerIdNotUsedByBackstop}`,
     });
 
-    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
 
     expect(result.dependencyWakesHealed).toBe(0);
     expect(result.dependencyWakeExistingSkipped).toBe(1);
@@ -656,7 +623,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       })
       .where(eq(agents.id, agentId));
 
-    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
 
     expect(result.dependencyWakesHealed).toBe(0);
     expect(result.dependencyWakeDeferredOrFailed).toBe(1);
@@ -679,7 +646,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   it("does not create recovery issues outside the configured lookback window", async () => {
     await enableAutoRecovery();
     const { companyId } = await seedBlockedChain({ notYetStale: true });
-    const heartbeat = heartbeatService(db);
+    const heartbeat = heartbeatSvc;
 
     const result = await heartbeat.reconcileIssueGraphLiveness();
 
@@ -708,7 +675,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       releasePolicy: { strategy: "manual" },
     });
 
-    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
 
     expect(result.findings).toBe(1);
     expect(result.escalationsCreated).toBe(0);
@@ -734,7 +701,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       contextSnapshot: { issueId: blockedIssueId },
     });
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, blockerIssueId));
-    const heartbeat = heartbeatService(db);
+    const heartbeat = heartbeatSvc;
 
     const result = await heartbeat.reconcileIssueGraphLiveness();
 
@@ -748,7 +715,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       blockerStatus: "backlog",
       blockerAssigneeAgentId: "coder",
     });
-    const heartbeat = heartbeatService(db);
+    const heartbeat = heartbeatSvc;
 
     const first = await heartbeat.reconcileIssueGraphLiveness();
     const second = await heartbeat.reconcileIssueGraphLiveness();
@@ -807,7 +774,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       ].join(":"),
     });
 
-    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
 
     expect(result.findings).toBe(0);
     expect(result.escalationsCreated).toBe(0);
@@ -845,7 +812,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       ].join(":"),
     });
 
-    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
 
     expect(result.findings).toBe(0);
     expect(result.escalationsCreated).toBe(0);
@@ -861,7 +828,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   it("creates one manager escalation, preserves blockers, and records owner selection", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
-    const heartbeat = heartbeatService(db);
+    const heartbeat = heartbeatSvc;
 
     const first = await heartbeat.reconcileIssueGraphLiveness();
     const second = await heartbeat.reconcileIssueGraphLiveness();
@@ -958,7 +925,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       occurredAt: new Date(),
     });
 
-    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
 
     expect(result.escalationsCreated).toBe(1);
     const escalations = await db
@@ -1119,7 +1086,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       type: "blocks",
     });
 
-    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
 
     expect(result.escalationsCreated).toBe(1);
     const escalations = await db
@@ -1161,7 +1128,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       relatedIssueId: secondBlockedIssueId,
       type: "blocks",
     });
-    const heartbeat = heartbeatService(db);
+    const heartbeat = heartbeatSvc;
 
     const result = await heartbeat.reconcileIssueGraphLiveness();
 
@@ -1186,7 +1153,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   it("holds a recently closed matching escalation, then re-escalates after the cooldown", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
-    const heartbeat = heartbeatService(db);
+    const heartbeat = heartbeatSvc;
     const now = new Date();
     const incidentKey = [
       "harness_liveness",
@@ -1254,7 +1221,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   it("re-escalates immediately after a matching escalation is cancelled", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
-    const heartbeat = heartbeatService(db);
+    const heartbeat = heartbeatSvc;
     const now = new Date();
     const incidentKey = [
       "harness_liveness",
@@ -1289,7 +1256,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   it("removes closed liveness escalations from blocker relations during reconciliation", async () => {
     await enableAutoRecovery();
     const { companyId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
-    const heartbeat = heartbeatService(db);
+    const heartbeat = heartbeatSvc;
 
     const first = await heartbeat.reconcileIssueGraphLiveness();
     expect(first.escalationsCreated).toBe(1);
@@ -1332,7 +1299,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   });
 
   it("handles an armed cutoff when no liveness findings exist", async () => {
-    const heartbeat = heartbeatService(db);
+    const heartbeat = heartbeatSvc;
 
     const result = await heartbeat.reconcileIssueGraphLiveness({
       issueCreatedAtGte: new Date(),

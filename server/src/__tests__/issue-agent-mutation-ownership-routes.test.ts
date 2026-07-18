@@ -399,6 +399,19 @@ function boardActor() {
   };
 }
 
+function allowStandardAgentRootIssueCreation() {
+  mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+    allowed:
+      input.action === "tasks:assign" ||
+      input.action === "issue:read" ||
+      input.action === "issue:mutate" ||
+      input.action === "company_scope:read",
+    action: input.action,
+    reason: "allow_test_default",
+    explanation: "Allowed by test default.",
+  }));
+}
+
 describe("agent issue mutation checkout ownership", () => {
   beforeEach(() => {
     vi.resetModules();
@@ -559,8 +572,13 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockIssueService.getByIdentifier.mockResolvedValue(null);
     mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId,
+      blockerIssueIds: [],
       unresolvedBlockerCount: 0,
       unresolvedBlockerIssueIds: [],
+      pendingFinalizeBlockerIssueIds: [],
+      allBlockersDone: true,
+      isDependencyReady: true,
     });
     mockIssueService.getComment.mockResolvedValue({
       id: "comment-1",
@@ -1457,6 +1475,7 @@ describe("agent issue mutation checkout ownership", () => {
   });
 
   it("defaults agent-created root follow-up issues to inherit the current run workspace", async () => {
+    allowStandardAgentRootIssueCreation();
     const app = await createApp(
       ownerActor(),
       createRunContextDb({
@@ -1483,6 +1502,7 @@ describe("agent issue mutation checkout ownership", () => {
   });
 
   it("preserves explicit workspace choices on agent-created root issues", async () => {
+    allowStandardAgentRootIssueCreation();
     const app = await createApp(
       ownerActor(),
       createRunContextDb({
@@ -1548,6 +1568,7 @@ describe("agent issue mutation checkout ownership", () => {
   });
 
   it("strips agent-supplied createdByUserId and derives attribution from the authenticated actor", async () => {
+    allowStandardAgentRootIssueCreation();
     const app = await createApp(ownerActor());
 
     const res = await request(app)

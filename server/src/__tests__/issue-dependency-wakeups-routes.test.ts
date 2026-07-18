@@ -114,7 +114,7 @@ async function createApp() {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = actorOverride ?? {
+    (req as any).actor = {
       type: "board",
       userId: "local-board",
       companyIds: ["company-1"],
@@ -201,7 +201,7 @@ describe("issue dependency wakeups in issue routes", () => {
     ]);
 
     const res = await request(await createApp()).patch("/api/issues/issue-1").send({ status: "done" });
-    expect(res.status).toBe(200);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
     await vi.waitFor(() => {
       expect(mockWakeup).toHaveBeenCalledWith(
         "agent-2",
@@ -267,7 +267,7 @@ describe("issue dependency wakeups in issue routes", () => {
       .patch(`/api/issues/${parentIssueId}`)
       .send({ status: "blocked", blockedByIssueIds: [childIssueId] });
 
-    expect(res.status).toBe(200);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
     await vi.waitFor(() => {
       expect(mockWakeup).toHaveBeenCalledWith(
         "agent-2",
@@ -353,7 +353,7 @@ describe("issue dependency wakeups in issue routes", () => {
     });
 
     const res = await request(await createApp()).patch("/api/issues/child-1").send({ status: "done" });
-    expect(res.status).toBe(200);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
     await vi.waitFor(() => {
       expect(mockWakeup).toHaveBeenCalledWith(
         "agent-9",

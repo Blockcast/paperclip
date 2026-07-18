@@ -44,7 +44,9 @@ import {
   findActiveExecutiveHold,
   ISSUE_LIST_MAX_LIMIT,
   issueService,
+  parseExecutiveHoldMarkerTimestamp,
 } from "../services/issues.ts";
+import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,

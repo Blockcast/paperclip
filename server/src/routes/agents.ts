@@ -4014,12 +4014,23 @@ export function agentRoutes(
 
   router.get("/heartbeat-runs/:runId/log", async (req, res) => {
     const runId = req.params.runId as string;
-    const run = await getAccessibleResource(req, res, heartbeat.getRunLogAccess(runId), "Heartbeat run not found");
-    if (!run) return;
-
     const offset = Number(req.query.offset ?? 0);
     const normalizedOffset = Number.isFinite(offset) ? offset : 0;
     const limitBytes = readRunLogLimitBytes(req.query.limitBytes);
+    const run = await heartbeat.getRunLogAccess(runId);
+    if (!run) {
+      res.status(404).json({ error: "Heartbeat run not found" });
+      return;
+    }
+
+    // Preserve the cross-tenant not-found response while retaining an audit
+    // record for attempts against a run that actually exists. This avoids an
+    // existence oracle without silently dropping denied log-access events.
+    if (!hasCompanyAccess(req, run.companyId)) {
+      await logRunLogAccessAudit(req, run, "denied", { offset: normalizedOffset, limitBytes });
+      res.status(404).json({ error: "Heartbeat run not found" });
+      return;
+    }
 
     try {
       assertCompanyAccess(req, run.companyId);

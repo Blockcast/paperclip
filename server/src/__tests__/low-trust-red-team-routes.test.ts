@@ -41,6 +41,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { parseWakePayloadFromMessage } from "./helpers/wake-message.js";
 import { errorHandler } from "../middleware/index.js";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
@@ -72,6 +73,12 @@ async function waitFor(condition: () => boolean | Promise<boolean>, timeoutMs = 
   throw new Error("Timed out waiting for condition");
 }
 
+async function deleteDocuments(db: Db) {
+  await db.delete(issueDocuments);
+  await db.delete(documentRevisions);
+  await db.delete(documents);
+}
+
 function isHeartbeatCleanupFkError(error: unknown) {
   const message = error instanceof Error ? `${error.message} ${String(error.cause ?? "")}` : String(error);
   return (
@@ -82,6 +89,7 @@ function isHeartbeatCleanupFkError(error: unknown) {
 }
 
 async function deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db: Db) {
+  let lastError: unknown = null;
   for (let attempt = 0; attempt < 10; attempt += 1) {
     await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
@@ -113,21 +121,6 @@ async function deleteCompaniesAfterSideEffectsDrain(db: Db) {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
   }
-}
-
-async function deleteCompanySkillsAfterLateHeartbeatWritesDrain(db: Db) {
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    await db.delete(companySkills);
-    try {
-      await db.delete(companies);
-      return;
-    } catch (error) {
-      lastError = error;
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-  }
-  throw lastError;
 }
 
 function expectNoCanary(value: unknown, ...markers: string[]) {
@@ -662,13 +655,24 @@ async function seedLowTrustFixture(db: Db) {
 describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () => {
   let db!: Db;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let activeHeartbeat: ReturnType<typeof heartbeatService> | null = null;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-low-trust-red-team-routes-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
+    if (activeHeartbeat) {
+      const heartbeat = activeHeartbeat;
+      activeHeartbeat = null;
+      await cleanupHeartbeatTestState(db, heartbeat, {
+        errorLabel: "low-trust red-team route test cleanup",
+        drainTimeoutMs: 30_000,
+      });
+      return;
+    }
+
     await db.delete(issueThreadInteractions);
     await db.delete(issueApprovals);
     await db.delete(approvals);
@@ -686,7 +690,7 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     await db.delete(issueRelations);
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
-    await deleteHeartbeatRunsAfterActivityLogDrains(db);
+    await deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db);
     await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(agentRuntimeState);
@@ -694,7 +698,8 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     await db.delete(companyMemberships);
     await db.delete(agents);
     await db.delete(projects);
-    await deleteCompanySkillsAfterLateHeartbeatWritesDrain(db);
+    await db.delete(companySkills);
+    await deleteCompaniesAfterSideEffectsDrain(db);
   });
 
   afterAll(async () => {
@@ -1185,6 +1190,7 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
         PAPERCLIP_RESTORE_IN_PROGRESS: "false",
       },
     });
+    activeHeartbeat = heartbeat;
 
     try {
       const comment = await request(lowTrustApp)
