@@ -1545,6 +1545,36 @@ describe("K8s session isolation metadata", () => {
     });
   });
 
+  // BLO-16960: a concurrency-enabled agent with an explicit `reuse_existing`
+  // persisted `shared_workspace` must keep using that reused checkout root --
+  // not fall through to an ephemeral `/runtime-cache/paperclip-runs/<runId>`
+  // root -- even though `shared_workspace` mode never sets `isWorkspaceIsolated`.
+  it("uses the reused workspace root for an explicitly selected persisted shared_workspace under concurrency", () => {
+    expect(
+      buildK8sRunIsolationDescriptor({
+        adapterType: "claude_k8s",
+        runId: "run-1",
+        companyId: "company-1",
+        agentId: "agent-1",
+        taskKey: "issue-1",
+        statelessPrReview: false,
+        executionWorkspace: {
+          cwd: "/paperclip/agent-home/agent-1/shared-checkout",
+          source: "project_primary",
+          strategy: "project_primary",
+        },
+        persistedExecutionWorkspaceId: "shared-workspace-1",
+        persistedWorkspaceExplicitlySelected: true,
+        effectiveMaxConcurrentRuns: 3,
+        effectiveExecutionWorkspaceMode: "shared_workspace",
+      }),
+    ).toMatchObject({
+      isolationMode: "workspace",
+      isolationKey: "workspace:shared-workspace-1",
+      workspaceRoot: "/paperclip/agent-home/agent-1/shared-checkout",
+    });
+  });
+
   it("removes user-controlled mutable paths before K8s adapter dispatch", () => {
     expect(stripK8sIsolationOwnedEnv({
       env: {

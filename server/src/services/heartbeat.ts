@@ -3373,6 +3373,7 @@ export function buildK8sRunIsolationDescriptor(input: {
     strategy?: string | null;
   };
   persistedExecutionWorkspaceId?: string | null;
+  persistedWorkspaceExplicitlySelected?: boolean;
   effectiveMaxConcurrentRuns?: number;
   effectiveExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode>;
   isolationIdentity?: {
@@ -3394,6 +3395,7 @@ export function buildK8sRunIsolationDescriptor(input: {
     statelessPrReview: input.statelessPrReview,
     isWorkspaceIsolated,
     persistedExecutionWorkspaceId: input.persistedExecutionWorkspaceId,
+    persistedWorkspaceExplicitlySelected: input.persistedWorkspaceExplicitlySelected,
     effectiveMaxConcurrentRuns: input.effectiveMaxConcurrentRuns ?? 1,
   });
   if (!isolationIdentity) return null;
@@ -3459,13 +3461,24 @@ export function resolveK8sRunIsolationIdentity(input: {
   statelessPrReview: boolean;
   isWorkspaceIsolated: boolean;
   persistedExecutionWorkspaceId?: string | null;
+  persistedWorkspaceExplicitlySelected?: boolean;
   effectiveMaxConcurrentRuns: number;
 }): { isolationMode: "shared" | "run" | "workspace"; isolationKey: string } | null {
   if (!isK8sAdapter(input.adapterType)) return null;
   if (input.statelessPrReview) {
     return { isolationMode: "run", isolationKey: `run:${input.runId}` };
   }
-  if (input.isWorkspaceIsolated && input.persistedExecutionWorkspaceId) {
+  // BLO-16960: a persisted workspace the caller explicitly asked to reuse
+  // (`executionWorkspacePreference: "reuse_existing"`) takes precedence even
+  // when its persisted mode isn't isolated (e.g. `shared_workspace`) — the
+  // isolation *mode* only tells us whether a new isolated checkout is being
+  // minted, not whether an existing checkout was explicitly selected.
+  // Otherwise this run would silently fall through to the concurrency-driven
+  // `run:` branch below and discard the reused checkout.
+  if (
+    input.persistedExecutionWorkspaceId &&
+    (input.isWorkspaceIsolated || input.persistedWorkspaceExplicitlySelected)
+  ) {
     return {
       isolationMode: "workspace",
       isolationKey: `workspace:${input.persistedExecutionWorkspaceId}`,
@@ -3480,6 +3493,8 @@ export function resolveK8sRunIsolationIdentity(input: {
   // reservations (and independent ephemeral workspaces, avoiding shared-repo
   // push collisions). Agents with effective concurrency 1 keep the warm
   // persistent shared workspace, so this is a no-op unless concurrency is on.
+  // Runs targeting an explicitly reused persisted workspace (handled above)
+  // never reach this branch, so anonymous siblings still get distinct keys.
   if (input.effectiveMaxConcurrentRuns > 1) {
     return { isolationMode: "run", isolationKey: `run:${input.runId}` };
   }
@@ -13496,6 +13511,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       statelessPrReview: paperclipPrReview !== null,
       isWorkspaceIsolated: workspaceIsolationRequested,
       persistedExecutionWorkspaceId: plannedExecutionWorkspaceId,
+      persistedWorkspaceExplicitlySelected: shouldReuseExisting,
       effectiveMaxConcurrentRuns:
         resolveExternalLifecycleConcurrency(parseHeartbeatPolicy(agent)).effectiveMaxConcurrentRuns,
     });
