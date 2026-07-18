@@ -96,6 +96,15 @@ export const EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC = "paperclip_external_lifecy
  * concurrent low `process_lost` count is UNRELIABLE, not healthy.
  */
 export const PROCESS_LOST_LIVENESS_NULL_METRIC = "paperclip_process_lost_liveness_null_total";
+/**
+ * Orphaned-managed-pod reap counter (BLO-16850). Incremented once per pod
+ * force-deleted by the orphaned-managed-pod sweep in reapOrphanedRuns — a
+ * still-Running external-lifecycle agent pod whose heartbeat run has finalized
+ * (terminal/absent) with no live Job. Labeled by bounded `adapter`
+ * (claude_k8s/opencode_k8s/other). A sustained rate means runs are finalizing
+ * while their pods keep running (the wedged-container leak this reaper closes).
+ */
+export const ORPHANED_MANAGED_POD_REAPED_METRIC = "paperclip_orphaned_managed_pod_reaped_total";
 
 /**
  * Bounded `reason` allow-list (mirrors the adapter-lane reasons defined in
@@ -273,6 +282,7 @@ let externalRuntimeReservationOldestAge: Gauge | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let processLostLivenessNull: Counter | null = null;
+let orphanedManagedPodReaped: Counter<"adapter"> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -287,6 +297,7 @@ function ensureRegistry(): {
   processLostTotalCounter: Counter<"adapter" | "error_bucket" | "classification">;
   externalLifecycleRunningRunsGauge: Gauge<"adapter">;
   processLostLivenessNullCounter: Counter;
+  orphanedManagedPodReapedCounter: Counter<"adapter">;
 } {
   if (
     !registry
@@ -301,6 +312,7 @@ function ensureRegistry(): {
     || !processLostTotal
     || !externalLifecycleRunningRuns
     || !processLostLivenessNull
+    || !orphanedManagedPodReaped
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -397,6 +409,17 @@ function ensureRegistry(): {
         + PROCESS_LOST_TOTAL_METRIC + " reading unreliable rather than healthy (BLO-16184).",
       registers: [registry],
     });
+    orphanedManagedPodReaped = new Counter({
+      name: ORPHANED_MANAGED_POD_REAPED_METRIC,
+      help:
+        "Count of orphaned external-lifecycle agent pods force-deleted by the "
+        + "reapOrphanedRuns managed-pod sweep (BLO-16850): a still-Running pod whose "
+        + "heartbeat run finalized (terminal/absent) with no live Job. Labeled by bounded "
+        + "adapter (claude_k8s/opencode_k8s/other). A sustained rate means runs are "
+        + "finalizing while their pods keep running.",
+      labelNames: ["adapter"],
+      registers: [registry],
+    });
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -414,6 +437,7 @@ function ensureRegistry(): {
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     processLostLivenessNullCounter: processLostLivenessNull,
+    orphanedManagedPodReapedCounter: orphanedManagedPodReaped,
   };
 }
 
@@ -618,6 +642,18 @@ export function recordProcessLostLivenessNull(): void {
   ensureRegistry().processLostLivenessNullCounter.inc();
 }
 
+/**
+ * Record one orphaned external-lifecycle managed-pod reap (BLO-16850). The
+ * adapter label is normalized to the bounded external-adapter allow-list before
+ * touching the registry (claude_k8s/opencode_k8s/other), mirroring
+ * {@link recordProcessLost}'s cardinality guard.
+ */
+export function recordOrphanedManagedPodReaped(labels?: { adapterType?: string }): void {
+  ensureRegistry().orphanedManagedPodReapedCounter.inc({
+    adapter: normalizeExternalAdapter(labels?.adapterType),
+  });
+}
+
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
   const reg = getMetricsRegistry();
   const depBlockedSnapshot = snapshotDepBlockedMetrics();
@@ -656,6 +692,7 @@ export function __resetMetricsForTest(): void {
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   processLostLivenessNull = null;
+  orphanedManagedPodReaped = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
 }
