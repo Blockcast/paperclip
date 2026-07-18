@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { catalogManifest, catalogSkills, resolveCatalogSkillRef } from "./index.js";
 
@@ -87,5 +88,15 @@ describe("shipped skills catalog", () => {
     expect(resolveCatalogSkillRef(sample.id)).toMatchObject({ key: sample.key });
     expect(resolveCatalogSkillRef(sample.key)).toMatchObject({ key: sample.key });
     expect(resolveCatalogSkillRef(sample.slug)).toMatchObject({ key: sample.key });
+  });
+
+  it("selects user-seat GitHub auth through the agent token-file wrapper", async () => {
+    const content = await readFile(
+      new URL("../catalog/bundled/software-development/github-pr-workflow/SKILL.md", import.meta.url),
+      "utf8",
+    );
+
+    expect(content).toContain('PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE"');
+    expect(content).not.toContain('GH_TOKEN="$AUTHOR_TOKEN"');
   });
 });
