@@ -107,16 +107,25 @@ real `gh pr review`.
 branch and create the PR with it — and use it for the final merge too:
 
 ```sh
-AUTHOR_TOKEN="$(cat /paperclip/.secrets/github-merge-token/token)"
+USER_TOKEN_FILE=/paperclip/.secrets/github-merge-token/token
 
 # push the branch + open the PR as the allyblockcast USER (formally reviewable)
-GH_TOKEN="$AUTHOR_TOKEN" git -c http.https://github.com/.extraheader= \
+PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE" \
+  git -c http.https://github.com/.extraheader= \
   push -u origin "$(git branch --show-current)"
-GH_TOKEN="$AUTHOR_TOKEN" gh pr create --repo <org>/<repo> --title ... --body ...
+PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE" \
+  gh pr create --repo <org>/<repo> --title ... --body ...
 
 # ... later, after the review checklist is satisfied:
-GH_TOKEN="$AUTHOR_TOKEN" gh pr merge <number> --repo <org>/<repo> --squash
+PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE" \
+  gh pr merge <number> --repo <org>/<repo> --squash
 ```
+
+The agent image wraps `gh` and deliberately replaces `GH_TOKEN` with the token
+read from `PAPERCLIP_GITHUB_TOKEN_FILE` on every invocation. Setting `GH_TOKEN`
+does not switch identities in these pods; select the user-seat token file as
+shown above. The same environment override reaches the `gh` credential helper
+used by `git push`.
 
 Rules:
 - Use the **user-seat token** for the branch push, `gh pr create`, and

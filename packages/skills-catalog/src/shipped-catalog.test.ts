@@ -1,4 +1,5 @@
 import { readFileSync, readdirSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -192,5 +193,15 @@ describe("shipped skills catalog", () => {
     const remoteExecPattern = /\b(?:curl|wget)\b[\s\S]{0,160}\|\s*(?:sh|bash)|\b(?:bash|sh)\s+-c\b|\beval\b|\bpython\s+-c\b|\bnode\s+-e\b/i;
 
     expect(remoteExecPattern.test(rampSkill)).toBe(false);
+  });
+
+  it("selects user-seat GitHub auth through the agent token-file wrapper", async () => {
+    const content = await readFile(
+      new URL("../catalog/bundled/software-development/github-pr-workflow/SKILL.md", import.meta.url),
+      "utf8",
+    );
+
+    expect(content).toContain('PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE"');
+    expect(content).not.toContain('GH_TOKEN="$AUTHOR_TOKEN"');
   });
 });
