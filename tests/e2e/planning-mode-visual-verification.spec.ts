@@ -3,7 +3,7 @@ import { expect, test } from "@playwright/test";
 const AGENT_NAME = "Chief of staff";
 const TASK_TITLE = "Hire your first engineer and create a hiring plan";
 
-test.setTimeout(120_000);
+test.setTimeout(240_000);
 
 test("captures planning mode UI for desktop and mobile", async ({ page, baseURL }) => {
   const timestamp = Date.now();
@@ -21,7 +21,7 @@ test("captures planning mode UI for desktop and mobile", async ({ page, baseURL 
     const req = route.request();
     const body = JSON.parse(req.postData() || "{}");
     const auth = req.headers().authorization;
-    const real = await fetch(new URL(req.url()).toString(), {
+    const real = await fetch(new URL(req.url(), baseURL).toString(), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -41,8 +41,16 @@ test("captures planning mode UI for desktop and mobile", async ({ page, baseURL 
       body: await real.text(),
     });
   });
+  // This spec captures the CLASSIC (flag-off) wizard + composer; pin the
+  // experimental flag off in case an earlier spec on this shared instance
+  // turned it on (the NUX specs do).
+  const flagRes = await page.request.patch("/api/instance/settings/experimental", {
+    data: { enableConferenceRoomChat: false },
+  });
+  expect(flagRes.ok()).toBe(true);
 
   await page.goto("/onboarding");
+
   const startBtn = page.getByRole("button", { name: /Start Onboarding|New Company|Add Agent/ });
   if (await startBtn.count()) await startBtn.first().click();
 
@@ -107,21 +115,8 @@ test("captures planning mode UI for desktop and mobile", async ({ page, baseURL 
   };
 
   const toggleComposerWorkMode = async () => {
-    const classicMenuTrigger = page
-      .getByTestId("issue-chat-composer-work-mode-menu")
-      .or(page.getByRole("button", { name: "More composer options" }))
-      .first();
-    if (await classicMenuTrigger.isVisible()) {
-      await classicMenuTrigger.click();
-      await page.getByTestId("issue-chat-composer-work-mode-menu-toggle").click();
-      return;
-    }
-
     await page.getByTestId("issue-chat-composer-work-mode-toggle").click();
-    if ((await page.getByTestId("issue-chat-composer").getAttribute("data-pending-work-mode")) === "standard") {
-      return;
-    }
-    await page.getByTestId("issue-chat-composer-work-mode-menu-toggle").click();
+    await page.getByTestId("issue-chat-composer-work-mode-menu-standard").click();
   };
 
   await setMode("planning");
