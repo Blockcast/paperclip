@@ -124,7 +124,9 @@ jobs:
     name: Typecheck + Release Registry
     needs: [policy]
     runs-on: default
-    timeout-minutes: 20
+    # ARC setup plus the sequential build-gap typechecks exceeded the previous
+    # 20-minute ceiling while the final UI typecheck was still making progress.
+    timeout-minutes: 40
 
     steps:
       - name: Checkout repository
