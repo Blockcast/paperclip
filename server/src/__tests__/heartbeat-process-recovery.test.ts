@@ -626,6 +626,33 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0]);
   }
 
+  async function seedPrelaunchReservation(input: {
+    companyId: string;
+    agentId: string;
+    runId: string;
+    state?: "reserved" | "launching";
+    reservedAt: Date;
+  }) {
+    return db
+      .insert(externalRuntimeReservations)
+      .values({
+        companyId: input.companyId,
+        agentId: input.agentId,
+        runId: input.runId,
+        slotId: 0,
+        state: input.state ?? "reserved",
+        isolationMode: "pending",
+        isolationKey: `pending:${input.runId}`,
+        isolationBoundAt: input.reservedAt,
+        reservedAt: input.reservedAt,
+        launchingAt: input.state === "launching" ? input.reservedAt : null,
+        createdAt: input.reservedAt,
+        updatedAt: input.reservedAt,
+      })
+      .returning()
+      .then((rows) => rows[0]);
+  }
+
   async function seedStrandedIssueFixture(input: {
     status: "todo" | "in_progress";
     runStatus: "failed" | "timed_out" | "cancelled" | "succeeded";
@@ -1667,6 +1694,68 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // cold-boot grace configured, so the stale reservation must converge.
 
     const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+
+    expect(result.runIds).toContain(runId);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+  });
+
+  it.each(["reserved", "launching"] as const)(
+    "keeps a six-minute-old pre-adapter run while its %s reservation still owns launch",
+    async (state) => {
+      // Workspace realization and preRun hooks execute after the run/slot claim
+      // but before adapter.invoke. A setup that crosses the five-minute run-row
+      // grace must not lose its still-active reservation just before it launches.
+      const reservedAt = new Date(Date.now() - 6 * 60 * 1000);
+      const { companyId, agentId, runId } = await seedRunFixture({
+        adapterType: "opencode_k8s",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: false,
+        lastOutputAt: null,
+      });
+      const reservation = await seedPrelaunchReservation({
+        companyId,
+        agentId,
+        runId,
+        state,
+        reservedAt,
+      });
+
+      const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+      expect(result.runIds).not.toContain(runId);
+      const run = await heartbeat.getRun(runId);
+      expect(run?.status).toBe("running");
+      expect(run?.errorCode).toBeNull();
+      const persistedReservation = await db
+        .select()
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.id, reservation.id))
+        .then((rows) => rows[0]);
+      expect(persistedReservation?.releasedAt).toBeNull();
+    },
+  );
+
+  it("still reaps a pre-adapter run whose reservation-only launch ownership is older than the bounded grace", async () => {
+    const reservedAt = new Date(Date.now() - 16 * 60 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null,
+    });
+    await seedPrelaunchReservation({
+      companyId,
+      agentId,
+      runId,
+      state: "reserved",
+      reservedAt,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
 
     expect(result.runIds).toContain(runId);
     const run = await heartbeat.getRun(runId);

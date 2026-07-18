@@ -11773,6 +11773,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (isExternalLifecycleRunInRecentGrace(run, now, EXTERNAL_LIFECYCLE_PRE_ADAPTER_STALE_MS)) {
           continue;
         }
+        // A claimed external-runtime run can legitimately spend longer than the
+        // five-minute run-row grace in workspace/preRun preparation before it
+        // reaches markExternalRuntimeReservationLaunching(). While its active
+        // reservation is still reserved/launching and no launched Job identity
+        // exists, that reservation is durable proof that the in-flight executor
+        // still owns the launch. Give that owner the normal external-lifecycle
+        // stale window before treating the run as orphaned. The bound is measured
+        // from reservedAt (not updatedAt), so unrelated reservation writes cannot
+        // renew the shield indefinitely and ancient reservation-only orphans still
+        // converge through the existing process_lost path.
+        const reservation = reservationsByRunId.get(run.id);
+        const reservationReservedAt = reservation
+          ? new Date(reservation.reservedAt).getTime()
+          : 0;
+        const activePrelaunchReservation = Boolean(
+          reservation
+          && (reservation.state === "reserved" || reservation.state === "launching")
+          && reservation.jobName === null
+          && reservation.jobUid === null
+          && Number.isFinite(reservationReservedAt)
+          && reservationReservedAt > 0
+          && now.getTime() - reservationReservedAt < EXTERNAL_LIFECYCLE_STALE_MS,
+        );
+        if (activePrelaunchReservation) {
+          continue;
+        }
         // BLO-13176: past the grace, DO NOT blindly declare the run orphaned.
         // Workspace provisioning (image pull, repo clone, opencode/claude cold
         // boot) can exceed 5 min while the k8s Job is perfectly alive and simply
