@@ -56,7 +56,9 @@ export default defineConfig({
     // Always boot a dedicated throwaway instance for e2e so browser tests
     // never attach to the developer's active Paperclip home/server.
     reuseExistingServer: false,
-    timeout: 120_000,
+    // ARC cold starts can spend more than two minutes bootstrapping embedded
+    // PostgreSQL and the server before the health endpoint becomes available.
+    timeout: 300_000,
     stdout: "pipe",
     stderr: "pipe",
     env: {

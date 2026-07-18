@@ -164,9 +164,9 @@ jobs:
     name: General tests (${{ matrix.group_label }})
     needs: [policy]
     runs-on: default
-    # ARC cold starts plus the larger server shards can exceed 20 minutes
-    # while still making progress; retain margin under the PR job ceiling.
-    timeout-minutes: 30
+    # ARC cold starts plus the larger server shards can exceed 30 minutes
+    # while still completing passing test files; keep a bounded hour ceiling.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       max-parallel: 2
