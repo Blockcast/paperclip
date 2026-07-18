@@ -1,5 +1,5 @@
 group "default" {
-  targets = ["base", "claude", "codex", "gemini", "acpx", "opencode", "pi", "hermes"]
+  targets = ["base", "claude", "codex", "gemini", "opencode", "pi", "hermes"]
 }
 
 variable "VERSION" { default = "dev" }

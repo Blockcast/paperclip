@@ -122,6 +122,11 @@ const ORIGINAL_ENV = new Map<string, string | undefined>(
 
 describe("opencode remote execution", () => {
   const cleanupDirs: string[] = [];
+  const originalOpenCodeAllowAllModels = process.env.OPENCODE_ALLOW_ALL_MODELS;
+
+  beforeEach(() => {
+    delete process.env.OPENCODE_ALLOW_ALL_MODELS;
+  });
 
   beforeEach(() => {
     for (const key of ISOLATED_ENV_KEYS) delete process.env[key];
@@ -134,6 +139,11 @@ describe("opencode remote execution", () => {
       else process.env[key] = value;
     }
     vi.clearAllMocks();
+    if (originalOpenCodeAllowAllModels === undefined) {
+      delete process.env.OPENCODE_ALLOW_ALL_MODELS;
+    } else {
+      process.env.OPENCODE_ALLOW_ALL_MODELS = originalOpenCodeAllowAllModels;
+    }
     while (cleanupDirs.length > 0) {
       const dir = cleanupDirs.pop();
       if (!dir) continue;

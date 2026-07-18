@@ -127,7 +127,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
       status: "active",
       issuePrefix: "RFR",
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -222,7 +222,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
       status: "active",
       issuePrefix: "RQC",
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -291,7 +291,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
       status: "active",
       issuePrefix: "RRN",
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -392,7 +392,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
       status: "active",
       issuePrefix: "RRR",
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -498,7 +498,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
       status: "active",
       issuePrefix: "RCR",
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
     await db.insert(agents).values({
       id: agentId,
       companyId,

@@ -3,35 +3,6 @@ import { buildSandboxNpmInstallCommand } from "@paperclipai/adapter-utils";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import type { ServerAdapterModule } from "../adapters/index.js";
 
-// vi.fn signature widened so .mock.calls[i]?.[0] resolves to a known shape
-// rather than the empty-tuple inferred from `async () => ({...})` — slice-3
-// (1c4d315cf) + slice-4 (#255) precedent.
-const hermesExecuteMock = vi.hoisted(() =>
-  vi.fn<(ctx: AdapterExecutionContext) => Promise<{
-    exitCode: number;
-    signal: string | null;
-    timedOut: boolean;
-  }>>(async () => ({
-    exitCode: 0,
-    signal: null,
-    timedOut: false,
-  })),
-);
-
-vi.mock("hermes-paperclip-adapter/server", () => ({
-  execute: hermesExecuteMock,
-  testEnvironment: async () => ({
-    adapterType: "hermes_local",
-    status: "pass",
-    checks: [],
-    testedAt: new Date(0).toISOString(),
-  }),
-  sessionCodec: null,
-  listSkills: async () => [],
-  syncSkills: async () => ({ entries: [] }),
-  detectModel: async () => null,
-}));
-
 import {
   detectAdapterModel,
   findActiveServerAdapter,
@@ -67,17 +38,18 @@ const externalAdapter: ServerAdapterModule = {
 describe("server adapter registry", () => {
   beforeEach(() => {
     unregisterServerAdapter("external_test");
+    unregisterServerAdapter("hermes_local");
+    unregisterServerAdapter("hermes_gateway");
     unregisterServerAdapter("claude_local");
     setOverridePaused("claude_local", false);
-    setOverridePaused("hermes_local", true);
   });
 
   afterEach(() => {
     unregisterServerAdapter("external_test");
+    unregisterServerAdapter("hermes_local");
+    unregisterServerAdapter("hermes_gateway");
     unregisterServerAdapter("claude_local");
     setOverridePaused("claude_local", false);
-    setOverridePaused("hermes_local", false);
-    hermesExecuteMock.mockClear();
   });
 
   it("registers external adapters and exposes them through lookup helpers", async () => {
@@ -157,6 +129,83 @@ describe("server adapter registry", () => {
     expect(resolved.models).toEqual([
       { id: "plugin-model", label: "Plugin Override" },
     ]);
+  });
+
+  it("loads Hermes local from the external package and accepts runtime overrides", () => {
+    const builtInLocal = findServerAdapter("hermes_local");
+    const builtInGateway = findServerAdapter("hermes_gateway");
+
+    expect(builtInLocal).not.toBeNull();
+    expect(builtInLocal?.supportsLocalAgentJwt).toBe(true);
+    expect(builtInLocal?.supportsInstructionsBundle).toBe(false);
+    expect(builtInLocal?.requiresMaterializedRuntimeSkills).toBe(false);
+    expect(builtInLocal?.detectModel).toBeTypeOf("function");
+    expect(builtInLocal?.getConfigSchema).toBeUndefined();
+    expect(builtInGateway).toBeNull();
+
+    const hermesLocalExternalAdapter: ServerAdapterModule = {
+      type: "hermes_local",
+      execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
+      testEnvironment: async () => ({
+        adapterType: "hermes_local",
+        status: "pass",
+        checks: [],
+        testedAt: new Date(0).toISOString(),
+      }),
+      supportsLocalAgentJwt: true,
+      supportsInstructionsBundle: true,
+      instructionsPathKey: "instructionsFilePath",
+      requiresMaterializedRuntimeSkills: false,
+      listSkills: async () => ({
+        adapterType: "hermes_local",
+        supported: true,
+        mode: "ephemeral",
+        desiredSkills: [],
+        entries: [],
+        warnings: [],
+      }),
+      getConfigSchema: () => ({ fields: [{ key: "provider", label: "Provider", type: "text" }] }),
+      detectModel: async () => ({
+        model: "hermes-model",
+        provider: "openrouter",
+        source: "test",
+      }),
+    };
+
+    const hermesGatewayExternalAdapter: ServerAdapterModule = {
+      type: "hermes_gateway",
+      execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
+      testEnvironment: async () => ({
+        adapterType: "hermes_gateway",
+        status: "pass",
+        checks: [],
+        testedAt: new Date(0).toISOString(),
+      }),
+      supportsLocalAgentJwt: false,
+      supportsInstructionsBundle: false,
+      requiresMaterializedRuntimeSkills: false,
+      getConfigSchema: () => ({
+        fields: [{ key: "apiBaseUrl", label: "API URL", type: "text" }],
+      }),
+    };
+
+    registerServerAdapter(hermesLocalExternalAdapter);
+
+    expect(requireServerAdapter("hermes_local")).toBe(hermesLocalExternalAdapter);
+    expect(findActiveServerAdapter("hermes_local")?.supportsLocalAgentJwt).toBe(true);
+
+    unregisterServerAdapter("hermes_local");
+
+    expect(requireServerAdapter("hermes_local")).toBe(builtInLocal);
+
+    registerServerAdapter(hermesGatewayExternalAdapter);
+
+    expect(requireServerAdapter("hermes_gateway")).toBe(hermesGatewayExternalAdapter);
+    expect(findActiveServerAdapter("hermes_gateway")?.supportsLocalAgentJwt).toBe(false);
+
+    unregisterServerAdapter("hermes_gateway");
+
+    expect(findServerAdapter("hermes_gateway")).toBeNull();
   });
 
   it("exposes capability flags from registered adapters", () => {
@@ -317,339 +366,6 @@ describe("server adapter registry", () => {
     expect(await listAdapterModels("claude_local")).toEqual(builtInModels);
     expect(await detectAdapterModel("claude_local")).toEqual(builtInDetectedModel);
     expect(detectModel).toHaveBeenCalledTimes(1);
-  });
-
-  it("injects the local agent JWT and Paperclip API auth guidance into Hermes", async () => {
-    const adapter = requireServerAdapter("hermes_local");
-
-    await adapter.execute({
-      runId: "run-123",
-      agent: {
-        id: "agent-123",
-        companyId: "company-123",
-        name: "Hermes Agent",
-        adapterType: "hermes_local",
-        adapterConfig: {
-          env: {
-            OPENAI_API_KEY: "llm-token",
-          },
-          promptTemplate: "Existing prompt",
-        },
-      },
-      runtime: {
-        sessionId: null,
-        sessionParams: null,
-        sessionDisplayId: null,
-        taskKey: null,
-      },
-      config: {},
-      context: {},
-      onLog: async () => {},
-      onMeta: async () => {},
-      onSpawn: async () => {},
-      authToken: "agent-run-jwt",
-    });
-
-    expect(hermesExecuteMock).toHaveBeenCalledTimes(1);
-    // `toHaveBeenCalledTimes(1)` above (or the explicit setup of this test)
-    // guarantees calls[0] exists, but TS doesn't track that — `!` is fine.
-    const [patchedCtx] = hermesExecuteMock.mock.calls[0]!;
-    // adapterConfig typed `unknown` on AdapterAgent; narrow for the
-    // assertion sites below — runtime shape is the env/promptTemplate map
-    // Hermes patches with the JWT.
-    const adapterConfig = patchedCtx.agent.adapterConfig as {
-      env?: Record<string, string>;
-      promptTemplate?: string;
-      hermesCommand?: string;
-    };
-    expect(patchedCtx.agent.adapterConfig).toMatchObject({
-      env: {
-        OPENAI_API_KEY: "llm-token",
-        PAPERCLIP_API_KEY: "agent-run-jwt",
-        PAPERCLIP_RUN_ID: "run-123",
-      },
-    });
-    expect(adapterConfig.promptTemplate).toContain(
-      "Authorization: Bearer $PAPERCLIP_API_KEY",
-    );
-    expect(adapterConfig.promptTemplate).toContain(
-      "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID",
-    );
-    expect(adapterConfig.promptTemplate).toContain("Existing prompt");
-  });
-
-  it("preserves Hermes command normalization while injecting auth", async () => {
-    const adapter = requireServerAdapter("hermes_local");
-
-    await adapter.execute({
-      runId: "run-123",
-      agent: {
-        id: "agent-123",
-        companyId: "company-123",
-        name: "Hermes Agent",
-        adapterType: "hermes_local",
-        adapterConfig: {
-          command: "agent-hermes",
-        },
-      },
-      runtime: {
-        sessionId: null,
-        sessionParams: null,
-        sessionDisplayId: null,
-        taskKey: null,
-      },
-      config: {
-        command: "runtime-hermes",
-      },
-      context: {},
-      onLog: async () => {},
-      onMeta: async () => {},
-      onSpawn: async () => {},
-      authToken: "agent-run-jwt",
-    });
-
-    expect(hermesExecuteMock).toHaveBeenCalledTimes(1);
-    // `toHaveBeenCalledTimes(1)` above (or the explicit setup of this test)
-    // guarantees calls[0] exists, but TS doesn't track that — `!` is fine.
-    const [patchedCtx] = hermesExecuteMock.mock.calls[0]!;
-    // adapterConfig typed `unknown` on AdapterAgent; narrow for the
-    // assertion sites below — runtime shape is the env/promptTemplate map
-    // Hermes patches with the JWT.
-    const adapterConfig = patchedCtx.agent.adapterConfig as {
-      env?: Record<string, string>;
-      promptTemplate?: string;
-      hermesCommand?: string;
-    };
-    expect(patchedCtx.config.hermesCommand).toBe("runtime-hermes");
-    expect(adapterConfig.hermesCommand).toBe("agent-hermes");
-    expect(adapterConfig.env!.PAPERCLIP_API_KEY).toBe("agent-run-jwt");
-  });
-
-  it("passes Hermes custom providers through extraArgs while injecting auth", async () => {
-    const adapter = requireServerAdapter("hermes_local");
-
-    await adapter.execute({
-      runId: "run-123",
-      agent: {
-        id: "agent-123",
-        companyId: "company-123",
-        name: "Hermes Agent",
-        role: "engineer",
-        adapterType: "hermes_local",
-        adapterConfig: {
-          provider: "custom:paperclip-openai",
-          extraArgs: ["--source", "tool"],
-        },
-      },
-      runtime: {},
-      config: {},
-      context: {},
-      onLog: async () => {},
-      onMeta: async () => {},
-      onSpawn: async () => {},
-      authToken: "agent-run-jwt",
-    });
-
-    const [patchedCtx] = hermesExecuteMock.mock.calls[0];
-    expect(patchedCtx.agent.adapterConfig.provider).toBe("custom:paperclip-openai");
-    expect(patchedCtx.agent.adapterConfig.extraArgs).toEqual([
-      "--source",
-      "tool",
-      "--provider",
-      "custom:paperclip-openai",
-    ]);
-    expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("agent-run-jwt");
-  });
-
-  it("does not duplicate an explicit Hermes provider extraArg", async () => {
-    const adapter = requireServerAdapter("hermes_local");
-
-    await adapter.execute({
-      runId: "run-123",
-      agent: {
-        id: "agent-123",
-        companyId: "company-123",
-        name: "Hermes Agent",
-        role: "engineer",
-        adapterType: "hermes_local",
-        adapterConfig: {
-          provider: "custom:paperclip-openai",
-          extraArgs: ["--provider=custom:paperclip-openai"],
-        },
-      },
-      runtime: {},
-      config: {},
-      context: {},
-      onLog: async () => {},
-      onMeta: async () => {},
-      onSpawn: async () => {},
-      authToken: "agent-run-jwt",
-    });
-
-    const [patchedCtx] = hermesExecuteMock.mock.calls[0];
-    expect(patchedCtx.agent.adapterConfig.extraArgs).toEqual([
-      "--provider=custom:paperclip-openai",
-    ]);
-  });
-
-  it("does not duplicate spaced Hermes provider extraArgs", async () => {
-    const adapter = requireServerAdapter("hermes_local");
-
-    await adapter.execute({
-      runId: "run-123",
-      agent: {
-        id: "agent-123",
-        companyId: "company-123",
-        name: "Hermes Agent",
-        role: "engineer",
-        adapterType: "hermes_local",
-        adapterConfig: {
-          provider: "custom:paperclip-openai",
-          extraArgs: ["--provider", "custom:paperclip-openai"],
-        },
-      },
-      runtime: {},
-      config: {},
-      context: {},
-      onLog: async () => {},
-      onMeta: async () => {},
-      onSpawn: async () => {},
-      authToken: "agent-run-jwt",
-    });
-
-    const [patchedCtx] = hermesExecuteMock.mock.calls[0];
-    expect(patchedCtx.agent.adapterConfig.extraArgs).toEqual([
-      "--provider",
-      "custom:paperclip-openai",
-    ]);
-  });
-
-  it("passes the original Hermes context through when authToken is absent", async () => {
-    const adapter = requireServerAdapter("hermes_local");
-    const ctx = {
-      runId: "run-123",
-      agent: {
-        id: "agent-123",
-        companyId: "company-123",
-        name: "Hermes Agent",
-        adapterType: "hermes_local",
-        adapterConfig: {
-          env: {
-            PAPERCLIP_API_KEY: "server-level-key",
-          },
-          promptTemplate: "Existing prompt",
-        },
-      },
-      runtime: {
-        sessionId: null,
-        sessionParams: null,
-        sessionDisplayId: null,
-        taskKey: null,
-      },
-      config: {},
-      context: {},
-      onLog: async () => {},
-      onMeta: async () => {},
-      onSpawn: async () => {},
-    };
-
-    await adapter.execute(ctx);
-
-    expect(hermesExecuteMock).toHaveBeenCalledTimes(1);
-    expect(hermesExecuteMock).toHaveBeenCalledWith(ctx);
-  });
-
-  it("preserves an explicit Hermes Paperclip API key and does not set promptTemplate when none was configured", async () => {
-    const adapter = requireServerAdapter("hermes_local");
-
-    await adapter.execute({
-      runId: "run-123",
-      agent: {
-        id: "agent-123",
-        companyId: "company-123",
-        name: "Hermes Agent",
-        adapterType: "hermes_local",
-        adapterConfig: {
-          env: {
-            PAPERCLIP_API_KEY: "explicit-agent-key",
-            PAPERCLIP_RUN_ID: "stale-run-id",
-          },
-        },
-      },
-      runtime: {
-        sessionId: null,
-        sessionParams: null,
-        sessionDisplayId: null,
-        taskKey: null,
-      },
-      config: {},
-      context: {},
-      onLog: async () => {},
-      onMeta: async () => {},
-      onSpawn: async () => {},
-      authToken: "agent-run-jwt",
-    });
-
-    // `toHaveBeenCalledTimes(1)` above (or the explicit setup of this test)
-    // guarantees calls[0] exists, but TS doesn't track that — `!` is fine.
-    const [patchedCtx] = hermesExecuteMock.mock.calls[0]!;
-    // adapterConfig typed `unknown` on AdapterAgent; narrow for the
-    // assertion sites below — runtime shape is the env/promptTemplate map
-    // Hermes patches with the JWT.
-    const adapterConfig = patchedCtx.agent.adapterConfig as {
-      env?: Record<string, string>;
-      promptTemplate?: string;
-      hermesCommand?: string;
-    };
-    expect(adapterConfig.env!.PAPERCLIP_API_KEY).toBe("explicit-agent-key");
-    expect(adapterConfig.env!.PAPERCLIP_RUN_ID).toBe("run-123");
-    // No custom promptTemplate was set — Hermes must use its built-in default.
-    // Setting promptTemplate here would replace the full default with just the auth guard text,
-    // stripping assigned issue / workflow instructions.
-    expect(adapterConfig.promptTemplate).toBeUndefined();
-  });
-
-  it("does not set promptTemplate when no custom template is configured, preserving Hermes default", async () => {
-    const adapter = requireServerAdapter("hermes_local");
-
-    await adapter.execute({
-      runId: "run-123",
-      agent: {
-        id: "agent-123",
-        companyId: "company-123",
-        name: "Hermes Agent",
-        adapterType: "hermes_local",
-        adapterConfig: {},
-      },
-      runtime: {
-        sessionId: null,
-        sessionParams: null,
-        sessionDisplayId: null,
-        taskKey: null,
-      },
-      config: {},
-      context: {},
-      onLog: async () => {},
-      onMeta: async () => {},
-      onSpawn: async () => {},
-      authToken: "agent-run-jwt",
-    });
-
-    // `toHaveBeenCalledTimes(1)` above (or the explicit setup of this test)
-    // guarantees calls[0] exists, but TS doesn't track that — `!` is fine.
-    const [patchedCtx] = hermesExecuteMock.mock.calls[0]!;
-    // adapterConfig typed `unknown` on AdapterAgent; narrow for the
-    // assertion sites below — runtime shape is the env/promptTemplate map
-    // Hermes patches with the JWT.
-    const adapterConfig = patchedCtx.agent.adapterConfig as {
-      env?: Record<string, string>;
-      promptTemplate?: string;
-      hermesCommand?: string;
-    };
-    // promptTemplate must remain unset so Hermes uses its built-in heartbeat/task prompt.
-    expect(adapterConfig.promptTemplate).toBeUndefined();
-    // Auth token is still injected.
-    expect(adapterConfig.env!.PAPERCLIP_API_KEY).toBe("agent-run-jwt");
   });
 });
 

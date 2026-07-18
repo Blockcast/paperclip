@@ -95,7 +95,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       name: "Paperclip",
       issuePrefix: issuePrefix(companyId),
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -126,7 +126,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       name: "Other",
       issuePrefix: issuePrefix(otherCompanyId),
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
     await db.insert(projects).values({
       id: projectId,
       companyId,
@@ -1083,7 +1083,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
         name: "Other",
         issuePrefix: issuePrefix(otherCompanyId),
         requireBoardApprovalForNewAgents: false,
-      });
+      defaultResponsibleUserId: "responsible-user",      });
       const services = buildHostServices(db, "plugin-record-id", pluginKey, createEventBusStub());
 
       await expect(

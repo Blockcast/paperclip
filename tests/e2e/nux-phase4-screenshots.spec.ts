@@ -10,11 +10,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  *
  * Boots a throwaway local_trusted instance (see playwright.config.ts webServer)
  * and captures screenshots of every surface integrated by NUX Phases 1–3:
- *   - Team name
- *   - Mission definition
- *   - Team-lead setup
- *   - Model connection
- *   - Setup review
+ *   - "Build a new company" step 1 (company name) + step 2 (mission)
+ *   - Team-lead hire step (capsule wizard, PAP-125)
+ *   - Onboarding front door (path picker)
+ *   - "Add agents to your org" growth intake
  *   - Conference Room (BoardChat) shell + composer + activity feed
  *   - Artifacts page
  *
@@ -58,42 +57,16 @@ test.describe("NUX Phase 4 visual QA", () => {
     const baseUrl =
       baseURL ?? "http://127.0.0.1:" + (process.env.PAPERCLIP_E2E_PORT ?? "3199");
 
-    await page.route("**/test-environment", (route) =>
-      route.fulfill({
-        contentType: "application/json",
-        body: JSON.stringify({ status: "pass", checks: [] }),
-      }),
-    );
-
-    await page.route("**/agent-hires", async (route) => {
-      const req = route.request();
-      const body = JSON.parse(req.postData() || "{}");
-      const auth = req.headers().authorization;
-      const real = await fetch(new URL(req.url(), baseUrl).toString(), {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(auth ? { Authorization: auth } : {}),
-        },
-        body: JSON.stringify({
-          name: body.name,
-          role: body.role,
-          adapterType: "http",
-          adapterConfig: { url: "http://127.0.0.1:1/dead" },
-          runtimeConfig: { heartbeat: { enabled: false } },
-        }),
-      });
-      await route.fulfill({
-        status: real.status,
-        contentType: "application/json",
-        body: await real.text(),
-      });
-    });
-
-    // ── Section A: onboarding wizard ──────────────────────────────────────
+    // ── Section A: create-company path (name → mission → hire) ────────────
     await openWizard(page);
+    // Front door shows when the wizard doesn't open directly on the create
+    // path (e.g. another spec already created a company on this instance).
+    const createCard = page.getByRole("button", { name: /Build a new company/ });
+    if (await createCard.count()) {
+      await createCard.first().click();
+    }
     await expect(
-      page.getByRole("heading", { name: "Name your team" }),
+      page.getByRole("heading", { name: "Name your company" }),
     ).toBeVisible({ timeout: 15_000 });
     await page.getByPlaceholder("Acme Corp").fill("QA Robotics");
     await page.screenshot({ path: shot("01-company-setup.png") });
@@ -131,11 +104,27 @@ test.describe("NUX Phase 4 visual QA", () => {
 
     await page.getByRole("button", { name: /Give it a heartbeat/ }).click();
     await expect(
-      page.getByRole("heading", { name: "Review" }),
-    ).toBeVisible({ timeout: 30_000 });
-    await page.screenshot({ path: shot("05-review.png") });
+      page.getByRole("heading", { name: "Welcome to Paperclip" }),
+    ).toBeVisible({ timeout: 10_000 });
+    await expect(
+      page.getByRole("heading", { name: "Build a new company" }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "Add agents to your org" }),
+    ).toBeVisible();
+    await page.screenshot({ path: shot("01-front-door.png") });
 
-    await page.getByRole("button", { name: "Close" }).click();
+    await page.getByRole("button", { name: /Add agents to your org/ }).click();
+    // The grow path shares step 1 (company name) before its step-2 intake.
+    await expect(
+      page.getByRole("heading", { name: "Name your company" }),
+    ).toBeVisible({ timeout: 10_000 });
+    await page.getByPlaceholder("Acme Corp").fill("QA Robotics Grow");
+    await page.getByRole("button", { name: /^Next/ }).click();
+    await expect(
+      page.getByRole("heading", { name: /Tell us about your team/ }),
+    ).toBeVisible({ timeout: 10_000 });
+    await page.screenshot({ path: shot("05-growth-intake.png") });
 
     // ── Section C: Conference Room (BoardChat) ────────────────────────────
     // Visit the company dashboard first so CompanyContext selects the company

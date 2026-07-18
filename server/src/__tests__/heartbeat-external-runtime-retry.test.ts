@@ -157,7 +157,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       name: "External Runtime Retry Co",
       issuePrefix: "ERR",
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -320,7 +320,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       name: "External Runtime Isolation Co",
       issuePrefix: "ERI",
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -464,7 +464,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       name: "External Runtime Race Co",
       issuePrefix: "ERX",
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -584,7 +584,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       name: "External Runtime Sibling Co",
       issuePrefix: "ERS",
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -779,7 +779,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       name: "External Runtime Reconcile Co",
       issuePrefix: "ERC",
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
     await db.insert(agents).values({
       id: agentId,
       companyId,

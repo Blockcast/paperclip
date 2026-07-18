@@ -155,7 +155,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       name: "TestCo",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
 
     await db.insert(agents).values({
       id: agentId,
@@ -331,7 +331,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       name: "StaleTestCo",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
 
     await db.insert(agents).values({
       id: agentId,
@@ -495,7 +495,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       name: "StarvationTestCo",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
 
     await db.insert(agents).values({
       id: agentId,
@@ -656,7 +656,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       name: "RecoveryTestCo",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
 
     await db.insert(agents).values({
       id: agentId,
@@ -833,7 +833,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       name: "ExternalSlotStarvationCo",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
 
     await db.insert(agents).values({
       id: agentId,

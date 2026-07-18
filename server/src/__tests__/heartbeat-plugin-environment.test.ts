@@ -39,6 +39,11 @@ vi.mock("../adapters/index.js", () => ({
     execute: adapterExecute,
     supportsLocalAgentJwt: false,
   }),
+  findActiveServerAdapter: () => ({
+    type: "codex_local",
+    execute: adapterExecute,
+    supportsLocalAgentJwt: false,
+  }),
   listAdapterModelProfiles: async () => [],
   runningProcesses: new Map(),
 }));
@@ -109,6 +114,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       name: "Acme",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       status: "active",
+      defaultResponsibleUserId: "responsible-user",
       createdAt: new Date(),
       updatedAt: new Date(),
     });
@@ -341,6 +347,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
         name: "Acme A",
         issuePrefix: `T${companyAId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
         status: "active",
+        defaultResponsibleUserId: "responsible-user-a",
         createdAt: new Date(),
         updatedAt: new Date(),
       },
@@ -349,6 +356,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
         name: "Acme B",
         issuePrefix: `T${companyBId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
         status: "active",
+        defaultResponsibleUserId: "responsible-user-b",
         createdAt: new Date(),
         updatedAt: new Date(),
       },
@@ -449,24 +457,27 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
 
     const acquireCalls = workerManager.call.mock.calls
       .filter(([, method]) => method === "environmentAcquireLease");
+    const acquirePayloads = acquireCalls.map(([, , payload]) => payload);
 
     expect(acquireCalls).toHaveLength(2);
-    expect(acquireCalls[0]?.[2]).toMatchObject({
-      companyId: companyAId,
-      environmentId: sharedEnvironmentId,
-      config: { template: "shared" },
-      agentId: agentAId,
-      runId: sharedRun!.id,
-      adapterType: "codex_local",
-    });
-    expect(acquireCalls[1]?.[2]).toMatchObject({
-      companyId: companyBId,
-      environmentId: overrideEnvironmentId,
-      config: { template: "override" },
-      agentId: agentBId,
-      runId: overrideRun!.id,
-      adapterType: "codex_local",
-    });
+    expect(acquirePayloads).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        companyId: companyAId,
+        environmentId: sharedEnvironmentId,
+        config: { template: "shared" },
+        agentId: agentAId,
+        runId: sharedRun!.id,
+        adapterType: "codex_local",
+      }),
+      expect.objectContaining({
+        companyId: companyBId,
+        environmentId: overrideEnvironmentId,
+        config: { template: "override" },
+        agentId: agentBId,
+        runId: overrideRun!.id,
+        adapterType: "codex_local",
+      }),
+    ]));
   }, 15_000);
 
   it("ignores stale non-reused workspace environment config in favor of the assignee selection", async () => {
@@ -509,6 +520,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       name: "Acme",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       status: "active",
+      defaultResponsibleUserId: "responsible-user",
       createdAt: new Date(),
       updatedAt: new Date(),
     });
@@ -635,6 +647,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       title: "Environment matrix: e2b / codex_local",
       status: "in_progress",
       priority: "medium",
+      responsibleUserId: "responsible-user",
       assigneeAgentId: agentId,
       executionWorkspaceId: staleExecutionWorkspaceId,
       executionWorkspaceSettings: {

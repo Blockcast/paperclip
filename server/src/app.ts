@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { issues, plugins, type Db } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
+import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
@@ -15,13 +16,20 @@ import { applyTrustProxy, parseTrustProxyEnv } from "./middleware/trust-proxy.js
 import { healthRoutes } from "./routes/health.js";
 import { companyRoutes } from "./routes/companies.js";
 import { companySkillRoutes } from "./routes/company-skills.js";
+import { companySkillPolicyRoutes } from "./routes/company-skill-policy.js";
+import { inboxAgentPolicyRoutes } from "./routes/inbox-agent-policy.js";
+import { builtInAgentRoutes } from "./routes/built-in-agents.js";
+import { folderRoutes } from "./routes/folders.js";
+import { summarySlotRoutes } from "./routes/summary-slots.js";
 import { teamsCatalogRoutes } from "./routes/teams-catalog.js";
 import { agentRoutes } from "./routes/agents.js";
 import { projectRoutes } from "./routes/projects.js";
 import { issueRoutes } from "./routes/issues.js";
 import { issueTreeControlRoutes } from "./routes/issue-tree-control.js";
+import { caseRoutes } from "./routes/cases.js";
 import { fileResourceRoutes } from "./routes/file-resources.js";
 import { routineRoutes } from "./routes/routines.js";
+import { pipelineRoutes } from "./routes/pipelines.js";
 import { environmentRoutes } from "./routes/environments.js";
 import { executionWorkspaceRoutes } from "./routes/execution-workspaces.js";
 import { goalRoutes } from "./routes/goals.js";
@@ -29,9 +37,13 @@ import { milestoneRoutes } from "./routes/milestones.js";
 import { boardChatRoutes } from "./routes/board-chat.js";
 import { approvalRoutes } from "./routes/approvals.js";
 import { secretRoutes } from "./routes/secrets.js";
+import { toolAccessRoutes } from "./routes/tool-access.js";
+import { smokeLabRoutes } from "./routes/smoke-lab.js";
 import { costRoutes } from "./routes/costs.js";
 import { activityRoutes } from "./routes/activity.js";
 import { dashboardRoutes } from "./routes/dashboard.js";
+import { attentionRoutes } from "./routes/attention.js";
+import { decisionTrainingRoutes } from "./routes/decision-training.js";
 import { userProfileRoutes } from "./routes/user-profiles.js";
 import { sidebarBadgeRoutes } from "./routes/sidebar-badges.js";
 import { sidebarPreferenceRoutes } from "./routes/sidebar-preferences.js";
@@ -53,6 +65,7 @@ import { accessRoutes } from "./routes/access.js";
 import { workspaceScanRoutes } from "./routes/workspace-scan.js";
 import { loadConfig } from "./config.js";
 import { pluginRoutes } from "./routes/plugins.js";
+import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "./routes/tool-gateway.js";
 import { adapterRoutes } from "./routes/adapters.js";
 import { metricsIngestRoutes } from "./routes/metrics-ingest.js";
 import { renderMetrics } from "./services/metrics.js";
@@ -66,6 +79,7 @@ import { createPluginWorkerManager, type PluginWorkerManager } from "./services/
 import { createPluginJobScheduler } from "./services/plugin-job-scheduler.js";
 import { pluginJobStore } from "./services/plugin-job-store.js";
 import { createPluginToolDispatcher } from "./services/plugin-tool-dispatcher.js";
+import { createToolGatewayService } from "./services/tool-gateway.js";
 import { pluginLifecycleManager } from "./services/plugin-lifecycle.js";
 import { createPluginJobCoordinator } from "./services/plugin-job-coordinator.js";
 import { buildHostServices, flushPluginLogBuffer } from "./services/plugin-host-services.js";
@@ -79,6 +93,7 @@ import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
 import { createCachedViteHtmlRenderer } from "./vite-html-renderer.js";
 import { registerBodyParsers } from "./http/body-parsers.js";
+import { apiCompression } from "./middleware/api-compression.js";
 
 type UiMode = "none" | "static" | "vite-dev";
 const FEEDBACK_EXPORT_FLUSH_INTERVAL_MS = 5_000;
@@ -251,6 +266,7 @@ export async function createApp(
       }): Promise<unknown>;
     };
     databaseBackupService?: InstanceDatabaseBackupService;
+    databaseBackupHealth?: InspectDatabaseBackupHealthOptions;
     deploymentMode: DeploymentMode;
     deploymentExposure: DeploymentExposure;
     allowedHostnames: string[];
@@ -270,6 +286,7 @@ export async function createApp(
   },
 ) {
   const app = express();
+  app.locals.paperclipDb = db;
   // JSON + urlencoded + raw catch-all, each capturing req.rawBody so the
   // API->worker proxy can forward the exact provider-signed bytes for HMAC
   // verification. See server/src/http/body-parsers.ts.
@@ -296,6 +313,7 @@ export async function createApp(
   // when the server may be reachable without a known reverse proxy in front.
   applyTrustProxy(app, parseTrustProxyEnv(process.env.TRUST_PROXY));
 
+  app.use("/api", apiCompression());
   app.use(httpLogger);
   const privateHostnameGateEnabled = shouldEnablePrivateHostnameGuard({
     deploymentMode: opts.deploymentMode,
@@ -427,23 +445,27 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
       deploymentExposure: opts.deploymentExposure,
       authReady: opts.authReady,
       companyDeletionEnabled: opts.companyDeletionEnabled,
+      databaseBackupHealth: opts.databaseBackupHealth,
     }),
   );
   api.use(openApiRoutes());
   api.use("/companies", companyRoutes(db, opts.storageService));
   api.use(llmRoutes(db));
+  api.use(folderRoutes(db));
   api.use(companySkillRoutes(db));
+  api.use(companySkillPolicyRoutes(db));
+  api.use(inboxAgentPolicyRoutes(db));
+  api.use(builtInAgentRoutes(db));
+  api.use(summarySlotRoutes(db));
   api.use(teamsCatalogRoutes(db));
   api.use(agentRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(assetRoutes(db, opts.storageService));
   api.use(projectRoutes(db));
-  api.use(issueRoutes(db, opts.storageService, {
-    feedbackExportService: opts.feedbackExportService,
-    pluginWorkerManager: workerManager,
-  }));
+  api.use(caseRoutes(db, opts.storageService));
   api.use(issueTreeControlRoutes(db));
   api.use(fileResourceRoutes(db));
   api.use(routineRoutes(db, { pluginWorkerManager: workerManager }));
+  api.use(pipelineRoutes(db));
   api.use(environmentRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(executionWorkspaceRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(goalRoutes(db));
@@ -451,9 +473,15 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   api.use(boardChatRoutes(db, { deploymentMode: opts.deploymentMode }));
   api.use(approvalRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(secretRoutes(db));
+  const trustedLocalStdioRuntimeHost =
+    process.env.PAPERCLIP_TRUSTED_MCP_RUNTIME_HOST
+    ?? process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST
+    ?? null;
   api.use(costRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(activityRoutes(db));
   api.use(dashboardRoutes(db));
+  api.use(attentionRoutes(db));
+  api.use(decisionTrainingRoutes(db));
   api.use(userProfileRoutes(db));
   api.use(sidebarBadgeRoutes(db));
   api.use(sidebarPreferenceRoutes(db));
@@ -482,6 +510,31 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     lifecycleManager: lifecycle,
     db,
   });
+  const toolGateway = createToolGatewayService(db, {
+    pluginToolDispatcher: toolDispatcher,
+    deploymentMode: opts.deploymentMode,
+    deploymentExposure: opts.deploymentExposure,
+    trustedLocalStdioRuntimeHost,
+  });
+  // Issue routes are intentionally mounted after the gateway is constructed because
+  // issue approval endpoints delegate to it. The intervening routers use distinct
+  // route prefixes, so this dependency does not change issue-route precedence.
+  api.use(issueRoutes(db, opts.storageService, {
+    feedbackExportService: opts.feedbackExportService,
+    pluginWorkerManager: workerManager,
+    approveToolActionRequest: (input) => toolGateway.approveActionRequest(input),
+  }));
+  app.use(mcpGatewayProtocolRoutes(toolGateway));
+  api.use(toolAccessRoutes(db, {
+    deploymentMode: opts.deploymentMode,
+    deploymentExposure: opts.deploymentExposure,
+    trustedLocalStdioRuntimeHost,
+    toolGateway,
+  }));
+  api.use(smokeLabRoutes(db, {
+    deploymentMode: opts.deploymentMode,
+    deploymentExposure: opts.deploymentExposure,
+  }));
   const jobCoordinator = createPluginJobCoordinator({
     db,
     lifecycle,
@@ -632,6 +685,9 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     },
   );
   api.use(
+    toolGatewayRoutes(db, toolGateway),
+  );
+  api.use(
     pluginRoutes(
       db,
       loader,
@@ -643,6 +699,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
         nodeRole: appConfig.paperclipNodeRole,
         workersInternalUrl: appConfig.paperclipWorkersInternalUrl,
       },
+      { toolGateway },
     ),
   );
   api.use(adapterRoutes());

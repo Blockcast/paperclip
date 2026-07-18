@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import {
   claudeCommandSupportsEffortFlag,
@@ -61,6 +62,8 @@ const addDirIndex = argv.indexOf("--add-dir");
 const addDir = addDirIndex >= 0 ? argv[addDirIndex + 1] : null;
 const instructionsIndex = argv.indexOf("--append-system-prompt-file");
 const instructionsFilePath = instructionsIndex >= 0 ? argv[instructionsIndex + 1] : null;
+const mcpConfigIndex = argv.indexOf("--mcp-config");
+const mcpConfigPath = mcpConfigIndex >= 0 ? argv[mcpConfigIndex + 1] : null;
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const payload = {
   argv,
@@ -68,6 +71,8 @@ const payload = {
   addDir,
   instructionsFilePath,
   instructionsContents: instructionsFilePath ? fs.readFileSync(instructionsFilePath, "utf8") : null,
+  mcpConfigPath,
+  mcpConfigContents: mcpConfigPath ? fs.readFileSync(mcpConfigPath, "utf8") : null,
   skillEntries: addDir ? fs.readdirSync(path.join(addDir, ".claude", "skills")).sort() : [],
   claudeConfigDir: process.env.CLAUDE_CONFIG_DIR || null,
   claudeConfigEntries: process.env.CLAUDE_CONFIG_DIR && fs.existsSync(process.env.CLAUDE_CONFIG_DIR)
@@ -394,6 +399,59 @@ function createLocalSandboxRunner() {
 }
 
 describe("claude execute", () => {
+  it("uses a strict per-agent MCP config only when managed servers are present", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-mcp-config-"));
+    const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);
+    try {
+      const run = async (runId: string, agentId: string, servers: AdapterRuntimeMcpServer[]) => {
+        await execute({
+          runId,
+          agent: { id: agentId, companyId: "co-1", name: agentId, adapterType: "claude_local", adapterConfig: { engine: "cli" } },
+          runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+          config: {
+            engine: "cli",
+            command: commandPath,
+            cwd: workspace,
+            env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
+            promptTemplate: "Do work.",
+          },
+          runtimeMcp: { getServers: () => servers },
+          context: {},
+          authToken: "tok",
+          onLog: async () => {},
+        });
+        return JSON.parse(await fs.readFile(capturePath, "utf8"));
+      };
+
+      const alpha = await run("run-alpha", "agent-alpha", [{
+        name: "alpha",
+        url: "https://paperclip.example/api/tool-gateway/gateways/alpha/mcp",
+        token: "alpha-token",
+        connectionId: "connection-alpha",
+      }]);
+      const zero = await run("run-zero", "agent-zero", []);
+
+      expect(alpha.argv).toEqual(expect.arrayContaining(["--strict-mcp-config", "--mcp-config"]));
+      expect(JSON.parse(alpha.mcpConfigContents)).toEqual({
+        mcpServers: {
+          alpha: {
+            type: "http",
+            url: "https://paperclip.example/api/tool-gateway/gateways/alpha/mcp",
+            headers: { Authorization: "Bearer alpha-token" },
+          },
+        },
+      });
+      expect(zero.argv).not.toContain("--mcp-config");
+      expect(zero.argv).not.toContain("--strict-mcp-config");
+      expect(zero.mcpConfigPath).toBeNull();
+      expect(zero.mcpConfigContents).toBeNull();
+      expect(alpha.mcpConfigPath).toContain("/agents/agent-alpha/");
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   /**
    * Regression tests for https://github.com/paperclipai/paperclip/issues/2848
    *
@@ -409,9 +467,10 @@ describe("claude execute", () => {
     try {
       await execute({
         runId: "run-fresh",
-        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
         runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
@@ -446,9 +505,10 @@ describe("claude execute", () => {
     try {
       await execute({
         runId: "run-resume",
-        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
         runtime: { sessionId: "11111111-1111-4111-8111-111111111111", sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
@@ -484,9 +544,10 @@ describe("claude execute", () => {
     try {
       await execute({
         runId: "run-notes-fresh",
-        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
         runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           env: {},
@@ -516,9 +577,10 @@ describe("claude execute", () => {
     try {
       await execute({
         runId: "run-notes-resume",
-        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
         runtime: { sessionId: "11111111-1111-4111-8111-111111111111", sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           env: {},
@@ -553,9 +615,10 @@ describe("claude execute", () => {
     try {
       const result = await execute({
         runId: "run-resume-fallback",
-        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
         runtime: { sessionId: "11111111-1111-4111-8111-111111111111", sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           env: {
@@ -617,7 +680,7 @@ describe("claude execute", () => {
     try {
       const result = await execute({
         runId: "run-thinking-resume",
-        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
         runtime: {
           sessionId: staleSessionId,
           sessionParams: {
@@ -629,6 +692,7 @@ describe("claude execute", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
@@ -678,9 +742,10 @@ describe("claude execute", () => {
     try {
       const result = await execute({
         runId: "run-max-turns",
-        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
         runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           promptTemplate: "Do work.",
@@ -717,9 +782,10 @@ describe("claude execute", () => {
     try {
       const result = await execute({
         runId: "run-max-turns-text",
-        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
         runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           promptTemplate: "Do work.",
@@ -752,9 +818,10 @@ describe("claude execute", () => {
     try {
       const result = await execute({
         runId: "run-max-turns-fallback-text",
-        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
         runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           promptTemplate: "Do work.",
@@ -803,7 +870,7 @@ describe("claude execute", () => {
           companyId: "company-1",
           name: "Claude Coder",
           adapterType: "claude_local",
-          adapterConfig: {},
+          adapterConfig: { engine: "cli" },
         },
         runtime: {
           sessionId: null,
@@ -812,6 +879,7 @@ describe("claude execute", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: "claude",
           cwd: workspace,
           env: {
@@ -830,6 +898,9 @@ describe("claude execute", () => {
 
       expect(result.exitCode).toBe(0);
       expect(result.errorMessage).toBeNull();
+      expect(result.usage).toEqual({ inputTokens: 1, cachedInputTokens: 0, outputTokens: 1 });
+      expect(result.usageBasis).toBe("per_run");
+      expect(result.costUsd).toBeNull();
       expect(loggedCommand).toBe(commandPath);
       expect(loggedEnv.HOME).toBe(root);
       expect(loggedEnv.CLAUDE_CONFIG_DIR).toBe(claudeConfigDir);
@@ -874,7 +945,7 @@ describe("claude execute", () => {
           companyId: "company-1",
           name: "Claude Coder",
           adapterType: "claude_local",
-          adapterConfig: {},
+          adapterConfig: { engine: "cli" },
         },
         runtime: {
           sessionId: null,
@@ -883,6 +954,7 @@ describe("claude execute", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: localWorkspace,
           env: {
@@ -952,7 +1024,7 @@ describe("claude execute", () => {
           companyId: "company-1",
           name: "Claude Coder",
           adapterType: "claude_local",
-          adapterConfig: {},
+          adapterConfig: { engine: "cli" },
         },
         runtime: {
           sessionId: null,
@@ -961,6 +1033,7 @@ describe("claude execute", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           effort: "low",
@@ -1008,7 +1081,7 @@ describe("claude execute", () => {
         companyId: "company-1",
         name: "Claude Coder",
         adapterType: "claude_local",
-        adapterConfig: {},
+        adapterConfig: { engine: "cli" },
       },
       runtime: {
         sessionId: null,
@@ -1017,6 +1090,7 @@ describe("claude execute", () => {
         taskKey: null,
       },
       config: {
+        engine: "cli",
         command: commandPath,
         cwd: workspace,
         effort: "low",
@@ -1150,7 +1224,7 @@ describe("claude execute", () => {
           companyId: "company-1",
           name: "Claude Coder",
           adapterType: "claude_local",
-          adapterConfig: {},
+          adapterConfig: { engine: "cli" },
         },
         runtime: {
           sessionId: null,
@@ -1159,6 +1233,7 @@ describe("claude execute", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           instructionsFilePath: instructionsPath,
@@ -1190,7 +1265,7 @@ describe("claude execute", () => {
           companyId: "company-1",
           name: "Claude Coder",
           adapterType: "claude_local",
-          adapterConfig: {},
+          adapterConfig: { engine: "cli" },
         },
         runtime: {
           sessionId: null,
@@ -1199,6 +1274,7 @@ describe("claude execute", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           instructionsFilePath: instructionsPath,
@@ -1315,7 +1391,7 @@ describe("claude execute", () => {
           companyId: "company-1",
           name: "Claude Coder",
           adapterType: "claude_local",
-          adapterConfig: {},
+          adapterConfig: { engine: "cli" },
         },
         runtime: {
           sessionId: null,
@@ -1324,6 +1400,7 @@ describe("claude execute", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           instructionsFilePath: instructionsPath,
@@ -1346,7 +1423,7 @@ describe("claude execute", () => {
           companyId: "company-1",
           name: "Claude Coder",
           adapterType: "claude_local",
-          adapterConfig: {},
+          adapterConfig: { engine: "cli" },
         },
         runtime: {
           sessionId: null,
@@ -1355,6 +1432,7 @@ describe("claude execute", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           instructionsFilePath: instructionsPath,
@@ -1392,7 +1470,7 @@ describe("claude execute", () => {
     }
   }, 15_000);
 
-  it("classifies Claude 'out of extra usage' failures as provider_quota_exhausted", async () => {
+  it("classifies Claude 'out of extra usage' failures as provider quota errors", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-transient-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "claude");
@@ -1421,7 +1499,7 @@ describe("claude execute", () => {
           companyId: "company-1",
           name: "Claude Coder",
           adapterType: "claude_local",
-          adapterConfig: {},
+          adapterConfig: { engine: "cli" },
         },
         runtime: {
           sessionId: null,
@@ -1430,6 +1508,7 @@ describe("claude execute", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           promptTemplate: "Follow the paperclip heartbeat.",
@@ -1441,6 +1520,11 @@ describe("claude execute", () => {
 
       expect(result.exitCode).toBe(1);
       expect(result.errorCode).toBe("provider_quota_exhausted");
+      expect(result.errorFamily).toBe("provider_quota");
+      const expectedRetryNotBefore = "2026-04-22T21:00:00.000Z";
+      expect(result.retryNotBefore).toBe(expectedRetryNotBefore);
+      expect(result.resultJson?.retryNotBefore).toBe(expectedRetryNotBefore);
+      expect(result.resultJson?.providerQuotaRetryNotBefore).toBe(expectedRetryNotBefore);
       expect(result.errorMessage ?? "").toContain("extra usage");
     } finally {
       vi.useRealTimers();
@@ -1450,107 +1534,21 @@ describe("claude execute", () => {
     }
   });
 
-  it("does not classify Paperclip API auth text in Claude output as Claude auth required", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-paperclip-auth-text-"));
+  it("treats subtype=success results as successful even when the process exits nonzero", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-success-subtype-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "claude");
     await fs.mkdir(workspace, { recursive: true });
     await writeFailingClaudeCommand(commandPath, {
-      preludeEvents: [
-        {
-          type: "assistant",
-          session_id: "claude-session-paperclip-auth-text",
-          message: {
-            content: [
-              {
-                type: "text",
-                text: "The Paperclip API is returning 401 (Agent authentication required).",
-              },
-            ],
-          },
-        },
-      ],
-      resultEvent: {
-        type: "result",
-        subtype: "success",
-        session_id: "claude-session-paperclip-auth-text",
-        is_error: true,
-        result: "You're out of extra usage · resets 12:10am (UTC)",
-        api_error_status: 429,
-      },
-    });
-
-    const previousHome = process.env.HOME;
-    process.env.HOME = root;
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-04-29T20:42:00.000Z"));
-
-    try {
-      const result = await execute({
-        runId: "run-claude-paperclip-auth-text",
-        agent: {
-          id: "agent-1",
-          companyId: "company-1",
-          name: "Claude Coder",
-          adapterType: "claude_local",
-          adapterConfig: {},
-        },
-        runtime: {
-          sessionId: null,
-          sessionParams: null,
-          sessionDisplayId: null,
-          taskKey: null,
-        },
-        config: {
-          command: commandPath,
-          cwd: workspace,
-          promptTemplate: "Follow the paperclip heartbeat.",
-        },
-        context: {},
-        authToken: "run-jwt-token",
-        onLog: async () => {},
-      });
-
-      expect(result.exitCode).toBe(1);
-      // Contract: a Paperclip-API auth phrase echoed in Claude's assistant
-      // output must NOT trip the claude_auth_required classifier — that
-      // path requires real Claude/Anthropic context (parse.ts guards on
-      // assistant-typed lines + a Claude/Anthropic/oauth context match).
-      expect(result.errorCode).not.toBe("claude_auth_required");
-      // The actual failure here is the result event's "out of extra usage"
-      // message, which classifies first as provider_quota_exhausted (see
-      // execute.ts: quota check runs before transient_upstream).
-      expect(result.errorCode).toBe("provider_quota_exhausted");
-    } finally {
-      vi.useRealTimers();
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("treats subtype=success + is_error=false as success even when CLI exits non-zero", async () => {
-    // Real-world heartbeat-runs from CTO showed status=failed with errorCode=adapter_failed
-    // and the error field literally containing the agent's successful summary text. Trace:
-    // CLI emitted {type:"result", subtype:"success", is_error:false, result:"<summary>"}
-    // and then exited 1 anyway (post-completion cleanup hiccup / stderr noise). The adapter
-    // trusted the exit code and re-queued already-completed work. Trust the SDK's success
-    // signal instead.
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-success-exit1-"));
-    const workspace = path.join(root, "workspace");
-    const commandPath = path.join(root, "claude");
-    await fs.mkdir(workspace, { recursive: true });
-    await writeFailingClaudeCommand(commandPath, {
-      resultEvent: {
-        type: "result",
-        subtype: "success",
-        session_id: "claude-session-success-exit1",
-        is_error: false,
-        result: "Wave-3 closed: BLO-3850, BLO-3845. All same umbrella pattern.",
-        total_cost_usd: 1.07,
-        usage: { input_tokens: 35, cache_read_input_tokens: 882717, output_tokens: 6275 },
-      },
       exitCode: 1,
+      resultEvent: {
+        type: "result",
+        subtype: "success",
+        session_id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+        is_error: false,
+        result: "Implemented the requested change.",
+        usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 },
+      },
     });
 
     const previousHome = process.env.HOME;
@@ -1558,13 +1556,13 @@ describe("claude execute", () => {
 
     try {
       const result = await execute({
-        runId: "run-claude-success-exit1",
+        runId: "run-claude-success-subtype",
         agent: {
           id: "agent-1",
           companyId: "company-1",
           name: "Claude Coder",
           adapterType: "claude_local",
-          adapterConfig: {},
+          adapterConfig: { engine: "cli" },
         },
         runtime: {
           sessionId: null,
@@ -1573,6 +1571,7 @@ describe("claude execute", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           promptTemplate: "Follow the paperclip heartbeat.",
@@ -1582,17 +1581,10 @@ describe("claude execute", () => {
         onLog: async () => {},
       });
 
-      // CLI's exit code is preserved on the result envelope (it really did exit 1)…
       expect(result.exitCode).toBe(1);
-      // …but the run is NOT classified as adapter_failed: the SDK explicitly said
-      // subtype=success + is_error=false, so the agent's work landed.
       expect(result.errorMessage).toBeNull();
       expect(result.errorCode).toBeNull();
-      expect(result.errorFamily).toBeNull();
-      // Summary is preserved — downstream consumers (continuation logic, audit
-      // trail, billing) see the actual completion text, not "Claude run failed:
-      // subtype=success: <summary>".
-      expect(result.summary).toContain("Wave-3 closed");
+      expect(result.summary).toBe("Implemented the requested change.");
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
@@ -1627,7 +1619,7 @@ describe("claude execute", () => {
           companyId: "company-1",
           name: "Claude Coder",
           adapterType: "claude_local",
-          adapterConfig: {},
+          adapterConfig: { engine: "cli" },
         },
         runtime: {
           sessionId: null,
@@ -1636,6 +1628,7 @@ describe("claude execute", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           promptTemplate: "Follow the paperclip heartbeat.",
@@ -1687,7 +1680,7 @@ describe("claude execute", () => {
           companyId: "company-1",
           name: "Claude Coder",
           adapterType: "claude_local",
-          adapterConfig: {},
+          adapterConfig: { engine: "cli" },
         },
         runtime: {
           sessionId: null,
@@ -1696,6 +1689,7 @@ describe("claude execute", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           promptTemplate: "Follow the paperclip heartbeat.",
@@ -1743,7 +1737,7 @@ describe("claude execute", () => {
           companyId: "company-1",
           name: "Claude Coder",
           adapterType: "claude_local",
-          adapterConfig: {},
+          adapterConfig: { engine: "cli" },
         },
         runtime: {
           sessionId: null,
@@ -1752,6 +1746,7 @@ describe("claude execute", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           promptTemplate: "Follow the paperclip heartbeat.",
@@ -1821,7 +1816,7 @@ process.exit(0);
           companyId: "company-1",
           name: "Claude Coder",
           adapterType: "claude_local",
-          adapterConfig: {},
+          adapterConfig: { engine: "cli" },
         },
         runtime: {
           sessionId: null,
@@ -1830,6 +1825,7 @@ process.exit(0);
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           promptTemplate: "Follow the paperclip heartbeat.",
@@ -1900,10 +1896,11 @@ process.exit(0);
           companyId: "company-1",
           name: "Claude Coder",
           adapterType: "claude_local",
-          adapterConfig: {},
+          adapterConfig: { engine: "cli" },
         },
         runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           promptTemplate: "Follow the paperclip heartbeat.",
@@ -1935,7 +1932,7 @@ process.exit(0);
     try {
       const result = await execute({
         runId: "run-poisoned-msgid",
-        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
         runtime: {
           sessionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
           sessionParams: {
@@ -1947,6 +1944,7 @@ process.exit(0);
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           env: {
@@ -1990,9 +1988,10 @@ process.exit(0);
     try {
       const result = await execute({
         runId: "run-poisoned-fresh",
-        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
         runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
@@ -2033,7 +2032,7 @@ process.exit(0);
     try {
       const result = await execute({
         runId: "run-poisoned-retry",
-        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
         runtime: {
           sessionId: "aaaaaaaa-0000-4000-8000-000000000004",
           sessionParams: {
@@ -2045,6 +2044,7 @@ process.exit(0);
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
