@@ -3361,6 +3361,7 @@ export function buildK8sRunIsolationDescriptor(input: {
     strategy?: string | null;
   };
   persistedExecutionWorkspaceId?: string | null;
+  effectiveMaxConcurrentRuns?: number;
   effectiveExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode>;
   isolationIdentity?: {
     isolationMode: "shared" | "run" | "workspace";
@@ -3381,6 +3382,7 @@ export function buildK8sRunIsolationDescriptor(input: {
     statelessPrReview: input.statelessPrReview,
     isWorkspaceIsolated,
     persistedExecutionWorkspaceId: input.persistedExecutionWorkspaceId,
+    effectiveMaxConcurrentRuns: input.effectiveMaxConcurrentRuns ?? 1,
   });
   if (!isolationIdentity) return null;
   const { isolationMode, isolationKey } = isolationIdentity;
@@ -3445,6 +3447,7 @@ export function resolveK8sRunIsolationIdentity(input: {
   statelessPrReview: boolean;
   isWorkspaceIsolated: boolean;
   persistedExecutionWorkspaceId?: string | null;
+  effectiveMaxConcurrentRuns: number;
 }): { isolationMode: "shared" | "run" | "workspace"; isolationKey: string } | null {
   if (!isK8sAdapter(input.adapterType)) return null;
   if (input.statelessPrReview) {
@@ -3455,6 +3458,18 @@ export function resolveK8sRunIsolationIdentity(input: {
       isolationMode: "workspace",
       isolationKey: `workspace:${input.persistedExecutionWorkspaceId}`,
     };
+  }
+  // BLO-16842: an agent that will actually run siblings concurrently (effective
+  // external-lifecycle concurrency > 1) cannot share the single
+  // `agent-shared:<agentId>` writer reservation — the second admitted slot would
+  // conflict on external_runtime_reservations_active_isolation_writer_idx and be
+  // deferred, silently serializing the agent. Give each such run its own
+  // ephemeral `run:<runId>` isolation so siblings hold independent writer
+  // reservations (and independent ephemeral workspaces, avoiding shared-repo
+  // push collisions). Agents with effective concurrency 1 keep the warm
+  // persistent shared workspace, so this is a no-op unless concurrency is on.
+  if (input.effectiveMaxConcurrentRuns > 1) {
+    return { isolationMode: "run", isolationKey: `run:${input.runId}` };
   }
   return { isolationMode: "shared", isolationKey: `agent-shared:${input.agentId}` };
 }
@@ -13238,6 +13253,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       statelessPrReview: paperclipPrReview !== null,
       isWorkspaceIsolated: workspaceIsolationRequested,
       persistedExecutionWorkspaceId: plannedExecutionWorkspaceId,
+      effectiveMaxConcurrentRuns:
+        resolveExternalLifecycleConcurrency(parseHeartbeatPolicy(agent)).effectiveMaxConcurrentRuns,
     });
     if (k8sIsolationIdentity) {
       if (!externalRuntimeReservation) {

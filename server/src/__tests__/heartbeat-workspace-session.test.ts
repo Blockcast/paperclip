@@ -1538,6 +1538,7 @@ describe("K8s session isolation metadata", () => {
       statelessPrReview: false,
       isWorkspaceIsolated: true,
       persistedExecutionWorkspaceId: "planned-workspace-1",
+      effectiveMaxConcurrentRuns: 1,
     })).toEqual({
       isolationMode: "workspace",
       isolationKey: "workspace:planned-workspace-1",

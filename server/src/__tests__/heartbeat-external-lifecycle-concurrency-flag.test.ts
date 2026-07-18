@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   resolveExternalLifecycleConcurrency,
   resolveHeartbeatPolicyForRuntimeConfig,
+  resolveK8sRunIsolationIdentity,
 } from "../services/heartbeat.ts";
 
 // Regression coverage for BLO-15959: bounded external-lifecycle concurrency
@@ -68,5 +69,57 @@ describe("resolveExternalLifecycleConcurrency", () => {
     // reservation/slot state needs to change for this to take effect.
     const disabledAgain = resolveExternalLifecycleConcurrency({ concurrencyEnabled: false, maxConcurrentRuns: 4 });
     expect(disabledAgain.effectiveMaxConcurrentRuns).toBe(1);
+  });
+});
+
+describe("resolveK8sRunIsolationIdentity: concurrency-aware run isolation (BLO-16842)", () => {
+  const base = {
+    adapterType: "opencode_k8s" as const,
+    runId: "run-123",
+    agentId: "agent-abc",
+    statelessPrReview: false,
+    isWorkspaceIsolated: false,
+    persistedExecutionWorkspaceId: null,
+  };
+
+  it("keeps shared isolation for a default (effective concurrency 1) coding run", () => {
+    expect(resolveK8sRunIsolationIdentity({ ...base, effectiveMaxConcurrentRuns: 1 })).toEqual({
+      isolationMode: "shared",
+      isolationKey: "agent-shared:agent-abc",
+    });
+  });
+
+  it("gives per-run isolation to a coding run once effective concurrency exceeds 1", () => {
+    expect(resolveK8sRunIsolationIdentity({ ...base, effectiveMaxConcurrentRuns: 2 })).toEqual({
+      isolationMode: "run",
+      isolationKey: "run:run-123",
+    });
+  });
+
+  it("does not let concurrency override a deliberate persistent workspace", () => {
+    expect(
+      resolveK8sRunIsolationIdentity({
+        ...base,
+        isWorkspaceIsolated: true,
+        persistedExecutionWorkspaceId: "ws-9",
+        effectiveMaxConcurrentRuns: 3,
+      }),
+    ).toEqual({ isolationMode: "workspace", isolationKey: "workspace:ws-9" });
+  });
+
+  it("still uses run isolation for a stateless PR review regardless of concurrency", () => {
+    expect(
+      resolveK8sRunIsolationIdentity({
+        ...base,
+        statelessPrReview: true,
+        effectiveMaxConcurrentRuns: 1,
+      }),
+    ).toEqual({ isolationMode: "run", isolationKey: "run:run-123" });
+  });
+
+  it("returns null for non-k8s adapters even under concurrency", () => {
+    expect(
+      resolveK8sRunIsolationIdentity({ ...base, adapterType: "local", effectiveMaxConcurrentRuns: 5 }),
+    ).toBeNull();
   });
 });
