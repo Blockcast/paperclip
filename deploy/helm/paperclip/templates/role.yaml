@@ -33,9 +33,18 @@ rules:
   # and reads individual Pod state for log-streaming preflight
   # (opencode-k8s execute.js:311 + :552). `get` is NOT in opencode-k8s's
   # SSAR self-test.
+  #
+  # `delete` (BLO-16850, added by the paperclip server — not the adapters):
+  # the server-side cleanupOrphanedManagedPods reaper (reapOrphanedRuns in
+  # server/src/services/heartbeat.ts) force-deletes an orphaned Running pod
+  # left behind after its run finalized. The owning Job's Background-propagation
+  # cascade does NOT force-kill a wedged container, so the lingering pod must be
+  # deleted directly (gracePeriodSeconds 0). Verified in prod: the reaper 403'd
+  # on `delete pods` until this grant, so the sweep detected orphans but could
+  # not reap them.
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list", "delete"]
   # Pod logs — adapter streams stdout/stderr back to the paperclip UI.
   - apiGroups: [""]
     resources: ["pods/log"]
