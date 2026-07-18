@@ -101,6 +101,7 @@ describeEmbeddedPostgres("executeRun finalize: cancelled status skips next-queue
       name: "Cancel-Dispatch Co",
       issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
     });
     await db.insert(agents).values({
       id: agentId,

@@ -13,6 +13,10 @@ const agentRuntimeImagesWorkflow = readFileSync(
   path.join(repoRoot, ".github/workflows/agent-runtime-images.yml"),
   "utf8",
 );
+const agentRuntimeBake = readFileSync(
+  path.join(repoRoot, "docker/agent-runtime/buildx-bake.hcl"),
+  "utf8",
+);
 const designerDockerfile = readFileSync(path.join(repoRoot, "packages/services/designer/Dockerfile"), "utf8");
 const designerPackageLock = readFileSync(path.join(repoRoot, "packages/services/designer/package-lock.json"), "utf8");
 
@@ -126,10 +130,16 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerAgentWorkflow).toContain('FFMPEG_IMAGE=${{ steps.bases.outputs.ffmpeg_image }}');
   });
 
-  it("publishes agent runtime images to a GHCR owner this repo token can write", () => {
-    expect(agentRuntimeImagesWorkflow).toContain("REGISTRY: ${{ vars.AGENT_RUNTIME_REGISTRY || 'ghcr.io/blockcast' }}");
-    expect(agentRuntimeImagesWorkflow).toContain("password: ${{ secrets.GITHUB_TOKEN }}");
+  it("publishes agent runtime images to Harbor with a secondary GHA cache", () => {
+    expect(agentRuntimeImagesWorkflow).toContain(
+      "REGISTRY: ${{ vars.AGENT_RUNTIME_REGISTRY || 'harbor.blockcast.net/paperclip-agent' }}",
+    );
+    expect(agentRuntimeImagesWorkflow).toContain("password: ${{ secrets.HARBOR_PASSWORD }}");
     expect(agentRuntimeImagesWorkflow).not.toContain("REGISTRY: ghcr.io/paperclipai");
+    expect(agentRuntimeBake).toContain(
+      "type=registry,ref=${REGISTRY}/agent-runtime-base:buildcache-v1",
+    );
+    expect(agentRuntimeBake).toContain("type=gha,scope=agent-runtime-base");
   });
 
   it("keeps the designer Docker build context aligned with npm ci inputs", () => {

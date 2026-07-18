@@ -24,13 +24,19 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+  CC: "sccache gcc"
+  CXX: "sccache g++"
+
 jobs:
   visual:
     name: Storybook visual regression
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'storybook-visual'))
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 35
 
     steps:
@@ -47,6 +53,9 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

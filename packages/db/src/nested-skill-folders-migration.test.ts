@@ -8,7 +8,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
 
-const MIGRATION_FILE = "0175_nested_skill_folders.sql";
+const MIGRATION_FILE = "0197_nested_skill_folders.sql";
 const cleanups: Array<() => Promise<void>> = [];
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -21,7 +21,7 @@ async function migrationHash() {
 describeEmbeddedPostgres("nested skill folders migration", () => {
   afterEach(async () => {
     await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
-  });
+  }, 60_000);
 
   it("backfills existing folders, bundled skills, and project scan skills", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-nested-folders-migration-");

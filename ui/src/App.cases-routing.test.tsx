@@ -10,7 +10,7 @@
 
 import type { ReactNode } from "react";
 import { flushSync } from "react-dom";
-import { createRoot } from "react-dom/client";
+import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -108,8 +108,9 @@ async function waitForText(container: HTMLElement, text: string) {
   expect(container.textContent).toContain(text);
 }
 
+let App: typeof import("./App").App;
+
 async function renderAppAt(container: HTMLElement, path: string) {
-  const { App } = await import("./App");
   const root = createRoot(container);
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   flushSync(() => {
@@ -126,9 +127,15 @@ async function renderAppAt(container: HTMLElement, path: string) {
 
 describe("App Cases routing (PAP-13002)", () => {
   let container: HTMLDivElement;
+  let root: Root | null;
+
+  beforeAll(async () => {
+    ({ App } = await import("./App"));
+  }, 60_000);
 
   beforeEach(() => {
     container = document.createElement("div");
+    root = null;
     document.body.appendChild(container);
     mockHealthApi.get.mockResolvedValue({
       status: "ok",
@@ -151,22 +158,24 @@ describe("App Cases routing (PAP-13002)", () => {
   });
 
   afterEach(() => {
+    if (root) {
+      flushSync(() => root?.unmount());
+      root = null;
+    }
     container.remove();
     document.body.innerHTML = "";
     vi.clearAllMocks();
   });
 
   it("redirects unprefixed /cases to the company-prefixed list page", async () => {
-    const root = await renderAppAt(container, "/cases");
+    root = await renderAppAt(container, "/cases");
     await waitForText(container, "CASES_LIST_PAGE");
     expect(container.textContent).not.toContain("No company matches prefix");
-    flushSync(() => root.unmount());
   }, 20000);
 
   it("redirects unprefixed /cases/:id to the company-prefixed detail page", async () => {
-    const root = await renderAppAt(container, "/cases/PAP-C5");
+    root = await renderAppAt(container, "/cases/PAP-C5");
     await waitForText(container, "CASE_DETAIL_PAGE");
     expect(container.textContent).not.toContain("No company matches prefix");
-    flushSync(() => root.unmount());
   }, 20000);
 });

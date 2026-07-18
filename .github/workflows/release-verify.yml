@@ -8,10 +8,16 @@ on:
         required: true
         type: string
 
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+  CC: "sccache gcc"
+  CXX: "sccache g++"
+
 jobs:
   typecheck:
     name: Typecheck
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 20
     permissions:
       contents: read
@@ -33,6 +39,9 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 
@@ -44,7 +53,7 @@ jobs:
 
   general_tests:
     name: General tests (${{ matrix.group_label }})
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 20
     permissions:
       contents: read
@@ -86,6 +95,9 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
@@ -100,7 +112,7 @@ jobs:
 
   serialized_tests:
     name: Serialized tests (${{ matrix.shard_label }})
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 20
     permissions:
       contents: read
@@ -138,6 +150,9 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
@@ -146,7 +161,7 @@ jobs:
 
   build:
     name: Build
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 20
     permissions:
       contents: read
@@ -167,6 +182,9 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile

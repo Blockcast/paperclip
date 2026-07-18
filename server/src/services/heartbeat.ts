@@ -4138,6 +4138,9 @@ export function resolveK8sRunIsolationIdentity(input: {
       isolationKey: `workspace:${input.persistedExecutionWorkspaceId}`,
     };
   }
+  // Workspace intent without a persisted workspace id has no stable workspace
+  // key yet. That pre-existing gap used to fall through to shared isolation;
+  // concurrent runs use ephemeral per-run isolation until an id is available.
   // BLO-16842: an agent that will actually run siblings concurrently (effective
   // external-lifecycle concurrency > 1) cannot share the single
   // `agent-shared:<agentId>` writer reservation — the second admitted slot would

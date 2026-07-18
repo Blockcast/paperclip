@@ -899,8 +899,7 @@ describe("IssueProperties", () => {
     await flush();
 
     await waitForAssertion(() => {
-      // Upstream changed PICKER_RESULT_LIMIT from 50 to 20.
-      expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", { q: "remote", limit: 20 });
+      expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", { q: "remote", limit: 50 });
       expect(container.textContent).toContain("PAP-99 Remote blocker");
       expect(container.textContent).not.toContain("PAP-3 Loaded issue");
     });

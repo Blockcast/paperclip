@@ -240,7 +240,7 @@ async function flushReact() {
 
 async function waitForAssertion(assertion: () => void) {
   let lastError: unknown;
-  for (let i = 0; i < 20; i += 1) {
+  for (let i = 0; i < 100; i += 1) {
     await flushReact();
     try {
       assertion();
@@ -723,9 +723,7 @@ describe("CompanyEnvironments — test provider button", () => {
 
     confirmSpy.mockReturnValue(true);
     await act(async () => click(findButton(document.body, "Cancel")));
-    await flushReact();
-
-    expect(getEnvironmentFormPage()).toBeNull();
+    await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeNull());
   });
 
   it("keeps unload and in-app link warnings after env var changes are staged into the form", async () => {

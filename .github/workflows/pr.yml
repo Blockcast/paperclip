@@ -9,6 +9,12 @@ concurrency:
   group: pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+  CC: "sccache gcc"
+  CXX: "sccache g++"
+
 jobs:
   policy:
     runs-on: default
@@ -142,6 +148,9 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -208,6 +217,9 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -266,6 +278,9 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -317,6 +332,9 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -350,6 +368,9 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -404,6 +425,9 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

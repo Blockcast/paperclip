@@ -131,6 +131,7 @@ describeEmbeddedPostgres("heartbeat dependabot stale-wake backfill (BLO-16446)",
       name: "Stale Wake Co",
       issuePrefix: `SW${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
     });
     await db.insert(agents).values({
       id: agentId,

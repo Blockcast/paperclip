@@ -42,15 +42,19 @@ const userVisibleUpdatedAtTables = new Set([
 
 const migrationUpdatedAtUpdateAllowlist = new Map<string, ReadonlySet<string>>([
   [
+    "0085_blo_company_linear_provider.sql",
+    new Set(["companies"]),
+  ],
+  [
     "0105_instance_scoped_environments.sql",
     new Set(["issues"]),
   ],
   [
-    "0131_repair_run_responsible_user_context_refs.sql",
+    "0153_repair_run_responsible_user_context_refs.sql",
     new Set(["heartbeat_runs"]),
   ],
   [
-    "0135_repair_run_responsible_user_updated_at_sweep.sql",
+    "0157_repair_run_responsible_user_updated_at_sweep.sql",
     new Set(["companies", "heartbeat_runs", "issues", "routine_runs", "routines"]),
   ],
 ]);
@@ -655,7 +659,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       await applyPendingMigrations(connectionString);
 
       const builtInResourcesHash = await migrationHash(
-        "0140_built_in_managed_resources.sql",
+        "0162_built_in_managed_resources.sql",
       );
       const legacyBuiltInResourcesHash = createHash("sha256")
         .update("legacy 0136_built_in_managed_resources.sql")
@@ -686,7 +690,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       const pendingState = await inspectMigrations(connectionString);
       expect(pendingState).toMatchObject({
         status: "needsMigrations",
-        pendingMigrations: ["0140_built_in_managed_resources.sql"],
+        pendingMigrations: ["0162_built_in_managed_resources.sql"],
         reason: "pending-migrations",
       });
 
@@ -752,7 +756,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
   );
 
   it(
-    "replays migration 0134 without bumping issue updated_at for inbox archives",
+    "replays migration 0156 without bumping issue updated_at for inbox archives",
     async () => {
       const connectionString = await createTempDatabase();
 
@@ -761,7 +765,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       try {
         const runResponsibleUserHash = await migrationHash(
-          "0134_run_responsible_user_invariant.sql",
+          "0156_run_responsible_user_invariant.sql",
         );
 
         await sql.unsafe(`
@@ -846,7 +850,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       const pendingState = await inspectMigrations(connectionString);
       expect(pendingState).toMatchObject({
         status: "needsMigrations",
-        pendingMigrations: ["0134_run_responsible_user_invariant.sql"],
+        pendingMigrations: ["0156_run_responsible_user_invariant.sql"],
         reason: "pending-migrations",
       });
 
@@ -885,14 +889,14 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
   );
 
   it(
-    "replays migration 0135 to repair updated_at sweeps and no-op when clean",
+    "replays migration 0157 to repair updated_at sweeps and no-op when clean",
     async () => {
       const connectionString = await createTempDatabase();
 
       await applyPendingMigrations(connectionString);
 
       const repairSweepHash = await migrationHash(
-        "0135_repair_run_responsible_user_updated_at_sweep.sql",
+        "0157_repair_run_responsible_user_updated_at_sweep.sql",
       );
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       try {
@@ -1290,7 +1294,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       try {
         const runResponsibleUserRepairHash = await migrationHash(
-          "0131_repair_run_responsible_user_context_refs.sql",
+          "0153_repair_run_responsible_user_context_refs.sql",
         );
 
         await sql.unsafe(`
@@ -1385,7 +1389,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       const pendingState = await inspectMigrations(connectionString);
       expect(pendingState).toMatchObject({
         status: "needsMigrations",
-        pendingMigrations: ["0131_repair_run_responsible_user_context_refs.sql"],
+        pendingMigrations: ["0153_repair_run_responsible_user_context_refs.sql"],
         reason: "pending-migrations",
       });
 

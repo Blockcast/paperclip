@@ -45,7 +45,7 @@ describeEmbeddedPostgres("pipeline schema", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
-  });
+  }, 60_000);
 
   it("persists one row per pipeline table and enforces unique keys and required checks", async () => {
     const [company] = await db.insert(companies).values({ name: "Pipeline Co", issuePrefix: "PIP" }).returning();

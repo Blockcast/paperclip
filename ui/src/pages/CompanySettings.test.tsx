@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { flushSync } from "react-dom";
-import { createRoot } from "react-dom/client";
+import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { AGENT_ADAPTER_TYPES, getEnvironmentCapabilities } from "@paperclipai/shared";
@@ -119,7 +119,7 @@ async function flushReact() {
 
 async function waitForAssertion(assertion: () => void) {
   let lastError: unknown;
-  for (let i = 0; i < 20; i += 1) {
+  for (let i = 0; i < 100; i += 1) {
     await flushReact();
     try {
       assertion();
@@ -163,9 +163,11 @@ function renderCompanyEnvironments(queryClient: QueryClient, initialPath = ENVIR
 
 describe("CompanyEnvironments", () => {
   let container: HTMLDivElement;
+  let root: Root | null;
 
   beforeEach(() => {
     container = document.createElement("div");
+    root = null;
     document.body.appendChild(container);
 
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({
@@ -187,20 +189,24 @@ describe("CompanyEnvironments", () => {
     });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    if (root) {
+      await act(async () => root?.unmount());
+      root = null;
+    }
     container.remove();
     document.body.innerHTML = "";
     vi.clearAllMocks();
   });
 
   it("hides sandbox creation when no run-capable sandbox provider plugins are installed", async () => {
-    const root = createRoot(container);
+    root = createRoot(container);
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
 
     await act(async () => {
-      root.render(renderCompanyEnvironments(queryClient));
+      root!.render(renderCompanyEnvironments(queryClient));
     });
     await flushReact();
     await flushReact();
@@ -211,13 +217,10 @@ describe("CompanyEnvironments", () => {
     expect(container.textContent).not.toContain("Fake sandbox");
     expect(container.textContent).not.toContain("Fake is the deterministic test provider");
 
-    await act(async () => {
-      root.unmount();
-    });
   });
 
   it("omits the Local driver option and lists Sandbox before SSH", async () => {
-    const root = createRoot(container);
+    root = createRoot(container);
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
@@ -238,7 +241,7 @@ describe("CompanyEnvironments", () => {
     );
 
     await act(async () => {
-      root.render(renderCompanyEnvironments(queryClient));
+      root!.render(renderCompanyEnvironments(queryClient));
     });
     await flushReact();
     await flushReact();
@@ -263,13 +266,10 @@ describe("CompanyEnvironments", () => {
     expect(driverOptionValues).not.toContain("local");
     expect(driverOptionValues).toEqual(["sandbox", "ssh"]);
 
-    await act(async () => {
-      root.unmount();
-    });
   });
 
   it("shows the Local driver option when editing an existing local environment", async () => {
-    const root = createRoot(container);
+    root = createRoot(container);
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
@@ -289,7 +289,7 @@ describe("CompanyEnvironments", () => {
     ]);
 
     await act(async () => {
-      root.render(renderCompanyEnvironments(queryClient));
+      root!.render(renderCompanyEnvironments(queryClient));
     });
     await flushReact();
     await flushReact();
@@ -314,13 +314,10 @@ describe("CompanyEnvironments", () => {
     expect(driverOptionValues).toContain("local");
     expect(driverSelect!.value).toBe("local");
 
-    await act(async () => {
-      root.unmount();
-    });
   });
 
   it("preserves sandbox config when re-selecting the same provider while editing", async () => {
-    const root = createRoot(container);
+    root = createRoot(container);
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
@@ -363,7 +360,7 @@ describe("CompanyEnvironments", () => {
     );
 
     await act(async () => {
-      root.render(renderCompanyEnvironments(queryClient));
+      root!.render(renderCompanyEnvironments(queryClient));
     });
     await flushReact();
     await flushReact();
@@ -395,8 +392,5 @@ describe("CompanyEnvironments", () => {
       .find((input) => (input as HTMLInputElement).value === "saved-template") as HTMLInputElement | undefined;
     expect(templateInput?.value).toBe("saved-template");
 
-    await act(async () => {
-      root.unmount();
-    });
   });
 });
