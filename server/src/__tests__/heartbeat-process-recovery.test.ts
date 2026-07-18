@@ -158,10 +158,19 @@ const mockReadAgentJobRunStatusByName = vi.hoisted(() =>
     >
   >(async () => null),
 );
+const mockListManagedAgentPods = vi.hoisted(() =>
+  vi.fn<() => Promise<Array<Record<string, unknown>> | null>>(async () => null),
+);
+const mockDeleteAgentPodExact = vi.hoisted(() =>
+  vi.fn<(identity: { name: string; uid: string; runId: string; agentId: string }) =>
+    Promise<"deleted" | "missing" | "mismatch" | null>>(async () => "deleted"),
+);
 vi.mock("../services/k8s-job-liveness.ts", () => ({
   listLiveAgentJobRunIds: mockListLiveAgentJobRunIds,
   listAgentJobRunStatuses: mockListAgentJobRunStatuses,
   listManagedAgentJobs: mockListManagedAgentJobs,
+  listManagedAgentPods: mockListManagedAgentPods,
+  deleteAgentPodExact: mockDeleteAgentPodExact,
   indexUniqueAgentJobRunStatuses: (jobs: Array<{
     runId: string | null;
     name: string;
@@ -758,6 +767,33 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const settledRun = await waitForRunToSettle(executorHeartbeat, runId, 5_000);
     expect(settledRun?.status).toBe("succeeded");
   });
+
+  async function seedPrelaunchReservation(input: {
+    companyId: string;
+    agentId: string;
+    runId: string;
+    state?: "reserved" | "launching";
+    reservedAt: Date;
+  }) {
+    return db
+      .insert(externalRuntimeReservations)
+      .values({
+        companyId: input.companyId,
+        agentId: input.agentId,
+        runId: input.runId,
+        slotId: 0,
+        state: input.state ?? "reserved",
+        isolationMode: "pending",
+        isolationKey: `pending:${input.runId}`,
+        isolationBoundAt: input.reservedAt,
+        reservedAt: input.reservedAt,
+        launchingAt: input.state === "launching" ? input.reservedAt : null,
+        createdAt: input.reservedAt,
+        updatedAt: input.reservedAt,
+      })
+      .returning()
+      .then((rows) => rows[0]);
+  }
 
   async function seedStrandedIssueFixture(input: {
     status: "todo" | "in_progress";
@@ -1458,6 +1494,68 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(0);
+  });
+
+  it.each(["reserved", "launching"] as const)(
+    "keeps a six-minute-old pre-adapter run while its %s reservation still owns launch",
+    async (state) => {
+      // Workspace realization and preRun hooks execute after the run/slot claim
+      // but before adapter.invoke. A setup that crosses the five-minute run-row
+      // grace must not lose its still-active reservation just before it launches.
+      const reservedAt = new Date(Date.now() - 6 * 60 * 1000);
+      const { companyId, agentId, runId } = await seedRunFixture({
+        adapterType: "opencode_k8s",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: false,
+        lastOutputAt: null,
+      });
+      const reservation = await seedPrelaunchReservation({
+        companyId,
+        agentId,
+        runId,
+        state,
+        reservedAt,
+      });
+
+      const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+      expect(result.runIds).not.toContain(runId);
+      const run = await heartbeat.getRun(runId);
+      expect(run?.status).toBe("running");
+      expect(run?.errorCode).toBeNull();
+      const persistedReservation = await db
+        .select()
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.id, reservation.id))
+        .then((rows) => rows[0]);
+      expect(persistedReservation?.releasedAt).toBeNull();
+    },
+  );
+
+  it("still reaps a pre-adapter run whose reservation-only launch ownership is older than the bounded grace", async () => {
+    const reservedAt = new Date(Date.now() - 16 * 60 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null,
+    });
+    await seedPrelaunchReservation({
+      companyId,
+      agentId,
+      runId,
+      state: "reserved",
+      reservedAt,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
   });
 
   it("queues exactly one retry when the recorded local pid is dead", async () => {
@@ -7566,6 +7664,129 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(runs).toHaveLength(1);
+  });
+
+  // BLO-16850: the orphaned-managed-pod sweep force-deletes still-Running
+  // external-lifecycle agent pods whose heartbeat run has finalized
+  // (terminal/absent) with no live Job. Default-safe: when listManagedAgentPods
+  // is kube-blind (null), the sweep is a no-op (all other recovery tests leave
+  // mockListManagedAgentPods at its null default).
+  describe("reapOrphanedRuns: orphaned managed-pod sweep (BLO-16850)", () => {
+    function orphanPod(over: Partial<{
+      name: string; uid: string; runId: string; agentId: string;
+      adapterType: string; phase: string; isActiveOrTerminating: boolean;
+      deletionTimestamp: Date | null; createdAt: Date | null;
+    }>) {
+      const sixMinAgo = new Date(Date.now() - 6 * 60 * 1000);
+      return {
+        name: over.name ?? "agent-opencode-orphan-xyz",
+        uid: over.uid ?? "orphan-pod-uid",
+        runId: over.runId ?? randomUUID(),
+        agentId: over.agentId ?? randomUUID(),
+        adapterType: over.adapterType ?? "opencode_k8s",
+        phase: over.phase ?? "Running",
+        isActiveOrTerminating: over.isActiveOrTerminating ?? true,
+        deletionTimestamp: over.deletionTimestamp ?? null,
+        createdAt: over.createdAt === undefined ? sixMinAgo : over.createdAt,
+      };
+    }
+
+    it("force-deletes a Running managed pod whose run has finalized (terminal) and has no live Job", async () => {
+      const { runId, agentId } = await seedRunFixture({
+        adapterType: "opencode_k8s",
+        runStatus: "failed",
+        includeIssue: false,
+      });
+      mockListManagedAgentPods.mockResolvedValueOnce([
+        orphanPod({ runId, agentId, name: "agent-opencode-x", uid: "u1" }),
+      ]);
+
+      await heartbeat.reapOrphanedRuns();
+
+      expect(mockDeleteAgentPodExact).toHaveBeenCalledWith({
+        name: "agent-opencode-x", uid: "u1", runId, agentId,
+      });
+    });
+
+    it("does NOT reap a pod whose run is still running", async () => {
+      const { runId, agentId } = await seedRunFixture({
+        adapterType: "opencode_k8s",
+        runStatus: "running",
+        includeIssue: false,
+      });
+      mockListManagedAgentPods.mockResolvedValueOnce([orphanPod({ runId, agentId })]);
+      // A running external-lifecycle run makes hasExternalCandidates true, so the
+      // reaper consults the listLiveAgentJobRunIds fallback; return an empty set
+      // so liveJobRunIds is a real (empty) set rather than null.
+      mockListLiveAgentJobRunIds.mockResolvedValueOnce(new Set());
+
+      await heartbeat.reapOrphanedRuns();
+
+      expect(mockDeleteAgentPodExact).not.toHaveBeenCalled();
+    });
+
+    it("does NOT reap a pod whose run id is in liveJobRunIds (live Job)", async () => {
+      const { runId, agentId } = await seedRunFixture({
+        adapterType: "opencode_k8s",
+        runStatus: "failed",
+        includeIssue: false,
+      });
+      mockListManagedAgentPods.mockResolvedValueOnce([
+        orphanPod({ runId, agentId, name: "agent-opencode-live", uid: "u3" }),
+      ]);
+      // The run is terminal in the DB, but a live Job still exists for it. A
+      // terminal run is not in activeRuns, so hasExternalCandidates is false and
+      // the listLiveAgentJobRunIds fallback never fires; surface the live Job
+      // through the primary jobRunStatuses path instead (an "active" entry =>
+      // liveJobRunIds contains runId). Same protection branch, reliable trigger.
+      mockListAgentJobRunStatuses.mockResolvedValueOnce(
+        new Map([[runId, { phase: "active" as const, name: "agent-opencode-live", uid: "u3" }]]),
+      );
+
+      await heartbeat.reapOrphanedRuns();
+
+      expect(mockDeleteAgentPodExact).not.toHaveBeenCalled();
+    });
+
+    it("does NOT reap a pod younger than the grace window", async () => {
+      const { runId, agentId } = await seedRunFixture({
+        adapterType: "opencode_k8s",
+        runStatus: "failed",
+        includeIssue: false,
+      });
+      mockListManagedAgentPods.mockResolvedValueOnce([
+        orphanPod({ runId, agentId, createdAt: new Date() }), // just created
+      ]);
+
+      await heartbeat.reapOrphanedRuns();
+
+      expect(mockDeleteAgentPodExact).not.toHaveBeenCalled();
+    });
+
+    it("is a no-op when the managed-pod list is unavailable (kube-blind)", async () => {
+      mockListManagedAgentPods.mockResolvedValueOnce(null);
+
+      await heartbeat.reapOrphanedRuns();
+
+      expect(mockDeleteAgentPodExact).not.toHaveBeenCalled();
+    });
+
+    it("also reaps an orphaned pod whose run ROW is entirely gone", async () => {
+      // No heartbeatRuns row inserted -> run absent -> terminal-or-absent branch.
+      // Use real UUIDs so the inArray(heartbeatRuns.id, ...) lookup does not fail
+      // the uuid column cast; the absent row is what exercises the branch.
+      const ghostRunId = randomUUID();
+      const ghostAgentId = randomUUID();
+      mockListManagedAgentPods.mockResolvedValueOnce([
+        orphanPod({ runId: ghostRunId, agentId: ghostAgentId, name: "agent-opencode-ghost", uid: "gu" }),
+      ]);
+
+      await heartbeat.reapOrphanedRuns();
+
+      expect(mockDeleteAgentPodExact).toHaveBeenCalledWith({
+        name: "agent-opencode-ghost", uid: "gu", runId: ghostRunId, agentId: ghostAgentId,
+      });
+    });
   });
 
   // BLO-8677: suppression of repeated non-assignee (CTO/manager) wakes when

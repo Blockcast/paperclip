@@ -86,14 +86,17 @@ import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
   deleteAgentJobExact,
   deleteAgentJobsForRun,
+  deleteAgentPodExact,
   hasActiveJobForAgent,
   indexUniqueAgentJobRunStatuses,
   listAgentJobRunStatuses,
   listManagedAgentJobs,
+  listManagedAgentPods,
   listLiveAgentJobRunIds,
   matchExactAgentJob,
   readAgentJobRunStatusByName,
   type AgentJobRunStatus,
+  type ManagedAgentPod,
 } from "./k8s-job-liveness.js";
 import { getActiveAgentIds } from "./agent-roster.js";
 import { processPendingImageBumpForAgent } from "./agent-image-bump.js";
@@ -242,6 +245,7 @@ import {
   recordCcrotateCapacityDeferred,
   recordConcurrentRunBlocked,
   recordHeartbeatRunFailed,
+  recordOrphanedManagedPodReaped,
   recordProcessLost,
   recordProcessLostLivenessNull,
   setExternalLifecycleRunningRuns,
@@ -944,6 +948,11 @@ export const EXTERNAL_LIFECYCLE_COLD_BOOT_REATTACH_GRACE_MS = 5 * 60 * 1000;
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
+// BLO-16850: minimum pod age before the orphaned-managed-pod sweep will
+// force-delete it. A pod is created moments before its heartbeat_runs row
+// flips to "running"; this grace prevents reaping that startup race. Mirrors
+// the 5-min grace in cleanupManagedJobsWithoutRun.
+const ORPHANED_MANAGED_POD_REAP_GRACE_MS = 5 * 60 * 1000;
 const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 const SESSION_ISOLATION_KEY_PARAM = "paperclipIsolationKey";
 
@@ -14780,6 +14789,86 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return deleted;
   }
 
+  async function cleanupOrphanedManagedPods(
+    now: Date,
+    liveJobRunIds: Set<string> | null,
+    inventory?: ManagedAgentPod[] | null,
+  ): Promise<string[]> {
+    // Cold-boot / kube-blind guard (BLO-12564): never reap while the kube view
+    // may be incomplete right after worker boot.
+    if (
+      coldBootReattachGraceMs > 0
+      && now.getTime() - workerBootAt.getTime() < coldBootReattachGraceMs
+    ) {
+      return [];
+    }
+    const pods = inventory === undefined ? await listManagedAgentPods() : inventory;
+    if (!pods) return []; // kube-blind → no-op (BLO-12564)
+
+    const candidates = pods.filter(
+      (pod) =>
+        hasExternalLifecycle(pod.adapterType ?? "")
+        && pod.runId
+        && pod.agentId
+        && pod.uid
+        && pod.name
+        && pod.createdAt
+        && now.getTime() - pod.createdAt.getTime() >= ORPHANED_MANAGED_POD_REAP_GRACE_MS
+        && !pod.deletionTimestamp
+        && pod.isActiveOrTerminating,
+    );
+    if (candidates.length === 0) return [];
+
+    const runIds = [...new Set(candidates.map((p) => p.runId).filter((id): id is string => Boolean(id)))];
+    // Which of these runs are still LIVE (non-terminal) in the DB? Those pods are
+    // protected — the per-run reap loop / dispatcher owns them.
+    const liveRunIds = new Set(
+      (
+        await db
+          .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(inArray(heartbeatRuns.id, runIds))
+      )
+        .filter((row) => !TERMINAL_RUN_STATUSES.has(row.status))
+        .map((row) => row.id),
+    );
+
+    const toReap = candidates
+      .filter((pod) => {
+        if (liveRunIds.has(pod.runId!)) return false; // run still active in DB
+        if (liveJobRunIds && liveJobRunIds.has(pod.runId!)) return false; // live Job (positive-liveness, BLO-13176)
+        return true;
+      })
+      .sort((a, b) => (a.createdAt!.getTime()) - (b.createdAt!.getTime()))
+      .slice(0, 25);
+
+    const reaped: string[] = [];
+    for (const pod of toReap) {
+      const result = await deleteAgentPodExact({
+        name: pod.name,
+        uid: pod.uid,
+        runId: pod.runId!,
+        agentId: pod.agentId!,
+      });
+      if (result === "deleted" || result === "missing") {
+        reaped.push(pod.name);
+        logger.warn(
+          {
+            agentId: pod.agentId,
+            podName: pod.name,
+            runId: pod.runId,
+            adapterType: pod.adapterType,
+            phase: pod.phase,
+            ageMs: now.getTime() - pod.createdAt!.getTime(),
+          },
+          "reaped orphaned managed agent pod: run terminal/absent + no live Job, pod still Running (BLO-16850)",
+        );
+        recordOrphanedManagedPodReaped({ adapterType: pod.adapterType ?? undefined });
+      }
+    }
+    return reaped;
+  }
+
   async function releaseExternalRuntimeReservationIfQuiesced(runId: string, reason: string) {
     const reservation = await getActiveExternalRuntimeReservation(db, runId);
     if (!reservation) return null;
@@ -15086,6 +15175,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       recordProcessLostLivenessNull();
     }
 
+    // BLO-16850: sweep still-Running external-lifecycle pods whose run has
+    // finalized (terminal/absent) with no live Job. Non-fatal — a sweep failure
+    // must never abort the per-run reap below.
+    try {
+      await cleanupOrphanedManagedPods(now, liveJobRunIds);
+    } catch (error) {
+      logger.warn(
+        { error: error instanceof Error ? error.message : String(error) },
+        "orphaned managed-pod sweep failed (non-fatal)",
+      );
+    }
+
     for (const { run, adapterType, adapterConfig } of activeRuns) {
       if (runningProcesses.has(run.id)) continue;
       if (ambiguousExternalRunIds.has(run.id)) continue;
@@ -15119,6 +15220,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Within the short pre-adapter grace, always skip: the run just created
         // its DB row + k8s Job and has not had time to reach adapter.invoke.
         if (isExternalLifecycleRunInRecentGrace(run, now, EXTERNAL_LIFECYCLE_PRE_ADAPTER_STALE_MS)) {
+          continue;
+        }
+        // A claimed external-runtime run can legitimately spend longer than the
+        // five-minute run-row grace in workspace/preRun preparation before it
+        // reaches markExternalRuntimeReservationLaunching(). While its active
+        // reservation is still reserved/launching and no launched Job identity
+        // exists, that reservation is durable proof that the in-flight executor
+        // still owns the launch. Give that owner the normal external-lifecycle
+        // stale window before treating the run as orphaned. The bound is measured
+        // from reservedAt (not updatedAt), so unrelated reservation writes cannot
+        // renew the shield indefinitely and ancient reservation-only orphans still
+        // converge through the existing process_lost path.
+        const reservation = reservationsByRunId.get(run.id);
+        const reservationReservedAt = reservation
+          ? new Date(reservation.reservedAt).getTime()
+          : 0;
+        const activePrelaunchReservation = Boolean(
+          reservation
+          && (reservation.state === "reserved" || reservation.state === "launching")
+          && reservation.jobName === null
+          && reservation.jobUid === null
+          && Number.isFinite(reservationReservedAt)
+          && reservationReservedAt > 0
+          && now.getTime() - reservationReservedAt < EXTERNAL_LIFECYCLE_STALE_MS,
+        );
+        if (activePrelaunchReservation) {
           continue;
         }
         // BLO-13176: past the grace, DO NOT blindly declare the run orphaned.
