@@ -920,6 +920,11 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(reservationA?.isolationKey).toBe(`run:${runIdA}`);
     expect(reservationB?.isolationKey).toBe(`run:${runIdB}`);
     expect(reservationA?.isolationKey).not.toBe(reservationB?.isolationKey);
+    // The whole point of BLO-16842: neither sibling serialized on the shared
+    // writer lock, i.e. neither reservation was deferred for an isolation
+    // conflict. Distinct run:<id> keys make that impossible; assert it directly.
+    expect(reservationA?.releaseReason).not.toBe("external_runtime_isolation_conflict");
+    expect(reservationB?.releaseReason).not.toBe("external_runtime_isolation_conflict");
   }, 30_000);
 
   it("compensates by deleting the exact Job when the periodic reconciliation loop loses the create/stamp race", async () => {
