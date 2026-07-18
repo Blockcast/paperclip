@@ -2532,6 +2532,21 @@ describe("K8s session isolation metadata", () => {
     });
   });
 
+  it("uses per-run isolation for concurrent workspace intent without a durable id", () => {
+    expect(resolveK8sRunIsolationIdentity({
+      adapterType: "opencode_k8s",
+      runId: "run-1",
+      agentId: "agent-1",
+      statelessPrReview: false,
+      isWorkspaceIsolated: true,
+      persistedExecutionWorkspaceId: null,
+      effectiveMaxConcurrentRuns: 2,
+    })).toEqual({
+      isolationMode: "run",
+      isolationKey: "run:run-1",
+    });
+  });
+
   it("removes user-controlled mutable paths before K8s adapter dispatch", () => {
     expect(stripK8sIsolationOwnedEnv({
       env: {
