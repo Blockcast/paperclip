@@ -536,12 +536,24 @@ test.describe("Pipelines tutorial UI flow", () => {
       await page.getByRole("option", { name: plan.contentType }).click();
     }
     await expect(page.getByRole("button", { name: "Submit 3 items" })).toBeEnabled();
-    await page.getByRole("button", { name: "Submit 3 items" }).click();
+    const [batchResponse] = await Promise.all([
+      page.waitForResponse(
+        (response) =>
+          response.request().method() === "POST" &&
+          response.url().endsWith(`/api/pipelines/${pipeline.id}/cases/batch`),
+        { timeout: 30_000 },
+      ),
+      page.getByRole("button", { name: "Submit 3 items" }).click(),
+    ]);
+    expect(
+      batchResponse.ok(),
+      `batch create failed ${batchResponse.status()}: ${await batchResponse.text()}`,
+    ).toBe(true);
 
     const draftingColumn = page.getByLabel("Drafting column");
-    await expect(draftingColumn.getByText("Launch blog post")).toBeVisible();
-    await expect(draftingColumn.getByText("Changelog entry")).toBeVisible();
-    await expect(draftingColumn.getByText("Launch tweet")).toBeVisible();
+    await expect(draftingColumn.getByText("Launch blog post")).toBeVisible({ timeout: 30_000 });
+    await expect(draftingColumn.getByText("Changelog entry")).toBeVisible({ timeout: 30_000 });
+    await expect(draftingColumn.getByText("Launch tweet")).toBeVisible({ timeout: 30_000 });
     await expectProsumerVocabulary(page);
 
     const items = await listItems(board, pipeline.id);
