@@ -306,6 +306,12 @@ export interface InitializeParams {
   manifest: PaperclipPluginManifestV1;
   /** Bootstrap configuration. Company-scoped config is read via `ctx.config.get(companyId)`. */
   config: Record<string, unknown>;
+  /**
+   * Sole configured company, when the host can prove this worker has exactly
+   * one company-scoped config. This scopes legacy setup-time host calls
+   * without exposing another company's configuration.
+   */
+  companyId?: string | null;
   /** Instance-level metadata. */
   instanceInfo: {
     /** UUID of this Paperclip instance. */

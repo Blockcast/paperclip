@@ -10,6 +10,7 @@ import {
   createDb,
   issueComments,
   issues,
+  pluginConfig,
   pluginEntities,
   pluginWebhookDeliveries,
   plugins,
@@ -55,7 +56,7 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-linear-webhook-fixtures-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     // Delete in FK-safe order: rows that reference companies/issues before the referenced rows
@@ -110,6 +111,11 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
         ],
       },
     });
+    await db.insert(pluginConfig).values({
+      pluginId,
+      companyId,
+      configJson: {},
+    });
     await db.insert(issues).values({
       id: boundIssueId,
       companyId,
@@ -145,6 +151,7 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
       _method: string,
       params: Record<string, unknown>,
     ): Promise<void> {
+      expect(params.companyId).toBe(companyId);
       const body = params.parsedBody as { type: string; action: string; data: Record<string, unknown> };
       const { type, action, data } = body;
 
@@ -284,6 +291,7 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
       .where(eq(pluginWebhookDeliveries.pluginId, pluginId));
     expect(deliveries).toHaveLength(fixtures.length + 1);
     expect(deliveries.every((d) => d.status === "success")).toBe(true);
+    expect(deliveries.every((d) => d.companyId === companyId)).toBe(true);
   });
 });
 

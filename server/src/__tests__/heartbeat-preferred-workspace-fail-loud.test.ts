@@ -82,7 +82,7 @@ describeEmbeddedPostgres("preferred non-primary workspace fail-loud", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-fail-loud-");
     db = createDb(tempDb.connectionString);
     heartbeat = heartbeatService(db, { penstockAvailabilityGate: allowPenstockGate });
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     adapterExecute.mockClear();

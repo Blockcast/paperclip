@@ -2986,6 +2986,35 @@ export function pluginRoutes(
       return;
     }
 
+    // Public webhook routes predate company-scoped plugin config. Preserve
+    // existing single-company URLs by inferring the only configured company,
+    // while requiring an explicit query parameter when the plugin is
+    // configured for more than one company. The selected company is attached
+    // to the worker invocation so nested config, secret, state, and entity
+    // calls remain protected by the normal invocation-scope guards.
+    const requestedCompanyId =
+      typeof req.query.companyId === "string" && req.query.companyId.trim().length > 0
+        ? req.query.companyId.trim()
+        : null;
+    const configuredCompanyIds = await registry.listConfigCompanyIds(plugin.id);
+    let companyId: string;
+    if (requestedCompanyId) {
+      if (!configuredCompanyIds.includes(requestedCompanyId)) {
+        res.status(404).json({ error: "Plugin is not configured for that company" });
+        return;
+      }
+      companyId = requestedCompanyId;
+    } else if (configuredCompanyIds.length === 1) {
+      companyId = configuredCompanyIds[0]!;
+    } else {
+      res.status(400).json({
+        error: configuredCompanyIds.length === 0
+          ? "Plugin must be configured for a company before receiving webhooks"
+          : '"companyId" query parameter is required for a multi-company plugin',
+      });
+      return;
+    }
+
     // Step 5: Extract request data
     const requestId = randomUUID();
     const rawHeaders: Record<string, string> = {};
@@ -3011,6 +3040,7 @@ export function pluginRoutes(
       .insert(pluginWebhookDeliveries)
       .values({
         pluginId: plugin.id,
+        companyId,
         webhookKey: endpointKey,
         status: "pending",
         payload,
@@ -3022,6 +3052,7 @@ export function pluginRoutes(
     // Step 7: Dispatch to the worker via handleWebhook RPC
     try {
       await webhookDeps.workerManager.call(plugin.id, "handleWebhook", {
+        companyId,
         endpointKey,
         headers: req.headers as Record<string, string | string[]>,
         rawBody,

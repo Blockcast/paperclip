@@ -100,6 +100,10 @@ const FEEDBACK_EXPORT_FLUSH_INTERVAL_MS = 5_000;
 const LEGACY_CCROTATE_PLUGIN_KEY = "kkroo.ccrotate";
 const LEGACY_CCROTATE_RETIREMENT_REASON =
   "Retired after Penstock migration; ccrotate auth/serve/state backends are no longer active.";
+const INCOMPATIBLE_PLUGIN_UPDATER_KEY = "lucitra.plugin-updater";
+const INCOMPATIBLE_PLUGIN_UPDATER_VERSION = "0.5.0";
+const INCOMPATIBLE_PLUGIN_UPDATER_REASON =
+  "Disabled because v0.5.0 depends on the unpublished @lucitra/plugin-sdk and predates company-scoped plugin config.";
 const VITE_DEV_ASSET_PREFIXES = [
   "/@fs/",
   "/@id/",
@@ -947,6 +951,38 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     }
   };
 
+  const retireIncompatiblePluginUpdater = async (): Promise<void> => {
+    try {
+      const existing = await pluginRegistry.getByKey(INCOMPATIBLE_PLUGIN_UPDATER_KEY);
+      if (
+        !existing ||
+        existing.version !== INCOMPATIBLE_PLUGIN_UPDATER_VERSION ||
+        existing.status === "disabled" ||
+        existing.status === "uninstalled"
+      ) return;
+
+      await db
+        .update(plugins)
+        .set({
+          status: "disabled",
+          lastError: INCOMPATIBLE_PLUGIN_UPDATER_REASON,
+          updatedAt: new Date(),
+        })
+        .where(eq(plugins.id, existing.id));
+      logger.info(
+        {
+          pluginId: existing.id,
+          pluginKey: existing.pluginKey,
+          version: existing.version,
+          fromStatus: existing.status,
+        },
+        "retired incompatible plugin updater before plugin loadAll",
+      );
+    } catch (err) {
+      logger.warn({ err }, "failed to retire incompatible plugin updater before plugin loadAll");
+    }
+  };
+
   // loader.loadAll() activates every status='ready' plugin, which calls
   // workerManager.startWorker() on each. On the API tier the workerManager
   // is the stub from services/plugin-worker-manager-stub.ts; every call
@@ -965,6 +1001,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   } else {
     void ensureBundledKubernetesPlugin()
       .then(() => retireLegacyCcrotatePlugin())
+      .then(() => retireIncompatiblePluginUpdater())
       .then(() => loader.loadAll())
       .then((result) => {
         if (result) {

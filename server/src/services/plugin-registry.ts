@@ -304,6 +304,14 @@ export function pluginRegistryService(db: Db) {
         .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
         .then((rows) => rows[0] ?? null),
 
+    /** List the companies that currently have configuration for a plugin. */
+    listConfigCompanyIds: (pluginId: string) =>
+      db
+        .select({ companyId: pluginConfig.companyId })
+        .from(pluginConfig)
+        .where(eq(pluginConfig.pluginId, pluginId))
+        .then((rows) => rows.map((row) => row.companyId)),
+
     /**
      * Create or fully replace a plugin's company-scoped configuration.
      * If a config row already exists for the plugin/company pair it is replaced;

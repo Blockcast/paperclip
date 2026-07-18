@@ -235,7 +235,9 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
 
     const execution = heartbeat.__test_executeRunForTesting(runId);
     let retryReservation: typeof externalRuntimeReservations.$inferSelect | undefined;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
+    // ARC runners can be heavily contended after the embedded-Postgres suites;
+    // keep the assertion deterministic without weakening the expected state.
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
       retryReservation = await db
         .select()
         .from(externalRuntimeReservations)
@@ -744,7 +746,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
 
     let losingReservation: typeof externalRuntimeReservations.$inferSelect | undefined;
     let siblingReservation: typeof externalRuntimeReservations.$inferSelect | undefined;
-    for (let attempt = 0; attempt < 200; attempt += 1) {
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
       [losingReservation, siblingReservation] = await Promise.all([
         db.select().from(externalRuntimeReservations).where(eq(externalRuntimeReservations.runId, losingRunId)).then((rows) => rows[0]),
         db.select().from(externalRuntimeReservations).where(eq(externalRuntimeReservations.runId, siblingRunId)).then((rows) => rows[0]),

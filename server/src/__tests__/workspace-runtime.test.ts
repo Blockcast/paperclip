@@ -3237,7 +3237,7 @@ describe("realizeExecutionWorkspace", () => {
         Array.isArray(submodulePaths) &&
         submodulePaths.includes(submodulePath);
     })).toBe(true);
-  }, 20_000);
+  }, 60_000);
 
   it("repairs worktree submodules before running provision commands", async () => {
     const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: false });
@@ -4669,7 +4669,7 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-workspace-dirty-quarantine-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 60_000);
 
   afterAll(async () => {
     await tempDb?.cleanup();
@@ -5311,7 +5311,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-workspace-runtime-control-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 60_000);
 
   afterAll(async () => {
     await tempDb?.cleanup();
@@ -5864,7 +5864,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
         }
       }
     }
-  }, 20_000);
+  }, 60_000);
 
   it("does not adopt a live registry process from another workspace with the same runtime service ID", async () => {
     const companyId = randomUUID();

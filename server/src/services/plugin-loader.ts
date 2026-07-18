@@ -2239,6 +2239,23 @@ export function pluginLoader(
       // Plugin configuration is company-scoped. Workers receive an empty
       // bootstrap config and must use ctx.config.get(companyId) at runtime.
       const config: Record<string, unknown> = {};
+      let bootstrapCompanyId: string | undefined;
+      try {
+        const configuredCompanyIds = await registry.listConfigCompanyIds(pluginId);
+        if (configuredCompanyIds.length === 1) {
+          bootstrapCompanyId = configuredCompanyIds[0];
+        } else if (configuredCompanyIds.length > 1) {
+          log.warn(
+            { pluginId, pluginKey, configuredCompanyCount: configuredCompanyIds.length },
+            "plugin-loader: multiple company configs; legacy bootstrap scope disabled",
+          );
+        }
+      } catch {
+        log.debug(
+          { pluginId, pluginKey },
+          "plugin-loader: unable to resolve legacy bootstrap company scope",
+        );
+      }
 
       // ------------------------------------------------------------------
       // 5. Spawn worker process
@@ -2247,6 +2264,7 @@ export function pluginLoader(
         entrypointPath: workerEntrypoint,
         manifest,
         config,
+        bootstrapCompanyId,
         instanceInfo,
         apiVersion: manifest.apiVersion,
         databaseNamespace,

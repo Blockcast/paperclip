@@ -127,7 +127,9 @@ describe("sandbox adapter execution targets", () => {
         clearTimeout(timeout);
         reject(error);
       });
-      child.on("exit", (exitCode) => {
+      // `exit` can fire before the stdout/stderr pipes flush on a contended
+      // runner. `close` waits for both the process and its stdio handles.
+      child.on("close", (exitCode) => {
         clearTimeout(timeout);
         resolve(exitCode);
       });

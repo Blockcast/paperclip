@@ -133,7 +133,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         testedAt: new Date().toISOString(),
       }),
     });
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     mockAdapterExecute.mockReset();

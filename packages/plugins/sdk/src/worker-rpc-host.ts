@@ -430,6 +430,14 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
 
       config: {
         async get(companyId?: string) {
+          const invocationCompanyId = invocationContextStorage.getStore()?.scope.companyId;
+          // Company-scoped hosts intentionally send an empty bootstrap config.
+          // Legacy plugins may still read config during setup before any company
+          // config exists. Let those workers initialize in a disabled/default
+          // state; all post-initialize reads still require a host-issued scope.
+          if (!initialized && !companyId && !invocationCompanyId) {
+            return currentConfig;
+          }
           return callHost("config.get", companyId ? { companyId } : {});
         },
       },
