@@ -158,7 +158,7 @@ describeEmbeddedPostgres("issue comment derived attribution migration", () => {
         await sql.end();
       }
     },
-    20_000,
+    60_000,
   );
 
   it(
@@ -251,7 +251,7 @@ describeEmbeddedPostgres("issue comment derived attribution migration", () => {
       const finalState = await inspectMigrations(connectionString);
       expect(finalState.status).toBe("upToDate");
     },
-    20_000,
+    60_000,
   );
 
   it(
@@ -340,6 +340,6 @@ describeEmbeddedPostgres("issue comment derived attribution migration", () => {
       const finalState = await inspectMigrations(connectionString);
       expect(finalState.status).toBe("upToDate");
     },
-    20_000,
+    60_000,
   );
 });

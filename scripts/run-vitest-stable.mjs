@@ -334,7 +334,14 @@ function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = 
   }
 
   if (groupName === generalWorkspacesAGroupName) {
-    runProjectGroup(generalWorkspacesAProjects, groupName);
+    runProjectGroup(["@paperclipai/ui"], groupName);
+    // The CLI project has several embedded-Postgres suites. Starting those
+    // files concurrently on a single ARC runner makes initialization contend
+    // heavily and turns otherwise sub-minute tests into timeout flakes.
+    runVitest(
+      ["--project", "paperclipai", ...serializedServerVitestArgs],
+      `${groupName} project paperclipai`,
+    );
     return;
   }
 

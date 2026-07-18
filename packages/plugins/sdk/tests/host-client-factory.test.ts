@@ -328,6 +328,7 @@ describe("createHostClientHandlers invocation company scope", () => {
 });
 
 describe("agents.updateAdapterOverrides (optional, capability-gated host method)", () => {
+  const CONTEXT = { invocationScope: { companyId: "company-a" } };
   const PARAMS = {
     agentId: "agent-1",
     companyId: "company-a",
@@ -365,7 +366,7 @@ describe("agents.updateAdapterOverrides (optional, capability-gated host method)
       services,
     });
 
-    await expect(handlers["agents.updateAdapterOverrides"](PARAMS)).resolves.toBe(updated);
+    await expect(handlers["agents.updateAdapterOverrides"](PARAMS, CONTEXT)).resolves.toBe(updated);
     expect(updateAdapterOverrides).toHaveBeenCalledWith(PARAMS);
   });
 
@@ -382,7 +383,7 @@ describe("agents.updateAdapterOverrides (optional, capability-gated host method)
     });
 
     const clearParams = { agentId: "agent-1", companyId: "company-a", overrides: null };
-    await handlers["agents.updateAdapterOverrides"](clearParams);
+    await handlers["agents.updateAdapterOverrides"](clearParams, CONTEXT);
     expect(updateAdapterOverrides).toHaveBeenCalledWith(clearParams);
   });
 
@@ -395,7 +396,7 @@ describe("agents.updateAdapterOverrides (optional, capability-gated host method)
       services,
     });
 
-    await expect(handlers["agents.updateAdapterOverrides"](PARAMS)).rejects.toThrow(
+    await expect(handlers["agents.updateAdapterOverrides"](PARAMS, CONTEXT)).rejects.toThrow(
       /does not implement agents\.updateAdapterOverrides/,
     );
   });
