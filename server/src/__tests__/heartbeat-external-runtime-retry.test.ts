@@ -1,12 +1,18 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
   companies,
   createDb,
+  executionWorkspaces,
   externalRuntimeReservations,
   heartbeatRuns,
+  issues,
+  projects,
 } from "@paperclipai/db";
 import type {
   AdapterExecutionContext,
@@ -309,11 +315,27 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(new Set(reservationIds)).toEqual(new Set([reservation.id]));
   }, 30_000);
 
-  it("defers a same-scope contender without failing or invoking its adapter", async () => {
+  it("defers a workspace-scope contender without failing or invoking its adapter", async () => {
+    // BLO-16842 repurposed this case. Pre-fix, a concurrency-enabled k8s agent's
+    // plain coding runs all shared the single `agent-shared:<agentId>` writer key,
+    // so a second admitted slot collided and deferred. Post-fix, each such run
+    // resolves to its own `run:<runId>` key, so that shared-key collision is
+    // unreachable by design. The isolation-conflict deferral + retry + resume flow
+    // is STILL live, however, whenever two runs resolve to the same NON-run key --
+    // realistically the same `workspace:<id>` (two runs reusing one persisted
+    // execution workspace). This test drives that workspace-key collision: the
+    // owner reservation is manually pinned to `workspace:<SHARED_WORKSPACE_ID>`,
+    // and the contender -- a plain (non-PR) run whose issue reuses that same
+    // persisted execution workspace -- resolves (via resolveK8sRunIsolationIdentity)
+    // to the identical key, so it defers on the active-isolation-writer lock.
     const companyId = randomUUID();
     const agentId = randomUUID();
+    const projectId = randomUUID();
+    const sharedWorkspaceId = randomUUID();
+    const contenderIssueId = randomUUID();
     const ownerRunId = randomUUID();
     const contenderRunId = randomUUID();
+    const sharedWorkspaceCwd = await fs.mkdtemp(path.join(os.tmpdir(), "blo-16842-workspace-"));
 
     await db.insert(companies).values({
       id: companyId,
@@ -334,13 +356,54 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
           enabled: true,
           wakeOnDemand: true,
           maxConcurrentRuns: 2,
-          // BLO-15959: this test exercises isolation-key serialization across
-          // two slots (not just the fallback one-run cap), so it must opt
-          // into concurrency to reach the isolation-conflict path.
+          // BLO-16842: the workspace-key deferral path is only reachable once a
+          // second run is admitted, so the agent must opt into concurrency (with
+          // effective concurrency > 1 the fix keeps `workspace:<id>` for
+          // workspace-isolated runs but hands plain runs a per-run key).
           concurrencyEnabled: true,
         },
       },
       permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Shared Workspace Project",
+    });
+    // One persisted execution workspace that both the owner reservation and the
+    // contender run resolve to. `mode: "isolated_workspace"` makes the contender's
+    // run workspace-isolated (so resolveK8sRunIsolationIdentity returns
+    // `workspace:<sharedWorkspaceId>`); `strategyType: "project_primary"` keeps
+    // reuse a pure metadata operation -- ensurePersistedExecutionWorkspaceAvailable
+    // returns the realized workspace from this row without any git/worktree disk
+    // I/O -- so the contender can run to completion on resume without a real repo.
+    await db.insert(executionWorkspaces).values({
+      id: sharedWorkspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "project_primary",
+      name: "Shared execution workspace",
+      status: "active",
+      cwd: sharedWorkspaceCwd,
+    });
+    // The contender's issue reuses the shared execution workspace
+    // (executionWorkspacePreference: "reuse_existing"), which is what makes
+    // executeRun's plannedExecutionWorkspaceId equal sharedWorkspaceId (rather than
+    // a fresh random id) so the resolved writer key collides with the owner's.
+    // assigneeAgentId must be this agent (else the queued run is cancelled as
+    // "issue_assignee_changed" before it can reach the isolation bind); projectId
+    // stays null so workspace resolution uses the agent-home fallback rather than
+    // realizing a managed project workspace.
+    await db.insert(issues).values({
+      id: contenderIssueId,
+      companyId,
+      title: "Reuse the shared execution workspace",
+      identifier: "ERI-1",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      executionWorkspaceId: sharedWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
     });
     await db.insert(heartbeatRuns).values([
       {
@@ -359,7 +422,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
         invocationSource: "assignment",
         triggerDetail: "system",
         status: "queued",
-        contextSnapshot: {},
+        contextSnapshot: { issueId: contenderIssueId },
       },
     ]);
 
@@ -368,8 +431,8 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     await bindExternalRuntimeReservationIsolation(db, {
       runId: ownerRunId,
       reservationId: ownerClaim!.reservation.id,
-      isolationMode: "shared",
-      isolationKey: `agent-shared:${agentId}`,
+      isolationMode: "workspace",
+      isolationKey: `workspace:${sharedWorkspaceId}`,
     });
 
     await heartbeat.__test_executeRunForTesting(contenderRunId);
@@ -440,10 +503,19 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       .from(externalRuntimeReservations)
       .where(eq(externalRuntimeReservations.runId, contenderRunId))
       .then((rows) => rows[0]);
-    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    // The contender resumed and ran to completion once the owner freed the
+    // workspace writer key. Unlike the old issue-less setup, this run is linked to
+    // an issue, so its successful completion promotes the issue and dispatches a
+    // follow-up continuation run (a DISTINCT runId) -- expected issue behaviour,
+    // not a deferral property -- so we assert the adapter fired rather than pin an
+    // exact global count. The load-bearing proof is that the contender's OWN run
+    // succeeded on a fresh reservation bound to the same workspace key it had
+    // deferred on.
+    expect(mockAdapterExecute).toHaveBeenCalled();
     expect(completedContender.status).toBe("succeeded");
     expect(reusedReservation.id).not.toBe(contenderReservation?.id);
-    expect(reusedReservation.isolationKey).toBe(`agent-shared:${agentId}`);
+    expect(reusedReservation.isolationMode).toBe("workspace");
+    expect(reusedReservation.isolationKey).toBe(`workspace:${sharedWorkspaceId}`);
   }, 30_000);
 
   // BLO-16269: `createNamespacedJob` happens inside the bundled k8s adapter
@@ -754,6 +826,105 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       .where(eq(heartbeatRuns.id, siblingRunId))
       .then((rows) => rows[0]);
     expect(siblingRun?.status).toBe("succeeded");
+  }, 30_000);
+
+  it("gives two concurrent non-PR coding runs independent run-isolated reservations", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runIdA = randomUUID();
+    const runIdB = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "External Runtime Concurrency Co",
+      issuePrefix: "ERC",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Opencode K8s Concurrent",
+      role: "engineer",
+      status: "active",
+      adapterType: "opencode_k8s",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          enabled: true,
+          wakeOnDemand: true,
+          maxConcurrentRuns: 2,
+          concurrencyEnabled: true,
+        },
+      },
+      permissions: {},
+    });
+    // Plain assignment runs -- NO pr_review context -- so isolation must come
+    // from the concurrency branch, not the stateless-PR-review branch.
+    await db.insert(heartbeatRuns).values([
+      {
+        id: runIdA,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { wakeReason: "assignment" },
+      },
+      {
+        id: runIdB,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { wakeReason: "assignment" },
+      },
+    ]);
+
+    mockAdapterExecute.mockImplementation(
+      async (ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> => {
+        const jobName = `agent-opencode-${ctx.runId.slice(0, 8)}`;
+        await ctx.onMeta?.({ adapterType: "opencode_k8s", command: `kubectl job/${jobName}` });
+        await ctx.onExternalRuntimeLaunched?.({
+          jobName,
+          jobUid: `uid-${ctx.runId.slice(0, 8)}`,
+        });
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "coding run launched",
+          resultJson: { ok: true },
+          usage: { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0 },
+          provider: "test",
+          model: "test-model",
+        };
+      },
+    );
+
+    await Promise.all([
+      heartbeat.__test_executeRunForTesting(runIdA),
+      heartbeat.__test_executeRunForTesting(runIdB),
+    ]);
+
+    const [reservationA, reservationB] = await Promise.all([
+      db.select().from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.runId, runIdA)).then((rows) => rows[0]),
+      db.select().from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.runId, runIdB)).then((rows) => rows[0]),
+    ]);
+
+    expect(reservationA?.isolationMode).toBe("run");
+    expect(reservationB?.isolationMode).toBe("run");
+    expect(reservationA?.isolationKey).toBe(`run:${runIdA}`);
+    expect(reservationB?.isolationKey).toBe(`run:${runIdB}`);
+    expect(reservationA?.isolationKey).not.toBe(reservationB?.isolationKey);
+    // The whole point of BLO-16842: neither sibling serialized on the shared
+    // writer lock, i.e. neither reservation was deferred for an isolation
+    // conflict. Distinct run:<id> keys make that impossible; assert it directly.
+    expect(reservationA?.releaseReason).not.toBe("external_runtime_isolation_conflict");
+    expect(reservationB?.releaseReason).not.toBe("external_runtime_isolation_conflict");
   }, 30_000);
 
   it("compensates by deleting the exact Job when the periodic reconciliation loop loses the create/stamp race", async () => {
