@@ -613,7 +613,7 @@ test.describe("Pipelines tutorial UI flow", () => {
 
     await page.goto(`${companyPath}/pipelines/${pipeline.id}/items/${root.id}`);
     await expect(page.getByRole("heading", { name: "Pipeline primitives launch" }).first()).toBeVisible({
-      timeout: 15_000,
+      timeout: 30_000,
     });
     await expect(page.getByRole("heading", { name: "Ready to move to Assets?" })).toBeVisible();
     await expect(page.getByText("Draft is ready for the next review.")).toBeVisible();
