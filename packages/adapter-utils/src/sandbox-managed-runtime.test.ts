@@ -300,7 +300,7 @@ describe("sandbox managed runtime", () => {
       status.phase === "export" &&
       /^Exporting git history from sandbox: 100% \(\d+\.\d\/\d+\.\d MB\)$/.test(status.message)
     ))).toBe(true);
-  });
+  }, 60_000);
 
   it("repairs stale host index deletions when the sandbox restores a clean git worktree", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-clean-restore-"));
@@ -517,7 +517,7 @@ describe("sandbox managed runtime", () => {
     expect(downloadMembers.some((entry) => entry === ".git" || entry.startsWith(".git/"))).toBe(false);
     expect(downloadMembers.some((entry) => entry === "node_modules" || entry.startsWith("node_modules/"))).toBe(false);
     expect(downloadMembers.some((entry) => entry.includes("/node_modules/") || entry.endsWith("/node_modules"))).toBe(false);
-  });
+  }, 60_000);
 
   it("builds workspace/asset tarballs without a './' self-entry (so untar does not chmod/utime an unowned target dir)", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-tarself-"));

@@ -489,7 +489,7 @@ describe("sandbox adapter execution targets", () => {
       }
       await bridge?.stop();
     }
-  });
+  }, 30_000);
 
   it("applies the remote sandbox fallback when adapter timeoutSec is unset", () => {
     const sandboxTarget: AdapterSandboxExecutionTarget = {

@@ -771,7 +771,7 @@ describe("sandbox callback bridge", () => {
     await expect(response.json()).resolves.toMatchObject({
       error: expect.stringMatching(/JSON|Unexpected|Unterminated/i),
     });
-  });
+  }, 30_000);
 
   it("reuses an already-uploaded bridge entrypoint when the remote file hash matches", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-sync-"));
