@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { eq } from "drizzle-orm";
 import {
   agents,
+  authUsers,
   companies,
   companyMemberships,
   companySecretBindings,
@@ -58,6 +59,7 @@ describeEmbeddedPostgres("secretService", () => {
     await db.delete(companyMemberships);
     await db.delete(agents);
     await db.delete(companies);
+    await db.delete(authUsers);
   });
 
   afterAll(async () => {
@@ -88,6 +90,18 @@ describeEmbeddedPostgres("secretService", () => {
     userId: string,
     membershipRole: "owner" | "member" | "viewer" = "member",
   ) {
+    await db
+      .insert(authUsers)
+      .values({
+        id: userId,
+        name: `User ${userId}`,
+        email: `${userId}@example.com`,
+        emailVerified: true,
+        image: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .onConflictDoNothing();
     await db.insert(companyMemberships).values({
       companyId,
       principalType: "user",
@@ -97,6 +111,43 @@ describeEmbeddedPostgres("secretService", () => {
       createdAt: new Date(),
       updatedAt: new Date(),
     });
+  }
+
+  async function seedConfiguredUserSecretRuntime(userId: string) {
+    const companyId = await seedCompany();
+    await seedCompanyMember(companyId, userId);
+    const svc = secretService(db);
+    const definition = await svc.createUserSecretDefinition(companyId, {
+      key: "github_token",
+      name: "GitHub token",
+      provider: "local_encrypted",
+    });
+    const env = {
+      GITHUB_TOKEN: {
+        type: "user_secret_ref" as const,
+        key: "github_token",
+        version: "latest" as const,
+      },
+    };
+    const optionalEnv = {
+      OPTIONAL_GITHUB_TOKEN: {
+        type: "user_secret_ref" as const,
+        key: "github_token",
+        version: "latest" as const,
+        required: false,
+      },
+    };
+    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: "agent-1" }, env);
+    await svc.syncEnvBindingsForTarget(
+      companyId,
+      { targetType: "agent", targetId: "agent-optional" },
+      optionalEnv,
+    );
+    await svc.createCurrentUserSecretValue(companyId, userId, {
+      definitionId: definition.id,
+      value: "must-not-be-injected",
+    });
+    return { companyId, svc, definition, env, optionalEnv };
   }
 
   it("rejects cross-company secret references during env normalization", async () => {
@@ -655,6 +706,95 @@ describeEmbeddedPostgres("secretService", () => {
       outcome: "success",
     });
     expect(JSON.stringify(events)).not.toContain("user-one-secret");
+  });
+
+  it("denies configured user secrets when the responsible user is a viewer", async () => {
+    const userId = "viewer-user";
+    const { companyId, svc, definition, env, optionalEnv } =
+      await seedConfiguredUserSecretRuntime(userId);
+    await db
+      .update(companyMemberships)
+      .set({ membershipRole: "viewer", updatedAt: new Date() })
+      .where(eq(companyMemberships.principalId, userId));
+
+    await expect(
+      svc.collectMissingRuntimeBindings(companyId, env, {
+        consumerType: "agent",
+        consumerId: "agent-1",
+        responsibleUserId: userId,
+      }),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        bindingType: "user_secret_ref",
+        userSecretDefinitionId: definition.id,
+        responsibleUserId: userId,
+        errorCode: "responsible_user_unauthorized",
+      }),
+    ]);
+    await expect(
+      svc.resolveEnvBindings(companyId, env, {
+        consumerType: "agent",
+        consumerId: "agent-1",
+        actorType: "agent",
+        actorId: "agent-1",
+        responsibleUserId: userId,
+      }),
+    ).rejects.toMatchObject({
+      status: 403,
+      details: { code: "RESPONSIBLE_USER_UNAUTHORIZED" },
+    });
+    await expect(
+      svc.resolveEnvBindings(companyId, optionalEnv, {
+        consumerType: "agent",
+        consumerId: "agent-optional",
+        actorType: "agent",
+        actorId: "agent-optional",
+        responsibleUserId: userId,
+      }),
+    ).resolves.toMatchObject({ env: {}, manifest: [] });
+  });
+
+  it("denies configured user secrets when the responsible user no longer exists", async () => {
+    const userId = "removed-user";
+    const { companyId, svc, definition, env, optionalEnv } =
+      await seedConfiguredUserSecretRuntime(userId);
+    await db.delete(authUsers).where(eq(authUsers.id, userId));
+
+    await expect(
+      svc.collectMissingRuntimeBindings(companyId, env, {
+        consumerType: "agent",
+        consumerId: "agent-1",
+        responsibleUserId: userId,
+      }),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        bindingType: "user_secret_ref",
+        userSecretDefinitionId: definition.id,
+        responsibleUserId: userId,
+        errorCode: "responsible_user_unavailable",
+      }),
+    ]);
+    await expect(
+      svc.resolveEnvBindings(companyId, env, {
+        consumerType: "agent",
+        consumerId: "agent-1",
+        actorType: "agent",
+        actorId: "agent-1",
+        responsibleUserId: userId,
+      }),
+    ).rejects.toMatchObject({
+      status: 403,
+      details: { code: "RESPONSIBLE_USER_UNAVAILABLE" },
+    });
+    await expect(
+      svc.resolveEnvBindings(companyId, optionalEnv, {
+        consumerType: "agent",
+        consumerId: "agent-optional",
+        actorType: "agent",
+        actorId: "agent-optional",
+        responsibleUserId: userId,
+      }),
+    ).resolves.toMatchObject({ env: {}, manifest: [] });
   });
 
   it("can skip user-secret refs while resolving adapter config for non-runtime skill discovery", async () => {

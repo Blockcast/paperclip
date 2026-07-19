@@ -2088,6 +2088,49 @@ export function authorizationService(db: Db) {
     return responsibleUserAuthzShadowMode() ? agentDecision : denied;
   }
 
+  async function decideResponsibleUserSecretAccess(input: {
+    companyId: string;
+    userId: string;
+  }): Promise<AuthorizationDecision> {
+    const userId = input.userId.trim();
+    const unavailable = () => deny({
+      action: "secrets:read",
+      reason: "deny_missing_membership",
+      code: "RESPONSIBLE_USER_UNAVAILABLE",
+      explanation: `Responsible user ${userId || "unknown"} is unavailable for company ${input.companyId}.`,
+    });
+    if (!userId) return unavailable();
+
+    // Credential injection is a security boundary, so bypass the short-lived
+    // responsible-user snapshot cache and re-check the current user and
+    // membership rows immediately before resolving user-owned material.
+    const snapshot = await loadResponsibleUserSnapshot(input.companyId, userId);
+    if (!snapshot.userExists || !snapshot.activeMembership) return unavailable();
+
+    const userDecision = await decideBase({
+      actor: {
+        type: "board",
+        userId,
+        companyIds: [input.companyId],
+        memberships: [snapshot.activeMembership],
+        isInstanceAdmin: false,
+        ignoreInstanceAdmin: true,
+        source: "session",
+      },
+      action: "secrets:read",
+      resource: { type: "company", companyId: input.companyId },
+    });
+    if (userDecision.allowed) return userDecision;
+
+    return deny({
+      action: "secrets:read",
+      reason: userDecision.reason,
+      code: "RESPONSIBLE_USER_UNAUTHORIZED",
+      explanation: `Responsible user ${userId} is not authorized for secrets:read: ${userDecision.explanation}`,
+      grant: userDecision.grant,
+    });
+  }
+
   async function decide(input: {
     actor: AuthorizationActor;
     action: AuthorizationAction;
@@ -2101,5 +2144,6 @@ export function authorizationService(db: Db) {
   return {
     decide,
     decidePrincipalGrant,
+    decideResponsibleUserSecretAccess,
   };
 }
