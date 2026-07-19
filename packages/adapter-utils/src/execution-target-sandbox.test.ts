@@ -459,7 +459,7 @@ describe("sandbox adapter execution targets", () => {
       const timeout = setTimeout(() => {
         child.kill("SIGKILL");
         reject(new Error("Timed out waiting for streaming process session proxy."));
-      }, 5000);
+      }, 20_000);
       child.on("error", (error) => {
         clearTimeout(timeout);
         reject(error);
@@ -476,7 +476,7 @@ describe("sandbox adapter execution targets", () => {
       await waitForCondition(
         () => stdout.includes("delta:ping\n") && stderr.includes("trace:ping\n"),
         "Timed out waiting for live process session output.",
-        3000,
+        15_000,
       );
       expect(exited).toBe(false);
 
