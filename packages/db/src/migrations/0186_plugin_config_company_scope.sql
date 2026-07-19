@@ -93,7 +93,7 @@ BEGIN
   WHERE "company_id" IS NULL;
 
   IF unresolved_count > 0 THEN
-    RAISE EXCEPTION 'Cannot assign company_id for % plugin_config row(s); resolve ambiguous plugin secret bindings before applying migration 0164', unresolved_count;
+    RAISE EXCEPTION 'Cannot assign company_id for % plugin_config row(s); resolve ambiguous plugin secret bindings before applying migration 0186', unresolved_count;
   END IF;
 END $$;--> statement-breakpoint
 
