@@ -21091,6 +21091,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // same issue workspace while the assignee already has a live run.
       const agentNameKey = normalizeAgentNameKey(agent.name);
 
+      // Resolve through the shared client before taking the issue lock. Doing this
+      // from inside the transaction can deadlock the pool under a wake burst: every
+      // spare connection waits on the row lock while the lock holder waits for a
+      // second connection to resolve the responsible user.
+      const queuedResponsibleUserId = await resolveQueuedResponsibleUserId();
+
       const outcome = await db.transaction(async (tx) => {
         await tx.execute(
           sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
@@ -22118,7 +22124,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             invocationSource: source,
             triggerDetail,
             status: "queued",
-            responsibleUserId: await resolveQueuedResponsibleUserId(),
+            responsibleUserId: queuedResponsibleUserId,
             wakeupRequestId: wakeupRequest.id,
             contextSnapshot: enrichedContextSnapshot,
             sessionIdBefore: sessionBefore,
@@ -22227,6 +22233,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return mergedRun;
     }
 
+    // Resolve before taking the agent lock for the same pool-starvation reason as
+    // the issue-scoped path above. The promise remains lazy, so optimistic
+    // coalescing still avoids the lookup entirely.
+    const queuedResponsibleUserId = await resolveQueuedResponsibleUserId();
     const queueOutcome = await db.transaction(async (tx) => {
       await tx.execute(
         sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
@@ -22338,7 +22348,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           invocationSource: source,
           triggerDetail,
           status: "queued",
-          responsibleUserId: await resolveQueuedResponsibleUserId(),
+          responsibleUserId: queuedResponsibleUserId,
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,
