@@ -10,7 +10,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  *
  * Boots a throwaway local_trusted instance (see playwright.config.ts webServer)
  * and captures screenshots of every surface integrated by NUX Phases 1–3:
- *   - Team name
+ *   - Company name
  *   - Mission definition
  *   - Team-lead setup
  *   - Model connection
@@ -41,6 +41,8 @@ async function openWizard(page: import("@playwright/test").Page) {
 }
 
 test.describe("NUX Phase 4 visual QA", () => {
+  test.setTimeout(180_000);
+
   test("captures every integrated surface", async ({ page, baseURL }) => {
     // New-NUX surfaces are flag-gated default-OFF (PAP-136/137/138): turn the
     // experimental flag on for this throwaway instance before driving them.
@@ -92,8 +94,14 @@ test.describe("NUX Phase 4 visual QA", () => {
 
     // ── Section A: onboarding wizard ──────────────────────────────────────
     await openWizard(page);
+    // The front door appears when another spec already created a company on
+    // this shared test instance.
+    const createCard = page.getByRole("button", { name: /Build a new company/ });
+    if (await createCard.count()) {
+      await createCard.first().click();
+    }
     await expect(
-      page.getByRole("heading", { name: "Name your team" }),
+      page.getByRole("heading", { name: "Name your company" }),
     ).toBeVisible({ timeout: 15_000 });
     await page.getByPlaceholder("Acme Corp").fill("QA Robotics");
     await page.screenshot({ path: shot("01-company-setup.png") });

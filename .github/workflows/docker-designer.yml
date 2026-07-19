@@ -107,7 +107,11 @@ jobs:
           push: true
           provenance: false
           sbom: false
-          cache-from: type=registry,ref=harbor.blockcast.net/paperclip-designer/designer:buildcache-v1
-          cache-to: type=registry,ref=harbor.blockcast.net/paperclip-designer/designer:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
+          cache-from: |
+            type=registry,ref=harbor.blockcast.net/paperclip-designer/designer:buildcache-v1
+            type=gha,scope=paperclip-designer
+          cache-to: |
+            type=registry,ref=harbor.blockcast.net/paperclip-designer/designer:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
+            type=gha,scope=paperclip-designer,mode=min,ignore-error=true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

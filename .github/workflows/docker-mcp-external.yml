@@ -74,7 +74,11 @@ jobs:
           push: true
           provenance: false
           sbom: false
-          cache-from: type=registry,ref=harbor.blockcast.net/library/paperclip-mcp-external:buildcache-v1
-          cache-to: type=registry,ref=harbor.blockcast.net/library/paperclip-mcp-external:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
+          cache-from: |
+            type=registry,ref=harbor.blockcast.net/library/paperclip-mcp-external:buildcache-v1
+            type=gha,scope=paperclip-mcp-external
+          cache-to: |
+            type=registry,ref=harbor.blockcast.net/library/paperclip-mcp-external:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
+            type=gha,scope=paperclip-mcp-external,mode=min,ignore-error=true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

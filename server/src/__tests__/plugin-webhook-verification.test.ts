@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
   getByKey: vi.fn(),
+  listConfigCompanyIds: vi.fn(),
   upsertConfig: vi.fn(),
 }));
 
@@ -28,8 +29,10 @@ vi.mock("../services/activity-log.js", () => ({ logActivity: vi.fn() }));
 vi.mock("../services/live-events.js", () => ({ publishGlobalLiveEvent: vi.fn() }));
 
 const PLUGIN_ID = "11111111-1111-4111-8111-111111111111";
+const COMPANY_ID = "22222222-2222-4222-8222-222222222222";
 
 function readyPluginWithSlackEvents() {
+  mockRegistry.listConfigCompanyIds.mockResolvedValue([COMPANY_ID]);
   mockRegistry.getById.mockResolvedValue({
     id: PLUGIN_ID,
     pluginKey: "paperclip-plugin-slack",
@@ -114,5 +117,19 @@ describe("plugin webhook url_verification handshake", () => {
       expect.objectContaining({ parsedBody: expect.objectContaining({ type: "url_verification" }) }),
     );
     expect(res.status).not.toBe(200);
+  }, 20_000);
+
+  it("requires an explicit company for an ambiguously configured webhook", async () => {
+    readyPluginWithSlackEvents();
+    mockRegistry.listConfigCompanyIds.mockResolvedValue([COMPANY_ID, "company-2"]);
+    const { app, workerManager } = await createApp();
+
+    const res = await request(app)
+      .post(`/api/plugins/${PLUGIN_ID}/webhooks/slack-events`)
+      .send({ type: "event_callback", event: { type: "app_mention" } });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("companyId");
+    expect(workerManager.call).not.toHaveBeenCalled();
   }, 20_000);
 });

@@ -1,3 +1,8 @@
+import type {
+  EventDimensionsMap,
+  PaperclipEventName,
+} from "./generated/paperclip-telemetry.js";
+
 export interface TelemetryState {
   installId: string;
   salt: string;
@@ -12,11 +17,14 @@ export interface TelemetryConfig {
   schemaVersion?: string;
 }
 
+export type TelemetryDimensionValue = string | number | boolean;
+export type TelemetryDimensions = Record<string, TelemetryDimensionValue>;
+
 /** Per-event object inside the backend envelope */
 export interface TelemetryEvent {
   name: string;
   occurredAt: string;
-  dimensions: Record<string, string | number | boolean>;
+  dimensions: TelemetryDimensions;
 }
 
 /** Full payload sent to the backend ingest endpoint */
@@ -28,18 +36,9 @@ export interface TelemetryEventEnvelope {
   events: TelemetryEvent[];
 }
 
-export type TelemetryEventName =
-  | "install.started"
-  | "install.completed"
-  | "company.imported"
-  | "project.created"
-  | "routine.created"
-  | "routine.run"
-  | "goal.created"
-  | "agent.created"
-  | "skill.imported"
-  | "agent.first_heartbeat"
-  | "agent.task_completed"
-  | "sweep.blocked_promotion_skipped_awaiting_user"
-  | "error.handler_crash"
-  | `plugin.${string}`;
+export type RegisteredPluginEventName =
+  "sweep.blocked_promotion_skipped_awaiting_user";
+export type TelemetryEventName = PaperclipEventName | RegisteredPluginEventName;
+
+export type TelemetryEventDimensions<K extends TelemetryEventName> =
+  K extends keyof EventDimensionsMap ? EventDimensionsMap[K] : TelemetryDimensions;

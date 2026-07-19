@@ -740,6 +740,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       id: companyId,
       name: "Test",
       issuePrefix,
+      defaultResponsibleUserId: "test-board-user",
       requireBoardApprovalForNewAgents: false,
     });
     await db.insert(agents).values({
@@ -773,6 +774,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       id: companyId,
       name: "Test",
       issuePrefix: "BLO",
+      defaultResponsibleUserId: "test-board-user",
       requireBoardApprovalForNewAgents: false,
     });
     await db.insert(agents).values({

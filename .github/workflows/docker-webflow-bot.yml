@@ -128,7 +128,11 @@ jobs:
           push: true
           provenance: false
           sbom: false
-          cache-from: type=registry,ref=harbor.blockcast.net/paperclip-webflow-bot/webflow-bot:buildcache-v1
-          cache-to: type=registry,ref=harbor.blockcast.net/paperclip-webflow-bot/webflow-bot:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
+          cache-from: |
+            type=registry,ref=harbor.blockcast.net/paperclip-webflow-bot/webflow-bot:buildcache-v1
+            type=gha,scope=paperclip-webflow-bot
+          cache-to: |
+            type=registry,ref=harbor.blockcast.net/paperclip-webflow-bot/webflow-bot:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
+            type=gha,scope=paperclip-webflow-bot,mode=min,ignore-error=true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

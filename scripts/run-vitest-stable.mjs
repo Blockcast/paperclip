@@ -3,8 +3,14 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { loadShardDurations, selectGeneralServerShard } from "./general-server-shard.mjs";
 
 const repoRoot = process.cwd();
+const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
+const generalServerShardDurations = loadShardDurations(
+  path.join(scriptsDir, "general-server-shard-durations.json"),
+);
 const serverRoot = path.join(repoRoot, "server");
 const serverSrcDir = path.join(repoRoot, "server", "src");
 const serverTestsDir = path.join(repoRoot, "server", "src", "__tests__");
@@ -13,7 +19,6 @@ const nonServerProjects = [
   "@paperclipai/skills-catalog",
   "@paperclipai/db",
   "@paperclipai/adapter-utils",
-  "@paperclipai/adapter-acpx-local",
   "@paperclipai/adapter-codex-local",
   "@paperclipai/adapter-opencode-local",
   "@paperclipai/plugin-sdk",
@@ -62,6 +67,13 @@ const generalGroupNames = [generalServerGroupName, generalWorkspacesAGroupName, 
 const serializedServerVitestArgs = [
   "--no-file-parallelism",
   "--maxWorkers=1",
+];
+// Workspace projects run concurrently inside each Vitest invocation. ARC CPU
+// contention can stretch otherwise healthy filesystem/process tests beyond
+// Vitest's 5-second default without indicating a hang.
+const arcWorkspaceVitestArgs = [
+  "--testTimeout=30000",
+  "--hookTimeout=60000",
 ];
 
 function walk(dir) {
@@ -281,17 +293,20 @@ function runGeneralSuites(routeTests) {
   }
 }
 
-function runProjectGroup(projects, groupName) {
+function runProjectGroup(projects, groupName, extraArgs = []) {
   for (const project of projects) {
-    runVitest(["--project", project], `${groupName} project ${project}`);
+    runVitest(["--project", project, ...extraArgs], `${groupName} project ${project}`);
   }
 }
 
 function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = null) {
   if (groupName === generalServerGroupName) {
     if (shardCount !== null && shardCount > 1) {
-      const shardFiles = generalServerTestFiles.filter(
-        (_, index) => index % shardCount === shardIndex,
+      const shardFiles = selectGeneralServerShard(
+        generalServerTestFiles,
+        shardIndex,
+        shardCount,
+        generalServerShardDurations,
       );
       console.log(
         `\n[test:run] general-server shard ${shardIndex + 1}/${shardCount} running ${shardFiles.length} of ${generalServerTestFiles.length} suites`,
@@ -326,12 +341,19 @@ function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = 
   }
 
   if (groupName === generalWorkspacesAGroupName) {
-    runProjectGroup(generalWorkspacesAProjects, groupName);
+    runProjectGroup(["@paperclipai/ui"], groupName);
+    // The CLI project has several embedded-Postgres suites. Starting those
+    // files concurrently on a single ARC runner makes initialization contend
+    // heavily and turns otherwise sub-minute tests into timeout flakes.
+    runVitest(
+      ["--project", "paperclipai", ...serializedServerVitestArgs],
+      `${groupName} project paperclipai`,
+    );
     return;
   }
 
   if (groupName === generalWorkspacesBGroupName) {
-    runProjectGroup(generalWorkspacesBProjects, groupName);
+    runProjectGroup(generalWorkspacesBProjects, groupName, arcWorkspaceVitestArgs);
     return;
   }
 
@@ -371,6 +393,8 @@ const routeTests = walk(serverTestsDir)
 // dedicated serialized shards. Sharding this list across runners is what keeps
 // the general-server lane from becoming the PR critical path: the server vitest
 // config pins maxWorkers to 1, so the only way to parallelize is across jobs.
+// Suites are partitioned by recorded duration (scripts/general-server-shard.mjs)
+// rather than round-robin, so one slow suite cluster can't stretch a single shard.
 const generalServerTestFiles = walk(serverSrcDir)
   .map((file) => toRepoPath(file))
   .filter((repoPath) => repoPath.endsWith(".test.ts"))
@@ -391,6 +415,7 @@ if (options.dryRun) {
         shardCount: options.shardCount,
         group: options.group,
         availableGeneralGroups: generalGroupNames,
+        generalWorkspacesBVitestArgs: arcWorkspaceVitestArgs,
         serializedSuiteCount: routeTests.length,
         selectedSerializedSuites: serializedSuites.map((routeTest) => routeTest.repoPath),
         generalServerSuiteCount: generalServerTestFiles.length,
@@ -398,8 +423,11 @@ if (options.dryRun) {
           options.mode === generalModeName &&
           options.group === generalServerGroupName &&
           options.shardCount !== null
-            ? generalServerTestFiles.filter(
-                (_, index) => index % options.shardCount === options.shardIndex,
+            ? selectGeneralServerShard(
+                generalServerTestFiles,
+                options.shardIndex,
+                options.shardCount,
+                generalServerShardDurations,
               )
             : null,
       },
