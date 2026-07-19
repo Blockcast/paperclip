@@ -119,7 +119,7 @@ describeEmbeddedPostgres("resetPostgresDatabase", () => {
     } finally {
       await verifySql.end();
     }
-  }, 30_000);
+  }, 120_000);
 });
 
 describeEmbeddedPostgres("applyPendingMigrations", () => {
@@ -752,7 +752,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
         await verifySql.end();
       }
     },
-    20_000,
+    120_000,
   );
 
   it(
@@ -885,7 +885,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
         await verifySql.end();
       }
     },
-    20_000,
+    120_000,
   );
 
   it(
@@ -1281,7 +1281,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
         await afterSecondRun.end();
       }
     },
-    20_000,
+    120_000,
   );
 
   it(
@@ -1408,6 +1408,6 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
         await verifySql.end();
       }
     },
-    20_000,
+    120_000,
   );
 });

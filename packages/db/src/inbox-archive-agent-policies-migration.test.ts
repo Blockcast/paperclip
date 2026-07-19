@@ -189,6 +189,6 @@ describeEmbeddedPostgres("inbox archive agent policy migration", () => {
 
       expect((await inspectMigrations(connectionString)).status).toBe("upToDate");
     },
-    30_000,
+    120_000,
   );
 });

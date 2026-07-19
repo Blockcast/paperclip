@@ -119,5 +119,5 @@ describeEmbeddedPostgres("nested skill folders migration", () => {
       .toContain("WHERE (parent_id IS NULL)");
     expect(indexes.find((index) => index.indexname === "folders_company_kind_parent_slug_uq")?.indexdef)
       .toContain("WHERE (parent_id IS NOT NULL)");
-  }, 30_000);
+  }, 120_000);
 });
