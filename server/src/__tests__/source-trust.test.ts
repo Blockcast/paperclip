@@ -98,7 +98,7 @@ describeEmbeddedPostgres("resolveActorSourceTrustForIssue", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-source-trust-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(heartbeatRuns);

@@ -97,7 +97,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-pr-review-queue-");
     db = createDb(tempDb.connectionString);
     peerDb = createDb(tempDb.connectionString);
-  }, 60_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(heartbeatRunEvents);

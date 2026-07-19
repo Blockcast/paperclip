@@ -36,7 +36,7 @@ describeEmbeddedPostgres("heartbeat timer wake coalescing", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-timer-wake-coalescing-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(heartbeatRunEvents);

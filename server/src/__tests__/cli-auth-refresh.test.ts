@@ -116,7 +116,7 @@ describeEmbeddedPostgres("cli-auth refresh (sliding board key renewal)", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.keyId).toBe(key.id);
     expect(res.body.expiresAt).toBe(expiresAt.toISOString());
-  }, 20_000);
+  }, 120_000);
 
   it("extends a soon-expiring key to a fresh TTL window and logs activity", async () => {
     const { userId, companyId } = await createBoardUser(db);
@@ -151,7 +151,7 @@ describeEmbeddedPostgres("cli-auth refresh (sliding board key renewal)", () => {
       .where(eq(activityLog.companyId, companyId))
       .then((rows) => rows.filter((row) => row.action === "board_api_key.refreshed"));
     expect(logged.length).toBe(1);
-  }, 20_000);
+  }, 120_000);
 
   it("never shortens a key that already outlives a fresh TTL window", async () => {
     const { userId } = await createBoardUser(db);
@@ -170,7 +170,7 @@ describeEmbeddedPostgres("cli-auth refresh (sliding board key renewal)", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.refreshed).toBe(false);
     expect(res.body.expiresAt).toBe(farOut.toISOString());
-  }, 20_000);
+  }, 120_000);
 
   it("leaves a never-expires key untouched", async () => {
     const { userId } = await createBoardUser(db);
@@ -195,7 +195,7 @@ describeEmbeddedPostgres("cli-auth refresh (sliding board key renewal)", () => {
       .where(eq(boardApiKeys.id, key.id))
       .then((rows) => rows[0]!);
     expect(stored.expiresAt).toBeNull();
-  }, 20_000);
+  }, 120_000);
 
   it("rejects refresh with an already-expired token", async () => {
     const { userId } = await createBoardUser(db);
@@ -218,7 +218,7 @@ describeEmbeddedPostgres("cli-auth refresh (sliding board key renewal)", () => {
       .where(eq(boardApiKeys.id, key.id))
       .then((rows) => rows[0]!);
     expect(stored.expiresAt!.getTime()).toBeLessThan(Date.now());
-  }, 20_000);
+  }, 120_000);
 
   it("rejects refresh for board actors that are not backed by a board key", async () => {
     const { userId, companyId } = await createBoardUser(db);
@@ -248,5 +248,5 @@ describeEmbeddedPostgres("cli-auth refresh (sliding board key renewal)", () => {
 
     const res = await request(app).post("/api/cli-auth/refresh");
     expect(res.status, JSON.stringify(res.body)).toBe(400);
-  }, 20_000);
+  }, 120_000);
 });

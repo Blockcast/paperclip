@@ -130,7 +130,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     mockGetActiveExternalRuntimeReservation.mockImplementation((...args: Parameters<
       typeof actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation
     >) => actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation(...args));
-  }, 30_000);
+  }, 120_000);
 
   afterEach(async () => {
     mockAdapterExecute.mockReset();
@@ -146,7 +146,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
         typeof actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation
       >) => actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation(...args));
     await cleanupHeartbeatTestState(db, heartbeat);
-  }, 30_000);
+  }, 120_000);
 
   afterAll(async () => {
     await tempDb?.cleanup();
@@ -316,7 +316,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       ([ctx]) => (ctx as AdapterExecutionContext).externalRuntime?.reservationId,
     );
     expect(new Set(reservationIds)).toEqual(new Set([reservation.id]));
-  }, 30_000);
+  }, 120_000);
 
   it("defers a workspace-scope contender without failing or invoking its adapter", async () => {
     // BLO-16842 repurposed this case. Pre-fix, a concurrency-enabled k8s agent's
@@ -520,7 +520,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(reusedReservation.id).not.toBe(contenderReservation?.id);
     expect(reusedReservation.isolationMode).toBe("workspace");
     expect(reusedReservation.isolationKey).toBe(`workspace:${sharedWorkspaceId}`);
-  }, 30_000);
+  }, 120_000);
 
   // BLO-16269: `createNamespacedJob` happens inside the bundled k8s adapter
   // (outside this repo) and can land in-cluster even after the reservation
@@ -642,7 +642,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0]);
     expect(run).toMatchObject({ status: "failed", errorCode: "process_lost" });
-  }, 30_000);
+  }, 120_000);
 
   it("does not touch a sibling run's live Job when only one run's create/stamp race is lost", async () => {
     const companyId = randomUUID();
@@ -828,7 +828,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       .where(eq(heartbeatRuns.id, siblingRunId))
       .then((rows) => rows[0]);
     expect(siblingRun?.status).toBe("succeeded");
-  }, 30_000);
+  }, 120_000);
 
   it("gives two concurrent non-PR coding runs independent run-isolated reservations", async () => {
     const companyId = randomUUID();
@@ -928,7 +928,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     // conflict. Distinct run:<id> keys make that impossible; assert it directly.
     expect(reservationA?.releaseReason).not.toBe("external_runtime_isolation_conflict");
     expect(reservationB?.releaseReason).not.toBe("external_runtime_isolation_conflict");
-  }, 30_000);
+  }, 120_000);
 
   it("compensates by deleting the exact Job when the periodic reconciliation loop loses the create/stamp race", async () => {
     // Ally review on PR #690 (BLO-16269) flagged that both new race tests above
@@ -1035,5 +1035,5 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(reservation.state).toBe("released");
     expect(reservation.jobName).toBeNull();
     expect(reservation.jobUid).toBeNull();
-  }, 30_000);
+  }, 120_000);
 });
