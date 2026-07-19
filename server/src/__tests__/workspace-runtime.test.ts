@@ -5668,8 +5668,9 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     const runId = randomUUID();
     const executionWorkspaceId = randomUUID();
     const stoppedServiceId = randomUUID();
+    const staleOwnerMarker = `stale-owner-${randomUUID()}`;
     const serviceCommand =
-      "node -e \"const http=require('node:http'); const stale=process.env.STALE_HEALTH==='1'; http.createServer((req,res)=>{ if (req.url==='/api/health' && stale) { res.statusCode=503; res.end('database_unreachable'); return; } res.end('ok'); }).listen(Number(process.env.PORT), '127.0.0.1')\"";
+      "node -e \"const http=require('node:http'); const stale=process.env.STALE_HEALTH==='1'; http.createServer((req,res)=>{ if (req.url==='/api/health' && stale) { res.statusCode=503; res.end(process.env.STALE_OWNER_MARKER); return; } res.end('ok'); }).listen(Number(process.env.PORT), '127.0.0.1')\"";
     const scopeType = "agent";
     const scopeId = agentId;
     const reuseKey = createHash("sha256")
@@ -5692,6 +5693,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
         ...process.env,
         PORT: String(stalePort),
         STALE_HEALTH: "1",
+        STALE_OWNER_MARKER: staleOwnerMarker,
       },
       detached: process.platform !== "win32",
       stdio: "ignore",
@@ -5838,12 +5840,9 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
       expect(services[0]?.port).not.toBe(stalePort);
       expect(services[0]?.url).not.toBe(rootUrl);
       await expect(fetch(services[0]!.url!)).resolves.toMatchObject({ ok: true });
-      await expect(fetch(healthUrl)).resolves.toMatchObject({ ok: false, status: 503 });
-      // Depending on the shell/runner, the listening Node process may either
-      // replace the detached shell or remain its child. The stale 503 response
-      // above proves the original service still owns this port; require a live
-      // listener without assuming which process in that group holds the socket.
-      expect(await readLocalServicePortOwner(stalePort!)).toBeTypeOf("number");
+      const staleOwnerResponse = await fetch(healthUrl);
+      expect(staleOwnerResponse).toMatchObject({ ok: false, status: 503 });
+      expect(await staleOwnerResponse.text()).toBe(staleOwnerMarker);
     } finally {
       leasedRunIds.delete(runId);
       await releaseRuntimeServicesForRun(runId);

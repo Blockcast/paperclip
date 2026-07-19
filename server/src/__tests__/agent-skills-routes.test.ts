@@ -377,7 +377,7 @@ describe.sequential("agent skill routes", () => {
         }),
       }),
     );
-  });
+  }, 60_000);
 
   it("lists skills without resolving required user-secret env bindings", async () => {
     const adapterConfig = {

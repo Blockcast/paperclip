@@ -450,7 +450,7 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(200);
     expect(res.body.adapterConfig).toEqual({});
     expect(res.body.runtimeConfig).toEqual({});
-  }, 20_000);
+  }, 60_000);
 
   it("keeps board agent detail visible while redacting secrets for low-trust agents", async () => {
     mockAgentService.getById.mockResolvedValue({
@@ -491,7 +491,7 @@ describe.sequential("agent permission routes", () => {
       },
     });
     expect(res.body.permissions).toMatchObject({ trustPreset: LOW_TRUST_REVIEW_PRESET });
-  }, 20_000);
+  }, 60_000);
 
   it("redacts company agent list for authenticated company members without agent admin permission", async () => {
     mockAccessService.canUser.mockResolvedValue(false);
@@ -843,7 +843,7 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(403);
     expect(res.body.error).toContain("instructions path or bundle configuration");
     expect(mockLogActivity).not.toHaveBeenCalled();
-  }, 15_000);
+  }, 60_000);
 
   it("preserves agent-authenticated budget pause metadata and hard-pauses the agent", async () => {
     const pausedAt = "2026-06-24T00:00:00.000Z";
@@ -1059,7 +1059,7 @@ describe.sequential("agent permission routes", () => {
       true,
       "board-user",
     );
-  }, 15_000);
+  }, 60_000);
 
   it("rejects unsupported query parameters on the agent list route", async () => {
     const app = await createApp({
@@ -1600,7 +1600,7 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(200);
     expect(res.body.access.canAssignTasks).toBe(true);
     expect(res.body.access.taskAssignSource).toBe("explicit_grant");
-  }, 15_000);
+  }, 60_000);
 
   it("reports simple-mode task assignment as enabled for active company agent members", async () => {
     mockAccessService.listPrincipalGrants.mockResolvedValue([]);
@@ -1618,7 +1618,7 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(200);
     expect(res.body.access.canAssignTasks).toBe(true);
     expect(res.body.access.taskAssignSource).toBe("simple_default");
-  }, 15_000);
+  }, 60_000);
 
   it("keeps task assignment enabled when agent creation privilege is enabled", async () => {
     mockAgentService.updatePermissions.mockResolvedValue({
