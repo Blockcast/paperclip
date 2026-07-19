@@ -20,9 +20,9 @@ permissions:
   id-token: write   # cosign keyless OIDC
 
 env:
-  # The upstream bake default remains ghcr.io/paperclipai, but this Blockcast
-  # repo's GITHUB_TOKEN can only create/push GHCR packages under this owner.
-  REGISTRY: ${{ vars.AGENT_RUNTIME_REGISTRY || 'ghcr.io/blockcast' }}
+  # Keep the default image and registry-cache path on the on-prem Harbor LAN.
+  # The variable remains an escape hatch for mirrors or upstream testing.
+  REGISTRY: ${{ vars.AGENT_RUNTIME_REGISTRY || 'harbor.blockcast.net/paperclip-agent' }}
   VERSION: ${{ github.event.inputs.version || format('git-{0}', github.sha) }}
 
 jobs:
@@ -36,7 +36,16 @@ jobs:
         with:
           cleanup: true
 
-      - name: Log into GHCR
+      - name: Log into Harbor
+        if: startsWith(env.REGISTRY, 'harbor.blockcast.net/')
+        uses: docker/login-action@v4
+        with:
+          registry: harbor.blockcast.net
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Log into GHCR override
+        if: startsWith(env.REGISTRY, 'ghcr.io/')
         uses: docker/login-action@v4
         with:
           registry: ghcr.io

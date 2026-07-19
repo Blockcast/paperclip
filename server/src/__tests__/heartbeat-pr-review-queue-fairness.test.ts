@@ -97,7 +97,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-pr-review-queue-");
     db = createDb(tempDb.connectionString);
     peerDb = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(heartbeatRunEvents);
@@ -127,7 +127,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
       status: "active",
       issuePrefix: "RFR",
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -222,7 +222,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
       status: "active",
       issuePrefix: "RQC",
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -291,7 +291,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
       status: "active",
       issuePrefix: "RRN",
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -356,11 +356,26 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
       idempotencyKey: `${taskKey}:github_pr_review_requested`,
     });
 
-    const outcomeBeforeCommit = await Promise.race([
-      enqueue.then(() => "enqueued" as const),
-      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100)),
-    ]);
-    expect(outcomeBeforeCommit).toBe("blocked");
+    const lockWaitDeadline = Date.now() + 10_000;
+    let enqueueIsWaitingForLock = false;
+    while (Date.now() < lockWaitDeadline) {
+      const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+        select exists (
+          select 1
+          from pg_stat_activity
+          where datname = current_database()
+            and pid <> pg_backend_pid()
+            and wait_event_type = 'Lock'
+            and query ~* 'select id from agents.*for update'
+        ) as waiting
+      `);
+      if (Array.from(waitingRows)[0]?.waiting) {
+        enqueueIsWaitingForLock = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(enqueueIsWaitingForLock).toBe(true);
 
     releaseRunLock();
     await inFlightRun;
@@ -392,7 +407,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
       status: "active",
       issuePrefix: "RRR",
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -498,7 +513,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
       status: "active",
       issuePrefix: "RCR",
       requireBoardApprovalForNewAgents: false,
-    });
+      defaultResponsibleUserId: "responsible-user",    });
     await db.insert(agents).values({
       id: agentId,
       companyId,

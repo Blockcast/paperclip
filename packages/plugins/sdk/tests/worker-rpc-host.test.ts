@@ -155,6 +155,80 @@ describe("worker performAction context", () => {
   });
 });
 
+describe("worker config bootstrap", () => {
+  it("returns the empty bootstrap config during unscoped setup without a host call", async () => {
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const pending = new Map<string, (response: JsonRpcResponse) => void>();
+    let setupConfig: Record<string, unknown> | null = null;
+    let hostConfigCalls = 0;
+    const plugin = definePlugin({
+      async setup(ctx) {
+        setupConfig = await ctx.config.get();
+      },
+    });
+    const worker = startWorkerRpcHost({
+      plugin,
+      stdin: hostToWorker,
+      stdout: workerToHost,
+    });
+
+    hostReadline.on("line", (line) => {
+      const message = parseMessage(line);
+      if (isJsonRpcRequest(message)) {
+        if (message.method === "config.get") hostConfigCalls += 1;
+        hostToWorker.write(serializeMessage(createErrorResponse(
+          message.id,
+          PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+          "unexpected unscoped config read",
+        )));
+        return;
+      }
+      if (!isJsonRpcResponse(message)) return;
+      pending.get(String(message.id))?.(message);
+      pending.delete(String(message.id));
+    });
+
+    try {
+      const id = "host-initialize";
+      const initialized = new Promise<unknown>((resolve, reject) => {
+        pending.set(id, (response) => {
+          if ("error" in response && response.error) {
+            reject(new Error(response.error.message));
+            return;
+          }
+          resolve((response as { result?: unknown }).result);
+        });
+      });
+      hostToWorker.write(serializeMessage(createRequest("initialize", {
+        manifest: {
+          id: "paperclip.bootstrap-config-test",
+          apiVersion: 1,
+          version: "1.0.0",
+          displayName: "Bootstrap config test",
+          description: "Bootstrap config test",
+          author: "Paperclip",
+          categories: ["automation"],
+          capabilities: [],
+          entrypoints: {},
+        },
+        config: {},
+        databaseNamespace: null,
+      }, id)));
+
+      await expect(initialized).resolves.toMatchObject({ ok: true });
+      expect(setupConfig).toEqual({});
+      expect(hostConfigCalls).toBe(0);
+    } finally {
+      worker.stop();
+      hostReadline.close();
+      hostToWorker.destroy();
+      workerToHost.destroy();
+    }
+  });
+});
+
 describe("worker issue create forwarding", () => {
   it("passes linkedLinearIssue through to the host", async () => {
     const hostToWorker = new PassThrough();

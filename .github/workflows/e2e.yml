@@ -8,6 +8,12 @@ on:
         type: boolean
         default: true
 
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+  CC: "sccache gcc"
+  CXX: "sccache g++"
+
 jobs:
   e2e:
     runs-on: default
@@ -26,6 +32,9 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm build

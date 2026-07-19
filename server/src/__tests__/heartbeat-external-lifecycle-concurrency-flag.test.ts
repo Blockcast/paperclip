@@ -107,6 +107,17 @@ describe("resolveK8sRunIsolationIdentity: concurrency-aware run isolation (BLO-1
     ).toEqual({ isolationMode: "workspace", isolationKey: "workspace:ws-9" });
   });
 
+  it("uses per-run isolation when workspace intent has no persisted workspace id yet", () => {
+    expect(
+      resolveK8sRunIsolationIdentity({
+        ...base,
+        isWorkspaceIsolated: true,
+        persistedExecutionWorkspaceId: null,
+        effectiveMaxConcurrentRuns: 2,
+      }),
+    ).toEqual({ isolationMode: "run", isolationKey: "run:run-123" });
+  });
+
   it("still uses run isolation for a stateless PR review regardless of concurrency", () => {
     expect(
       resolveK8sRunIsolationIdentity({

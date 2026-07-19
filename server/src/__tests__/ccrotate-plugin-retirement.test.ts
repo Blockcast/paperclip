@@ -37,6 +37,19 @@ describe("ccrotate plugin retirement", () => {
     );
   });
 
+  it("retires only the incompatible published updater before plugin loadAll", () => {
+    const app = readRepoFile("server/src/app.ts");
+    const bundledPackages = readRepoFile("server/src/bootstrap/bundled-plugin-packages.ts");
+
+    expect(bundledPackages).not.toContain('"@lucitra/paperclip-plugin-updater"');
+    expect(app).toContain('const INCOMPATIBLE_PLUGIN_UPDATER_KEY = "lucitra.plugin-updater"');
+    expect(app).toContain('const INCOMPATIBLE_PLUGIN_UPDATER_VERSION = "0.5.0"');
+    expect(app).toContain("retired incompatible plugin updater before plugin loadAll");
+    expect(app.indexOf(".then(() => retireIncompatiblePluginUpdater())")).toBeLessThan(
+      app.indexOf(".then(() => loader.loadAll())"),
+    );
+  });
+
   it("removes only the fingerprinted read-only ccrotate PVC wrapper", () => {
     const statefulSet = readRepoFile("deploy/helm/paperclip/templates/statefulset.yaml");
 

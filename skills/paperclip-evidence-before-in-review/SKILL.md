@@ -2,13 +2,10 @@
 name: paperclip-evidence-before-in-review
 required: true
 description: >
-  Before moving any paperclip issue to `in_review`, produce the evidence
-  shapes the server-side artifact-evidence gate expects, keyed by the
-  issue's labels. Triggers on any PATCH that transitions status to
-  `in_review`. Without the right evidence, the gate records a `block`
-  verdict (Phase 1 warn-only today; Phase 2 will 422). Use whenever you
-  are about to claim "done" or move an issue from `in_progress` to
-  `in_review`.
+  Before moving a Paperclip issue to `in_review`, produce the label-keyed
+  evidence required by the server's artifact-evidence gate. Use on any
+  transition to `in_review` or completion claim; missing evidence records a
+  `block` verdict (warn-only in Phase 1, HTTP 422 in Phase 2).
 ---
 
 # Evidence Before in_review

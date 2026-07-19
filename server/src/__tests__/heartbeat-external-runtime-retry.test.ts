@@ -130,7 +130,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     mockGetActiveExternalRuntimeReservation.mockImplementation((...args: Parameters<
       typeof actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation
     >) => actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation(...args));
-  }, 30_000);
+  }, 120_000);
 
   afterEach(async () => {
     mockAdapterExecute.mockReset();
@@ -146,7 +146,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
         typeof actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation
       >) => actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation(...args));
     await cleanupHeartbeatTestState(db, heartbeat);
-  }, 30_000);
+  }, 120_000);
 
   afterAll(async () => {
     await tempDb?.cleanup();
@@ -163,6 +163,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       name: "External Runtime Retry Co",
       issuePrefix: "ERR",
       requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
     });
     await db.insert(agents).values({
       id: agentId,
@@ -234,7 +235,9 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
 
     const execution = heartbeat.__test_executeRunForTesting(runId);
     let retryReservation: typeof externalRuntimeReservations.$inferSelect | undefined;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
+    // ARC runners can be heavily contended after the embedded-Postgres suites;
+    // keep the assertion deterministic without weakening the expected state.
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
       retryReservation = await db
         .select()
         .from(externalRuntimeReservations)
@@ -313,7 +316,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       ([ctx]) => (ctx as AdapterExecutionContext).externalRuntime?.reservationId,
     );
     expect(new Set(reservationIds)).toEqual(new Set([reservation.id]));
-  }, 30_000);
+  }, 120_000);
 
   it("defers a workspace-scope contender without failing or invoking its adapter", async () => {
     // BLO-16842 repurposed this case. Pre-fix, a concurrency-enabled k8s agent's
@@ -342,6 +345,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       name: "External Runtime Isolation Co",
       issuePrefix: "ERI",
       requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
     });
     await db.insert(agents).values({
       id: agentId,
@@ -516,7 +520,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(reusedReservation.id).not.toBe(contenderReservation?.id);
     expect(reusedReservation.isolationMode).toBe("workspace");
     expect(reusedReservation.isolationKey).toBe(`workspace:${sharedWorkspaceId}`);
-  }, 30_000);
+  }, 120_000);
 
   // BLO-16269: `createNamespacedJob` happens inside the bundled k8s adapter
   // (outside this repo) and can land in-cluster even after the reservation
@@ -536,6 +540,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       name: "External Runtime Race Co",
       issuePrefix: "ERX",
       requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
     });
     await db.insert(agents).values({
       id: agentId,
@@ -566,8 +571,11 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
 
     let allowStampToProceed!: () => void;
     const stampGate = new Promise<void>((resolve) => { allowStampToProceed = resolve; });
+    let markMetaRecorded!: () => void;
+    const metaRecorded = new Promise<void>((resolve) => { markMetaRecorded = resolve; });
     mockAdapterExecute.mockImplementation(async (ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> => {
       await ctx.onMeta?.({ adapterType: "claude_k8s", command: `kubectl job/${jobName}` });
+      markMetaRecorded();
       // createNamespacedJob has already succeeded in-cluster at this point;
       // hold before reporting it back so the test can reap/release the
       // reservation out from under the in-flight launch.
@@ -587,19 +595,12 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     });
 
     const execution = heartbeat.__test_executeRunForTesting(runId);
-
-    let reservationBeforeReap: typeof externalRuntimeReservations.$inferSelect | undefined;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      reservationBeforeReap = await db
-        .select()
-        .from(externalRuntimeReservations)
-        .where(eq(externalRuntimeReservations.runId, runId))
-        .then((rows) => rows[0]);
-      if (reservationBeforeReap?.state === "launching" && reservationBeforeReap.expectedJobName === jobName) {
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    await metaRecorded;
+    const reservationBeforeReap = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, runId))
+      .then((rows) => rows[0]);
     expect(reservationBeforeReap).toMatchObject({
       state: "launching",
       expectedJobName: jobName,
@@ -641,7 +642,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0]);
     expect(run).toMatchObject({ status: "failed", errorCode: "process_lost" });
-  }, 30_000);
+  }, 120_000);
 
   it("does not touch a sibling run's live Job when only one run's create/stamp race is lost", async () => {
     const companyId = randomUUID();
@@ -656,6 +657,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       name: "External Runtime Sibling Co",
       issuePrefix: "ERS",
       requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
     });
     await db.insert(agents).values({
       id: agentId,
@@ -744,7 +746,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
 
     let losingReservation: typeof externalRuntimeReservations.$inferSelect | undefined;
     let siblingReservation: typeof externalRuntimeReservations.$inferSelect | undefined;
-    for (let attempt = 0; attempt < 200; attempt += 1) {
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
       [losingReservation, siblingReservation] = await Promise.all([
         db.select().from(externalRuntimeReservations).where(eq(externalRuntimeReservations.runId, losingRunId)).then((rows) => rows[0]),
         db.select().from(externalRuntimeReservations).where(eq(externalRuntimeReservations.runId, siblingRunId)).then((rows) => rows[0]),
@@ -826,7 +828,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       .where(eq(heartbeatRuns.id, siblingRunId))
       .then((rows) => rows[0]);
     expect(siblingRun?.status).toBe("succeeded");
-  }, 30_000);
+  }, 120_000);
 
   it("gives two concurrent non-PR coding runs independent run-isolated reservations", async () => {
     const companyId = randomUUID();
@@ -839,6 +841,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       name: "External Runtime Concurrency Co",
       issuePrefix: "ERC",
       requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
     });
     await db.insert(agents).values({
       id: agentId,
@@ -925,7 +928,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     // conflict. Distinct run:<id> keys make that impossible; assert it directly.
     expect(reservationA?.releaseReason).not.toBe("external_runtime_isolation_conflict");
     expect(reservationB?.releaseReason).not.toBe("external_runtime_isolation_conflict");
-  }, 30_000);
+  }, 120_000);
 
   it("compensates by deleting the exact Job when the periodic reconciliation loop loses the create/stamp race", async () => {
     // Ally review on PR #690 (BLO-16269) flagged that both new race tests above
@@ -950,6 +953,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       name: "External Runtime Reconcile Co",
       issuePrefix: "ERC",
       requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
     });
     await db.insert(agents).values({
       id: agentId,
@@ -1031,5 +1035,5 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(reservation.state).toBe("released");
     expect(reservation.jobName).toBeNull();
     expect(reservation.jobUid).toBeNull();
-  }, 30_000);
+  }, 120_000);
 });

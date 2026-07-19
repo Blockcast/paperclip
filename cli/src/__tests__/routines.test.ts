@@ -98,7 +98,7 @@ describeEmbeddedPostgres("disableAllRoutinesInConfig", () => {
     tempRoot = mkdtempSync(path.join(os.tmpdir(), "paperclip-routines-cli-config-"));
     configPath = path.join(tempRoot, "config.json");
     writeTestConfig(configPath, tempRoot, tempDb.connectionString);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(routines);
@@ -112,7 +112,7 @@ describeEmbeddedPostgres("disableAllRoutinesInConfig", () => {
     if (tempRoot) {
       rmSync(tempRoot, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
 
   it("pauses only non-archived routines for the selected company", async () => {
     const companyId = randomUUID();

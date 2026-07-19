@@ -9,6 +9,65 @@ import {
 import { PLUGIN_RPC_ERROR_CODES } from "../src/protocol.js";
 
 describe("createHostClientHandlers invocation company scope", () => {
+  it("rejects worker-selected config and secret company ids without a host invocation scope", async () => {
+    const configGet = vi.fn(async () => ({ apiKeyRef: "unreachable" }));
+    const secretsResolve = vi.fn(async () => "unreachable");
+    const services = {
+      config: { get: configGet },
+      secrets: { resolve: secretsResolve },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    await expect(
+      handlers["config.get"]({ companyId: "company-a" }),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    await expect(
+      handlers["secrets.resolve"]({
+        companyId: "company-a",
+        secretRef: { type: "secret_ref", secretId: "secret-a" },
+      }),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(configGet).not.toHaveBeenCalled();
+    expect(secretsResolve).not.toHaveBeenCalled();
+  });
+
+  it("allows explicit config and secret company ids only when they match the host invocation scope", async () => {
+    const configGet = vi.fn(async () => ({ apiKeyRef: "ref" }));
+    const secretsResolve = vi.fn(async () => "resolved");
+    const services = {
+      config: { get: configGet },
+      secrets: { resolve: secretsResolve },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      handlers["config.get"]({ companyId: "company-a" }, context),
+    ).resolves.toEqual({ apiKeyRef: "ref" });
+    await expect(
+      handlers["secrets.resolve"]({
+        companyId: "company-a",
+        secretRef: { type: "secret_ref", secretId: "secret-a" },
+      }, context),
+    ).resolves.toBe("resolved");
+
+    expect(configGet).toHaveBeenCalledWith({ companyId: "company-a" }, context);
+    expect(secretsResolve).toHaveBeenCalledWith({
+      companyId: "company-a",
+      secretRef: { type: "secret_ref", secretId: "secret-a" },
+    }, context);
+  });
+
   it("rejects company-scoped host calls outside the current invocation company", async () => {
     const projectsList = vi.fn(async () => []);
     const services = {
@@ -269,6 +328,7 @@ describe("createHostClientHandlers invocation company scope", () => {
 });
 
 describe("agents.updateAdapterOverrides (optional, capability-gated host method)", () => {
+  const CONTEXT = { invocationScope: { companyId: "company-a" } };
   const PARAMS = {
     agentId: "agent-1",
     companyId: "company-a",
@@ -306,7 +366,7 @@ describe("agents.updateAdapterOverrides (optional, capability-gated host method)
       services,
     });
 
-    await expect(handlers["agents.updateAdapterOverrides"](PARAMS)).resolves.toBe(updated);
+    await expect(handlers["agents.updateAdapterOverrides"](PARAMS, CONTEXT)).resolves.toBe(updated);
     expect(updateAdapterOverrides).toHaveBeenCalledWith(PARAMS);
   });
 
@@ -323,7 +383,7 @@ describe("agents.updateAdapterOverrides (optional, capability-gated host method)
     });
 
     const clearParams = { agentId: "agent-1", companyId: "company-a", overrides: null };
-    await handlers["agents.updateAdapterOverrides"](clearParams);
+    await handlers["agents.updateAdapterOverrides"](clearParams, CONTEXT);
     expect(updateAdapterOverrides).toHaveBeenCalledWith(clearParams);
   });
 
@@ -336,7 +396,7 @@ describe("agents.updateAdapterOverrides (optional, capability-gated host method)
       services,
     });
 
-    await expect(handlers["agents.updateAdapterOverrides"](PARAMS)).rejects.toThrow(
+    await expect(handlers["agents.updateAdapterOverrides"](PARAMS, CONTEXT)).rejects.toThrow(
       /does not implement agents\.updateAdapterOverrides/,
     );
   });

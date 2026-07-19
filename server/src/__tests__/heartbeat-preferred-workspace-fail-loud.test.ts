@@ -11,7 +11,6 @@ import {
   companies,
   createDb,
   executionWorkspaces,
-  heartbeatRuns,
   issues,
   projects,
   projectWorkspaces,
@@ -20,6 +19,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { heartbeatService } from "../services/heartbeat.js";
 
 const execFileAsync = promisify(execFile);
@@ -39,6 +39,11 @@ const allowPenstockGate = {
 
 vi.mock("../adapters/index.js", () => ({
   getServerAdapter: () => ({
+    type: "codex_local",
+    execute: adapterExecute,
+    supportsLocalAgentJwt: false,
+  }),
+  findActiveServerAdapter: () => ({
     type: "codex_local",
     execute: adapterExecute,
     supportsLocalAgentJwt: false,
@@ -69,30 +74,21 @@ async function createGitRepo() {
 
 describeEmbeddedPostgres("preferred non-primary workspace fail-loud", () => {
   let db!: ReturnType<typeof createDb>;
+  let heartbeat!: ReturnType<typeof heartbeatService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const tempRoots: string[] = [];
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-fail-loud-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+    heartbeat = heartbeatService(db, { penstockAvailabilityGate: allowPenstockGate });
+  }, 120_000);
 
   afterEach(async () => {
     adapterExecute.mockClear();
-    // Drain any in-flight run lifecycle work before teardown so the heartbeat's
-    // async finalizers don't touch the DB after it closes.
-    let idlePolls = 0;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
-      const hasActiveRun = runs.some((run) => run.status === "queued" || run.status === "running");
-      if (!hasActiveRun) {
-        idlePolls += 1;
-        if (idlePolls >= 5) break;
-      } else {
-        idlePolls = 0;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
+    await cleanupHeartbeatTestState(db, heartbeat, {
+      extraTruncateTables: ["environments", "instance_settings"],
+    });
     while (tempRoots.length > 0) {
       const root = tempRoots.pop();
       if (root) await rm(root, { recursive: true, force: true }).catch(() => undefined);
@@ -122,6 +118,7 @@ describeEmbeddedPostgres("preferred non-primary workspace fail-loud", () => {
       name: "Acme",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       status: "active",
+      defaultResponsibleUserId: "responsible-user",
       createdAt: new Date(),
       updatedAt: new Date(),
     });
@@ -184,7 +181,6 @@ describeEmbeddedPostgres("preferred non-primary workspace fail-loud", () => {
       updatedAt: new Date(),
     });
 
-    const heartbeat = heartbeatService(db, { penstockAvailabilityGate: allowPenstockGate });
     const run = await heartbeat.wakeup(agentId, {
       source: "automation",
       triggerDetail: "system",
@@ -222,5 +218,5 @@ describeEmbeddedPostgres("preferred non-primary workspace fail-loud", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(refreshedIssue?.executionWorkspaceId ?? null).toBeNull();
-  }, 20_000);
+  }, 120_000);
 });

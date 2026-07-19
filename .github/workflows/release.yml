@@ -25,240 +25,23 @@ concurrency:
   group: release-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+  CC: "sccache gcc"
+  CXX: "sccache g++"
+
 jobs:
-  verify_canary_typecheck:
-    name: Canary typecheck
-    if: github.event_name == 'push'
-    runs-on: default
-    timeout-minutes: 25
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          cache: pnpm
-
-      - name: Validate release package manifest
-        run: node ./scripts/release-package-map.mjs check
-
-      - name: Install dependencies
-        # On master a dependency PR merges with a stale lockfile: the
-        # no-lockfile-commit policy defers the refresh to chore/refresh-lockfile,
-        # so plain --frozen-lockfile fails on the manifest/lockfile drift until
-        # that refresh lands (which made #404's canary flap red). Try frozen for
-        # reproducibility; fall back to a manifest-driven resolve during the drift
-        # window so the canary validates the about-to-land state, not a stale one.
-        run: pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile
-
-      - name: Typecheck
-        run: pnpm -r typecheck
-
-  verify_canary_general_tests:
-    name: Canary general tests (${{ matrix.group_label }})
-    if: github.event_name == 'push'
-    runs-on: default
-    timeout-minutes: 25
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - group: general-server
-            group_label: server 1/4
-            shard_index: 0
-            shard_count: 4
-          - group: general-server
-            group_label: server 2/4
-            shard_index: 1
-            shard_count: 4
-          - group: general-server
-            group_label: server 3/4
-            shard_index: 2
-            shard_count: 4
-          - group: general-server
-            group_label: server 4/4
-            shard_index: 3
-            shard_count: 4
-          - group: general-workspaces-a
-            group_label: workspaces-a
-            shard_index: ''
-            shard_count: ''
-          - group: general-workspaces-b
-            group_label: workspaces-b
-            shard_index: ''
-            shard_count: ''
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9.15.4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: pnpm
-
-      - name: Install dependencies
-        # On master a dependency PR merges with a stale lockfile: the
-        # no-lockfile-commit policy defers the refresh to chore/refresh-lockfile,
-        # so plain --frozen-lockfile fails on the manifest/lockfile drift until
-        # that refresh lands (which made #404's canary flap red). Try frozen for
-        # reproducibility; fall back to a manifest-driven resolve during the drift
-        # window so the canary validates the about-to-land state, not a stale one.
-        run: pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile
-
-      - name: Run grouped general test suites
-        run: |
-          args=(--group '${{ matrix.group }}')
-          if [ -n '${{ matrix.shard_count }}' ]; then
-            args+=(--shard-index '${{ matrix.shard_index }}' --shard-count '${{ matrix.shard_count }}')
-          fi
-          pnpm test:run:general -- "${args[@]}"
-
-  verify_canary_serialized_server:
-    name: Canary serialized server suites (${{ matrix.shard_label }})
-    if: github.event_name == 'push'
-    runs-on: default
-    timeout-minutes: 25
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - shard_index: 0
-            shard_count: 4
-            shard_label: 1/4
-          - shard_index: 1
-            shard_count: 4
-            shard_label: 2/4
-          - shard_index: 2
-            shard_count: 4
-            shard_label: 3/4
-          - shard_index: 3
-            shard_count: 4
-            shard_label: 4/4
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9.15.4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: pnpm
-
-      - name: Install dependencies
-        # On master a dependency PR merges with a stale lockfile: the
-        # no-lockfile-commit policy defers the refresh to chore/refresh-lockfile,
-        # so plain --frozen-lockfile fails on the manifest/lockfile drift until
-        # that refresh lands (which made #404's canary flap red). Try frozen for
-        # reproducibility; fall back to a manifest-driven resolve during the drift
-        # window so the canary validates the about-to-land state, not a stale one.
-        run: pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile
-
-      - name: Run serialized server test shard
-        run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
-
-  verify_canary_build:
-    name: Canary build
-    if: github.event_name == 'push'
-    runs-on: default
-    timeout-minutes: 25
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9.15.4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: pnpm
-
-      - name: Install dependencies
-        # On master a dependency PR merges with a stale lockfile: the
-        # no-lockfile-commit policy defers the refresh to chore/refresh-lockfile,
-        # so plain --frozen-lockfile fails on the manifest/lockfile drift until
-        # that refresh lands (which made #404's canary flap red). Try frozen for
-        # reproducibility; fall back to a manifest-driven resolve during the drift
-        # window so the canary validates the about-to-land state, not a stale one.
-        run: pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile
-
-      - name: Build
-        run: pnpm build
-
   verify_canary:
-    # Preserve the canary gate that publish_canary depends on, while the
-    # underlying verification runs in parallel. The old single self-hosted
-    # lane frequently hit its 45m timeout before the serialized route suites
-    # completed.
-    name: verify_canary
-    if: ${{ github.event_name == 'push' && always() }}
-    needs:
-      - verify_canary_typecheck
-      - verify_canary_general_tests
-      - verify_canary_serialized_server
-      - verify_canary_build
-    runs-on: default
-    timeout-minutes: 5
-    permissions:
-      contents: read
-
-    steps:
-      - name: Fail if any canary verification lane failed
-        env:
-          TYPECHECK_RESULT: ${{ needs.verify_canary_typecheck.result }}
-          GENERAL_TESTS_RESULT: ${{ needs.verify_canary_general_tests.result }}
-          SERIALIZED_SERVER_RESULT: ${{ needs.verify_canary_serialized_server.result }}
-          BUILD_RESULT: ${{ needs.verify_canary_build.result }}
-        run: |
-          test "$TYPECHECK_RESULT" = "success"
-          test "$GENERAL_TESTS_RESULT" = "success"
-          test "$SERIALIZED_SERVER_RESULT" = "success"
-          test "$BUILD_RESULT" = "success"
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/release-verify.yml
+    with:
+      ref: ${{ github.sha }}
 
   publish_canary:
-    # npm trusted-publisher config (per package settings on npmjs.org) binds
-    # to paperclipai/paperclip's OIDC identity. Forks like Blockcast/paperclip
-    # don't own the @paperclipai/* / paperclipai npm namespaces and don't have
-    # a matching trusted-publisher entry, so publishes from a fork hit
-    # ENEEDAUTH on every master push and red-light the whole Release workflow
-    # for no real reason (Docker workflow handles deploys separately and is
-    # not gated on this). Gate on the upstream repo so forks still run
-    # verify_canary but skip publish cleanly.
+    # Only upstream owns the @paperclipai npm trusted-publisher identity.
+    # Blockcast still runs verify_canary, while Docker workflows publish the
+    # fork's deployable artifacts to Harbor.
     if: github.event_name == 'push' && github.repository == 'paperclipai/paperclip'
     needs: verify_canary
     runs-on: arc-deploy
@@ -284,6 +67,9 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
@@ -315,43 +101,9 @@ jobs:
 
   verify_stable:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: default
-    timeout-minutes: 30
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          ref: ${{ inputs.source_ref }}
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          cache: pnpm
-
-      - name: Validate release package manifest
-        run: node ./scripts/release-package-map.mjs check
-
-      - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
-
-      - name: Typecheck
-        run: pnpm -r typecheck
-
-      - name: Run tests
-        run: pnpm test:run
-
-      - name: Build
-        run: pnpm build
+    uses: ./.github/workflows/release-verify.yml
+    with:
+      ref: ${{ inputs.source_ref }}
 
   preview_stable:
     if: github.event_name == 'workflow_dispatch' && inputs.dry_run
@@ -379,6 +131,9 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 
@@ -397,9 +152,6 @@ jobs:
           ./scripts/release.sh "${args[@]}"
 
   publish_stable:
-    # Same fork-gating as publish_canary (see comment above) — only the
-    # upstream repo has the matching npm trusted-publisher entry, so forks
-    # would hit ENEEDAUTH if they ever trigger this job manually.
     if: github.event_name == 'workflow_dispatch' && !inputs.dry_run && github.repository == 'paperclipai/paperclip'
     needs: verify_stable
     runs-on: arc-deploy
@@ -426,6 +178,9 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile

@@ -44,6 +44,23 @@ async function listInstalledPlugins(ctx: BootstrapContext): Promise<PluginListEn
   return (await res.json()) as PluginListEntry[];
 }
 
+async function resolveSoleBootstrapCompanyId(ctx: BootstrapContext): Promise<string | null> {
+  const res = await ctx.fetchInternal(`${ctx.baseUrl}/api/companies`).catch(() => null);
+  if (!res?.ok) return null;
+  const companies = (await res.json()) as Array<{ id?: unknown }>;
+  const companyIds = companies
+    .map((company) => company.id)
+    .filter((id): id is string => typeof id === "string" && id.length > 0);
+  if (companyIds.length !== 1) {
+    logger.warn(
+      { companyCount: companyIds.length },
+      "skipping plugin env auto-config because a sole company could not be selected",
+    );
+    return null;
+  }
+  return companyIds[0]!;
+}
+
 async function readBundlePackageJson(
   absPath: string,
 ): Promise<{ name: string | null; version: string | null }> {
@@ -378,27 +395,39 @@ export async function autoConfigureAlertmanagerFromEnv(ctx: BootstrapContext): P
       (p) => p.pluginKey === "paperclip-plugin-alertmanager" && p.status === "ready",
     );
     if (!amPlugin) return;
+    const companyId = await resolveSoleBootstrapCompanyId(ctx);
+    if (!companyId) return;
 
-    const configRes = await ctx.fetchInternal(`${ctx.baseUrl}/api/plugins/${amPlugin.id}/config`);
+    const configRes = await ctx.fetchInternal(
+      `${ctx.baseUrl}/api/plugins/${amPlugin.id}/config?companyId=${encodeURIComponent(companyId)}`,
+    );
     if (!configRes.ok) return;
 
     const config = (await configRes.json()) as { configJson?: Record<string, unknown> | null };
     const existing = config?.configJson ?? {};
-    if (existing.webhookToken === webhookToken) return;
     // Operator already wired the production secret-ref path; respect it instead
     // of stamping the inline env value back on top every restart.
-    if (typeof existing.webhookTokenRef === "string" && existing.webhookTokenRef.length > 0) {
-      return;
-    }
+    const usesSecretRef =
+      typeof existing.webhookTokenRef === "string" && existing.webhookTokenRef.length > 0;
+    const nextConfig = {
+      ...existing,
+      defaultCompanyId:
+        typeof existing.defaultCompanyId === "string" && existing.defaultCompanyId.length > 0
+          ? existing.defaultCompanyId
+          : companyId,
+      ...(usesSecretRef ? {} : { webhookToken }),
+    };
+    if (
+      nextConfig.defaultCompanyId === existing.defaultCompanyId &&
+      (usesSecretRef || existing.webhookToken === webhookToken)
+    ) return;
 
     await ctx.fetchInternal(`${ctx.baseUrl}/api/plugins/${amPlugin.id}/config`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        configJson: {
-          ...existing,
-          webhookToken,
-        },
+        companyId,
+        configJson: nextConfig,
       }),
     });
     logger.info("Auto-configured Alertmanager plugin webhookToken from env");
@@ -424,8 +453,12 @@ export async function autoConfigureLinearFromEnv(ctx: BootstrapContext): Promise
       (p) => p.pluginKey === "paperclip-plugin-linear" && p.status === "ready",
     );
     if (!linearPlugin) return;
+    const companyId = await resolveSoleBootstrapCompanyId(ctx);
+    if (!companyId) return;
 
-    const configRes = await ctx.fetchInternal(`${ctx.baseUrl}/api/plugins/${linearPlugin.id}/config`);
+    const configRes = await ctx.fetchInternal(
+      `${ctx.baseUrl}/api/plugins/${linearPlugin.id}/config?companyId=${encodeURIComponent(companyId)}`,
+    );
     if (!configRes.ok) return;
 
     const config = (await configRes.json()) as { configJson?: Record<string, unknown> | null };
@@ -436,6 +469,7 @@ export async function autoConfigureLinearFromEnv(ctx: BootstrapContext): Promise
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        companyId,
         configJson: {
           ...existing,
           linearClientId,

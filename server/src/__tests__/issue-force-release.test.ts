@@ -17,6 +17,7 @@ vi.mock("../services/index.js", () => ({
   accessService: () => ({ canUser: vi.fn(), hasPermission: vi.fn() }),
   agentService: () => ({}),
   companyService: () => ({}),
+  companySkillService: () => ({}),
   documentService: () => ({}),
   documentAnnotationService: () => ({}),
   executionWorkspaceService: () => ({}),

@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
@@ -17,6 +17,7 @@ import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { budgetService } from "./budgets.js";
 import { issueService } from "./issues.js";
+import { visibleIssueCondition } from "./issue-visibility.js";
 import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
@@ -32,8 +33,13 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS = 6 * 60 * 60 * 1000
 export const PRODUCTIVITY_REVIEW_REPEAT_BACKOFF_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_ESCALATION_THRESHOLD = 3;
 export const DEFAULT_PRODUCTIVITY_REVIEW_ESCALATION_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
+export const DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
+export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS = 3;
+export const DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS = 24 * 60 * 60 * 1000;
+export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 1;
+export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS = 3;
 
-const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
+const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
@@ -61,6 +67,11 @@ type ProductivityReviewThresholds = {
   resolvedSnoozeMs: number;
   escalationThreshold: number;
   escalationLookbackMs: number;
+  refreshIntervalMs: number;
+  maxRefreshComments: number;
+  creationWindowMs: number;
+  maxCreationsPerWindow: number;
+  maxConsecutiveNoActionReviews: number;
 };
 
 type ProductivityReviewEvidence = {
@@ -237,6 +248,26 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
       overrides?.escalationLookbackMs ?? DEFAULT_PRODUCTIVITY_REVIEW_ESCALATION_LOOKBACK_MS,
       DEFAULT_PRODUCTIVITY_REVIEW_ESCALATION_LOOKBACK_MS,
     ),
+    refreshIntervalMs: readPositiveInteger(
+      overrides?.refreshIntervalMs ?? DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
+      DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
+    ),
+    maxRefreshComments: readPositiveInteger(
+      overrides?.maxRefreshComments ?? DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
+      DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
+    ),
+    creationWindowMs: readPositiveInteger(
+      overrides?.creationWindowMs ?? DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS,
+      DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS,
+    ),
+    maxCreationsPerWindow: readPositiveInteger(
+      overrides?.maxCreationsPerWindow ?? DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW,
+      DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW,
+    ),
+    maxConsecutiveNoActionReviews: readPositiveInteger(
+      overrides?.maxConsecutiveNoActionReviews ?? DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS,
+      DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS,
+    ),
   };
 }
 
@@ -339,7 +370,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           eq(issues.companyId, companyId),
           eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
           eq(issues.originId, sourceIssueId),
-          isNull(issues.hiddenAt),
+          visibleIssueCondition(),
           notInArray(issues.status, ["done", "cancelled"]),
         ),
       )
@@ -398,7 +429,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           eq(issues.companyId, companyId),
           eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
           eq(issues.originId, sourceIssueId),
-          inArray(issues.status, ["done", "cancelled"]),
+          eq(issues.status, "done"),
           gt(issues.updatedAt, cutoff),
         ),
       )
@@ -427,6 +458,114 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         ),
       )
       .then((rows) => Number(rows[0]?.count ?? 0));
+  }
+
+  async function countRecentProductivityReviews(
+    companyId: string,
+    sourceIssueId: string,
+    thresholds: ProductivityReviewThresholds,
+    now: Date,
+  ) {
+    const cutoff = new Date(now.getTime() - thresholds.creationWindowMs);
+    return db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+          eq(issues.originId, sourceIssueId),
+          visibleIssueCondition(),
+          sql`${issues.status} <> 'cancelled'`,
+          sql`${issues.createdAt} >= ${cutoff.toISOString()}::timestamptz`,
+        ),
+      )
+      .then((rows) => Number(rows[0]?.count ?? 0));
+  }
+
+  async function countConsecutiveNoActionProductivityReviews(
+    companyId: string,
+    sourceIssueId: string,
+    thresholds: ProductivityReviewThresholds,
+  ) {
+    const completedReviews = await db
+      .select({
+        createdAt: issues.createdAt,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+          eq(issues.originId, sourceIssueId),
+          eq(issues.status, "done"),
+          visibleIssueCondition(),
+        ),
+      )
+      .orderBy(desc(issues.createdAt), desc(issues.id))
+      .limit(thresholds.maxConsecutiveNoActionReviews);
+
+    const earliestReviewCreatedAt = completedReviews.at(-1)?.createdAt;
+    if (!earliestReviewCreatedAt) return 0;
+    const sourceActions = await db
+      .select({ createdAt: activityLog.createdAt })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, sourceIssueId),
+          gte(activityLog.createdAt, earliestReviewCreatedAt),
+        ),
+      );
+
+    let streak = 0;
+    for (const [index, review] of completedReviews.entries()) {
+      const nextNewerReviewCreatedAt = completedReviews[index - 1]?.createdAt ?? null;
+      const sourceAction = sourceActions.some((activity) => {
+        if (activity.createdAt < review.createdAt) return false;
+        return !nextNewerReviewCreatedAt || activity.createdAt < nextNewerReviewCreatedAt;
+      });
+      if (sourceAction) break;
+      streak += 1;
+    }
+    return streak;
+  }
+
+  async function getRefreshCommentState(companyId: string, reviewIssueId: string) {
+    return db
+      .select({
+        count: sql<number>`count(*)::int`,
+        latestCreatedAt: sql<Date | null>`max(${issueComments.createdAt})`,
+      })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, companyId),
+          eq(issueComments.issueId, reviewIssueId),
+          sql`${issueComments.body} like ${`${PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX}%`}`,
+        ),
+      )
+      .then((rows) => {
+        const row = rows[0];
+        return {
+          count: Number(row?.count ?? 0),
+          latestCreatedAt: coerceDate(row?.latestCreatedAt),
+        };
+      });
+  }
+
+  async function addRefreshComment(reviewIssueId: string, body: string, generatedAt: Date) {
+    const comment = await issuesSvc.addComment(reviewIssueId, body, {});
+    await db
+      .update(issueComments)
+      .set({ createdAt: generatedAt, updatedAt: generatedAt })
+      .where(eq(issueComments.id, comment.id));
+    await db
+      .update(issues)
+      .set({ updatedAt: generatedAt })
+      .where(eq(issues.id, reviewIssueId));
+    return comment;
   }
 
   async function findOpenProductivityReviewEscalation(companyId: string, sourceIssueId: string) {
@@ -915,7 +1054,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
 
   async function createOrUpdateReview(
     evidence: ProductivityReviewEvidence,
-    opts: { prefix: string },
+    opts: { prefix: string; thresholds: ProductivityReviewThresholds },
   ) {
     if (evidence.routineOnlySamplingWindow) {
       logger.info(
@@ -937,26 +1076,28 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // skip the addComment so the review thread doesn't accumulate
       // ~identical "evidence refreshed" comments. The previous run
       // is reused as the {kind:"existing"} outcome.
-      const lastRefreshAt = await findLatestRefreshCommentAt(
-        evidence.sourceIssue.companyId,
-        existing.id,
+      const refreshState = await getRefreshCommentState(evidence.sourceIssue.companyId, existing.id);
+      const lastRefreshAt = refreshState.latestCreatedAt ?? existing.createdAt;
+      const effectiveRefreshIntervalMs = Math.max(
+        PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS,
+        opts.thresholds.refreshIntervalMs,
       );
       if (
-        lastRefreshAt &&
-        evidence.generatedAt.getTime() - lastRefreshAt.getTime() < PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS
+        refreshState.count >= opts.thresholds.maxRefreshComments ||
+        evidence.generatedAt.getTime() - lastRefreshAt.getTime() < effectiveRefreshIntervalMs
       ) {
         logger.debug(
           {
             reviewIssueId: existing.id,
             sourceIssueId: evidence.sourceIssue.id,
             lastRefreshAt: lastRefreshAt.toISOString(),
-            minIntervalMs: PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS,
+            minIntervalMs: effectiveRefreshIntervalMs,
           },
           "productivity review refresh throttled: previous refresh within hard-floor window",
         );
         return { kind: "existing" as const, reviewIssueId: existing.id };
       }
-      await issuesSvc.addComment(existing.id, buildRefreshComment(evidence, opts.prefix), {});
+      await addRefreshComment(existing.id, buildRefreshComment(evidence, opts.prefix), evidence.generatedAt);
       await logActivity(db, {
         companyId: evidence.sourceIssue.companyId,
         actorType: "system",
@@ -975,6 +1116,25 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         },
       });
       return { kind: "updated" as const, reviewIssueId: existing.id };
+    }
+
+    const recentCreationCount = await countRecentProductivityReviews(
+      evidence.sourceIssue.companyId,
+      evidence.sourceIssue.id,
+      opts.thresholds,
+      evidence.generatedAt,
+    );
+    if (recentCreationCount >= opts.thresholds.maxCreationsPerWindow) {
+      return { kind: "creation_capped" as const, reviewIssueId: null };
+    }
+
+    const consecutiveNoActionReviews = await countConsecutiveNoActionProductivityReviews(
+      evidence.sourceIssue.companyId,
+      evidence.sourceIssue.id,
+      opts.thresholds,
+    );
+    if (consecutiveNoActionReviews >= opts.thresholds.maxConsecutiveNoActionReviews) {
+      return { kind: "no_action_suppressed" as const, reviewIssueId: null };
     }
 
     const ownerAgentId = await resolveReviewOwnerAgentId(evidence.sourceIssue, evidence.sourceAgent);
@@ -1002,6 +1162,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       if (!raced) throw error;
       return { kind: "existing" as const, reviewIssueId: raced.id };
     }
+    await db
+      .update(issues)
+      .set({ createdAt: evidence.generatedAt, updatedAt: evidence.generatedAt })
+      .where(eq(issues.id, review.id));
 
     await logActivity(db, {
       companyId: evidence.sourceIssue.companyId,
@@ -1164,6 +1328,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     now?: Date;
     companyId?: string;
     thresholds?: Partial<ProductivityReviewThresholds>;
+    issueCreatedAtGte?: Date | null;
   }) {
     const now = opts?.now ?? new Date();
     const thresholds = buildThresholds(opts?.thresholds);
@@ -1173,11 +1338,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .where(
         and(
           opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
-          isNull(issues.hiddenAt),
+          visibleIssueCondition(),
           isNull(issues.assigneeUserId),
           inArray(issues.status, ["todo", "in_progress"]),
           sql`${issues.assigneeAgentId} is not null`,
           sql`${issues.originKind} <> ${PRODUCTIVITY_REVIEW_ORIGIN_KIND}`,
+          opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
         ),
       )
       .orderBy(asc(issues.updatedAt), asc(issues.id))
@@ -1193,6 +1359,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       optedOut: 0,
       monitorScheduledSuppressed: 0,
       closedSuppressedMonitorReviews: 0,
+      creationCapped: 0,
+      noActionSuppressed: 0,
       skipped: 0,
       suppressedTerminalSource: 0,
       failed: 0,
@@ -1235,24 +1403,6 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         result.snoozed += 1;
         continue;
       }
-      const priorReviewCount = await countResolvedProductivityReviews(
-        candidate.companyId,
-        candidate.id,
-        thresholds.escalationLookbackMs,
-        now,
-      );
-      if (priorReviewCount >= thresholds.escalationThreshold) {
-        const outcome = await createProductivityReviewEscalation({
-          sourceIssue: candidate,
-          priorReviewCount,
-          thresholds,
-          now,
-        });
-        if (outcome.kind === "existing") result.existing += 1;
-        else result.escalated += 1;
-        result.reviewIssueIds.push(outcome.escalationIssueId);
-        continue;
-      }
       if (await hasRepeatedTerminalReviewsInBackoff(candidate.companyId, candidate.id, now)) {
         result.snoozed += 1;
         continue;
@@ -1274,10 +1424,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           }
           continue;
         }
-        const outcome = await createOrUpdateReview(evidence, { prefix });
+        const outcome = await createOrUpdateReview(evidence, { prefix, thresholds });
         if (outcome.kind === "created") result.created += 1;
         else if (outcome.kind === "updated") result.updated += 1;
         else if (outcome.kind === "skipped") result.skipped += 1;
+        else if (outcome.kind === "creation_capped") result.creationCapped += 1;
+        else if (outcome.kind === "no_action_suppressed") result.noActionSuppressed += 1;
         else result.existing += 1;
         if (outcome.reviewIssueId) result.reviewIssueIds.push(outcome.reviewIssueId);
       } catch (err) {

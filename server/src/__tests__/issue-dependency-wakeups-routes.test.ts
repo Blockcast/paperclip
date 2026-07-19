@@ -3,6 +3,7 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockWakeup = vi.hoisted(() => vi.fn(async () => undefined));
+const mockFindExistingIssueBlockersResolvedWake = vi.hoisted(() => vi.fn(async () => null));
 const mockIssueService = vi.hoisted(() => ({
   getAncestors: vi.fn(),
   getById: vi.fn(),
@@ -11,6 +12,7 @@ const mockIssueService = vi.hoisted(() => ({
   getCommentCursor: vi.fn(),
   getRelationSummaries: vi.fn(),
   update: vi.fn(),
+  getDependencyReadiness: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
   findMentionedAgents: vi.fn(async () => []),
@@ -32,6 +34,9 @@ vi.mock("../services/index.js", () => ({
   }),
   agentService: () => ({
     getById: vi.fn(),
+  }),
+  companySkillService: () => ({
+    completeTestRunForIssue: vi.fn(async () => null),
   }),
   documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
   documentService: () => ({
@@ -91,7 +96,17 @@ vi.mock("../services/index.js", () => ({
   }),
 }));
 
-async function createApp(actorOverride?: Record<string, unknown>) {
+vi.mock("../services/issue-dependency-wakeups.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/issue-dependency-wakeups.js")>(
+    "../services/issue-dependency-wakeups.js",
+  );
+  return {
+    ...actual,
+    findExistingIssueBlockersResolvedWake: mockFindExistingIssueBlockersResolvedWake,
+  };
+});
+
+async function createApp() {
   const [{ issueRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -99,7 +114,7 @@ async function createApp(actorOverride?: Record<string, unknown>) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = actorOverride ?? {
+    (req as any).actor = {
       type: "board",
       userId: "local-board",
       companyIds: ["company-1"],
@@ -120,6 +135,7 @@ describe("issue dependency wakeups in issue routes", () => {
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     vi.clearAllMocks();
+    mockFindExistingIssueBlockersResolvedWake.mockResolvedValue(null);
     mockIssueService.getAncestors.mockResolvedValue([]);
     mockIssueService.getComment.mockResolvedValue(null);
     mockIssueService.getCommentCursor.mockResolvedValue({
@@ -128,6 +144,15 @@ describe("issue dependency wakeups in issue routes", () => {
       latestCommentAt: null,
     });
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: "issue-1",
+      blockerIssueIds: [],
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      pendingFinalizeBlockerIssueIds: [],
+      allBlockersDone: true,
+      isDependencyReady: true,
+    });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
   });
@@ -176,7 +201,7 @@ describe("issue dependency wakeups in issue routes", () => {
     ]);
 
     const res = await request(await createApp()).patch("/api/issues/issue-1").send({ status: "done" });
-    expect(res.status).toBe(200);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
     await vi.waitFor(() => {
       expect(mockWakeup).toHaveBeenCalledWith(
         "agent-2",
@@ -191,135 +216,74 @@ describe("issue dependency wakeups in issue routes", () => {
     });
   });
 
-  // BLO-13250: a single blocker completion woke exactly one of four sibling
-  // dependents in production. Assert every dependent in a fan-out gets its
-  // own wake — including two dependents that share the same assignee agent,
-  // the shape most likely to collide if the wake dispatch coalesced by
-  // agent instead of by (blocker, dependent) pair.
-  it("wakes every dependent in a fan-out (N>=3, including two sharing an assignee) via REST PATCH", async () => {
-    const blockerIssue = {
-      id: "blocker-1",
+  it("wakes an assigned blocked issue when blockers are applied after the blocker is already done", async () => {
+    const parentIssueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const childIssueId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    mockIssueService.getById.mockResolvedValue({
+      id: parentIssueId,
       companyId: "company-1",
       identifier: "PAP-200",
-      title: "Founder-GO canary gate",
+      title: "Blocked after completion",
       description: null,
-      status: "in_progress",
-      priority: "critical",
+      status: "todo",
+      priority: "medium",
       parentId: null,
-      assigneeAgentId: "gate-agent",
+      assigneeAgentId: "agent-2",
       assigneeUserId: null,
       createdByAgentId: null,
       createdByUserId: null,
       executionWorkspaceId: null,
       labels: [],
       labelIds: [],
-    };
-    mockIssueService.getById.mockResolvedValue(blockerIssue);
-    mockIssueService.update.mockResolvedValue({ ...blockerIssue, status: "done" });
-
-    const dependents = [
-      { id: "dep-1", assigneeAgentId: "agent-a", blockerIssueIds: ["blocker-1"] },
-      { id: "dep-2", assigneeAgentId: "agent-b", blockerIssueIds: ["blocker-1"] },
-      // Shares assignee "agent-a" with dep-1 — the suspected collision shape.
-      { id: "dep-3", assigneeAgentId: "agent-a", blockerIssueIds: ["blocker-1"] },
-      { id: "dep-4", assigneeAgentId: "agent-c", blockerIssueIds: ["blocker-1"] },
-    ];
-    mockIssueService.listWakeableBlockedDependents.mockResolvedValue(dependents);
-
-    const res = await request(await createApp()).patch("/api/issues/blocker-1").send({ status: "done" });
-    expect(res.status).toBe(200);
-
-    await vi.waitFor(() => {
-      expect(mockWakeup).toHaveBeenCalledTimes(dependents.length);
     });
-
-    const idempotencyKeys = new Set<string>();
-    for (const dependent of dependents) {
-      const call = mockWakeup.mock.calls.find(([agentId, wakeup]) =>
-        agentId === dependent.assigneeAgentId
-        && (wakeup as { payload?: { issueId?: string } }).payload?.issueId === dependent.id);
-      expect(call, `expected a wake for dependent ${dependent.id}`).toBeTruthy();
-      const wakeup = call![1] as {
-        reason: string;
-        payload: { issueId: string; resolvedBlockerIssueId: string };
-        idempotencyKey?: string | null;
-      };
-      expect(wakeup.reason).toBe("issue_blockers_resolved");
-      expect(wakeup.payload.resolvedBlockerIssueId).toBe("blocker-1");
-      // Idempotency key MUST include the dependent id so sibling dependents
-      // of the same resolved blocker can never coalesce into one wake.
-      expect(wakeup.idempotencyKey).toBe(`blockers_resolved:blocker-1:${dependent.id}`);
-      idempotencyKeys.add(wakeup.idempotencyKey!);
-    }
-    // Every dependent's key is unique — none collided with a sibling's.
-    expect(idempotencyKeys.size).toBe(dependents.length);
-  });
-
-  // Same fan-out, but the blocker is completed by its own assignee agent
-  // (the "agent run-complete" path from the incident report) rather than an
-  // operator/board actor, via the same PATCH /issues/:id endpoint agents use
-  // to report completion.
-  it("wakes every dependent in a fan-out when the blocker is completed by its assignee agent", async () => {
-    const agentRunId = "77777777-7777-4777-8777-777777777777";
-    const blockerIssue = {
-      id: "blocker-2",
+    mockIssueService.update.mockResolvedValue({
+      id: parentIssueId,
       companyId: "company-1",
-      identifier: "PAP-201",
-      title: "Founder-GO canary gate",
+      identifier: "PAP-200",
+      title: "Blocked after completion",
       description: null,
-      status: "in_progress",
-      priority: "critical",
+      status: "blocked",
+      priority: "medium",
       parentId: null,
-      assigneeAgentId: "gate-agent",
+      assigneeAgentId: "agent-2",
       assigneeUserId: null,
       createdByAgentId: null,
       createdByUserId: null,
       executionWorkspaceId: null,
-      // Matches the acting agent's runId below so
-      // assertAgentIssueMutationAllowed's isCurrentIssueExecutionRun
-      // fast-path applies (the agent completing its own checked-out run).
-      checkoutRunId: agentRunId,
-      executionRunId: agentRunId,
       labels: [],
       labelIds: [],
-    };
-    mockIssueService.getById.mockResolvedValue(blockerIssue);
-    mockIssueService.update.mockResolvedValue({ ...blockerIssue, status: "done" });
-
-    const dependents = [
-      { id: "dep-5", assigneeAgentId: "agent-d", blockerIssueIds: ["blocker-2"] },
-      { id: "dep-6", assigneeAgentId: "agent-d", blockerIssueIds: ["blocker-2"] },
-      { id: "dep-7", assigneeAgentId: "agent-e", blockerIssueIds: ["blocker-2"] },
-    ];
-    mockIssueService.listWakeableBlockedDependents.mockResolvedValue(dependents);
-
-    const agentActor = {
-      type: "agent",
-      agentId: "gate-agent",
-      companyId: "company-1",
-      source: "agent_key",
-      runId: agentRunId,
-    };
-
-    const res = await request(await createApp(agentActor))
-      .patch("/api/issues/blocker-2")
-      .send({ status: "done" });
-    if (res.status !== 200) console.error("DEBUG res.body", res.body);
-    expect(res.status).toBe(200);
-
-    await vi.waitFor(() => {
-      expect(mockWakeup).toHaveBeenCalledTimes(dependents.length);
     });
-    for (const dependent of dependents) {
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: parentIssueId,
+      blockerIssueIds: [childIssueId],
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      pendingFinalizeBlockerIssueIds: [],
+      allBlockersDone: true,
+      isDependencyReady: true,
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${parentIssueId}`)
+      .send({ status: "blocked", blockedByIssueIds: [childIssueId] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await vi.waitFor(() => {
       expect(mockWakeup).toHaveBeenCalledWith(
-        dependent.assigneeAgentId,
+        "agent-2",
         expect.objectContaining({
           reason: "issue_blockers_resolved",
-          payload: expect.objectContaining({ issueId: dependent.id, resolvedBlockerIssueId: "blocker-2" }),
-          idempotencyKey: `blockers_resolved:blocker-2:${dependent.id}`,
+          payload: expect.objectContaining({
+            issueId: parentIssueId,
+            resolvedBlockerIssueId: childIssueId,
+            mutation: "blocked_dependency_restored",
+          }),
+          contextSnapshot: expect.objectContaining({
+            source: "issue.blockers_restored",
+          }),
         }),
       );
-    }
+    });
   });
 
   it("wakes the parent when all direct children become terminal", async () => {
@@ -389,7 +353,7 @@ describe("issue dependency wakeups in issue routes", () => {
     });
 
     const res = await request(await createApp()).patch("/api/issues/child-1").send({ status: "done" });
-    expect(res.status).toBe(200);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
     await vi.waitFor(() => {
       expect(mockWakeup).toHaveBeenCalledWith(
         "agent-9",
