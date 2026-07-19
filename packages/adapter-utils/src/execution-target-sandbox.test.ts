@@ -71,6 +71,37 @@ describe("sandbox adapter execution targets", () => {
     };
   }
 
+  function createStdinWriteReorderingSandboxRunner() {
+    const runner = createLocalSandboxRunner();
+    let resolveSecondFinalize!: () => void;
+    const secondFinalizeCompleted = new Promise<void>((resolve) => {
+      resolveSecondFinalize = resolve;
+    });
+
+    return {
+      execute: async (input: Parameters<typeof runner.execute>[0]) => {
+        const script = input.args?.join("\n") ?? "";
+        const isFinalize = script.includes("base64 -d <");
+        const isFirstStdinFinalize = isFinalize && script.includes("/stdin/000000000001.json");
+        const isSecondStdinFinalize = isFinalize && script.includes("/stdin/000000000002.json");
+
+        if (isFirstStdinFinalize) {
+          // If writes are launched concurrently, make the second file visible
+          // for several poll intervals before the first. A serialized writer
+          // reaches the fallback and then creates both files in order.
+          await Promise.race([
+            secondFinalizeCompleted.then(() => new Promise((resolve) => setTimeout(resolve, 150))),
+            new Promise((resolve) => setTimeout(resolve, 300)),
+          ]);
+        }
+
+        const result = await runner.execute(input);
+        if (isSecondStdinFinalize) resolveSecondFinalize();
+        return result;
+      },
+    };
+  }
+
   async function readRuntimeTextFiles(rootDir: string): Promise<string[]> {
     const entries = await readdir(rootDir, { withFileTypes: true }).catch(() => []);
     const contents: string[] = [];
@@ -105,7 +136,11 @@ describe("sandbox adapter execution targets", () => {
     throw new Error(message);
   }
 
-  async function runProxyWithInput(command: string, input: string): Promise<{ stdout: string; stderr: string; code: number | null }> {
+  async function runProxyWithInput(
+    command: string,
+    input: string,
+    timeoutMs = 5000,
+  ): Promise<{ stdout: string; stderr: string; code: number | null }> {
     const child = spawn(command, [], { stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
@@ -122,7 +157,7 @@ describe("sandbox adapter execution targets", () => {
       const timeout = setTimeout(() => {
         child.kill("SIGKILL");
         reject(new Error("Timed out waiting for process session proxy."));
-      }, 5000);
+      }, timeoutMs);
       child.on("error", (error) => {
         clearTimeout(timeout);
         reject(error);
@@ -216,7 +251,7 @@ describe("sandbox adapter execution targets", () => {
       providerKey: "local-test",
       remoteCwd: rootDir,
       timeoutMs: 30_000,
-      runner: createLocalSandboxRunner(),
+      runner: createStdinWriteReorderingSandboxRunner(),
     };
 
     const bridge = await startAdapterExecutionTargetProcessSessionBridge({
@@ -228,13 +263,13 @@ describe("sandbox adapter execution targets", () => {
       args: [childPath],
       cwd: rootDir,
       env: {},
-      timeoutSec: 5,
+      timeoutSec: 15,
       onLog: async () => {},
     });
     expect(bridge).not.toBeNull();
 
     try {
-      const result = await runProxyWithInput(bridge!.agentCommand, "hello\n");
+      const result = await runProxyWithInput(bridge!.agentCommand, "hello\n", 15_000);
       expect(result.code).toBe(0);
       expect(result.stdout).toBe("out:hello\n");
       expect(result.stderr).toBe("err:hello\n");
