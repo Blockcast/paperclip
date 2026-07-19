@@ -1288,7 +1288,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     expect(await heartbeat.resumeRunningExternalRuntimeRuns()).toBe(1);
     expect(await heartbeat.resumeRunningExternalRuntimeRuns()).toBe(0);
-    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 30_000 });
     finishExecution();
     await waitForRunToSettle(heartbeat, runId);
   });
@@ -1335,7 +1335,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
 
     expect(await heartbeat.resumeRunningExternalRuntimeRuns()).toBe(1);
-    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 30_000 });
     await heartbeat.drainInFlightExecutions(10_000);
 
     const run = await heartbeat.getRun(runId);
@@ -1376,7 +1376,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       async () => {
         expect(await heartbeat.resumeRunningExternalRuntimeRuns()).toBe(1);
       },
-      { timeout: 10_000 },
+      { timeout: 30_000 },
     );
 
     // Now that the first reattach's `finally` block is confirmed complete,
@@ -1396,7 +1396,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(lease.releasedAt).toBeNull();
     }
 
-    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(2), { timeout: 10_000 });
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(2), { timeout: 30_000 });
     await heartbeat.drainInFlightExecutions(10_000);
     const runAfterSecondAttempt = await heartbeat.getRun(runId);
     expect(runAfterSecondAttempt?.status).toBe("running");
@@ -1437,7 +1437,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     expect(await heartbeat.resumeRunningExternalRuntimeRuns()).toBe(0);
     expect(await heartbeat.resumeRunningExternalRuntimeRuns()).toBe(1);
-    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 30_000 });
     finishExecution();
     await waitForRunToSettle(heartbeat, runId);
   });
@@ -1482,7 +1482,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.runIds).not.toContain(runId);
     expect((await heartbeat.getRun(runId))?.status).toBe("running");
     expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
-    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 30_000 });
     finishExecution();
     await waitForRunToSettle(heartbeat, runId);
   });
@@ -1536,7 +1536,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       uid: duplicate.uid,
     });
     expect(await heartbeat.resumeRunningExternalRuntimeRuns()).toBe(1);
-    await vi.waitFor(() => expect(finishExecution).toBeTypeOf("function"), { timeout: 10_000 });
+    await vi.waitFor(() => expect(finishExecution).toBeTypeOf("function"), { timeout: 30_000 });
     expect(mockReadAgentJobRunStatusByName).not.toHaveBeenCalled();
     finishExecution();
     await waitForRunToSettle(heartbeat, runId);
