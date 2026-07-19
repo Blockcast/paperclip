@@ -166,12 +166,17 @@ jobs:
     name: General tests (${{ matrix.group_label }})
     needs: [policy]
     runs-on: default
-    # ARC cold starts plus the larger server shards can exceed 30 minutes
-    # while still completing passing test files; keep a bounded hour ceiling.
-    timeout-minutes: 60
+    # Embedded Postgres can spend tens of seconds per suite waiting on shared
+    # ARC node storage. A server shard reached the previous 60-minute ceiling
+    # while still advancing through passing suites, so retain a bounded margin
+    # without treating runner I/O contention as a test failure.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
-      max-parallel: 2
+      # Every matrix entry gets an isolated ARC pod/database. Serializing this
+      # matrix only lengthens the critical path and leaves on-prem capacity
+      # unused when it is available.
+      max-parallel: 6
       matrix:
         include:
           - group: general-server
@@ -295,10 +300,10 @@ jobs:
     name: Verify serialized server suites (${{ matrix.shard_label }})
     needs: [policy, general_tests]
     runs-on: default
-    timeout-minutes: 20
+    timeout-minutes: 90
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 4
       matrix:
         include:
           - shard_index: 0

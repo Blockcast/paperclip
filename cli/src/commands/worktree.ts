@@ -1596,6 +1596,12 @@ export function resolvePnpmInstallInvocation(
 }
 
 function installDependenciesBestEffort(targetPath: string): void {
+  // Tests that exercise real git worktree creation do not assert dependency
+  // installation, and the command already treats installation as best-effort.
+  // Let those tests skip the expensive network/disk work explicitly while
+  // preserving production behavior when the flag is unset.
+  if (process.env.PAPERCLIP_SKIP_DEPENDENCY_INSTALL === "1") return;
+
   const installSpinner = p.spinner();
   installSpinner.start("Installing dependencies...");
   const pnpm = resolvePnpmInstallInvocation();

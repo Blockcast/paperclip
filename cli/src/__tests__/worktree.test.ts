@@ -52,6 +52,10 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 
+// The real install is best-effort and unasserted by this suite. Skipping it
+// removes a large, load-sensitive pnpm operation from ARC worktree tests.
+process.env.PAPERCLIP_SKIP_DEPENDENCY_INSTALL = "1";
+
 const ORIGINAL_CWD = process.cwd();
 const ORIGINAL_ENV = { ...process.env };
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();

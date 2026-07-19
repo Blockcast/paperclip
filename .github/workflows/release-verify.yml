@@ -18,7 +18,7 @@ jobs:
   typecheck:
     name: Typecheck
     runs-on: default
-    timeout-minutes: 20
+    timeout-minutes: 40
     permissions:
       contents: read
 
@@ -54,7 +54,9 @@ jobs:
   general_tests:
     name: General tests (${{ matrix.group_label }})
     runs-on: default
-    timeout-minutes: 20
+    # Keep release verification on ARC while tolerating embedded-Postgres I/O
+    # contention observed on the shared on-prem runner nodes.
+    timeout-minutes: 90
     permissions:
       contents: read
     strategy:
@@ -113,7 +115,7 @@ jobs:
   serialized_tests:
     name: Serialized tests (${{ matrix.shard_label }})
     runs-on: default
-    timeout-minutes: 20
+    timeout-minutes: 90
     permissions:
       contents: read
     strategy:
@@ -162,7 +164,7 @@ jobs:
   build:
     name: Build
     runs-on: default
-    timeout-minutes: 20
+    timeout-minutes: 40
     permissions:
       contents: read
 
