@@ -20827,12 +20827,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const isolatedWorkspacesEnabled = issueId
       ? (await instanceSettings.getExperimental()).enableIsolatedWorkspaces
       : false;
-    let queuedResponsibleUserIdPromise: Promise<string> | null = null;
+    let queuedResponsibleUserIdPromise: Promise<string | null> | null = null;
     const resolveQueuedResponsibleUserId = () => {
       queuedResponsibleUserIdPromise ??= (async () => {
         const queuedIssueContext = issueId ? await getIssueExecutionContext(agent.companyId, issueId) : null;
         const queuedRoutineEnvContext = await getRoutineEnvForExecutionIssue(agent.companyId, queuedIssueContext);
-        const queuedResponsibleUserId = await resolveResponsibleUserIdForRunSeed({
+        return resolveResponsibleUserIdForRunSeed({
           companyId: agent.companyId,
           contextSnapshot: enrichedContextSnapshot,
           issueContext: queuedIssueContext,
@@ -20842,20 +20842,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           source,
           triggerDetail,
         });
-        if (!queuedResponsibleUserId) {
-          throw new HttpError(422, "Unable to resolve responsible user for heartbeat run dispatch", {
-            code: "responsible_user_unresolved",
-            agentId,
-            companyId: agent.companyId,
-            issueId: issueId ?? null,
-            source,
-            triggerDetail,
-            wakeReason: readNonEmptyString(enrichedContextSnapshot.wakeReason),
-          });
-        }
-        return queuedResponsibleUserId;
       })();
       return queuedResponsibleUserIdPromise;
+    };
+    const requireQueuedResponsibleUserId = (queuedResponsibleUserId: string | null) => {
+      if (queuedResponsibleUserId) return queuedResponsibleUserId;
+      throw new HttpError(422, "Unable to resolve responsible user for heartbeat run dispatch", {
+        code: "responsible_user_unresolved",
+        agentId,
+        companyId: agent.companyId,
+        issueId: issueId ?? null,
+        source,
+        triggerDetail,
+        wakeReason: readNonEmptyString(enrichedContextSnapshot.wakeReason),
+      });
     };
 
     const budgetBlock = await budgets.getInvocationBlock(agent.companyId, agentId, {
@@ -22124,7 +22124,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             invocationSource: source,
             triggerDetail,
             status: "queued",
-            responsibleUserId: queuedResponsibleUserId,
+            responsibleUserId: requireQueuedResponsibleUserId(queuedResponsibleUserId),
             wakeupRequestId: wakeupRequest.id,
             contextSnapshot: enrichedContextSnapshot,
             sessionIdBefore: sessionBefore,
@@ -22348,7 +22348,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           invocationSource: source,
           triggerDetail,
           status: "queued",
-          responsibleUserId: queuedResponsibleUserId,
+          responsibleUserId: requireQueuedResponsibleUserId(queuedResponsibleUserId),
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,

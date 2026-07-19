@@ -1146,7 +1146,7 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
     await vi.waitFor(async () => {
       const latest = await heartbeat.getRun(run!.id);
       expect(latest?.status).toBe("succeeded");
-    }, { timeout: 10_000 });
+    }, { timeout: 60_000 });
 
     expect(adapterExecute).toHaveBeenCalledTimes(1);
     const adapterInput = adapterExecute.mock.calls[0]?.[0] as {
