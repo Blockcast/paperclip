@@ -311,7 +311,7 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
   afterAll(async () => {
     await db.$client.end();
     await tempDb?.cleanup();
-  }, 60_000);
+  }, 120_000);
 
   it("repairs clean unrecorded branch drift before recording workspace finalization", async () => {
     const repoRoot = await createGitRepo();

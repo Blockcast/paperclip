@@ -42,6 +42,12 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const seededAgentIds = new Set<string>();
+  const heartbeatServices = new Set<ReturnType<typeof heartbeatService>>();
+  const createHeartbeat = () => {
+    const service = heartbeatService(db);
+    heartbeatServices.add(service);
+    return service;
+  };
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-monitor-");
@@ -122,6 +128,12 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   }
 
   afterEach(async () => {
+    const servicesToDrain = [...heartbeatServices];
+    try {
+      await Promise.all(servicesToDrain.map((service) => service.drainInFlightExecutions(60_000)));
+    } finally {
+      heartbeatServices.clear();
+    }
     seededAgentIds.clear();
     let lastError: unknown = null;
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -134,7 +146,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       }
     }
     throw lastError;
-  });
+  }, 120_000);
 
   afterAll(async () => {
     await tempDb?.cleanup();
@@ -242,7 +254,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   it("triggers due issue monitors once and clears the one-shot schedule", async () => {
     const { issueId, agentId } = await seedFixture();
-    const heartbeat = heartbeatService(db);
+    const heartbeat = createHeartbeat();
     const tickAt = new Date("2026-04-11T12:31:00.000Z");
 
     const result = await heartbeat.tickTimers(tickAt);
@@ -322,7 +334,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         monitor: monitorState,
       },
     }).where(eq(issues.id, issueId));
-    const heartbeat = heartbeatService(db);
+    const heartbeat = createHeartbeat();
 
     const result = await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
 
@@ -344,7 +356,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   it("lets the board trigger a scheduled issue monitor immediately", async () => {
     const { issueId, agentId, nextCheckAt } = await seedFixture();
-    const heartbeat = heartbeatService(db);
+    const heartbeat = createHeartbeat();
     const triggeredAt = new Date("2026-04-11T12:00:00.000Z");
 
     const result = await heartbeat.triggerIssueMonitor(issueId, {
@@ -390,7 +402,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   it("clears due monitors that cannot be dispatched and records a skip", async () => {
     const { issueId } = await seedFixture({ agentStatus: "paused" });
-    const heartbeat = heartbeatService(db);
+    const heartbeat = createHeartbeat();
     const tickAt = new Date("2026-04-11T12:31:00.000Z");
 
     const result = await heartbeat.tickTimers(tickAt);
@@ -420,7 +432,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         recoveryPolicy: "wake_owner",
       },
     });
-    const heartbeat = heartbeatService(db);
+    const heartbeat = createHeartbeat();
     const tickAt = new Date("2026-04-11T12:31:00.000Z");
 
     const result = await heartbeat.tickTimers(tickAt);
@@ -465,7 +477,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         recoveryPolicy: "create_recovery_issue",
       },
     });
-    const heartbeat = heartbeatService(db);
+    const heartbeat = createHeartbeat();
     const tickAt = new Date("2026-04-11T12:31:00.000Z");
 
     const result = await heartbeat.tickTimers(tickAt);
@@ -500,7 +512,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         externalRef: "https://provider.example/deploy/123?token=secret",
       },
     });
-    const heartbeat = heartbeatService(db);
+    const heartbeat = createHeartbeat();
     const tickAt = new Date("2026-04-11T12:31:00.000Z");
 
     await heartbeat.tickTimers(tickAt);

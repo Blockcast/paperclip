@@ -139,7 +139,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
-  });
+  }, 240_000);
 
   async function seedCompanyAndAgent(opts: SeedOptions = {}): Promise<SeedResult> {
     const companyId = randomUUID();
