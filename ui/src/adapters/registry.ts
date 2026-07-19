@@ -6,10 +6,10 @@ import { cursorCloudUIAdapter } from "./cursor-cloud";
 import { cursorLocalUIAdapter } from "./cursor";
 import { geminiLocalUIAdapter } from "./gemini-local";
 import { grokLocalUIAdapter } from "./grok-local";
+import { hermesLocalUIAdapter } from "./hermes-local";
 import { openCodeLocalUIAdapter } from "./opencode-local";
 import { piLocalUIAdapter } from "./pi-local";
 import { openClawGatewayUIAdapter } from "./openclaw-gateway";
-import { hermesLocalUIAdapter } from "./hermes-local";
 import { openrouterLocalUIAdapter } from "./openrouter-local";
 import { processUIAdapter } from "./process";
 import { httpUIAdapter } from "./http";
@@ -29,6 +29,11 @@ const builtinAdaptersByType = new Map<string, UIAdapterModule>();
 
 // Tracks which builtin types currently have an active external override.
 const activeExternalOverrides = new Set<string>();
+
+// Non-builtin adapters currently mirrored from the server. Keeping this
+// separate from manually registered UI adapters lets sync remove or pause an
+// external adapter without disturbing local test/dev registrations.
+const activeNonBuiltinExternalTypes = new Set<string>();
 
 // Generation counter to discard stale dynamic parser loads. When an override
 // is deactivated while a load is in-flight, the generation is bumped and the
@@ -223,15 +228,26 @@ export function syncExternalAdapters(
 
   // ── Non-builtin externals ───────────────────────────────────────────────
 
-  for (const { type, label } of serverAdapters) {
+  for (const type of [...activeNonBuiltinExternalTypes]) {
+    if (enabledExternalTypes.has(type)) continue;
+    activeNonBuiltinExternalTypes.delete(type);
+    invalidateDynamicParser(type);
+    unregisterUIAdapter(type);
+  }
+
+  for (const { type, label, disabled, overrideDisabled } of serverAdapters) {
     if (builtinTypes.has(type)) continue; // handled above
+    if (disabled || overrideDisabled) continue;
 
     const existing = adaptersByType.get(type);
 
     // If this type already has an externally-loaded dynamic parser, skip —
     // it was loaded from disk on a previous sync. Only re-trigger loading
     // when the server returns a new external adapter that hasn't been loaded yet.
-    if (existing && existing !== processUIAdapter) continue;
+    if (existing && existing !== processUIAdapter) {
+      activeNonBuiltinExternalTypes.add(type);
+      continue;
+    }
 
     let loadStarted = false;
     // Use the existing built-in parser as fallback (if any) so we don't
@@ -262,6 +278,7 @@ export function syncExternalAdapters(
       ConfigFields: existing?.ConfigFields ?? SchemaConfigFields,
       buildAdapterConfig: existing?.buildAdapterConfig ?? buildSchemaAdapterConfig,
     });
+    activeNonBuiltinExternalTypes.add(type);
   }
 }
 

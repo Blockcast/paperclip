@@ -8,6 +8,7 @@ const mockAgentService = vi.hoisted(() => ({
 
 const mockHeartbeatService = vi.hoisted(() => ({
   buildRunOutputSilence: vi.fn(),
+  decorateActiveRunStatus: vi.fn(),
   getRunIssueSummary: vi.fn(),
   getActiveRunIssueSummaryForAgent: vi.fn(),
   getRunLogAccess: vi.fn(),
@@ -63,6 +64,7 @@ function registerModuleMocks() {
       hasPermission: vi.fn(async () => true),
     }),
     approvalService: () => ({}),
+    builtInAgentService: () => ({ ensureCompanyDefaultAgentGrants: vi.fn() }),
     companySkillService: () => ({ listRuntimeSkillEntries: vi.fn() }),
     budgetService: () => ({}),
     heartbeatService: () => mockHeartbeatService,
@@ -202,6 +204,11 @@ describe("agent live run routes", () => {
     });
     mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
     mockHeartbeatService.buildRunOutputSilence.mockResolvedValue(null);
+    mockHeartbeatService.decorateActiveRunStatus.mockImplementation((run) => ({
+      ...run,
+      currentStatusMessage: null,
+      currentStatusUpdatedAt: null,
+    }));
     mockHeartbeatService.getRunIssueSummary.mockResolvedValue({
       id: "run-1",
       status: "running",
@@ -264,6 +271,8 @@ describe("agent live run routes", () => {
       agentName: "Builder",
       adapterType: "codex_local",
       outputSilence: null,
+      currentStatusMessage: null,
+      currentStatusUpdatedAt: null,
     });
     expect(res.body).not.toHaveProperty("resultJson");
     expect(res.body).not.toHaveProperty("contextSnapshot");
@@ -311,79 +320,33 @@ describe("agent live run routes", () => {
     });
   });
 
-  it("does not expose live runs for terminal issues", async () => {
-    mockIssueService.getByIdentifier.mockResolvedValueOnce({
-      id: "issue-1",
-      companyId: "company-1",
-      executionRunId: null,
-      assigneeAgentId: "agent-1",
-      status: "done",
-    });
-    const db = { select: vi.fn() };
+  it("includes ephemeral current status fields on active run polling", async () => {
+    mockHeartbeatService.decorateActiveRunStatus.mockImplementation((run) => ({
+      ...run,
+      currentStatusMessage: "Syncing workspace to sandbox",
+      currentStatusUpdatedAt: new Date("2026-04-10T09:30:05.000Z"),
+      currentToolName: "bash",
+      lastAssistantSnippet: "Inspecting files",
+      lastEventAt: new Date("2026-04-10T09:30:06.000Z"),
+    }));
 
     const res = await requestApp(
-      await createApp(db),
-      (baseUrl) => request(baseUrl).get("/api/issues/PC1A2-1295/live-runs"),
+      await createApp(),
+      (baseUrl) => request(baseUrl).get("/api/issues/PC1A2-1295/active-run"),
     );
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body).toEqual([]);
-    expect(db.select).not.toHaveBeenCalled();
-    expect(mockHeartbeatService.buildRunOutputSilence).not.toHaveBeenCalled();
-  });
-
-  it("uses the issue execution run as the issue live-runs authority", async () => {
-    const liveRows = [{
-      id: "run-current",
-      status: "running",
-      invocationSource: "on_demand",
-      triggerDetail: "manual",
-      contextCommentId: "comment-1",
-      contextWakeCommentId: "comment-1",
-      startedAt: new Date("2026-04-10T09:30:00.000Z"),
-      finishedAt: null,
-      createdAt: new Date("2026-04-10T09:29:59.000Z"),
-      agentId: "agent-1",
-      agentName: "Builder",
-      adapterType: "codex_local",
-      logBytes: 0,
-      livenessState: "healthy",
-      livenessReason: null,
-      continuationAttempt: 0,
-      lastUsefulActionAt: null,
-      nextAction: null,
-      lastOutputAt: null,
-      lastOutputSeq: null,
-      lastOutputStream: null,
-      lastOutputBytes: 0,
-      processStartedAt: null,
-    }];
-    mockIssueService.getByIdentifier.mockResolvedValueOnce({
-      id: "issue-1",
-      companyId: "company-1",
-      executionRunId: "run-current",
-      assigneeAgentId: "agent-1",
-      status: "in_progress",
-    });
-    const { db } = createLiveRunsDbStub(liveRows);
-
-    const res = await requestApp(
-      await createApp(db),
-      (baseUrl) => request(baseUrl).get("/api/issues/PC1A2-1295/live-runs"),
+    expect(mockHeartbeatService.decorateActiveRunStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "run-1", issueId: "issue-1" }),
+      { companyId: "company-1", issueId: "issue-1" },
     );
-
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body).toHaveLength(1);
-    expect(res.body[0]).toMatchObject({
-      id: "run-current",
-      status: "running",
-      agentId: "agent-1",
-      agentName: "Builder",
-      adapterType: "codex_local",
-      outputSilence: null,
+    expect(res.body).toMatchObject({
+      currentStatusMessage: "Syncing workspace to sandbox",
+      currentStatusUpdatedAt: "2026-04-10T09:30:05.000Z",
+      currentToolName: "bash",
+      lastAssistantSnippet: "Inspecting files",
+      lastEventAt: "2026-04-10T09:30:06.000Z",
     });
-    expect(db.select).toHaveBeenCalledTimes(1);
-    expect(mockHeartbeatService.buildRunOutputSilence).toHaveBeenCalledTimes(1);
   });
 
   it("uses narrow run log metadata lookups for log polling", async () => {
@@ -443,7 +406,7 @@ describe("agent live run routes", () => {
       (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/log?offset=4&limitBytes=32"),
     );
 
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(404);
     expect(mockHeartbeatService.readLog).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       companyId: "company-1",

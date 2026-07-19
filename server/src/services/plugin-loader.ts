@@ -2234,17 +2234,27 @@ export function pluginLoader(
       const hostHandlers = buildHostHandlers(pluginId, manifest);
 
       // ------------------------------------------------------------------
-      // 4. Retrieve plugin config (if any)
+      // 4. Bootstrap worker config
       // ------------------------------------------------------------------
-      let config: Record<string, unknown> = {};
+      // Plugin configuration is company-scoped. Workers receive an empty
+      // bootstrap config and must use ctx.config.get(companyId) at runtime.
+      const config: Record<string, unknown> = {};
+      let bootstrapCompanyId: string | undefined;
       try {
-        const configRow = await registry.getConfig(pluginId);
-        if (configRow && typeof configRow === "object" && "configJson" in configRow) {
-          config = (configRow as { configJson: Record<string, unknown> }).configJson ?? {};
+        const configuredCompanyIds = await registry.listConfigCompanyIds(pluginId);
+        if (configuredCompanyIds.length === 1) {
+          bootstrapCompanyId = configuredCompanyIds[0];
+        } else if (configuredCompanyIds.length > 1) {
+          log.warn(
+            { pluginId, pluginKey, configuredCompanyCount: configuredCompanyIds.length },
+            "plugin-loader: multiple company configs; legacy bootstrap scope disabled",
+          );
         }
       } catch {
-        // Config may not exist yet — use empty object
-        log.debug({ pluginId }, "plugin-loader: no config found, using empty config");
+        log.debug(
+          { pluginId, pluginKey },
+          "plugin-loader: unable to resolve legacy bootstrap company scope",
+        );
       }
 
       // ------------------------------------------------------------------
@@ -2254,6 +2264,7 @@ export function pluginLoader(
         entrypointPath: workerEntrypoint,
         manifest,
         config,
+        bootstrapCompanyId,
         instanceInfo,
         apiVersion: manifest.apiVersion,
         databaseNamespace,

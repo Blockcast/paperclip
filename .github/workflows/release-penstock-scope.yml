@@ -32,6 +32,12 @@ permissions:
   contents: read
   id-token: write # required: lets the runner mint the OIDC token npm exchanges
 
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+  CC: "sccache gcc"
+  CXX: "sccache g++"
+
 jobs:
   publish:
     runs-on: arc-deploy
@@ -50,6 +56,9 @@ jobs:
         with:
           node-version: 24
           registry-url: "https://registry.npmjs.org"
+
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       # Trusted publishing requires npm >= 11.5.1 (setup-node ships older).
       - name: Upgrade npm (trusted publishing)
