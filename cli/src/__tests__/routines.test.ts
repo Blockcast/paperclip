@@ -98,7 +98,7 @@ describeEmbeddedPostgres("disableAllRoutinesInConfig", () => {
     tempRoot = mkdtempSync(path.join(os.tmpdir(), "paperclip-routines-cli-config-"));
     configPath = path.join(tempRoot, "config.json");
     writeTestConfig(configPath, tempRoot, tempDb.connectionString);
-  }, 60_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(routines);

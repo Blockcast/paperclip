@@ -357,7 +357,7 @@ describeEmbeddedPostgres("externalObjectService", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-external-objects-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(activityLog);

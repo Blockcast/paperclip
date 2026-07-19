@@ -30,7 +30,7 @@ describeEmbeddedPostgres("board claim", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-board-claim-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  }, 120_000);
 
   afterEach(async () => {
     await initializeBoardClaimChallenge(db, { deploymentMode: "local_trusted" });

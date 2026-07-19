@@ -80,6 +80,7 @@ import {
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { runWithTransientDbRetry } from "../lib/db-retry.js";
 import { publishLiveEvent } from "./live-events.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
@@ -9807,12 +9808,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
-    const updated = await db
-      .update(heartbeatRuns)
-      .set({ status, ...patch, updatedAt: new Date() })
-      .where(eq(heartbeatRuns.id, runId))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    // BLO-16998: the finalize UPDATE can lose a deadlock (40P01), hit the role
+    // statement_timeout (57014), or time out waiting on a row lock (55P03) under
+    // bloat/contention. Unretried, the throw leaves the run stuck in `running`
+    // forever and the agent never dispatches its next work. The write is
+    // idempotent (a status set-by-id), so a bounded jittered retry is safe and
+    // covers both the normal completion finalize and the BLO-16850 reaper's
+    // process_lost finalize (both go through setRunStatus).
+    const updated = await runWithTransientDbRetry(
+      () =>
+        db
+          .update(heartbeatRuns)
+          .set({ status, ...patch, updatedAt: new Date() })
+          .where(eq(heartbeatRuns.id, runId))
+          .returning()
+          .then((rows) => rows[0] ?? null),
+      {
+        onRetry: ({ attempt, error }) =>
+          logger.warn(
+            {
+              runId,
+              status,
+              attempt,
+              sqlstate: (error as { code?: string } | null)?.code,
+              err: error,
+            },
+            "setRunStatus write hit a transient db error; retrying (BLO-16998)",
+          ),
+      },
+    );
 
     if (updated) {
       if (isHeartbeatRunTerminalStatus(updated.status)) {
@@ -9867,12 +9891,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
-    const updated = await db
-      .update(heartbeatRuns)
-      .set({ status, ...patch, updatedAt: new Date() })
-      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    // BLO-16998: same transient-retry rationale as setRunStatus — the guarded
+    // finalize UPDATE is idempotent (status set-by-id, gated on status="running")
+    // so replaying it on a transient failure is safe.
+    const updated = await runWithTransientDbRetry(
+      () =>
+        db
+          .update(heartbeatRuns)
+          .set({ status, ...patch, updatedAt: new Date() })
+          .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
+          .returning()
+          .then((rows) => rows[0] ?? null),
+      {
+        onRetry: ({ attempt, error }) =>
+          logger.warn(
+            {
+              runId,
+              status,
+              attempt,
+              sqlstate: (error as { code?: string } | null)?.code,
+              err: error,
+            },
+            "setRunStatusIfRunning write hit a transient db error; retrying (BLO-16998)",
+          ),
+      },
+    );
 
     if (updated) {
       if (isHeartbeatRunTerminalStatus(updated.status)) {

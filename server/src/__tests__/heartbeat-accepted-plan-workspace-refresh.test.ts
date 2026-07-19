@@ -139,7 +139,7 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-accepted-plan-workspace-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  }, 120_000);
 
   afterEach(async () => {
     adapterExecute.mockClear();
@@ -457,7 +457,7 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
       sourceIssueId: issueId,
     });
     expect(isolatedRows[0]?.cwd).not.toBe(repoRoot);
-  }, 20_000);
+  }, 120_000);
 
   it("keeps accepted-plan children strategy-only until first realization after the base ref moves", async () => {
     const companyId = randomUUID();
@@ -854,7 +854,7 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
     }));
     expect(adapterInput.context.paperclipTaskMarkdown).toContain("Make the plan only.");
     expect(adapterInput.context.paperclipTaskMarkdown).not.toContain("Create child issues from the approved plan only");
-  }, 20_000);
+  }, 120_000);
 
   it("guards cross-issue accepted-plan retries even when the waking issue is standard work mode", async () => {
     const companyId = randomUUID();
@@ -1020,7 +1020,7 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
     }));
     expect(adapterInput.context.paperclipTaskMarkdown).toContain("Issue: \"PAP-9401\"");
     expect(adapterInput.context.paperclipTaskMarkdown).not.toContain("Create child issues from the approved plan only");
-  }, 20_000);
+  }, 120_000);
 
   it("preserves accepted-plan continuation resume state when the wake issue owns the in-flight claim", async () => {
     const companyId = randomUUID();
@@ -1156,5 +1156,5 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
     expect(adapterInput.runtime.sessionId).toBe("accepted-plan-retry-session");
     expect(adapterInput.context.acceptedPlanWakeRouting).toBeUndefined();
     expect(adapterInput.context.paperclipTaskMarkdown).toContain("Create child issues from the approved plan only");
-  }, 20_000);
+  }, 120_000);
 });

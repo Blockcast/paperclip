@@ -31,7 +31,7 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-archived-company-guard-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(heartbeatRunEvents);

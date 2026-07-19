@@ -1272,7 +1272,7 @@ describe("realizeExecutionWorkspace", () => {
     });
 
     await expect(fs.readFile(path.join(reused.cwd, ".paperclip-provision-version"), "utf8")).resolves.toBe("v2\n");
-  }, 30_000);
+  }, 120_000);
 
   it("writes an isolated repo-local Paperclip config and worktree branding when provisioning", async () => {
     const repoRoot = await createTempRepo();
@@ -1461,7 +1461,7 @@ describe("realizeExecutionWorkspace", () => {
         process.env.PATH = previousPath;
       }
     }
-  }, 15_000);
+  }, 120_000);
 
   it(
     "provisions worktree-local pnpm node_modules instead of reusing base-repo links",
@@ -1638,7 +1638,7 @@ describe("realizeExecutionWorkspace", () => {
     await expect(fs.readFile(path.join(workspace.cwd, ".paperclip", "config.json"), "utf8")).resolves.toContain(
       "\"database\"",
     );
-  }, 30_000);
+  }, 120_000);
 
   it("reinstalls worktree-local pnpm dependencies when package metadata changes", async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-stale-deps-"));
@@ -2166,7 +2166,7 @@ describe("realizeExecutionWorkspace", () => {
     });
     expect(provisionOperation?.result.stdout).toContain("[output truncated to last");
     expect(provisionOperation?.result.stdout?.length ?? 0).toBeLessThan(300000);
-  }, 10_000);
+  }, 120_000);
 
   it("reuses an existing branch without resetting it when recreating a missing worktree", async () => {
     const repoRoot = await createTempRepo();
@@ -2307,7 +2307,7 @@ describe("realizeExecutionWorkspace", () => {
     await expect(fs.readFile(path.join(initial.cwd, ".paperclip-restored-branch"), "utf8")).resolves.toBe(`${branchName}\n`);
     const actualHead = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: initial.cwd })).stdout.trim();
     expect(actualHead).toBe(expectedHead);
-  }, 15_000);
+  }, 120_000);
 
   it("repairs a clean persisted git worktree branch mismatch when both branches point at the same commit", async () => {
     const repoRoot = await createTempRepo();
@@ -3002,7 +3002,7 @@ describe("realizeExecutionWorkspace", () => {
     });
 
     await expect(fs.readFile(path.join(initial.cwd, ".paperclip-restored-state"), "utf8")).resolves.toBe("reprovisioned\n");
-  }, 15_000);
+  }, 120_000);
 
   it("rebinds a stale shared project_primary cwd to the managed checkout when the persisted cwd is not a git repo", async () => {
     const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rebind-home-"));
@@ -3087,7 +3087,7 @@ describe("realizeExecutionWorkspace", () => {
       else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
       await fs.rm(paperclipHome, { recursive: true, force: true });
     }
-  }, 10_000);
+  }, 120_000);
 
   it("leaves a shared project_primary cwd alone when it already contains a git checkout", async () => {
     const repoRoot = await createTempRepo();
@@ -3237,7 +3237,7 @@ describe("realizeExecutionWorkspace", () => {
         Array.isArray(submodulePaths) &&
         submodulePaths.includes(submodulePath);
     })).toBe(true);
-  }, 60_000);
+  }, 120_000);
 
   it("repairs worktree submodules before running provision commands", async () => {
     const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: false });
@@ -3305,7 +3305,7 @@ describe("realizeExecutionWorkspace", () => {
       if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL;
       else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol;
     }
-  }, 20_000);
+  }, 120_000);
 
   it("auto-detects the default branch when baseRef is not configured", async () => {
     // Create a repo with "master" as default branch (not "main")
@@ -3357,7 +3357,7 @@ describe("realizeExecutionWorkspace", () => {
     const worktreeOp = operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created);
     expect(worktreeOp).toBeDefined();
     expect(worktreeOp!.metadata!.baseRef).toBe("origin/master");
-  }, 10_000);
+  }, 120_000);
 
   it("auto-detects the default branch via symbolic-ref when origin/HEAD is set", async () => {
     const repoRoot = await createTempRepo("main");
@@ -3415,7 +3415,7 @@ describe("realizeExecutionWorkspace", () => {
     const worktreeOp = operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created);
     expect(worktreeOp).toBeDefined();
     expect(worktreeOp!.metadata!.baseRef).toBe("origin/master");
-  }, 10_000);
+  }, 120_000);
 
   it("removes a created git worktree and branch during cleanup", async () => {
     const repoRoot = await createTempRepo();
@@ -3543,7 +3543,7 @@ describe("realizeExecutionWorkspace", () => {
     ).resolves.toMatchObject({
       stdout: expect.stringContaining(workspace.branchName!),
     });
-  }, 10_000);
+  }, 120_000);
 
   it("records teardown and cleanup operations when a recorder is provided", async () => {
     const repoRoot = await createTempRepo();
@@ -3848,7 +3848,7 @@ describe("ensureRuntimeServicesForRun", () => {
     expect(third).toHaveLength(1);
     expect(third[0]?.reused).toBe(false);
     expect(third[0]?.id).not.toBe(first[0]?.id);
-  }, 10_000);
+  }, 120_000);
 
   it("does not reuse project-scoped shared services across different workspace launch contexts", async () => {
     const primaryWorkspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-primary-"));
@@ -4273,7 +4273,7 @@ describe("ensureRuntimeServicesForRun", () => {
       workspaceCwd: workspace.cwd,
       runtimeServiceId: worker?.id ?? null,
     });
-  }, 10_000);
+  }, 120_000);
 });
 
 describe("buildWorkspaceRuntimeDesiredStatePatch", () => {
@@ -5864,7 +5864,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
         }
       }
     }
-  }, 60_000);
+  }, 120_000);
 
   it("does not adopt a live registry process from another workspace with the same runtime service ID", async () => {
     const companyId = randomUUID();

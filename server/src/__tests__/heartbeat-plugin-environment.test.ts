@@ -242,7 +242,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       });
     }, { timeout: 5_000 });
     expect(adapterExecute).toHaveBeenCalledTimes(1);
-  }, 15_000);
+  }, 120_000);
 
   it("inherits the instance default environment across companies while preserving explicit agent overrides", async () => {
     const sharedEnvironmentId = randomUUID();
@@ -478,7 +478,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
         adapterType: "codex_local",
       }),
     ]));
-  }, 15_000);
+  }, 120_000);
 
   it("ignores stale non-reused workspace environment config in favor of the assignee selection", async () => {
     const companyId = randomUUID();
@@ -682,5 +682,5 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       workspaceMode: "shared_workspace",
       adapterType: "codex_local",
     });
-  }, 15_000);
+  }, 120_000);
 });

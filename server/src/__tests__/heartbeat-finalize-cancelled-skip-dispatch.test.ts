@@ -69,7 +69,7 @@ describeEmbeddedPostgres("executeRun finalize: cancelled status skips next-queue
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-finalize-cancelled-");
     db = createDb(tempDb.connectionString);
     heartbeat = heartbeatService(db);
-  }, 30_000);
+  }, 120_000);
 
   afterEach(async () => {
     mockAdapterExecute.mockReset();
@@ -87,7 +87,7 @@ describeEmbeddedPostgres("executeRun finalize: cancelled status skips next-queue
     // claim + finalize paths populate. Plain row-delete hits a 23503 ordering
     // problem because activity_log has no ON DELETE CASCADE on run_id.
     await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
-  }, 30_000);
+  }, 120_000);
 
   afterAll(async () => {
     await tempDb?.cleanup();

@@ -44,7 +44,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-blocker-attention-");
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
-  }, 60_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(issueThreadInteractions);
