@@ -17058,7 +17058,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       statelessPrReview: paperclipPrReview !== null,
       isWorkspaceIsolated: workspaceIsolationRequested,
       persistedExecutionWorkspaceId: plannedExecutionWorkspaceId,
-      persistedWorkspaceExplicitlySelected: shouldReuseExisting,
+      persistedWorkspaceExplicitlySelected: workspaceReuseRequest.existingExecutionWorkspaceAvailable,
       effectiveMaxConcurrentRuns:
         resolveExternalLifecycleConcurrency(parseHeartbeatPolicy(agent)).effectiveMaxConcurrentRuns,
     });
