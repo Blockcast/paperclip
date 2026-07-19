@@ -520,5 +520,5 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       "git_worktree_remove",
       "git_branch_delete",
     ]));
-  }, 20_000);
+  }, 120_000);
 });

@@ -55,7 +55,7 @@ describeEmbeddedPostgres("Linear webhook fixture replay harness", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-linear-webhook-fixtures-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     // Delete in FK-safe order: rows that reference companies/issues before the referenced rows

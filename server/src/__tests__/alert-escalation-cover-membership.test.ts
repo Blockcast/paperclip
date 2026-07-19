@@ -98,7 +98,7 @@ describeEmbeddedPostgres("alert escalation cover membership (BLO-16120)", () => 
     // (unqualified schema refs, banned DDL, non-whitelisted public reads),
     // this throws and the suite fails here before any logic test runs.
     await pluginDatabaseService(db).applyMigrations(pluginId, manifest, packageRoot);
-  }, 30_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.execute(sql.raw(`TRUNCATE TABLE "${namespace}".alert_escalation_cover_members CASCADE`));

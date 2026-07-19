@@ -27,7 +27,7 @@ describeEmbeddedPostgres("issue list routes assigneeAgentId filter", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-list-routes-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(issues);

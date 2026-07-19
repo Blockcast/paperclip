@@ -1588,6 +1588,15 @@ export function resolvePnpmInstallInvocation(
 }
 
 function installDependenciesBestEffort(targetPath: string): void {
+  // Skip the real `pnpm install` when explicitly disabled. The install is
+  // already best-effort and non-fatal (failures are caught below and the flow
+  // continues), so nothing asserts it ran — but shelling out to a real install
+  // in the worktree tests is slow and flaky on contended CI runners, which is a
+  // chronic verify_canary timeout source (BLO-17026). The CLI test suite sets
+  // PAPERCLIP_SKIP_DEPENDENCY_INSTALL to opt out.
+  if (nonEmpty(process.env.PAPERCLIP_SKIP_DEPENDENCY_INSTALL)) {
+    return;
+  }
   const installSpinner = p.spinner();
   installSpinner.start("Installing dependencies...");
   const pnpm = resolvePnpmInstallInvocation();

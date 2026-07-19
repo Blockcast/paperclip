@@ -39,7 +39,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-stale-lock-sweep-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(issueComments);

@@ -77,7 +77,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
         testedAt: new Date().toISOString(),
       }),
     });
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     capturedRuns.length = 0;

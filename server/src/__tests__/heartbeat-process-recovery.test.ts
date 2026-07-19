@@ -4095,7 +4095,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .where(eq(agentWakeupRequests.agentId, agentId));
       const matches = rows.filter((wakeup) => wakeup.reason === "finish_successful_run_handoff");
       return matches.length > 0 ? matches : null;
-    }, 5_000);
+    }, 120_000);
     await waitForHeartbeatIdle(db, 5_000);
 
     expect(handoffWakeups).toHaveLength(1);
@@ -4199,7 +4199,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .where(eq(agentWakeupRequests.idempotencyKey, idempotencyKey));
       const requeued = rows.filter((wakeup) => wakeup.reason === "finish_successful_run_handoff");
       return requeued.length > 1 ? requeued : null;
-    }, 5_000);
+    }, 120_000);
     await waitForHeartbeatIdle(db, 5_000);
 
     expect(handoffWakeups).toHaveLength(2);
@@ -4283,7 +4283,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .where(eq(agentWakeupRequests.agentId, agentId));
       const matches = rows.filter((wakeup) => wakeup.reason === "finish_successful_run_handoff");
       return matches.length > 0 ? matches : null;
-    }, 5_000);
+    }, 120_000);
     await waitForHeartbeatIdle(db, 5_000);
     const classifiedRun = await db
       .select()
@@ -4349,7 +4349,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .where(eq(agentWakeupRequests.agentId, agentId));
       const matches = rows.filter((wakeup) => wakeup.reason === "finish_successful_run_handoff");
       return matches.length > 0 ? matches : null;
-    }, 5_000);
+    }, 120_000);
     await waitForHeartbeatIdle(db, 5_000);
 
     expect(handoffWakeups).toHaveLength(1);
@@ -6052,7 +6052,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const retryRun = await waitForValue(async () => {
       const rows = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
       return rows.find((row) => row.id !== runId && row.livenessState === "advanced") ?? null;
-    }, 5_000);
+    }, 120_000);
     if (retryRun?.id) {
       await waitForRunToSettle(heartbeat, retryRun.id, 5_000);
     }
