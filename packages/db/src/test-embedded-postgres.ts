@@ -86,7 +86,14 @@ async function getAvailablePort(): Promise<number> {
 }
 
 async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), tempDirPrefix));
+  // Place the throwaway PG data dir under EMBEDDED_POSTGRES_DATA_ROOT when set.
+  // The ARC self-hosted runners point this at a tmpfs mount so initdb's fsync
+  // storm runs in RAM instead of on the contended shared host disk, which was
+  // the dominant cost of the release verify_canary embedded-Postgres timeouts
+  // (BLO-17026). Unset elsewhere (local dev, ubuntu-latest) -> os.tmpdir(), so
+  // behavior is unchanged there.
+  const dataRoot = process.env.EMBEDDED_POSTGRES_DATA_ROOT || os.tmpdir();
+  const dataDir = fs.mkdtempSync(path.join(dataRoot, tempDirPrefix));
   const port = await getAvailablePort();
   const EmbeddedPostgres = await getEmbeddedPostgresCtor();
   const instance = new EmbeddedPostgres({
