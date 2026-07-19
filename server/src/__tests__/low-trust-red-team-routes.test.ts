@@ -76,6 +76,7 @@ async function deleteHeartbeatRunsAfterActivityLogDrains(db: Db) {
     await db.delete(activityLog);
     await deleteDocuments(db);
     try {
+      await db.delete(heartbeatRunEvents);
       await db.delete(heartbeatRuns);
       return;
     } catch (error) {
@@ -550,7 +551,6 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(activityLog);
-    await db.delete(heartbeatRunEvents);
     await deleteHeartbeatRunsAfterActivityLogDrains(db);
     await db.delete(agentWakeupRequests);
     await db.delete(issues);
