@@ -50,6 +50,14 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 
+// Skip the best-effort real `pnpm install` inside worktree:make throughout
+// this suite. It is non-fatal overhead (the command tolerates install failure
+// and continues) that no test asserts, but shelling out to a real install is
+// slow and flaky on contended CI runners — a chronic verify_canary timeout
+// source (BLO-17026). Set before the ORIGINAL_ENV snapshot so the module-level
+// afterEach preserves it across every test in this file.
+process.env.PAPERCLIP_SKIP_DEPENDENCY_INSTALL = "1";
+
 const ORIGINAL_CWD = process.cwd();
 const ORIGINAL_ENV = { ...process.env };
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -448,7 +456,7 @@ describe("worktree helpers", () => {
       await db.$client?.end?.({ timeout: 5 }).catch(() => undefined);
       await tempDb.cleanup();
     }
-  }, 20_000);
+  }, 120_000);
 
   it("copies the source local_encrypted secrets key into the seeded worktree instance", () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-secrets-"));
@@ -952,7 +960,7 @@ describe("worktree helpers", () => {
       }
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 120_000);
 
   it("restores the current worktree config and instance data if reseed fails", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-reseed-rollback-"));
@@ -1109,7 +1117,7 @@ describe("worktree helpers", () => {
       execFileSync("git", ["worktree", "remove", "--force", worktreePath], { cwd: repoRoot, stdio: "ignore" });
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, 120_000);
 
   it("creates and initializes a worktree from the top-level worktree:make command", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-make-"));
@@ -1144,7 +1152,7 @@ describe("worktree helpers", () => {
       homedirSpy.mockRestore();
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
-  }, 20_000);
+  }, 120_000);
 
   it("no-ops on the primary checkout unless --branch is provided", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-repair-primary-"));
@@ -1216,7 +1224,7 @@ describe("worktree helpers", () => {
       process.chdir(originalCwd);
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
-  }, 20_000);
+  }, 120_000);
 
   it("creates and repairs a missing branch worktree when --branch is provided", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-repair-branch-"));
@@ -1251,7 +1259,7 @@ describe("worktree helpers", () => {
       process.chdir(originalCwd);
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
-  }, 20_000);
+  }, 120_000);
 });
 
 describeEmbeddedPostgres("pauseSeededScheduledRoutines", () => {
@@ -1386,5 +1394,5 @@ describeEmbeddedPostgres("pauseSeededScheduledRoutines", () => {
       await db.$client?.end?.({ timeout: 5 }).catch(() => undefined);
       await tempDb.cleanup();
     }
-  }, 20_000);
+  }, 120_000);
 });

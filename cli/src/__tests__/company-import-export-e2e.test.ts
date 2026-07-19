@@ -196,7 +196,7 @@ async function stopServerProcess(child: ServerProcess | null) {
       if (child.exitCode === null) {
         child.kill("SIGKILL");
       }
-    }, 5_000);
+    }, 120_000);
   });
 }
 

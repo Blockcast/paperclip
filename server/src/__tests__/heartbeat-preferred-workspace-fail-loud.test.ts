@@ -75,7 +75,7 @@ describeEmbeddedPostgres("preferred non-primary workspace fail-loud", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-fail-loud-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     adapterExecute.mockClear();
@@ -222,5 +222,5 @@ describeEmbeddedPostgres("preferred non-primary workspace fail-loud", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(refreshedIssue?.executionWorkspaceId ?? null).toBeNull();
-  }, 20_000);
+  }, 120_000);
 });

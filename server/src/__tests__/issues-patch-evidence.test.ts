@@ -35,7 +35,7 @@ describeEmbeddedPostgres("PATCH /issues/:id evidence gate", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-patch-evidence-");
     db = createDb(tempDb.connectionString);
-  }, 30_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(issueLabels);

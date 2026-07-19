@@ -539,7 +539,7 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-low-trust-red-team-routes-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(issueThreadInteractions);
@@ -975,7 +975,7 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
           .where(eq(heartbeatRuns.id, run!.id))
           .then((rows) => rows[0]?.status ?? null);
         return status === "succeeded" || status === "failed" || status === "cancelled";
-      }, 30_000);
+      }, 120_000);
     } finally {
       gateway.releaseFirstWait();
       await gateway.close();

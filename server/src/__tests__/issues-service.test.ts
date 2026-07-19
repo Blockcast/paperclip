@@ -6563,7 +6563,7 @@ describeEmbeddedPostgres("accepted plan decomposition", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-accepted-plan-decomposition-");
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(issuePlanDecompositions);
@@ -7262,7 +7262,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-checkout-owner-");
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(issueComments);
