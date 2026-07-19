@@ -468,6 +468,8 @@ type SecretResolutionErrorCode =
   | "secret_inactive"
   | "secret_scope_invalid"
   | "responsible_user_missing"
+  | "responsible_user_unavailable"
+  | "responsible_user_unauthorized"
   | "user_secret_definition_missing"
   | "user_secret_definition_inactive"
   | "user_secret_missing"
@@ -571,6 +573,10 @@ function secretResolutionErrorCode(error: unknown): SecretResolutionErrorCode {
       case "version_inactive":
       case "provider_error":
         return details.code;
+      case "RESPONSIBLE_USER_UNAVAILABLE":
+        return "responsible_user_unavailable";
+      case "RESPONSIBLE_USER_UNAUTHORIZED":
+        return "responsible_user_unauthorized";
     }
     if (error.message === "Secret is not active") return "secret_inactive";
     if (error.message === "User secret value is not configured") return "user_secret_missing";
@@ -595,7 +601,7 @@ function secretResolutionErrorCode(error: unknown): SecretResolutionErrorCode {
   return "provider_error";
 }
 
-function missingUserSecretDefinitionRuntimeBinding(
+function missingUserSecretRuntimeBinding(
   entry: {
     key: string;
     configPath: string;
@@ -603,7 +609,11 @@ function missingUserSecretDefinitionRuntimeBinding(
   },
   context: Omit<SecretConsumerContext, "configPath">,
   definition: typeof userSecretDefinitions.$inferSelect | null,
-  errorCode: "user_secret_definition_missing" | "user_secret_definition_inactive",
+  errorCode:
+    | "responsible_user_unavailable"
+    | "responsible_user_unauthorized"
+    | "user_secret_definition_missing"
+    | "user_secret_definition_inactive",
 ): MissingRuntimeBinding {
   return {
     consumerType: missingRuntimeConsumerType(context.consumerType),
@@ -2688,6 +2698,17 @@ export function secretService(db: Db) {
           { code: "binding_not_allowed" },
         );
       }
+      const responsibleUserDecision = await authorization.decideResponsibleUserSecretAccess({
+        companyId,
+        userId: responsibleUserId,
+      });
+      if (!responsibleUserDecision.allowed) {
+        if (optionalBinding) return null;
+        throw forbidden(
+          responsibleUserDecision.explanation,
+          authorizationDeniedDetails(responsibleUserDecision),
+        );
+      }
       const secret = await getUserSecretValue({
         companyId,
         ownerUserId: responsibleUserId,
@@ -3945,7 +3966,7 @@ export function secretService(db: Db) {
           definition = await resolveUserSecretDefinition(companyId, { definitionKey: entry.binding.key });
         } catch {
           missingUserSecretBindings.push(
-            missingUserSecretDefinitionRuntimeBinding(
+            missingUserSecretRuntimeBinding(
               entry,
               context,
               null,
@@ -3956,7 +3977,7 @@ export function secretService(db: Db) {
         }
         if (definition.status !== "active") {
           missingUserSecretBindings.push(
-            missingUserSecretDefinitionRuntimeBinding(
+            missingUserSecretRuntimeBinding(
               entry,
               context,
               definition,
@@ -4010,6 +4031,24 @@ export function secretService(db: Db) {
             responsibleUserId: null,
             errorCode: "responsible_user_missing",
           });
+          continue;
+        }
+
+        const responsibleUserDecision = await authorization.decideResponsibleUserSecretAccess({
+          companyId,
+          userId: context.responsibleUserId,
+        });
+        if (!responsibleUserDecision.allowed) {
+          missingUserSecretBindings.push(
+            missingUserSecretRuntimeBinding(
+              entry,
+              context,
+              definition,
+              responsibleUserDecision.code === "RESPONSIBLE_USER_UNAVAILABLE"
+                ? "responsible_user_unavailable"
+                : "responsible_user_unauthorized",
+            ),
+          );
           continue;
         }
 
@@ -4102,7 +4141,7 @@ export function secretService(db: Db) {
           definition = await resolveUserSecretDefinition(companyId, { definitionKey: entry.binding.key });
         } catch {
           missingUserSecretBindings.push(
-            missingUserSecretDefinitionRuntimeBinding(
+            missingUserSecretRuntimeBinding(
               entry,
               context,
               null,
@@ -4113,7 +4152,7 @@ export function secretService(db: Db) {
         }
         if (definition.status !== "active") {
           missingUserSecretBindings.push(
-            missingUserSecretDefinitionRuntimeBinding(
+            missingUserSecretRuntimeBinding(
               entry,
               context,
               definition,
@@ -4167,6 +4206,24 @@ export function secretService(db: Db) {
             responsibleUserId: null,
             errorCode: "responsible_user_missing",
           });
+          continue;
+        }
+
+        const responsibleUserDecision = await authorization.decideResponsibleUserSecretAccess({
+          companyId,
+          userId: context.responsibleUserId,
+        });
+        if (!responsibleUserDecision.allowed) {
+          missingUserSecretBindings.push(
+            missingUserSecretRuntimeBinding(
+              entry,
+              context,
+              definition,
+              responsibleUserDecision.code === "RESPONSIBLE_USER_UNAVAILABLE"
+                ? "responsible_user_unavailable"
+                : "responsible_user_unauthorized",
+            ),
+          );
           continue;
         }
 
