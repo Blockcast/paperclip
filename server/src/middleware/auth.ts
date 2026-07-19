@@ -148,6 +148,33 @@ async function auditAgentJwtRunHeaderMismatch(
   }
 }
 
+async function auditAgentJwtMissingResponsibleUser(
+  db: Db,
+  input: { companyId: string; agentId: string; runId: string; method: string; url: string },
+) {
+  try {
+    await db.insert(activityLog).values({
+      companyId: input.companyId,
+      actorType: "agent",
+      actorId: input.agentId,
+      action: "auth.agent_jwt_missing_responsible_user",
+      entityType: "heartbeat_run",
+      entityId: input.runId,
+      ...(isUuidLike(input.agentId) ? { agentId: input.agentId } : {}),
+      ...(isUuidLike(input.runId) ? { runId: input.runId } : {}),
+      details: {
+        method: input.method,
+        url: input.url,
+      },
+    });
+  } catch (err) {
+    logger.warn(
+      { err, companyId: input.companyId, agentId: input.agentId, runId: input.runId },
+      "Failed to audit rejected agent JWT without responsible user binding",
+    );
+  }
+}
+
 async function auditAgentKeyMissingResponsibleUser(
   db: Db,
   input: { companyId: string; agentId: string; keyId: string; method: string; url: string },
@@ -415,13 +442,27 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         return;
       }
 
-      const onBehalfOfUserId = claims.responsible_user_id !== undefined
+      const hasSignedResponsibleUserClaim = claims.responsible_user_id !== undefined;
+      const onBehalfOfUserId = hasSignedResponsibleUserClaim
         ? normalizeOptionalString(claims.responsible_user_id)
         : await resolveLegacyRunResponsibleUserId(db, {
             companyId: claims.company_id,
             agentId: claims.sub,
             runId: claims.run_id,
           });
+      if (hasSignedResponsibleUserClaim && !onBehalfOfUserId) {
+        await auditAgentJwtMissingResponsibleUser(db, {
+          companyId: claims.company_id,
+          agentId: claims.sub,
+          runId: claims.run_id,
+          method: req.method,
+          url: req.originalUrl,
+        });
+        next(forbidden("Responsible user is unavailable for this agent JWT", {
+          code: "RESPONSIBLE_USER_UNAVAILABLE",
+        }));
+        return;
+      }
       const onBehalfOfMemberships = await loadResponsibleUserMemberships(db, {
         companyId: claims.company_id,
         userId: onBehalfOfUserId,

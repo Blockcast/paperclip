@@ -197,6 +197,35 @@ describe("agent auth middleware", () => {
     });
   });
 
+  it("rejects current agent JWTs with an explicit null responsible user and audits the denial", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const { db, activity } = createDbState({
+      agent: { id: agentId, companyId },
+      run: { id: runId, companyId, agentId, responsibleUserId: "user-row" },
+    });
+    const token = createLocalAgentJwt(agentId, companyId, "codex_local", runId, null);
+
+    const res = await request(createApp(db))
+      .get(`/companies/${companyId}/protected`)
+      .set("Authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("RESPONSIBLE_USER_UNAVAILABLE");
+    expect(activity).toHaveLength(1);
+    expect(activity[0]).toMatchObject({
+      companyId,
+      actorType: "agent",
+      actorId: agentId,
+      action: "auth.agent_jwt_missing_responsible_user",
+      entityType: "heartbeat_run",
+      entityId: runId,
+      runId,
+      details: { method: "GET", url: `/companies/${companyId}/protected` },
+    });
+  });
+
   it("preserves signed skill_test JWT scope on the request actor", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

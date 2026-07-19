@@ -7,6 +7,7 @@ import {
   activityLog,
   agents,
   assets,
+  authUsers,
   caseAttachments,
   caseDocuments,
   caseEvents,
@@ -14,6 +15,7 @@ import {
   caseLabels,
   cases,
   companies,
+  companyMemberships,
   createDb,
   documentAnnotationComments,
   documentAnnotationThreads,
@@ -107,7 +109,9 @@ describeEmbeddedPostgres("cases routes", () => {
     await db.delete(heartbeatRuns);
     await db.delete(projects);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(companies);
+    await db.delete(authUsers);
     await db.delete(instanceSettings);
   });
 
@@ -394,10 +398,29 @@ describeEmbeddedPostgres("cases routes", () => {
     const company = await seedCompany("JWT");
     const agent = await seedAgent(company.id);
     const runId = randomUUID();
+    const responsibleUserId = `case-user-${randomUUID()}`;
+    const now = new Date();
+    await db.insert(authUsers).values({
+      id: responsibleUserId,
+      name: "Case Responsible User",
+      email: `${responsibleUserId}@example.com`,
+      emailVerified: true,
+      image: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: responsibleUserId,
+      status: "active",
+      membershipRole: "operator",
+    });
     await db.insert(heartbeatRuns).values({
       id: runId,
       companyId: company.id,
       agentId: agent.id,
+      responsibleUserId,
       status: "running",
     });
     const [issue] = await db.insert(issues).values({
@@ -406,7 +429,7 @@ describeEmbeddedPostgres("cases routes", () => {
       status: "in_progress",
       executionRunId: runId,
     }).returning();
-    const token = createLocalAgentJwt(agent.id, company.id, agent.adapterType, runId);
+    const token = createLocalAgentJwt(agent.id, company.id, agent.adapterType, runId, responsibleUserId);
     expect(token).toBeTruthy();
 
     const http = request(authenticatedApp());
