@@ -71,6 +71,37 @@ describe("sandbox adapter execution targets", () => {
     };
   }
 
+  function createStdinWriteReorderingSandboxRunner() {
+    const runner = createLocalSandboxRunner();
+    let resolveSecondFinalize!: () => void;
+    const secondFinalizeCompleted = new Promise<void>((resolve) => {
+      resolveSecondFinalize = resolve;
+    });
+
+    return {
+      execute: async (input: Parameters<typeof runner.execute>[0]) => {
+        const script = input.args?.join("\n") ?? "";
+        const isFinalize = script.includes("base64 -d <");
+        const isFirstStdinFinalize = isFinalize && script.includes("/stdin/000000000001.json");
+        const isSecondStdinFinalize = isFinalize && script.includes("/stdin/000000000002.json");
+
+        if (isFirstStdinFinalize) {
+          // If writes are launched concurrently, make the second file visible
+          // for several poll intervals before the first. A serialized writer
+          // reaches the fallback and then creates both files in order.
+          await Promise.race([
+            secondFinalizeCompleted.then(() => new Promise((resolve) => setTimeout(resolve, 150))),
+            new Promise((resolve) => setTimeout(resolve, 300)),
+          ]);
+        }
+
+        const result = await runner.execute(input);
+        if (isSecondStdinFinalize) resolveSecondFinalize();
+        return result;
+      },
+    };
+  }
+
   async function readRuntimeTextFiles(rootDir: string): Promise<string[]> {
     const entries = await readdir(rootDir, { withFileTypes: true }).catch(() => []);
     const contents: string[] = [];
@@ -216,7 +247,7 @@ describe("sandbox adapter execution targets", () => {
       providerKey: "local-test",
       remoteCwd: rootDir,
       timeoutMs: 30_000,
-      runner: createLocalSandboxRunner(),
+      runner: createStdinWriteReorderingSandboxRunner(),
     };
 
     const bridge = await startAdapterExecutionTargetProcessSessionBridge({
