@@ -4,7 +4,8 @@
 //   2. parse application/x-www-form-urlencoded into req.body AND capture
 //      req.rawBody (NEW — Slack interactivity is form-encoded; the handler
 //      reads req.body.payload, and signature verification needs the raw bytes)
-//   3. capture req.rawBody for ANY other content-type via a raw catch-all
+//   3. capture req.rawBody for any other non-multipart content-type via a raw
+//      catch-all
 //      (NEW — so a future webhook content-type can never silently re-break
 //      HMAC verification by falling through with no captured rawBody)
 //
@@ -73,9 +74,9 @@ describe("registerBodyParsers", () => {
       .set("content-type", "text/plain")
       .send(raw);
 
-    // The catch-all guarantees rawBody is present regardless of content-type,
-    // so signature verification can never silently break for a new webhook
-    // content-type. req.body becomes a Buffer (no parsed object expected here).
+    // The catch-all guarantees rawBody is present for arbitrary non-multipart
+    // content types, so signature verification cannot silently break for a new
+    // webhook media type. req.body becomes a Buffer here.
     expect(res.body.rawBody).toBe(raw);
     expect(res.body.rawBodyIsBuffer).toBe(true);
   });

@@ -11,14 +11,16 @@
 //     (`payload=<urlencoded-json>`), so express.urlencoded is required or
 //     req.body stays {} and the interactivity handler (which reads
 //     req.body.payload) never fires.
-//   - The express.raw({type:"*/*"}) catch-all guarantees req.rawBody is
-//     captured for EVERY content-type. Without it, a future webhook arriving
-//     with a content-type neither json nor urlencoded handles would fall
-//     through with no rawBody and silently re-break signature verification.
+//   - The express.raw catch-all guarantees req.rawBody is captured for every
+//     non-multipart content-type. Without it, a future webhook arriving with a
+//     content-type neither json nor urlencoded handles would fall through with
+//     no rawBody and silently re-break signature verification. Multipart is
+//     excluded so route-scoped parsers such as Multer can consume its stream.
 //     body-parser 2.x skips already-consumed streams via onFinished.isFinished
 //     (NOT a req._body flag), so the catch-all only acts when json/urlencoded
 //     did not — it never double-parses or clobbers a parsed req.body.
 
+import type { IncomingMessage } from "node:http";
 import express from "express";
 import {
   DEFAULT_JSON_BODY_LIMIT,
@@ -35,12 +37,18 @@ function captureRawBody(
   (req as unknown as { rawBody: Buffer }).rawBody = buf;
 }
 
+/** Match the previous wildcard behavior while leaving multipart streams unread. */
+function shouldCaptureRawBody(req: IncomingMessage): boolean {
+  const expressRequest = req as express.Request;
+  return Boolean(expressRequest.is("*/*")) && !expressRequest.is("multipart/*");
+}
+
 /**
  * Mount the body-parser middleware stack on `app`. Order matters:
  *   1. company-import path gets a larger JSON limit (mounted first, path-scoped)
  *   2. global JSON
  *   3. global urlencoded (form bodies → req.body, e.g. Slack interactivity)
- *   4. raw catch-all (captures rawBody for any other content-type)
+ *   4. raw catch-all (captures rawBody for any other non-multipart content-type)
  * Every parser captures req.rawBody via the same verify hook.
  */
 export function registerBodyParsers(app: express.Express): void {
@@ -58,7 +66,7 @@ export function registerBodyParsers(app: express.Express): void {
   );
   app.use(
     express.raw({
-      type: "*/*",
+      type: shouldCaptureRawBody,
       limit: DEFAULT_JSON_BODY_LIMIT,
       verify: captureRawBody,
     }),

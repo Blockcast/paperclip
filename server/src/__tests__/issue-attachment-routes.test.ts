@@ -3,6 +3,7 @@ import type { IncomingMessage } from "node:http";
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { registerBodyParsers } from "../http/body-parsers.js";
 import type { PutFileInput, StorageService } from "../storage/types.js";
 
 const mockIssueService = vi.hoisted(() => ({
@@ -154,7 +155,9 @@ async function createApp(storage: StorageService, options?: { companyIds?: strin
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
   ]);
   const app = express();
-  app.use(express.json());
+  // Mirror createApp's production parser stack. In particular, multipart
+  // attachment bodies must remain unread until the route's Multer middleware.
+  registerBodyParsers(app);
   app.use((req, _res, next) => {
     (req as any).actor = {
       type: "board",
@@ -256,7 +259,7 @@ describe("issue attachment routes", () => {
     mockWorkProductService.update.mockReset();
   });
 
-  it("accepts zip uploads for issue attachments", async () => {
+  it("passes multipart zip uploads through the production body parsers to Multer", async () => {
     const storage = createStorageService();
     mockIssueService.getById.mockResolvedValue({
       id: "11111111-1111-4111-8111-111111111111",
