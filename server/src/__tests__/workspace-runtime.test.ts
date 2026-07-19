@@ -3687,12 +3687,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     await expect(fetch(service!.url!)).rejects.toThrow();
   });
 
-  // retry: this test captures an ephemeral port, frees it, then spawns a
-  // subprocess to re-grab that exact port — an inherent race (the freed port
-  // can be taken by another process, or the subprocess can be slow to bind
-  // under load). Flaked verify_canary on both ARC and ubuntu-latest. Retry
-  // clears the race without weakening the reuse-avoidance assertion (BLO-17026).
-  it("does not reuse a stopped auto-port service port while another process owns it", { timeout: 120_000, retry: 2 }, async () => {
+  it("does not reuse a stopped auto-port service port while another process owns it", { timeout: 120_000 }, async () => {
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-unhealthy-adopt-"));
     const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-home-"));
     process.env.PAPERCLIP_HOME = paperclipHome;
