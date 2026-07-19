@@ -28,7 +28,9 @@ function dryRunJson(args) {
   return JSON.parse(result.stdout);
 }
 
-const SHARD_COUNT = 3;
+// Match the PR matrix. The reusable release workflow's three-way matrix is
+// checked independently by release-verify-workflow.test.mjs.
+const SHARD_COUNT = 4;
 
 test("the general-server shards form a complete, non-overlapping partition", () => {
   const shards = Array.from({ length: SHARD_COUNT }, (_, index) =>
@@ -129,7 +131,7 @@ test("the checked-in manifest loads and covers most of the current suite set", (
   const currentFiles = shard.selectedGeneralServerSuites;
   const known = currentFiles.filter((file) => durations[file] !== undefined).length;
   assert.ok(
-    known / currentFiles.length >= 0.5,
+    known / currentFiles.length >= 0.9,
     `manifest is stale: only ${known} of ${currentFiles.length} suites have recorded durations — regenerate it from a recent PR run (see the manifest's $comment)`,
   );
 });
