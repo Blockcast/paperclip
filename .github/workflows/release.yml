@@ -69,7 +69,13 @@ jobs:
   verify_canary_general_tests:
     name: Canary general tests (${{ matrix.group_label }})
     if: github.event_name == 'push'
-    runs-on: default
+    # ubuntu-latest, not the shared ARC pool (`default`): these lanes run the
+    # embedded-Postgres + real-git-worktree integration suites, whose startup
+    # (initdb/pg_ctl, worktree:make) climbs past the per-test Vitest budgets
+    # under ARC contention. #712 (BLO-16561) moved them to `default` and they
+    # have flaked verify_canary red ever since — gating publish/deploy. Isolated
+    # hosted runners restore the pre-#712 passing condition. See BLO-17026.
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
       contents: read
@@ -137,7 +143,10 @@ jobs:
   verify_canary_serialized_server:
     name: Canary serialized server suites (${{ matrix.shard_label }})
     if: github.event_name == 'push'
-    runs-on: default
+    # ubuntu-latest, not the shared ARC pool (`default`): embedded-Postgres
+    # server shards flake past their Vitest timeouts under ARC contention (see
+    # verify_canary_general_tests above and BLO-17026). Isolated hosted runners.
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
       contents: read
