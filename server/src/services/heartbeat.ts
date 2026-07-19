@@ -14774,10 +14774,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     ambiguousRunIds: ReadonlySet<string> = new Set(),
   ) {
     const pending = await db
-      .select()
+      .select({
+        reservation: externalRuntimeReservations,
+        runStatus: heartbeatRuns.status,
+      })
       .from(externalRuntimeReservations)
-      .where(eq(externalRuntimeReservations.state, "release_pending"));
-    for (const reservation of pending) {
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, externalRuntimeReservations.runId))
+      .where(
+        or(
+          eq(externalRuntimeReservations.state, "release_pending"),
+          and(
+            inArray(externalRuntimeReservations.state, ["reserved", "launching"]),
+            isNull(externalRuntimeReservations.expectedJobName),
+            isNull(externalRuntimeReservations.jobName),
+            isNull(externalRuntimeReservations.jobUid),
+            inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+          ),
+        ),
+      );
+    for (const { reservation, runStatus } of pending) {
       if (activeRunExecutions.has(reservation.runId)) continue;
       if (ambiguousRunIds.has(reservation.runId)) continue;
       const observed = jobRunStatuses?.get(reservation.runId) ?? null;
@@ -14823,10 +14838,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       if (!terminalOrMissing) continue;
 
-      await releaseExternalRuntimeReservation(db, {
+      const terminalPrelaunchOrphan =
+        reservation.state === "reserved" || reservation.state === "launching";
+      const released = await releaseExternalRuntimeReservation(db, {
         runId: reservation.runId,
-        reason: reservation.releaseReason ?? "job_terminal_or_missing",
+        reason:
+          reservation.releaseReason ??
+          (terminalPrelaunchOrphan ? "terminal_prelaunch_orphan" : "job_terminal_or_missing"),
       });
+      if (released && terminalPrelaunchOrphan) {
+        logger.warn(
+          {
+            reservationId: reservation.id,
+            runId: reservation.runId,
+            runStatus,
+            reservationState: reservation.state,
+          },
+          "released prelaunch external-runtime reservation left behind by terminal run",
+        );
+      }
     }
   }
 
