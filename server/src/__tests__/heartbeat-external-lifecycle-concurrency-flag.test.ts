@@ -133,4 +133,47 @@ describe("resolveK8sRunIsolationIdentity: concurrency-aware run isolation (BLO-1
       resolveK8sRunIsolationIdentity({ ...base, adapterType: "local", effectiveMaxConcurrentRuns: 5 }),
     ).toBeNull();
   });
+
+  // BLO-16960: PR #719 (BLO-16842) added the concurrency-driven `run:` fallback
+  // but only preserved persisted-workspace precedence when `isWorkspaceIsolated`
+  // was true. An explicit `reuse_existing` selection of a persisted
+  // `shared_workspace`-mode workspace leaves `isWorkspaceIsolated` false, so it
+  // silently fell through to `run:<runId>` once effective concurrency exceeded
+  // 1 -- discarding the reused checkout. `persistedWorkspaceExplicitlySelected`
+  // closes that gap independently of the isolation-mode flag.
+  it("preserves an explicitly reused persisted shared_workspace over the concurrency run: fallback", () => {
+    expect(
+      resolveK8sRunIsolationIdentity({
+        ...base,
+        isWorkspaceIsolated: false,
+        persistedExecutionWorkspaceId: "ws-shared-9",
+        persistedWorkspaceExplicitlySelected: true,
+        effectiveMaxConcurrentRuns: 3,
+      }),
+    ).toEqual({ isolationMode: "workspace", isolationKey: "workspace:ws-shared-9" });
+  });
+
+  it("keeps legacy shared isolation for explicit shared_workspace reuse when concurrency is disabled", () => {
+    expect(
+      resolveK8sRunIsolationIdentity({
+        ...base,
+        isWorkspaceIsolated: false,
+        persistedExecutionWorkspaceId: "ws-shared-9",
+        persistedWorkspaceExplicitlySelected: true,
+        effectiveMaxConcurrentRuns: 1,
+      }),
+    ).toEqual({ isolationMode: "shared", isolationKey: "agent-shared:agent-abc" });
+  });
+
+  it("still hands anonymous concurrent siblings distinct run: keys when no workspace was explicitly reused", () => {
+    expect(
+      resolveK8sRunIsolationIdentity({
+        ...base,
+        isWorkspaceIsolated: false,
+        persistedExecutionWorkspaceId: null,
+        persistedWorkspaceExplicitlySelected: false,
+        effectiveMaxConcurrentRuns: 3,
+      }),
+    ).toEqual({ isolationMode: "run", isolationKey: "run:run-123" });
+  });
 });
