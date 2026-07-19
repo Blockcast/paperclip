@@ -141,6 +141,10 @@ function parseCopySources(depsStage) {
   return sources;
 }
 
+function isLiteralCopySource(source) {
+  return !["?", "*", "[", "]", "{", "}", "$"].some((marker) => source.includes(marker));
+}
+
 function main() {
   const depsStage = extractDepsStage(readFileSync(dockerfilePath, "utf8"));
   if (!depsStage.trim()) {
@@ -175,6 +179,18 @@ function main() {
   }));
 
   let missing = 0;
+  for (const source of copySources) {
+    if (!isLiteralCopySource(source)) continue;
+
+    const normalized = source.replace(/^\.\//, "").replace(/\/$/, "");
+    if (!normalized || path.isAbsolute(normalized)) continue;
+
+    if (!existsSync(path.join(repoRoot, normalized))) {
+      console.error(`Dockerfile deps stage references missing COPY source: ${source}`);
+      missing = 1;
+    }
+  }
+
   for (const pkg of requiredPackageJsons) {
     const covered = copyMatchers.some(({ regex }) => regex.test(pkg));
     if (!covered) {
