@@ -1575,6 +1575,36 @@ describe("K8s session isolation metadata", () => {
     });
   });
 
+  it("keeps shared roots and legacy warm sessions for explicit shared_workspace reuse at concurrency one", () => {
+    const sharedRoot = resolveDefaultAgentWorkspaceDir("agent-1");
+    const sharedIsolation = buildK8sRunIsolationDescriptor({
+      adapterType: "claude_k8s",
+      runId: "run-1",
+      companyId: "company-1",
+      agentId: "agent-1",
+      taskKey: "issue-1",
+      statelessPrReview: false,
+      executionWorkspace: {
+        cwd: "/paperclip/agent-home/agent-1/shared-checkout",
+        source: "project_primary",
+        strategy: "project_primary",
+      },
+      persistedExecutionWorkspaceId: "shared-workspace-1",
+      persistedWorkspaceExplicitlySelected: true,
+      effectiveMaxConcurrentRuns: 1,
+      effectiveExecutionWorkspaceMode: "shared_workspace",
+    });
+
+    expect(sharedIsolation).toMatchObject({
+      isolationMode: "shared",
+      isolationKey: "agent-shared:agent-1",
+      workspaceRoot: "/paperclip/agent-home/agent-1/shared-checkout",
+      homeRoot: sharedRoot,
+      sessionRoot: sharedRoot,
+    });
+    expect(sessionParamsMatchIsolation({ sessionId: "legacy-session" }, sharedIsolation)).toBe(true);
+  });
+
   it("removes user-controlled mutable paths before K8s adapter dispatch", () => {
     expect(stripK8sIsolationOwnedEnv({
       env: {

@@ -3468,16 +3468,18 @@ export function resolveK8sRunIsolationIdentity(input: {
   if (input.statelessPrReview) {
     return { isolationMode: "run", isolationKey: `run:${input.runId}` };
   }
-  // BLO-16960: a persisted workspace the caller explicitly asked to reuse
-  // (`executionWorkspacePreference: "reuse_existing"`) takes precedence even
-  // when its persisted mode isn't isolated (e.g. `shared_workspace`) — the
-  // isolation *mode* only tells us whether a new isolated checkout is being
-  // minted, not whether an existing checkout was explicitly selected.
-  // Otherwise this run would silently fall through to the concurrency-driven
-  // `run:` branch below and discard the reused checkout.
+  // BLO-16960: when concurrency would otherwise force the `run:` fallback, a
+  // persisted workspace the caller explicitly asked to reuse
+  // (`executionWorkspacePreference: "reuse_existing"`) still takes precedence
+  // even when its persisted mode isn't isolated (e.g. `shared_workspace`). At
+  // effective concurrency 1, preserve the existing shared identity so warm
+  // sessions and the agent-scoped home/session roots remain compatible.
   if (
     input.persistedExecutionWorkspaceId &&
-    (input.isWorkspaceIsolated || input.persistedWorkspaceExplicitlySelected)
+    (
+      input.isWorkspaceIsolated ||
+      (input.persistedWorkspaceExplicitlySelected && input.effectiveMaxConcurrentRuns > 1)
+    )
   ) {
     return {
       isolationMode: "workspace",

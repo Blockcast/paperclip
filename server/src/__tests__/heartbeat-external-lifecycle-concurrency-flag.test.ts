@@ -142,6 +142,18 @@ describe("resolveK8sRunIsolationIdentity: concurrency-aware run isolation (BLO-1
     ).toEqual({ isolationMode: "workspace", isolationKey: "workspace:ws-shared-9" });
   });
 
+  it("keeps legacy shared isolation for explicit shared_workspace reuse when concurrency is disabled", () => {
+    expect(
+      resolveK8sRunIsolationIdentity({
+        ...base,
+        isWorkspaceIsolated: false,
+        persistedExecutionWorkspaceId: "ws-shared-9",
+        persistedWorkspaceExplicitlySelected: true,
+        effectiveMaxConcurrentRuns: 1,
+      }),
+    ).toEqual({ isolationMode: "shared", isolationKey: "agent-shared:agent-abc" });
+  });
+
   it("still hands anonymous concurrent siblings distinct run: keys when no workspace was explicitly reused", () => {
     expect(
       resolveK8sRunIsolationIdentity({
