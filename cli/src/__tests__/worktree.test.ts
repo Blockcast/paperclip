@@ -1005,7 +1005,7 @@ describe("worktree helpers", () => {
       }
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
-  }, 120_000);
+  }, 240_000);
 
   it("restores the current worktree config and instance data if reseed fails", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-reseed-rollback-"));

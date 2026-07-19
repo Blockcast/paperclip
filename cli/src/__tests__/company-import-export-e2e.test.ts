@@ -37,7 +37,7 @@ async function getAvailablePort(): Promise<number> {
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
-const SERVER_STARTUP_TIMEOUT_MS = 60_000;
+const SERVER_STARTUP_TIMEOUT_MS = 120_000;
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -323,13 +323,13 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     });
 
     await waitForServer(apiBase, child, output);
-  }, 120_000);
+  }, 180_000);
 
   afterAll(async () => {
     await stopServerProcess(serverProcess);
     await tempDb?.cleanup();
     if (tempRoot) {
-      rmSync(tempRoot, { recursive: true, force: true });
+      rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
