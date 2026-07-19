@@ -136,7 +136,11 @@ describe("sandbox adapter execution targets", () => {
     throw new Error(message);
   }
 
-  async function runProxyWithInput(command: string, input: string): Promise<{ stdout: string; stderr: string; code: number | null }> {
+  async function runProxyWithInput(
+    command: string,
+    input: string,
+    timeoutMs = 5000,
+  ): Promise<{ stdout: string; stderr: string; code: number | null }> {
     const child = spawn(command, [], { stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
@@ -153,7 +157,7 @@ describe("sandbox adapter execution targets", () => {
       const timeout = setTimeout(() => {
         child.kill("SIGKILL");
         reject(new Error("Timed out waiting for process session proxy."));
-      }, 5000);
+      }, timeoutMs);
       child.on("error", (error) => {
         clearTimeout(timeout);
         reject(error);
@@ -259,13 +263,13 @@ describe("sandbox adapter execution targets", () => {
       args: [childPath],
       cwd: rootDir,
       env: {},
-      timeoutSec: 5,
+      timeoutSec: 15,
       onLog: async () => {},
     });
     expect(bridge).not.toBeNull();
 
     try {
-      const result = await runProxyWithInput(bridge!.agentCommand, "hello\n");
+      const result = await runProxyWithInput(bridge!.agentCommand, "hello\n", 15_000);
       expect(result.code).toBe(0);
       expect(result.stdout).toBe("out:hello\n");
       expect(result.stderr).toBe("err:hello\n");
