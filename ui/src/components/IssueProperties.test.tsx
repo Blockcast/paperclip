@@ -15,6 +15,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Issue } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IssueProperties } from "./IssueProperties";
+import { queryKeys } from "../lib/queryKeys";
 
 const mockAgentsApi = vi.hoisted(() => ({
   list: vi.fn(),
@@ -36,10 +37,15 @@ const mockIssuesApi = vi.hoisted(() => ({
   createLabel: vi.fn(),
   upsertWatchdog: vi.fn(),
   deleteWatchdog: vi.fn(),
+  unarchiveFromInbox: vi.fn(),
 }));
 
 const mockAuthApi = vi.hoisted(() => ({
   getSession: vi.fn(),
+}));
+
+const mockAccessApi = vi.hoisted(() => ({
+  listUserDirectory: vi.fn(),
 }));
 
 const mockInstanceSettingsApi = vi.hoisted(() => ({
@@ -72,6 +78,10 @@ vi.mock("../api/auth", () => ({
   authApi: mockAuthApi,
 }));
 
+vi.mock("../api/access", () => ({
+  accessApi: mockAccessApi,
+}));
+
 vi.mock("../api/instanceSettings", () => ({
   instanceSettingsApi: mockInstanceSettingsApi,
 }));
@@ -95,7 +105,14 @@ vi.mock("../lib/recent-assignees", () => ({
 }));
 
 vi.mock("../lib/assignees", () => ({
-  formatAssigneeUserLabel: () => "Me",
+  formatAssigneeUserLabel: (userId: string | null | undefined, currentUserId?: string | null, userLabelMap?: Map<string, string>) => {
+    if (!userId) return null;
+    return userLabelMap?.get(userId) ?? (userId === currentUserId ? "You" : "User");
+  },
+  formatUserLabel: (userId: string | null | undefined, userLabelMap?: Map<string, string>) => {
+    if (!userId) return null;
+    return userLabelMap?.get(userId) ?? "User";
+  },
 }));
 
 vi.mock("./StatusIcon", () => ({
@@ -109,7 +126,7 @@ vi.mock("./PriorityIcon", () => ({
 }));
 
 vi.mock("./Identity", () => ({
-  Identity: ({ name }: { name: string }) => <span>{name}</span>,
+  Identity: ({ name, shape }: { name: string; shape?: string }) => <span data-shape={shape ?? "circle"}>{name}</span>,
 }));
 
 vi.mock("./AgentIconPicker", () => ({
@@ -118,6 +135,7 @@ vi.mock("./AgentIconPicker", () => ({
 
 vi.mock("@/lib/router", () => ({
   Link: ({ children, to, ...props }: { children: ReactNode; to: string } & ComponentProps<"a">) => <a href={to} {...props}>{children}</a>,
+  useCaseHref: () => (caseId: string) => `/cases/${caseId}`,
 }));
 
 vi.mock("@/components/ui/separator", () => ({
@@ -145,6 +163,17 @@ async function flush() {
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
+}
+
+/**
+ * Finds the trigger button for a property row by its (sentence-case) label.
+ * `PropertyRow` exposes a stable label hook so layout utility changes do not
+ * affect tests that need to find the corresponding value slot.
+ */
+function findRowTrigger(container: HTMLElement, label: string): HTMLButtonElement | undefined {
+  const labelSpan = container.querySelector(`[data-property-label="${label}"]`);
+  const row = labelSpan?.closest('[data-property-row="true"]');
+  return (row?.querySelector("button") as HTMLButtonElement | null) ?? undefined;
 }
 
 async function waitForAssertion(assertion: () => void, attempts = 20) {
@@ -177,6 +206,7 @@ function createIssue(overrides: Partial<Issue> = {}): Issue {
     priority: "medium",
     assigneeAgentId: null,
     assigneeUserId: null,
+    responsibleUserId: null,
     checkoutRunId: null,
     executionRunId: null,
     executionAgentNameKey: null,
@@ -373,7 +403,7 @@ function createExecutionState(overrides: Partial<IssueExecutionState> = {}): Iss
   };
 }
 
-function renderProperties(container: HTMLDivElement, props: ComponentProps<typeof IssueProperties>) {
+function renderPropertiesWithQueryClient(container: HTMLDivElement, props: ComponentProps<typeof IssueProperties>) {
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: { retry: false },
@@ -387,6 +417,11 @@ function renderProperties(container: HTMLDivElement, props: ComponentProps<typeo
       </QueryClientProvider>,
     );
   });
+  return { root, queryClient };
+}
+
+function renderProperties(container: HTMLDivElement, props: ComponentProps<typeof IssueProperties>) {
+  const { root } = renderPropertiesWithQueryClient(container, props);
   return root;
 }
 
@@ -410,7 +445,22 @@ describe("IssueProperties", () => {
     }));
     mockIssuesApi.upsertWatchdog.mockResolvedValue({});
     mockIssuesApi.deleteWatchdog.mockResolvedValue({ ok: true });
+    mockIssuesApi.unarchiveFromInbox.mockResolvedValue({ ok: true });
     mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-1" } });
+    mockAccessApi.listUserDirectory.mockResolvedValue({
+      users: [
+        {
+          principalId: "user-1",
+          status: "active",
+          user: { id: "user-1", name: "Riley Board", email: "riley@example.com", image: null },
+        },
+        {
+          principalId: "user-2",
+          status: "active",
+          user: { id: "user-2", name: "Morgan Product", email: "morgan@example.com", image: null },
+        },
+      ],
+    });
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({
       enableTaskWatchdogs: false,
     });
@@ -418,6 +468,133 @@ describe("IssueProperties", () => {
 
   afterEach(() => {
     document.body.innerHTML = "";
+  });
+
+  it("shows assignee and originating without responsible wording", async () => {
+    mockAgentsApi.list.mockResolvedValue([{ id: "agent-1", name: "CodexCoder", status: "active", adapterType: "codex_local" }]);
+    const root = renderProperties(container, {
+      issue: createIssue({
+        assigneeAgentId: "agent-1",
+        createdByUserId: "user-1",
+        responsibleUserId: "user-2",
+      }),
+      childIssues: [],
+      onUpdate: vi.fn(),
+      inline: true,
+    });
+    await flush();
+
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Assignee");
+      expect(container.textContent).toContain("CodexCoder");
+      expect(container.textContent).toContain("Originating");
+      expect(container.textContent).toContain("Riley Board");
+      expect(container.textContent).not.toContain("Morgan Product");
+      expect(container.textContent).not.toContain("Responsible");
+      expect(container.textContent).not.toContain("Kicked off by");
+      expect(container.textContent).not.toContain("Created by");
+      expect(container.querySelector('[data-shape="square"]')?.textContent).toContain("CodexCoder");
+    });
+
+    act(() => root.unmount());
+  });
+
+  it("shows originating without merged responsible wording when responsible is derived from the creator", async () => {
+    const root = renderProperties(container, {
+      issue: createIssue({
+        createdByUserId: "user-1",
+        responsibleUserId: null,
+      }),
+      childIssues: [],
+      onUpdate: vi.fn(),
+      inline: true,
+    });
+    await flush();
+
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Originating");
+      expect(container.textContent).toContain("Riley Board");
+      expect(container.textContent).not.toContain("Kicked off by");
+      expect(container.textContent).not.toContain("Kicked off by · responsible");
+      expect(container.textContent).not.toContain("(auto)");
+      expect(container.textContent).not.toContain("Created by");
+    });
+
+    act(() => root.unmount());
+  });
+
+  it("shows originating agent without responsible wording", async () => {
+    mockAgentsApi.list.mockResolvedValue([{ id: "agent-1", name: "CodexCoder", status: "active", adapterType: "codex_local" }]);
+    const root = renderProperties(container, {
+      issue: createIssue({
+        createdByAgentId: "agent-1",
+        createdByUserId: null,
+        responsibleUserId: null,
+      }),
+      childIssues: [],
+      onUpdate: vi.fn(),
+      inline: true,
+    });
+    await flush();
+
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Originating");
+      expect(container.textContent).toContain("CodexCoder");
+      expect(container.textContent).toContain("Assignee");
+      expect(container.textContent).toContain("Unassigned");
+      expect(container.textContent).not.toContain("Responsible");
+      expect(container.textContent).not.toContain("Kicked off by");
+      expect(container.querySelector('[data-shape="square"]')?.textContent).toContain("CodexCoder");
+    });
+
+    act(() => root.unmount());
+  });
+
+  it("attributes an agent-created issue to the transitive responsible user with a via affordance", async () => {
+    mockAgentsApi.list.mockResolvedValue([{ id: "agent-1", name: "CodexCoder", status: "active", adapterType: "codex_local" }]);
+    const root = renderProperties(container, {
+      issue: createIssue({
+        createdByAgentId: "agent-1",
+        createdByUserId: null,
+        responsibleUserId: "user-2",
+      }),
+      childIssues: [],
+      onUpdate: vi.fn(),
+      inline: true,
+    });
+    await flush();
+
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Originating");
+      expect(container.textContent).toContain("Morgan Product");
+      expect(container.textContent).toContain("via CodexCoder");
+      expect(container.textContent).not.toContain("Responsible");
+      expect(container.textContent).not.toContain("Kicked off by");
+    });
+
+    act(() => root.unmount());
+  });
+
+  it("shows originating responsible user for a routine execution with no creator", async () => {
+    const root = renderProperties(container, {
+      issue: createIssue({
+        createdByAgentId: null,
+        createdByUserId: null,
+        responsibleUserId: "user-2",
+      }),
+      childIssues: [],
+      onUpdate: vi.fn(),
+      inline: true,
+    });
+    await flush();
+
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Originating");
+      expect(container.textContent).toContain("Morgan Product");
+      expect(container.textContent).not.toContain("via ");
+    });
+
+    act(() => root.unmount());
   });
 
   it("groups the assignee picker and gates a live-run reassign behind an interrupt confirm", async () => {
@@ -588,7 +765,8 @@ describe("IssueProperties", () => {
 
     await waitForAssertion(() => {
       expect(container.textContent).toContain("Watchdog");
-      expect(container.textContent).toContain("Set watchdog");
+      // Empty watchdog uses the uniform muted "None" empty state (ux-spec §6).
+      expect(findRowTrigger(container, "Watchdog")?.textContent).toContain("None");
     });
 
     act(() => root.unmount());
@@ -721,8 +899,7 @@ describe("IssueProperties", () => {
     await flush();
 
     await waitForAssertion(() => {
-      // Upstream changed PICKER_RESULT_LIMIT from 50 to 20.
-      expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", { q: "remote", limit: 20 });
+      expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", { q: "remote", limit: 50 });
       expect(container.textContent).toContain("PAP-99 Remote blocker");
       expect(container.textContent).not.toContain("PAP-3 Loaded issue");
     });
@@ -822,12 +999,12 @@ describe("IssueProperties", () => {
     expect(container.textContent).not.toContain("SUB-6");
     expect(
       Array.from(container.querySelectorAll("button")).filter((button) =>
-        button.textContent?.trim() === "and 2 more...",
+        button.textContent?.trim() === "Show 2 more",
       ),
     ).toHaveLength(2);
 
     const expandBlockedBy = Array.from(container.querySelectorAll("button")).find((button) =>
-      button.textContent?.trim() === "and 2 more...",
+      button.textContent?.trim() === "Show 2 more",
     );
     expect(expandBlockedBy).not.toBeUndefined();
     await act(async () => {
@@ -837,10 +1014,10 @@ describe("IssueProperties", () => {
     expect(container.textContent).toContain("BLOCK-6");
     expect(container.textContent).toContain("BLOCK-7");
     expect(container.textContent).not.toContain("SUB-6");
-    expect(container.textContent).toContain("show less");
+    expect(container.textContent).toContain("Show less");
 
     const expandSubTasks = Array.from(container.querySelectorAll("button")).find((button) =>
-      button.textContent?.trim() === "and 2 more...",
+      button.textContent?.trim() === "Show 2 more",
     );
     expect(expandSubTasks).not.toBeUndefined();
     await act(async () => {
@@ -851,17 +1028,17 @@ describe("IssueProperties", () => {
     expect(container.textContent).toContain("SUB-7");
     expect(
       Array.from(container.querySelectorAll("button")).filter((button) =>
-        button.textContent?.trim() === "and 2 more...",
+        button.textContent?.trim() === "Show 2 more",
       ),
     ).toHaveLength(0);
     expect(
       Array.from(container.querySelectorAll("button")).filter((button) =>
-        button.textContent?.trim() === "show less",
+        button.textContent?.trim() === "Show less",
       ),
     ).toHaveLength(2);
 
     const collapseBlockedBy = Array.from(container.querySelectorAll("button")).find((button) =>
-      button.textContent?.trim() === "show less",
+      button.textContent?.trim() === "Show less",
     );
     expect(collapseBlockedBy).not.toBeUndefined();
     await act(async () => {
@@ -870,7 +1047,131 @@ describe("IssueProperties", () => {
 
     expect(container.textContent).not.toContain("BLOCK-6");
     expect(container.textContent).toContain("SUB-6");
-    expect(container.textContent).toContain("and 2 more...");
+    expect(container.textContent).toContain("Show 2 more");
+
+    act(() => root.unmount());
+  });
+
+  it("collapses long blocking and related task lists until the more button is clicked", async () => {
+    const blocking = Array.from({ length: 7 }, (_, index) => ({
+      id: `blocking-${index + 1}`,
+      identifier: `BLOCKING-${index + 1}`,
+      title: `Blocking issue ${index + 1}`,
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    })) as NonNullable<Issue["blocks"]>;
+    const relatedIssues = Array.from({ length: 7 }, (_, index) => ({
+      id: `related-${index + 1}`,
+      identifier: `RELATED-${index + 1}`,
+      title: `Related issue ${index + 1}`,
+      status: "todo" as const,
+      priority: "medium" as const,
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    }));
+    const root = renderProperties(container, {
+      issue: createIssue({
+        blocks: blocking,
+        relatedWork: {
+          outbound: relatedIssues.map((issue) => ({
+            issue,
+            mentionCount: 1,
+            sources: [{ kind: "description", sourceRecordId: null, label: "description", matchedText: issue.identifier }],
+          })),
+          inbound: [],
+        },
+      }),
+      childIssues: [],
+      onUpdate: vi.fn(),
+      inline: true,
+    });
+    await flush();
+
+    expect(container.textContent).toContain("BLOCKING-5");
+    expect(container.textContent).not.toContain("BLOCKING-6");
+    expect(container.textContent).toContain("RELATED-5");
+    expect(container.textContent).not.toContain("RELATED-6");
+    expect(
+      Array.from(container.querySelectorAll("button")).filter((button) =>
+        button.textContent?.trim() === "Show 2 more",
+      ),
+    ).toHaveLength(2);
+
+    const expandBlocking = Array.from(container.querySelectorAll("button")).find((button) =>
+      button.textContent?.trim() === "Show 2 more",
+    );
+    expect(expandBlocking).not.toBeUndefined();
+    await act(async () => {
+      expandBlocking!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(container.textContent).toContain("BLOCKING-6");
+    expect(container.textContent).toContain("BLOCKING-7");
+    expect(container.textContent).not.toContain("RELATED-6");
+
+    const expandRelated = Array.from(container.querySelectorAll("button")).find((button) =>
+      button.textContent?.trim() === "Show 2 more",
+    );
+    expect(expandRelated).not.toBeUndefined();
+    await act(async () => {
+      expandRelated!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(container.textContent).toContain("RELATED-6");
+    expect(container.textContent).toContain("RELATED-7");
+
+    act(() => root.unmount());
+  });
+
+  it("collapses long external URL rows until the more button is clicked", async () => {
+    const externalObjects = Array.from({ length: 7 }, (_, index) => ({
+      mentionCount: 1,
+      sourceLabels: ["Description"],
+      pill: {
+        providerKey: "url" as const,
+        objectType: "link" as const,
+        displayKey: null,
+        iconKey: null,
+        statusCategory: "unknown" as const,
+        statusIconKey: null,
+        statusLabel: null,
+        liveness: "unknown" as const,
+        displayTitle: `https://example.com/reference-${index + 1}`,
+        url: `https://example.com/reference-${index + 1}`,
+      },
+      group: {
+        object: null,
+        mentions: [],
+        mentionCount: 1,
+        sourceLabels: ["Description"],
+      },
+    }));
+    const root = renderProperties(container, {
+      issue: createIssue(),
+      childIssues: [],
+      onUpdate: vi.fn(),
+      inline: true,
+      externalObjects,
+    });
+    await flush();
+
+    expect(container.textContent).toContain("reference-5");
+    expect(container.textContent).not.toContain("reference-6");
+    expect(container.textContent).toContain("References");
+    const expandUrls = Array.from(container.querySelectorAll("button")).find((button) =>
+      button.textContent?.trim() === "Show 2 more",
+    );
+    expect(expandUrls).not.toBeUndefined();
+
+    await act(async () => {
+      expandUrls!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(container.textContent).toContain("reference-6");
+    expect(container.textContent).toContain("reference-7");
+    expect(container.textContent).toContain("Show less");
 
     act(() => root.unmount());
   });
@@ -907,7 +1208,7 @@ describe("IssueProperties", () => {
     await flush();
 
     const expandBlockedBy = Array.from(container.querySelectorAll("button")).find((button) =>
-      button.textContent?.trim() === "and 2 more...",
+      button.textContent?.trim() === "Show 2 more",
     );
     expect(expandBlockedBy).not.toBeUndefined();
     await act(async () => {
@@ -931,7 +1232,7 @@ describe("IssueProperties", () => {
     await flush();
 
     expect(container.textContent).not.toContain("BLOCK-6");
-    expect(container.textContent).toContain("and 2 more...");
+    expect(container.textContent).toContain("Show 2 more");
 
     act(() => root.unmount());
   });
@@ -1136,7 +1437,7 @@ describe("IssueProperties", () => {
     await flush();
 
     expect(container.textContent).not.toContain("Task ids");
-    expect(container.textContent).toContain("Related Tasks");
+    expect(container.textContent).toContain("Related tasks");
     expect(container.textContent).toContain("PAP-22");
 
     act(() => root.unmount());
@@ -1223,7 +1524,7 @@ describe("IssueProperties", () => {
     });
     await flush();
 
-    expect(container.textContent).not.toContain("Related Tasks");
+    expect(container.textContent).not.toContain("Related tasks");
 
     act(() => root.unmount());
   });
@@ -1276,7 +1577,7 @@ describe("IssueProperties", () => {
     act(() => root.unmount());
   });
 
-  it("hides model options when the issue uses the assignee default", async () => {
+  it("hides model options when the issue uses the responsible default", async () => {
     mockAgentsApi.list.mockResolvedValue([
       {
         id: "agent-1",
@@ -1339,7 +1640,7 @@ describe("IssueProperties", () => {
     await flush();
     await flush();
 
-    expect(container.textContent).toContain("Custom · gpt-5.4 · high");
+    expect(container.textContent).toContain("Override · gpt-5.4 · high");
     expect(container.textContent).toContain("Model lane");
 
     // Wait for the adapter-models query to resolve so the model options render.
@@ -1394,11 +1695,21 @@ describe("IssueProperties", () => {
     });
     await flush();
 
-    const clearButton = container.querySelector('button[aria-label="Clear adapter options"]');
-    expect(clearButton).not.toBeNull();
+    // The trailing "clear" X was removed (ux-spec: one trailing-action style).
+    // Clearing now happens by selecting the "Primary" model lane inside the picker.
+    const optionsTrigger = findRowTrigger(container, "Model");
+    expect(optionsTrigger).toBeTruthy();
+    await act(async () => {
+      optionsTrigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flush();
+
+    const primaryLane = Array.from(container.querySelectorAll('button[role="radio"]'))
+      .find((button) => button.textContent?.trim() === "Primary");
+    expect(primaryLane).not.toBeUndefined();
 
     await act(async () => {
-      clearButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      primaryLane!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
 
     expect(onUpdate).toHaveBeenCalledWith({ assigneeAdapterOverrides: null });
@@ -1463,9 +1774,9 @@ describe("IssueProperties", () => {
     });
     await flush();
 
-    const parentTrigger = Array.from(container.querySelectorAll("button"))
-      .find((button) => button.textContent?.includes("No parent"));
-    expect(parentTrigger).not.toBeUndefined();
+    // Empty parent now uses the uniform muted "None" empty state (ux-spec §6).
+    const parentTrigger = findRowTrigger(container, "Parent");
+    expect(parentTrigger?.textContent).toContain("None");
 
     await act(async () => {
       parentTrigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -1779,8 +2090,7 @@ describe("IssueProperties", () => {
     let trigger: HTMLButtonElement | undefined;
     await waitForAssertion(() => {
       expect(container.textContent).toContain("Watchdog");
-      trigger = Array.from(container.querySelectorAll("button"))
-        .find((button) => button.textContent?.includes("Set watchdog"));
+      trigger = findRowTrigger(container, "Watchdog");
       expect(trigger).toBeTruthy();
     });
 
@@ -1830,18 +2140,75 @@ describe("IssueProperties", () => {
     act(() => root.unmount());
   });
 
+  it("updates cached issue detail when saving a watchdog", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableTaskWatchdogs: true,
+    });
+    mockAgentsApi.list.mockResolvedValue([watchdogAgent]);
+    const savedWatchdog = createWatchdogSummary({
+      instructions: "Watch the deploy",
+    });
+    mockIssuesApi.upsertWatchdog.mockResolvedValueOnce(savedWatchdog);
+    const issue = createIssue({ watchdog: null });
+    const { root, queryClient } = renderPropertiesWithQueryClient(container, {
+      issue,
+      childIssues: [],
+      onUpdate: vi.fn(),
+      inline: true,
+    });
+    queryClient.setQueryData(queryKeys.issues.detail(issue.id), issue);
+    await flush();
+
+    let trigger: HTMLButtonElement | undefined;
+    await waitForAssertion(() => {
+      trigger = findRowTrigger(container, "Watchdog");
+      expect(trigger).toBeTruthy();
+    });
+
+    await act(async () => {
+      trigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flush();
+
+    let agentOption: HTMLElement | undefined;
+    await waitForAssertion(() => {
+      agentOption = Array.from(container.querySelectorAll("button, [role='option']"))
+        .find((node) => node.textContent?.includes("ClaudeCoder")) as HTMLElement | undefined;
+      expect(agentOption).toBeTruthy();
+    });
+    await act(async () => {
+      agentOption!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flush();
+
+    const finalSave = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent === "Set watchdog" && button !== trigger);
+    expect(finalSave).toBeTruthy();
+    await act(async () => {
+      finalSave!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flush();
+
+    expect(queryClient.getQueryData<Issue>(queryKeys.issues.detail(issue.id))?.watchdog)
+      .toEqual(savedWatchdog);
+
+    act(() => root.unmount());
+  });
+
   it("renders an existing watchdog and removes it via the API", async () => {
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({
       enableTaskWatchdogs: true,
     });
     mockAgentsApi.list.mockResolvedValue([watchdogAgent]);
     const onUpdate = vi.fn();
-    const root = renderProperties(container, {
-      issue: createIssue({ watchdog: createWatchdogSummary() }),
+    const issue = createIssue({ watchdog: createWatchdogSummary() });
+    const { root, queryClient } = renderPropertiesWithQueryClient(container, {
+      issue,
       childIssues: [],
       onUpdate,
       inline: true,
     });
+    queryClient.setQueryData(queryKeys.issues.detail(issue.id), issue);
     await flush();
 
     await waitForAssertion(() => {
@@ -1864,6 +2231,47 @@ describe("IssueProperties", () => {
     await flush();
 
     expect(mockIssuesApi.deleteWatchdog).toHaveBeenCalledWith("issue-1");
+    expect(queryClient.getQueryData<Issue>(queryKeys.issues.detail(issue.id))?.watchdog)
+      .toBeNull();
+
+    act(() => root.unmount());
+  });
+
+  it("truncates the watchdog instructions one-line summary in the properties value column", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableTaskWatchdogs: true,
+    });
+    mockAgentsApi.list.mockResolvedValue([watchdogAgent]);
+    const instructions = "get greptile to stop re-reviewing the same task unless a fresh code change lands";
+    const root = renderProperties(container, {
+      issue: createIssue({
+        watchdog: createWatchdogSummary({ instructions }),
+      }),
+      childIssues: [],
+      onUpdate: vi.fn(),
+      inline: true,
+    });
+    await flush();
+
+    // ux-spec: watchdog row shows agent + a truncated one-line summary; the
+    // full instructions live in the popover (surfaced here via the row title).
+    let instructionNode: HTMLSpanElement | undefined;
+    await waitForAssertion(() => {
+      instructionNode = Array.from(container.querySelectorAll("span"))
+        .find((node) =>
+          node.textContent?.includes("get greptile")
+          && node.className.includes("text-muted-foreground")
+          && !node.className.includes("inline-flex")
+        ) as HTMLSpanElement | undefined;
+      expect(instructionNode).toBeTruthy();
+    });
+
+    expect(instructionNode!.className).toContain("truncate");
+    expect(instructionNode!.className).not.toContain("whitespace-normal");
+    expect(instructionNode!.className).not.toContain("break-words");
+
+    const watchdogTrigger = findRowTrigger(container, "Watchdog");
+    expect(watchdogTrigger?.querySelector("[title]")?.getAttribute("title")).toBe(instructions);
 
     act(() => root.unmount());
   });
@@ -1888,11 +2296,13 @@ describe("IssueProperties", () => {
     });
     await flush();
 
+    // The link is now an icon-only "open task" affordance (ux-spec: one
+    // trailing-action style), so we assert on href + accessible label.
     await waitForAssertion(() => {
       const link = Array.from(container.querySelectorAll("a"))
         .find((anchor) => anchor.getAttribute("href") === "/issues/issue-wd");
       expect(link).toBeTruthy();
-      expect(link!.textContent).toContain("PAP-42");
+      expect(link!.getAttribute("aria-label")).toBe("Open watchdog task");
     });
 
     act(() => root.unmount());
@@ -1949,12 +2359,36 @@ describe("IssueProperties", () => {
             sourceLabels: ["Comment"],
           },
         },
+        {
+          mentionCount: 1,
+          sourceLabels: ["Comment"],
+          pill: {
+            providerKey: "url",
+            objectType: "link",
+            displayKey: null,
+            iconKey: null,
+            statusCategory: "unknown",
+            statusIconKey: null,
+            statusLabel: null,
+            liveness: "unknown",
+            displayTitle: "https://example.com/release-notes",
+            url: "https://example.com/release-notes",
+          },
+          group: {
+            object: null,
+            mentions: [],
+            mentionCount: 1,
+            sourceLabels: ["Comment"],
+          },
+        },
       ],
     });
     await flush();
 
     expect(container.textContent).toContain("Github Pull Request");
     expect(container.textContent).toContain("Github Issue");
+    expect(container.textContent).toContain("URL");
+    expect(container.textContent).not.toContain("URL link");
     expect(container.textContent).toContain("PR 241 - Merged");
     expect(container.textContent).toContain("Merged");
     expect(container.textContent).toContain("Open");
@@ -1971,6 +2405,111 @@ describe("IssueProperties", () => {
     expect(pullRequestLink?.className).not.toContain("paperclip-mention-chip");
     expect(pullRequestLink?.className).not.toContain("rounded-full");
     expect(pullRequestLink?.className).not.toContain("border");
+
+    act(() => root.unmount());
+  });
+
+  it("shows agent-archive attribution and unarchive only in the properties pane", async () => {
+    mockAgentsApi.list.mockResolvedValue([
+      { id: "agent-9", name: "Gardener", status: "active", adapterType: "codex_local", icon: null },
+    ]);
+    const root = renderProperties(container, {
+      issue: createIssue({
+        archivedAt: new Date("2026-04-06T12:10:00.000Z"),
+        archivedByActorType: "agent",
+        archivedByAgentId: "agent-9",
+        archivedByRunId: "run-1",
+      }),
+      childIssues: [],
+      onUpdate: vi.fn(),
+      inline: true,
+    });
+    await flush();
+
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Archived");
+      // The value shows just the agent name (the row label already says
+      // "Archived"), giving the name the full column width at 320px.
+      expect(container.textContent).toContain("Gardener");
+      const unarchive = Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent?.includes("Unarchive"));
+      expect(unarchive).toBeTruthy();
+    });
+
+    // The tooltip must carry the full "Archived by <name> · <time>" phrasing so
+    // the attribution is recoverable if a long name truncates at the 320px pane
+    // width (PAP-14182 review fix).
+    const attribution = Array.from(container.querySelectorAll("span"))
+      .find((span) => span.getAttribute("title")?.startsWith("Archived by Gardener"));
+    expect(attribution).toBeTruthy();
+
+    const unarchiveButton = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.includes("Unarchive"))!;
+    await act(async () => {
+      unarchiveButton.click();
+    });
+    await flush();
+    expect(mockIssuesApi.unarchiveFromInbox).toHaveBeenCalledWith("issue-1");
+
+    act(() => root.unmount());
+  });
+
+  it("surfaces unarchive failures inline", async () => {
+    mockAgentsApi.list.mockResolvedValue([
+      { id: "agent-9", name: "Gardener", status: "active", adapterType: "codex_local", icon: null },
+    ]);
+    mockIssuesApi.unarchiveFromInbox.mockRejectedValue(new Error("Archive policy denied"));
+    const root = renderProperties(container, {
+      issue: createIssue({
+        archivedAt: new Date("2026-04-06T12:10:00.000Z"),
+        archivedByActorType: "agent",
+        archivedByAgentId: "agent-9",
+        archivedByRunId: "run-1",
+      }),
+      childIssues: [],
+      onUpdate: vi.fn(),
+      inline: true,
+    });
+    await flush();
+
+    let unarchiveButton: HTMLButtonElement | undefined;
+    await waitForAssertion(() => {
+      unarchiveButton = Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent?.includes("Unarchive"));
+      expect(unarchiveButton).toBeTruthy();
+    });
+    await act(async () => {
+      unarchiveButton!.click();
+    });
+    await flush();
+
+    await waitForAssertion(() => {
+      expect(container.querySelector('[role="alert"]')?.textContent).toContain("Archive policy denied");
+    });
+
+    act(() => root.unmount());
+  });
+
+  it("does not render archive attribution for user (manual) archives", async () => {
+    const root = renderProperties(container, {
+      issue: createIssue({
+        archivedAt: new Date("2026-04-06T12:10:00.000Z"),
+        archivedByActorType: "user",
+        archivedByAgentId: null,
+      }),
+      childIssues: [],
+      onUpdate: vi.fn(),
+      inline: true,
+    });
+    await flush();
+
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Updated");
+    });
+    expect(container.textContent).not.toContain("Archived by");
+    expect(
+      Array.from(container.querySelectorAll("button")).some((button) => button.textContent?.includes("Unarchive")),
+    ).toBe(false);
 
     act(() => root.unmount());
   });

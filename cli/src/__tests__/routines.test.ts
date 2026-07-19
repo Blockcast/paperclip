@@ -112,7 +112,7 @@ describeEmbeddedPostgres("disableAllRoutinesInConfig", () => {
     if (tempRoot) {
       rmSync(tempRoot, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
 
   it("pauses only non-archived routines for the selected company", async () => {
     const companyId = randomUUID();

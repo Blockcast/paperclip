@@ -280,17 +280,18 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
           const [existingConfig] = await db
             .select()
             .from(pluginConfig)
-            .where(eq(pluginConfig.pluginId, plugin.id))
+            .where(and(eq(pluginConfig.pluginId, plugin.id), eq(pluginConfig.companyId, companyId)))
             .limit(1);
 
           if (existingConfig) {
             await db
               .update(pluginConfig)
               .set({ configJson, updatedAt: new Date() })
-              .where(eq(pluginConfig.pluginId, plugin.id));
+              .where(and(eq(pluginConfig.pluginId, plugin.id), eq(pluginConfig.companyId, companyId)));
           } else {
             await db.insert(pluginConfig).values({
               pluginId: plugin.id,
+              companyId,
               configJson,
             });
           }
@@ -560,7 +561,10 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
       // Get config for teamId
       let teamId = "";
       if (plugin) {
-        const [cfg] = await db.select().from(pluginConfig).where(eq(pluginConfig.pluginId, plugin.id));
+        const [cfg] = await db
+          .select()
+          .from(pluginConfig)
+          .where(and(eq(pluginConfig.pluginId, plugin.id), eq(pluginConfig.companyId, companyId)));
         teamId = (cfg?.configJson as Record<string, unknown>)?.teamId as string ?? "";
       }
 

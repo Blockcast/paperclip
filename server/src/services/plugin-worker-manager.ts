@@ -243,6 +243,11 @@ export interface WorkerStartOptions {
   manifest: PaperclipPluginManifestV1;
   /** Resolved plugin configuration. */
   config: Record<string, unknown>;
+  /**
+   * Sole configured company used to scope legacy setup and scheduled-job
+   * invocations. Omitted when zero or multiple company configs exist.
+   */
+  bootstrapCompanyId?: string;
   /** Host instance information for the initialize call. */
   instanceInfo: {
     instanceId: string;
@@ -637,6 +642,24 @@ export function createPluginWorkerHandle(
     }
 
     return null;
+  }
+
+  function deriveCallInvocationScope(
+    method: HostToWorkerMethodName | string,
+    params: unknown,
+  ): PluginInvocationScope {
+    const derived = deriveInvocationScope(method, params);
+    if (derived) return derived;
+
+    // Plugin job declarations predate company-scoped plugin config and remain
+    // instance-level. A worker with exactly one configured company can safely
+    // run those legacy jobs in that sole scope; ambiguous workers stay
+    // instance-scoped and the normal host guards reject company access.
+    if (method === "runJob" && options.bootstrapCompanyId) {
+      return { companyId: options.bootstrapCompanyId };
+    }
+
+    return {};
   }
 
   function registerInvocation(scope: PluginInvocationScope, ttlMs?: number): PluginInvocationContext {
@@ -1064,6 +1087,7 @@ export function createPluginWorkerHandle(
     const initParams: InitializeParams = {
       manifest: options.manifest,
       config: options.config,
+      companyId: options.bootstrapCompanyId ?? null,
       instanceInfo: options.instanceInfo,
       apiVersion: options.apiVersion,
       databaseNamespace: options.databaseNamespace ?? null,
@@ -1254,7 +1278,7 @@ export function createPluginWorkerHandle(
 
       const id = nextRequestId++;
       const timeout = Math.min(timeoutMs ?? rpcTimeoutMs, MAX_RPC_TIMEOUT_MS);
-      const invocationScope = deriveInvocationScope(method, params) ?? {};
+      const invocationScope = deriveCallInvocationScope(method, params);
       const invocation = registerInvocation(invocationScope);
 
       // Guard against double-settlement. When a process exits all pending
@@ -1377,7 +1401,7 @@ export function createPluginWorkerHandle(
 
     notify(method: string, params: unknown) {
       if (status !== "running") return;
-      const invocationScope = deriveInvocationScope(method, params) ?? {};
+      const invocationScope = deriveCallInvocationScope(method, params);
       const invocation = registerInvocation(invocationScope, MAX_RPC_TIMEOUT_MS);
       try {
         // Notifications are fire-and-forget: drop them under stdin backpressure

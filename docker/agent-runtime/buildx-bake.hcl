@@ -1,5 +1,5 @@
 group "default" {
-  targets = ["base", "claude", "codex", "gemini", "acpx", "opencode", "pi", "hermes"]
+  targets = ["base", "claude", "codex", "gemini", "opencode", "pi", "hermes"]
 }
 
 variable "VERSION" { default = "dev" }
@@ -10,12 +10,16 @@ target "base" {
   dockerfile = "docker/agent-runtime/Dockerfile.base"
   platforms = ["linux/amd64"]
   tags = ["${REGISTRY}/agent-runtime-base:${VERSION}"]
-  # GHA registry-less layer cache. base carries the heavy shared
-  # toolchain so it exports mode=max; each agent target is a thin
-  # FROM-base delta and exports mode=min to stay under the 10GB GHA
-  # cache budget. ignore-error keeps a cache blip from failing the build.
-  cache-from = ["type=gha,scope=agent-runtime-base"]
-  cache-to = ["type=gha,scope=agent-runtime-base,mode=max,ignore-error=true"]
+  # Harbor is the durable on-prem cache; GHA is a secondary warm cache for
+  # cross-run reuse. A failure in either exporter must not fail image publish.
+  cache-from = [
+    "type=registry,ref=${REGISTRY}/agent-runtime-base:buildcache-v1",
+    "type=gha,scope=agent-runtime-base",
+  ]
+  cache-to = [
+    "type=registry,ref=${REGISTRY}/agent-runtime-base:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true",
+    "type=gha,scope=agent-runtime-base,mode=max,ignore-error=true",
+  ]
 }
 
 target "claude" {
@@ -23,8 +27,8 @@ target "claude" {
   dockerfile = "docker/agent-runtime/Dockerfile.claude"
   platforms = ["linux/amd64"]
   tags = ["${REGISTRY}/agent-runtime-claude:${VERSION}"]
-  cache-from = ["type=gha,scope=agent-runtime-claude"]
-  cache-to = ["type=gha,scope=agent-runtime-claude,mode=min,ignore-error=true"]
+  cache-from = ["type=registry,ref=${REGISTRY}/agent-runtime-claude:buildcache-v1", "type=gha,scope=agent-runtime-claude"]
+  cache-to = ["type=registry,ref=${REGISTRY}/agent-runtime-claude:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true", "type=gha,scope=agent-runtime-claude,mode=min,ignore-error=true"]
   args = {
     BASE_TAG = "${VERSION}"
   }
@@ -38,8 +42,8 @@ target "codex" {
   dockerfile = "docker/agent-runtime/Dockerfile.codex"
   platforms = ["linux/amd64"]
   tags = ["${REGISTRY}/agent-runtime-codex:${VERSION}"]
-  cache-from = ["type=gha,scope=agent-runtime-codex"]
-  cache-to = ["type=gha,scope=agent-runtime-codex,mode=min,ignore-error=true"]
+  cache-from = ["type=registry,ref=${REGISTRY}/agent-runtime-codex:buildcache-v1", "type=gha,scope=agent-runtime-codex"]
+  cache-to = ["type=registry,ref=${REGISTRY}/agent-runtime-codex:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true", "type=gha,scope=agent-runtime-codex,mode=min,ignore-error=true"]
   args = {
     BASE_TAG = "${VERSION}"
   }
@@ -53,8 +57,8 @@ target "gemini" {
   dockerfile = "docker/agent-runtime/Dockerfile.gemini"
   platforms = ["linux/amd64"]
   tags = ["${REGISTRY}/agent-runtime-gemini:${VERSION}"]
-  cache-from = ["type=gha,scope=agent-runtime-gemini"]
-  cache-to = ["type=gha,scope=agent-runtime-gemini,mode=min,ignore-error=true"]
+  cache-from = ["type=registry,ref=${REGISTRY}/agent-runtime-gemini:buildcache-v1", "type=gha,scope=agent-runtime-gemini"]
+  cache-to = ["type=registry,ref=${REGISTRY}/agent-runtime-gemini:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true", "type=gha,scope=agent-runtime-gemini,mode=min,ignore-error=true"]
   args = {
     BASE_TAG = "${VERSION}"
   }
@@ -68,8 +72,8 @@ target "acpx" {
   dockerfile = "docker/agent-runtime/Dockerfile.acpx"
   platforms = ["linux/amd64"]
   tags = ["${REGISTRY}/agent-runtime-acpx:${VERSION}"]
-  cache-from = ["type=gha,scope=agent-runtime-acpx"]
-  cache-to = ["type=gha,scope=agent-runtime-acpx,mode=min,ignore-error=true"]
+  cache-from = ["type=registry,ref=${REGISTRY}/agent-runtime-acpx:buildcache-v1", "type=gha,scope=agent-runtime-acpx"]
+  cache-to = ["type=registry,ref=${REGISTRY}/agent-runtime-acpx:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true", "type=gha,scope=agent-runtime-acpx,mode=min,ignore-error=true"]
   args = {
     BASE_TAG = "${VERSION}"
   }
@@ -83,8 +87,8 @@ target "opencode" {
   dockerfile = "docker/agent-runtime/Dockerfile.opencode"
   platforms = ["linux/amd64"]
   tags = ["${REGISTRY}/agent-runtime-opencode:${VERSION}"]
-  cache-from = ["type=gha,scope=agent-runtime-opencode"]
-  cache-to = ["type=gha,scope=agent-runtime-opencode,mode=min,ignore-error=true"]
+  cache-from = ["type=registry,ref=${REGISTRY}/agent-runtime-opencode:buildcache-v1", "type=gha,scope=agent-runtime-opencode"]
+  cache-to = ["type=registry,ref=${REGISTRY}/agent-runtime-opencode:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true", "type=gha,scope=agent-runtime-opencode,mode=min,ignore-error=true"]
   args = {
     BASE_TAG = "${VERSION}"
   }
@@ -98,8 +102,8 @@ target "pi" {
   dockerfile = "docker/agent-runtime/Dockerfile.pi"
   platforms = ["linux/amd64"]
   tags = ["${REGISTRY}/agent-runtime-pi:${VERSION}"]
-  cache-from = ["type=gha,scope=agent-runtime-pi"]
-  cache-to = ["type=gha,scope=agent-runtime-pi,mode=min,ignore-error=true"]
+  cache-from = ["type=registry,ref=${REGISTRY}/agent-runtime-pi:buildcache-v1", "type=gha,scope=agent-runtime-pi"]
+  cache-to = ["type=registry,ref=${REGISTRY}/agent-runtime-pi:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true", "type=gha,scope=agent-runtime-pi,mode=min,ignore-error=true"]
   args = {
     BASE_TAG = "${VERSION}"
   }
@@ -113,8 +117,8 @@ target "hermes" {
   dockerfile = "docker/agent-runtime/Dockerfile.hermes"
   platforms = ["linux/amd64"]
   tags = ["${REGISTRY}/agent-runtime-hermes:${VERSION}"]
-  cache-from = ["type=gha,scope=agent-runtime-hermes"]
-  cache-to = ["type=gha,scope=agent-runtime-hermes,mode=min,ignore-error=true"]
+  cache-from = ["type=registry,ref=${REGISTRY}/agent-runtime-hermes:buildcache-v1", "type=gha,scope=agent-runtime-hermes"]
+  cache-to = ["type=registry,ref=${REGISTRY}/agent-runtime-hermes:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true", "type=gha,scope=agent-runtime-hermes,mode=min,ignore-error=true"]
   args = {
     BASE_TAG = "${VERSION}"
   }

@@ -100,7 +100,10 @@ export class InvocationScopeDeniedError extends Error {
 export interface HostServices {
   /** Provides `config.get`. */
   config: {
-    get(): Promise<Record<string, unknown>>;
+    get(
+      params: WorkerToHostMethods["config.get"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<Record<string, unknown>>;
   };
 
   /** Provides trusted company-scoped local folder helpers. */
@@ -153,7 +156,10 @@ export interface HostServices {
 
   /** Provides `secrets.resolve`, `secrets.list`, `secrets.manage`. */
   secrets: {
-    resolve(params: WorkerToHostMethods["secrets.resolve"][0]): Promise<string>;
+    resolve(
+      params: WorkerToHostMethods["secrets.resolve"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<string>;
     list(params: WorkerToHostMethods["secrets.list"][0]): Promise<WorkerToHostMethods["secrets.list"][1]>;
     providers(params: WorkerToHostMethods["secrets.providers"][0]): Promise<WorkerToHostMethods["secrets.providers"][1]>;
     create(params: WorkerToHostMethods["secrets.create"][0]): Promise<WorkerToHostMethods["secrets.create"][1]>;
@@ -649,15 +655,21 @@ export function createHostClientHandlers(
     }
 
     const allowedCompanyId = readNonEmptyString(context?.invocationScope?.companyId);
-    if (!allowedCompanyId) return;
 
     if (requested.kind === "all") {
       if (method === "companies.list") return;
+      if (!allowedCompanyId) {
+        throw new InvocationScopeDeniedError(pluginId, method, "company context is required");
+      }
       throw new InvocationScopeDeniedError(
         pluginId,
         method,
         `the current invocation is scoped to company "${allowedCompanyId}"`,
       );
+    }
+
+    if (!allowedCompanyId) {
+      throw new InvocationScopeDeniedError(pluginId, method, "company context is required");
     }
 
     if (requested.companyId !== allowedCompanyId) {
@@ -667,6 +679,40 @@ export function createHostClientHandlers(
         `requested company "${requested.companyId}" but the current invocation is scoped to company "${allowedCompanyId}"`,
       );
     }
+  }
+
+  function resolveRequiredCompanyId(
+    method: WorkerToHostMethodName,
+    params: unknown,
+    context?: WorkerHostCallContext,
+  ): string {
+    if (context?.invalidInvocationScope) {
+      throw new InvocationScopeDeniedError(
+        pluginId,
+        method,
+        "the worker referenced a missing, expired, or unknown invocation scope",
+      );
+    }
+
+    const requested = requestedCompanyScope(method, params);
+    const scopedCompanyId = readNonEmptyString(context?.invocationScope?.companyId);
+    if (requested.kind === "single") {
+      if (!scopedCompanyId) {
+        throw new InvocationScopeDeniedError(pluginId, method, "company context is required");
+      }
+      if (requested.companyId !== scopedCompanyId) {
+        throw new InvocationScopeDeniedError(
+          pluginId,
+          method,
+          `requested company "${requested.companyId}" but the current invocation is scoped to company "${scopedCompanyId}"`,
+        );
+      }
+      return scopedCompanyId;
+    }
+
+    if (scopedCompanyId) return scopedCompanyId;
+
+    throw new InvocationScopeDeniedError(pluginId, method, "company context is required");
   }
 
   /**
@@ -706,8 +752,9 @@ export function createHostClientHandlers(
 
   return {
     // Config
-    "config.get": gated("config.get", async () => {
-      return services.config.get();
+    "config.get": gated("config.get", async (params, context) => {
+      const companyId = resolveRequiredCompanyId("config.get", params, context);
+      return services.config.get({ ...params, companyId }, context);
     }),
 
     "localFolders.declarations": gated("localFolders.declarations", async (params) => {
@@ -783,8 +830,9 @@ export function createHostClientHandlers(
     }),
 
     // Secrets
-    "secrets.resolve": gated("secrets.resolve", async (params) => {
-      return services.secrets.resolve(params);
+    "secrets.resolve": gated("secrets.resolve", async (params, context) => {
+      const companyId = resolveRequiredCompanyId("secrets.resolve", params, context);
+      return services.secrets.resolve({ ...params, companyId }, context);
     }),
     "secrets.list": gated("secrets.list", async (params) => {
       return services.secrets.list(params);

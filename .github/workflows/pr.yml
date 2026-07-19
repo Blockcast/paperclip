@@ -9,6 +9,12 @@ concurrency:
   group: pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+  CC: "sccache gcc"
+  CXX: "sccache g++"
+
 jobs:
   policy:
     runs-on: default
@@ -72,6 +78,14 @@ jobs:
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
 
+      - name: Test general-server shard partition
+        run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
+
+      - name: Test release verify workflow wiring
+        run: node --test ./scripts/__tests__/release-verify-workflow.test.mjs
+
+      - name: Test standalone package build concurrency
+        run: node --test ./scripts/__tests__/build-standalone-concurrency.test.mjs
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 
@@ -110,7 +124,9 @@ jobs:
     name: Typecheck + Release Registry
     needs: [policy]
     runs-on: default
-    timeout-minutes: 20
+    # ARC setup plus the sequential build-gap typechecks exceeded the previous
+    # 20-minute ceiling while the final UI typecheck was still making progress.
+    timeout-minutes: 40
 
     steps:
       - name: Checkout repository
@@ -134,6 +150,9 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -147,10 +166,17 @@ jobs:
     name: General tests (${{ matrix.group_label }})
     needs: [policy]
     runs-on: default
-    timeout-minutes: 20
+    # Embedded Postgres can spend tens of seconds per suite waiting on shared
+    # ARC node storage. A server shard reached the previous 60-minute ceiling
+    # while still advancing through passing suites, so retain a bounded margin
+    # without treating runner I/O contention as a test failure.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
-      max-parallel: 2
+      # Every matrix entry gets an isolated ARC pod/database. Serializing this
+      # matrix only lengthens the critical path and leaves on-prem capacity
+      # unused when it is available.
+      max-parallel: 6
       matrix:
         include:
           - group: general-server
@@ -199,6 +225,9 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -258,6 +287,9 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -268,10 +300,10 @@ jobs:
     name: Verify serialized server suites (${{ matrix.shard_label }})
     needs: [policy, general_tests]
     runs-on: default
-    timeout-minutes: 20
+    timeout-minutes: 90
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 4
       matrix:
         include:
           - shard_index: 0
@@ -309,6 +341,9 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -343,6 +378,9 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -373,7 +411,9 @@ jobs:
   e2e:
     needs: [policy]
     runs-on: default
-    timeout-minutes: 30
+    # The serial browser suite now covers 43 flows and remained active through
+    # test 42 when ARC enforced the previous 30-minute job ceiling.
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -396,6 +436,9 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

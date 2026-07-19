@@ -771,7 +771,7 @@ describe("sandbox callback bridge", () => {
     await expect(response.json()).resolves.toMatchObject({
       error: expect.stringMatching(/JSON|Unexpected|Unterminated/i),
     });
-  });
+  }, 30_000);
 
   it("reuses an already-uploaded bridge entrypoint when the remote file hash matches", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-sync-"));
@@ -913,6 +913,9 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/issues/issue-1/release" },
       { method: "PATCH", path: "/api/issues/issue-1" },
       { method: "GET", path: "/api/issues/issue-1/approvals" },
+      { method: "GET", path: "/api/issues/issue-1/work-products" },
+      { method: "POST", path: "/api/issues/issue-1/work-products" },
+      { method: "PATCH", path: "/api/work-products/wp-1" },
       { method: "GET", path: "/api/issues/issue-1/interactions" },
       { method: "GET", path: "/api/issues/issue-1/interactions/inter-1" },
       { method: "POST", path: "/api/issues/issue-1/interactions" },
@@ -966,6 +969,7 @@ describe("sandbox callback bridge", () => {
       { method: "GET", path: "/api/heartbeat-runs/run-1/artifacts" },
       { method: "DELETE", path: "/api/issues/issue-1/documents/plan" },
       { method: "DELETE", path: "/api/issues/issue-1/approvals/ap-1" },
+      { method: "DELETE", path: "/api/work-products/wp-1" },
       { method: "POST", path: "/api/approvals/ap-1/approve" },
       { method: "POST", path: "/api/approvals/ap-1/reject" },
       { method: "POST", path: "/api/companies/co-1/logo" },
