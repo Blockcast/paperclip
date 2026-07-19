@@ -137,17 +137,30 @@ describeEmbeddedPostgres("secretService", () => {
         required: false,
       },
     };
+    const adapterConfig = {
+      apiBaseUrl: "http://127.0.0.1:9119/api",
+      apiKey: {
+        type: "user_secret_ref" as const,
+        key: "github_token",
+        version: "latest" as const,
+      },
+    };
     await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: "agent-1" }, env);
     await svc.syncEnvBindingsForTarget(
       companyId,
       { targetType: "agent", targetId: "agent-optional" },
       optionalEnv,
     );
+    await svc.syncUserSecretDeclarationsForTarget(
+      companyId,
+      { targetType: "agent", targetId: "agent-adapter" },
+      [{ definitionKey: "github_token", configPath: "apiKey", envKey: "apiKey" }],
+    );
     await svc.createCurrentUserSecretValue(companyId, userId, {
       definitionId: definition.id,
       value: "must-not-be-injected",
     });
-    return { companyId, svc, definition, env, optionalEnv };
+    return { companyId, svc, definition, env, optionalEnv, adapterConfig };
   }
 
   it("rejects cross-company secret references during env normalization", async () => {
@@ -710,7 +723,7 @@ describeEmbeddedPostgres("secretService", () => {
 
   it("denies configured user secrets when the responsible user is a viewer", async () => {
     const userId = "viewer-user";
-    const { companyId, svc, definition, env, optionalEnv } =
+    const { companyId, svc, definition, env, optionalEnv, adapterConfig } =
       await seedConfiguredUserSecretRuntime(userId);
     await db
       .update(companyMemberships)
@@ -726,6 +739,26 @@ describeEmbeddedPostgres("secretService", () => {
     ).resolves.toEqual([
       expect.objectContaining({
         bindingType: "user_secret_ref",
+        userSecretDefinitionId: definition.id,
+        responsibleUserId: userId,
+        errorCode: "responsible_user_unauthorized",
+      }),
+    ]);
+    await expect(
+      svc.collectMissingAdapterConfigRuntimeBindings(
+        companyId,
+        adapterConfig,
+        "hermes_gateway",
+        {
+          consumerType: "agent",
+          consumerId: "agent-adapter",
+          responsibleUserId: userId,
+        },
+      ),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        bindingType: "user_secret_ref",
+        configPath: "apiKey",
         userSecretDefinitionId: definition.id,
         responsibleUserId: userId,
         errorCode: "responsible_user_unauthorized",
