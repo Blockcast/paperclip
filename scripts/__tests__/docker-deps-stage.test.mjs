@@ -6,10 +6,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const checker = path.join(repoRoot, "scripts", "check-docker-deps-stage.mjs");
 
-test("rejects literal Dockerfile COPY sources that no longer exist", (t) => {
+test("rejects stale literal Dockerfile COPY sources", (t) => {
   const fixtureRoot = mkdtempSync(path.join(tmpdir(), "paperclip-docker-deps-"));
   t.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
 
