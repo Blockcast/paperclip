@@ -241,10 +241,9 @@ function createWorkerProxyHandler(
         // original form-urlencoded payload entirely (Slack interactivity) and
         // does not reproduce non-canonical JSON byte-for-byte. The
         // content-type is carried untouched by forwardRequestHeaders; we must
-        // NOT override it. rawBody is always present for requests with a body
-        // (the express.raw catch-all in app.ts captures every content-type);
-        // the JSON.stringify fallback is a defensive guard that should not
-        // fire in practice.
+        // NOT override it. rawBody is present for the non-multipart requests
+        // handled by the current proxy allowlist; the JSON.stringify fallback
+        // is a defensive guard that should not fire in practice.
         const stashedRaw = (req as unknown as { rawBody?: Buffer }).rawBody;
         if (stashedRaw) {
           // Zero-copy Uint8Array view of the exact captured bytes. (Buffer is a

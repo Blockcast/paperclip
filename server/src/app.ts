@@ -291,9 +291,10 @@ export async function createApp(
 ) {
   const app = express();
   app.locals.paperclipDb = db;
-  // JSON + urlencoded + raw catch-all, each capturing req.rawBody so the
-  // API->worker proxy can forward the exact provider-signed bytes for HMAC
-  // verification. See server/src/http/body-parsers.ts.
+  // JSON + urlencoded + a non-multipart raw catch-all capture req.rawBody so
+  // the API->worker proxy can forward exact provider-signed bytes for HMAC
+  // verification while route-scoped multipart parsers retain the stream.
+  // See server/src/http/body-parsers.ts.
   registerBodyParsers(app);
 
   // Prometheus exposition (BLO-8328). Mounted ahead of httpLogger and
