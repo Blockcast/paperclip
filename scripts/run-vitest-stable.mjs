@@ -68,6 +68,13 @@ const serializedServerVitestArgs = [
   "--no-file-parallelism",
   "--maxWorkers=1",
 ];
+// Workspace projects run concurrently inside each Vitest invocation. ARC CPU
+// contention can stretch otherwise healthy filesystem/process tests beyond
+// Vitest's 5-second default without indicating a hang.
+const arcWorkspaceVitestArgs = [
+  "--testTimeout=30000",
+  "--hookTimeout=60000",
+];
 
 function walk(dir) {
   const entries = readdirSync(dir);
@@ -286,9 +293,9 @@ function runGeneralSuites(routeTests) {
   }
 }
 
-function runProjectGroup(projects, groupName) {
+function runProjectGroup(projects, groupName, extraArgs = []) {
   for (const project of projects) {
-    runVitest(["--project", project], `${groupName} project ${project}`);
+    runVitest(["--project", project, ...extraArgs], `${groupName} project ${project}`);
   }
 }
 
@@ -346,7 +353,7 @@ function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = 
   }
 
   if (groupName === generalWorkspacesBGroupName) {
-    runProjectGroup(generalWorkspacesBProjects, groupName);
+    runProjectGroup(generalWorkspacesBProjects, groupName, arcWorkspaceVitestArgs);
     return;
   }
 
@@ -408,6 +415,7 @@ if (options.dryRun) {
         shardCount: options.shardCount,
         group: options.group,
         availableGeneralGroups: generalGroupNames,
+        generalWorkspacesBVitestArgs: arcWorkspaceVitestArgs,
         serializedSuiteCount: routeTests.length,
         selectedSerializedSuites: serializedSuites.map((routeTest) => routeTest.repoPath),
         generalServerSuiteCount: generalServerTestFiles.length,

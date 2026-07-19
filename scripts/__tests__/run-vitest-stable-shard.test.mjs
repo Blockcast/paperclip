@@ -69,6 +69,14 @@ test("shard flags are rejected for the parallel workspace groups", () => {
   assert.notEqual(result.status, 0, "workspace groups must not accept shard flags");
 });
 
+test("the workspace-b group uses ARC-safe Vitest timeouts", () => {
+  const dryRun = dryRunJson(["--mode", "general", "--group", "general-workspaces-b"]);
+  assert.deepEqual(dryRun.generalWorkspacesBVitestArgs, [
+    "--testTimeout=30000",
+    "--hookTimeout=60000",
+  ]);
+});
+
 test("duration-aware partition balances skewed weights better than round-robin", () => {
   // Round-robin puts all three heavy suites on shard 0 (indexes 0, 3, 6).
   const files = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
