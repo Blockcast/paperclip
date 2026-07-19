@@ -67,7 +67,9 @@ jobs:
         run: node ./scripts/check-github-runner-labels.mjs
 
       - name: Validate Dockerfile deps stage
-        run: node ./scripts/check-docker-deps-stage.mjs
+        run: |
+          node ./scripts/check-docker-deps-stage.mjs
+          node --test ./scripts/__tests__/docker-deps-stage.test.mjs
 
       - name: Validate Docker deploy timeout margin
         run: node --test ./scripts/check-docker-deploy-timeout.test.js
