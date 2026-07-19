@@ -3,9 +3,11 @@
   "files": [],
   "references": [
     { "path": "./packages/adapter-utils" },
+    { "path": "./packages/google-sheets-mcp-server" },
     { "path": "./packages/mcp-server" },
     { "path": "./packages/shared" },
     { "path": "./packages/db" },
+    { "path": "./packages/adapters/acpx-local" },
     { "path": "./packages/adapters/claude-local" },
     { "path": "./packages/adapters/codex-local" },
     { "path": "./packages/adapters/cursor-local" },

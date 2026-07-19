@@ -138,6 +138,11 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "environment.destroyLease": ["environment.drivers.register"],
   "environment.realizeWorkspace": ["environment.drivers.register"],
   "environment.execute": ["environment.drivers.register"],
+  "environment.startInteractiveSetup": ["environment.drivers.register"],
+  "environment.getInteractiveSetup": ["environment.drivers.register"],
+  "environment.captureTemplate": ["environment.drivers.register"],
+  "environment.cancelInteractiveSetup": ["environment.drivers.register"],
+  "environment.deleteTemplate": ["environment.drivers.register"],
 };
 
 /**

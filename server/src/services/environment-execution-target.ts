@@ -49,7 +49,6 @@ export async function resolveEnvironmentExecutionTarget(input: {
 
   if (input.environment.driver === "sandbox") {
     if (
-      input.adapterType !== "acpx_local" &&
       input.adapterType !== "codex_local" &&
       input.adapterType !== "claude_local" &&
       input.adapterType !== "gemini_local" &&
@@ -88,6 +87,10 @@ export async function resolveEnvironmentExecutionTarget(input: {
       environmentId: input.environment.id ?? null,
       leaseId: input.leaseId ?? null,
       timeoutMs,
+      // Run-log streaming defaults ON for sandbox environments so agent CLI
+      // output reaches the UI mid-run; `streamRunLogs: false` is an explicit
+      // opt-out back to batch-at-end delivery.
+      streamRunLogs: parsed.config.streamRunLogs !== false,
       runner: input.environmentRuntime && input.lease
         ? {
             supportsSingleStreamStdinProgress: false,
@@ -188,7 +191,6 @@ export async function resolveEnvironmentExecutionTarget(input: {
   if (
     (
       input.adapterType !== "codex_local" &&
-      input.adapterType !== "acpx_local" &&
       input.adapterType !== "claude_local" &&
       input.adapterType !== "gemini_local" &&
       input.adapterType !== "opencode_local" &&

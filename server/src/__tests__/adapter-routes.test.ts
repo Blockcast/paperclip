@@ -115,12 +115,14 @@ describe("adapter routes", () => {
     adapterRoutes = routes.adapterRoutes;
     errorHandler = middleware.errorHandler;
     setOverridePaused("claude_local", false);
+    unregisterServerAdapter("hermes_local");
     unregisterServerAdapter("claude_local");
     registerServerAdapter(overridingConfigSchemaAdapter);
   });
 
   afterEach(() => {
     setOverridePaused("claude_local", false);
+    unregisterServerAdapter("hermes_local");
     unregisterServerAdapter("claude_local");
   });
 
@@ -140,6 +142,7 @@ describe("adapter routes", () => {
       expect(typeof adapter.capabilities.supportsSkills).toBe("boolean");
       expect(typeof adapter.capabilities.supportsLocalAgentJwt).toBe("boolean");
       expect(typeof adapter.capabilities.requiresMaterializedRuntimeSkills).toBe("boolean");
+      expect(typeof adapter.capabilities.supportsAcp).toBe("boolean");
     }
   });
 
@@ -158,6 +161,15 @@ describe("adapter routes", () => {
       supportsSkills: true,
       supportsLocalAgentJwt: true,
       requiresMaterializedRuntimeSkills: false,
+      supportsAcp: true,
+    });
+    expect(codexLocal.acp).toMatchObject({
+      agentId: "codex",
+      skillsMode: "ephemeral",
+      prerequisites: {
+        nodeRange: ">=22.13.0",
+        packages: ["@agentclientprotocol/codex-acp"],
+      },
     });
 
     // process adapter should have no local capabilities
@@ -166,8 +178,9 @@ describe("adapter routes", () => {
     expect(processAdapter.capabilities).toMatchObject({
       supportsInstructionsBundle: false,
       supportsSkills: false,
-      supportsLocalAgentJwt: false,
+      supportsLocalAgentJwt: true,
       requiresMaterializedRuntimeSkills: false,
+      supportsAcp: false,
     });
 
     // cursor adapter should require materialized runtime skills
@@ -175,6 +188,25 @@ describe("adapter routes", () => {
     expect(cursorAdapter).toBeDefined();
     expect(cursorAdapter.capabilities.requiresMaterializedRuntimeSkills).toBe(true);
     expect(cursorAdapter.capabilities.supportsInstructionsBundle).toBe(true);
+    expect(cursorAdapter.capabilities.supportsAcp).toBe(false);
+
+    const geminiAdapter = res.body.find((a: any) => a.type === "gemini_local");
+    expect(geminiAdapter).toBeDefined();
+    expect(geminiAdapter.capabilities).toMatchObject({
+      supportsInstructionsBundle: true,
+      supportsSkills: true,
+      supportsLocalAgentJwt: true,
+      requiresMaterializedRuntimeSkills: true,
+      supportsAcp: true,
+    });
+    expect(geminiAdapter.acp).toMatchObject({
+      agentId: "gemini",
+      skillsMode: "ephemeral",
+      prerequisites: {
+        nodeRange: ">=20.0.0",
+        packages: ["@google/gemini-cli"],
+      },
+    });
 
     const grokAdapter = res.body.find((a: any) => a.type === "grok_local");
     expect(grokAdapter).toBeDefined();
@@ -183,19 +215,22 @@ describe("adapter routes", () => {
       supportsSkills: true,
       supportsLocalAgentJwt: true,
       requiresMaterializedRuntimeSkills: true,
+      supportsAcp: false,
     });
 
-    // hermes_local currently supports skills + local JWT, but not the managed
-    // instructions bundle flow because the bundled adapter does not consume
-    // instructionsFilePath at runtime.
-    const hermesAdapter = res.body.find((a: any) => a.type === "hermes_local");
-    expect(hermesAdapter).toBeDefined();
-    expect(hermesAdapter.capabilities).toMatchObject({
+    const hermesLocal = res.body.find((a: any) => a.type === "hermes_local");
+    expect(hermesLocal).toBeDefined();
+    expect(hermesLocal.source).toBe("builtin");
+    expect(hermesLocal.capabilities).toMatchObject({
       supportsInstructionsBundle: false,
       supportsSkills: true,
       supportsLocalAgentJwt: true,
       requiresMaterializedRuntimeSkills: false,
+      supportsAcp: false,
     });
+
+    const hermesGateway = res.body.find((a: any) => a.type === "hermes_gateway");
+    expect(hermesGateway).toBeUndefined();
   });
 
   it("GET /api/adapters derives supportsSkills from listSkills/syncSkills presence", async () => {
@@ -214,7 +249,7 @@ describe("adapter routes", () => {
     expect(codexLocal).toBeDefined();
     expect(codexLocal.capabilities.supportsSkills).toBe(true);
 
-    // acpx_local exposes runtime-aware skill snapshots for Claude/Codex/custom ACP agents
+    // acpx_local exposes runtime-aware skill snapshots for Claude/Codex/custom ACP agents.
     const acpxLocal = res.body.find((a: any) => a.type === "acpx_local");
     expect(acpxLocal).toBeDefined();
     expect(acpxLocal.capabilities.supportsSkills).toBe(true);
@@ -275,6 +310,108 @@ describe("adapter routes", () => {
     expect(keys).not.toContain("instructionsFilePath");
     expect(keys).not.toContain("promptTemplate");
     expect(keys).not.toContain("bootstrapPromptTemplate");
+  });
+
+  it("serves the built-in claude_local ACP engine config schema", async () => {
+    const app = createApp();
+
+    const paused = await request(app)
+      .patch("/api/adapters/claude_local/override")
+      .send({ paused: true });
+    expect(paused.status, JSON.stringify(paused.body)).toBe(200);
+
+    const res = await request(app).get("/api/adapters/claude_local/config-schema");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.fields).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          key: "engine",
+          default: "auto",
+          options: expect.arrayContaining([
+            expect.objectContaining({ value: "auto" }),
+            expect.objectContaining({ value: "cli" }),
+            expect.objectContaining({ value: "acp" }),
+          ]),
+        }),
+        expect.objectContaining({
+          key: "agentCommand",
+          meta: { visibleWhen: { key: "engine", values: ["acp"] } },
+        }),
+        expect.objectContaining({
+          key: "warmHandleIdleMs",
+          default: 0,
+        }),
+      ]),
+    );
+  });
+
+  it("serves the built-in codex_local ACP engine config schema", async () => {
+    const app = createApp();
+
+    const res = await request(app).get("/api/adapters/codex_local/config-schema");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.fields).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          key: "engine",
+          default: "auto",
+          options: expect.arrayContaining([
+            expect.objectContaining({ value: "auto" }),
+            expect.objectContaining({ value: "cli" }),
+            expect.objectContaining({ value: "acp" }),
+          ]),
+        }),
+        expect.objectContaining({
+          key: "agentCommand",
+          meta: { visibleWhen: { key: "engine", values: ["acp"] } },
+        }),
+        expect.objectContaining({
+          key: "warmHandleIdleMs",
+          default: 0,
+        }),
+      ]),
+    );
+  });
+
+  it("serves the built-in gemini_local ACP engine config schema", async () => {
+    const app = createApp();
+
+    const res = await request(app).get("/api/adapters/gemini_local/config-schema");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.fields).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          key: "engine",
+          default: "auto",
+          options: expect.arrayContaining([
+            expect.objectContaining({ value: "auto" }),
+            expect.objectContaining({ value: "cli" }),
+            expect.objectContaining({ value: "acp" }),
+          ]),
+        }),
+        expect.objectContaining({
+          key: "agentCommand",
+          meta: { visibleWhen: { key: "engine", values: ["acp"] } },
+        }),
+        expect.objectContaining({
+          key: "warmHandleIdleMs",
+          default: 0,
+        }),
+      ]),
+    );
+  });
+
+  it("does not invent built-in schemas for externally supplied Hermes adapters", async () => {
+    const app = createApp();
+
+    const local = await request(app).get("/api/adapters/hermes_local/config-schema");
+    expect(local.status, JSON.stringify(local.body)).toBe(404);
+
+    const gateway = await request(app).get("/api/adapters/hermes_gateway/config-schema");
+    expect(gateway.status, JSON.stringify(gateway.body)).toBe(404);
   });
 
   it("GET /api/adapters includes ACPX model availability", async () => {

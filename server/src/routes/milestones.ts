@@ -3,7 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { createMilestoneSchema, updateMilestoneSchema } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { createMilestonesService, logActivity } from "../services/index.js";
-import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import { assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
 
 export function milestoneRoutes(db: Db) {
   const router = Router();
@@ -19,12 +19,8 @@ export function milestoneRoutes(db: Db) {
 
   router.get("/milestones/:id", async (req, res) => {
     const id = req.params.id as string;
-    const milestone = await svc.getById(id);
-    if (!milestone) {
-      res.status(404).json({ error: "Milestone not found" });
-      return;
-    }
-    assertCompanyAccess(req, milestone.companyId);
+    const milestone = await getAccessibleResource(req, res, svc.getById(id), "Milestone not found");
+    if (!milestone) return;
     res.json(milestone);
   });
 
@@ -55,12 +51,8 @@ export function milestoneRoutes(db: Db) {
 
   router.patch("/milestones/:id", validate(updateMilestoneSchema), async (req, res) => {
     const id = req.params.id as string;
-    const existing = await svc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Milestone not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Milestone not found");
+    if (!existing) return;
     const milestone = await svc.update(id, req.body);
     if (!milestone) {
       res.status(404).json({ error: "Milestone not found" });
@@ -90,12 +82,8 @@ export function milestoneRoutes(db: Db) {
 
   router.delete("/milestones/:id", async (req, res) => {
     const id = req.params.id as string;
-    const existing = await svc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Milestone not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Milestone not found");
+    if (!existing) return;
     const removed = await svc.remove(id);
     if (!removed) {
       res.status(404).json({ error: "Milestone not found" });

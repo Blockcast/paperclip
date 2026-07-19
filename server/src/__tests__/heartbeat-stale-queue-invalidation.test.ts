@@ -139,7 +139,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
-  });
+  }, 240_000);
 
   async function seedCompanyAndAgent(opts: SeedOptions = {}): Promise<SeedResult> {
     const companyId = randomUUID();
@@ -148,6 +148,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       id: companyId,
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: false,
     });
     await db.insert(agents).values({
@@ -349,7 +350,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(countExecuteCallsForRun(run!.id)).toBe(1);
   });
 
-  it("runs generic timer wakes by default for proactive agents without assigned issue work", async () => {
+  it("allows legacy generic timer wakes by default when no skip policy is set", async () => {
     const { agentId } = await seedCompanyAndAgent({
       heartbeatConfig: {
         enabled: true,
@@ -363,7 +364,24 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
 
     expect(run).not.toBeNull();
     await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
+    expect(countExecuteCallsForRun(run!.id)).toBe(1);
+  });
 
+  it("allows explicit proactive generic timer wakes without assigned issue work", async () => {
+    const { agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: false,
+      },
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).not.toBeNull();
+    await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
     expect(countExecuteCallsForRun(run!.id)).toBe(1);
   });
 
@@ -1463,5 +1481,64 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(run?.status).toBe("succeeded");
     expect(run?.errorCode).toBeNull();
     expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs accepted-interaction continuation recovery despite a pre-acceptance review park", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Approved implementation resumes",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    await seedContinuationSummary({
+      companyId,
+      issueId,
+      agentId,
+      body: [
+        "# Continuation Summary",
+        "",
+        "## Next Action",
+        "",
+        "- Wait for reviewer feedback or approval before continuing executor work.",
+      ].join("\n"),
+    });
+
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_continuation_needed",
+      invocationSource: "automation",
+      contextExtras: {
+        retryReason: "issue_continuation_needed",
+        mutation: "interaction",
+        interactionId: randomUUID(),
+        interactionResolvedAt: "2026-03-19T00:05:00.000Z",
+      },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded";
+    });
+
+    const run = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run?.status).toBe("succeeded");
+    expect(run?.errorCode).toBeNull();
+    expect(countExecuteCallsForRun(runId)).toBe(1);
   });
 });

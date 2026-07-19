@@ -350,6 +350,55 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
+  it("scopes legacy runJob invocations to the sole configured company", async () => {
+    const companiesGet = vi.fn(async (
+      params: { companyId: string },
+      context?: { invocationScope?: { companyId?: string | null } | null },
+    ) => ({
+      id: params.companyId,
+      scopedCompanyId: context?.invocationScope?.companyId ?? null,
+    }));
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      bootstrapCompanyId: "company-a",
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {
+        "companies.get": companiesGet as never,
+      },
+    });
+
+    try {
+      await handle.start();
+
+      await expect(handle.call("runJob", {
+        job: {
+          jobKey: "probe",
+          runId: "run-1",
+          trigger: "schedule",
+          scheduledAt: "2026-06-01T00:00:00.000Z",
+          mode: "echo",
+          requestedCompanyId: "company-a",
+        },
+      } as HostToWorkerMethods["runJob"][0])).resolves.toEqual({
+        id: "company-a",
+        scopedCompanyId: "company-a",
+      });
+
+      expect(companiesGet).toHaveBeenCalledWith(
+        { companyId: "company-a" },
+        { invocationScope: { companyId: "company-a" } },
+      );
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("rejects performAction nested host calls that omit the invocation id", async () => {
     const handlers = createHostClientHandlers({
       pluginId: "test.plugin",
@@ -494,36 +543,102 @@ describe("plugin-worker-manager stderr failure context", () => {
   });
 });
 
-describe("anthropicRoutingEnv", () => {
-  it("forwards the Anthropic routing vars that are set on the host", () => {
-    expect(
-      anthropicRoutingEnv({
-        ANTHROPIC_BASE_URL: "https://paperclip.example/ccrotate",
-        ANTHROPIC_AUTH_TOKEN: "pcp_board_token",
-        ANTHROPIC_API_KEY: "pcp_board_token",
-      }),
-    ).toEqual({
-      ANTHROPIC_BASE_URL: "https://paperclip.example/ccrotate",
-      ANTHROPIC_AUTH_TOKEN: "pcp_board_token",
-      ANTHROPIC_API_KEY: "pcp_board_token",
+
+describe("plugin host company context guards", () => {
+  it("rejects config and secret calls without host-issued company context before host services run", async () => {
+    const configGet = vi.fn(async () => ({ apiKey: "unreachable" }));
+    const secretsResolve = vi.fn(async () => "unreachable");
+    const handlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["secrets.read-ref"],
+      services: {
+        config: { get: configGet },
+        secrets: { resolve: secretsResolve },
+      } as unknown as HostServices,
     });
+
+    await expect(handlers["config.get"]({})).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
+    await expect(handlers["config.get"]({ companyId: "company-1" })).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
+    await expect(
+      handlers["secrets.resolve"]({
+        secretRef: { type: "secret_ref", secretId: "11111111-1111-4111-8111-111111111111" },
+      }),
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
+    await expect(
+      handlers["secrets.resolve"]({
+        companyId: "company-1",
+        secretRef: { type: "secret_ref", secretId: "11111111-1111-4111-8111-111111111111" },
+      }),
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
+
+    expect(configGet).not.toHaveBeenCalled();
+    expect(secretsResolve).not.toHaveBeenCalled();
   });
 
-  it("drops unset and empty vars so the SDK default base URL is never clobbered", () => {
-    expect(
-      anthropicRoutingEnv({
-        ANTHROPIC_BASE_URL: "",
-        ANTHROPIC_AUTH_TOKEN: "pcp_board_token",
-      }),
-    ).toEqual({ ANTHROPIC_AUTH_TOKEN: "pcp_board_token" });
-  });
+  it("rejects cross-company config and secret reads in scoped worker invocations before host services run", async () => {
+    const configGet = vi.fn(async () => ({ apiKeyRef: "unreachable" }));
+    const secretsResolve = vi.fn(async () => "unreachable");
+    const hostHandlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["secrets.read-ref"],
+      services: {
+        config: { get: configGet },
+        secrets: { resolve: secretsResolve },
+      } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers,
+    });
 
-  it("never forwards unrelated host env vars", () => {
-    expect(
-      anthropicRoutingEnv({
-        DATABASE_URL: "postgres://secret",
-        BETTER_AUTH_SECRET: "shh",
-      }),
-    ).toEqual({});
+    try {
+      await handle.start();
+
+      for (const hostMethod of ["config.get", "secrets.resolve"] as const) {
+        await expect(handle.call("performAction", {
+          key: "probe",
+          params: {
+            mode: "echo",
+            hostMethod,
+            requestedCompanyId: "company-b",
+          },
+          actorContext: {
+            type: "agent",
+            userId: null,
+            agentId: "agent-1",
+            runId: "run-1",
+            companyId: "company-a",
+          },
+          renderEnvironment: null,
+        })).rejects.toMatchObject({
+          code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+          message: expect.stringContaining('requested company "company-b"'),
+        });
+      }
+
+      expect(configGet).not.toHaveBeenCalled();
+      expect(secretsResolve).not.toHaveBeenCalled();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
   });
 });

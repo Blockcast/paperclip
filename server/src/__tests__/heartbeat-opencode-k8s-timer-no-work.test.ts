@@ -63,6 +63,7 @@ describeEmbeddedPostgres("opencode_k8s timer no-work suppression", () => {
       name: "Paperclip",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
     });
 
     await db.insert(agents).values({

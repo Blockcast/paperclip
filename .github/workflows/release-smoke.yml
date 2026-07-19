@@ -21,6 +21,7 @@ on:
         required: false
         default: release-smoke
         type: string
+
   workflow_call:
     inputs:
       paperclip_version:
@@ -34,6 +35,12 @@ on:
         required: false
         default: release-smoke
         type: string
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+  CC: "sccache gcc"
+  CXX: "sccache g++"
 
 jobs:
   smoke:
@@ -54,6 +61,9 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile

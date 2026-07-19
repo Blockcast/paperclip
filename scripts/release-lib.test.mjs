@@ -18,6 +18,7 @@ function runPublishHelper({ pnpmMode, npmVersionExists = false, distTag = "canar
   const callLog = join(fixtureDir, "calls.log");
   mkdirSync(binDir);
   mkdirSync(stateDir);
+  writeFileSync(callLog, "");
 
   writeExecutable(
     join(binDir, "pnpm"),

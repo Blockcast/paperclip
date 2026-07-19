@@ -60,6 +60,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       name: "Test",
       issuePrefix: "BLO",
       requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
     });
     await db.insert(agents).values({
       id: agentId,
