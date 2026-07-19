@@ -861,8 +861,8 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       expect(scopedIssue?.executionLockedAt).toBeInstanceOf(Date);
       expect(scopedReservation).toMatchObject({
         slotId: 1,
-        isolationMode: "shared",
-        isolationKey: `agent-shared:${agentId}`,
+        isolationMode: "run",
+        isolationKey: `run:${scopedRunId}`,
       });
       expect(adapterCalledForRun(scopedRunId)).toBe(true);
     } finally {
