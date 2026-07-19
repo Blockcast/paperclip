@@ -131,7 +131,10 @@ describe("App Cases routing (PAP-13002)", () => {
 
   beforeAll(async () => {
     ({ App } = await import("./App"));
-  }, 60_000);
+    // Importing the full App module pulls in the entire route/dependency graph.
+    // On the shared ARC pool under CPU contention this cold transform can exceed
+    // 60s without indicating a hang (BLO-17053), so give it generous headroom.
+  }, 180_000);
 
   beforeEach(() => {
     container = document.createElement("div");

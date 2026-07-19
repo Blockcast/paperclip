@@ -619,5 +619,8 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
 
     expect(importedFromZip.company.action).toBe("created");
     expect(importedFromZip.agents.some((agent) => agent.action === "created")).toBe(true);
-  }, 90_000);
+    // Spawns a real server process and drives a full export + double import. The
+    // prior 90s override sat below this project's own 120s ARC default and
+    // flaked under shared-runner contention (BLO-17053); give it real headroom.
+  }, 180_000);
 });
