@@ -162,7 +162,9 @@ WORKDIR /vendor
 # if the metrics or log transport is unavailable; map legacy `isolated` labels
 # to the bounded `workspace` mode. PR kkroo/paperclip-adapter-claude-k8s#23;
 # typecheck, build, and 432/432 tests pass.
-ARG CLAUDE_K8S_REF=e2bc98321155d857ac3ee545ff2952c3dd4a6617
+# Bumped 2026-07-20 to cd52a58: bound the pre-Job live-Job list to 15 seconds
+# and fail closed when Kubernetes does not answer. PR kkroo/paperclip-adapter-claude-k8s#24.
+ARG CLAUDE_K8S_REF=cd52a58173200fe1193c54f732b0405e0b8073fe
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
