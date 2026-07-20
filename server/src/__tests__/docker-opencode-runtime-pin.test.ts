@@ -31,7 +31,8 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   });
 
   it("vendors the claude_k8s adapter commit with runtime isolation and Penstock retry hints", () => {
-    expect(serverDockerfile).toContain("ARG CLAUDE_K8S_REF=e2bc98321155d857ac3ee545ff2952c3dd4a6617");
+    expect(serverDockerfile).toContain("ARG CLAUDE_K8S_REF=cd52a58173200fe1193c54f732b0405e0b8073fe");
+    expect(serverDockerfile).toContain("bound the pre-Job live-Job list to 15 seconds");
     expect(serverDockerfile).toContain("PEN-1305 PreToolUse env-guard");
     expect(serverDockerfile).toContain("always materialize the shared MCP baseline");
     expect(serverDockerfile).toContain("Fixes BackendEngineerGo/Ally missing paperclip/hindsight/gbrain/linear/etc.");
