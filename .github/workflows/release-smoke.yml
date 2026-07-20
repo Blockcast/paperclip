@@ -94,6 +94,7 @@ jobs:
           INPUT_PAPERCLIP_VERSION: ${{ inputs.paperclip_version }}
         run: |
           metadata_file="$RUNNER_TEMP/release-smoke.env"
+          echo "SMOKE_METADATA_FILE=$metadata_file" >> "$GITHUB_ENV"
           HOST_PORT="$INPUT_HOST_PORT" \
           DATA_DIR="$RUNNER_TEMP/release-smoke-data" \
           PAPERCLIPAI_VERSION="$INPUT_PAPERCLIP_VERSION" \
@@ -124,8 +125,19 @@ jobs:
       - name: Capture Docker logs
         if: always()
         run: |
+          if [[ -f "${SMOKE_METADATA_FILE:-}" ]]; then
+            set -a
+            source "$SMOKE_METADATA_FILE"
+            set +a
+          fi
           if [[ -n "${SMOKE_CONTAINER_NAME:-}" ]]; then
-            docker logs "$SMOKE_CONTAINER_NAME" >"$RUNNER_TEMP/docker-onboard-smoke.log" 2>&1 || true
+            {
+              docker logs "$SMOKE_CONTAINER_NAME" 2>&1 || true
+              echo "--- npm debug log tail ---"
+              docker exec "$SMOKE_CONTAINER_NAME" bash -lc \
+                'for log in "$HOME"/.npm/_logs/*; do [[ -f "$log" ]] || continue; echo "--- $log ---"; tail -n 200 "$log"; done' \
+                2>&1 || true
+            } >"$RUNNER_TEMP/docker-onboard-smoke.log"
           fi
 
       - name: Upload diagnostics
@@ -143,6 +155,11 @@ jobs:
       - name: Stop Docker smoke container
         if: always()
         run: |
+          if [[ -f "${SMOKE_METADATA_FILE:-}" ]]; then
+            set -a
+            source "$SMOKE_METADATA_FILE"
+            set +a
+          fi
           if [[ -n "${SMOKE_CONTAINER_NAME:-}" ]]; then
             docker rm -f "$SMOKE_CONTAINER_NAME" >/dev/null 2>&1 || true
           fi
