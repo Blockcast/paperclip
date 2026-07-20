@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
@@ -440,6 +440,32 @@ describe("runChildProcess", () => {
     expect(result.stdout).toBe("hello from stdin");
     expect(onSpawnCompletedAt).toBeGreaterThanOrEqual(startedAt + spawnDelayMs);
     expect(finishedAt - startedAt).toBeGreaterThanOrEqual(spawnDelayMs);
+  });
+
+  it("ignores a closed stdin when the child stops reading before spawn persistence completes", async () => {
+    const onLogError = vi.fn();
+    const spawnDelayMs = 150;
+
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      ["-e", "require('node:fs').closeSync(0);setTimeout(() => process.exit(0), 300)"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        stdin: "unused input",
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+        onLogError,
+        onSpawn: async () => {
+          await new Promise((resolve) => setTimeout(resolve, spawnDelayMs));
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(onLogError).not.toHaveBeenCalled();
   });
 
   it.skipIf(process.platform === "win32")("kills descendant processes on timeout via the process group", async () => {

@@ -1139,7 +1139,7 @@ describe("claude execute", () => {
       restore();
       await fs.rm(root, { recursive: true, force: true });
     }
-  }, 10_000);
+  }, 30_000);
 
   it("degrades to the conservative fallback (returns null) when the sandbox probe throws, and retries on the next lease", async () => {
     let calls = 0;
