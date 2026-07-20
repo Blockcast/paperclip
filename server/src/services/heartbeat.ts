@@ -22916,15 +22916,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await releaseIssueExecutionAndPromote(cancelled);
     }
 
-    await finalizeAgentStatus(run.agentId, "cancelled");
-    await startNextQueuedRunForAgent(run.agentId);
-
     // RCA 2026-05-06: external-lifecycle adapters (claude_k8s, opencode_k8s)
     // create a k8s Job that doesn't observe local SIGTERM. Without this,
     // a manual cancel UPDATE'd `status='cancelled'` but the Job stayed
     // alive; the next dispatch's precondition matched the surviving Job
-    // and rejected with "Concurrent run blocked". Cascade-delete the
-    // Job so the slot frees up. Best-effort.
+    // and rejected with "Concurrent run blocked". Delete the exact Job
+    // before dispatching another run: the dispatcher may release the terminal
+    // run's reservation, which is the durable name/UID identity required for
+    // safe deletion. Best-effort.
     if (agent && hasExternalLifecycle(agent.adapterType)) {
       try {
         const deleted = await deleteExactExternalRuntimeJob(run);
@@ -22939,6 +22938,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       }
     }
+
+    await finalizeAgentStatus(run.agentId, "cancelled");
+    await startNextQueuedRunForAgent(run.agentId);
     return cancelled;
   }
 

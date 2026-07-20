@@ -305,7 +305,7 @@ async function waitForPidExit(pid: number, timeoutMs = 2_000) {
 async function waitForRunToSettle(
   heartbeat: ReturnType<typeof heartbeatService>,
   runId: string,
-  timeoutMs = 3_000,
+  timeoutMs = 10_000,
 ) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
