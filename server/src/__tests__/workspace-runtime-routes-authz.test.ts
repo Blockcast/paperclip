@@ -332,7 +332,13 @@ describe.sequential("workspace runtime service route authorization", () => {
     expect(res.body.error).toContain("Missing permission");
     expect(mockProjectService.getById).toHaveBeenCalledWith(projectId);
     expect(mockAssertCanManageProjectWorkspaceRuntimeServices).toHaveBeenCalled();
-  }, 15000);
+    // These route tests cold-import errors.js + the project/execution-workspace
+    // route + middleware modules per case. On the shared ARC pool under CPU
+    // contention that transform occasionally exceeds a 15s budget; when this
+    // test times out its in-flight request is not aborted and later lands its
+    // assertCanManage call inside the next test, corrupting that test's
+    // not.toHaveBeenCalled() count (BLO-17053). Give it real headroom.
+  }, 60_000);
 
   it("blocks shared-project stop/restart requests from agents", async () => {
     mockProjectService.getById.mockResolvedValue(buildProject({
@@ -381,7 +387,7 @@ describe.sequential("workspace runtime service route authorization", () => {
       expect(mockAssertCanManageProjectWorkspaceRuntimeServices).not.toHaveBeenCalled();
     }
 
-  }, 15000);
+  }, 60_000);
 
   it("rejects agent callers that create project execution workspace commands", async () => {
     const app = await createProjectApp({
@@ -472,7 +478,7 @@ describe.sequential("workspace runtime service route authorization", () => {
     expect(res.body.error).toContain("Missing permission");
     expect(mockExecutionWorkspaceService.getById).toHaveBeenCalledWith(executionWorkspaceId);
     expect(mockAssertCanManageExecutionWorkspaceRuntimeServices).toHaveBeenCalled();
-  }, 15000);
+  }, 60_000);
 
   it("rejects agent callers that patch execution workspace command config", async () => {
     mockExecutionWorkspaceService.getById.mockResolvedValue(buildExecutionWorkspace({ id: executionWorkspaceId }));
