@@ -8584,11 +8584,13 @@ export function issueRoutes(
       },
     });
 
-    if (existing.status === "in_progress" && issue.status !== existing.status && issue.status !== "in_progress") {
+    const explicitlyRecordedSuccessfulRunDisposition =
+      req.body.status !== undefined && issue.status !== "in_progress";
+    if (explicitlyRecordedSuccessfulRunDisposition) {
       await listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id], { hydrateLiveness: false })
         .then(async (handoffStates) => {
           const handoff = handoffStates.get(issue.id);
-          if (handoff?.state !== "required") return;
+          if (handoff?.state !== "required" && handoff?.state !== "escalated") return;
           await logActivity(db, {
             companyId: issue.companyId,
             actorType: actor.actorType,
