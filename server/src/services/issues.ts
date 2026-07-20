@@ -2414,12 +2414,20 @@ async function listIssueBlockerAttentionMap(
   const edgesByIssueId = new Map<string, IssueBlockerAttentionEdge[]>();
   for (const root of roots) nodesById.set(root.id, { ...root });
 
-  let frontier = roots.map((root) => root.id);
-  let truncated = false;
-  for (let depth = 0; frontier.length > 0 && depth < BLOCKER_ATTENTION_MAX_DEPTH; depth += 1) {
-    const nextFrontier = new Set<string>();
+  // Query the union of each breadth-first layer once, but retain independent
+  // visited sets and truncation state for every root. This keeps the batched
+  // query shape without letting one oversized graph invalidate unrelated
+  // roots in the same list page.
+  const nodeIdsByRoot = new Map(roots.map((root) => [root.id, new Set([root.id])]));
+  const queriedNodeIds = new Set<string>();
+  const truncatedRootIds = new Set<string>();
+  let frontierByRoot = new Map(roots.map((root) => [root.id, new Set([root.id])]));
+  for (let depth = 0; frontierByRoot.size > 0 && depth < BLOCKER_ATTENTION_MAX_DEPTH; depth += 1) {
+    const frontier = [...new Set([...frontierByRoot.values()].flatMap((nodeIds) => [...nodeIds]))].filter(
+      (nodeId) => !queriedNodeIds.has(nodeId),
+    );
 
-    for (const chunk of chunkList([...new Set(frontier)], ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+    for (const chunk of chunkList(frontier, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
       const explicitBlockerRowsPromise: Promise<IssueBlockerAttentionQueryRow[]> = dbOrTx
         .select({
           issueId: issueRelations.relatedIssueId,
@@ -2477,6 +2485,7 @@ async function listIssueBlockerAttentionMap(
         explicitBlockerRowsPromise,
         childRowsPromise,
       ]);
+      for (const nodeId of chunk) queriedNodeIds.add(nodeId);
 
       appendBlockerAttentionEdges(edgesByIssueId, [
         ...explicitBlockerRows
@@ -2503,17 +2512,34 @@ async function listIssueBlockerAttentionMap(
           monitorAttemptCount: row.monitorAttemptCount,
           executionPolicy: row.executionPolicy,
         });
-        nextFrontier.add(row.blockerIssueId);
       }
     }
 
-    if (nodesById.size > BLOCKER_ATTENTION_MAX_NODES) {
-      truncated = true;
-      break;
+    const nextFrontierByRoot = new Map<string, Set<string>>();
+    for (const [rootId, rootFrontier] of frontierByRoot) {
+      const rootNodeIds = nodeIdsByRoot.get(rootId)!;
+      const nextRootFrontier = new Set<string>();
+      let rootTruncated = false;
+      for (const nodeId of rootFrontier) {
+        for (const edge of edgesByIssueId.get(nodeId) ?? []) {
+          if (rootNodeIds.has(edge.blockerIssueId)) continue;
+          rootNodeIds.add(edge.blockerIssueId);
+          if (rootNodeIds.size > BLOCKER_ATTENTION_MAX_NODES) {
+            truncatedRootIds.add(rootId);
+            rootTruncated = true;
+            break;
+          }
+          nextRootFrontier.add(edge.blockerIssueId);
+        }
+        if (rootTruncated) break;
+      }
+      if (!rootTruncated && nextRootFrontier.size > 0) {
+        nextFrontierByRoot.set(rootId, nextRootFrontier);
+      }
     }
-    frontier = [...nextFrontier];
+    frontierByRoot = nextFrontierByRoot;
   }
-  if (frontier.length > 0) truncated = true;
+  for (const rootId of frontierByRoot.keys()) truncatedRootIds.add(rootId);
 
   const nodeIds = [...nodesById.keys()];
   const activeIssueIds = new Set<string>();
@@ -2652,9 +2678,11 @@ async function listIssueBlockerAttentionMap(
   const classifyPath = (
     nodeId: string,
     seen: Set<string>,
+    rootNodeIds: Set<string>,
+    rootTraversalTruncated: boolean,
   ): PathClassification => {
     const sample = blockerSampleIdentifier(nodesById.get(nodeId));
-    if (truncated || seen.has(nodeId)) {
+    if (rootTraversalTruncated || !rootNodeIds.has(nodeId) || seen.has(nodeId)) {
       return { covered: false, stalled: false, sampleBlockerIdentifier: sample, sampleStalledBlockerIdentifier: null };
     }
     const node = nodesById.get(nodeId);
@@ -2692,7 +2720,9 @@ async function listIssueBlockerAttentionMap(
     if (downstream.length > 0) {
       const nextSeen = new Set(seen);
       nextSeen.add(nodeId);
-      const classified = downstream.map((edge) => classifyPath(edge.blockerIssueId, nextSeen));
+      const classified = downstream.map((edge) =>
+        classifyPath(edge.blockerIssueId, nextSeen, rootNodeIds, rootTraversalTruncated),
+      );
       const stalledChild = classified.find((result) => result.stalled || result.sampleStalledBlockerIdentifier);
       const sampleStalled = stalledChild?.sampleStalledBlockerIdentifier ?? null;
       const hardAttention = classified.find((result) => !result.covered && !result.stalled);
@@ -2732,6 +2762,8 @@ async function listIssueBlockerAttentionMap(
   };
 
   for (const root of roots) {
+    const rootNodeIds = nodeIdsByRoot.get(root.id) ?? new Set([root.id]);
+    const rootTraversalTruncated = truncatedRootIds.has(root.id);
     const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
     if (topLevelEdges.length === 0) {
       attentionMap.set(root.id, createIssueBlockerAttention({
@@ -2743,7 +2775,7 @@ async function listIssueBlockerAttentionMap(
 
     const classified = topLevelEdges.map((edge) => ({
       edge,
-      result: classifyPath(edge.blockerIssueId, new Set([root.id])),
+      result: classifyPath(edge.blockerIssueId, new Set([root.id]), rootNodeIds, rootTraversalTruncated),
     }));
     const coveredBlockerCount = classified.filter((entry) => entry.result.covered).length;
     const stalledBlockerCount = classified.filter((entry) => entry.result.stalled).length;
@@ -3469,7 +3501,15 @@ async function listIssueBlockedInboxAttentionMap(
   const graphIssueIds = graphIssues.map((issue) => issue.id);
   const issuesById = new Map<string, IssueRow>(graphIssues.map((issue) => [issue.id, issue]));
 
-  const [activeRunRows, wakeRows, scheduledRetryRows, interactionRows, approvalRows, handoffMap] = await Promise.all([
+  const [
+    activeRunRows,
+    wakeRows,
+    scheduledRetryRows,
+    interactionRows,
+    approvalRows,
+    handoffMap,
+    blockerAttentionByIssueId,
+  ] = await Promise.all([
     graphIssueIds.length === 0
       ? Promise.resolve([])
       : dbOrTx
@@ -3569,6 +3609,10 @@ async function listIssueBlockedInboxAttentionMap(
             inArray(issueApprovals.issueId, graphIssueIds),
           )),
     listSuccessfulRunHandoffMapForIssues(dbOrTx, companyId, rowIssueIds, { hydrateLiveness: false }),
+    // Resolve the union of blocked roots once. Calling this from the row loop
+    // turns every blocked-inbox read into an N+1 graph traversal on companies
+    // with a large stopped-work backlog.
+    listIssueBlockerAttentionMap(dbOrTx, companyId, issueRows),
   ]);
 
   const pendingInteractions = (interactionRows as BlockedInboxInteractionRow[]).map((row) => ({
@@ -3835,8 +3879,7 @@ async function listIssueBlockedInboxAttentionMap(
       continue;
     }
 
-    const blockerAttention = await listIssueBlockerAttentionMap(dbOrTx, companyId, [row]);
-    const blockerState = blockerAttention.get(row.id);
+    const blockerState = blockerAttentionByIssueId.get(row.id);
     if (row.status === "blocked" && (blockerState?.state === "needs_attention" || blockerState?.state === "stalled")) {
       result.set(row.id, attentionBase({
         state: "needs_attention",

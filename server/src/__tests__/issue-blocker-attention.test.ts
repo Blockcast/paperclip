@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -711,6 +711,103 @@ describeEmbeddedPostgres("issue blocker attention", () => {
 
     expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
   });
+
+  it("batches blocked-inbox blocker attention across independent roots", async () => {
+    const { companyId, agentId } = await createCompany("BIBQ");
+    const firstParentId = await insertIssue({
+      companyId,
+      identifier: "BIBQ-1",
+      title: "First blocked source",
+      status: "blocked",
+    });
+    const firstBlockerId = await insertIssue({
+      companyId,
+      identifier: "BIBQ-2",
+      title: "First running leaf",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: firstBlockerId, blockedIssueId: firstParentId });
+    await activeRun({ companyId, agentId, issueId: firstBlockerId });
+
+    const selectSpy = vi.spyOn(db, "select");
+    let oneRootSelectCount = 0;
+    try {
+      expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
+      oneRootSelectCount = selectSpy.mock.calls.length;
+    } finally {
+      selectSpy.mockRestore();
+    }
+
+    const secondParentId = await insertIssue({
+      companyId,
+      identifier: "BIBQ-3",
+      title: "Second blocked source",
+      status: "blocked",
+    });
+    const secondBlockerId = await insertIssue({
+      companyId,
+      identifier: "BIBQ-4",
+      title: "Second running leaf",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: secondBlockerId, blockedIssueId: secondParentId });
+    await activeRun({ companyId, agentId, issueId: secondBlockerId });
+
+    const secondSelectSpy = vi.spyOn(db, "select");
+    let twoRootSelectCount = 0;
+    try {
+      expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
+      twoRootSelectCount = secondSelectSpy.mock.calls.length;
+    } finally {
+      secondSelectSpy.mockRestore();
+    }
+
+    expect(twoRootSelectCount).toBe(oneRootSelectCount);
+  });
+
+  it("isolates traversal truncation to the oversized blocked-inbox root", async () => {
+    const { companyId } = await createCompany("BIBN");
+    const oversizedParentId = await insertIssue({
+      companyId,
+      identifier: "BIBN-1",
+      title: "Oversized blocked source",
+      status: "blocked",
+    });
+
+    const childRows = Array.from({ length: 2_000 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      identifier: `BIBN-${index + 2}`,
+      title: `Human-owned blocker ${index + 2}`,
+      status: "backlog",
+      priority: "medium",
+      parentId: oversizedParentId,
+      assigneeUserId: "board-user-1",
+      originKind: "manual",
+      originFingerprint: "default",
+    }));
+
+    await db.insert(issues).values(childRows);
+
+    const coveredParentId = await insertIssue({
+      companyId,
+      identifier: "BIBN-2002",
+      title: "Small covered blocked source",
+      status: "blocked",
+    });
+    await block({
+      companyId,
+      blockerIssueId: childRows[0]!.id,
+      blockedIssueId: coveredParentId,
+    });
+
+    const rows = await svc.list(companyId, { attention: "blocked" });
+
+    expect(rows.map((row) => row.id)).toContain(oversizedParentId);
+    expect(rows.map((row) => row.id)).not.toContain(coveredParentId);
+  }, 120_000);
 
   it("classifies assigned backlog and invalid review leaves for blocked inbox attention", async () => {
     const { companyId, agentId, pausedAgentId } = await createCompany("BIC");
