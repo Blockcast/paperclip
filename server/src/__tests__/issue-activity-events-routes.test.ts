@@ -19,6 +19,7 @@ const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(async () => false),
   hasPermission: vi.fn(async () => false),
+  decide: vi.fn(async () => ({ allowed: true, reason: "test_allow" })),
 }));
 const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
@@ -74,6 +75,12 @@ function registerModuleMocks() {
     routineService: () => mockRoutineService,
   }));
 
+  vi.doMock("../services/task-watchdog-scope.js", () => ({
+    TASK_WATCHDOG_ORIGIN_KIND: "task_watchdog",
+    resolveTaskWatchdogMutationScope: vi.fn(async () => ({ kind: "none" })),
+    taskWatchdogScopeAllowsIssueMutation: vi.fn(async () => ({ kind: "none" })),
+  }));
+
   vi.doMock("../services/index.js", () => ({
     companyService: () => ({
       getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
@@ -123,7 +130,15 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp(db: unknown = {}) {
+const defaultBoardActor = {
+  type: "board",
+  userId: "local-board",
+  companyIds: ["company-1"],
+  source: "local_implicit",
+  isInstanceAdmin: false,
+};
+
+async function createApp(db: unknown = {}, actor: Record<string, unknown> = defaultBoardActor) {
   const [{ issueRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -131,13 +146,7 @@ async function createApp(db: unknown = {}) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
+    (req as any).actor = actor;
     next();
   });
   app.use("/api", issueRoutes(db as any, {} as any));
@@ -171,6 +180,7 @@ describe("issue activity event routes", () => {
     vi.doUnmock("../services/instance-settings.js");
     vi.doUnmock("../services/issues.js");
     vi.doUnmock("../services/routines.js");
+    vi.doUnmock("../services/task-watchdog-scope.js");
     vi.doUnmock("../routes/issues.js");
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
@@ -452,6 +462,37 @@ describe("issue activity event routes", () => {
         }),
       );
     });
+  });
+
+  it("does not let an agent reaffirmation resolve a successful-run handoff", async () => {
+    const issue = { ...makeIssue(), status: "blocked" };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(
+      await createApp(
+        {},
+        {
+          type: "agent",
+          agentId: issue.assigneeAgentId,
+          companyId: issue.companyId,
+          runId: "run-agent-reaffirmation",
+          source: "agent_jwt",
+        },
+      ),
+    )
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "blocked" });
+
+    expect(res.status).toBe(200);
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "issue.successful_run_handoff_resolved" }),
+    );
   });
 
   it("does not log successful_run_handoff_resolved when status stays in_progress", async () => {

@@ -8585,7 +8585,7 @@ export function issueRoutes(
     });
 
     const explicitlyRecordedSuccessfulRunDisposition =
-      req.body.status !== undefined && issue.status !== "in_progress";
+      actor.actorType === "user" && req.body.status !== undefined && issue.status !== "in_progress";
     if (explicitlyRecordedSuccessfulRunDisposition) {
       await listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id], { hydrateLiveness: false })
         .then(async (handoffStates) => {

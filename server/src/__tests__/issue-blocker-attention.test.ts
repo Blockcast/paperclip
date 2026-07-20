@@ -767,44 +767,46 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(twoRootSelectCount).toBe(oneRootSelectCount);
   });
 
-  it("preserves the per-root traversal budget when batching large independent graphs", async () => {
+  it("isolates traversal truncation to the oversized blocked-inbox root", async () => {
     const { companyId } = await createCompany("BIBN");
-    const firstParentId = await insertIssue({
+    const oversizedParentId = await insertIssue({
       companyId,
       identifier: "BIBN-1",
-      title: "First large blocked source",
+      title: "Oversized blocked source",
       status: "blocked",
     });
 
-    const childRows = (parentId: string, offset: number) =>
-      Array.from({ length: 1_000 }, (_, index) => ({
-        id: randomUUID(),
-        companyId,
-        identifier: `BIBN-${offset + index}`,
-        title: `Human-owned blocker ${offset + index}`,
-        status: "backlog",
-        priority: "medium",
-        parentId,
-        assigneeUserId: "board-user-1",
-        originKind: "manual",
-        originFingerprint: "default",
-      }));
-
-    await db.insert(issues).values(childRows(firstParentId, 2));
-    expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
-
-    const secondParentId = await insertIssue({
+    const childRows = Array.from({ length: 2_000 }, (_, index) => ({
+      id: randomUUID(),
       companyId,
-      identifier: "BIBN-1002",
-      title: "Second large blocked source",
+      identifier: `BIBN-${index + 2}`,
+      title: `Human-owned blocker ${index + 2}`,
+      status: "backlog",
+      priority: "medium",
+      parentId: oversizedParentId,
+      assigneeUserId: "board-user-1",
+      originKind: "manual",
+      originFingerprint: "default",
+    }));
+
+    await db.insert(issues).values(childRows);
+
+    const coveredParentId = await insertIssue({
+      companyId,
+      identifier: "BIBN-2002",
+      title: "Small covered blocked source",
       status: "blocked",
     });
-    await db.insert(issues).values(childRows(secondParentId, 1_003));
+    await block({
+      companyId,
+      blockerIssueId: childRows[0]!.id,
+      blockedIssueId: coveredParentId,
+    });
 
-    // The combined graph contains 2,002 nodes. The old shared 2,000-node
-    // ceiling truncated the batch and falsely surfaced both otherwise-covered
-    // roots, even though each 1,001-node graph classified cleanly by itself.
-    expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
+    const rows = await svc.list(companyId, { attention: "blocked" });
+
+    expect(rows.map((row) => row.id)).toContain(oversizedParentId);
+    expect(rows.map((row) => row.id)).not.toContain(coveredParentId);
   }, 120_000);
 
   it("classifies assigned backlog and invalid review leaves for blocked inbox attention", async () => {
