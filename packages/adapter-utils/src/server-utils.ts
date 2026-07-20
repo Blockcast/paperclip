@@ -3210,10 +3210,19 @@ export async function runChildProcess(
 
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
+          const handleStdinError = (err: unknown) => {
+            const code = (err as NodeJS.ErrnoException | null)?.code;
+            if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") return;
+            onLogError(err, runId, "failed to write child stdin");
+          };
+          stdin.on("error", handleStdinError);
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
-            stdin.write(opts.stdin as string);
-            stdin.end();
+            try {
+              stdin.end(opts.stdin as string);
+            } catch (err) {
+              handleStdinError(err);
+            }
           });
         }
 
