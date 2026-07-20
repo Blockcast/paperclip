@@ -3,14 +3,11 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
-  agentRuntimeState,
   agentWakeupRequests,
   activityLog,
   budgetPolicies,
   companies,
-  companySkills,
   createDb,
-  environmentLeases,
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -22,6 +19,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
@@ -157,7 +155,10 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   });
 
   async function cleanupRetryFixture() {
-    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+    await cleanupHeartbeatTestState(db, heartbeat, {
+      errorLabel: "heartbeat retry scheduling cleanup",
+      drainTimeoutMs: 30_000,
+    });
   }
 
   async function seedRetryFixture(input: {
