@@ -2410,6 +2410,12 @@ async function listIssueBlockerAttentionMap(
   }
   if (roots.length === 0) return attentionMap;
 
+  // Preserve the historical per-root traversal allowance when callers batch
+  // independent blocked graphs. A single shared ceiling makes classification
+  // depend on batch/page size: two individually valid graphs can jointly trip
+  // truncation and turn every root into a false needs-attention result.
+  const maxNodes = BLOCKER_ATTENTION_MAX_NODES * roots.length;
+
   const nodesById = new Map<string, IssueBlockerAttentionNode>();
   const edgesByIssueId = new Map<string, IssueBlockerAttentionEdge[]>();
   for (const root of roots) nodesById.set(root.id, { ...root });
@@ -2507,7 +2513,7 @@ async function listIssueBlockerAttentionMap(
       }
     }
 
-    if (nodesById.size > BLOCKER_ATTENTION_MAX_NODES) {
+    if (nodesById.size > maxNodes) {
       truncated = true;
       break;
     }

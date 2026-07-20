@@ -767,6 +767,46 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(twoRootSelectCount).toBe(oneRootSelectCount);
   });
 
+  it("preserves the per-root traversal budget when batching large independent graphs", async () => {
+    const { companyId } = await createCompany("BIBN");
+    const firstParentId = await insertIssue({
+      companyId,
+      identifier: "BIBN-1",
+      title: "First large blocked source",
+      status: "blocked",
+    });
+
+    const childRows = (parentId: string, offset: number) =>
+      Array.from({ length: 1_000 }, (_, index) => ({
+        id: randomUUID(),
+        companyId,
+        identifier: `BIBN-${offset + index}`,
+        title: `Human-owned blocker ${offset + index}`,
+        status: "backlog",
+        priority: "medium",
+        parentId,
+        assigneeUserId: "board-user-1",
+        originKind: "manual",
+        originFingerprint: "default",
+      }));
+
+    await db.insert(issues).values(childRows(firstParentId, 2));
+    expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
+
+    const secondParentId = await insertIssue({
+      companyId,
+      identifier: "BIBN-1002",
+      title: "Second large blocked source",
+      status: "blocked",
+    });
+    await db.insert(issues).values(childRows(secondParentId, 1_003));
+
+    // The combined graph contains 2,002 nodes. The old shared 2,000-node
+    // ceiling truncated the batch and falsely surfaced both otherwise-covered
+    // roots, even though each 1,001-node graph classified cleanly by itself.
+    expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
+  }, 120_000);
+
   it("classifies assigned backlog and invalid review leaves for blocked inbox attention", async () => {
     const { companyId, agentId, pausedAgentId } = await createCompany("BIC");
     const backlogParentId = await insertIssue({ companyId, identifier: "BIC-1", title: "Blocked by parked work", status: "blocked" });
