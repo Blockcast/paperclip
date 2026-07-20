@@ -316,10 +316,11 @@ ARG CLAUDE_K8S_REF=e2bc98321155d857ac3ee545ff2952c3dd4a6617
 # of exiting before OpenCode starts. Real Git checkouts still use independent
 # shared-object clones. Full adapter suite 526/526, focused manifest suite
 # 119/119, typecheck, and build pass.
-# Bumped 2026-07-20 to c3b8194: bound the pre-Job live-Job list to 15 seconds
-# and fail closed when Kubernetes does not answer. Focused suite 13/13, full
-# adapter suite 527/527, typecheck, and build pass.
-ARG OPENCODE_K8S_REF=c3b81948f0f4580c081eeb43da688351fabad702
+# Bumped 2026-07-20 to 239f2e1 (#48):
+# bound the pre-Job live-Job list to 15 seconds and fail closed when Kubernetes
+# does not answer. Focused suite 13/13, full adapter suite 527/527, typecheck,
+# and build pass.
+ARG OPENCODE_K8S_REF=239f2e1a3e27344e154600fae7ba668c13b36a5d
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
