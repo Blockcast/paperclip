@@ -514,6 +514,14 @@ describe("sandbox callback bridge", () => {
     const directories = sandboxCallbackBridgeDirectories(queueDir);
     const bridgeToken = createSandboxCallbackBridgeToken();
     const seenRequestIds: string[] = [];
+    let markRequestObserved!: (requestId: string) => void;
+    const requestObserved = new Promise<string>((resolve) => {
+      markRequestObserved = resolve;
+    });
+    let releaseHandler!: () => void;
+    const handlerRelease = new Promise<void>((resolve) => {
+      releaseHandler = resolve;
+    });
 
     const worker = await startSandboxCallbackBridgeWorker({
       client: createCommandManagedSandboxCallbackBridgeQueueClient({
@@ -525,7 +533,8 @@ describe("sandbox callback bridge", () => {
       authorizeRequest: async () => null,
       handleRequest: async (request) => {
         seenRequestIds.push(request.id);
-        await new Promise((resolve) => setTimeout(resolve, 250));
+        markRequestObserved(request.id);
+        await handlerRelease;
         return {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -555,11 +564,8 @@ describe("sandbox callback bridge", () => {
       },
     });
 
-    for (let attempt = 0; attempt < 50 && seenRequestIds.length === 0; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-
-    expect(seenRequestIds).toHaveLength(1);
+    const observedRequestId = await requestObserved;
+    expect(seenRequestIds).toEqual([observedRequestId]);
     await worker.stop({ drainTimeoutMs: 10 });
 
     const response = await responsePromise;
@@ -568,7 +574,8 @@ describe("sandbox callback bridge", () => {
       error: "Bridge worker stopped before request could be handled.",
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    releaseHandler();
+    await worker.stop({ drainTimeoutMs: 1_000 });
 
     await expect(readdir(directories.responsesDir)).resolves.toEqual([]);
     await expect(
