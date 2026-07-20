@@ -15193,12 +15193,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const jobStatus = jobRunStatuses.get(run.id);
         const jobName = jobStatus?.name ?? null;
         const jobUid = jobStatus?.uid ?? null;
-        // A recently re-armed reservation means an owner consumed and deleted
-        // a terminal attempt before preparing the same run id's replacement.
-        // Do not let a stale namespace snapshot bind that old Job back onto the
-        // reservation. Live Jobs and stale ownerless recovery remain unchanged.
-        const terminalAttemptStillOwned =
-          jobStatus?.phase !== "active" && replacementPendingRunIds.has(run.id);
         if (jobStatus && (!jobName || !jobUid)) {
           logger.error(
             { runId: run.id, jobName, jobUid },
@@ -15206,8 +15200,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
           ambiguousExternalRunIds.add(run.id);
           jobRunStatuses.delete(run.id);
-        } else if (jobName && jobUid && !terminalAttemptStillOwned) {
+        } else if (jobName && jobUid) {
           try {
+            // Read at the stamp decision point rather than trusting the earlier
+            // reservation inventory. An in-process retry can re-arm ownership
+            // after that snapshot; a terminal Job from the consumed attempt must
+            // never be rebound onto its replacement reservation.
+            const reservation = await getActiveExternalRuntimeReservation(db, run.id);
+            const reservationUpdatedAt = reservation
+              ? new Date(reservation.updatedAt).getTime()
+              : Number.NaN;
+            const terminalAttemptStillOwned = Boolean(
+              jobStatus?.phase !== "active" &&
+              reservation?.state === "launching" &&
+              reservation.jobName === null &&
+              reservation.jobUid === null &&
+              reservation.launchedAt === null &&
+              Number.isFinite(reservationUpdatedAt) &&
+              now.getTime() - reservationUpdatedAt < EXTERNAL_LIFECYCLE_STALE_MS
+            );
+            if (terminalAttemptStillOwned) continue;
             if (managedJobs) {
               const exact = matchExactAgentJob(managedJobs, {
                 runId: run.id,
@@ -15217,7 +15229,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               });
               if (exact.kind !== "exact") throw new Error(`Managed Job identity is ${exact.kind}`);
             }
-            const reservation = await getActiveExternalRuntimeReservation(db, run.id);
             if (!reservation) throw new Error(`No active external-runtime reservation for run ${run.id}`);
             const stamped = await recordExternalRuntimeJobIdentity(db, {
               runId: run.id,
