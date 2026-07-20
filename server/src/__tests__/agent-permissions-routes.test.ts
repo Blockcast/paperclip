@@ -638,6 +638,65 @@ describe.sequential("agent permission routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  it("preserves full heartbeat policy when patching only external concurrency fields", async () => {
+    const existingHeartbeat = {
+      enabled: true,
+      cooldownSec: 30,
+      intervalSec: 86400,
+      wakeOnDemand: true,
+      maxConcurrentRuns: 4,
+      concurrencyEnabled: true,
+    };
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      runtimeConfig: { heartbeat: existingHeartbeat },
+    });
+    mockAgentService.update.mockResolvedValue({
+      ...baseAgent,
+      runtimeConfig: {
+        heartbeat: {
+          ...existingHeartbeat,
+          maxConcurrentRuns: 1,
+          concurrencyEnabled: false,
+        },
+      },
+    });
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({
+        runtimeConfig: {
+          heartbeat: {
+            maxConcurrentRuns: 1,
+            concurrencyEnabled: false,
+          },
+        },
+      }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalledWith(
+      agentId,
+      expect.objectContaining({
+        runtimeConfig: {
+          heartbeat: {
+            ...existingHeartbeat,
+            maxConcurrentRuns: 1,
+            concurrencyEnabled: false,
+          },
+        },
+      }),
+      expect.anything(),
+    );
+  });
+
   it("blocks agent-authenticated self-updates that set host-executed workspace commands", async () => {
     const app = await createApp({
       type: "agent",

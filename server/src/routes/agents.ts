@@ -1273,6 +1273,19 @@ export function agentRoutes(
     return normalizedRuntimeConfig;
   }
 
+  function mergeRuntimeConfigPatchForAgentUpdate(
+    existingRuntimeConfig: unknown,
+    requestedRuntimeConfig: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const mergedRuntimeConfig = { ...requestedRuntimeConfig };
+    const requestedHeartbeat = asRecord(requestedRuntimeConfig.heartbeat);
+    if (requestedHeartbeat) {
+      const existingHeartbeat = asRecord(asRecord(existingRuntimeConfig)?.heartbeat) ?? {};
+      mergedRuntimeConfig.heartbeat = { ...existingHeartbeat, ...requestedHeartbeat };
+    }
+    return mergedRuntimeConfig;
+  }
+
   function listRuntimeModelProfileAdapterConfigs(runtimeConfig: unknown): Array<{
     profileKey: string;
     profile: Record<string, unknown>;
@@ -3165,8 +3178,8 @@ export function agentRoutes(
         res.status(422).json({ error: "runtimeConfig must be an object" });
         return;
       }
-      assertNoAgentRuntimeConfigAdapterConfigMutation(req, runtimeConfig);
-      requestedRuntimeConfig = runtimeConfig;
+      requestedRuntimeConfig = mergeRuntimeConfigPatchForAgentUpdate(existing.runtimeConfig, runtimeConfig);
+      assertNoAgentRuntimeConfigAdapterConfigMutation(req, requestedRuntimeConfig);
     }
     const touchesAdapterConfiguration =
       hasOwn(patchData, "adapterType") ||
