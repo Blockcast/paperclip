@@ -14774,10 +14774,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     ambiguousRunIds: ReadonlySet<string> = new Set(),
   ) {
     const pending = await db
-      .select()
+      .select({
+        reservation: externalRuntimeReservations,
+        runStatus: heartbeatRuns.status,
+      })
       .from(externalRuntimeReservations)
-      .where(eq(externalRuntimeReservations.state, "release_pending"));
-    for (const reservation of pending) {
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, externalRuntimeReservations.runId))
+      .where(
+        or(
+          eq(externalRuntimeReservations.state, "release_pending"),
+          and(
+            inArray(externalRuntimeReservations.state, ["reserved", "launching"]),
+            isNull(externalRuntimeReservations.expectedJobName),
+            isNull(externalRuntimeReservations.jobName),
+            isNull(externalRuntimeReservations.jobUid),
+            inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+          ),
+        ),
+      );
+    for (const { reservation, runStatus } of pending) {
       if (activeRunExecutions.has(reservation.runId)) continue;
       if (ambiguousRunIds.has(reservation.runId)) continue;
       const observed = jobRunStatuses?.get(reservation.runId) ?? null;
@@ -14823,10 +14838,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       if (!terminalOrMissing) continue;
 
-      await releaseExternalRuntimeReservation(db, {
+      const terminalPrelaunchOrphan =
+        reservation.state === "reserved" || reservation.state === "launching";
+      const released = await releaseExternalRuntimeReservation(db, {
         runId: reservation.runId,
-        reason: reservation.releaseReason ?? "job_terminal_or_missing",
+        reason:
+          reservation.releaseReason ??
+          (terminalPrelaunchOrphan ? "terminal_prelaunch_orphan" : "job_terminal_or_missing"),
       });
+      if (released && terminalPrelaunchOrphan) {
+        logger.warn(
+          {
+            reservationId: reservation.id,
+            runId: reservation.runId,
+            runStatus,
+            reservationState: reservation.state,
+          },
+          "released prelaunch external-runtime reservation left behind by terminal run",
+        );
+      }
     }
   }
 
@@ -15163,12 +15193,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const jobStatus = jobRunStatuses.get(run.id);
         const jobName = jobStatus?.name ?? null;
         const jobUid = jobStatus?.uid ?? null;
-        // A recently re-armed reservation means an owner consumed and deleted
-        // a terminal attempt before preparing the same run id's replacement.
-        // Do not let a stale namespace snapshot bind that old Job back onto the
-        // reservation. Live Jobs and stale ownerless recovery remain unchanged.
-        const terminalAttemptStillOwned =
-          jobStatus?.phase !== "active" && replacementPendingRunIds.has(run.id);
         if (jobStatus && (!jobName || !jobUid)) {
           logger.error(
             { runId: run.id, jobName, jobUid },
@@ -15176,8 +15200,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
           ambiguousExternalRunIds.add(run.id);
           jobRunStatuses.delete(run.id);
-        } else if (jobName && jobUid && !terminalAttemptStillOwned) {
+        } else if (jobName && jobUid) {
           try {
+            // Read at the stamp decision point rather than trusting the earlier
+            // reservation inventory. An in-process retry can re-arm ownership
+            // after that snapshot; a terminal Job from the consumed attempt must
+            // never be rebound onto its replacement reservation.
+            const reservation = await getActiveExternalRuntimeReservation(db, run.id);
+            const reservationUpdatedAt = reservation
+              ? new Date(reservation.updatedAt).getTime()
+              : Number.NaN;
+            const terminalAttemptStillOwned = Boolean(
+              jobStatus?.phase !== "active" &&
+              reservation?.state === "launching" &&
+              reservation.jobName === null &&
+              reservation.jobUid === null &&
+              reservation.launchedAt === null &&
+              Number.isFinite(reservationUpdatedAt) &&
+              now.getTime() - reservationUpdatedAt < EXTERNAL_LIFECYCLE_STALE_MS
+            );
+            if (terminalAttemptStillOwned) continue;
             if (managedJobs) {
               const exact = matchExactAgentJob(managedJobs, {
                 runId: run.id,
@@ -15187,7 +15229,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               });
               if (exact.kind !== "exact") throw new Error(`Managed Job identity is ${exact.kind}`);
             }
-            const reservation = await getActiveExternalRuntimeReservation(db, run.id);
             if (!reservation) throw new Error(`No active external-runtime reservation for run ${run.id}`);
             const stamped = await recordExternalRuntimeJobIdentity(db, {
               runId: run.id,
@@ -22875,15 +22916,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await releaseIssueExecutionAndPromote(cancelled);
     }
 
-    await finalizeAgentStatus(run.agentId, "cancelled");
-    await startNextQueuedRunForAgent(run.agentId);
-
     // RCA 2026-05-06: external-lifecycle adapters (claude_k8s, opencode_k8s)
     // create a k8s Job that doesn't observe local SIGTERM. Without this,
     // a manual cancel UPDATE'd `status='cancelled'` but the Job stayed
     // alive; the next dispatch's precondition matched the surviving Job
-    // and rejected with "Concurrent run blocked". Cascade-delete the
-    // Job so the slot frees up. Best-effort.
+    // and rejected with "Concurrent run blocked". Delete the exact Job
+    // before dispatching another run: the dispatcher may release the terminal
+    // run's reservation, which is the durable name/UID identity required for
+    // safe deletion. Best-effort.
     if (agent && hasExternalLifecycle(agent.adapterType)) {
       try {
         const deleted = await deleteExactExternalRuntimeJob(run);
@@ -22898,6 +22938,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       }
     }
+
+    await finalizeAgentStatus(run.agentId, "cancelled");
+    await startNextQueuedRunForAgent(run.agentId);
     return cancelled;
   }
 

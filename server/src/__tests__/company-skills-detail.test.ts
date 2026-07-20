@@ -142,7 +142,7 @@ describeEmbeddedPostgres("companySkillService.detail", () => {
 
     const detail = await Promise.race([
       svc.detail(companyId, skillId),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("skill detail timed out")), 1_000)),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("skill detail timed out")), 10_000)),
     ]);
 
     expect(mockListSkills).not.toHaveBeenCalled();

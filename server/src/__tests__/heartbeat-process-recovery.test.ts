@@ -305,7 +305,7 @@ async function waitForPidExit(pid: number, timeoutMs = 2_000) {
 async function waitForRunToSettle(
   heartbeat: ReturnType<typeof heartbeatService>,
   runId: string,
-  timeoutMs = 3_000,
+  timeoutMs = 10_000,
 ) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -499,7 +499,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   async function seedRunFixture(input?: {
     adapterType?: string;
     agentStatus?: "paused" | "idle" | "running";
-    runStatus?: "running" | "queued" | "failed";
+    runStatus?: "running" | "queued" | "interrupted" | "failed";
     processPid?: number | null;
     processGroupId?: number | null;
     processLossRetryCount?: number;
@@ -773,8 +773,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     agentId: string;
     runId: string;
     state?: "reserved" | "launching";
+    isolationMode?: "pending" | "shared";
+    expectedJobName?: string | null;
     reservedAt: Date;
   }) {
+    const isolationMode = input.isolationMode ?? "pending";
     return db
       .insert(externalRuntimeReservations)
       .values({
@@ -783,11 +786,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         runId: input.runId,
         slotId: 0,
         state: input.state ?? "reserved",
-        isolationMode: "pending",
-        isolationKey: `pending:${input.runId}`,
+        isolationMode,
+        isolationKey:
+          isolationMode === "shared" ? `agent-shared:${input.agentId}` : `pending:${input.runId}`,
         isolationBoundAt: input.reservedAt,
         reservedAt: input.reservedAt,
         launchingAt: input.state === "launching" ? input.reservedAt : null,
+        expectedJobName: input.expectedJobName ?? null,
         createdAt: input.reservedAt,
         updatedAt: input.reservedAt,
       })
@@ -1556,6 +1561,173 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const run = await heartbeat.getRun(runId);
     expect(run?.status).toBe("failed");
     expect(run?.errorCode).toBe("process_lost");
+  });
+
+  it("releases an old prelaunch reservation left behind by a terminal run so the next queued run can start", async () => {
+    const reservedAt = new Date(Date.now() - 16 * 60 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      runStatus: "interrupted",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null,
+    });
+    const reservation = await seedPrelaunchReservation({
+      companyId,
+      agentId,
+      runId,
+      state: "launching",
+      isolationMode: "shared",
+      reservedAt,
+    });
+    const queuedRunId = randomUUID();
+    const queuedWakeupRequestId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: queuedWakeupRequestId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: {},
+      status: "queued",
+      runId: queuedRunId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: queuedWakeupRequestId,
+      contextSnapshot: {},
+    });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+
+    await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    const releasedReservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.id, reservation.id))
+      .then((rows) => rows[0]);
+    expect(releasedReservation).toMatchObject({
+      state: "released",
+      releaseReason: "terminal_prelaunch_orphan",
+    });
+    expect(releasedReservation?.releasedAt).not.toBeNull();
+
+    await heartbeat.resumeQueuedRuns();
+    const settledRun = await waitForRunToSettle(heartbeat, queuedRunId, 5_000);
+    expect(settledRun?.status).toBe("succeeded");
+  });
+
+  it("does not release an old prelaunch reservation while its heartbeat run is non-terminal", async () => {
+    const reservedAt = new Date(Date.now() - 16 * 60 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      runStatus: "queued",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null,
+    });
+    const reservation = await seedPrelaunchReservation({
+      companyId,
+      agentId,
+      runId,
+      state: "launching",
+      isolationMode: "shared",
+      reservedAt,
+    });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+
+    await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect((await heartbeat.getRun(runId))?.status).toBe("queued");
+    const persistedReservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.id, reservation.id))
+      .then((rows) => rows[0]);
+    expect(persistedReservation?.state).toBe("launching");
+    expect(persistedReservation?.releasedAt).toBeNull();
+  });
+
+  it("does not treat expected Job ownership as a terminal prelaunch orphan", async () => {
+    const reservedAt = new Date(Date.now() - 16 * 60 * 1000);
+    const expectedJobName = "agent-opencode-expected-job";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      runStatus: "failed",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null,
+    });
+    const reservation = await seedPrelaunchReservation({
+      companyId,
+      agentId,
+      runId,
+      state: "launching",
+      isolationMode: "shared",
+      expectedJobName,
+      reservedAt,
+    });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: expectedJobName,
+    });
+
+    await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    const persistedReservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.id, reservation.id))
+      .then((rows) => rows[0]);
+    expect(persistedReservation?.state).toBe("launching");
+    expect(persistedReservation?.releasedAt).toBeNull();
+    expect(mockReadAgentJobRunStatusByName).not.toHaveBeenCalled();
+  });
+
+  it("keeps a recent shared prelaunch reservation while terminal execution teardown may still be unwinding", async () => {
+    const reservedAt = new Date(Date.now() - 60 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      runStatus: "failed",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null,
+    });
+    const reservation = await seedPrelaunchReservation({
+      companyId,
+      agentId,
+      runId,
+      state: "launching",
+      isolationMode: "shared",
+      reservedAt,
+    });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+
+    await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    const persistedReservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.id, reservation.id))
+      .then((rows) => rows[0]);
+    expect(persistedReservation?.state).toBe("launching");
+    expect(persistedReservation?.releasedAt).toBeNull();
   });
 
   it("queues exactly one retry when the recorded local pid is dead", async () => {

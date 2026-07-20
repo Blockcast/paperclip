@@ -194,9 +194,16 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
 
     let allowReplacementLaunch!: () => void;
     const replacementLaunchGate = new Promise<void>((resolve) => { allowReplacementLaunch = resolve; });
+    let markReplacementLaunchStarted!: () => void;
+    const replacementLaunchStarted = new Promise<void>((resolve) => {
+      markReplacementLaunchStarted = resolve;
+    });
     mockAdapterExecute.mockImplementation(async (ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> => {
       const attempt = mockAdapterExecute.mock.calls.length;
-      if (attempt === 2) await replacementLaunchGate;
+      if (attempt === 2) {
+        markReplacementLaunchStarted();
+        await replacementLaunchGate;
+      }
       await ctx.onMeta?.({
         adapterType: "claude_k8s",
         command: `kubectl job/${jobName}`,
@@ -234,26 +241,15 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     });
 
     const execution = heartbeat.__test_executeRunForTesting(runId);
-    let retryReservation: typeof externalRuntimeReservations.$inferSelect | undefined;
-    // ARC runners can be heavily contended after the embedded-Postgres suites;
-    // keep the assertion deterministic without weakening the expected state.
-    for (let attempt = 0; attempt < 1_000; attempt += 1) {
-      retryReservation = await db
-        .select()
-        .from(externalRuntimeReservations)
-        .where(eq(externalRuntimeReservations.runId, runId))
-        .then((rows) => rows[0]);
-      if (
-        mockAdapterExecute.mock.calls.length === 1 &&
-        retryReservation?.state === "launching" &&
-        retryReservation.expectedJobName === null &&
-        retryReservation.jobName === null &&
-        retryReservation.jobUid === null
-      ) {
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    // Wait for attempt 2 to enter the explicit gate. This proves the retry
+    // reservation has been re-armed and prevents scheduler/ARC timing from
+    // deciding whether the reaper samples attempt 1 or the replacement.
+    await replacementLaunchStarted;
+    const retryReservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, runId))
+      .then((rows) => rows[0]);
     expect(retryReservation).toMatchObject({
       state: "launching",
       expectedJobName: null,
