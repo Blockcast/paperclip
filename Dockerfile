@@ -311,7 +311,12 @@ ARG CLAUDE_K8S_REF=e2bc98321155d857ac3ee545ff2952c3dd4a6617
 # (stream + await) instead of failing new runs with k8s_concurrent_run_blocked
 # (observed: Players-Engineer run 8d35d883 blocked after a paperclip-0 restart).
 # PR kkroo/paperclip-adapter-opencode-k8s#46; adapter suite 118/118, typecheck clean.
-ARG OPENCODE_K8S_REF=f4ca4a604f78387244661fddc1f5cd23e37cf35a
+# Bumped 2026-07-20 to ad549a0 (#47): run isolation now detects the generic
+# non-Git fallback workspace and creates a private empty run workspace instead
+# of exiting before OpenCode starts. Real Git checkouts still use independent
+# shared-object clones. Full adapter suite 526/526, focused manifest suite
+# 119/119, typecheck, and build pass.
+ARG OPENCODE_K8S_REF=ad549a077fbff9274a69d412bbe1665a40913ec9
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
