@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -710,6 +710,61 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     await activeRun({ companyId, agentId, issueId: blockerId });
 
     expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
+  });
+
+  it("batches blocked-inbox blocker attention across independent roots", async () => {
+    const { companyId, agentId } = await createCompany("BIBQ");
+    const firstParentId = await insertIssue({
+      companyId,
+      identifier: "BIBQ-1",
+      title: "First blocked source",
+      status: "blocked",
+    });
+    const firstBlockerId = await insertIssue({
+      companyId,
+      identifier: "BIBQ-2",
+      title: "First running leaf",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: firstBlockerId, blockedIssueId: firstParentId });
+    await activeRun({ companyId, agentId, issueId: firstBlockerId });
+
+    const selectSpy = vi.spyOn(db, "select");
+    let oneRootSelectCount = 0;
+    try {
+      expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
+      oneRootSelectCount = selectSpy.mock.calls.length;
+    } finally {
+      selectSpy.mockRestore();
+    }
+
+    const secondParentId = await insertIssue({
+      companyId,
+      identifier: "BIBQ-3",
+      title: "Second blocked source",
+      status: "blocked",
+    });
+    const secondBlockerId = await insertIssue({
+      companyId,
+      identifier: "BIBQ-4",
+      title: "Second running leaf",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: secondBlockerId, blockedIssueId: secondParentId });
+    await activeRun({ companyId, agentId, issueId: secondBlockerId });
+
+    const secondSelectSpy = vi.spyOn(db, "select");
+    let twoRootSelectCount = 0;
+    try {
+      expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
+      twoRootSelectCount = secondSelectSpy.mock.calls.length;
+    } finally {
+      secondSelectSpy.mockRestore();
+    }
+
+    expect(twoRootSelectCount).toBe(oneRootSelectCount);
   });
 
   it("classifies assigned backlog and invalid review leaves for blocked inbox attention", async () => {

@@ -3469,7 +3469,15 @@ async function listIssueBlockedInboxAttentionMap(
   const graphIssueIds = graphIssues.map((issue) => issue.id);
   const issuesById = new Map<string, IssueRow>(graphIssues.map((issue) => [issue.id, issue]));
 
-  const [activeRunRows, wakeRows, scheduledRetryRows, interactionRows, approvalRows, handoffMap] = await Promise.all([
+  const [
+    activeRunRows,
+    wakeRows,
+    scheduledRetryRows,
+    interactionRows,
+    approvalRows,
+    handoffMap,
+    blockerAttentionByIssueId,
+  ] = await Promise.all([
     graphIssueIds.length === 0
       ? Promise.resolve([])
       : dbOrTx
@@ -3569,6 +3577,10 @@ async function listIssueBlockedInboxAttentionMap(
             inArray(issueApprovals.issueId, graphIssueIds),
           )),
     listSuccessfulRunHandoffMapForIssues(dbOrTx, companyId, rowIssueIds, { hydrateLiveness: false }),
+    // Resolve the union of blocked roots once. Calling this from the row loop
+    // turns every blocked-inbox read into an N+1 graph traversal on companies
+    // with a large stopped-work backlog.
+    listIssueBlockerAttentionMap(dbOrTx, companyId, issueRows),
   ]);
 
   const pendingInteractions = (interactionRows as BlockedInboxInteractionRow[]).map((row) => ({
@@ -3835,8 +3847,7 @@ async function listIssueBlockedInboxAttentionMap(
       continue;
     }
 
-    const blockerAttention = await listIssueBlockerAttentionMap(dbOrTx, companyId, [row]);
-    const blockerState = blockerAttention.get(row.id);
+    const blockerState = blockerAttentionByIssueId.get(row.id);
     if (row.status === "blocked" && (blockerState?.state === "needs_attention" || blockerState?.state === "stalled")) {
       result.set(row.id, attentionBase({
         state: "needs_attention",
