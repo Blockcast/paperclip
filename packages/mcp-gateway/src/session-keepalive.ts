@@ -170,7 +170,8 @@ export class SessionStore {
  * Some servers return 410 Gone with the same body when they explicitly
  * GC'd the session. Older kubernetes-mcp-server releases instead return a
  * JSON-RPC error with HTTP 200 after their connection-scoped lifecycle state
- * expires, so recover that response too.
+ * expires, either as bare JSON or in MCP SSE `data:` frames, so recover those
+ * responses too.
  */
 export function isSessionNotFoundResponse(statusCode: number, bodyText: string): boolean {
   const lower = bodyText.toLowerCase();
