@@ -365,29 +365,36 @@ function runSerializedSuites(routeTests, shardIndex, shardCount) {
   console.log(
     `\n[test:run] serialized shard ${shardIndex + 1}/${shardCount} running ${shardTests.length} of ${routeTests.length} suites`,
   );
-
-  for (const routeTest of shardTests) {
-    runVitest(
-      [
-        "--project",
-        "@paperclipai/server",
-        routeTest.repoPath,
-        "--pool=forks",
-        "--isolate",
-        // MITIGATION, not the root cause. These route suites time out (never
-        // assert-fail) under shared-ARC contention because createProjectApp/
-        // createExecutionWorkspaceApp cache-bust a cold dynamic import of the
-        // whole route+middleware+services module graph PER TEST — that per-test
-        // re-transform balloons past the budget under load, and with one file
-        // per invocation a single tipped test reds the shard. Retry lets a
-        // transient timeout self-heal until the harness is refactored to import
-        // once + reset mocks surgically (the real fix). Timeouts only, so retry
-        // cannot mask an assertion regression here. (BLO-17053)
-        "--retry=2",
-      ],
-      routeTest.repoPath,
-    );
+  if (shardTests.length === 0) {
+    return;
   }
+
+  // Run the whole shard in ONE Vitest invocation instead of one process per
+  // file. The dominant serialized-lane cost was never the per-test transform —
+  // it was forking a fresh process + cold dep-optimize + cold-importing the
+  // route graph PER FILE, paid fresh every file, which ARC contention balloons
+  // into the timeout flake. Batching reuses the shared main-process transform/
+  // dep-optimize cache across files while --isolate still runs each FILE in its
+  // own fork (no cross-file module leak — verified on a 12-file shard under
+  // --sequence.shuffle, and a full 31-file shard: 242/242, ~0.7GB peak RSS on
+  // the orchestrator, well under the runner limit). Measured: a 6-file sample
+  // dropped ~177s -> ~88s (~2x) and a full 31-file shard runs batched in one
+  // pass, with zero source changes. --retry=2 still lets a genuinely tipped
+  // test self-heal (timeouts only; cannot mask an assertion regression).
+  // (BLO-17053)
+  runVitest(
+    [
+      "--project",
+      "@paperclipai/server",
+      ...shardTests.map((routeTest) => routeTest.repoPath),
+      "--no-file-parallelism",
+      "--maxWorkers=1",
+      "--pool=forks",
+      "--isolate",
+      "--retry=2",
+    ],
+    `serialized shard ${shardIndex + 1}/${shardCount} (${shardTests.length} suites, batched)`,
+  );
 }
 
 const routeTests = walk(serverTestsDir)
