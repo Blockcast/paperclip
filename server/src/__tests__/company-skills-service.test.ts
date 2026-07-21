@@ -1724,6 +1724,69 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     await expect(fs.stat(entry!.source)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("lists only requested runtime skills without reconciling the filesystem inventory", async () => {
+    const companyId = randomUUID();
+    const requestedSkillId = randomUUID();
+    const requestedSkillKey = `company/${companyId}/runtime-requested`;
+    const omittedSkillKey = `company/${companyId}/runtime-omitted`;
+    const missingRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-fast-path-"));
+    cleanupDirs.add(missingRoot);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companySkills).values([
+      {
+        id: requestedSkillId,
+        companyId,
+        key: requestedSkillKey,
+        slug: "runtime-requested",
+        name: "Runtime Requested",
+        description: null,
+        markdown: "# Runtime Requested\n",
+        sourceType: "local_path",
+        sourceLocator: path.join(missingRoot, "requested"),
+        trustLevel: "markdown_only",
+        compatibility: "compatible",
+        fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+        metadata: { sourceKind: "local_path" },
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        key: omittedSkillKey,
+        slug: "runtime-omitted",
+        name: "Runtime Omitted",
+        description: null,
+        markdown: "# Runtime Omitted\n",
+        sourceType: "local_path",
+        sourceLocator: path.join(missingRoot, "omitted"),
+        trustLevel: "markdown_only",
+        compatibility: "compatible",
+        fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+        metadata: { sourceKind: "local_path" },
+      },
+    ]);
+
+    const entries = await svc.listRuntimeSkillEntries(companyId, {
+      materializeMissing: false,
+      reconcileInventory: false,
+      skillKeys: [requestedSkillKey],
+    });
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      key: requestedSkillKey,
+      sourceStatus: "missing",
+    });
+    await expect(
+      db.select({ id: companySkills.id }).from(companySkills).where(eq(companySkills.id, requestedSkillId)),
+    ).resolves.toHaveLength(1);
+  });
+
   it("materializes source-missing company skills from the stored markdown during runtime listing", async () => {
     const companyId = randomUUID();
     const skillId = randomUUID();

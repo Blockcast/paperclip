@@ -17285,6 +17285,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
     const runtimeSkillPreference = readPaperclipSkillSyncPreference(effectiveResolvedConfig);
     const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(agent.companyId, {
+      // The execution hot path consumes the already-installed DB inventory. A
+      // full filesystem/catalog reconciliation is a control-plane maintenance
+      // operation and can take minutes on a shared runtime volume; serializing
+      // every run setup behind it lets the pre-adapter reaper outrun live work.
+      reconcileInventory: false,
+      skillKeys: runtimeSkillPreference.desiredSkillEntries.map((entry) => entry.key),
       versionSelections: skillVersionSelectionMap(runtimeSkillPreference.desiredSkillEntries),
     });
     let runtimeConfig: Record<string, unknown> = {

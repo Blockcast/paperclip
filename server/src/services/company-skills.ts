@@ -357,6 +357,8 @@ export type ProjectSkillScanTarget = {
 
 type RuntimeSkillEntryOptions = {
   materializeMissing?: boolean;
+  reconcileInventory?: boolean;
+  skillKeys?: readonly string[];
   versionSelections?: Map<string, string | null>;
 };
 
@@ -5377,10 +5379,21 @@ export function companySkillService(db: Db) {
     companyId: string,
     options: RuntimeSkillEntryOptions = {},
   ): Promise<PaperclipSkillEntry[]> {
-    const skills = await listFull(companyId);
+    const skills = options.reconcileInventory === false
+      ? await db
+          .select(selectCompanySkillColumns())
+          .from(companySkills)
+          .where(eq(companySkills.companyId, companyId))
+          .orderBy(asc(companySkills.name), asc(companySkills.key))
+          .then((rows) => rows.map((row) => toCompanySkill(row)))
+      : await listFull(companyId);
+    const requestedSkillKeys = options.skillKeys
+      ? new Set(options.skillKeys.map((key) => key.trim()).filter(Boolean))
+      : null;
 
     const out: PaperclipSkillEntry[] = [];
     for (const skill of skills) {
+      if (requestedSkillKeys && !requestedSkillKeys.has(skill.key)) continue;
       const sourceResolution = await resolveRuntimeSkillSource(companyId, skill, options);
       if (!sourceResolution) continue;
 
