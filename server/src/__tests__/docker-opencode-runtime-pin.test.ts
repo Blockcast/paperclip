@@ -115,6 +115,9 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   it("routes Paperclip Docker image builds through the DIND runner pool", () => {
     expect(dockerWorkflow.match(/runs-on: arc-dind/g)).toHaveLength(1);
     expect(dockerWorkflow.match(/runs-on: arc-deploy/g)).toHaveLength(1);
+    expect(dockerWorkflow).toContain(
+      "if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}",
+    );
     expect(dockerAgentWorkflow.match(/runs-on: arc-dind/g)).toHaveLength(1);
     expect(dockerAgentWorkflow).not.toContain("runs-on: arc-deploy");
     expect(dockerWorkflow).not.toContain("runs-on: self-hosted");
