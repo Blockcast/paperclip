@@ -31,7 +31,7 @@ cleanup() {
     kill "$LOG_PID" >/dev/null 2>&1 || true
   fi
   if [[ "$PRESERVE_CONTAINER_ON_EXIT" != "true" ]]; then
-    docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
   if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
     rm -rf "$TMP_DIR"
@@ -264,7 +264,7 @@ fi
 
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
-docker run -d --rm \
+docker run -d \
   --name "$CONTAINER_NAME" \
   -p "$HOST_PORT:3100" \
   -e HOST=0.0.0.0 \

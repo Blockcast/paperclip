@@ -11,7 +11,8 @@ const ADMIN_PASSWORD =
 
 const COMPANY_NAME = `Release-Smoke-${Date.now()}`;
 const AGENT_NAME = "CEO";
-const TASK_TITLE = "Release smoke task";
+const MISSION = "Verify the published Docker package completes authenticated onboarding.";
+const TASK_TITLE = "Hire your first engineer and create a hiring plan";
 
 async function signIn(page: Page) {
   await page.goto("/");
@@ -25,13 +26,20 @@ async function signIn(page: Page) {
 }
 
 async function openOnboarding(page: Page) {
+  await page.goto("/onboarding");
   const wizardHeading = page.locator("h3", { hasText: "Name your company" });
-  const startButton = page.getByRole("button", { name: "Start Onboarding" });
+  const startButton = page.getByRole("button", {
+    name: /Start Onboarding|New Company|Add Agent/,
+  });
+  const createButton = page.getByRole("button", { name: /Build a new company/ });
 
-  await expect(wizardHeading.or(startButton)).toBeVisible({ timeout: 20_000 });
+  await expect(wizardHeading.or(startButton).or(createButton)).toBeVisible({ timeout: 20_000 });
 
   if (await startButton.isVisible()) {
     await startButton.click();
+  }
+  if (await createButton.isVisible()) {
+    await createButton.click();
   }
 
   await expect(wizardHeading).toBeVisible({ timeout: 10_000 });
@@ -41,36 +49,60 @@ test.describe("Docker authenticated onboarding smoke", () => {
   test("logs in, completes onboarding, and triggers the first CEO run", async ({
     page,
   }) => {
+    await page.route("**/test-environment", (route) =>
+      route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ status: "pass", checks: [] }),
+      }),
+    );
+    await page.route("**/agent-hires", async (route) => {
+      const request = route.request();
+      const body = request.postDataJSON() as {
+        name: string;
+        role: string;
+        runtimeConfig?: Record<string, unknown>;
+      };
+      await route.continue({
+        postData: JSON.stringify({
+          name: body.name,
+          role: body.role,
+          adapterType: "http",
+          adapterConfig: { url: "http://127.0.0.1:1/release-smoke" },
+          runtimeConfig: body.runtimeConfig,
+        }),
+      });
+    });
+
     await signIn(page);
     await openOnboarding(page);
 
     await page.locator('input[placeholder="Acme Corp"]').fill(COMPANY_NAME);
     await page.getByRole("button", { name: "Next" }).click();
 
-    await expect(
-      page.locator("h3", { hasText: "Create your first agent" })
-    ).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByRole("heading", { name: "Define your mission" })).toBeVisible({
+      timeout: 10_000,
+    });
+    await page.getByPlaceholder("What is your team trying to achieve?").fill(MISSION);
+    await page.getByRole("button", { name: /Confirm mission/ }).click();
 
-    await expect(page.locator('input[placeholder="CEO"]')).toHaveValue(AGENT_NAME);
-    await page.getByRole("button", { name: "Next" }).click();
+    await expect(page.getByRole("heading", { name: "Create your team lead" })).toBeVisible({
+      timeout: 15_000,
+    });
+    await page.getByPlaceholder("Chief of staff").fill(AGENT_NAME);
+    await page.getByRole("button", { name: /^Next/ }).click();
 
-    await expect(
-      page.locator("h3", { hasText: "Give it something to do" })
-    ).toBeVisible({ timeout: 10_000 });
-    await page
-      .locator('input[placeholder="e.g. Research competitor pricing"]')
-      .fill(TASK_TITLE);
-    await page.getByRole("button", { name: "Next" }).click();
+    await expect(page.getByRole("heading", { name: "Connect a model" })).toBeVisible({
+      timeout: 20_000,
+    });
+    await page.getByRole("button", { name: /Give it a heartbeat/ }).click();
 
-    await expect(
-      page.locator("h3", { hasText: "Ready to launch" })
-    ).toBeVisible({ timeout: 10_000 });
-    await expect(page.getByText(COMPANY_NAME)).toBeVisible();
-    await expect(page.getByText(AGENT_NAME)).toBeVisible();
-    await expect(page.getByText(TASK_TITLE)).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Review" })).toBeVisible({
+      timeout: 30_000,
+    });
+    await expect(page.getByText(MISSION)).toBeVisible();
 
-    await page.getByRole("button", { name: "Create & Open Task" }).click();
-    await expect(page).toHaveURL(/\/issues\//, { timeout: 10_000 });
+    await page.getByRole("button", { name: /Get started/ }).click();
+    await expect(page).toHaveURL(/\/dashboard$/, { timeout: 30_000 });
 
     const baseUrl = new URL(page.url()).origin;
 
@@ -93,7 +125,7 @@ test.describe("Docker authenticated onboarding smoke", () => {
     const ceoAgent = agents.find((entry) => entry.name === AGENT_NAME);
     expect(ceoAgent).toBeTruthy();
     expect(ceoAgent!.role).toBe("ceo");
-    expect(ceoAgent!.adapterType).not.toBe("process");
+    expect(ceoAgent!.adapterType).toBe("http");
 
     const issuesRes = await page.request.get(
       `${baseUrl}/api/companies/${company!.id}/issues`

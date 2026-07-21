@@ -26,7 +26,7 @@ describe("Docker onboard release smoke contract", () => {
   });
 
   it("preserves detached startup failures for workflow diagnostics and cleanup", () => {
-    const containerRun = smokeScript.indexOf("docker run -d --rm");
+    const containerRun = smokeScript.indexOf("docker run -d");
     const metadataWrite = smokeScript.indexOf("\nwrite_metadata_file\n", containerRun);
     const preserveContainer = smokeScript.indexOf(
       'PRESERVE_CONTAINER_ON_EXIT="true"',
@@ -39,6 +39,8 @@ describe("Docker onboard release smoke contract", () => {
     expect(metadataWrite).toBeGreaterThan(containerRun);
     expect(preserveContainer).toBeGreaterThan(metadataWrite);
     expect(readinessProbe).toBeGreaterThan(preserveContainer);
+    expect(smokeScript).not.toContain("docker run -d --rm");
+    expect(smokeScript).toContain('docker rm -f "$CONTAINER_NAME"');
     expect(smokeWorkflow).toContain('echo "SMOKE_METADATA_FILE=$metadata_file" >> "$GITHUB_ENV"');
     expect(smokeWorkflow.match(/source "\$SMOKE_METADATA_FILE"/g)).toHaveLength(2);
     expect(smokeWorkflow).toContain("--- npm debug log tail ---");
