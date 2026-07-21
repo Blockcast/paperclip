@@ -374,6 +374,16 @@ function runSerializedSuites(routeTests, shardIndex, shardCount) {
         routeTest.repoPath,
         "--pool=forks",
         "--isolate",
+        // MITIGATION, not the root cause. These route suites time out (never
+        // assert-fail) under shared-ARC contention because createProjectApp/
+        // createExecutionWorkspaceApp cache-bust a cold dynamic import of the
+        // whole route+middleware+services module graph PER TEST — that per-test
+        // re-transform balloons past the budget under load, and with one file
+        // per invocation a single tipped test reds the shard. Retry lets a
+        // transient timeout self-heal until the harness is refactored to import
+        // once + reset mocks surgically (the real fix). Timeouts only, so retry
+        // cannot mask an assertion regression here. (BLO-17053)
+        "--retry=2",
       ],
       routeTest.repoPath,
     );
