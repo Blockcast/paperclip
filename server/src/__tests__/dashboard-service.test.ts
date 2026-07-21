@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, costEvents, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -48,6 +48,7 @@ describeEmbeddedPostgres("dashboard service", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     // cost_events / heartbeat_runs / issues FK-reference agents + companies,
     // so delete children before parents to avoid FK violations.
     await db.delete(costEvents);
@@ -74,6 +75,23 @@ describeEmbeddedPostgres("dashboard service", () => {
       permissions: {},
     };
   }
+
+  it("skips recursive run activity aggregation for sidebar polling", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const executeSpy = vi.spyOn(db, "execute");
+    const summary = await dashboardService(db).core(companyId, { includeRunActivity: false });
+
+    expect(executeSpy).not.toHaveBeenCalled();
+    expect(summary.runActivity).toHaveLength(14);
+    expect(summary.runActivity.every((bucket) => bucket.total === 0)).toBe(true);
+  });
 
   it("aggregates the full 14-day run activity window without recent-run truncation", async () => {
     const companyId = randomUUID();
