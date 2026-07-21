@@ -228,15 +228,15 @@ describeEmbeddedPostgres("permissions upgrade visibility and route boundaries", 
 
     const app = await createApp(db, agentActor(company.id, readerAgent.id));
 
-    const [issueList, comments, docs, docDetail, attachments, activity, workProducts] = await Promise.all([
-      request(app).get(`/api/companies/${company.id}/issues`),
-      request(app).get(`/api/issues/${issue.id}/comments`),
-      request(app).get(`/api/issues/${issue.id}/documents`),
-      request(app).get(`/api/issues/${issue.id}/documents/plan`),
-      request(app).get(`/api/issues/${issue.id}/attachments`),
-      request(app).get(`/api/issues/${issue.id}/activity`),
-      request(app).get(`/api/issues/${issue.id}/work-products`),
-    ]);
+    // This verifies visibility, not concurrent request handling. Serial reads
+    // avoid making one embedded Postgres fixture contend with itself on ARC.
+    const issueList = await request(app).get(`/api/companies/${company.id}/issues`);
+    const comments = await request(app).get(`/api/issues/${issue.id}/comments`);
+    const docs = await request(app).get(`/api/issues/${issue.id}/documents`);
+    const docDetail = await request(app).get(`/api/issues/${issue.id}/documents/plan`);
+    const attachments = await request(app).get(`/api/issues/${issue.id}/attachments`);
+    const activity = await request(app).get(`/api/issues/${issue.id}/activity`);
+    const workProducts = await request(app).get(`/api/issues/${issue.id}/work-products`);
 
     expect(issueList.status, JSON.stringify(issueList.body)).toBe(200);
     expect(issueList.body.items ?? issueList.body).toEqual(
