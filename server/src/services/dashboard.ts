@@ -58,11 +58,10 @@ function emptyStatusBuckets(): Record<IssueStatus, number> {
 export function dashboardService(db: Db) {
   const budgets = budgetService(db);
 
-  // Cheap aggregates the sidebar-badges polling path needs (agent status,
-  // task counts, costs, pending approvals, run activity). Split out so
-  // sidebar-badges (polled ~every 15 s on every page) doesn't pay for the
-  // GROUP BY-on-issues queries that summary() adds.
-  async function core(companyId: string) {
+  // Common dashboard aggregates. Sidebar polling disables run activity below:
+  // it only needs agent/cost alerts and must not run the recursive retry-chain
+  // chart query every ~15 seconds on every page.
+  async function core(companyId: string, options?: { includeRunActivity?: boolean }) {
     const company = await db
       .select()
       .from(companies)
@@ -134,37 +133,44 @@ export function dashboardService(db: Db) {
 
     const monthSpendCents = Number(monthSpend);
     // A failed ancestor whose retry chain later succeeds is reported as
-    // recovered instead of inflating the headline failure count.
-    const runActivityRows = (await db.execute(sql`
-      WITH RECURSIVE recovered_runs(id) AS (
-        SELECT parent.id
-        FROM ${heartbeatRuns} AS child
-        JOIN ${heartbeatRuns} AS parent ON parent.id = child.retry_of_run_id
-        WHERE child.company_id = ${companyId}
-          AND child.status = 'succeeded'
-        UNION
-        SELECT parent.id
-        FROM recovered_runs rr
-        JOIN ${heartbeatRuns} AS child ON child.id = rr.id
-        JOIN ${heartbeatRuns} AS parent ON parent.id = child.retry_of_run_id
-      )
-      SELECT
-        to_char(run.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS date,
-        run.status AS status,
-        run.error_code AS error_code,
-        (run.id IN (SELECT id FROM recovered_runs)) AS recovered,
-        count(*)::double precision AS count
-      FROM ${heartbeatRuns} AS run
-      WHERE run.company_id = ${companyId}
-        AND run.created_at >= ${runActivityStart.toISOString()}::timestamptz
-      GROUP BY date, run.status, run.error_code, recovered
-    `)) as unknown as Iterable<{
+    // recovered instead of inflating the headline failure count. Retry links
+    // are FK-backed, so the CTE can emit retryOfRunId directly without joining
+    // the parent row. Its seed and traversal stay inside the chart window: a
+    // retry that recovers a recent run cannot have been created before it.
+    const runActivityRows = options?.includeRunActivity === false
+      ? []
+      : (await db.execute(sql`
+        WITH RECURSIVE recovered_runs(id) AS (
+          SELECT child.retry_of_run_id
+          FROM ${heartbeatRuns} AS child
+          WHERE child.company_id = ${companyId}
+            AND child.status = 'succeeded'
+            AND child.created_at >= ${runActivityStart.toISOString()}::timestamptz
+            AND child.retry_of_run_id IS NOT NULL
+          UNION
+          SELECT child.retry_of_run_id
+          FROM recovered_runs rr
+          JOIN ${heartbeatRuns} AS child ON child.id = rr.id
+          WHERE child.retry_of_run_id IS NOT NULL
+            AND child.created_at >= ${runActivityStart.toISOString()}::timestamptz
+        )
+        SELECT
+          to_char(run.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS date,
+          run.status AS status,
+          run.error_code AS error_code,
+          (run.id IN (SELECT id FROM recovered_runs)) AS recovered,
+          count(*)::double precision AS count
+        FROM ${heartbeatRuns} AS run
+        WHERE run.company_id = ${companyId}
+          AND run.created_at >= ${runActivityStart.toISOString()}::timestamptz
+        GROUP BY date, run.status, run.error_code, recovered
+      `)) as unknown as Iterable<{
       date: string;
       status: string;
       error_code: string | null;
       recovered: boolean | string;
       count: number | string;
-    }>;
+      }>;
 
     const runActivity = new Map(
       runActivityDays.map((date) => [
