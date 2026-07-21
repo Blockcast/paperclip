@@ -9,6 +9,8 @@ DATA_DIR="${DATA_DIR:-$REPO_ROOT/data/docker-onboard-smoke}"
 HOST_UID="${HOST_UID:-$(id -u)}"
 SMOKE_DETACH="${SMOKE_DETACH:-false}"
 SMOKE_METADATA_FILE="${SMOKE_METADATA_FILE:-}"
+SMOKE_READY_TIMEOUT_SECONDS="${SMOKE_READY_TIMEOUT_SECONDS:-300}"
+SMOKE_HTTP_TIMEOUT_SECONDS="${SMOKE_HTTP_TIMEOUT_SECONDS:-5}"
 PAPERCLIP_DEPLOYMENT_MODE="${PAPERCLIP_DEPLOYMENT_MODE:-authenticated}"
 PAPERCLIP_DEPLOYMENT_EXPOSURE="${PAPERCLIP_DEPLOYMENT_EXPOSURE:-private}"
 PAPERCLIP_PUBLIC_URL="${PAPERCLIP_PUBLIC_URL:-http://localhost:${HOST_PORT}}"
@@ -29,7 +31,7 @@ cleanup() {
     kill "$LOG_PID" >/dev/null 2>&1 || true
   fi
   if [[ "$PRESERVE_CONTAINER_ON_EXIT" != "true" ]]; then
-    docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
   if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
     rm -rf "$TMP_DIR"
@@ -46,11 +48,14 @@ container_is_running() {
 
 wait_for_http() {
   local url="$1"
-  local attempts="${2:-60}"
+  local timeout_seconds="${2:-$SMOKE_READY_TIMEOUT_SECONDS}"
   local sleep_seconds="${3:-1}"
-  local i
-  for ((i = 1; i <= attempts; i += 1)); do
-    if curl -fsS "$url" >/dev/null 2>&1; then
+  local deadline=$((SECONDS + timeout_seconds))
+  while ((SECONDS < deadline)); do
+    if curl -fsS \
+      --connect-timeout "$SMOKE_HTTP_TIMEOUT_SECONDS" \
+      --max-time "$SMOKE_HTTP_TIMEOUT_SECONDS" \
+      "$url" >/dev/null 2>&1; then
       return 0
     fi
     if ! container_is_running; then
@@ -259,7 +264,7 @@ fi
 
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
-docker run -d --rm \
+docker run -d \
   --name "$CONTAINER_NAME" \
   -p "$HOST_PORT:3100" \
   -e HOST=0.0.0.0 \
@@ -270,6 +275,11 @@ docker run -d --rm \
   -v "$DATA_DIR:/paperclip" \
   "$IMAGE_NAME" >/dev/null
 
+write_metadata_file
+if [[ "$SMOKE_DETACH" == "true" ]]; then
+  PRESERVE_CONTAINER_ON_EXIT="true"
+fi
+
 if [[ "$SMOKE_DETACH" != "true" ]]; then
   docker logs -f "$CONTAINER_NAME" &
   LOG_PID=$!
@@ -278,8 +288,8 @@ fi
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-onboard-smoke.XXXXXX")"
 COOKIE_JAR="$TMP_DIR/cookies.txt"
 
-if ! wait_for_http "$PAPERCLIP_PUBLIC_URL/api/health" 90 1; then
-  echo "Smoke bootstrap failed: server did not become ready at $PAPERCLIP_PUBLIC_URL/api/health" >&2
+if ! wait_for_http "$PAPERCLIP_PUBLIC_URL/api/health" "$SMOKE_READY_TIMEOUT_SECONDS" 1; then
+  echo "Smoke bootstrap failed: server did not become ready at $PAPERCLIP_PUBLIC_URL/api/health after ${SMOKE_READY_TIMEOUT_SECONDS}s" >&2
   docker logs "$CONTAINER_NAME" >&2 || true
   exit 1
 fi
@@ -288,10 +298,7 @@ if [[ "$SMOKE_AUTO_BOOTSTRAP" == "true" && "$PAPERCLIP_DEPLOYMENT_MODE" == "auth
   auto_bootstrap_authenticated_smoke
 fi
 
-write_metadata_file
-
 if [[ "$SMOKE_DETACH" == "true" ]]; then
-  PRESERVE_CONTAINER_ON_EXIT="true"
   echo "==> Smoke container ready for automation"
   echo "    Smoke base URL: $PAPERCLIP_PUBLIC_URL"
   echo "    Smoke admin credentials: $SMOKE_ADMIN_EMAIL / $SMOKE_ADMIN_PASSWORD"
