@@ -1,6 +1,13 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+// BLO-17053: import the route + middleware modules ONCE (hoisted vi.mock below
+// makes the static import see the mocked services). Building a fresh app +
+// fresh router per test (see createApp) keeps per-router closure state — e.g.
+// companies.ts's per-router importJobs map — from leaking across tests, so we
+// no longer cache-bust a cold re-import of the module graph on every test.
+import { companyRoutes } from "../routes/companies.js";
+import { errorHandler } from "../middleware/index.js";
 
 const mockCompanyService = vi.hoisted(() => ({
   list: vi.fn(),
@@ -82,36 +89,16 @@ vi.mock("../services/index.js", () => ({
   logActivity: mockLogActivity,
 }));
 
-function registerCompanyRouteMocks() {
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => mockAccessService,
-    agentService: () => mockAgentService,
-    budgetService: () => mockBudgetService,
-    companyArtifactsService: () => mockCompanyArtifactsService,
-    companyPortabilityService: () => mockCompanyPortabilityService,
-    companyService: () => mockCompanyService,
-    feedbackService: () => mockFeedbackService,
-    logActivity: mockLogActivity,
-  }));
-}
-
-let appImportCounter = 0;
-
-async function createApp(actor: Record<string, unknown>) {
-  registerCompanyRouteMocks();
-  appImportCounter += 1;
-  const routeModulePath = `../routes/companies.js?company-portability-routes-${appImportCounter}`;
-  const middlewareModulePath = `../middleware/index.js?company-portability-routes-${appImportCounter}`;
-  const [{ companyRoutes }, { errorHandler }] = await Promise.all([
-    import(routeModulePath) as Promise<typeof import("../routes/companies.js")>,
-    import(middlewareModulePath) as Promise<typeof import("../middleware/index.js")>,
-  ]);
+function createApp(actor: Record<string, unknown>) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
     (req as any).actor = actor;
     next();
   });
+  // Fresh router per call: companyRoutes() closes over a per-router importJobs
+  // map, so a new instance per test keeps async-import-job state isolated
+  // without re-importing (and re-transforming) the module graph.
   app.use("/api/companies", companyRoutes({} as any));
   app.use(errorHandler);
   return app;
@@ -225,7 +212,7 @@ describe.sequential("company portability routes", () => {
   });
 
   it.sequential("rejects non-CEO agents from CEO-safe export preview routes", async () => {
-    const app = await createApp({
+    const app = createApp({
       type: "agent",
       agentId: engineerAgentId,
       companyId,
@@ -243,7 +230,7 @@ describe.sequential("company portability routes", () => {
   });
 
   it.sequential("rejects non-CEO export preview callers before validating request shape", async () => {
-    const app = await createApp({
+    const app = createApp({
       type: "agent",
       agentId: engineerAgentId,
       companyId,
@@ -261,7 +248,7 @@ describe.sequential("company portability routes", () => {
   });
 
   it.sequential("rejects non-CEO agents from legacy and CEO-safe export bundle routes", async () => {
-    const app = await createApp({
+    const app = createApp({
       type: "agent",
       agentId: engineerAgentId,
       companyId,
@@ -288,7 +275,7 @@ describe.sequential("company portability routes", () => {
       warnings: [],
       paperclipExtensionPath: ".paperclip.yaml",
     });
-    const app = await createApp({
+    const app = createApp({
       type: "agent",
       agentId: ceoAgentId,
       companyId,
@@ -306,7 +293,7 @@ describe.sequential("company portability routes", () => {
 
   it.sequential("allows CEO agents to export through legacy and CEO-safe bundle routes", async () => {
     mockCompanyPortabilityService.exportBundle.mockResolvedValue(createExportResult());
-    const app = await createApp({
+    const app = createApp({
       type: "agent",
       agentId: ceoAgentId,
       companyId,
@@ -327,7 +314,7 @@ describe.sequential("company portability routes", () => {
 
   it.sequential("allows board users to export through legacy and CEO-safe bundle routes", async () => {
     mockCompanyPortabilityService.exportBundle.mockResolvedValue(createExportResult());
-    const app = await createApp({
+    const app = createApp({
       type: "board",
       userId: "user-1",
       companyIds: [companyId],
@@ -345,7 +332,7 @@ describe.sequential("company portability routes", () => {
   });
 
   it.sequential("rejects CEO agents from exporting another company before services run", async () => {
-    const app = await createApp({
+    const app = createApp({
       type: "agent",
       agentId: ceoAgentId,
       companyId,
@@ -369,7 +356,7 @@ describe.sequential("company portability routes", () => {
   });
 
   it.sequential("rejects replace collision strategy on CEO-safe import routes", async () => {
-    const app = await createApp({
+    const app = createApp({
       type: "agent",
       agentId: ceoAgentId,
       companyId: "11111111-1111-4111-8111-111111111111",
@@ -392,7 +379,7 @@ describe.sequential("company portability routes", () => {
   });
 
   it.sequential("rejects CEO agents from previewing or applying imports against another route company", async () => {
-    const app = await createApp({
+    const app = createApp({
       type: "agent",
       agentId: ceoAgentId,
       companyId,
@@ -418,7 +405,7 @@ describe.sequential("company portability routes", () => {
   });
 
   it.sequential("rejects CEO-safe import bodies that target a different company than the route", async () => {
-    const app = await createApp({
+    const app = createApp({
       type: "agent",
       agentId: ceoAgentId,
       companyId,
@@ -444,7 +431,7 @@ describe.sequential("company portability routes", () => {
   });
 
   it.sequential("keeps global import preview routes board-only", async () => {
-    const app = await createApp({
+    const app = createApp({
       type: "agent",
       agentId: engineerAgentId,
       companyId: "11111111-1111-4111-8111-111111111111",
@@ -466,7 +453,7 @@ describe.sequential("company portability routes", () => {
   });
 
   it.sequential("keeps global import preview board-only before validating request shape", async () => {
-    const app = await createApp({
+    const app = createApp({
       type: "agent",
       agentId: engineerAgentId,
       companyId: "11111111-1111-4111-8111-111111111111",
@@ -484,7 +471,7 @@ describe.sequential("company portability routes", () => {
   });
 
   it.sequential("requires instance admin for new-company import preview", async () => {
-    const app = await createApp({
+    const app = createApp({
       type: "board",
       userId: "user-1",
       companyIds: ["11111111-1111-4111-8111-111111111111"],
@@ -507,7 +494,7 @@ describe.sequential("company portability routes", () => {
   });
 
   it.sequential("rejects replace collision strategy on CEO-safe import apply routes", async () => {
-    const app = await createApp({
+    const app = createApp({
       type: "agent",
       agentId: ceoAgentId,
       companyId: "11111111-1111-4111-8111-111111111111",
@@ -530,7 +517,7 @@ describe.sequential("company portability routes", () => {
   });
 
   it.sequential("rejects non-CEO agents from CEO-safe import preview routes", async () => {
-    const app = await createApp({
+    const app = createApp({
       type: "agent",
       agentId: engineerAgentId,
       companyId: "11111111-1111-4111-8111-111111111111",
@@ -553,7 +540,7 @@ describe.sequential("company portability routes", () => {
   });
 
   it.sequential("rejects non-CEO import preview callers before validating request shape", async () => {
-    const app = await createApp({
+    const app = createApp({
       type: "agent",
       agentId: engineerAgentId,
       companyId: "11111111-1111-4111-8111-111111111111",
@@ -571,7 +558,7 @@ describe.sequential("company portability routes", () => {
   });
 
   it.sequential("rejects non-CEO agents from CEO-safe import apply routes", async () => {
-    const app = await createApp({
+    const app = createApp({
       type: "agent",
       agentId: engineerAgentId,
       companyId: "11111111-1111-4111-8111-111111111111",
@@ -594,7 +581,7 @@ describe.sequential("company portability routes", () => {
   });
 
   it.sequential("requires instance admin for new-company import apply", async () => {
-    const app = await createApp({
+    const app = createApp({
       type: "board",
       userId: "user-1",
       companyIds: ["11111111-1111-4111-8111-111111111111"],
@@ -622,7 +609,7 @@ describe.sequential("company portability routes", () => {
       resolveImport = resolve;
     });
     mockCompanyPortabilityService.importBundle.mockReturnValueOnce(pendingImport);
-    const app = await createApp(cloudTenantActor());
+    const app = createApp(cloudTenantActor());
 
     const accepted = await request(app)
       .post("/api/companies/import")
@@ -667,7 +654,7 @@ describe.sequential("company portability routes", () => {
 
   it.sequential("reports trusted Cloud async import job failures with the tenant error message", async () => {
     mockCompanyPortabilityService.importBundle.mockRejectedValueOnce(new Error("tenant import exploded"));
-    const app = await createApp(cloudTenantActor());
+    const app = createApp(cloudTenantActor());
 
     const accepted = await request(app)
       .post("/api/companies/import")
@@ -687,7 +674,7 @@ describe.sequential("company portability routes", () => {
   });
 
   it.sequential("accepts trusted Cloud async import jobs before validating the full import payload", async () => {
-    const app = await createApp(cloudTenantActor());
+    const app = createApp(cloudTenantActor());
 
     const accepted = await request(app)
       .post("/api/companies/import")
@@ -710,7 +697,7 @@ describe.sequential("company portability routes", () => {
 
   it.sequential("keeps global import apply synchronous when Cloud async opt-in is absent", async () => {
     mockCompanyPortabilityService.importBundle.mockResolvedValueOnce(createImportResult("created"));
-    const app = await createApp(cloudTenantActor());
+    const app = createApp(cloudTenantActor());
 
     const res = await request(app)
       .post("/api/companies/import")
