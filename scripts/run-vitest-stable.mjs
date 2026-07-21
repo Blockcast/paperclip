@@ -379,9 +379,11 @@ function runSerializedSuites(routeTests, shardIndex, shardCount) {
   // --sequence.shuffle, and a full 31-file shard: 242/242, ~0.7GB peak RSS on
   // the orchestrator, well under the runner limit). Measured: a 6-file sample
   // dropped ~177s -> ~88s (~2x) and a full 31-file shard runs batched in one
-  // pass, with zero source changes. --retry=2 still lets a genuinely tipped
-  // test self-heal (timeouts only; cannot mask an assertion regression).
-  // (BLO-17053)
+  // pass, with zero source changes. --retry=1 is a thin permanent margin (not
+  // the old crutch): batching removed the per-file cold-start that ARC
+  // contention ballooned, confirmed by two clean 4/4 batched runs (the #765 PR
+  // CI and the 6b8e9572 master canary), so one retry absorbs a rare contention
+  // spike without masking a real regression (timeouts only). (BLO-17053)
   runVitest(
     [
       "--project",
@@ -391,7 +393,7 @@ function runSerializedSuites(routeTests, shardIndex, shardCount) {
       "--maxWorkers=1",
       "--pool=forks",
       "--isolate",
-      "--retry=2",
+      "--retry=1",
     ],
     `serialized shard ${shardIndex + 1}/${shardCount} (${shardTests.length} suites, batched)`,
   );
