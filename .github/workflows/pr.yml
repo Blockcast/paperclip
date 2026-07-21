@@ -356,7 +356,9 @@ jobs:
     name: Canary Dry Run
     needs: [policy]
     runs-on: default
-    timeout-minutes: 20
+    # ARC setup/cache restore plus release.sh's mandatory workspace build hit
+    # the previous 20-minute ceiling while the build was still progressing.
+    timeout-minutes: 40
 
     steps:
       - name: Checkout repository
