@@ -30,10 +30,9 @@ env:
 
 jobs:
   build-and-push:
-    # Push-only: schedule/workflow_dispatch runs deploy the per-commit tag a
-    # prior push build already put in Harbor (the deploy job verifies it
-    # exists before rolling).
-    if: ${{ github.event_name == 'push' }}
+    # Pushes and manual recovery dispatches build the selected ref. Scheduled
+    # runs remain deploy-only and consume a tag published by an earlier build.
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     runs-on: arc-dind
     timeout-minutes: 90
     concurrency:
@@ -212,8 +211,7 @@ jobs:
     needs: build-and-push
     runs-on: arc-deploy
     # !cancelled() lets this run when build-and-push was SKIPPED
-    # (schedule/workflow_dispatch); the result check still blocks deploys
-    # after a FAILED build.
+    # (schedule); the result check still blocks deploys after a FAILED build.
     if: ${{ !cancelled() && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && (needs.build-and-push.result == 'success' || needs.build-and-push.result == 'skipped') }}
     # Must exceed helm upgrade's --timeout 30m below, plus checkout/cleanup margin.
     timeout-minutes: 40
