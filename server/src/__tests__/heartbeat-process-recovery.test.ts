@@ -1563,6 +1563,114 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.errorCode).toBe("process_lost");
   });
 
+  it("immediately reaps a fresh exact-missing Job after restart when no adapter owner remains", async () => {
+    const jobName = "agent-opencode-restart-missing";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      externalRunId: jobName,
+      lastOutputAt: new Date(),
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    const reservation = await seedLaunchedReservation({
+      companyId,
+      agentId,
+      runId,
+      jobName,
+    });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "failed",
+      errorCode: "job_missing",
+    });
+    const persistedReservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.id, reservation.id))
+      .then((rows) => rows[0]);
+    expect(persistedReservation).toMatchObject({
+      state: "released",
+      releaseReason: "job_missing",
+    });
+  });
+
+  it("keeps a fresh ownerless run when the exact Job lookup is inconclusive", async () => {
+    const jobName = "agent-opencode-inventory-inconclusive";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      externalRunId: jobName,
+      lastOutputAt: new Date(),
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce(null);
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).not.toContain(runId);
+    expect((await heartbeat.getRun(runId))?.status).toBe("running");
+  });
+
+  it("keeps a fresh exact-missing Job while the local adapter owner may still finalize it", async () => {
+    const jobName = "agent-opencode-owner-finalizing";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      externalRunId: jobName,
+      lastOutputAt: new Date(),
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    const freshResult = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(freshResult.runIds).not.toContain(runId);
+    expect((await heartbeat.getRun(runId))?.status).toBe("running");
+
+    await db
+      .update(heartbeatRuns)
+      .set({ lastOutputAt: new Date(Date.now() - 16 * 60 * 1000) })
+      .where(eq(heartbeatRuns.id, runId));
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    const staleResult = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(staleResult.runIds).toContain(runId);
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "failed",
+      errorCode: "job_missing",
+    });
+  });
+
   it("releases an old prelaunch reservation left behind by a terminal run so the next queued run can start", async () => {
     const reservedAt = new Date(Date.now() - 16 * 60 * 1000);
     const { companyId, agentId, runId } = await seedRunFixture({
