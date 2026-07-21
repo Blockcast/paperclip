@@ -879,6 +879,41 @@ describe("mcp gateway lifecycle compatibility", () => {
     expect(upstream.receivedToolCalls).toEqual(["ping", "ping"]);
   });
 
+  it("single-flights concurrent stale-session recovery on a path-prefixed route", async () => {
+    const upstream = await createStrictMcpUpstream();
+    const gateway = await createGateway(upstream.url);
+
+    const initialize = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "0" } },
+      }),
+    });
+    const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
+    expect(clientSessionId).toBeTruthy();
+
+    upstream.clearSessions();
+    upstream.raceNextRecovery();
+    const call = (id: number) => fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(clientSessionId ?? undefined),
+      body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "ping", arguments: {} } }),
+    });
+    const responses = await Promise.all([call(2), call(3)]);
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    await expect(Promise.all(responses.map((response) => response.json()))).resolves.toEqual([
+      expect.objectContaining({ result: { content: [{ type: "text", text: "ping" }] } }),
+      expect.objectContaining({ result: { content: [{ type: "text", text: "ping" }] } }),
+    ]);
+    expect(upstream.methods.filter((method) => method === "initialize")).toHaveLength(2);
+    expect(upstream.receivedToolCalls).toEqual(["ping", "ping"]);
+  });
+
   it("leases Figma credentials server-side and only forwards the resolved token upstream", async () => {
     const upstream = await createStrictMcpUpstream();
     const custody = await createCustodyService({ failRepeatedLeaseForSession: true });
@@ -1142,6 +1177,28 @@ describe("mcp gateway lifecycle compatibility", () => {
     expect(call.status).toBe(200);
     expect(beta.receivedToolCalls).toEqual(["search"]);
     expect(alpha.receivedToolCalls).toEqual([]);
+  });
+
+  it("single-flights concurrent aggregate session bootstrap", async () => {
+    const upstream = await createStrictMcpUpstream([{ name: "ping", description: "Ping" }]);
+    const gateway = await createAggregateGateway({ alpha: { url: upstream.url, credentialHeaders: [] } });
+    const clientSessionId = "aggregate-bootstrap-session";
+    upstream.raceNextRecovery();
+
+    const call = (id: number) => postJson(
+      gateway.url,
+      { jsonrpc: "2.0", id, method: "tools/call", params: { name: "alpha__ping", arguments: {} } },
+      jsonHeaders(clientSessionId),
+    );
+    const responses = await Promise.all([call(1), call(2)]);
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    await expect(Promise.all(responses.map((response) => response.json()))).resolves.toEqual([
+      expect.objectContaining({ result: { content: [{ type: "text", text: "ping" }] } }),
+      expect.objectContaining({ result: { content: [{ type: "text", text: "ping" }] } }),
+    ]);
+    expect(upstream.methods.filter((method) => method === "initialize")).toHaveLength(1);
+    expect(upstream.receivedToolCalls).toEqual(["ping", "ping"]);
   });
 
   it("applies credential custody to aggregate upstream sessions", async () => {
@@ -1529,6 +1586,32 @@ describe("mcp gateway lifecycle compatibility", () => {
       "notifications/initialized",
       "tools/call",
     ]);
+  });
+
+  it("single-flights concurrent stale-session recovery on aggregate tool calls", async () => {
+    const upstream = await createStrictMcpUpstream([{ name: "ping", description: "Ping" }]);
+    const gateway = await createAggregateGateway({ alpha: { url: upstream.url, credentialHeaders: [] } });
+
+    const initialize = await postJson(gateway.url, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
+    expect(clientSessionId).toBeTruthy();
+    upstream.clearSessions();
+    upstream.raceNextRecovery();
+
+    const call = (id: number) => postJson(
+      gateway.url,
+      { jsonrpc: "2.0", id, method: "tools/call", params: { name: "alpha__ping", arguments: {} } },
+      jsonHeaders(clientSessionId ?? undefined),
+    );
+    const responses = await Promise.all([call(2), call(3)]);
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    await expect(Promise.all(responses.map((response) => response.json()))).resolves.toEqual([
+      expect.objectContaining({ result: { content: [{ type: "text", text: "ping" }] } }),
+      expect.objectContaining({ result: { content: [{ type: "text", text: "ping" }] } }),
+    ]);
+    expect(upstream.methods.filter((method) => method === "initialize")).toHaveLength(2);
+    expect(upstream.receivedToolCalls).toEqual(["ping", "ping"]);
   });
 
   it("opens the aggregate breaker when stale-session recovery bootstrap is rejected", async () => {

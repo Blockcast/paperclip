@@ -837,6 +837,7 @@ async function serveMatched(
   if (clientSessionId) {
     const record = store.get(clientSessionId);
     if (record) {
+      const attemptedUpstreamSessionId = record.upstreamSessionId;
       const credentialToken = custodyConfig
         ? await resolveCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, record.clientSessionId)
         : undefined;
@@ -845,7 +846,7 @@ async function serveMatched(
         req.method ?? "POST",
         req.headers,
         body,
-        record.upstreamSessionId,
+        attemptedUpstreamSessionId,
         timeoutMs,
         credentialToken,
         matched.config,
@@ -864,7 +865,7 @@ async function serveMatched(
         const retryResult = await store.runExclusive(clientSessionId, async () => {
           const current = store.get(clientSessionId);
           let retryUpstreamId = current?.upstreamSessionId;
-          if (!retryUpstreamId || retryUpstreamId === record.upstreamSessionId) {
+          if (!retryUpstreamId || retryUpstreamId === attemptedUpstreamSessionId) {
             retryUpstreamId = await createUpstreamSession(
               matched.upstreamUrl,
               req.headers,
