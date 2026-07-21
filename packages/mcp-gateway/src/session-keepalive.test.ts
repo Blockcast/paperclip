@@ -107,6 +107,13 @@ describe("isSessionNotFoundResponse", () => {
     )).toBe(true);
   });
 
+  it("matches an SSE-wrapped JSON-RPC lifecycle error", () => {
+    expect(isSessionNotFoundResponse(
+      200,
+      'event: message\ndata: {"jsonrpc":"2.0","id":2,"error":{"code":0,"message":"method \\"tools/call\\" is invalid during session initialization"}}\n\n',
+    )).toBe(true);
+  });
+
   it("does not match unrelated 404s", () => {
     expect(isSessionNotFoundResponse(404, '{"error":"Method not found"}')).toBe(false);
     expect(isSessionNotFoundResponse(500, '{"error":"Session not found"}')).toBe(false);
@@ -114,6 +121,10 @@ describe("isSessionNotFoundResponse", () => {
     expect(isSessionNotFoundResponse(
       200,
       '{"result":{"content":[{"text":"method is invalid during session initialization"}]}}',
+    )).toBe(false);
+    expect(isSessionNotFoundResponse(
+      200,
+      'event: message\ndata: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"method is invalid during session initialization"}]}}\n\n',
     )).toBe(false);
   });
 });

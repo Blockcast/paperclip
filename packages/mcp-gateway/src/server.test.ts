@@ -20,7 +20,7 @@ interface StrictMcpUpstream {
   receivedHeaders: http.IncomingHttpHeaders[];
   receivedToolCalls: string[];
   clearSessions: () => void;
-  resetSessionInitialization: () => void;
+  resetSessionInitialization: (responseFormat?: "json" | "sse") => void;
   rejectNextInitialize: () => void;
   close: () => Promise<void>;
 }
@@ -68,6 +68,7 @@ async function listen(server: http.Server): Promise<string> {
 async function createStrictMcpUpstream(tools: Array<Record<string, unknown>> = [{ name: "ping", description: "Ping" }]): Promise<StrictMcpUpstream> {
   let nextSession = 1;
   let rejectNextInitialize = false;
+  let lifecycleErrorResponseFormat: "json" | "sse" = "json";
   const sessions = new Map<string, { initialized: boolean }>();
   const methods: string[] = [];
   const receivedHeaders: http.IncomingHttpHeaders[] = [];
@@ -113,13 +114,14 @@ async function createStrictMcpUpstream(tools: Array<Record<string, unknown>> = [
     }
 
     if (!session.initialized) {
-      res.statusCode = 200;
-      res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({
+      const lifecycleError = JSON.stringify({
         jsonrpc: "2.0",
         id: message.id ?? 0,
         error: { code: 0, message: `method "${method}" is invalid during session initialization` },
-      }));
+      });
+      res.statusCode = 200;
+      res.setHeader("content-type", lifecycleErrorResponseFormat === "sse" ? "text/event-stream" : "application/json");
+      res.end(lifecycleErrorResponseFormat === "sse" ? `event: message\ndata: ${lifecycleError}\n\n` : lifecycleError);
       return;
     }
 
@@ -151,7 +153,8 @@ async function createStrictMcpUpstream(tools: Array<Record<string, unknown>> = [
     receivedHeaders,
     receivedToolCalls,
     clearSessions: () => sessions.clear(),
-    resetSessionInitialization: () => {
+    resetSessionInitialization: (responseFormat = "json") => {
+      lifecycleErrorResponseFormat = responseFormat;
       for (const session of sessions.values()) session.initialized = false;
     },
     rejectNextInitialize: () => {
@@ -773,6 +776,43 @@ describe("mcp gateway lifecycle compatibility", () => {
     expect(clientSessionId).toBeTruthy();
 
     upstream.resetSessionInitialization();
+    const toolsCall = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(clientSessionId ?? undefined),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "ping", arguments: {} } }),
+    });
+
+    expect(toolsCall.status).toBe(200);
+    expect(await toolsCall.json()).toMatchObject({ result: { content: [{ text: "ping" }] } });
+    expect(toolsCall.headers.get(MCP_SESSION_HEADER)).toBe(clientSessionId);
+    expect(upstream.methods).toEqual([
+      "initialize",
+      "notifications/initialized",
+      "tools/call",
+      "initialize",
+      "notifications/initialized",
+      "tools/call",
+    ]);
+  });
+
+  it("reinitializes when an idle upstream returns an SSE-wrapped lifecycle error", async () => {
+    const upstream = await createStrictMcpUpstream();
+    const gateway = await createGateway(upstream.url);
+
+    const initialize = await fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "0" } },
+      }),
+    });
+    const clientSessionId = initialize.headers.get(MCP_SESSION_HEADER);
+    expect(clientSessionId).toBeTruthy();
+
+    upstream.resetSessionInitialization("sse");
     const toolsCall = await fetch(gateway.url, {
       method: "POST",
       headers: jsonHeaders(clientSessionId ?? undefined),

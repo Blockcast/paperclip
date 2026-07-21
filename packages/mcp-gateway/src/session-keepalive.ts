@@ -170,7 +170,8 @@ export class SessionStore {
  * Some servers return 410 Gone with the same body when they explicitly
  * GC'd the session. Older kubernetes-mcp-server releases instead return a
  * JSON-RPC error with HTTP 200 after their connection-scoped lifecycle state
- * expires, so recover that response too.
+ * expires, either as bare JSON or in MCP SSE `data:` frames, so recover those
+ * responses too.
  */
 export function isSessionNotFoundResponse(statusCode: number, bodyText: string): boolean {
   const lower = bodyText.toLowerCase();
@@ -178,13 +179,34 @@ export function isSessionNotFoundResponse(statusCode: number, bodyText: string):
     return lower.includes("session not found") || lower.includes("session expired");
   }
   if (statusCode < 200 || statusCode >= 300) return false;
-  try {
-    const response = JSON.parse(bodyText) as { error?: { message?: unknown } };
-    return typeof response.error?.message === "string" &&
-      response.error.message.toLowerCase().includes("invalid during session initialization");
-  } catch {
-    return false;
+
+  const payloads = [bodyText];
+  let eventData: string[] = [];
+  const flushEventData = () => {
+    if (eventData.length > 0) payloads.push(eventData.join("\n"));
+    eventData = [];
+  };
+  for (const line of bodyText.split(/\r?\n/)) {
+    if (line === "") {
+      flushEventData();
+    } else if (line.startsWith("data:")) {
+      eventData.push(line.slice(5).replace(/^ /, ""));
+    }
   }
+  flushEventData();
+
+  for (const payload of payloads) {
+    try {
+      const response = JSON.parse(payload) as { error?: { message?: unknown } };
+      if (typeof response.error?.message === "string" &&
+        response.error.message.toLowerCase().includes("invalid during session initialization")) {
+        return true;
+      }
+    } catch {
+      // Ignore non-JSON SSE events and continue checking remaining data payloads.
+    }
+  }
+  return false;
 }
 
 export const MCP_SESSION_HEADER = "mcp-session-id";
