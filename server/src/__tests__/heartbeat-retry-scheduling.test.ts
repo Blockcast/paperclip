@@ -1376,6 +1376,37 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ).toBe(false);
   });
 
+  it("BLO-17456: retries a pr_review_output_missing run, including a taskKey-only persisted snapshot", () => {
+    // Mirrors the BLO-8215 pr_review_auth_expired gate: a run that left no
+    // durable review/skip evidence must still get a bounded automatic retry
+    // instead of stranding the exact-head gate on a terminal failure.
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "pr_review_output_missing",
+        resultJson: {},
+        contextSnapshot: { taskKey: "pr_review:Blockcast/pim-multicast-gateway:1656" },
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "pr_review_output_missing",
+        resultJson: {},
+        contextSnapshot: { wakeReason: "github_pr_review_requested", reviewKind: "pr_review", githubPrNumber: 1656 },
+      }),
+    ).toBe(true);
+  });
+
+  it("BLO-17456: does not retry a pr_review_output_missing code outside a PR-review context", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "pr_review_output_missing",
+        resultJson: {},
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(false);
+  });
+
   it("does not retry plain adapter failures when the wake is not an idempotent PR review", () => {
     expect(
       shouldScheduleAutomaticRunRetry({

@@ -696,6 +696,18 @@ export function shouldScheduleAutomaticRunRetry(
     return isPrReviewRetryContext(parseObject(run.contextSnapshot));
   }
 
+  // BLO-17456: a run that exited successfully but left no durable review/skip
+  // evidence (`pr_review_output_missing`, set by evaluatePrReviewCompletionEvidence
+  // only after its own GitHub-side rescue check — BLO-10448 — already failed to
+  // find one) was previously a terminal failure with no automatic retry, so
+  // clearing it required an out-of-band fix (e.g. a manual agent image bump)
+  // instead of the platform just trying again. Bounded-retry it like the other
+  // pr_review-scoped recoverable failures above so a transient posting glitch
+  // self-heals instead of silently stranding the exact-head gate.
+  if (run.errorCode === "pr_review_output_missing") {
+    return isPrReviewRetryContext(parseObject(run.contextSnapshot));
+  }
+
   // BLO-9147 AC2: capacity-class dispatch refusals (k8s_concurrent_run_blocked)
   // are re-queued for pr_review wakes with bounded backoff so the review lands
   // once a slot frees. Non-PR wakes remain terminal (BLO-7913 leak guard).
