@@ -16,6 +16,7 @@ function operatorComment(body: string, createdAt = "2026-05-11T20:00:00.000Z"): 
 }
 
 const FRONTEND_DONE_WHEN = `## Goal\nShip the blog.\n\n## Done when\n- entry page renders\n- listing page renders\n- footer at bottom\n`;
+const LANDING_ARTIFACT = "https://github.com/Blockcast/paperclip/pull/775";
 
 describe("resolveRequiredShapes", () => {
   it("unions required shapes across multiple matching labels", () => {
@@ -29,6 +30,7 @@ describe("resolveRequiredShapes", () => {
         "screenshot:1440x900",
         "screenshot:390x844",
         "checklist:done-when",
+        "landing-artifact",
         "pr-link",
       ]),
     );
@@ -100,6 +102,7 @@ describe("evaluateEvidence — frontend label", () => {
       "",
       "![blog entry desktop 1440x900](./blog_entry_desktop_1440.png)",
       "![blog entry mobile 390x844](./blog_entry_mobile_390.png)",
+      LANDING_ARTIFACT,
       "",
       "| Criterion | Status | Evidence |",
       "|---|---|---|",
@@ -137,6 +140,7 @@ describe("evaluateEvidence — frontend label", () => {
         agentComment(
           [
             "Shipped. Per-bug:",
+            LANDING_ARTIFACT,
             "| # | Status |",
             "|---|---|",
             "| entry | ✅ |",
@@ -155,7 +159,7 @@ describe("evaluateEvidence — frontend label", () => {
   });
 
   it("blocks when only one viewport is present", () => {
-    const body = `![desktop](./shot_1440x900.png)\n| Item | Status |\n|---|---|\n| entry | ✅ |\n| listing | ✅ |\n| footer | ✅ |`;
+    const body = `![desktop](./shot_1440x900.png)\n${LANDING_ARTIFACT}\n| Item | Status |\n|---|---|\n| entry | ✅ |\n| listing | ✅ |\n| footer | ✅ |`;
     const result = evaluateEvidence({
       issue: {
         description: FRONTEND_DONE_WHEN,
@@ -202,6 +206,7 @@ describe("evaluateEvidence — backend label", () => {
       " Test Files  1 passed (1)",
       "      Tests  35 passed (35)",
       "```",
+      LANDING_ARTIFACT,
       "",
       "- [x] adds USABLE_TIERS entry",
       "- [x] adds asymmetric test for claude",
@@ -295,7 +300,7 @@ describe("evaluateEvidence — unlabeled issue", () => {
   it("blocks labeled issues when required Done-when criteria are absent", () => {
     const result = evaluateEvidence({
       issue: { description: "## Goal\nfix the thing", labels: [{ name: "backend" }] },
-      comments: [agentComment("Test Files  3 passed (3)")],
+      comments: [agentComment(`Test Files  3 passed (3)\n${LANDING_ARTIFACT}`)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
     });
@@ -454,6 +459,7 @@ describe("evaluateEvidence — comment recency window", () => {
       [
         "![desktop](./shot_1440x900.png)",
         "![mobile](./shot_390x844.png)",
+        LANDING_ARTIFACT,
         "| C | S | E |",
         "|---|---|---|",
         "| entry | ✅ | x |",
@@ -629,6 +635,7 @@ describe("evaluateEvidence — additional shape coverage (review-driven)", () =>
       [
         "![desktop](./shot_1440x900.png)",
         "![mobile](./shot_390x844.png)",
+        LANDING_ARTIFACT,
         "| C | S |",
         "|---|---|",
         "| entry | ✅ |",
@@ -726,6 +733,7 @@ describe("evaluateEvidence — shapeDetections shape", () => {
         "e2e-run",
         "e2e-script",
         "kubectl-state",
+        "landing-artifact",
         "migration-output",
         "pr-link",
         "probe-output",
@@ -753,6 +761,7 @@ describe("evaluateEvidence — db-migration label", () => {
       "Planning Time: 0.123 ms",
       "Execution Time: 0.045 ms",
       "```",
+      LANDING_ARTIFACT,
     ].join("\n");
     const result = evaluateEvidence({
       issue: {
@@ -769,7 +778,7 @@ describe("evaluateEvidence — db-migration label", () => {
   });
 
   it("passes for the 'migration' label alias", () => {
-    const body = "Applied 1 migration successfully.\n\n(5 rows)\n";
+    const body = `Applied 1 migration successfully.\n\n(5 rows)\n${LANDING_ARTIFACT}`;
     const result = evaluateEvidence({
       issue: {
         description: "## Done when\n- migration applied",
@@ -789,6 +798,7 @@ describe("evaluateEvidence — db-migration label", () => {
       "drizzle-kit: push completed",
       "✓ done",
       "```",
+      LANDING_ARTIFACT,
     ].join("\n");
     const result = evaluateEvidence({
       issue: {
@@ -814,6 +824,7 @@ describe("evaluateEvidence — db-migration label", () => {
       " 98432",
       "(1 row)",
       "```",
+      LANDING_ARTIFACT,
     ].join("\n");
     const result = evaluateEvidence({
       issue: {
@@ -834,7 +845,9 @@ describe("evaluateEvidence — db-migration label", () => {
         labels: [{ name: "db-migration" }],
       },
       comments: [
-        agentComment("Verified table exists.\n\nSELECT COUNT(*) FROM foo;\n(7 rows)"),
+        agentComment(
+          `Verified table exists.\n\nSELECT COUNT(*) FROM foo;\n(7 rows)\n${LANDING_ARTIFACT}`,
+        ),
       ],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
@@ -850,6 +863,7 @@ describe("evaluateEvidence — db-migration label", () => {
       "ALTER TABLE issues ADD COLUMN last_evidence_verdict jsonb;",
       "CREATE INDEX issue_events_issue_id_idx ON issue_events(issue_id);",
       "```",
+      LANDING_ARTIFACT,
     ].join("\n");
     const result = evaluateEvidence({
       issue: {
@@ -870,7 +884,7 @@ describe("evaluateEvidence — db-migration label", () => {
         description: "## Done when\n- migration applied",
         labels: [{ name: "db-migration" }],
       },
-      comments: [agentComment("Migration ran successfully — trust me.")],
+      comments: [agentComment(`Migration ran successfully — trust me.\n${LANDING_ARTIFACT}`)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
     });
@@ -892,12 +906,12 @@ describe("evaluateEvidence — db-migration label", () => {
     expect(result.verdict).toBe("block");
   });
 
-  it("resolveRequiredShapes: db-migration label returns migration-output required", () => {
+  it("resolveRequiredShapes: db-migration label returns migration and artifact requirements", () => {
     const { required, unlabeledFallback } = resolveRequiredShapes(
       { labels: [{ name: "db-migration" }] },
       DEFAULT_EVIDENCE_REGISTRY,
     );
     expect(unlabeledFallback).toBe(false);
-    expect(required).toEqual(["migration-output"]);
+    expect(required).toEqual(["migration-output", "landing-artifact"]);
   });
 });

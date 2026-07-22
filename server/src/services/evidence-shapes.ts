@@ -21,6 +21,7 @@ export type EvidenceShape =
   | "probe-output"
   | "url-probe"
   | "pr-link"
+  | "landing-artifact"
   | "ci-green"
   | "e2e-script"
   | "e2e-run"
@@ -46,19 +47,36 @@ export type EvidenceRegistry = Record<string, EvidenceRegistryEntry>;
  *     typically one-field CMS edits — over-gating slows the operator.
  *   - `pr` is the lightest of all: just a PR link. CI-green enforcement
  *     comes in Phase 2 (BLO-4828).
+ *   - `landing-artifact` (BLO-17560): added to every code-completion label
+ *     (`frontend`, `ui`, `cms-published`, `backend`, `db-migration`,
+ *     `migration`) after two independent fabrication incidents (BLO-6393
+ *     2026-05-22, BLO-6395 2026-06-10) where an agent posted a detailed
+ *     "implementation complete, unit-tested" comment — screenshots/test
+ *     banner + a fully-checked `checklist:done-when` table — for code that
+ *     only ever existed in an ephemeral workspace and was never committed.
+ *     Both incidents satisfied every previously-required shape for their
+ *     label and still passed the gate. `landing-artifact` closes that hole:
+ *     it requires a GitHub PR link OR a commit link in the target repo, and
+ *     it is additive to (not a replacement for) the existing shapes — a
+ *     passing test banner is necessary but no longer sufficient on its own.
+ *     `infra` and `cms-data-op` are intentionally NOT included: their
+ *     existing shapes (`kubectl-state`, `url-probe`) already demand live
+ *     state that can't be fabricated the same way, and some ops changes are
+ *     legitimately applied ahead of a PR landing (e.g. emergency kubectl
+ *     edits later backfilled into IaC).
  */
 export const DEFAULT_EVIDENCE_REGISTRY: EvidenceRegistry = {
   frontend: {
-    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when"],
+    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when", "landing-artifact"],
   },
   ui: {
-    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when"],
+    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when", "landing-artifact"],
   },
   "cms-published": {
-    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when"],
+    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when", "landing-artifact"],
   },
   backend: {
-    required: ["test-output", "checklist:done-when"],
+    required: ["test-output", "checklist:done-when", "landing-artifact"],
   },
   infra: {
     required: ["kubectl-state", "probe-output"],
@@ -70,10 +88,10 @@ export const DEFAULT_EVIDENCE_REGISTRY: EvidenceRegistry = {
     required: ["pr-link"],
   },
   "db-migration": {
-    required: ["migration-output"],
+    required: ["migration-output", "landing-artifact"],
   },
   migration: {
-    required: ["migration-output"],
+    required: ["migration-output", "landing-artifact"],
   },
 };
 

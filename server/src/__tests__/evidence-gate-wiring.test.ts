@@ -5,6 +5,7 @@ import {
 } from "../services/evidence-gate-wiring.js";
 
 const FRONTEND_DONE_WHEN = `## Done when\n- a\n- b\n- c\n`;
+const LANDING_ARTIFACT = "https://github.com/Blockcast/paperclip/pull/775";
 
 function frontendBody(): string {
   return [
@@ -15,6 +16,7 @@ function frontendBody(): string {
     "| a | ✅ |",
     "| b | ✅ |",
     "| c | ✅ |",
+    LANDING_ARTIFACT,
   ].join("\n");
 }
 
@@ -157,7 +159,7 @@ describe("runEvidenceGate", () => {
         labels: [{ name: "frontend" }],
         comments: [
           {
-            body: "| a | ✅ |\n|---|---|\n| b | ✅ |\n| c | ✅ |\n| d | ✅ |",
+            body: `| a | ✅ |\n|---|---|\n| b | ✅ |\n| c | ✅ |\n| d | ✅ |\n${LANDING_ARTIFACT}`,
             authorAgentId: "a1",
             authorUserId: null,
             createdAt: "2026-05-11T20:00:00.000Z",
