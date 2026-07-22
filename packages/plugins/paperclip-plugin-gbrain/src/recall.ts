@@ -372,6 +372,12 @@ export function packCacheEntry(entry: CachedRecall): StoredRecall {
 /**
  * Inverse of {@link packCacheEntry}. Handles both compressed rows (graphZ) and
  * legacy inline-graph rows, so it is safe to deploy before old rows age out.
+ *
+ * Fails safe symmetrically with packCacheEntry: an unreadable graphZ — corrupt
+ * or truncated bytes (bad restore, partial write) or a codec a future writer
+ * introduced that this reader doesn't recognize — degrades to a status:"error"
+ * entry carrying the still-readable metadata, rather than throwing synchronously
+ * out of the gbrain_recall_cache tool handler.
  */
 export function unpackCacheEntry(stored: StoredRecall | CachedRecall): CachedRecall {
   const s = stored as StoredRecall;
@@ -386,6 +392,31 @@ export function unpackCacheEntry(stored: StoredRecall | CachedRecall): CachedRec
     // Legacy / null-graph row: graph (if any) is stored inline.
     return { ...meta, graph: (s as CachedRecall).graph ?? null };
   }
-  const json = brotliDecompressSync(Buffer.from(s.graphZ, "base64")).toString("utf8");
-  return { ...meta, graph: JSON.parse(json) };
+  // graphEnc actually gates the codec: only brotli is understood today, so an
+  // unrecognized value means a newer writer used a codec this reader can't
+  // inflate — degrade instead of feeding foreign bytes to brotliDecompressSync.
+  if (s.graphEnc !== undefined && s.graphEnc !== GRAPH_CODEC) {
+    return degradedRecall(s, `unknown graphZ codec "${String(s.graphEnc)}"`);
+  }
+  try {
+    const json = brotliDecompressSync(Buffer.from(s.graphZ, "base64")).toString("utf8");
+    return { ...meta, graph: JSON.parse(json) };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return degradedRecall(s, `cached gbrain-context graph could not be decompressed: ${msg}`);
+  }
+}
+
+/** A read-side failure result: keep the readable metadata, drop the graph, and
+ *  mark status "error" with the reason so the tool consumer sees a meaningful
+ *  "no context" payload instead of a thrown exception. */
+function degradedRecall(s: StoredRecall, reason: string): CachedRecall {
+  return {
+    fetchedAtIso: s.fetchedAtIso,
+    issuePageSlug: s.issuePageSlug,
+    depth: s.depth,
+    graph: null,
+    status: "error",
+    note: reason,
+  };
 }

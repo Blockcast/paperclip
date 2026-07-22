@@ -105,4 +105,29 @@ describe("packCacheEntry / unpackCacheEntry", () => {
     expect("note" in packed).toBe(false);
     expect("note" in unpackCacheEntry(packed)).toBe(false);
   });
+
+  it("degrades a corrupt graphZ to status:error instead of throwing", () => {
+    const packed = packCacheEntry(okEntry());
+    // Valid base64 that is not a brotli stream — brotliDecompressSync throws.
+    const corrupt: StoredRecall = {
+      ...packed,
+      graphZ: Buffer.from("not a brotli stream").toString("base64"),
+    };
+    const restored = unpackCacheEntry(corrupt);
+    expect(restored.status).toBe("error");
+    expect(restored.graph).toBeNull();
+    expect(restored.note).toMatch(/could not be decompressed/);
+    // Readable metadata survives.
+    expect(restored.issuePageSlug).toBe(packed.issuePageSlug);
+    expect(restored.depth).toBe(packed.depth);
+  });
+
+  it("degrades an unknown graphZ codec to status:error without decompressing", () => {
+    const packed = packCacheEntry(okEntry());
+    const future = { ...packed, graphEnc: "zstd" } as unknown as StoredRecall;
+    const restored = unpackCacheEntry(future);
+    expect(restored.status).toBe("error");
+    expect(restored.graph).toBeNull();
+    expect(restored.note).toMatch(/unknown graphZ codec/);
+  });
 });

@@ -210,9 +210,20 @@ const plugin = definePlugin({
         enrichmentFallback: config.recallEnrichmentFallback !== false,
       });
       const entry = buildCacheEntry({ result, depth });
+      const storedEntry = packCacheEntry(entry);
+      // packCacheEntry fails safe by storing the graph inline if compression
+      // throws. That's silent by design (pure fn, no logger), so surface it
+      // here: recurring fallbacks would quietly reintroduce the plugin_state
+      // bloat this path exists to prevent (BLO-17449).
+      if (entry.graph != null && storedEntry.graphZ === undefined) {
+        ctx.logger.warn(
+          "gbrain prefetch: graph compression fell back to inline storage (BLO-17449 bloat risk if recurring)",
+          { runId, status: entry.status },
+        );
+      }
       await ctx.state.set(
         { scopeKind: "run", scopeId: runId, stateKey: RECALL_STATE_KEY },
-        packCacheEntry(entry),
+        storedEntry,
       );
 
       ctx.logger.info("gbrain prefetch complete", {
