@@ -85,6 +85,7 @@ const ALL_SHAPES: readonly EvidenceShape[] = [
   "probe-output",
   "url-probe",
   "pr-link",
+  "landing-artifact",
   "ci-green",
   "e2e-script",
   "e2e-run",
@@ -285,12 +286,47 @@ function detectUrlProbe(text: string): boolean {
   return /\bcurl\b[^\n]+https?:\/\/[^\s]+/i.test(text);
 }
 
-function detectPrLink(text: string, allowedRepos?: readonly string[]): boolean {
-  const matches = text.matchAll(/https?:\/\/github\.com\/([\w-]+\/[\w.-]+)\/pull\/\d+/gi);
-  if (!allowedRepos) return !matches.next().done;
+function extractGithubPrRepos(text: string): string[] {
+  return Array.from(text.matchAll(/https?:\/\/github\.com\/([\w-]+\/[\w.-]+)\/pull\/\d+/gi)).map(
+    (match) => match[1]!,
+  );
+}
 
+function extractGithubCommitRepos(text: string): string[] {
+  // Full-length (7-40 hex char) SHAs only — short 4-6 char abbreviations are
+  // too collision-prone to trust as a landing artifact on their own, and
+  // GitHub's own commit URLs never truncate below 7.
+  return Array.from(
+    text.matchAll(/https?:\/\/github\.com\/([\w-]+\/[\w.-]+)\/commit\/[0-9a-f]{7,40}\b/gi),
+  ).map((match) => match[1]!);
+}
+
+function matchesAllowedRepo(repos: string[], allowedRepos?: readonly string[]): boolean {
+  if (repos.length === 0) return false;
+  if (!allowedRepos) return true;
   const allowed = new Set(allowedRepos.map((repo) => repo.toLocaleLowerCase("en-US")));
-  return Array.from(matches).some((match) => allowed.has(match[1]!.toLocaleLowerCase("en-US")));
+  return repos.some((repo) => allowed.has(repo.toLocaleLowerCase("en-US")));
+}
+
+function detectPrLink(text: string, allowedRepos?: readonly string[]): boolean {
+  return matchesAllowedRepo(extractGithubPrRepos(text), allowedRepos);
+}
+
+/**
+ * Landing-artifact shape (BLO-17560): a GitHub PR link OR a GitHub commit
+ * link in the target repo. Added after two fabricated "implementation
+ * complete" claims (BLO-6393, BLO-6395) satisfied every other shape for
+ * their label — screenshots/test banner + a fully-checked done-when
+ * checklist — for code that was never committed. Neither a bare prose
+ * mention of a filename nor a short/abbreviated SHA counts: only a full
+ * GitHub PR or commit URL is accepted, because that's the one claim the
+ * agent cannot fabricate without the artifact actually existing at that
+ * URL (QA Engineer / the operator can click through and verify).
+ */
+function detectLandingArtifact(text: string, allowedRepos?: readonly string[]): boolean {
+  if (matchesAllowedRepo(extractGithubPrRepos(text), allowedRepos)) return true;
+  if (matchesAllowedRepo(extractGithubCommitRepos(text), allowedRepos)) return true;
+  return false;
 }
 
 function detectCiGreen(text: string, allowedRepos?: readonly string[]): boolean {
@@ -371,6 +407,7 @@ function detectAll(input: {
     "probe-output": detectProbeOutput(text),
     "url-probe": detectUrlProbe(text),
     "pr-link": detectPrLink(text, allowedPrRepos),
+    "landing-artifact": detectLandingArtifact(text, allowedPrRepos),
     "ci-green": detectCiGreen(text, allowedPrRepos),
     "e2e-script": detectE2eScript(text, workProducts),
     "e2e-run": detectE2eRun(workProducts, text),
