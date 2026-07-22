@@ -123,7 +123,7 @@ describe("evaluateEvidence — landing-artifact (BLO-17560)", () => {
     expect(result.missing).toContain("landing-artifact");
   });
 
-  it("respects allowedPrRepos scoping for both PR and commit links", () => {
+  it("respects allowedPrRepos scoping for PR links", () => {
     const result = evaluateEvidence({
       issue: {
         description: DONE_WHEN_DESCRIPTION,
@@ -132,6 +132,26 @@ describe("evaluateEvidence — landing-artifact (BLO-17560)", () => {
       comments: [
         agentComment(
           `Implementation complete: https://github.com/some-other-org/unrelated-repo/pull/1\n\n${TEST_BANNER}\n\n${CHECKLIST}`,
+        ),
+      ],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      allowedPrRepos: ["Blockcast/paperclip"],
+    });
+
+    expect(result.verdict).toBe("block");
+    expect(result.missing).toContain("landing-artifact");
+  });
+
+  it("respects allowedPrRepos scoping for commit links", () => {
+    const result = evaluateEvidence({
+      issue: {
+        description: DONE_WHEN_DESCRIPTION,
+        labels: [{ name: "backend" }],
+      },
+      comments: [
+        agentComment(
+          `Implementation complete: https://github.com/some-other-org/unrelated-repo/commit/f64be7befb15f4919c6becb45f8642fa0c70c28f\n\n${TEST_BANNER}\n\n${CHECKLIST}`,
         ),
       ],
       workProducts: [],
