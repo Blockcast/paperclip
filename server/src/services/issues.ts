@@ -2539,6 +2539,18 @@ async function listIssueBlockerAttentionMap(
     }
     frontierByRoot = nextFrontierByRoot;
   }
+  // Depth-limit boundary (documented design tradeoff, not a classification bug).
+  // The loop above queries hop-distances 0..MAX_DEPTH-1 fully but only *discovers*
+  // the MAX_DEPTH layer — it never loads those nodes' edges. Any root still
+  // holding distance-MAX_DEPTH nodes in its frontier is conservatively marked
+  // truncated -> needs_attention, even when such a node is a terminating leaf
+  // that would otherwise classify as covered. This is safe-direction (surfaces to
+  // a human rather than hiding) and deterministic; it cannot cause the batched
+  // whole-page false-positive the per-root tracking fixed. If MAX_DEPTH is meant
+  // to be an inclusive hop bound (chains exactly MAX_DEPTH deep must classify
+  // fully), query the discovered final layer instead — and apply the same change
+  // to the single-root twin `terminalExplicitBlockersByRoot`, which shares this
+  // discover-but-don't-query last layer.
   for (const rootId of frontierByRoot.keys()) truncatedRootIds.add(rootId);
 
   const nodeIds = [...nodesById.keys()];
