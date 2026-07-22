@@ -16,6 +16,8 @@ The paperclip `in_review` gate exists because agents historically claimed comple
 
 This is a SHAPE check, not a TRUTH check. The gate only confirms you pasted the receipt. QA Engineer re-runs the receipt against the live artifact to catch fakery. Both lines of defense matter.
 
+**Update (BLO-17560, 2026-07-22):** two independent fabrication incidents (BLO-6393 2026-05-22, BLO-6395 2026-06-10) posted a fully-shaped "implementation complete" claim — screenshots or a test banner, plus a fully-checked done-when checklist — for code that only ever existed in an ephemeral workspace and was **never committed**. Both satisfied every shape the gate required at the time and still passed. The gate now also requires `landing-artifact` (a PR link or a commit link in the target repo) for every code-completion label. A passing test banner or a screenshot is necessary but no longer sufficient — see the `landing-artifact` section below.
+
 ## Procedure
 
 ### 1. Read the issue's labels
@@ -30,19 +32,42 @@ Look at the `labels` array. The label name(s) tell you which evidence shapes the
 
 | Label | Required shapes |
 |---|---|
-| `frontend`, `ui`, `cms-published` | `screenshot:1440x900` + `screenshot:390x844` + `checklist:done-when` |
-| `backend` | `test-output` + `checklist:done-when` |
+| `frontend`, `ui`, `cms-published` | `screenshot:1440x900` + `screenshot:390x844` + `checklist:done-when` + `landing-artifact` |
+| `backend` | `test-output` + `checklist:done-when` + `landing-artifact` |
 | `infra` | `kubectl-state` + `probe-output` |
 | `cms-data-op` | `url-probe` |
-| `db-migration`, `migration` | `migration-output` |
+| `db-migration`, `migration` | `migration-output` + `landing-artifact` |
 | `pr` | `pr-link` |
 | (no label or unrecognized) | `checklist:done-when` (weak default — verdict will be `warn`, not `block`) |
 
-Multiple labels union their required sets. A `frontend + pr` issue needs all of `screenshot:1440x900`, `screenshot:390x844`, `checklist:done-when`, `pr-link`.
+Multiple labels union their required sets. A `frontend + pr` issue needs all of `screenshot:1440x900`, `screenshot:390x844`, `checklist:done-when`, `landing-artifact`, `pr-link`.
+
+`infra` and `cms-data-op` intentionally do NOT require `landing-artifact`: their existing shapes already demand live, hard-to-fake state (a real `kubectl get`, a real HTTP probe), and some ops changes are legitimately applied ahead of a PR landing.
 
 Source of truth: `server/src/services/evidence-shapes.ts` (`DEFAULT_EVIDENCE_REGISTRY`).
 
 ### 3. Produce each required shape
+
+#### `landing-artifact`
+
+**A completion claim for code is not "done" until the code exists in the target repo.** Paste one of:
+
+- A GitHub PR URL: `https://github.com/Blockcast/paperclip/pull/N`
+- A GitHub commit URL: `https://github.com/Blockcast/paperclip/commit/<full sha>`
+
+Either satisfies the shape — you don't need both, and you don't need a merged PR, just an open one pointing at real code. A draft PR is fine.
+
+```markdown
+Implementation complete: https://github.com/Blockcast/paperclip/pull/774
+```
+
+**Common mistakes the gate detects:**
+- No link at all — just "implementation complete" prose, however detailed. This is exactly the shape of both BLO-17560 fabrication incidents: specific filenames + a passing test banner + a fully-checked checklist, but zero repo-resident evidence. **Pasted test/lint output alone does not clear this shape.**
+- A short/abbreviated SHA (`f64be7b`) instead of a full commit URL — too collision-prone to trust and not clickable-verifiable by QA/the operator.
+- A link to a different repo than the one you're actually working in — the gate can be scoped to `allowedPrRepos`; a mismatched repo doesn't count.
+- Editing a screenshot's alt-text or a checklist row to *say* "PR #774" without an actual `github.com/.../pull/N` URL — the detector matches URLs, not prose claims about URLs.
+
+If you legitimately have no PR yet (e.g. you're still iterating locally), you are not ready for `in_review` — open a draft PR first. See the Staff Engineer / implementer instructions for "GitHub PR Review Handoff Hygiene": draft PRs are valid early-review artifacts.
 
 #### `screenshot:1440x900` and `screenshot:390x844`
 
@@ -101,6 +126,7 @@ Accepted formats: vitest (`Test Files N passed`), pytest (`N passed in Ns`), jes
 **Common mistakes:**
 - "All tests pass" with no banner — gate won't detect this.
 - A failing run with `0 failed, 12 passed` — gate counts the `12 passed` so it satisfies the shape, but operator review will reject anyway.
+- **A real test banner from a real local run, with no `landing-artifact`** — this is the exact fabrication shape from BLO-6393/BLO-6395. The test banner alone no longer clears `backend`'s requirements; you also need a PR or commit link.
 
 #### `kubectl-state`
 
@@ -180,6 +206,7 @@ SELECT COUNT(*) FROM issue_events;
 - Posting `(N rows)` without runner output in the same comment — the detector requires a runner signal alongside the row-count.
 - A screenshot of a migration tool's UI — gate scans comment text, not images.
 - Posting migration output in the issue description rather than a comment — gate only scans agent-authored comments.
+- Migration runner output with no `landing-artifact` — the migration file itself needs to exist in a PR/commit, same as any other code change.
 
 #### `pr-link`
 
@@ -205,6 +232,7 @@ These have all happened on real issues and the gate exists to catch them:
 4. **DOM probes in agent-workspace files instead of inline.** The gate only scans comment bodies + work_products. Files in your shared workspace don't count.
 5. **Operator pasting the receipt for you.** The gate ignores `authorUserId` comments — only `authorAgentId` comments produce evidence. Paste your own.
 6. **Editing the issue description to remove `## Done when` bullets** to bypass the checklist requirement. Currently a Phase-1 bypass (see BLO-4828 punch list); will be detected in Phase 2.
+7. **A detailed "implementation complete, unit-tested" claim with no PR/commit link** (BLO-6393, BLO-6395; remediated as BLO-17560). Specific filenames, a real-looking test banner, and a fully-checked checklist are not evidence the code landed anywhere — they're evidence you ran something locally. `landing-artifact` exists specifically to catch this: if you can't paste a PR or commit URL, the code isn't committed, and the issue isn't ready for `in_review`.
 
 ## After landing
 
@@ -217,4 +245,4 @@ These have all happened on real issues and the gate exists to catch them:
 - Label registry: `server/src/services/evidence-shapes.ts`
 - Wiring: `server/src/services/evidence-gate-wiring.ts`
 - Schema: `issues.last_evidence_verdict` (jsonb, nullable)
-- Tracking: BLO-4461 (parent), BLO-4829 (evaluator), BLO-4824 (wiring), BLO-4828 (Phase-2 enforce)
+- Tracking: BLO-4461 (parent), BLO-4829 (evaluator), BLO-4824 (wiring), BLO-4828 (Phase-2 enforce), BLO-17560 (`landing-artifact` shape)
