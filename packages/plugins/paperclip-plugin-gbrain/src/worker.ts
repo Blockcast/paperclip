@@ -23,10 +23,12 @@ import {
 import { resolveGbrainUrlForAgent } from "./client-routing.js";
 import {
   buildCacheEntry,
+  packCacheEntry,
+  unpackCacheEntry,
   prefetchRunContext,
   RECALL_STATE_KEY,
   DEFAULT_RECALL_DEPTH,
-  type CachedRecall,
+  type StoredRecall,
 } from "./recall.js";
 
 const DEFAULT_HINDSIGHT_API_URL = "http://hindsight-api.hindsight.svc.cluster.local:8888";
@@ -134,11 +136,12 @@ const plugin = definePlugin({
         parametersSchema: { type: "object", properties: {}, additionalProperties: false },
       },
       async (_params, runCtx) => {
-        const cached = (await ctx.state.get({
+        const stored = (await ctx.state.get({
           scopeKind: "run",
           scopeId: runCtx.runId,
           stateKey: RECALL_STATE_KEY,
-        })) as CachedRecall | null;
+        })) as StoredRecall | null;
+        const cached = stored ? unpackCacheEntry(stored) : null;
         if (!cached) {
           return {
             data: {
@@ -209,7 +212,7 @@ const plugin = definePlugin({
       const entry = buildCacheEntry({ result, depth });
       await ctx.state.set(
         { scopeKind: "run", scopeId: runId, stateKey: RECALL_STATE_KEY },
-        entry,
+        packCacheEntry(entry),
       );
 
       ctx.logger.info("gbrain prefetch complete", {

@@ -17,6 +17,7 @@
 // mutations are. Acceptable for "starting context" use cases; agents
 // that need current state should call traverse_graph directly.
 
+import { brotliCompressSync, brotliDecompressSync, constants as zlibConstants } from "node:zlib";
 import type { GbrainCallable } from "./pages.js";
 import { agentSlug, issueSlug, projectSlug } from "./identity.js";
 
@@ -291,4 +292,100 @@ export function buildCacheEntry(input: {
     status: classification.status,
     note: input.result.reason ?? classification.note,
   };
+}
+
+// --- On-disk compression (BLO-17449) -------------------------------------
+//
+// The cached `graph` neighborhood is by far the largest thing this plugin
+// persists: ~640KB of JSON on average, up to ~6MB, one row per agent run. At
+// fleet volume that made `gbrain-context` ~9.5GB — the dominant consumer of
+// the control-plane Postgres and thus of the nightly pg_dump (BLO-17421).
+//
+// Postgres only pglz-compresses the TOASTed value (~2x on this JSON). Brotli
+// does far better on the repetitive graph shape (repeated keys, slug prefixes,
+// edge structure), so we brotli+base64 the graph into `graphZ` before writing
+// and inflate it on read. Everything else stays top-level PLAINTEXT — in
+// particular `status`, which both the five `value_json->>'status'` partial
+// indexes and the RAG-health aggregation route read directly; compressing it
+// would break those. Shrinking the stored value also speeds that health
+// aggregation, which must detoast each row just to read `status`.
+//
+// Base64 costs ~33% over the raw brotli bytes, but JSONB cannot hold binary and
+// a bytea column would mean a framework/schema change for one plugin; net win is
+// still ~70-80% vs the pglz-stored size.
+
+/** Brotli quality for graph compression. 6 keeps even a 6MB graph fast on the
+ *  run-start path while capturing nearly all of brotli's ratio on JSON. */
+const GRAPH_BROTLI_QUALITY = 6;
+/** Codec tag on graphZ; gates future codec changes (only brotli today). */
+const GRAPH_CODEC = "br" as const;
+
+/**
+ * On-disk form of {@link CachedRecall}: identical metadata, but the fat `graph`
+ * is replaced by `graphZ` (brotli+base64). Legacy rows written before this
+ * change carry an inline `graph` and no `graphZ`; {@link unpackCacheEntry}
+ * reads both. `status` is always present and top-level for the indexes.
+ */
+export interface StoredRecall {
+  fetchedAtIso: string;
+  issuePageSlug: string | null;
+  depth: number;
+  status: CachedRecallStatus;
+  note?: string;
+  /** Non-null only in legacy (pre-compression) rows, or when graph was null. */
+  graph?: unknown | null;
+  /** brotli+base64 of JSON.stringify(graph); present when a graph was cached. */
+  graphZ?: string;
+  /** Codec for graphZ. */
+  graphEnc?: typeof GRAPH_CODEC;
+}
+
+/**
+ * Compress a CachedRecall for persistence. A null/undefined graph is stored
+ * inline as `graph: null` (nothing to compress). If compression unexpectedly
+ * throws, fall back to storing the graph inline so a run never loses its
+ * context to a codec error.
+ */
+export function packCacheEntry(entry: CachedRecall): StoredRecall {
+  const base: StoredRecall = {
+    fetchedAtIso: entry.fetchedAtIso,
+    issuePageSlug: entry.issuePageSlug,
+    depth: entry.depth,
+    status: entry.status,
+    ...(entry.note !== undefined ? { note: entry.note } : {}),
+  };
+  if (entry.graph === null || entry.graph === undefined) {
+    return { ...base, graph: null };
+  }
+  try {
+    const json = JSON.stringify(entry.graph);
+    const graphZ = brotliCompressSync(Buffer.from(json, "utf8"), {
+      params: { [zlibConstants.BROTLI_PARAM_QUALITY]: GRAPH_BROTLI_QUALITY },
+    }).toString("base64");
+    return { ...base, graphZ, graphEnc: GRAPH_CODEC };
+  } catch {
+    // Never drop context over a compression failure — persist it uncompressed.
+    return { ...base, graph: entry.graph };
+  }
+}
+
+/**
+ * Inverse of {@link packCacheEntry}. Handles both compressed rows (graphZ) and
+ * legacy inline-graph rows, so it is safe to deploy before old rows age out.
+ */
+export function unpackCacheEntry(stored: StoredRecall | CachedRecall): CachedRecall {
+  const s = stored as StoredRecall;
+  const meta = {
+    fetchedAtIso: s.fetchedAtIso,
+    issuePageSlug: s.issuePageSlug,
+    depth: s.depth,
+    status: s.status,
+    ...(s.note !== undefined ? { note: s.note } : {}),
+  };
+  if (s.graphZ === undefined) {
+    // Legacy / null-graph row: graph (if any) is stored inline.
+    return { ...meta, graph: (s as CachedRecall).graph ?? null };
+  }
+  const json = brotliDecompressSync(Buffer.from(s.graphZ, "base64")).toString("utf8");
+  return { ...meta, graph: JSON.parse(json) };
 }
