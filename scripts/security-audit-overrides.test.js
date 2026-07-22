@@ -50,7 +50,15 @@ async function main() {
     assert.equal(packageJson.pnpm.overrides["fast-uri"], "^3.1.3");
 
     const lockfile = await readFile(join(fixtureRoot, "pnpm-lock.yaml"), "utf8");
-    assert.ok(!lockfile.includes("fast-uri@3.1.2:"));
+    const fastUriResolution = lockfile.match(
+      /^  fast-uri@(\d+)\.(\d+)\.(\d+):$/m,
+    );
+    assert.ok(fastUriResolution, "lockfile missing fast-uri resolution");
+    const [, major, minor, patch] = fastUriResolution.map(Number);
+    assert.ok(
+      major > 3 || (major === 3 && (minor > 1 || (minor === 1 && patch >= 3))),
+      `lockfile resolved vulnerable fast-uri ${major}.${minor}.${patch}`,
+    );
     assertIncludes(lockfile, "undici@6.27.0:", "lockfile");
     assertIncludes(lockfile, "undici@7.28.0:", "lockfile");
     assertIncludes(lockfile, "multer@2.2.0:", "lockfile");
