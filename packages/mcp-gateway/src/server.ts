@@ -340,7 +340,15 @@ async function createUpstreamSession(
   const initializeBody = initializeResult.body.toString("utf8");
   const upstreamSessionId = extractUpstreamSessionId(initializeResult.headers, initializeBody);
   if (!isSuccess(initializeResult.status) || !upstreamSessionId) return null;
-  await notifyUpstreamInitialized(upstreamUrl, inboundHeaders, upstreamSessionId, timeoutMs, credentialToken, upstreamConfig);
+  const initialized = await notifyUpstreamInitialized(
+    upstreamUrl,
+    inboundHeaders,
+    upstreamSessionId,
+    timeoutMs,
+    credentialToken,
+    upstreamConfig,
+  );
+  if (!initialized) return null;
   return upstreamSessionId;
 }
 
@@ -356,21 +364,25 @@ async function ensureUpstreamSession(
   const store = getOrCreateStore(state, prefix);
   const existing = store.get(clientSessionId);
   if (existing) return existing.upstreamSessionId;
-  const credentialToken = await resolveMatchedCustodyToken(custodyConfig, inboundHeaders, clientSessionId);
-  const upstreamSessionId = await createUpstreamSession(
-    upstream.url,
-    inboundHeaders,
-    initializePayload,
-    state.upstreamTimeoutMs,
-    credentialToken,
-    upstream,
-    custodyConfig,
-    clientSessionId,
-  );
-  if (!upstreamSessionId) return null;
-  store.createInitialized({ clientSessionId, upstreamSessionId, initializePayload });
-  await persistSessions(state);
-  return upstreamSessionId;
+  return store.runExclusive(clientSessionId, async () => {
+    const current = store.get(clientSessionId);
+    if (current) return current.upstreamSessionId;
+    const credentialToken = await resolveMatchedCustodyToken(custodyConfig, inboundHeaders, clientSessionId);
+    const upstreamSessionId = await createUpstreamSession(
+      upstream.url,
+      inboundHeaders,
+      initializePayload,
+      state.upstreamTimeoutMs,
+      credentialToken,
+      upstream,
+      custodyConfig,
+      clientSessionId,
+    );
+    if (!upstreamSessionId) return null;
+    store.createInitialized({ clientSessionId, upstreamSessionId, initializePayload });
+    await persistSessions(state);
+    return upstreamSessionId;
+  });
 }
 
 async function forwardAggregateWithSessionRecovery(
@@ -401,23 +413,39 @@ async function forwardAggregateWithSessionRecovery(
   const text = result.body.toString("utf8");
   if (!isSessionNotFoundResponse(result.status, text)) return result;
 
-  const retryCredentialToken = await resolveMatchedCustodyToken(custodyConfig, inboundHeaders, clientSessionId);
-  const newUpstreamSessionId = await createUpstreamSession(
-    upstream.url,
-    inboundHeaders,
-    initializePayload,
-    state.upstreamTimeoutMs,
-    retryCredentialToken,
-    upstream,
-    custodyConfig,
-    clientSessionId,
-  );
-  if (!newUpstreamSessionId) return null;
-  store.rotateUpstream(clientSessionId, newUpstreamSessionId);
-  result = await forward(upstream.url, method, inboundHeaders, body, newUpstreamSessionId, state.upstreamTimeoutMs, retryCredentialToken, upstream);
-  invalidateMatchedCustodyTokenIfUnauthorized(result, custodyConfig, inboundHeaders, clientSessionId);
-  await persistSessions(state);
-  return result;
+  return store.runExclusive(clientSessionId, async () => {
+    const current = store.get(clientSessionId);
+    let retryUpstreamSessionId = current?.upstreamSessionId;
+    const retryCredentialToken = await resolveMatchedCustodyToken(custodyConfig, inboundHeaders, clientSessionId);
+    if (!retryUpstreamSessionId || retryUpstreamSessionId === upstreamSessionId) {
+      retryUpstreamSessionId = await createUpstreamSession(
+        upstream.url,
+        inboundHeaders,
+        initializePayload,
+        state.upstreamTimeoutMs,
+        retryCredentialToken,
+        upstream,
+        custodyConfig,
+        clientSessionId,
+      ) ?? undefined;
+      if (!retryUpstreamSessionId) return null;
+      if (current) store.rotateUpstream(clientSessionId, retryUpstreamSessionId);
+      else store.createInitialized({ clientSessionId, upstreamSessionId: retryUpstreamSessionId, initializePayload });
+      await persistSessions(state);
+    }
+    result = await forward(
+      upstream.url,
+      method,
+      inboundHeaders,
+      body,
+      retryUpstreamSessionId,
+      state.upstreamTimeoutMs,
+      retryCredentialToken,
+      upstream,
+    );
+    invalidateMatchedCustodyTokenIfUnauthorized(result, custodyConfig, inboundHeaders, clientSessionId);
+    return result;
+  });
 }
 
 async function forward(
@@ -809,6 +837,7 @@ async function serveMatched(
   if (clientSessionId) {
     const record = store.get(clientSessionId);
     if (record) {
+      const attemptedUpstreamSessionId = record.upstreamSessionId;
       const credentialToken = custodyConfig
         ? await resolveCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, record.clientSessionId)
         : undefined;
@@ -817,7 +846,7 @@ async function serveMatched(
         req.method ?? "POST",
         req.headers,
         body,
-        record.upstreamSessionId,
+        attemptedUpstreamSessionId,
         timeoutMs,
         credentialToken,
         matched.config,
@@ -833,34 +862,40 @@ async function serveMatched(
           writeResponse(res, result, clientSessionId);
           return result.status;
         }
-        const replayInitResult = await forward(
-          matched.upstreamUrl,
-          "POST",
-          buildInitializeReplayHeaders(req.headers),
-          record.initializePayload,
-          null,
-          timeoutMs,
-          credentialToken,
-          matched.config,
-        );
-        const replayBody = replayInitResult.body.toString("utf8");
-        const newUpstreamId = extractUpstreamSessionId(replayInitResult.headers, replayBody);
-        if (isSuccess(replayInitResult.status) && newUpstreamId) {
-          await notifyUpstreamInitialized(matched.upstreamUrl, req.headers, newUpstreamId, timeoutMs, credentialToken, matched.config);
-          store.rotateUpstream(clientSessionId, newUpstreamId);
-          // Retry the original call with the new upstream id.
-          const retryResult = await forward(
+        const retryResult = await store.runExclusive(clientSessionId, async () => {
+          const current = store.get(clientSessionId);
+          let retryUpstreamId = current?.upstreamSessionId;
+          if (!retryUpstreamId || retryUpstreamId === attemptedUpstreamSessionId) {
+            retryUpstreamId = await createUpstreamSession(
+              matched.upstreamUrl,
+              req.headers,
+              record.initializePayload!,
+              timeoutMs,
+              credentialToken,
+              matched.config,
+            ) ?? undefined;
+            if (!retryUpstreamId) return null;
+            if (current) store.rotateUpstream(clientSessionId, retryUpstreamId);
+            else store.createInitialized({
+              clientSessionId,
+              upstreamSessionId: retryUpstreamId,
+              initializePayload: record.initializePayload!,
+            });
+            await persistSessionStore?.();
+          }
+          return forward(
             matched.upstreamUrl,
             req.method ?? "POST",
             req.headers,
             body,
-            newUpstreamId,
+            retryUpstreamId,
             timeoutMs,
             credentialToken,
             matched.config,
           );
+        });
+        if (retryResult) {
           writeResponse(res, retryResult, clientSessionId);
-          await persistSessionStore?.();
           return retryResult.status;
         }
         // Re-init failed; pass the original 404 through so the client can recover its own way.
@@ -881,22 +916,38 @@ async function serveMatched(
     : undefined;
 
   if (!isInitializeRequest && requestMethod !== "GET" && requestMethod !== "HEAD" && body.length > 0) {
-    const initializePayload = buildDefaultInitializePayload();
-    const upstreamSessionId = await createUpstreamSession(
-      matched.upstreamUrl,
-      req.headers,
-      initializePayload,
-      timeoutMs,
-      credentialToken,
-      matched.config,
-    );
-    if (upstreamSessionId) {
+    const bootstrapResult = await store.runExclusive(nextClientSessionId, async () => {
+      const current = store.get(nextClientSessionId);
+      if (current) {
+        const result = await forward(
+          matched.upstreamUrl,
+          requestMethod,
+          req.headers,
+          body,
+          current.upstreamSessionId,
+          timeoutMs,
+          credentialToken,
+          matched.config,
+        );
+        return { result, clientSessionId: current.clientSessionId };
+      }
+      const initializePayload = buildDefaultInitializePayload();
+      const upstreamSessionId = await createUpstreamSession(
+        matched.upstreamUrl,
+        req.headers,
+        initializePayload,
+        timeoutMs,
+        credentialToken,
+        matched.config,
+      );
+      if (!upstreamSessionId) return null;
       const record = store.createInitialized({
         clientSessionId: nextClientSessionId,
         upstreamSessionId,
         initializePayload,
       });
-      const retryResult = await forward(
+      await persistSessionStore?.();
+      const result = await forward(
         matched.upstreamUrl,
         requestMethod,
         req.headers,
@@ -906,12 +957,14 @@ async function serveMatched(
         credentialToken,
         matched.config,
       );
-      writeResponse(res, retryResult, record.clientSessionId);
-      await persistSessionStore?.();
-      if (retryResult.status === 401 && custodyConfig) {
-        invalidateCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, record.clientSessionId);
+      return { result, clientSessionId: record.clientSessionId };
+    });
+    if (bootstrapResult) {
+      writeResponse(res, bootstrapResult.result, bootstrapResult.clientSessionId);
+      if (bootstrapResult.result.status === 401 && custodyConfig) {
+        invalidateCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, bootstrapResult.clientSessionId);
       }
-      return retryResult.status;
+      return bootstrapResult.result.status;
     }
   }
 

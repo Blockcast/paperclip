@@ -32,15 +32,13 @@ metadata:
     app.kubernetes.io/managed-by: paperclip-mcp
     app.kubernetes.io/part-of: paperclip
 spec:
-  replicas: 2
+  # Session recovery is serialized in-process. Keep one replica until the
+  # lifecycle lock and session store are coordinated across processes.
+  replicas: 1
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      # Keep maxSurge=1, maxUnavailable=0 so a bad config doesn't kill
-      # all MCP traffic at once. New pod proves itself before the old
-      # pod is drained.
-      maxSurge: 1
-      maxUnavailable: 0
+    # Recreate prevents old and new pods from concurrently owning the same
+    # connection-scoped upstream lifecycle during a rollout.
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: paperclip-mcp-gateway

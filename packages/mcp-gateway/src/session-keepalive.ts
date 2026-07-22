@@ -59,6 +59,7 @@ export class SessionStore {
   private readonly idleTtlMs: number;
   private readonly maxSessions: number;
   private readonly records = new Map<string, SessionRecord>();
+  private readonly operations = new Map<string, Promise<void>>();
 
   constructor(opts: SessionStoreOpts = {}) {
     this.idleTtlMs = opts.idleTtlMs ?? 60 * 60 * 1000;
@@ -109,6 +110,24 @@ export class SessionStore {
 
   size(): number {
     return this.records.size;
+  }
+
+  /** Serialize lifecycle mutations and their triggering call per client session. */
+  async runExclusive<T>(clientSessionId: string, operation: () => Promise<T>): Promise<T> {
+    const prior = this.operations.get(clientSessionId) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = prior.catch(() => undefined).then(() => gate);
+    this.operations.set(clientSessionId, tail);
+    await prior.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.operations.get(clientSessionId) === tail) this.operations.delete(clientSessionId);
+    }
   }
 
   /** Visible-for-testing iterator. */
