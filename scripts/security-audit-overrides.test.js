@@ -44,7 +44,13 @@ async function main() {
       fixtureRoot,
     );
 
+    const packageJson = JSON.parse(
+      await readFile(join(fixtureRoot, "package.json"), "utf8"),
+    );
+    assert.equal(packageJson.pnpm.overrides["fast-uri"], "^3.1.3");
+
     const lockfile = await readFile(join(fixtureRoot, "pnpm-lock.yaml"), "utf8");
+    assert.ok(!lockfile.includes("fast-uri@3.1.2:"));
     assertIncludes(lockfile, "undici@6.27.0:", "lockfile");
     assertIncludes(lockfile, "undici@7.28.0:", "lockfile");
     assertIncludes(lockfile, "multer@2.2.0:", "lockfile");
