@@ -2038,7 +2038,7 @@ rl.on("line", (line) => {
         riskLevel: "read",
       });
       await allowAllToolsForAgent(db, company.id, agent.id);
-      const gateway = createTestToolGatewayService(db);
+      const gateway = createTestToolGatewayService(db, { now: () => elapsedMs });
       const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
       const connectedTool = (await gateway.listToolsForSession(session.token))
         .find((tool) => tool.providerType === "mcp_remote_http");
@@ -2058,7 +2058,7 @@ rl.on("line", (line) => {
           sessionToken: session.token,
           tool: connectedTool!.name,
           parameters: { kind },
-          timeoutMs: 700,
+          timeoutMs: 1_500,
         });
         contents.push(result.result?.content);
       }
@@ -2071,6 +2071,18 @@ rl.on("line", (line) => {
       ]);
       expect(fake.requests.slice(4).map((request) => request.headers["mcp-session-id"]))
         .toEqual(Array(4).fill("normal-connector-1"));
+
+      elapsedMs += 60 * 60_000 + 1;
+      await expect(gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: { kind: "Pod" },
+        timeoutMs: 1_500,
+      })).resolves.toMatchObject({ status: "completed" });
+      expect(fake.requests.slice(-4).map((request) => request.body?.method)).toEqual([
+        "tools/call", "initialize", "notifications/initialized", "tools/call",
+      ]);
+      expect(fake.requests.at(-1)?.headers["mcp-session-id"]).toBe("normal-connector-2");
     } finally {
       await fake.close();
     }

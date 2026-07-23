@@ -768,8 +768,39 @@ export function createToolGatewayService(
   const policyService = toolAccessPolicyService(db);
   const secrets = secretService(db);
   const protocolLimits = mcpGatewayProtocolLimits(options.mcpGatewayProtocolLimits);
-  const remoteMcpSessions = new Map<string, string>();
+  const remoteMcpSessions = new Map<string, { sessionId: string; expiresAt: number }>();
+  const remoteMcpSessionTtlMs = 60 * 60_000;
+  const remoteMcpSessionMaxEntries = 1_000;
   let nextProtocolRateLimitPruneAt = 0;
+
+  function getRemoteMcpSession(connectionId: string): string | undefined {
+    const cached = remoteMcpSessions.get(connectionId);
+    if (!cached) return undefined;
+    const current = options.now?.() ?? Date.now();
+    if (cached.expiresAt <= current) {
+      remoteMcpSessions.delete(connectionId);
+      return undefined;
+    }
+    remoteMcpSessions.delete(connectionId);
+    remoteMcpSessions.set(connectionId, {
+      sessionId: cached.sessionId,
+      expiresAt: current + remoteMcpSessionTtlMs,
+    });
+    return cached.sessionId;
+  }
+
+  function setRemoteMcpSession(connectionId: string, sessionId: string) {
+    remoteMcpSessions.delete(connectionId);
+    while (remoteMcpSessions.size >= remoteMcpSessionMaxEntries) {
+      const oldestConnectionId = remoteMcpSessions.keys().next().value;
+      if (oldestConnectionId === undefined) break;
+      remoteMcpSessions.delete(oldestConnectionId);
+    }
+    remoteMcpSessions.set(connectionId, {
+      sessionId,
+      expiresAt: (options.now?.() ?? Date.now()) + remoteMcpSessionTtlMs,
+    });
+  }
 
   async function pruneExpiredProtocolRateLimitCounters(current: number) {
     if (current < nextProtocolRateLimitPruneAt) return;
@@ -3035,8 +3066,8 @@ export function createToolGatewayService(
         dispatched: true,
       },
     };
-    let controller = new AbortController();
-    let timer = setTimeout(() => controller.abort(), ms);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ms);
     timer.unref?.();
     try {
       const toolCallPayload = {
@@ -3071,13 +3102,7 @@ export function createToolGatewayService(
             ?? receivedResponse.headers.get("traceparent"),
         };
       };
-      const resetTimeout = () => {
-        clearTimeout(timer);
-        controller = new AbortController();
-        timer = setTimeout(() => controller.abort(), ms);
-        timer.unref?.();
-      };
-      const cachedSessionId = remoteMcpSessions.get(connection.id);
+      const cachedSessionId = getRemoteMcpSession(connection.id);
       let recoveredSessionId: string | undefined;
       let response = await send(toolCallPayload, cachedSessionId);
       let body = await readBoundedRemoteResponse(response);
@@ -3103,10 +3128,9 @@ export function createToolGatewayService(
         });
       }
       if (isRemoteMcpInitializationError(payload)) {
-        if (cachedSessionId && remoteMcpSessions.get(connection.id) === cachedSessionId) {
+        if (cachedSessionId && remoteMcpSessions.get(connection.id)?.sessionId === cachedSessionId) {
           remoteMcpSessions.delete(connection.id);
         }
-        resetTimeout();
         const initializeResponse = await send({
           jsonrpc: "2.0",
           id: `${requestId}:initialize`,
@@ -3206,7 +3230,7 @@ export function createToolGatewayService(
       if (!Object.prototype.hasOwnProperty.call(payloadRecord, "result")) {
         throw malformedRemoteMcpResponse();
       }
-      if (recoveredSessionId) remoteMcpSessions.set(connection.id, recoveredSessionId);
+      if (recoveredSessionId) setRemoteMcpSession(connection.id, recoveredSessionId);
       const resultElicitation = extractMcpElicitationRequest(payloadRecord.result);
       if (resultElicitation) {
         await requestElicitationForRecordedToolCall({ session, tool, invocationId, request: resultElicitation });
