@@ -914,6 +914,29 @@ describe("mcp gateway lifecycle compatibility", () => {
     expect(upstream.receivedToolCalls).toEqual(["ping", "ping"]);
   });
 
+  it("serializes concurrent cold calls without a shared client session", async () => {
+    const upstream = await createStrictMcpUpstream();
+    const gateway = await createGateway(upstream.url);
+    upstream.raceNextRecovery();
+
+    const call = (id: number) => fetch(gateway.url, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "ping", arguments: {} } }),
+    });
+    const responses = await Promise.all([call(1), call(2), call(3), call(4)]);
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 200]);
+    await expect(Promise.all(responses.map((response) => response.json()))).resolves.toEqual([
+      expect.objectContaining({ result: { content: [{ type: "text", text: "ping" }] } }),
+      expect.objectContaining({ result: { content: [{ type: "text", text: "ping" }] } }),
+      expect.objectContaining({ result: { content: [{ type: "text", text: "ping" }] } }),
+      expect.objectContaining({ result: { content: [{ type: "text", text: "ping" }] } }),
+    ]);
+    expect(upstream.methods.filter((method) => method === "initialize")).toHaveLength(4);
+    expect(upstream.receivedToolCalls).toEqual(["ping", "ping", "ping", "ping"]);
+  });
+
   it("leases Figma credentials server-side and only forwards the resolved token upstream", async () => {
     const upstream = await createStrictMcpUpstream();
     const custody = await createCustodyService({ failRepeatedLeaseForSession: true });

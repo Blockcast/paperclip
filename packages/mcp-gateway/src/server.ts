@@ -364,7 +364,7 @@ async function ensureUpstreamSession(
   const store = getOrCreateStore(state, prefix);
   const existing = store.get(clientSessionId);
   if (existing) return existing.upstreamSessionId;
-  return store.runExclusive(clientSessionId, async () => {
+  return store.runLifecycleExclusive(async () => {
     const current = store.get(clientSessionId);
     if (current) return current.upstreamSessionId;
     const credentialToken = await resolveMatchedCustodyToken(custodyConfig, inboundHeaders, clientSessionId);
@@ -413,7 +413,7 @@ async function forwardAggregateWithSessionRecovery(
   const text = result.body.toString("utf8");
   if (!isSessionNotFoundResponse(result.status, text)) return result;
 
-  return store.runExclusive(clientSessionId, async () => {
+  return store.runLifecycleExclusive(async () => {
     const current = store.get(clientSessionId);
     let retryUpstreamSessionId = current?.upstreamSessionId;
     const retryCredentialToken = await resolveMatchedCustodyToken(custodyConfig, inboundHeaders, clientSessionId);
@@ -862,7 +862,7 @@ async function serveMatched(
           writeResponse(res, result, clientSessionId);
           return result.status;
         }
-        const retryResult = await store.runExclusive(clientSessionId, async () => {
+        const retryResult = await store.runLifecycleExclusive(async () => {
           const current = store.get(clientSessionId);
           let retryUpstreamId = current?.upstreamSessionId;
           if (!retryUpstreamId || retryUpstreamId === attemptedUpstreamSessionId) {
@@ -916,7 +916,7 @@ async function serveMatched(
     : undefined;
 
   if (!isInitializeRequest && requestMethod !== "GET" && requestMethod !== "HEAD" && body.length > 0) {
-    const bootstrapResult = await store.runExclusive(nextClientSessionId, async () => {
+    const bootstrapResult = await store.runLifecycleExclusive(async () => {
       const current = store.get(nextClientSessionId);
       if (current) {
         const result = await forward(
