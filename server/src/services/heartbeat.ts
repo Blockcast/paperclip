@@ -12235,6 +12235,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         message: `Bounded retry exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts; no further automatic retry will be queued`,
         payload: {
           retryReason,
+          // See the scheduled-retry event: carry the failing errorCode so an
+          // exhausted, code-specific failure surfaces its cause (e.g.
+          // pr_review_output_missing) directly in the exhaustion event.
+          ...(run.errorCode ? { errorCode: run.errorCode } : {}),
           retryFamily: transientRecovery?.errorFamily ?? null,
           scheduledRetryAttempt: run.scheduledRetryAttempt ?? 0,
           maxAttempts: maxAttemptsForFamily,
@@ -12811,6 +12815,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       payload: {
         retryRunId: retryRun.id,
         retryReason,
+        // Carry the failing errorCode so a recurring, code-specific failure
+        // (e.g. pr_review_output_missing evidence-loss) is distinguishable from
+        // a generic transient blip in the retry event alone, without having to
+        // cross-reference the originating run's errorCode.
+        ...(run.errorCode ? { errorCode: run.errorCode } : {}),
         ...(transientRecovery ? { errorFamily: transientRecovery.errorFamily } : {}),
         scheduledRetryAttempt: schedule.attempt,
         scheduledRetryAt: schedule.dueAt.toISOString(),
