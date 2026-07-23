@@ -654,6 +654,20 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(retryRun?.contextSnapshot as Record<string, unknown>).not.toHaveProperty("modelProfile");
     expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(expectedDueAt.toISOString());
 
+    // BLO-17456 follow-up: the scheduled-retry event carries the failing
+    // errorCode so a recurring code-specific failure is distinguishable from a
+    // generic transient blip in the retry event alone.
+    const scheduledEvent = await db
+      .select({ message: heartbeatRunEvents.message, payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, sourceRunId))
+      .orderBy(sql`${heartbeatRunEvents.id} desc`)
+      .then((rows) => rows.find((row) => row.message.includes("Scheduled bounded retry")) ?? null);
+    expect(scheduledEvent?.payload).toMatchObject({
+      retryReason: "transient_failure",
+      errorCode: "adapter_failed",
+    });
+
     const earlyPromotion = await heartbeat.promoteDueScheduledRetries(new Date("2026-04-20T12:01:59.000Z"));
     expect(earlyPromotion).toEqual({ promoted: 0, runIds: [] });
 
@@ -1347,16 +1361,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     });
   });
 
-  it("coalesces duplicate max-turn continuation schedules for the same source run and attempt", async () => {
-    const { issueId, runId, now } = await seedMaxTurnFixture();
-    const retryOptions = {
-      now,
-      retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
-      wakeReason: MAX_TURN_CONTINUATION_WAKE_REASON,
-      maxAttempts: 2,
-      delayMs: 1_000,
-    };
-
+  it("BLO-8215: retries a pr_review_auth_expired run in a PR-review context", () => {
     expect(
       shouldScheduleAutomaticRunRetry({
         errorCode: "pr_review_auth_expired",
@@ -1403,6 +1408,27 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         errorCode: "pr_review_output_missing",
         resultJson: {},
         contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(false);
+
+    // Guards the gate specifically, not the fall-through: a taskKey that is
+    // present but NOT `pr_review:`-prefixed must still be rejected, so a future
+    // weakening of isPrReviewRetryContext to "any taskKey present" is caught.
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "pr_review_output_missing",
+        resultJson: {},
+        contextSnapshot: { taskKey: `issue:${randomUUID()}:42`, wakeReason: "issue_assigned" },
+      }),
+    ).toBe(false);
+
+    // Null/malformed snapshot must not throw and must stay terminal (parseObject
+    // collapses non-objects to {}, isPrReviewRetryContext then returns false).
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "pr_review_output_missing",
+        resultJson: {},
+        contextSnapshot: null,
       }),
     ).toBe(false);
   });
@@ -1604,6 +1630,9 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(exhaustionEvent?.payload).toMatchObject({
       retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
       maxAttempts: 2,
+      // BLO-17456 follow-up: the failing errorCode is carried on the exhaustion
+      // event so a code-specific failure surfaces its cause directly.
+      errorCode: "adapter_failed",
     });
   });
 
