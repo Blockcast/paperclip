@@ -16,7 +16,11 @@ permissions:
 jobs:
   review:
     runs-on: default
-    timeout-minutes: 5
+    # ARC runners have no warm toolcache, so setup-node's download plus
+    # Dependency Review can exceed a tight 5-min cap and cancel the job (the
+    # cancelled job surfaces as a red `review` check). 10 min gives headroom
+    # without letting a genuinely hung job drain a runner.
+    timeout-minutes: 10
     env:
       # Blockcast does not provision the upstream commitperclip bot key. Skip
       # the bot steps (token + quality/security gates) when it is absent so
@@ -35,7 +39,15 @@ jobs:
           base-ref: ${{ github.event.pull_request.base.sha }}
           head-ref: ${{ github.event.pull_request.head.sha }}
 
+      # Only the commitperclip bot steps below use Node. On Blockcast the bot
+      # key is absent (COMMITPERCLIP_ENABLED=false), so setting up Node here
+      # would download the toolcache purely to leave it unused — the main cost
+      # that pushes this job past its cap. Gate it behind the same flag as its
+      # consumers: upstream (key present) still installs Node, Blockcast skips.
+      # Dependency Review runs as a JS action on the runner's own node20, so it
+      # does not depend on this step.
       - name: Set up Node
+        if: env.COMMITPERCLIP_ENABLED == 'true'
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '20'
