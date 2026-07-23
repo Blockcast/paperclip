@@ -532,21 +532,17 @@ describe("paperclip MCP tools", () => {
     expect(String(issuesUrl)).toBe(`http://localhost:3100/api/companies/${penId}/issues`);
   });
 
-  it("derives the target company from a cross-company issue identifier prefix", async () => {
-    const penId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        mockJsonResponse([{ id: penId, issuePrefix: "PEN" }]),
-      )
-      .mockResolvedValueOnce(mockJsonResponse({ id: "PEN-307" }));
+  it("lets the API route issue identifiers without listing companies", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(mockJsonResponse({ id: "PEN-307" }));
     vi.stubGlobal("fetch", fetchMock);
 
     const tool = getTool("paperclipGetIssue");
     await tool.execute({ issueId: "PEN-307" });
 
-    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
-    expect((init.headers as Record<string, string>)["X-Paperclip-Company"]).toBe(penId);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe("http://localhost:3100/api/issues/PEN-307");
+    expect((init.headers as Record<string, string>)["X-Paperclip-Company"]).toBeUndefined();
   });
 
   it("prefers an explicit company override over the issue-id prefix", async () => {
