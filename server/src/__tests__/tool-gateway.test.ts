@@ -1987,12 +1987,14 @@ rl.on("line", (line) => {
     const initializedSessions = new Set<string>();
     const fake = await startFakeRemoteMcpServer((fakeRequest) => {
       const method = fakeRequest.body?.method;
+      const delayMs = elapsedMs >= 610_000 ? 200 : undefined;
       const sessionId = typeof fakeRequest.headers["mcp-session-id"] === "string"
         ? fakeRequest.headers["mcp-session-id"]
         : null;
       if (method === "initialize") {
         const newSessionId = `normal-connector-${nextSession++}`;
         return {
+          delayMs,
           headers: { "mcp-session-id": newSessionId },
           body: {
             jsonrpc: "2.0",
@@ -2003,10 +2005,11 @@ rl.on("line", (line) => {
       }
       if (method === "notifications/initialized") {
         if (sessionId) initializedSessions.add(sessionId);
-        return { status: 202, rawBody: "" };
+        return { status: 202, rawBody: "", delayMs };
       }
       if (method === "tools/call" && elapsedMs >= 610_000 && (!sessionId || !initializedSessions.has(sessionId))) {
         return {
+          delayMs,
           body: {
             jsonrpc: "2.0",
             id: fakeRequest.body?.id,
@@ -2017,6 +2020,7 @@ rl.on("line", (line) => {
       const params = fakeRequest.body?.params as Record<string, unknown> | undefined;
       const args = params?.arguments as Record<string, unknown> | undefined;
       return {
+        delayMs,
         body: {
           jsonrpc: "2.0",
           id: fakeRequest.body?.id,
@@ -2054,6 +2058,7 @@ rl.on("line", (line) => {
           sessionToken: session.token,
           tool: connectedTool!.name,
           parameters: { kind },
+          timeoutMs: 700,
         });
         contents.push(result.result?.content);
       }
@@ -2062,10 +2067,10 @@ rl.on("line", (line) => {
       expect(fake.requests.map((request) => request.body?.method)).toEqual([
         "tools/call",
         "tools/call", "initialize", "notifications/initialized", "tools/call",
-        "tools/call", "initialize", "notifications/initialized", "tools/call",
-        "tools/call", "initialize", "notifications/initialized", "tools/call",
-        "tools/call", "initialize", "notifications/initialized", "tools/call",
+        "tools/call", "tools/call", "tools/call",
       ]);
+      expect(fake.requests.slice(4).map((request) => request.headers["mcp-session-id"]))
+        .toEqual(Array(4).fill("normal-connector-1"));
     } finally {
       await fake.close();
     }
