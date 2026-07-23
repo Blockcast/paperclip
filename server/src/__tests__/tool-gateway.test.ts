@@ -1978,6 +1978,116 @@ rl.on("line", (line) => {
     }
   });
 
+  it("recovers normal connector reads after more than 610 seconds idle", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    let elapsedMs = 0;
+    let nextSession = 1;
+    const initializedSessions = new Set<string>();
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => {
+      const method = fakeRequest.body?.method;
+      const delayMs = elapsedMs >= 610_000 ? 200 : undefined;
+      const sessionId = typeof fakeRequest.headers["mcp-session-id"] === "string"
+        ? fakeRequest.headers["mcp-session-id"]
+        : null;
+      if (method === "initialize") {
+        const newSessionId = `normal-connector-${nextSession++}`;
+        return {
+          delayMs,
+          headers: { "mcp-session-id": newSessionId },
+          body: {
+            jsonrpc: "2.0",
+            id: fakeRequest.body?.id,
+            result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "strict-idle", version: "1" } },
+          },
+        };
+      }
+      if (method === "notifications/initialized") {
+        if (sessionId) initializedSessions.add(sessionId);
+        return { status: 202, rawBody: "", delayMs };
+      }
+      if (method === "tools/call" && elapsedMs >= 610_000 && (!sessionId || !initializedSessions.has(sessionId))) {
+        return {
+          delayMs,
+          body: {
+            jsonrpc: "2.0",
+            id: fakeRequest.body?.id,
+            error: { code: 0, message: 'method "tools/call" is invalid during session initialization' },
+          },
+        };
+      }
+      const params = fakeRequest.body?.params as Record<string, unknown> | undefined;
+      const args = params?.arguments as Record<string, unknown> | undefined;
+      return {
+        delayMs,
+        body: {
+          jsonrpc: "2.0",
+          id: fakeRequest.body?.id,
+          result: { content: [{ type: "text", text: String(args?.kind ?? "baseline") }] },
+        },
+      };
+    });
+    try {
+      await createRemoteMcpTool(db, company.id, {
+        applicationKey: "strict-idle-kubernetes",
+        connectionName: "Kubernetes read-only",
+        toolName: "resources_get",
+        title: "Get Kubernetes resource",
+        url: fake.url,
+        riskLevel: "read",
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db, { now: () => elapsedMs });
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      await expect(gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: { kind: "Pod" },
+      })).resolves.toMatchObject({ status: "completed" });
+
+      elapsedMs += 610_001;
+      const kinds = ["Pod", "PersistentVolumeClaim", "Event", "Node"];
+      const contents: Array<string | undefined> = [];
+      for (const kind of kinds) {
+        const result = await gateway.executeTool({
+          sessionToken: session.token,
+          tool: connectedTool!.name,
+          parameters: { kind },
+          timeoutMs: 1_500,
+        });
+        contents.push(result.result?.content);
+      }
+
+      expect(contents).toEqual(kinds);
+      expect(fake.requests.map((request) => request.body?.method)).toEqual([
+        "tools/call",
+        "tools/call", "initialize", "notifications/initialized", "tools/call",
+        "tools/call", "tools/call", "tools/call",
+      ]);
+      expect(fake.requests.slice(4).map((request) => request.headers["mcp-session-id"]))
+        .toEqual(Array(4).fill("normal-connector-1"));
+
+      elapsedMs += 60 * 60_000 + 1;
+      await expect(gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: { kind: "Pod" },
+        timeoutMs: 1_500,
+      })).resolves.toMatchObject({ status: "completed" });
+      expect(fake.requests.slice(-4).map((request) => request.body?.method)).toEqual([
+        "tools/call", "initialize", "notifications/initialized", "tools/call",
+      ]);
+      expect(fake.requests.at(-1)?.headers["mcp-session-id"]).toBe("normal-connector-2");
+    } finally {
+      await fake.close();
+    }
+  });
+
   it("discovers and calls the SDK-backed KV demo MCP server over Streamable HTTP", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);

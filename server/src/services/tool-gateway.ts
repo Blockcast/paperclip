@@ -768,7 +768,39 @@ export function createToolGatewayService(
   const policyService = toolAccessPolicyService(db);
   const secrets = secretService(db);
   const protocolLimits = mcpGatewayProtocolLimits(options.mcpGatewayProtocolLimits);
+  const remoteMcpSessions = new Map<string, { sessionId: string; expiresAt: number }>();
+  const remoteMcpSessionTtlMs = 60 * 60_000;
+  const remoteMcpSessionMaxEntries = 1_000;
   let nextProtocolRateLimitPruneAt = 0;
+
+  function getRemoteMcpSession(connectionId: string): string | undefined {
+    const cached = remoteMcpSessions.get(connectionId);
+    if (!cached) return undefined;
+    const current = options.now?.() ?? Date.now();
+    if (cached.expiresAt <= current) {
+      remoteMcpSessions.delete(connectionId);
+      return undefined;
+    }
+    remoteMcpSessions.delete(connectionId);
+    remoteMcpSessions.set(connectionId, {
+      sessionId: cached.sessionId,
+      expiresAt: current + remoteMcpSessionTtlMs,
+    });
+    return cached.sessionId;
+  }
+
+  function setRemoteMcpSession(connectionId: string, sessionId: string) {
+    remoteMcpSessions.delete(connectionId);
+    while (remoteMcpSessions.size >= remoteMcpSessionMaxEntries) {
+      const oldestConnectionId = remoteMcpSessions.keys().next().value;
+      if (oldestConnectionId === undefined) break;
+      remoteMcpSessions.delete(oldestConnectionId);
+    }
+    remoteMcpSessions.set(connectionId, {
+      sessionId,
+      expiresAt: (options.now?.() ?? Date.now()) + remoteMcpSessionTtlMs,
+    });
+  }
 
   async function pruneExpiredProtocolRateLimitCounters(current: number) {
     if (current < nextProtocolRateLimitPruneAt) return;
@@ -2998,6 +3030,12 @@ export function createToolGatewayService(
     };
   }
 
+  function isRemoteMcpInitializationError(value: unknown): boolean {
+    const error = asRecord(asRecord(value)?.error);
+    return typeof error?.message === "string"
+      && error.message.toLowerCase().includes("invalid during session initialization");
+  }
+
   async function executeRemoteHttpTool(
     session: ToolGatewaySession,
     tool: ToolGatewayDescriptor,
@@ -3032,33 +3070,43 @@ export function createToolGatewayService(
     const timer = setTimeout(() => controller.abort(), ms);
     timer.unref?.();
     try {
-      const response = await fetch(endpoint, {
+      const toolCallPayload = {
+        jsonrpc: "2.0",
+        id: requestId,
+        method: "tools/call",
+        params: {
+          name: entry.toolName,
+          arguments: parameters ?? {},
+        },
+      };
+      const send = (payload: Record<string, unknown>, sessionId?: string) => fetch(endpoint, {
         method: "POST",
         redirect: "manual",
         // MCP Streamable HTTP requires the Accept header advertising both a JSON
         // body and an SSE stream; spec-compliant servers 406 without it.
-        headers: mcpHttpRequestHeaders(headers),
-        signal: controller.signal,
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: requestId,
-          method: "tools/call",
-          params: {
-            name: entry.toolName,
-            arguments: parameters ?? {},
-          },
+        headers: mcpHttpRequestHeaders({
+          ...headers,
+          ...(sessionId ? { "mcp-session-id": sessionId } : {}),
         }),
+        signal: controller.signal,
+        body: JSON.stringify(payload),
       });
-      const body = await readBoundedRemoteResponse(response);
-      execution.response = {
-        httpStatus: response.status,
-        contentType: response.headers.get("content-type"),
-        bodySizeBytes: Buffer.byteLength(body, "utf8"),
-        upstreamRequestId:
-          response.headers.get("x-request-id")
-          ?? response.headers.get("x-zapier-request-id")
-          ?? response.headers.get("traceparent"),
+      const recordResponse = (receivedResponse: Response, receivedBody: string) => {
+        execution.response = {
+          httpStatus: receivedResponse.status,
+          contentType: receivedResponse.headers.get("content-type"),
+          bodySizeBytes: Buffer.byteLength(receivedBody, "utf8"),
+          upstreamRequestId:
+            receivedResponse.headers.get("x-request-id")
+            ?? receivedResponse.headers.get("x-zapier-request-id")
+            ?? receivedResponse.headers.get("traceparent"),
+        };
       };
+      const cachedSessionId = getRemoteMcpSession(connection.id);
+      let recoveredSessionId: string | undefined;
+      let response = await send(toolCallPayload, cachedSessionId);
+      let body = await readBoundedRemoteResponse(response);
+      recordResponse(response, body);
       if (!response.ok) {
         await markRemoteConnectionHealth(connection, "error", "Remote MCP server returned an HTTP error.");
         throw new ToolGatewayHttpError(502, "Remote MCP server returned an HTTP error", "remote_http_status", {
@@ -3079,6 +3127,90 @@ export function createToolGatewayService(
           execution,
         });
       }
+      if (isRemoteMcpInitializationError(payload)) {
+        if (cachedSessionId && remoteMcpSessions.get(connection.id)?.sessionId === cachedSessionId) {
+          remoteMcpSessions.delete(connection.id);
+        }
+        const initializeResponse = await send({
+          jsonrpc: "2.0",
+          id: `${requestId}:initialize`,
+          method: "initialize",
+          params: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "paperclip-tool-gateway", version: "0.3.1" },
+          },
+        });
+        const initializeBody = await readBoundedRemoteResponse(initializeResponse);
+        recordResponse(initializeResponse, initializeBody);
+        if (!initializeResponse.ok) {
+          await markRemoteConnectionHealth(connection, "error", "Remote MCP session initialization returned an HTTP error.");
+          throw new ToolGatewayHttpError(502, "Remote MCP session initialization returned an HTTP error", "remote_http_status", {
+            status: initializeResponse.status,
+            connectionId: connection.id,
+            catalogEntryId: entry.id,
+            execution,
+          });
+        }
+        let initializePayload: unknown;
+        try {
+          initializePayload = parseMcpHttpResponseBody(initializeBody, initializeResponse.headers.get("content-type"));
+        } catch {
+          await markRemoteConnectionHealth(connection, "error", "Remote MCP session initialization returned invalid JSON.");
+          throw new ToolGatewayHttpError(502, "Remote MCP session initialization returned invalid JSON", "remote_http_invalid_json", {
+            connectionId: connection.id,
+            catalogEntryId: entry.id,
+            execution,
+          });
+        }
+        if (asRecord(initializePayload)?.error !== undefined) {
+          await markRemoteConnectionHealth(connection, "error", "Remote MCP session initialization returned a JSON-RPC error.");
+          throw new ToolGatewayHttpError(502, "Remote MCP session initialization returned an error", "remote_mcp_error", {
+            connectionId: connection.id,
+            catalogEntryId: entry.id,
+            execution,
+          });
+        }
+        recoveredSessionId = initializeResponse.headers.get("mcp-session-id") ?? undefined;
+        const initializedResponse = await send({
+          jsonrpc: "2.0",
+          method: "notifications/initialized",
+          params: {},
+        }, recoveredSessionId);
+        const initializedBody = await readBoundedRemoteResponse(initializedResponse);
+        recordResponse(initializedResponse, initializedBody);
+        if (!initializedResponse.ok) {
+          await markRemoteConnectionHealth(connection, "error", "Remote MCP initialized notification returned an HTTP error.");
+          throw new ToolGatewayHttpError(502, "Remote MCP initialized notification returned an HTTP error", "remote_http_status", {
+            status: initializedResponse.status,
+            connectionId: connection.id,
+            catalogEntryId: entry.id,
+            execution,
+          });
+        }
+        response = await send(toolCallPayload, recoveredSessionId);
+        body = await readBoundedRemoteResponse(response);
+        recordResponse(response, body);
+        if (!response.ok) {
+          await markRemoteConnectionHealth(connection, "error", "Remote MCP server returned an HTTP error after session initialization.");
+          throw new ToolGatewayHttpError(502, "Remote MCP server returned an HTTP error", "remote_http_status", {
+            status: response.status,
+            connectionId: connection.id,
+            catalogEntryId: entry.id,
+            execution,
+          });
+        }
+        try {
+          payload = parseMcpHttpResponseBody(body, response.headers.get("content-type"));
+        } catch {
+          await markRemoteConnectionHealth(connection, "error", "Remote MCP server returned invalid JSON after session initialization.");
+          throw new ToolGatewayHttpError(502, "Remote MCP server returned invalid JSON", "remote_http_invalid_json", {
+            connectionId: connection.id,
+            catalogEntryId: entry.id,
+            execution,
+          });
+        }
+      }
       const payloadRecord = asRecord(payload);
       if (!payloadRecord) throw malformedRemoteMcpResponse();
       const topLevelElicitation = extractMcpElicitationRequest(payloadRecord);
@@ -3098,6 +3230,7 @@ export function createToolGatewayService(
       if (!Object.prototype.hasOwnProperty.call(payloadRecord, "result")) {
         throw malformedRemoteMcpResponse();
       }
+      if (recoveredSessionId) setRemoteMcpSession(connection.id, recoveredSessionId);
       const resultElicitation = extractMcpElicitationRequest(payloadRecord.result);
       if (resultElicitation) {
         await requestElicitationForRecordedToolCall({ session, tool, invocationId, request: resultElicitation });
