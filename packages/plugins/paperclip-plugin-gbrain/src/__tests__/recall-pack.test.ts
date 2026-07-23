@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { brotliCompressSync } from "node:zlib";
 import {
   packCacheEntry,
   unpackCacheEntry,
@@ -129,5 +130,62 @@ describe("packCacheEntry / unpackCacheEntry", () => {
     expect(restored.status).toBe("error");
     expect(restored.graph).toBeNull();
     expect(restored.note).toMatch(/unknown graphZ codec/);
+  });
+
+  it("degrades a valid brotli stream whose payload isn't JSON to status:error", () => {
+    // A realistic corruption case (bit-flip after compression that still inflates):
+    // graphZ decompresses fine but JSON.parse throws. Shares the same try as the
+    // decompress path but exercises the JSON.parse branch specifically.
+    const packed = packCacheEntry(okEntry());
+    const notJson: StoredRecall = {
+      ...packed,
+      graphZ: brotliCompressSync(Buffer.from("not json", "utf8")).toString("base64"),
+    };
+    const restored = unpackCacheEntry(notJson);
+    expect(restored.status).toBe("error");
+    expect(restored.graph).toBeNull();
+    expect(restored.note).toMatch(/could not be decompressed/);
+    expect(restored.issuePageSlug).toBe(packed.issuePageSlug);
+  });
+
+  it("degrades an over-cap inflating graphZ to status:error instead of OOMing", () => {
+    // Brotli's ratio on repetitive input is extreme: 40MB of zeros compresses to
+    // a few dozen bytes but inflates past the 32MB maxOutputLength cap, so
+    // brotliDecompressSync throws a catchable ERR_BUFFER_TOO_LARGE rather than
+    // allocating unbounded memory and crashing the worker. Guards BLO-17449's
+    // never-throw guarantee for the corrupt/hostile-blob case.
+    const packed = packCacheEntry(okEntry());
+    const bomb: StoredRecall = {
+      ...packed,
+      graphZ: brotliCompressSync(Buffer.alloc(40 * 1024 * 1024)).toString("base64"),
+    };
+    const restored = unpackCacheEntry(bomb);
+    expect(restored.status).toBe("error");
+    expect(restored.graph).toBeNull();
+    expect(restored.note).toMatch(/could not be decompressed/);
+  });
+
+  it("falls back to inline graph storage when compression throws (circular ref)", () => {
+    // The write-side half of the fail-safe story: if JSON.stringify (or brotli)
+    // throws, packCacheEntry must persist the graph inline rather than drop a
+    // run's context. A circular reference makes JSON.stringify throw.
+    const circular: Record<string, unknown> = { nodes: [], edges: [] };
+    circular.self = circular;
+    const entry = {
+      fetchedAtIso: "2026-07-22T00:00:00.000Z",
+      issuePageSlug: "paperclip/issues/company-abc/BLO-1000",
+      depth: 2,
+      graph: circular,
+      status: "ok",
+      note: "traversed",
+    } as unknown as CachedRecall;
+    const packed = packCacheEntry(entry);
+    // Stored inline, uncompressed — no graphZ/graphEnc, graph preserved.
+    expect(packed.graphZ).toBeUndefined();
+    expect(packed.graphEnc).toBeUndefined();
+    expect(packed.graph).toBe(circular);
+    expect(packed.status).toBe("ok");
+    // And it round-trips back through the legacy (inline) read path.
+    expect(unpackCacheEntry(packed).graph).toBe(circular);
   });
 });

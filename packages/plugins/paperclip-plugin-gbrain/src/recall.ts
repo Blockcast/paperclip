@@ -319,6 +319,14 @@ export function buildCacheEntry(input: {
 const GRAPH_BROTLI_QUALITY = 6;
 /** Codec tag on graphZ; gates future codec changes (only brotli today). */
 const GRAPH_CODEC = "br" as const;
+/** Hard cap on the inflated graph size on the read path. Brotli's ratio on the
+ *  repetitive graph shape is extreme (50MB of zeros -> 89 bytes), so a corrupt,
+ *  truncated, or bit-flipped graphZ could otherwise force brotliDecompressSync
+ *  to allocate arbitrarily much and OOM-kill the worker *before* the try/catch
+ *  below can run — defeating unpackCacheEntry's never-throw guarantee. Sized at
+ *  ~5x the documented ~6MB max graph so every legitimate row inflates cleanly
+ *  while a hostile blob throws a catchable ERR_BUFFER_TOO_LARGE instead. */
+const GRAPH_MAX_INFLATED_BYTES = 32 * 1024 * 1024;
 
 /**
  * On-disk form of {@link CachedRecall}: identical metadata, but the fat `graph`
@@ -399,7 +407,9 @@ export function unpackCacheEntry(stored: StoredRecall | CachedRecall): CachedRec
     return degradedRecall(s, `unknown graphZ codec "${String(s.graphEnc)}"`);
   }
   try {
-    const json = brotliDecompressSync(Buffer.from(s.graphZ, "base64")).toString("utf8");
+    const json = brotliDecompressSync(Buffer.from(s.graphZ, "base64"), {
+      maxOutputLength: GRAPH_MAX_INFLATED_BYTES,
+    }).toString("utf8");
     return { ...meta, graph: JSON.parse(json) };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
