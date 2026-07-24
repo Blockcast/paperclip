@@ -164,7 +164,11 @@ WORKDIR /vendor
 # typecheck, build, and 432/432 tests pass.
 # Bumped 2026-07-20 to cd52a58: bound the pre-Job live-Job list to 15 seconds
 # and fail closed when Kubernetes does not answer. PR kkroo/paperclip-adapter-claude-k8s#24.
-ARG CLAUDE_K8S_REF=cd52a58173200fe1193c54f732b0405e0b8073fe
+# Bumped 2026-07-24 to c4f92ff: model-only commit based on the previous
+# production pin cd52a58. Adds Claude Opus 5, Claude Opus 5 1M, and Bedrock
+# Opus 5 model catalog entries without bundling later retry-semantics changes.
+# Focused models suite and typecheck pass.
+ARG CLAUDE_K8S_REF=c4f92ffcafbd6b286b291d0ad2e49557401d884d
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
@@ -322,7 +326,10 @@ ARG CLAUDE_K8S_REF=cd52a58173200fe1193c54f732b0405e0b8073fe
 # bound the pre-Job live-Job list to 15 seconds and fail closed when Kubernetes
 # does not answer. Focused suite 13/13, full adapter suite 527/527, typecheck,
 # and build pass.
-ARG OPENCODE_K8S_REF=239f2e1a3e27344e154600fae7ba668c13b36a5d
+# Bumped 2026-07-24 to 3ab75fb (#50): add anthropic/claude-opus-5 to the
+# static model picker and list-price fallback table. Focused pricing/static
+# adapter tests and typecheck pass.
+ARG OPENCODE_K8S_REF=3ab75fb6893d3f2eed26b38a830f1a48bd1f35c0
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
