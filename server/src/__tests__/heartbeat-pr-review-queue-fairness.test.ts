@@ -115,6 +115,85 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
     await tempDb?.cleanup();
   });
 
+  it("keeps wildcard-like wake prefixes out of bounded PR-review history", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "PR Review Observability Co",
+      status: "active",
+      issuePrefix: "PRO",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Ally",
+      role: "reviewer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: randomUUID(),
+        companyId,
+        agentId,
+        status: "succeeded",
+        finishedAt: new Date("2026-07-25T11:59:00.000Z"),
+        contextSnapshot: {
+          wakeReason: "githubXprYreview_submitted",
+          githubPrNumber: 999,
+        },
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        agentId,
+        status: "succeeded",
+        finishedAt: new Date("2026-07-25T11:58:00.000Z"),
+        contextSnapshot: {
+          reviewKind: "pr_review",
+          wakeReason: "github_pr_review_submitted",
+          githubPrNumber: 812,
+        },
+      },
+    ]);
+
+    const rows = await db.execute(sql<{ wakeReason: string }>`
+      select context_wake_reason as "wakeReason"
+      from heartbeat_runs
+      where company_id = ${companyId}
+        and (
+          starts_with(context_wake_reason, 'github_pr_')
+          or context_snapshot ->> 'reviewKind' = 'pr_review'
+        )
+      order by finished_at desc, id desc
+      limit 1
+    `);
+
+    expect(Array.from(rows)).toEqual([{ wakeReason: "github_pr_review_submitted" }]);
+  });
+
+  it("uses the terminal completion-order index for bounded company history", async () => {
+    await db.execute(sql`set enable_seqscan = off`);
+    const plan = await db.execute(sql<Record<string, string>>`
+      explain (costs off)
+      select id
+      from heartbeat_runs
+      where company_id = ${randomUUID()}
+        and finished_at >= ${"2026-07-18T00:00:00.000Z"}::timestamptz
+      order by finished_at desc, id desc
+      limit 201
+    `);
+    const planText = Array.from(plan).flatMap((row) => Object.values(row)).join("\n");
+
+    expect(planText).toContain("heartbeat_runs_company_finished_at_desc_idx");
+  });
+
   it("coalesces concurrent GitHub issue follow-ups behind a running run", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

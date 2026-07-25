@@ -3883,7 +3883,7 @@ export function agentRoutes(
     };
     const prReviewPredicate = and(
       or(
-        sql`${heartbeatRuns.contextWakeReason} like 'github_pr_%'`,
+        sql`starts_with(${heartbeatRuns.contextWakeReason}, 'github_pr_')`,
         sql`${heartbeatRuns.contextSnapshot} ->> 'reviewKind' = 'pr_review'`,
       ),
       sql`case jsonb_typeof(${heartbeatRuns.contextSnapshot} -> 'githubPrNumber')
