@@ -4143,6 +4143,25 @@ export function buildK8sRunIsolationDescriptor(input: {
   };
 }
 
+export function buildHeartbeatRunFailedMetricInput(input: {
+  agent: { id: string; adapterType: string | null };
+  issueId: string | null;
+  run: { errorCode: string | null; contextSnapshot: unknown };
+  k8sRunIsolation: { isolationMode: string } | null;
+}) {
+  const contextSnapshotObj = parseObject(input.run.contextSnapshot);
+  return {
+    agentId: input.agent.id,
+    issueId: input.issueId,
+    adapter: input.agent.adapterType,
+    errorCode: input.run.errorCode,
+    invocationSource:
+      readNonEmptyString(contextSnapshotObj.wakeReason) ??
+      readNonEmptyString(contextSnapshotObj.retryReason),
+    isolationMode: input.k8sRunIsolation?.isolationMode ?? null,
+  };
+}
+
 export function resolveK8sRunIsolationIdentity(input: {
   adapterType: string | null | undefined;
   runId: string;
@@ -19421,12 +19440,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
         if (outcome === "failed") {
-          const contextSnapshotObj = parseObject(livenessRun.contextSnapshot);
-          recordHeartbeatRunFailed({
-            adapter: agent.adapterType,
-            errorCode: livenessRun.errorCode,
-            invocationSource: readNonEmptyString(contextSnapshotObj.wakeReason) ?? readNonEmptyString(contextSnapshotObj.retryReason),
-          });
+          recordHeartbeatRunFailed(buildHeartbeatRunFailedMetricInput({
+            agent,
+            issueId,
+            run: livenessRun,
+            k8sRunIsolation,
+          }));
         }
         await recordZeroTokenCompletedRunStreak(agent);
         if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
