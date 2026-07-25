@@ -3881,60 +3881,72 @@ export function agentRoutes(
       finishedAt: heartbeatRuns.finishedAt,
       scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
     };
-    const prReviewPredicate = or(
-      sql`${heartbeatRuns.contextWakeReason} like 'github_pr_%'`,
-      sql`${heartbeatRuns.contextSnapshot} ->> 'reviewKind' = 'pr_review'`,
+    const prReviewPredicate = and(
+      or(
+        sql`${heartbeatRuns.contextWakeReason} like 'github_pr_%'`,
+        sql`${heartbeatRuns.contextSnapshot} ->> 'reviewKind' = 'pr_review'`,
+      ),
+      sql`case jsonb_typeof(${heartbeatRuns.contextSnapshot} -> 'githubPrNumber')
+        when 'number' then pg_input_is_valid(${heartbeatRuns.contextSnapshot} ->> 'githubPrNumber', 'double precision')
+        when 'string' then
+          btrim(${heartbeatRuns.contextSnapshot} ->> 'githubPrNumber') ~ '^[+-]?([0-9]+(\\.[0-9]*)?|\\.[0-9]+)([eE][+-]?[0-9]+)?$'
+          and pg_input_is_valid(btrim(${heartbeatRuns.contextSnapshot} ->> 'githubPrNumber'), 'double precision')
+        else false
+      end`,
     );
     const baseQuery = () => db
       .select(columns)
       .from(heartbeatRuns)
       .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id));
+    const activePredicate = and(
+      eq(heartbeatRuns.companyId, companyId),
+      prReviewPredicate,
+      inArray(heartbeatRuns.status, ["queued", "scheduled_retry", "running"]),
+    );
+    const activeSummaryPromise = db
+      .select({
+        agentId: heartbeatRuns.agentId,
+        agentName: agentsTable.name,
+        queuedCount: sql<number>`count(*) filter (where ${heartbeatRuns.status} in ('queued', 'scheduled_retry'))::int`,
+        oldestQueuedAt: sql<Date | null>`min(${heartbeatRuns.createdAt}) filter (where ${heartbeatRuns.status} in ('queued', 'scheduled_retry'))`,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
+      .where(activePredicate)
+      .groupBy(heartbeatRuns.agentId, agentsTable.name);
     const activeRowsPromise =
       baseQuery()
-        .where(
-          and(
-            eq(heartbeatRuns.companyId, companyId),
-            prReviewPredicate,
-            inArray(heartbeatRuns.status, ["queued", "scheduled_retry", "running"]),
-          ),
-        )
-        .orderBy(desc(heartbeatRuns.createdAt));
-    const terminalRowsPromise = (async () => {
-      const rows: Awaited<typeof activeRowsPromise> = [];
-      const batchSize = Math.min(1000, Math.max(100, limit * 2));
-      let offset = 0;
-      while (rows.length < limit) {
-        const candidates = await baseQuery()
-          .where(
-            and(
-              eq(heartbeatRuns.companyId, companyId),
-              prReviewPredicate,
-              gte(heartbeatRuns.finishedAt, terminalCutoff),
-            ),
-          )
-          .orderBy(desc(heartbeatRuns.createdAt))
-          .limit(batchSize)
-          .offset(offset);
-        for (const row of candidates) {
-          if (row.finishedAt !== null && derivePaperclipPrReview(row.contextSnapshot) !== null) {
-            rows.push(row);
-            if (rows.length === limit) break;
-          }
-        }
-        if (candidates.length < batchSize) break;
-        offset += batchSize;
-      }
-      return rows;
-    })();
-    const [activeRows, terminalRows] = await Promise.all([activeRowsPromise, terminalRowsPromise]);
+        .where(activePredicate)
+        .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+        .limit(limit + 1);
+    const terminalRowsPromise = baseQuery()
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          prReviewPredicate,
+          gte(heartbeatRuns.finishedAt, terminalCutoff),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(limit + 1);
+    const [activeSummary, activeCandidates, terminalCandidates] = await Promise.all([
+      activeSummaryPromise,
+      activeRowsPromise,
+      terminalRowsPromise,
+    ]);
 
-    const activePrReviewRows = activeRows.filter((row) =>
+    const activeRowsTruncated = activeCandidates.length > limit;
+    const terminalRowsTruncated = terminalCandidates.length > limit;
+    const activePrReviewRows = activeCandidates.slice(0, limit).filter((row) =>
       ["queued", "scheduled_retry", "running"].includes(row.status)
       && derivePaperclipPrReview(row.contextSnapshot) !== null,
     );
+    const terminalRows = terminalCandidates.slice(0, limit).filter((row) =>
+      row.finishedAt !== null && derivePaperclipPrReview(row.contextSnapshot) !== null
+    );
     const rows = [...activePrReviewRows, ...terminalRows]
       .filter((row, index, allRows) => allRows.findIndex((candidate) => candidate.id === row.id) === index)
-      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime() || b.id.localeCompare(a.id));
 
     const byAgent = new Map<string, {
       agentId: string;
@@ -3943,6 +3955,16 @@ export function agentRoutes(
       oldestQueuedAt: Date | null;
       runs: Array<Record<string, unknown>>;
     }>();
+
+    for (const summary of activeSummary) {
+      byAgent.set(summary.agentId, {
+        agentId: summary.agentId,
+        agentName: summary.agentName,
+        queuedCount: summary.queuedCount,
+        oldestQueuedAt: summary.oldestQueuedAt,
+        runs: [],
+      });
+    }
 
     for (const row of rows) {
       const prReview = derivePaperclipPrReview(row.contextSnapshot);
@@ -3954,12 +3976,6 @@ export function agentRoutes(
         oldestQueuedAt: null,
         runs: [],
       };
-      if (row.status === "queued" || row.status === "scheduled_retry") {
-        group.queuedCount += 1;
-        if (!group.oldestQueuedAt || row.createdAt < group.oldestQueuedAt) {
-          group.oldestQueuedAt = row.createdAt;
-        }
-      }
       const ageEnd = row.finishedAt ?? now;
       const disposition = row.status === "queued"
         ? "queued"
@@ -3990,16 +4006,24 @@ export function agentRoutes(
     res.json({
       generatedAt: now,
       lookbackHours,
-      agents: [...byAgent.values()].map((group) => ({
-        agentId: group.agentId,
-        agentName: group.agentName,
-        queuedCount: group.queuedCount,
-        oldestQueuedAt: group.oldestQueuedAt,
-        oldestQueuedAgeMs: group.oldestQueuedAt
-          ? Math.max(0, now.getTime() - group.oldestQueuedAt.getTime())
-          : null,
-        runs: group.runs,
-      })),
+      detailLimit: limit,
+      truncated: activeRowsTruncated || terminalRowsTruncated,
+      truncatedSections: {
+        activeRuns: activeRowsTruncated,
+        terminalRuns: terminalRowsTruncated,
+      },
+      agents: [...byAgent.values()]
+        .sort((a, b) => a.agentName.localeCompare(b.agentName) || a.agentId.localeCompare(b.agentId))
+        .map((group) => ({
+          agentId: group.agentId,
+          agentName: group.agentName,
+          queuedCount: group.queuedCount,
+          oldestQueuedAt: group.oldestQueuedAt,
+          oldestQueuedAgeMs: group.oldestQueuedAt
+            ? Math.max(0, now.getTime() - group.oldestQueuedAt.getTime())
+            : null,
+          runs: group.runs,
+        })),
     });
   });
 
