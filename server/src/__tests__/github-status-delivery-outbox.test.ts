@@ -1,0 +1,255 @@
+import { generateKeyPairSync, randomUUID } from "node:crypto";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  agents,
+  companies,
+  createDb,
+  githubCommitStatusDeliveries,
+  heartbeatRunEvents,
+  heartbeatRuns,
+} from "@paperclipai/db";
+import { asc, eq } from "drizzle-orm";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
+
+const h = vi.hoisted(() => ({
+  cfg: {
+    githubAppId: "",
+    githubAppInstallationId: "",
+    githubAppPrivateKey: "",
+    prReviewerBotLogin: "allyblockcast[bot]",
+  } as Record<string, string>,
+}));
+
+vi.mock("../config.js", () => ({ loadConfig: () => h.cfg }));
+
+import { _resetInstallationTokenCache } from "../services/github-app-auth.js";
+import {
+  enqueueGithubCommitStatusDelivery,
+  pollGitHubCommitStatusDeliveriesOnce,
+} from "../services/github-status-delivery-outbox.js";
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping embedded Postgres GitHub status delivery outbox tests: ${embeddedPostgresSupport.reason ?? "unsupported"}`,
+  );
+}
+
+const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+const PRIVATE_KEY_PEM = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+const FUTURE_ISO = "2999-01-01T00:00:00Z";
+const HEAD_SHA = "45eb633e348a826f43dc68b0c25fe83a96300cea";
+
+function jsonResponse(data: unknown, ok = true, status = 200): Response {
+  return { ok, status, json: async () => data } as unknown as Response;
+}
+
+function setCreds() {
+  h.cfg.githubAppId = "3966421";
+  h.cfg.githubAppInstallationId = "12345678";
+  h.cfg.githubAppPrivateKey = PRIVATE_KEY_PEM;
+  h.cfg.prReviewerBotLogin = "allyblockcast[bot]";
+}
+
+function clearCreds() {
+  h.cfg.githubAppId = "";
+  h.cfg.githubAppInstallationId = "";
+  h.cfg.githubAppPrivateKey = "";
+  h.cfg.prReviewerBotLogin = "allyblockcast[bot]";
+}
+
+describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-github-status-outbox-");
+    db = createDb(tempDb.connectionString);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  beforeEach(async () => {
+    _resetInstallationTokenCache();
+    clearCreds();
+    vi.unstubAllGlobals();
+    await db.delete(githubCommitStatusDeliveries);
+    await db.delete(heartbeatRunEvents);
+    await db.delete(heartbeatRuns);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  async function seedRun() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      errorCode: "pr_review_output_missing",
+      contextSnapshot: {
+        wakeReason: "github_pr_synchronized",
+        githubRepoFullName: "Blockcast/hang",
+        githubPrNumber: 7,
+        githubHeadSha: HEAD_SHA,
+      },
+    });
+    const delivery = await enqueueGithubCommitStatusDelivery(db, {
+      companyId,
+      sourceRunId: runId,
+      repoFullName: "Blockcast/hang",
+      sha: HEAD_SHA,
+      context: "review/ally-complete",
+      state: "failure",
+      description: "Paperclip reviewer run exhausted its automatic retries; no review was posted.",
+      targetUrl: "https://github.com/Blockcast/hang/pull/7",
+      prNumber: 7,
+      prUrl: "https://github.com/Blockcast/hang/pull/7",
+    });
+    return { companyId, agentId, runId, delivery };
+  }
+
+  function stubGithub(options: {
+    latestStatuses?: unknown[];
+    reviews?: unknown[];
+    comments?: unknown[];
+    postStatus?: number;
+  }) {
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      if (u.includes(`/commits/${HEAD_SHA}/statuses`)) return jsonResponse(options.latestStatuses ?? []);
+      if (u.includes("/pulls/") && u.includes("/reviews")) return jsonResponse(options.reviews ?? []);
+      if (u.includes("/issues/") && u.includes("/comments")) return jsonResponse(options.comments ?? []);
+      if (u.includes(`/statuses/${HEAD_SHA}`)) {
+        const status = options.postStatus ?? 201;
+        return jsonResponse({ id: 1 }, status < 400, status);
+      }
+      throw new Error(`unexpected url ${u}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  async function readDelivery(id: string) {
+    return db
+      .select()
+      .from(githubCommitStatusDeliveries)
+      .where(eq(githubCommitStatusDeliveries.id, id))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function readRunEvents(runId: string) {
+    return db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId))
+      .orderBy(asc(heartbeatRunEvents.seq));
+  }
+
+  it("posts the failure status after confirming no newer status or reviewer evidence exists", async () => {
+    setCreds();
+    const { runId, delivery } = await seedRun();
+    const fetchMock = stubGithub({ latestStatuses: [], reviews: [], comments: [] });
+
+    await expect(pollGitHubCommitStatusDeliveriesOnce(db)).resolves.toBe(1);
+
+    expect(await readDelivery(delivery.id)).toMatchObject({ status: "delivered", attempts: 0 });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(true);
+    const events = await readRunEvents(runId);
+    expect(events.at(-1)?.message).toContain("Set PR-review gate status review/ally-complete to failure");
+  });
+
+  it("skips the failure write when reviewer evidence now exists on GitHub", async () => {
+    setCreds();
+    const { delivery } = await seedRun();
+    const fetchMock = stubGithub({
+      latestStatuses: [],
+      reviews: [{ user: { login: "allyblockcast[bot]" }, commit_id: HEAD_SHA }],
+    });
+
+    await pollGitHubCommitStatusDeliveriesOnce(db);
+
+    expect(await readDelivery(delivery.id)).toMatchObject({ status: "skipped" });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(false);
+  });
+
+  it("retries a transient status write failure with bounded backoff", async () => {
+    setCreds();
+    const { runId, delivery } = await seedRun();
+    stubGithub({ latestStatuses: [], reviews: [], comments: [], postStatus: 503 });
+
+    await pollGitHubCommitStatusDeliveriesOnce(db);
+
+    const updated = await readDelivery(delivery.id);
+    expect(updated).toMatchObject({
+      status: "queued",
+      attempts: 1,
+      lastError: "commit_status_write_http_503",
+      lastErrorKind: "transient",
+    });
+    expect(updated?.nextAttemptAt.getTime()).toBeGreaterThan(Date.now());
+    const events = await readRunEvents(runId);
+    expect(events.at(-1)?.message).toContain("will retry");
+  });
+
+  it("marks permission failures as permanent instead of retrying forever", async () => {
+    setCreds();
+    const { delivery } = await seedRun();
+    stubGithub({ latestStatuses: [], reviews: [], comments: [], postStatus: 403 });
+
+    await pollGitHubCommitStatusDeliveriesOnce(db);
+
+    expect(await readDelivery(delivery.id)).toMatchObject({
+      status: "failed_permanent",
+      attempts: 0,
+      lastError: "commit_status_write_http_403",
+      lastErrorKind: "permanent",
+    });
+  });
+
+  it("surfaces missing GitHub App credentials as permanent configuration failure", async () => {
+    const { delivery } = await seedRun();
+
+    await pollGitHubCommitStatusDeliveriesOnce(db);
+
+    expect(await readDelivery(delivery.id)).toMatchObject({
+      status: "failed_permanent",
+      lastError: "missing_github_app_credentials",
+      lastErrorKind: "permanent",
+    });
+  });
+});

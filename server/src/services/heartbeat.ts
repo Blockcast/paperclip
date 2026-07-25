@@ -167,8 +167,9 @@ import {
   isThrottleCandidateIssueRewake,
 } from "./issue-rewake-throttle.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
-import { githubHasReviewerEvidenceForPr, githubPostCommitStatus } from "./github-app-auth.js";
+import { githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
 import { loadConfig } from "../config.js";
+import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
 import {
   ensureReferencedSharedDocsMaterialized,
   normalizeInstructionsEntryFile,
@@ -7865,15 +7866,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   /**
-   * Fail the configured PR-review gate status for a run whose bounded retry
-   * chain just exhausted, so a never-arriving required check stops reading as
-   * "still waiting". No-op unless an operator configured a context and the run
-   * carries a repo + exact head SHA (see resolvePrReviewGateStatusTarget).
-   * Best-effort by construction: the post result is recorded as a run event and
-   * never propagated, because status delivery must not alter run lifecycle.
-   * (BLO-17456)
+   * Queue the configured PR-review gate status failure for a run whose bounded
+   * retry chain just exhausted, so a never-arriving required check stops reading
+   * as "still waiting". The outbox owns evidence re-checks, retry, and final
+   * delivery logging; the heartbeat lifecycle only records that the work was
+   * durably queued. (BLO-17456)
    */
-  async function postExhaustedPrReviewGateStatus(
+  async function queueExhaustedPrReviewGateStatus(
     run: typeof heartbeatRuns.$inferSelect,
     contextSnapshot: Record<string, unknown>,
   ) {
@@ -7883,27 +7882,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
     if (!target) return;
 
-    const posted = await githubPostCommitStatus({
+    const delivery = await enqueueGithubCommitStatusDelivery(db, {
+      companyId: run.companyId,
+      sourceRunId: run.id,
       repoFullName: target.repoFullName,
       sha: target.sha,
       context: target.context,
       state: "failure",
       description: "Paperclip reviewer run exhausted its automatic retries; no review was posted.",
       targetUrl: target.prUrl,
+      prNumber: target.prNumber,
+      prUrl: target.prUrl,
     });
     await appendRunEvent(run, await nextRunEventSeq(run.id), {
       eventType: "lifecycle",
       stream: "system",
-      level: posted ? "info" : "warn",
-      message: posted
-        ? `Set PR-review gate status ${target.context} to failure on ${target.repoFullName}@${target.sha.slice(0, 7)} after retry exhaustion`
-        : `Could not post PR-review gate status ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)}; the required check stays pending`,
+      level: "info",
+      message:
+        delivery.status === "queued" || delivery.status === "processing"
+          ? `Queued PR-review gate status failure delivery for ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)} after retry exhaustion`
+          : `PR-review gate status failure delivery for ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)} is already ${delivery.status}`,
       payload: {
+        deliveryId: delivery.id,
+        deliveryStatus: delivery.status,
         statusContext: target.context,
         repoFullName: target.repoFullName,
         prNumber: target.prNumber,
         headSha: target.sha,
-        posted,
       },
     });
   }
@@ -12337,14 +12342,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       // BLO-17456: a PR-review chain that exhausts here leaves its required
       // status context unposted, so the PR sits on "Expected — waiting for
-      // status" with nothing signalling that no result is coming. Fail the
-      // context so the wedge is visible. Opt-in and best-effort: inert unless an
-      // operator configured a context, and any GitHub fault is logged and
-      // swallowed so status delivery can never alter exhaustion handling.
-      await postExhaustedPrReviewGateStatus(run, contextSnapshot).catch((error) => {
+      // status" with nothing signalling that no result is coming. Queue a
+      // durable status delivery so stale writes are guarded by a final
+      // GitHub-evidence read and transient GitHub/token failures can retry.
+      // Opt-in and swallowed so status delivery can never alter exhaustion
+      // handling.
+      await queueExhaustedPrReviewGateStatus(run, contextSnapshot).catch((error) => {
         logger.warn(
           { err: error, runId: run.id },
-          "failed to post exhausted PR-review gate status",
+          "failed to queue exhausted PR-review gate status",
         );
       });
       return {

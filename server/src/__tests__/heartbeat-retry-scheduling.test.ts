@@ -9,6 +9,7 @@ import {
   companies,
   createDb,
   executionWorkspaces,
+  githubCommitStatusDeliveries,
   heartbeatRunEvents,
   heartbeatRuns,
   issueRelations,
@@ -1602,9 +1603,8 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   // required status, so the PR sits on "Expected — waiting for status" forever.
   // These drive the real exhaustion path (no mocks): loadConfig() reads
   // process.env at call time, so setting the context here exercises the wiring
-  // end to end. GitHub App creds are absent in tests, so the write short-circuits
-  // to false — which is exactly the case that must stay observable rather than
-  // silent.
+  // end to end. The GitHub write itself is now handled by a durable outbox so
+  // the heartbeat only needs to prove that the delivery request was persisted.
   describe("exhausted PR-review gate status", () => {
     const GATE_CONTEXT_ENV = "PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT";
     const HEAD_SHA = "45eb633e348a826f43dc68b0c25fe83a96300cea";
@@ -1644,7 +1644,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         .from(heartbeatRunEvents)
         .where(eq(heartbeatRunEvents.runId, runId))
         .orderBy(sql`${heartbeatRunEvents.id} asc`);
-      return events;
+      return { events, runId };
     }
 
     const prReviewSnapshot = {
@@ -1655,28 +1655,36 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       githubPrUrl: "https://github.com/Blockcast/hang/pull/7",
     };
 
-    it("records the gate-status attempt on exhaustion when a context is configured", async () => {
+    it("queues the gate-status delivery on exhaustion when a context is configured", async () => {
       process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
-      const events = await exhaustPrReviewRun(prReviewSnapshot);
+      const { events, runId } = await exhaustPrReviewRun(prReviewSnapshot);
+      const [delivery] = await db
+        .select()
+        .from(githubCommitStatusDeliveries)
+        .where(eq(githubCommitStatusDeliveries.context, "review/ally-complete"));
 
       expect(events.at(-2)?.message).toContain("Bounded retry exhausted");
       const statusEvent = events.at(-1);
-      // Creds are absent in tests, so the post fails — the point is that the
-      // failure is recorded rather than swallowed, since a required check left
-      // pending is exactly the invisible state this feature exists to remove.
-      expect(statusEvent?.message).toContain("Could not post PR-review gate status review/ally-complete");
+      expect(statusEvent?.message).toContain("Queued PR-review gate status failure delivery for review/ally-complete");
       expect(statusEvent?.payload).toMatchObject({
+        deliveryId: delivery?.id,
+        deliveryStatus: "queued",
         statusContext: "review/ally-complete",
         repoFullName: "Blockcast/hang",
         prNumber: 7,
         headSha: HEAD_SHA,
-        posted: false,
+      });
+      expect(delivery).toMatchObject({
+        sourceRunId: runId,
+        repoFullName: "Blockcast/hang",
+        sha: HEAD_SHA,
+        status: "queued",
       });
     });
 
     it("writes no gate-status event when no context is configured (ships inert)", async () => {
       delete process.env[GATE_CONTEXT_ENV];
-      const events = await exhaustPrReviewRun(prReviewSnapshot);
+      const { events } = await exhaustPrReviewRun(prReviewSnapshot);
 
       expect(events.at(-1)?.message).toContain("Bounded retry exhausted");
       expect(events.some((e) => e.message.includes("gate status"))).toBe(false);
@@ -1684,7 +1692,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
     it("writes no gate-status event for a non-PR-review run even when configured", async () => {
       process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
-      const events = await exhaustPrReviewRun({ issueId: randomUUID(), wakeReason: "issue_assigned" });
+      const { events } = await exhaustPrReviewRun({ issueId: randomUUID(), wakeReason: "issue_assigned" });
 
       expect(events.at(-1)?.message).toContain("Bounded retry exhausted");
       expect(events.some((e) => e.message.includes("gate status"))).toBe(false);
@@ -1692,14 +1700,15 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
     it("writes no gate-status event when the wake carried no head SHA", async () => {
       process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
-      const events = await exhaustPrReviewRun({ ...prReviewSnapshot, githubHeadSha: undefined });
+      const { events } = await exhaustPrReviewRun({ ...prReviewSnapshot, githubHeadSha: undefined });
 
       expect(events.at(-1)?.message).toContain("Bounded retry exhausted");
       expect(events.some((e) => e.message.includes("gate status"))).toBe(false);
     });
   });
 
-  it("does not queue max-turn continuations after the configured cap", async () => {    const { runId, now } = await seedMaxTurnFixture({ scheduledRetryAttempt: 2 });
+  it("does not queue max-turn continuations after the configured cap", async () => {
+    const { runId, now } = await seedMaxTurnFixture({ scheduledRetryAttempt: 2 });
 
     const exhausted = await heartbeat.scheduleBoundedRetry(runId, {
       now,

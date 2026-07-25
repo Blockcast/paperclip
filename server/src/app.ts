@@ -86,6 +86,7 @@ import { buildHostServices, flushPluginLogBuffer } from "./services/plugin-host-
 import { createPluginEventBus } from "./services/plugin-event-bus.js";
 import { setPluginEventBus, setPluginEventOutboxDb } from "./services/activity-log.js";
 import { startPluginEventOutbox } from "./services/plugin-event-outbox.js";
+import { startGitHubCommitStatusDeliveryOutbox } from "./services/github-status-delivery-outbox.js";
 import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
@@ -994,12 +995,14 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // in server/src/index.ts so plugin lifecycle only runs on the tier that
   // can host workers.
   let stopPluginEventOutbox: (() => void) | null = null;
+  let stopGitHubStatusDeliveryOutbox: (() => void) | null = null;
   if (appConfig.paperclipNodeRole === "api") {
     logger.info(
       { role: appConfig.paperclipNodeRole },
       "skipping plugin loadAll on startup (API tier — workers tier owns plugin lifecycle)",
     );
   } else {
+    stopGitHubStatusDeliveryOutbox = startGitHubCommitStatusDeliveryOutbox(db);
     void ensureBundledKubernetesPlugin()
       .then(() => retireLegacyCcrotatePlugin())
       .then(() => retireIncompatiblePluginUpdater())
@@ -1025,6 +1028,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     if (appServicesShutdown) return;
     appServicesShutdown = true;
     stopPluginEventOutbox?.();
+    stopGitHubStatusDeliveryOutbox?.();
     disableFeedbackExportFlushes();
     devWatcher?.close();
     viteHtmlRenderer?.dispose();
