@@ -62,4 +62,57 @@ describeEmbeddedPostgres("heartbeat-run terminal index migration", () => {
 
     expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
   }, 60_000);
+
+  it("rejects an invalid precreated index with repair instructions", async () => {
+    const database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-terminal-invalid-");
+    cleanups.push(database.cleanup);
+    const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
+    cleanups.push(async () => sql.end());
+
+    await sql`
+      DELETE FROM "drizzle"."__drizzle_migrations"
+      WHERE "hash" = ${await migrationHash()}
+    `;
+    await sql.unsafe(`
+      UPDATE pg_index
+      SET indisvalid = FALSE
+      WHERE indexrelid = '${INDEX_NAME}'::regclass
+    `);
+
+    await expect(applyPendingMigrations(database.connectionString)).rejects.toMatchObject({
+      message: "migration 0205 found an invalid or incorrectly defined prerequisite index",
+      hint: expect.stringContaining(`DROP INDEX CONCURRENTLY IF EXISTS ${INDEX_NAME}`),
+    });
+    expect(await inspectMigrations(database.connectionString)).toMatchObject({
+      status: "needsMigrations",
+      pendingMigrations: [MIGRATION_FILE],
+    });
+  }, 60_000);
+
+  it("rejects an incorrectly defined same-name index", async () => {
+    const database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-terminal-wrong-");
+    cleanups.push(database.cleanup);
+    const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
+    cleanups.push(async () => sql.end());
+
+    await sql`
+      DELETE FROM "drizzle"."__drizzle_migrations"
+      WHERE "hash" = ${await migrationHash()}
+    `;
+    await sql.unsafe(`
+      DROP INDEX ${INDEX_NAME};
+      CREATE INDEX ${INDEX_NAME}
+      ON heartbeat_runs USING btree (company_id, id DESC)
+      WHERE finished_at IS NOT NULL
+    `);
+
+    await expect(applyPendingMigrations(database.connectionString)).rejects.toMatchObject({
+      message: "migration 0205 found an invalid or incorrectly defined prerequisite index",
+      hint: expect.stringContaining(`CREATE INDEX CONCURRENTLY ${INDEX_NAME}`),
+    });
+    expect(await inspectMigrations(database.connectionString)).toMatchObject({
+      status: "needsMigrations",
+      pendingMigrations: [MIGRATION_FILE],
+    });
+  }, 60_000);
 });
