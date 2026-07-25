@@ -19423,9 +19423,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (outcome === "failed") {
           const contextSnapshotObj = parseObject(livenessRun.contextSnapshot);
           recordHeartbeatRunFailed({
+            agentId: agent.id,
+            issueId,
             adapter: agent.adapterType,
             errorCode: livenessRun.errorCode,
             invocationSource: readNonEmptyString(contextSnapshotObj.wakeReason) ?? readNonEmptyString(contextSnapshotObj.retryReason),
+            isolationMode: k8sRunIsolation?.isolationMode ?? null,
           });
         }
         await recordZeroTokenCompletedRunStreak(agent);

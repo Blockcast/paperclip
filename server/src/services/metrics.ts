@@ -273,7 +273,15 @@ export function normalizeProcessLossClassification(classification: string | null
 let registry: Registry | null = null;
 let concurrentRunBlocked: Counter<"agent_id" | "reason" | "isolation_mode"> | null = null;
 let isolatedRunStarted: Counter<"agent_id" | "isolation_mode"> | null = null;
-let heartbeatRunFailed: Counter<"adapter" | "error_code" | "invocation_source"> | null = null;
+type HeartbeatRunFailedLabel =
+  | "agent_id"
+  | "issue_id"
+  | "adapter"
+  | "error_code"
+  | "invocation_source"
+  | "isolation_mode";
+
+let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
 let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = null;
 let externalRuntimeReservationEvents: Counter<"event"> | null = null;
@@ -288,7 +296,7 @@ function ensureRegistry(): {
   registry: Registry;
   counter: Counter<"agent_id" | "reason" | "isolation_mode">;
   isolatedStartedCounter: Counter<"agent_id" | "isolation_mode">;
-  failedCounter: Counter<"adapter" | "error_code" | "invocation_source">;
+  failedCounter: Counter<HeartbeatRunFailedLabel>;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
   zeroTokenCompletedRunStreakGauge: Gauge<"agent_id" | "adapter">;
   externalRuntimeReservationEventsCounter: Counter<"event">;
@@ -338,10 +346,12 @@ function ensureRegistry(): {
     heartbeatRunFailed = new Counter({
       name: HEARTBEAT_RUN_FAILED_METRIC,
       help:
-        "Count of heartbeat runs that reached terminal status 'failed', labeled by adapter type, "
-        + "error_code, and invocation_source (wake reason). Used to compute webhook-driven "
-        + "PR-review failure rate (BLO-7457 / BLO-9147). Cardinality bounded by allow-lists.",
-      labelNames: ["adapter", "error_code", "invocation_source"],
+        "Count of heartbeat runs that reached terminal status 'failed', labeled by agent, source issue, "
+        + "adapter, error_code, invocation_source (wake reason), and bounded isolation_mode. Used to "
+        + "compute webhook-driven PR-review failure rate and detect repeated execution-pod failures "
+        + "for one issue (BLO-7457 / BLO-9147 / BLO-17953). Agent and issue identifiers are retained "
+        + "only for k8s_pod_schedule_failed; other error codes collapse them to bounded fallbacks.",
+      labelNames: ["agent_id", "issue_id", "adapter", "error_code", "invocation_source", "isolation_mode"],
       registers: [registry],
     });
     ccrotateCapacityDeferred = new Counter({
@@ -499,6 +509,10 @@ export function recordIsolatedRunStarted(
 }
 
 export interface RecordHeartbeatRunFailedInput {
+  /** Agent that owned the finalized run. */
+  agentId: string | null | undefined;
+  /** Source issue for issue-scoped execution, or null for non-issue work. */
+  issueId: string | null | undefined;
   /** Agent adapter type (e.g. "claude_k8s", "claude_local"). */
   adapter: string | null | undefined;
   /** Finalized error code on the heartbeat_runs row. */
@@ -508,6 +522,8 @@ export interface RecordHeartbeatRunFailedInput {
    * Maps to `invocation_source` label.
    */
   invocationSource: string | null | undefined;
+  /** K8s workspace isolation mode; non-K8s and malformed values become unknown. */
+  isolationMode: string | null | undefined;
 }
 
 /**
@@ -517,11 +533,22 @@ export interface RecordHeartbeatRunFailedInput {
  */
 export function recordHeartbeatRunFailed(
   input: RecordHeartbeatRunFailedInput,
-): { adapter: string; error_code: string; invocation_source: string } {
+): Record<HeartbeatRunFailedLabel, string> {
+  // Per-issue labels are intentionally limited to the retry-loop failure this
+  // monitor needs. Keeping them on every terminal failure would retain one
+  // Prometheus counter series per historical issue for the process lifetime.
+  const isPodScheduleFailure = input.errorCode === "k8s_pod_schedule_failed";
   const labels = {
+    agent_id: isPodScheduleFailure && typeof input.agentId === "string" && input.agentId.length > 0
+      ? input.agentId
+      : UNKNOWN_AGENT_ID,
+    issue_id: isPodScheduleFailure && typeof input.issueId === "string" && input.issueId.length > 0
+      ? input.issueId
+      : "none",
     adapter: typeof input.adapter === "string" && input.adapter.length > 0 ? input.adapter : "unknown",
     error_code: typeof input.errorCode === "string" && input.errorCode.length > 0 ? input.errorCode : "unknown",
     invocation_source: normalizeInvocationSource(input.invocationSource),
+    isolation_mode: normalizeIsolationMode(input.isolationMode),
   };
   ensureRegistry().failedCounter.inc(labels);
   return labels;
