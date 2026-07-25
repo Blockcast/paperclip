@@ -634,14 +634,14 @@ describe("github-webhook pure helpers", () => {
     });
   });
 
-  it("ignores terminal dependabot alert actions (fixed / dismissed / auto_dismissed)", () => {
+  it("resolves terminal dependabot alert actions for receipt recording", () => {
     for (const action of ["fixed", "dismissed", "auto_dismissed"]) {
       expect(
         __test_resolveDependabotAlertContext({
           action,
           alert: { number: 7, security_vulnerability: { severity: "critical" } },
         }),
-      ).toBeNull();
+      ).toMatchObject({ action, alertNumber: 7, severity: "critical" });
     }
   });
 
@@ -2954,6 +2954,74 @@ describeEmbeddedPostgres("github-webhook route", () => {
     for (const run of runs) {
       expect((run.contextSnapshot as Record<string, unknown>).issueId).toBe(alertIssues[0]!.id);
     }
+  });
+
+  it("records a terminal webhook receipt on the alert issue and closes it", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+    const terminal = await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed");
+
+    expect(terminal.status).toBe(200);
+    expect(terminal.body).toMatchObject({ dependabotWakeFired: false });
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(issue?.status).toBe("done");
+    const receipts = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issue!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+        ),
+      );
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]!.body).toContain("Action: `fixed`");
+    expect(receipts[0]!.body).toContain("GitHub delivery: `delivery-fixed`");
+    expect(receipts[0]!.body).toContain("no Dependabot REST or GraphQL query was used");
+  });
+
+  it("creates a durable closed receipt issue for an orphan terminal delivery", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("high", "dismissed", 1591), "delivery-dismissed");
+    await postDependabot(app, dependabotPayload("high", "dismissed", 1591), "delivery-dismissed");
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#1591"));
+
+    expect(issue?.status).toBe("done");
+    expect(issue?.title).toContain("terminal receipt");
+    expect(issue?.description).toContain("delivery-dismissed");
+    const receiptIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#1591"));
+    expect(receiptIssues).toHaveLength(1);
+    const receipts = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`);
+    expect(receipts).toHaveLength(1);
+  });
+
+  it("records terminal receipts below the remediation severity floor", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("medium", "fixed", 1592), "delivery-medium-fixed");
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#1592"));
+
+    expect(issue?.status).toBe("done");
   });
 
   it("records a durable diagnostic instead of silently dropping a malformed alert payload", async () => {
