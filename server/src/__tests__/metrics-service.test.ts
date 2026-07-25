@@ -257,6 +257,38 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
     );
   });
 
+  it.each([
+    ["workspace", "workspace"],
+    ["shared", "shared"],
+    ["not-a-mode", UNKNOWN_ISOLATION_MODE],
+  ])(
+    "collapses source identifiers for %s pod-schedule failures",
+    async (isolationMode, expectedIsolationMode) => {
+      const labels = recordHeartbeatRunFailed({
+        agentId: "agent-a",
+        issueId: "issue-a",
+        adapter: "claude_k8s",
+        errorCode: "k8s_pod_schedule_failed",
+        invocationSource: "github_pr_review_submitted",
+        isolationMode,
+      });
+
+      expect(labels).toEqual({
+        agent_id: UNKNOWN_AGENT_ID,
+        issue_id: "none",
+        adapter: "claude_k8s",
+        error_code: "k8s_pod_schedule_failed",
+        invocation_source: "github_pr_review_submitted",
+        isolation_mode: expectedIsolationMode,
+      });
+
+      const { body } = await renderMetrics();
+      expect(body).toContain(
+        `${HEARTBEAT_RUN_FAILED_METRIC}{agent_id="${UNKNOWN_AGENT_ID}",issue_id="none",adapter="claude_k8s",error_code="k8s_pod_schedule_failed",invocation_source="github_pr_review_submitted",isolation_mode="${expectedIsolationMode}"} 1`,
+      );
+    },
+  );
+
   it("collapses unknown invocation source to the bounded fallback (cardinality guardrail)", async () => {
     const labels = recordHeartbeatRunFailed({
       agentId: "agent-a",

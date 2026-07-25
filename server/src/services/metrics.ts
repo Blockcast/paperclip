@@ -348,9 +348,10 @@ function ensureRegistry(): {
       help:
         "Count of heartbeat runs that reached terminal status 'failed', labeled by agent, source issue, "
         + "adapter, error_code, invocation_source (wake reason), and bounded isolation_mode. Used to "
-        + "compute webhook-driven PR-review failure rate and detect repeated execution-pod failures "
-        + "for one issue (BLO-7457 / BLO-9147 / BLO-17953). Agent and issue identifiers are retained "
-        + "only for k8s_pod_schedule_failed; other error codes collapse them to bounded fallbacks.",
+        + "compute webhook-driven PR-review failure rate and detect repeated run-isolated execution-pod "
+        + "failures for one issue (BLO-7457 / BLO-9147 / BLO-17953). Agent and issue identifiers are "
+        + "retained only for run-isolated k8s_pod_schedule_failed; other failures collapse them to "
+        + "bounded fallbacks.",
       labelNames: ["agent_id", "issue_id", "adapter", "error_code", "invocation_source", "isolation_mode"],
       registers: [registry],
     });
@@ -537,18 +538,19 @@ export function recordHeartbeatRunFailed(
   // Per-issue labels are intentionally limited to the retry-loop failure this
   // monitor needs. Keeping them on every terminal failure would retain one
   // Prometheus counter series per historical issue for the process lifetime.
-  const isPodScheduleFailure = input.errorCode === "k8s_pod_schedule_failed";
+  const isolationMode = normalizeIsolationMode(input.isolationMode);
+  const retainSourceIds = input.errorCode === "k8s_pod_schedule_failed" && isolationMode === "run";
   const labels = {
-    agent_id: isPodScheduleFailure && typeof input.agentId === "string" && input.agentId.length > 0
+    agent_id: retainSourceIds && typeof input.agentId === "string" && input.agentId.length > 0
       ? input.agentId
       : UNKNOWN_AGENT_ID,
-    issue_id: isPodScheduleFailure && typeof input.issueId === "string" && input.issueId.length > 0
+    issue_id: retainSourceIds && typeof input.issueId === "string" && input.issueId.length > 0
       ? input.issueId
       : "none",
     adapter: typeof input.adapter === "string" && input.adapter.length > 0 ? input.adapter : "unknown",
     error_code: typeof input.errorCode === "string" && input.errorCode.length > 0 ? input.errorCode : "unknown",
     invocation_source: normalizeInvocationSource(input.invocationSource),
-    isolation_mode: normalizeIsolationMode(input.isolationMode),
+    isolation_mode: isolationMode,
   };
   ensureRegistry().failedCounter.inc(labels);
   return labels;
