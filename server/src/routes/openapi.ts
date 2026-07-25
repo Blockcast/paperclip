@@ -3688,6 +3688,21 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/companies/{companyId}/pr-review-queue",
+  tags: ["runs"],
+  summary: "Inspect PR-review queue depth, age, targets, and dispositions",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      lookbackHours: z.coerce.number().int().min(1).max(168).optional(),
+      limit: z.coerce.number().int().min(1).max(1000).optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/companies/{companyId}/live-runs",
   tags: ["runs"],
   summary: "List live runs for a company",

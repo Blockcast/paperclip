@@ -4,7 +4,7 @@ import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import { REDACTED_EVENT_VALUE, redactEventPayload } from "../redaction.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
-import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, not, or, sql } from "drizzle-orm";
 import {
   agentSkillSyncSchema,
   agentMineInboxQuerySchema,
@@ -64,6 +64,7 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
+import { derivePaperclipPrReview } from "../services/heartbeat.js";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type {
   AdapterEnvironmentCheck,
@@ -3852,6 +3853,114 @@ export function agentRoutes(
     const summary = req.query.summary === "true" || req.query.summary === "1";
     const runs = await heartbeat.list(companyId, agentId, limit, { summary });
     res.json(runs);
+  });
+
+  router.get("/companies/:companyId/pr-review-queue", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertBoard(req);
+    assertCompanyAccess(req, companyId);
+
+    const lookbackHoursRaw = Number(req.query.lookbackHours ?? 24);
+    const lookbackHours = Number.isFinite(lookbackHoursRaw)
+      ? Math.max(1, Math.min(168, Math.trunc(lookbackHoursRaw)))
+      : 24;
+    const limitRaw = Number(req.query.limit ?? 200);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(1000, Math.trunc(limitRaw))) : 200;
+    const now = new Date();
+    const terminalCutoff = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
+
+    const rows = await db
+      .select({
+        id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        agentName: agentsTable.name,
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        createdAt: heartbeatRuns.createdAt,
+        startedAt: heartbeatRuns.startedAt,
+        finishedAt: heartbeatRuns.finishedAt,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          or(
+            sql`${heartbeatRuns.contextWakeReason} like 'github_pr_%'`,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'reviewKind' = 'pr_review'`,
+          ),
+          or(
+            inArray(heartbeatRuns.status, ["queued", "running"]),
+            gte(heartbeatRuns.finishedAt, terminalCutoff),
+          ),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(limit);
+
+    const byAgent = new Map<string, {
+      agentId: string;
+      agentName: string;
+      queuedCount: number;
+      oldestQueuedAt: Date | null;
+      runs: Array<Record<string, unknown>>;
+    }>();
+
+    for (const row of rows) {
+      const prReview = derivePaperclipPrReview(row.contextSnapshot);
+      if (!prReview) continue;
+      const group = byAgent.get(row.agentId) ?? {
+        agentId: row.agentId,
+        agentName: row.agentName,
+        queuedCount: 0,
+        oldestQueuedAt: null,
+        runs: [],
+      };
+      if (row.status === "queued") {
+        group.queuedCount += 1;
+        if (!group.oldestQueuedAt || row.createdAt < group.oldestQueuedAt) {
+          group.oldestQueuedAt = row.createdAt;
+        }
+      }
+      const ageEnd = row.finishedAt ?? now;
+      const disposition = row.status === "queued"
+        ? "queued"
+        : row.status === "running"
+          ? "dispatched"
+          : row.status === "succeeded"
+            ? "succeeded"
+            : row.errorCode ?? row.status;
+      group.runs.push({
+        id: row.id,
+        status: row.status,
+        disposition,
+        errorCode: row.errorCode,
+        repoFullName: prReview.repoFullName,
+        prNumber: prReview.prNumber,
+        headSha: prReview.headSha,
+        ageMs: Math.max(0, ageEnd.getTime() - row.createdAt.getTime()),
+        createdAt: row.createdAt,
+        startedAt: row.startedAt,
+        finishedAt: row.finishedAt,
+      });
+      byAgent.set(row.agentId, group);
+    }
+
+    res.json({
+      generatedAt: now,
+      lookbackHours,
+      agents: [...byAgent.values()].map((group) => ({
+        agentId: group.agentId,
+        agentName: group.agentName,
+        queuedCount: group.queuedCount,
+        oldestQueuedAt: group.oldestQueuedAt,
+        oldestQueuedAgeMs: group.oldestQueuedAt
+          ? Math.max(0, now.getTime() - group.oldestQueuedAt.getTime())
+          : null,
+        runs: group.runs,
+      })),
+    });
   });
 
   router.get("/companies/:companyId/live-runs", async (req, res) => {
