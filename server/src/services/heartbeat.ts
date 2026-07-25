@@ -167,7 +167,8 @@ import {
   isThrottleCandidateIssueRewake,
 } from "./issue-rewake-throttle.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
-import { githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
+import { githubHasReviewerEvidenceForPr, githubPostCommitStatus } from "./github-app-auth.js";
+import { loadConfig } from "../config.js";
 import {
   ensureReferencedSharedDocsMaterialized,
   normalizeInstructionsEntryFile,
@@ -6428,6 +6429,39 @@ export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown>
   };
 }
 
+/**
+ * Resolve where to post the "reviewer never finished" commit status for a run
+ * whose bounded retry chain just exhausted, or null when no status should be
+ * written. (BLO-17456)
+ *
+ * A required status context that is never posted renders as "Expected —
+ * waiting for status to be reported" indefinitely: branch protection blocks the
+ * PR and nothing signals the result is never coming. Failing the context turns
+ * that silent wedge into a visible red check. GitHub keeps the latest status
+ * per (sha, context), so a later real result from the context owner overwrites
+ * it — this is not terminal for the PR.
+ *
+ * Returns null unless ALL of the following hold, because a status posted to the
+ * wrong place is worse than one not posted at all:
+ *  - an operator opted in by configuring a context name (this server does not
+ *    own the branch-protection rule, so it must not invent one);
+ *  - the run is a PR-review run (`derivePaperclipPrReview`);
+ *  - the wake carried a repo AND an exact head SHA — statuses are per-commit,
+ *    so a guessed SHA would fail an unrelated commit.
+ */
+export function resolvePrReviewGateStatusTarget(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  gateContext: string,
+): { repoFullName: string; sha: string; context: string; prNumber: number; prUrl: string | null } | null {
+  const context = gateContext.trim();
+  if (!context) return null;
+  const prReview = derivePaperclipPrReview(contextSnapshot);
+  if (!prReview) return null;
+  const { repoFullName, headSha, prNumber, prUrl } = prReview;
+  if (!repoFullName || !headSha) return null;
+  return { repoFullName, sha: headSha, context, prNumber, prUrl: prUrl ?? null };
+}
+
 const PR_REVIEW_OUTPUT_EVIDENCE_MAX_CHARS = 240_000;
 
 function appendReviewOutputEvidenceText(parts: string[], value: unknown, budget: { remaining: number }) {
@@ -7828,6 +7862,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }),
     });
     return interaction.id;
+  }
+
+  /**
+   * Fail the configured PR-review gate status for a run whose bounded retry
+   * chain just exhausted, so a never-arriving required check stops reading as
+   * "still waiting". No-op unless an operator configured a context and the run
+   * carries a repo + exact head SHA (see resolvePrReviewGateStatusTarget).
+   * Best-effort by construction: the post result is recorded as a run event and
+   * never propagated, because status delivery must not alter run lifecycle.
+   * (BLO-17456)
+   */
+  async function postExhaustedPrReviewGateStatus(
+    run: typeof heartbeatRuns.$inferSelect,
+    contextSnapshot: Record<string, unknown>,
+  ) {
+    const target = resolvePrReviewGateStatusTarget(
+      contextSnapshot,
+      loadConfig().prReviewGateStatusContext,
+    );
+    if (!target) return;
+
+    const posted = await githubPostCommitStatus({
+      repoFullName: target.repoFullName,
+      sha: target.sha,
+      context: target.context,
+      state: "failure",
+      description: "Paperclip reviewer run exhausted its automatic retries; no review was posted.",
+      targetUrl: target.prUrl,
+    });
+    await appendRunEvent(run, await nextRunEventSeq(run.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: posted ? "info" : "warn",
+      message: posted
+        ? `Set PR-review gate status ${target.context} to failure on ${target.repoFullName}@${target.sha.slice(0, 7)} after retry exhaustion`
+        : `Could not post PR-review gate status ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)}; the required check stays pending`,
+      payload: {
+        statusContext: target.context,
+        repoFullName: target.repoFullName,
+        prNumber: target.prNumber,
+        headSha: target.sha,
+        posted,
+      },
+    });
   }
 
   async function escalatePlanApprovalResumeFailureNeedsAttention(input: {
@@ -12257,6 +12335,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         });
       }
+      // BLO-17456: a PR-review chain that exhausts here leaves its required
+      // status context unposted, so the PR sits on "Expected — waiting for
+      // status" with nothing signalling that no result is coming. Fail the
+      // context so the wedge is visible. Opt-in and best-effort: inert unless an
+      // operator configured a context, and any GitHub fault is logged and
+      // swallowed so status delivery can never alter exhaustion handling.
+      await postExhaustedPrReviewGateStatus(run, contextSnapshot).catch((error) => {
+        logger.warn(
+          { err: error, runId: run.id },
+          "failed to post exhausted PR-review gate status",
+        );
+      });
       return {
         outcome: "retry_exhausted" as const,
         attempt: nextAttempt,

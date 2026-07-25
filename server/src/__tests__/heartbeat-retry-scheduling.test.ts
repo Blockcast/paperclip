@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents,
   agentWakeupRequests,
@@ -173,6 +173,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     resultJson?: Record<string, unknown> | null;
     adapterType?: string;
     agentName?: string;
+    contextSnapshot?: Record<string, unknown>;
   }) {
     const adapterType = input.adapterType ?? "codex_local";
     const agentName = input.agentName ?? (adapterType === "claude_local" ? "ClaudeCoder" : "CodexCoder");
@@ -221,7 +222,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
             }
           : {}),
       },
-      contextSnapshot: {
+      contextSnapshot: input.contextSnapshot ?? {
         issueId: randomUUID(),
         wakeReason: "issue_assigned",
       },
@@ -1597,8 +1598,108 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     },
   );
 
-  it("does not queue max-turn continuations after the configured cap", async () => {
-    const { runId, now } = await seedMaxTurnFixture({ scheduledRetryAttempt: 2 });
+  // BLO-17456: when a PR-review chain exhausts, the reviewer never posts its
+  // required status, so the PR sits on "Expected — waiting for status" forever.
+  // These drive the real exhaustion path (no mocks): loadConfig() reads
+  // process.env at call time, so setting the context here exercises the wiring
+  // end to end. GitHub App creds are absent in tests, so the write short-circuits
+  // to false — which is exactly the case that must stay observable rather than
+  // silent.
+  describe("exhausted PR-review gate status", () => {
+    const GATE_CONTEXT_ENV = "PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT";
+    const HEAD_SHA = "45eb633e348a826f43dc68b0c25fe83a96300cea";
+    let priorGateContext: string | undefined;
+
+    beforeEach(() => {
+      priorGateContext = process.env[GATE_CONTEXT_ENV];
+    });
+
+    afterEach(() => {
+      if (priorGateContext === undefined) delete process.env[GATE_CONTEXT_ENV];
+      else process.env[GATE_CONTEXT_ENV] = priorGateContext;
+    });
+
+    async function exhaustPrReviewRun(contextSnapshot: Record<string, unknown>) {
+      const runId = randomUUID();
+      const now = new Date();
+      await seedRetryFixture({
+        runId,
+        companyId: randomUUID(),
+        agentId: randomUUID(),
+        now,
+        errorCode: "pr_review_output_missing",
+        scheduledRetryAttempt: 2,
+        contextSnapshot,
+      });
+      const outcome = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        retryReason: "transient_failure",
+        wakeReason: "github_pr_synchronized",
+        maxAttempts: 2,
+        delayMs: 1_000,
+      });
+      expect(outcome).toMatchObject({ outcome: "retry_exhausted" });
+      const events = await db
+        .select({ message: heartbeatRunEvents.message, payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, runId))
+        .orderBy(sql`${heartbeatRunEvents.id} asc`);
+      return events;
+    }
+
+    const prReviewSnapshot = {
+      wakeReason: "github_pr_synchronized",
+      githubPrNumber: 7,
+      githubRepoFullName: "Blockcast/hang",
+      githubHeadSha: HEAD_SHA,
+      githubPrUrl: "https://github.com/Blockcast/hang/pull/7",
+    };
+
+    it("records the gate-status attempt on exhaustion when a context is configured", async () => {
+      process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
+      const events = await exhaustPrReviewRun(prReviewSnapshot);
+
+      expect(events.at(-2)?.message).toContain("Bounded retry exhausted");
+      const statusEvent = events.at(-1);
+      // Creds are absent in tests, so the post fails — the point is that the
+      // failure is recorded rather than swallowed, since a required check left
+      // pending is exactly the invisible state this feature exists to remove.
+      expect(statusEvent?.message).toContain("Could not post PR-review gate status review/ally-complete");
+      expect(statusEvent?.payload).toMatchObject({
+        statusContext: "review/ally-complete",
+        repoFullName: "Blockcast/hang",
+        prNumber: 7,
+        headSha: HEAD_SHA,
+        posted: false,
+      });
+    });
+
+    it("writes no gate-status event when no context is configured (ships inert)", async () => {
+      delete process.env[GATE_CONTEXT_ENV];
+      const events = await exhaustPrReviewRun(prReviewSnapshot);
+
+      expect(events.at(-1)?.message).toContain("Bounded retry exhausted");
+      expect(events.some((e) => e.message.includes("gate status"))).toBe(false);
+    });
+
+    it("writes no gate-status event for a non-PR-review run even when configured", async () => {
+      process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
+      const events = await exhaustPrReviewRun({ issueId: randomUUID(), wakeReason: "issue_assigned" });
+
+      expect(events.at(-1)?.message).toContain("Bounded retry exhausted");
+      expect(events.some((e) => e.message.includes("gate status"))).toBe(false);
+    });
+
+    it("writes no gate-status event when the wake carried no head SHA", async () => {
+      process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
+      const events = await exhaustPrReviewRun({ ...prReviewSnapshot, githubHeadSha: undefined });
+
+      expect(events.at(-1)?.message).toContain("Bounded retry exhausted");
+      expect(events.some((e) => e.message.includes("gate status"))).toBe(false);
+    });
+  });
+
+  it("does not queue max-turn continuations after the configured cap", async () => {    const { runId, now } = await seedMaxTurnFixture({ scheduledRetryAttempt: 2 });
 
     const exhausted = await heartbeat.scheduleBoundedRetry(runId, {
       now,

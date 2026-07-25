@@ -18,6 +18,7 @@ import {
   mintAppJwt,
   getInstallationToken,
   githubHasReviewerEvidenceForPr,
+  githubPostCommitStatus,
   normalizeGithubLogin,
   _resetInstallationTokenCache,
 } from "../services/github-app-auth.js";
@@ -359,5 +360,99 @@ describe("githubHasReviewerEvidenceForPr", () => {
     await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
       error: "reviews_http_500",
     });
+  });
+});
+
+describe("githubPostCommitStatus (BLO-17456)", () => {
+  const repoFullName = "Blockcast/hang";
+  const sha = "45eb633e348a826f43dc68b0c25fe83a96300cea";
+  const context = "review/ally-complete";
+
+  function stubStatusPost(ok = true, status = 201) {
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      if (u.includes("/statuses/")) return jsonResponse({ id: 1 }, ok, status);
+      throw new Error(`unexpected url ${u}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  it("does not write when creds are absent, so an unmounted app never posts", async () => {
+    const fetchMock = stubStatusPost();
+    await expect(
+      githubPostCommitStatus({ repoFullName, sha, context, state: "failure" }),
+    ).resolves.toBe(false);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/statuses/"))).toBe(false);
+  });
+
+  it("POSTs state + context to the exact head SHA", async () => {
+    setCreds();
+    const fetchMock = stubStatusPost();
+    await expect(
+      githubPostCommitStatus({
+        repoFullName,
+        sha,
+        context,
+        state: "failure",
+        description: "reviewer exhausted retries",
+        targetUrl: "https://github.com/Blockcast/hang/pull/7",
+      }),
+    ).resolves.toBe(true);
+
+    const post = fetchMock.mock.calls.find(([url]) => String(url).includes("/statuses/"));
+    expect(String(post?.[0])).toContain(`/repos/${repoFullName}/statuses/${sha}`);
+    const init = post?.[1] as { method?: string; body?: string };
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body ?? "{}")).toEqual({
+      state: "failure",
+      context,
+      description: "reviewer exhausted retries",
+      target_url: "https://github.com/Blockcast/hang/pull/7",
+    });
+  });
+
+  it("omits description/target_url when not supplied", async () => {
+    setCreds();
+    const fetchMock = stubStatusPost();
+    await githubPostCommitStatus({ repoFullName, sha, context, state: "failure", targetUrl: null });
+    const post = fetchMock.mock.calls.find(([url]) => String(url).includes("/statuses/"));
+    expect(JSON.parse((post?.[1] as { body?: string }).body ?? "{}")).toEqual({
+      state: "failure",
+      context,
+    });
+  });
+
+  it("truncates the description to GitHub's 140-char limit", async () => {
+    setCreds();
+    const fetchMock = stubStatusPost();
+    await githubPostCommitStatus({ repoFullName, sha, context, state: "failure", description: "x".repeat(200) });
+    const post = fetchMock.mock.calls.find(([url]) => String(url).includes("/statuses/"));
+    expect(JSON.parse((post?.[1] as { body?: string }).body ?? "{}").description).toHaveLength(140);
+  });
+
+  it("returns false on a non-OK write (e.g. the App lacks statuses:write)", async () => {
+    setCreds();
+    stubStatusPost(false, 403);
+    await expect(
+      githubPostCommitStatus({ repoFullName, sha, context, state: "failure" }),
+    ).resolves.toBe(false);
+  });
+
+  it("returns false rather than throwing when the write rejects", async () => {
+    setCreds();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        if (String(url).includes("/access_tokens")) {
+          return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+        }
+        throw new Error("network down");
+      }),
+    );
+    await expect(
+      githubPostCommitStatus({ repoFullName, sha, context, state: "failure" }),
+    ).resolves.toBe(false);
   });
 });

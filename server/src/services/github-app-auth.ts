@@ -364,6 +364,51 @@ export async function githubListIssueCommentBodies(input: {
 }
 
 /**
+ * Post a commit status as the GitHub App. Returns false when creds are absent,
+ * the App lacks `statuses: write`, or the write fails — the caller logs and
+ * continues; a status post must never alter run-lifecycle handling.
+ *
+ * GitHub keeps the LATEST status per (sha, context), so a later real result
+ * from the context owner overwrites anything posted here — a failure written on
+ * exhaustion is never terminal for the PR. (BLO-17456)
+ */
+export async function githubPostCommitStatus(input: {
+  repoFullName: string;
+  sha: string;
+  context: string;
+  state: "error" | "failure" | "pending" | "success";
+  description?: string;
+  targetUrl?: string | null;
+}): Promise<boolean> {
+  const token = await getInstallationToken();
+  if (!token) return false;
+  const headers = {
+    ...GITHUB_API_HEADERS,
+    authorization: `Bearer ${token}`,
+    "content-type": "application/json",
+  };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  try {
+    const url = `${apiBase}/repos/${input.repoFullName}/statuses/${input.sha}`;
+    const res = await ghFetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        state: input.state,
+        context: input.context,
+        // GitHub truncates at 140 chars; trim here so the message we intend is
+        // the message that lands rather than an arbitrary server-side cut.
+        ...(input.description ? { description: input.description.slice(0, 140) } : {}),
+        ...(input.targetUrl ? { target_url: input.targetUrl } : {}),
+      }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Post an issue/PR comment as the GitHub App. Returns false when creds are
  * absent or the write fails — the caller logs and continues; a back-link post
  * failure must never break the webhook wake path. (BLO-13353)
