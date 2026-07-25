@@ -42,9 +42,11 @@ function registerModuleMocks() {
     heartbeatService: () => mockHeartbeatService,
     derivePaperclipPrReview: (context: Record<string, unknown> | null) => {
       if (!context || context.reviewKind !== "pr_review") return null;
+      const prNumber = Number(context.githubPrNumber);
+      if (!Number.isFinite(prNumber)) return null;
       return {
         repoFullName: context.githubRepoFullName ?? null,
-        prNumber: Number(context.githubPrNumber),
+        prNumber,
         headSha: context.githubHeadSha ?? null,
       };
     },
@@ -775,6 +777,19 @@ describe("PR review queue observability route", () => {
         createdAt: new Date("2026-07-25T11:40:00.000Z"),
         startedAt: new Date("2026-07-25T11:45:00.000Z"),
         finishedAt: null,
+        scheduledRetryAt: null,
+      },
+      {
+        id: "scheduled-retry",
+        agentId: routeAgentId,
+        agentName: "Ally",
+        status: "scheduled_retry",
+        errorCode: null,
+        contextSnapshot,
+        createdAt: new Date("2026-07-25T11:10:00.000Z"),
+        startedAt: null,
+        finishedAt: null,
+        scheduledRetryAt: new Date("2026-07-25T12:10:00.000Z"),
       },
       {
         id: "succeeded",
@@ -820,15 +835,16 @@ describe("PR review queue observability route", () => {
     expect(res.body.agents[0]).toMatchObject({
       agentId: routeAgentId,
       agentName: "Ally",
-      queuedCount: 2,
-      oldestQueuedAt: "2026-07-25T11:20:00.000Z",
-      oldestQueuedAgeMs: 2_400_000,
+      queuedCount: 3,
+      oldestQueuedAt: "2026-07-25T11:10:00.000Z",
+      oldestQueuedAgeMs: 3_000_000,
     });
     expect(res.body.agents[0].runs.map((run: { disposition: string; ageMs: number }) => [run.disposition, run.ageMs]))
       .toEqual([
-        ["queued", 2_400_000],
         ["queued", 600_000],
         ["dispatched", 1_200_000],
+        ["queued", 2_400_000],
+        ["scheduled_retry", 3_000_000],
         ["succeeded", 1_200_000],
         ["pr_review_output_missing", 1_800_000],
       ]);
@@ -837,12 +853,70 @@ describe("PR review queue observability route", () => {
       prNumber: 812,
       headSha: "abcdef123456",
     });
+    expect(res.body.agents[0].runs.find((run: { id: string }) => run.id === "scheduled-retry"))
+      .toMatchObject({
+        disposition: "scheduled_retry",
+        scheduledRetryAt: "2026-07-25T12:10:00.000Z",
+      });
     expect(res.body.agents[1]).toMatchObject({
       agentName: "Second Reviewer",
       queuedCount: 0,
       oldestQueuedAgeMs: null,
     });
     expect(res.body.agents[1].runs[0].disposition).toBe("adapter_failed");
+    vi.useRealTimers();
+  });
+
+  it("does not let capped terminal history evict active runs", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-25T12:00:00.000Z"));
+    const contextSnapshot = {
+      reviewKind: "pr_review",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 812,
+      githubHeadSha: "abcdef123456",
+    };
+    const terminal = (id: string, createdAt: string, context = contextSnapshot) => ({
+      id,
+      agentId: routeAgentId,
+      agentName: "Ally",
+      status: "succeeded",
+      errorCode: null,
+      contextSnapshot: context,
+      createdAt: new Date(createdAt),
+      startedAt: new Date(createdAt),
+      finishedAt: new Date("2026-07-25T11:59:00.000Z"),
+      scheduledRetryAt: null,
+    });
+    const { db } = createLiveRunsDbStub([
+      terminal("malformed", "2026-07-25T11:58:00.000Z", { reviewKind: "pr_review" }),
+      terminal("terminal-new", "2026-07-25T11:57:00.000Z"),
+      terminal("terminal-old", "2026-07-25T11:56:00.000Z"),
+      {
+        id: "active-oldest",
+        agentId: routeAgentId,
+        agentName: "Ally",
+        status: "queued",
+        errorCode: null,
+        contextSnapshot,
+        createdAt: new Date("2026-07-25T08:00:00.000Z"),
+        startedAt: null,
+        finishedAt: null,
+        scheduledRetryAt: null,
+      },
+    ]);
+    const app = await createApp(db);
+
+    const res = await request(app).get("/api/companies/company-1/pr-review-queue?limit=1");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.agents[0]).toMatchObject({
+      queuedCount: 1,
+      oldestQueuedAt: "2026-07-25T08:00:00.000Z",
+      oldestQueuedAgeMs: 14_400_000,
+    });
+    expect(res.body.agents[0].runs.map((run: { id: string }) => run.id))
+      .toEqual(["terminal-new", "active-oldest"]);
     vi.useRealTimers();
   });
 

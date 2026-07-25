@@ -3869,35 +3869,57 @@ export function agentRoutes(
     const now = new Date();
     const terminalCutoff = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
 
-    const rows = await db
-      .select({
-        id: heartbeatRuns.id,
-        agentId: heartbeatRuns.agentId,
-        agentName: agentsTable.name,
-        status: heartbeatRuns.status,
-        errorCode: heartbeatRuns.errorCode,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
-        createdAt: heartbeatRuns.createdAt,
-        startedAt: heartbeatRuns.startedAt,
-        finishedAt: heartbeatRuns.finishedAt,
-      })
+    const columns = {
+      id: heartbeatRuns.id,
+      agentId: heartbeatRuns.agentId,
+      agentName: agentsTable.name,
+      status: heartbeatRuns.status,
+      errorCode: heartbeatRuns.errorCode,
+      contextSnapshot: heartbeatRuns.contextSnapshot,
+      createdAt: heartbeatRuns.createdAt,
+      startedAt: heartbeatRuns.startedAt,
+      finishedAt: heartbeatRuns.finishedAt,
+      scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+    };
+    const prReviewPredicate = or(
+      sql`${heartbeatRuns.contextWakeReason} like 'github_pr_%'`,
+      sql`${heartbeatRuns.contextSnapshot} ->> 'reviewKind' = 'pr_review'`,
+    );
+    const baseQuery = () => db
+      .select(columns)
       .from(heartbeatRuns)
-      .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
-      .where(
-        and(
-          eq(heartbeatRuns.companyId, companyId),
-          or(
-            sql`${heartbeatRuns.contextWakeReason} like 'github_pr_%'`,
-            sql`${heartbeatRuns.contextSnapshot} ->> 'reviewKind' = 'pr_review'`,
+      .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id));
+    const [activeRows, terminalCandidates] = await Promise.all([
+      baseQuery()
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            prReviewPredicate,
+            inArray(heartbeatRuns.status, ["queued", "scheduled_retry", "running"]),
           ),
-          or(
-            inArray(heartbeatRuns.status, ["queued", "running"]),
+        )
+        .orderBy(desc(heartbeatRuns.createdAt)),
+      baseQuery()
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            prReviewPredicate,
             gte(heartbeatRuns.finishedAt, terminalCutoff),
           ),
-        ),
-      )
-      .orderBy(desc(heartbeatRuns.createdAt))
-      .limit(limit);
+        )
+        .orderBy(desc(heartbeatRuns.createdAt)),
+    ]);
+
+    const activePrReviewRows = activeRows.filter((row) =>
+      ["queued", "scheduled_retry", "running"].includes(row.status)
+      && derivePaperclipPrReview(row.contextSnapshot) !== null,
+    );
+    const terminalRows = terminalCandidates
+      .filter((row) => row.finishedAt !== null && derivePaperclipPrReview(row.contextSnapshot) !== null)
+      .slice(0, limit);
+    const rows = [...activePrReviewRows, ...terminalRows]
+      .filter((row, index, allRows) => allRows.findIndex((candidate) => candidate.id === row.id) === index)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
 
     const byAgent = new Map<string, {
       agentId: string;
@@ -3917,7 +3939,7 @@ export function agentRoutes(
         oldestQueuedAt: null,
         runs: [],
       };
-      if (row.status === "queued") {
+      if (row.status === "queued" || row.status === "scheduled_retry") {
         group.queuedCount += 1;
         if (!group.oldestQueuedAt || row.createdAt < group.oldestQueuedAt) {
           group.oldestQueuedAt = row.createdAt;
@@ -3926,11 +3948,13 @@ export function agentRoutes(
       const ageEnd = row.finishedAt ?? now;
       const disposition = row.status === "queued"
         ? "queued"
-        : row.status === "running"
-          ? "dispatched"
-          : row.status === "succeeded"
-            ? "succeeded"
-            : row.errorCode ?? row.status;
+        : row.status === "scheduled_retry"
+          ? "scheduled_retry"
+          : row.status === "running"
+            ? "dispatched"
+            : row.status === "succeeded"
+              ? "succeeded"
+              : row.errorCode ?? row.status;
       group.runs.push({
         id: row.id,
         status: row.status,
@@ -3943,6 +3967,7 @@ export function agentRoutes(
         createdAt: row.createdAt,
         startedAt: row.startedAt,
         finishedAt: row.finishedAt,
+        scheduledRetryAt: row.scheduledRetryAt,
       });
       byAgent.set(row.agentId, group);
     }
