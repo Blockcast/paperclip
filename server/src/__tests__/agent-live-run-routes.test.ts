@@ -130,6 +130,30 @@ function createLiveRunsDbStub(rows: Array<Record<string, unknown>>) {
 
   return {
     db: {
+      selectDistinctOn: vi.fn().mockImplementation(() => {
+        const oldestQueuedByAgent = [
+          ...rows
+            .filter((row) => row.status === "queued" || row.status === "scheduled_retry")
+            .sort((a, b) =>
+              (a.createdAt as Date).getTime() - (b.createdAt as Date).getTime()
+              || String(a.id).localeCompare(String(b.id))
+            )
+            .reduce((byAgent, row) => {
+              if (!byAgent.has(String(row.agentId))) byAgent.set(String(row.agentId), row);
+              return byAgent;
+            }, new Map<string, Record<string, unknown>>())
+            .values(),
+        ];
+        const orderedQuery = {
+          then: (resolve: (value: Array<Record<string, unknown>>) => unknown) => Promise.resolve(oldestQueuedByAgent).then(resolve),
+        };
+        return {
+          from: vi.fn().mockReturnThis(),
+          innerJoin: vi.fn().mockReturnThis(),
+          where: vi.fn().mockReturnThis(),
+          orderBy: vi.fn().mockReturnValue(orderedQuery),
+        };
+      }),
       select: vi.fn().mockImplementation((columns: Record<string, unknown>) => {
         let queryLimit: number | undefined;
         const isSummary = "queuedCount" in columns;
@@ -1056,17 +1080,17 @@ describe("PR review queue observability route", () => {
     });
   });
 
-  it("caps active detail without losing exact queue aggregates", async () => {
+  it("caps recent active detail while preserving each reviewer's oldest queued target", async () => {
     const contextSnapshot = {
       reviewKind: "pr_review",
       githubRepoFullName: "Blockcast/paperclip",
       githubPrNumber: 812,
       githubHeadSha: "abcdef123456",
     };
-    const active = (id: string, createdAt: string) => ({
+    const active = (id: string, createdAt: string, agentId = routeAgentId, agentName = "Ally") => ({
       id,
-      agentId: routeAgentId,
-      agentName: "Ally",
+      agentId,
+      agentName,
       status: "queued",
       errorCode: null,
       contextSnapshot,
@@ -1078,7 +1102,13 @@ describe("PR review queue observability route", () => {
     const { db } = createLiveRunsDbStub([
       active("same-time-a", "2026-07-25T11:00:00.000Z"),
       active("same-time-b", "2026-07-25T11:00:00.000Z"),
-      active("oldest", "2026-07-25T10:00:00.000Z"),
+      active("ally-oldest", "2026-07-25T10:00:00.000Z"),
+      active(
+        "second-oldest",
+        "2026-07-25T10:30:00.000Z",
+        "22222222-2222-4222-8222-222222222222",
+        "Second Reviewer",
+      ),
     ]);
     const app = await createApp(db);
 
@@ -1089,11 +1119,32 @@ describe("PR review queue observability route", () => {
       queuedCount: 3,
       oldestQueuedAt: "2026-07-25T10:00:00.000Z",
     });
-    expect(res.body.agents[0].runs.map((run: { id: string }) => run.id)).toEqual(["same-time-b"]);
+    expect(res.body.agents[0].runs.map((run: { id: string }) => run.id)).toEqual(["same-time-b", "ally-oldest"]);
+    expect(res.body.agents[1]).toMatchObject({
+      agentName: "Second Reviewer",
+      queuedCount: 1,
+    });
+    expect(res.body.agents[1].runs.map((run: { id: string }) => run.id)).toEqual(["second-oldest"]);
     expect(res.body).toMatchObject({
       truncated: true,
       truncatedSections: { activeRuns: true, terminalRuns: false },
     });
+  });
+
+  it.each([
+    "?limit=0",
+    "?limit=1.5",
+    "?limit=1001",
+    "?limit=not-a-number",
+    "?lookbackHours=0",
+    "?lookbackHours=24.5",
+    "?lookbackHours=169",
+  ])("rejects invalid queue query parameters: %s", async (query) => {
+    const { db } = createLiveRunsDbStub([]);
+    const app = await createApp(db);
+    const res = await request(app).get(`/api/companies/company-1/pr-review-queue${query}`);
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Validation error");
   });
 
   it("rejects agent credentials", async () => {

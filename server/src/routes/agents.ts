@@ -4,7 +4,8 @@ import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import { REDACTED_EVENT_VALUE, redactEventPayload } from "../redaction.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
-import { and, desc, eq, gte, inArray, not, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, not, or, sql } from "drizzle-orm";
+import { z } from "zod";
 import {
   agentSkillSyncSchema,
   agentMineInboxQuerySchema,
@@ -3860,12 +3861,10 @@ export function agentRoutes(
     assertBoard(req);
     assertCompanyAccess(req, companyId);
 
-    const lookbackHoursRaw = Number(req.query.lookbackHours ?? 24);
-    const lookbackHours = Number.isFinite(lookbackHoursRaw)
-      ? Math.max(1, Math.min(168, Math.trunc(lookbackHoursRaw)))
-      : 24;
-    const limitRaw = Number(req.query.limit ?? 200);
-    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(1000, Math.trunc(limitRaw))) : 200;
+    const { lookbackHours = 24, limit = 200 } = z.object({
+      lookbackHours: z.coerce.number().int().min(1).max(168).optional(),
+      limit: z.coerce.number().int().min(1).max(1000).optional(),
+    }).parse(req.query);
     const now = new Date();
     const terminalCutoff = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
 
@@ -3919,6 +3918,18 @@ export function agentRoutes(
         .where(activePredicate)
         .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
         .limit(limit + 1);
+    const oldestQueuedRowsPromise = db
+      .selectDistinctOn([heartbeatRuns.agentId], columns)
+      .from(heartbeatRuns)
+      .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          prReviewPredicate,
+          inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+        ),
+      )
+      .orderBy(heartbeatRuns.agentId, asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
     const terminalRowsPromise = baseQuery()
       .where(
         and(
@@ -3929,18 +3940,21 @@ export function agentRoutes(
       )
       .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.id))
       .limit(limit + 1);
-    const [activeSummary, activeCandidates, terminalCandidates] = await Promise.all([
+    const [activeSummary, activeCandidates, oldestQueuedCandidates, terminalCandidates] = await Promise.all([
       activeSummaryPromise,
       activeRowsPromise,
+      oldestQueuedRowsPromise,
       terminalRowsPromise,
     ]);
 
     const activeRowsTruncated = activeCandidates.length > limit;
     const terminalRowsTruncated = terminalCandidates.length > limit;
-    const activePrReviewRows = activeCandidates.slice(0, limit).filter((row) =>
-      ["queued", "scheduled_retry", "running"].includes(row.status)
-      && derivePaperclipPrReview(row.contextSnapshot) !== null,
-    );
+    const activePrReviewRows = [...oldestQueuedCandidates, ...activeCandidates.slice(0, limit)]
+      .filter((row, index, allRows) =>
+        ["queued", "scheduled_retry", "running"].includes(row.status)
+        && derivePaperclipPrReview(row.contextSnapshot) !== null
+        && allRows.findIndex((candidate) => candidate.id === row.id) === index
+      );
     const terminalRows = terminalCandidates.slice(0, limit).filter((row) =>
       row.finishedAt !== null && derivePaperclipPrReview(row.contextSnapshot) !== null
     );
