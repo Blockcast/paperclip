@@ -29,6 +29,7 @@ export const OPENAI_PRICING_USD_PER_MTOK: Record<
   string,
   { input: number; cachedInput: number; output: number }
 > = {
+  "anthropic/claude-opus-5": { input: 5.0, cachedInput: 0.5, output: 25.0 },
   // --- Original BLO-7436 entries (unverified; LiteLLM azure_ai/ variants
   // suggest 5.4/5.4-mini output may be understated — flagged for re-verify). ---
   "openai/gpt-5.6-sol": { input: 5.0, cachedInput: 0.5, output: 30.0 },

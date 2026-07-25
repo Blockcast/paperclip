@@ -30,8 +30,10 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(runtimeDockerfile).not.toMatch(/npm install[^\n]*\sopencode-ai(?:\s|\\)/);
   });
 
-  it("vendors the claude_k8s adapter commit with runtime isolation and Penstock retry hints", () => {
-    expect(serverDockerfile).toContain("ARG CLAUDE_K8S_REF=cd52a58173200fe1193c54f732b0405e0b8073fe");
+  it("vendors the claude_k8s adapter commit with runtime isolation, Penstock retry hints, and Opus 5", () => {
+    expect(serverDockerfile).toContain("ARG CLAUDE_K8S_REF=c4f92ffcafbd6b286b291d0ad2e49557401d884d");
+    expect(serverDockerfile).toContain("model-only commit based on the previous");
+    expect(serverDockerfile).toContain("without bundling later retry-semantics changes");
     expect(serverDockerfile).toContain("bound the pre-Job live-Job list to 15 seconds");
     expect(serverDockerfile).toContain("PEN-1305 PreToolUse env-guard");
     expect(serverDockerfile).toContain("always materialize the shared MCP baseline");
@@ -65,8 +67,9 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(serverDockerfile).toContain("map legacy `isolated` labels");
   });
 
-  it("vendors the opencode_k8s adapter commit with runtime isolation and the env-dump deny", () => {
-    expect(serverDockerfile).toContain("ARG OPENCODE_K8S_REF=239f2e1a3e27344e154600fae7ba668c13b36a5d");
+  it("vendors the opencode_k8s adapter commit with runtime isolation, the env-dump deny, and Opus 5", () => {
+    expect(serverDockerfile).toContain("ARG OPENCODE_K8S_REF=3ab75fb6893d3f2eed26b38a830f1a48bd1f35c0");
+    expect(serverDockerfile).toContain("add anthropic/claude-opus-5 to the");
     expect(serverDockerfile).toContain("bound the pre-Job live-Job list to 15 seconds");
     expect(serverDockerfile).toContain("PEN-1305 permission.bash env-dump deny");
     expect(serverDockerfile).toContain("disable opencode's turn-zero workspace");
