@@ -3927,7 +3927,7 @@ export function agentRoutes(
           gte(heartbeatRuns.finishedAt, terminalCutoff),
         ),
       )
-      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.id))
       .limit(limit + 1);
     const [activeSummary, activeCandidates, terminalCandidates] = await Promise.all([
       activeSummaryPromise,

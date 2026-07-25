@@ -148,7 +148,8 @@ function createLiveRunsDbStub(rows: Array<Record<string, unknown>>) {
               : row.finishedAt != null)
           : rows)
           .sort((a, b) =>
-            (b.createdAt as Date).getTime() - (a.createdAt as Date).getTime()
+            ((isPrReviewDetail && !isActiveDetail ? b.finishedAt : b.createdAt) as Date).getTime()
+            - ((isPrReviewDetail && !isActiveDetail ? a.finishedAt : a.createdAt) as Date).getTime()
             || String(b.id).localeCompare(String(a.id))
           );
         const activeSummary = [...new Map(
@@ -934,7 +935,7 @@ describe("PR review queue observability route", () => {
       githubPrNumber: 812,
       githubHeadSha: "abcdef123456",
     };
-    const terminal = (id: string, createdAt: string, context = contextSnapshot) => ({
+    const terminal = (id: string, createdAt: string, finishedAt: string, context = contextSnapshot) => ({
       id,
       agentId: routeAgentId,
       agentName: "Ally",
@@ -943,13 +944,13 @@ describe("PR review queue observability route", () => {
       contextSnapshot: context,
       createdAt: new Date(createdAt),
       startedAt: new Date(createdAt),
-      finishedAt: new Date("2026-07-25T11:59:00.000Z"),
+      finishedAt: new Date(finishedAt),
       scheduledRetryAt: null,
     });
     const { db } = createLiveRunsDbStub([
-      terminal("malformed", "2026-07-25T11:58:00.000Z", { reviewKind: "pr_review" }),
-      terminal("terminal-new", "2026-07-25T11:57:00.000Z"),
-      terminal("terminal-old", "2026-07-25T11:56:00.000Z"),
+      terminal("malformed", "2026-07-25T11:58:00.000Z", "2026-07-25T11:59:30.000Z", { reviewKind: "pr_review" }),
+      terminal("terminal-new", "2026-07-25T11:57:00.000Z", "2026-07-25T11:59:00.000Z"),
+      terminal("terminal-old", "2026-07-25T11:56:00.000Z", "2026-07-25T11:58:00.000Z"),
       {
         id: "active-oldest",
         agentId: routeAgentId,
@@ -1017,6 +1018,41 @@ describe("PR review queue observability route", () => {
       detailLimit: 1,
       truncated: false,
       truncatedSections: { activeRuns: false, terminalRuns: false },
+    });
+  });
+
+  it("bounds terminal history by completion order rather than creation order", async () => {
+    const contextSnapshot = {
+      reviewKind: "pr_review",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 812,
+      githubHeadSha: "abcdef123456",
+    };
+    const terminal = (id: string, createdAt: string, finishedAt: string) => ({
+      id,
+      agentId: routeAgentId,
+      agentName: "Ally",
+      status: "succeeded",
+      errorCode: null,
+      contextSnapshot,
+      createdAt: new Date(createdAt),
+      startedAt: new Date(createdAt),
+      finishedAt: new Date(finishedAt),
+      scheduledRetryAt: null,
+    });
+    const { db } = createLiveRunsDbStub([
+      terminal("created-later", "2026-07-25T11:00:00.000Z", "2026-07-25T11:20:00.000Z"),
+      terminal("finished-later", "2026-07-25T10:00:00.000Z", "2026-07-25T11:50:00.000Z"),
+    ]);
+    const app = await createApp(db);
+
+    const res = await request(app).get("/api/companies/company-1/pr-review-queue?limit=1");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.agents[0].runs.map((run: { id: string }) => run.id)).toEqual(["finished-later"]);
+    expect(res.body).toMatchObject({
+      truncated: true,
+      truncatedSections: { activeRuns: false, terminalRuns: true },
     });
   });
 
