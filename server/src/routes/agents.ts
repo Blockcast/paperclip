@@ -3889,7 +3889,7 @@ export function agentRoutes(
       .select(columns)
       .from(heartbeatRuns)
       .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id));
-    const [activeRows, terminalCandidates] = await Promise.all([
+    const activeRowsPromise =
       baseQuery()
         .where(
           and(
@@ -3898,25 +3898,40 @@ export function agentRoutes(
             inArray(heartbeatRuns.status, ["queued", "scheduled_retry", "running"]),
           ),
         )
-        .orderBy(desc(heartbeatRuns.createdAt)),
-      baseQuery()
-        .where(
-          and(
-            eq(heartbeatRuns.companyId, companyId),
-            prReviewPredicate,
-            gte(heartbeatRuns.finishedAt, terminalCutoff),
-          ),
-        )
-        .orderBy(desc(heartbeatRuns.createdAt)),
-    ]);
+        .orderBy(desc(heartbeatRuns.createdAt));
+    const terminalRowsPromise = (async () => {
+      const rows: Awaited<typeof activeRowsPromise> = [];
+      const batchSize = Math.min(1000, Math.max(100, limit * 2));
+      let offset = 0;
+      while (rows.length < limit) {
+        const candidates = await baseQuery()
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, companyId),
+              prReviewPredicate,
+              gte(heartbeatRuns.finishedAt, terminalCutoff),
+            ),
+          )
+          .orderBy(desc(heartbeatRuns.createdAt))
+          .limit(batchSize)
+          .offset(offset);
+        for (const row of candidates) {
+          if (row.finishedAt !== null && derivePaperclipPrReview(row.contextSnapshot) !== null) {
+            rows.push(row);
+            if (rows.length === limit) break;
+          }
+        }
+        if (candidates.length < batchSize) break;
+        offset += batchSize;
+      }
+      return rows;
+    })();
+    const [activeRows, terminalRows] = await Promise.all([activeRowsPromise, terminalRowsPromise]);
 
     const activePrReviewRows = activeRows.filter((row) =>
       ["queued", "scheduled_retry", "running"].includes(row.status)
       && derivePaperclipPrReview(row.contextSnapshot) !== null,
     );
-    const terminalRows = terminalCandidates
-      .filter((row) => row.finishedAt !== null && derivePaperclipPrReview(row.contextSnapshot) !== null)
-      .slice(0, limit);
     const rows = [...activePrReviewRows, ...terminalRows]
       .filter((row, index, allRows) => allRows.findIndex((candidate) => candidate.id === row.id) === index)
       .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());

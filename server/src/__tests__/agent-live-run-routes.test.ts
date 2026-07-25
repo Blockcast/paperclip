@@ -124,23 +124,39 @@ async function createApp(
 }
 
 function createLiveRunsDbStub(rows: Array<Record<string, unknown>>) {
-  const limit = vi.fn(async (value: number) => rows.slice(0, value));
-  const orderedQuery = {
-    limit,
-    then: (resolve: (value: Array<Record<string, unknown>>) => unknown) => Promise.resolve(rows).then(resolve),
-  };
-  const query = {
-    from: vi.fn().mockReturnThis(),
-    innerJoin: vi.fn().mockReturnThis(),
-    where: vi.fn().mockReturnThis(),
-    orderBy: vi.fn().mockReturnValue(orderedQuery),
-  };
+  const limit = vi.fn<(value: number) => unknown>();
+  const offset = vi.fn<(value: number) => unknown>();
 
   return {
     db: {
-      select: vi.fn().mockReturnValue(query),
+      select: vi.fn().mockImplementation(() => {
+        let queryLimit: number | undefined;
+        let queryOffset = 0;
+        const orderedQuery = {
+          limit: (value: number) => {
+            limit(value);
+            queryLimit = value;
+            return orderedQuery;
+          },
+          offset: (value: number) => {
+            offset(value);
+            queryOffset = value;
+            return orderedQuery;
+          },
+          then: (resolve: (value: Array<Record<string, unknown>>) => unknown) => Promise.resolve(
+            rows.slice(queryOffset, queryLimit === undefined ? undefined : queryOffset + queryLimit),
+          ).then(resolve),
+        };
+        return {
+          from: vi.fn().mockReturnThis(),
+          innerJoin: vi.fn().mockReturnThis(),
+          where: vi.fn().mockReturnThis(),
+          orderBy: vi.fn().mockReturnValue(orderedQuery),
+        };
+      }),
     },
     limit,
+    offset,
   };
 }
 
@@ -918,6 +934,42 @@ describe("PR review queue observability route", () => {
     expect(res.body.agents[0].runs.map((run: { id: string }) => run.id))
       .toEqual(["terminal-new", "active-oldest"]);
     vi.useRealTimers();
+  });
+
+  it("pages terminal candidates in bounded batches until the limit is filled", async () => {
+    const contextSnapshot = {
+      reviewKind: "pr_review",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 812,
+      githubHeadSha: "abcdef123456",
+    };
+    const terminal = (id: string, context: Record<string, unknown>) => ({
+      id,
+      agentId: routeAgentId,
+      agentName: "Ally",
+      status: "succeeded",
+      errorCode: null,
+      contextSnapshot: context,
+      createdAt: new Date("2026-07-25T11:00:00.000Z"),
+      startedAt: new Date("2026-07-25T11:01:00.000Z"),
+      finishedAt: new Date("2026-07-25T11:02:00.000Z"),
+      scheduledRetryAt: null,
+    });
+    const rows = [
+      ...Array.from({ length: 100 }, (_, index) => terminal(`malformed-${index}`, { reviewKind: "pr_review" })),
+      terminal("valid", contextSnapshot),
+    ];
+    const { db, limit, offset } = createLiveRunsDbStub(rows);
+    const app = await createApp(db);
+
+    const res = await request(app).get("/api/companies/company-1/pr-review-queue?limit=1");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.agents[0].runs.map((run: { id: string }) => run.id)).toEqual(["valid"]);
+    expect(limit).toHaveBeenCalledTimes(2);
+    expect(limit).toHaveBeenNthCalledWith(1, 100);
+    expect(limit).toHaveBeenNthCalledWith(2, 100);
+    expect(offset.mock.calls).toEqual([[0], [100]]);
   });
 
   it("rejects agent credentials", async () => {
