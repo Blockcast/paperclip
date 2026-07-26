@@ -517,6 +517,9 @@ const CAPACITY_BLOCKED_HEARTBEAT_RETRY_REASON = "capacity_blocked";
 const CAPACITY_BLOCKED_HEARTBEAT_RETRY_WAKE_REASON = "capacity_blocked_retry";
 export const CAPACITY_BLOCKED_HEARTBEAT_RETRY_DELAY_MS = 90 * 1000;
 export const CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS = 20;
+export const JOB_FAILED_HEARTBEAT_RETRY_REASON = "job_failed";
+export const JOB_FAILED_HEARTBEAT_RETRY_WAKE_REASON = "job_failed_retry";
+export const JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS = 4;
 export const DEP_BLOCKED_RETRY_REASON = "dependency_blocked";
 export const DEP_BLOCKED_BASE_DELAY_MS = 5 * 60 * 1000;
 export const DEP_BLOCKED_MAX_DELAY_MS = 60 * 60 * 1000;
@@ -708,11 +711,20 @@ export function shouldScheduleAutomaticRunRetry(
     return isPrReviewRetryContext(parseObject(run.contextSnapshot));
   }
 
-  // BLO-9147 AC2: capacity-class dispatch refusals (k8s_concurrent_run_blocked)
-  // are re-queued for pr_review wakes with bounded backoff so the review lands
-  // once a slot frees. Non-PR wakes remain terminal (BLO-7913 leak guard).
+  const contextSnapshot = parseObject(run.contextSnapshot);
+  const isIssueRun = Boolean(readNonEmptyString(contextSnapshot.issueId));
+
+  // Capacity refusals are safe to retry for durable issue work as well as PR
+  // reviews. Timer and maintenance runs remain terminal to avoid retry leaks.
   if (run.errorCode === "k8s_concurrent_run_blocked") {
-    return isPrReviewRetryContext(parseObject(run.contextSnapshot));
+    return isIssueRun || isPrReviewRetryContext(contextSnapshot);
+  }
+
+  // A failed external-lifecycle Job may have performed partial work, so only
+  // issue-backed runs get the bounded retry path. The issue execution lock and
+  // promotion gates prevent retries after reassignment or terminal completion.
+  if (run.errorCode === "job_failed") {
+    return isIssueRun;
   }
 
   // BLO-10448: scheduler-level transient infra failures where the agent pod
@@ -790,6 +802,13 @@ function resolveAutomaticRunRetryOpts(
       wakeReason: CAPACITY_BLOCKED_HEARTBEAT_RETRY_WAKE_REASON,
       maxAttempts: CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS,
       delayMs: CAPACITY_BLOCKED_HEARTBEAT_RETRY_DELAY_MS,
+    };
+  }
+  if (run.errorCode === "job_failed") {
+    return {
+      retryReason: JOB_FAILED_HEARTBEAT_RETRY_REASON,
+      wakeReason: JOB_FAILED_HEARTBEAT_RETRY_WAKE_REASON,
+      maxAttempts: JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS,
     };
   }
   return undefined;
