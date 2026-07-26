@@ -1554,14 +1554,28 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ).toBe(false);
   });
 
-  it("retries job_failed only for issue-backed runs with a finite cap", () => {
+  it("retries job_failed only when durable evidence proves adapter invocation never began", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "job_failed",
+        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: false } },
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(true);
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "job_failed",
+        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: true } },
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(false);
     expect(
       shouldScheduleAutomaticRunRetry({
         errorCode: "job_failed",
         resultJson: {},
         contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
       }),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       shouldScheduleAutomaticRunRetry({
         errorCode: "job_failed",
@@ -1776,6 +1790,73 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       });
     },
   );
+
+  it.each(["capacity_blocked", "job_failed"] as const)(
+    "suppresses %s retries when the issue entered a waiting posture",
+    async (retryReason) => {
+      for (const issueStatus of ["backlog", "blocked", "in_review"]) {
+        const fixture = await seedMaxTurnFixture({ issueStatus });
+        const scheduled = await heartbeat.scheduleBoundedRetry(fixture.runId, {
+          now: fixture.now,
+          retryReason,
+          wakeReason: `${retryReason}_retry`,
+          maxAttempts: 4,
+          delayMs: 1_000,
+        });
+        expect(scheduled).toMatchObject({
+          outcome: "not_scheduled",
+          errorCode: "issue_not_in_progress",
+          issueId: fixture.issueId,
+        });
+      }
+    },
+  );
+
+  it("rechecks the issue under lock in the same transaction that promotes an infrastructure retry", async () => {
+    const fixture = await seedMaxTurnFixture();
+    const scheduled = await heartbeat.scheduleBoundedRetry(fixture.runId, {
+      now: fixture.now,
+      retryReason: "capacity_blocked",
+      wakeReason: "capacity_blocked_retry",
+      maxAttempts: 4,
+      delayMs: 1_000,
+    });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    let releaseIssueLock!: () => void;
+    let reportIssueLockAcquired!: () => void;
+    const issueLockAcquired = new Promise<void>((resolve) => {
+      reportIssueLockAcquired = resolve;
+    });
+    const holdIssueLock = new Promise<void>((resolve) => {
+      releaseIssueLock = resolve;
+    });
+    const statusTransition = db.transaction(async (tx) => {
+      await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(eq(issues.id, fixture.issueId))
+        .for("update");
+      reportIssueLockAcquired();
+      await holdIssueLock;
+      await tx.update(issues).set({ status: "blocked" }).where(eq(issues.id, fixture.issueId));
+    });
+
+    await issueLockAcquired;
+    const promotion = heartbeat.promoteDueScheduledRetries(scheduled.dueAt);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    releaseIssueLock();
+    await statusTransition;
+
+    await expect(promotion).resolves.toEqual({ promoted: 0, runIds: [] });
+    const retry = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(retry).toEqual({ status: "cancelled", errorCode: "issue_not_in_progress" });
+  });
 
   it("does not queue max-turn continuations after the configured cap", async () => {
     const { runId, now } = await seedMaxTurnFixture({ scheduledRetryAttempt: 2 });
