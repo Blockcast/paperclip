@@ -958,7 +958,8 @@ describe("agent issue mutation checkout ownership", () => {
       .send({ body: "I was not mentioned." });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (grant)");
+    expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
@@ -974,7 +975,7 @@ describe("agent issue mutation checkout ownership", () => {
       .get(`/api/issues/${issueId}/comments`);
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (trust-boundary)");
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:read" }));
   });
 
@@ -990,7 +991,7 @@ describe("agent issue mutation checkout ownership", () => {
       .get(`/api/issues/${issueId}/interactions`);
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (trust-boundary)");
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:read" }));
     expect(mockIssueThreadInteractionService.listForIssue).not.toHaveBeenCalled();
   });
@@ -1036,7 +1037,7 @@ describe("agent issue mutation checkout ownership", () => {
       .get(`/api/issues/${issueId}/comments/comment-1`);
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (trust-boundary)");
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:read" }));
     expect(mockIssueService.getComment).not.toHaveBeenCalled();
   });
