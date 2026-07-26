@@ -163,7 +163,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
 } from "../services/issues.js";
-import { authorizationDeniedDetails } from "../services/authorization.js";
+import { authorizationBoundaryLabel, authorizationDeniedDetails } from "../services/authorization.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -3551,10 +3551,22 @@ export function issueRoutes(
     });
   }
 
+  // BLO-18152: every "Issue is outside this actor's authorization boundary"
+  // response (issue:read, issue:comment, issue:mutate) renders through this
+  // one function so the message always names which boundary fired instead of
+  // leaving the caller to guess whether it was a source-scope, trust-boundary,
+  // membership, or company-mismatch rejection.
+  function respondIssueBoundaryDenied(res: Response, decision: Awaited<ReturnType<typeof decideIssueAccess>>) {
+    res.status(403).json({
+      error: `Issue is outside this actor's authorization boundary (${authorizationBoundaryLabel(decision.reason)})`,
+      details: authorizationDeniedDetails(decision),
+    });
+  }
+
   async function assertIssueReadAllowed(req: Request, res: Response, issue: Parameters<typeof decideIssueAccess>[1]) {
     const decision = await decideIssueAccess(req, issue, "issue:read");
     if (decision.allowed) return true;
-    res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
+    respondIssueBoundaryDenied(res, decision);
     return false;
   }
 
@@ -3569,6 +3581,8 @@ export function issueRoutes(
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
     },
   ) {
     if (req.actor.type !== "agent") return true;
@@ -3592,9 +3606,23 @@ export function issueRoutes(
       }
       return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue);
     }
+    // BLO-18152: parity with assertAgentIssueMutationAllowed below — an agent
+    // whose run currently holds this issue's checkout/execution lock may
+    // always write to it, regardless of a narrower per-request trust
+    // boundary (e.g. a source_scoped_recovery_action wake) that
+    // decideIssueAccess would otherwise apply. Before this fix, only the
+    // PATCH mutate path granted this bypass, so the same actor+issue+run
+    // could get a 200 from PATCH {comment} and a 403 from this endpoint
+    // seconds apart.
+    if (isCurrentIssueExecutionRun(req, issue)) {
+      if (issue.status === "in_progress" && issue.assigneeAgentId === actorAgentId) {
+        if (!requireAgentRunId(req, res)) return false;
+      }
+      return true;
+    }
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:comment");
     if (!boundaryDecision.allowed) {
-      res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
+      respondIssueBoundaryDenied(res, boundaryDecision);
       return false;
     }
     if (issue.status === "in_progress" && issue.assigneeAgentId === actorAgentId) {
@@ -3781,7 +3809,7 @@ export function issueRoutes(
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
     if (!boundaryDecision.allowed) {
       if (await isActiveRecoveryActionOwner()) return true;
-      res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
+      respondIssueBoundaryDenied(res, boundaryDecision);
       return false;
     }
     if (await isActiveRecoveryActionOwner()) return true;
