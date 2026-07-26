@@ -727,6 +727,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/members/{memberId}/archive",
   "PATCH /api/companies/{companyId}/members/{memberId}/permissions",
   "GET /api/companies/{companyId}/user-directory",
+  "GET /api/companies/{companyId}/pr-review-queue",
   "POST /api/execution-workspaces/{id}/reconcile-branch",
   "GET /api/board-api-keys",
   "POST /api/board-api-keys",
@@ -3684,6 +3685,21 @@ registry.registerPath({
   summary: "List heartbeat runs for a company",
   request: { params: z.object({ companyId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/pr-review-queue",
+  tags: ["runs"],
+  summary: "Inspect PR-review queue depth, age, targets, and dispositions",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      lookbackHours: z.coerce.number().int().min(1).max(168).optional(),
+      limit: z.coerce.number().int().min(1).max(1000).optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
