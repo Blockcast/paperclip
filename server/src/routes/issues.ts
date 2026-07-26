@@ -3549,6 +3549,7 @@ export function issueRoutes(
       status: string;
     },
     action: "issue:comment" | "issue:read" | "issue:mutate",
+    extraScope?: Record<string, unknown>,
   ) {
     return access.decide({
       actor: req.actor,
@@ -3569,8 +3570,32 @@ export function issueRoutes(
         parentIssueId: issue.parentId,
         assigneeAgentId: issue.assigneeAgentId,
         assigneeUserId: issue.assigneeUserId,
+        ...extraScope,
       },
     });
+  }
+
+  // BLO-18163: coordination-metadata allowlist a CEO-role actor may PATCH on
+  // any issue in its company regardless of current assignee — dependency
+  // edges, priority, and routing fields are coordination state, not work
+  // content. Deliberately excludes status/title/description/workMode: those
+  // remain assignee-boundary-protected. Kept in sync with the acceptance
+  // criteria in BLO-18163; extending this set is a deliberate authorization
+  // decision, not a mechanical addition.
+  const CEO_COORDINATION_METADATA_FIELDS = new Set([
+    "blockedByIssueIds",
+    "priority",
+    "projectId",
+    "projectWorkspaceId",
+    "parentId",
+    "milestoneId",
+  ]);
+
+  function isCeoCoordinationMetadataOnlyPatchBody(body: unknown): boolean {
+    if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+    const keys = Object.keys(body as Record<string, unknown>);
+    if (keys.length === 0) return false;
+    return keys.every((key) => CEO_COORDINATION_METADATA_FIELDS.has(key));
   }
 
   // BLO-18152: every "Issue is outside this actor's authorization boundary"
@@ -3828,6 +3853,7 @@ export function issueRoutes(
       allowBlockedCorrection?: boolean;
       allowScopedRecoveryOwnerSourceMutation?: boolean;
       allowRecoveryActionOwner?: boolean;
+      coordinationMetadataOnly?: boolean;
     } = {},
   ) {
     if (req.actor.type !== "agent") return true;
@@ -3849,11 +3875,26 @@ export function issueRoutes(
       const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
       return activeRecoveryAction?.ownerAgentId === actorAgentId;
     };
-    const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
+    const boundaryDecision = await decideIssueAccess(
+      req,
+      issue,
+      "issue:mutate",
+      options.coordinationMetadataOnly ? { coordinationMetadataOnly: true } : undefined,
+    );
     if (!boundaryDecision.allowed) {
       if (await isActiveRecoveryActionOwner()) return true;
       respondIssueBoundaryDenied(res, boundaryDecision);
       return false;
+    }
+    // BLO-18163: the CEO coordination-metadata allow path is a deliberate
+    // exception to the assignee-ownership boundary below (that boundary is
+    // the entire reason the CEO previously had no route back onto a
+    // report's issue), not a widening of it — the route layer already
+    // constrained this decision to a body confined to the coordination
+    // allowlist, so it's safe to bypass the "another agent owns this issue"
+    // checkout/ownership checks that follow.
+    if (boundaryDecision.reason === "allow_ceo_coordination_metadata") {
+      return true;
     }
     if (await isActiveRecoveryActionOwner()) return true;
     if (issue.assigneeAgentId === null) {
@@ -8097,6 +8138,7 @@ export function issueRoutes(
       {
         allowBlockedCorrection: true,
         allowScopedRecoveryOwnerSourceMutation,
+        coordinationMetadataOnly: isCeoCoordinationMetadataOnlyPatchBody(req.body),
       },
     ))) return;
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;

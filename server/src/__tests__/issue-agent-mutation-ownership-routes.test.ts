@@ -10,6 +10,8 @@ const peerAgentId = "44444444-4444-4444-8444-444444444444";
 const staleAgentId = "66666666-1111-4666-8666-666666666666";
 const ownerRunId = "55555555-5555-4555-8555-555555555555";
 const recoveryActionId = "77777777-7777-4777-8777-777777777777";
+const ceoAgentId = "99999999-9999-4999-8999-999999999999";
+const ceoRunId = "99999999-1111-4999-8999-999999999999";
 
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
@@ -386,6 +388,16 @@ function ownerActorFromSweepRun() {
   return {
     ...ownerActor(),
     runId: "88888888-8888-4888-8888-888888888888",
+  };
+}
+
+function ceoActor() {
+  return {
+    type: "agent",
+    agentId: ceoAgentId,
+    companyId,
+    source: "agent_key",
+    runId: ceoRunId,
   };
 }
 
@@ -1270,6 +1282,55 @@ describe("agent issue mutation checkout ownership", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // BLO-18163: a CEO-role actor patching only the coordination-metadata
+  // allowlist (blockedByIssueIds here) must bypass the "another agent owns
+  // this issue" ownership check below, since that check is exactly what
+  // previously left the CEO with no route to clear a stale blocker edge.
+  it("allows a CEO's coordination-metadata-only PATCH to bypass the assignee ownership check", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+    mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
+    mockIssueService.update.mockResolvedValue(
+      makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, blockedByIssueIds: [] }),
+    );
+    mockAccessService.decide.mockImplementation(async (input: { action: string; scope?: Record<string, unknown> }) => {
+      if (input.action === "issue:read") {
+        return { allowed: true, action: input.action, reason: "allow_company_agent", explanation: "read." };
+      }
+      if (input.action === "issue:mutate" && input.scope?.coordinationMetadataOnly === true) {
+        return { allowed: true, action: input.action, reason: "allow_ceo_coordination_metadata", explanation: "ceo." };
+      }
+      return { allowed: false, action: input.action, reason: "deny_missing_grant", explanation: "denied." };
+    });
+
+    const res = await request(await createApp(ceoActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ blockedByIssueIds: [] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("does not treat a body carrying work content as coordination-metadata-only, even for the CEO", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string; scope?: Record<string, unknown> }) => {
+      if (input.action === "issue:read") {
+        return { allowed: true, action: input.action, reason: "allow_company_agent", explanation: "read." };
+      }
+      if (input.action === "issue:mutate" && input.scope?.coordinationMetadataOnly === true) {
+        return { allowed: true, action: input.action, reason: "allow_ceo_coordination_metadata", explanation: "ceo." };
+      }
+      return { allowed: false, action: input.action, reason: "deny_missing_grant", explanation: "denied." };
+    });
+
+    const res = await request(await createApp(ceoActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ blockedByIssueIds: [], title: "Rewritten by the CEO" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 

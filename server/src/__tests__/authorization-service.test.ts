@@ -1778,6 +1778,71 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  // BLO-18163: the CEO could create a blockedBy edge (by creating the issue)
+  // but had no route to remove one once the issue was assigned to a report —
+  // only the current assignee could PATCH it at all. This allows the CEO
+  // role to patch a narrow coordination-metadata allowlist (dependency
+  // edges, priority, routing) on any company issue, while the assignee
+  // boundary keeps protecting work content (title/description/status) for
+  // everyone, including the CEO.
+  it("allows a CEO-role actor to patch coordination metadata on another agent's issue", async () => {
+    const company = await createCompany(db, "CeoCoordinationMetadata");
+    const ceoAgent = await createAgent(db, company.id, { role: "ceo" });
+    const reportAgent = await createAgent(db, company.id, { role: "engineer" });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: ceoAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:mutate",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: reportAgent.id },
+      scope: { assigneeAgentId: reportAgent.id, coordinationMetadataOnly: true },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      reason: "allow_ceo_coordination_metadata",
+    });
+  });
+
+  it("still denies a non-CEO agent the coordination-metadata bypass on another agent's issue", async () => {
+    const company = await createCompany(db, "NonCeoCoordinationMetadata");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const otherAgent = await createAgent(db, company.id, { role: "engineer" });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:mutate",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: otherAgent.id },
+      scope: { assigneeAgentId: otherAgent.id, coordinationMetadataOnly: true },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
+  it("does not let the CEO coordination-metadata scope leak into a full issue:mutate call", async () => {
+    const company = await createCompany(db, "CeoCoordinationMetadataScoped");
+    const ceoAgent = await createAgent(db, company.id, { role: "ceo" });
+    const reportAgent = await createAgent(db, company.id, { role: "engineer" });
+
+    // No coordinationMetadataOnly scope flag here — this is what the route
+    // layer sends for a body containing title/description/other work
+    // content, and the CEO must still be denied exactly like any other
+    // non-assignee agent.
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: ceoAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:mutate",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: reportAgent.id },
+      scope: { assigneeAgentId: reportAgent.id },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
   it("denies execution-stage override for an unrelated peer agent", async () => {
     const company = await createCompany(db, "UnrelatedOverride");
     const actorAgent = await createAgent(db, company.id, { role: "engineer" });

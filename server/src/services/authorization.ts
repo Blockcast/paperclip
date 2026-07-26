@@ -111,6 +111,7 @@ export type AuthorizationDecision = {
     | "allow_company_member"
     | "allow_simple_company_member"
     | "allow_manager_chain"
+    | "allow_ceo_coordination_metadata"
     | "inbox_target_user_unresolved"
     | "inbox_management_disabled"
     | "inbox_agent_not_allowed"
@@ -2034,6 +2035,25 @@ export function authorizationService(db: Db) {
           action: input.action,
           reason: "allow_company_agent",
           explanation: "Allowed because the issue has no agent assignee.",
+        });
+      }
+      // BLO-18163: curating the dependency graph (and other pure coordination
+      // metadata) is a core CEO function, but the CEO had no route back onto
+      // an issue once it was assigned to a report — only the current assignee
+      // could touch it. The route layer (assertAgentIssueMutationAllowed)
+      // verifies the request body is confined to the coordination-metadata
+      // allowlist before setting this scope flag; this check never sees the
+      // body itself, so it must not be reachable for a bare "issue:mutate"
+      // call that could carry title/description changes.
+      if (
+        input.action === "issue:mutate" &&
+        scopeBoolean(input.scope, "coordinationMetadataOnly") &&
+        actorAgent.role === "ceo"
+      ) {
+        return allow({
+          action: input.action,
+          reason: "allow_ceo_coordination_metadata",
+          explanation: "Allowed because the CEO role may curate coordination metadata (blockers, priority, project, milestone) on any company issue.",
         });
       }
       if (
