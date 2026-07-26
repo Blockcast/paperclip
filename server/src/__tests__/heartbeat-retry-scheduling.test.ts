@@ -1671,6 +1671,45 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         retryReason,
       });
 
+      const replacementRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: replacementRunId,
+        companyId: scheduledFixture.companyId,
+        agentId: scheduledFixture.agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "running",
+        contextSnapshot: {
+          issueId: scheduledFixture.issueId,
+          wakeReason: "issue_continuation_needed",
+        },
+        startedAt: scheduledFixture.now,
+        updatedAt: scheduledFixture.now,
+        createdAt: scheduledFixture.now,
+      });
+      await db
+        .update(issues)
+        .set({ executionRunId: replacementRunId })
+        .where(eq(issues.id, scheduledFixture.issueId));
+      const stalePromotion = await heartbeat.promoteDueScheduledRetries(scheduled.dueAt);
+      expect(stalePromotion).toEqual({ promoted: 0, runIds: [] });
+
+      const cancelledRetry = await db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, retryRun!.id))
+        .then((rows) => rows[0] ?? null);
+      expect(cancelledRetry).toEqual({
+        status: "cancelled",
+        errorCode: "issue_execution_lock_changed",
+      });
+      const retainedIssueLock = await db
+        .select({ executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, scheduledFixture.issueId))
+        .then((rows) => rows[0]?.executionRunId ?? null);
+      expect(retainedIssueLock).toBe(replacementRunId);
+
       const exhaustedFixture = await seedMaxTurnFixture({ scheduledRetryAttempt: maxAttempts });
       await db
         .update(heartbeatRuns)

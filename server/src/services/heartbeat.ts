@@ -11696,11 +11696,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    if (
-      retryReason === MAX_TURN_CONTINUATION_RETRY_REASON &&
-      input.enforceIssueExecutionLock &&
-      issue.executionRunId !== run.id
-    ) {
+    if (input.enforceIssueExecutionLock && issue.executionRunId !== run.id) {
       return {
         allowed: false,
         reason: "Scheduled retry suppressed because the issue execution lock belongs to a different run",
