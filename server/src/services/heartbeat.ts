@@ -1910,6 +1910,31 @@ async function isGitCheckout(cwd: string | null | undefined) {
     .catch(() => false);
 }
 
+// Unlike isGitCheckout(), this does not fail open: a probe error that isn't
+// positively identifiable as "cwd is not a git checkout" (missing directory,
+// or git's own "not a git repository" fatal) is treated as "could be a
+// checkout". That covers the storage-layer failures (permission denied,
+// stale handle, I/O error, timeout) BLO-18147 exists to guard against —
+// those must reject dispatch, not silently wave it through because the probe
+// itself couldn't complete. Uses try/await rather than .then/.catch because
+// execFile can throw synchronously (e.g. ENOTDIR when cwd is not a
+// directory) before returning a promise to chain onto.
+async function probeGitCheckoutStateStrict(
+  cwd: string,
+): Promise<"checkout" | "not_a_checkout" | "indeterminate"> {
+  try {
+    const result = await execFile("git", ["rev-parse", "--show-toplevel"], { cwd });
+    return readNonEmptyString(result.stdout) ? "checkout" : "indeterminate";
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return "not_a_checkout";
+    const stderr = typeof (error as { stderr?: unknown })?.stderr === "string"
+      ? (error as { stderr: string }).stderr
+      : "";
+    if (/not a git repository/i.test(stderr)) return "not_a_checkout";
+    return "indeterminate";
+  }
+}
+
 function sameResolvedPath(left: string | null | undefined, right: string | null | undefined) {
   const leftPath = readNonEmptyString(left);
   const rightPath = readNonEmptyString(right);
@@ -2058,23 +2083,31 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     input.k8sRunIsolation?.isolationMode === "run" &&
     !input.resolvedWorkspace.realizationFailure &&
     effectiveCwd !== null &&
-    path.resolve(effectiveCwd) === path.resolve(agentFallbackCwd) &&
-    await isGitCheckout(effectiveCwd)
+    path.resolve(effectiveCwd) === path.resolve(agentFallbackCwd)
   ) {
-    throw new WorkspaceValidationFailure(
-      `Issue ${k8sIssue.identifier ?? k8sIssue.id} has no usable project or session execution workspace. Refusing to dispatch ${input.adapterType} run isolation from the shared agent-home fallback cwd "${effectiveCwd}" because its in-pod git bootstrap clones locally from this checkout and can exit 128 under storage pressure. Bind a project or execution workspace to this issue before retrying.`,
-      {
-        workspaceValidation: {
-          reason: "k8s_agent_home_git_bootstrap_unsupported",
-          adapterType: input.adapterType,
-          issueId: k8sIssue?.id ?? null,
-          issueIdentifier: k8sIssue?.identifier ?? null,
-          resolvedWorkspaceSource: input.resolvedWorkspace.source,
-          resolvedWorkspaceCwd: effectiveCwd,
-          isolationMode: input.k8sRunIsolation.isolationMode,
+    // Deliberately not isGitCheckout(): that helper fails open (any probe
+    // error -> false), which would wave a storage-layer probe failure
+    // straight through to dispatch and reproduce the exact exit-128 this
+    // guard exists to prevent. Reject dispatch unless the probe positively
+    // confirms the fallback cwd is NOT a git checkout.
+    const gitProbeState = await probeGitCheckoutStateStrict(effectiveCwd);
+    if (gitProbeState !== "not_a_checkout") {
+      throw new WorkspaceValidationFailure(
+        `Issue ${k8sIssue.identifier ?? k8sIssue.id} has no usable project or session execution workspace. Refusing to dispatch ${input.adapterType} run isolation from the shared agent-home fallback cwd "${effectiveCwd}" because its in-pod git bootstrap clones locally from this checkout and can exit 128 under storage pressure. Bind a project or execution workspace to this issue before retrying.`,
+        {
+          workspaceValidation: {
+            reason: "k8s_agent_home_git_bootstrap_unsupported",
+            adapterType: input.adapterType,
+            issueId: k8sIssue?.id ?? null,
+            issueIdentifier: k8sIssue?.identifier ?? null,
+            resolvedWorkspaceSource: input.resolvedWorkspace.source,
+            resolvedWorkspaceCwd: effectiveCwd,
+            isolationMode: input.k8sRunIsolation.isolationMode,
+            gitProbeState,
+          },
         },
-      },
-    );
+      );
+    }
   }
 
   if (!GIT_SENSITIVE_LOCAL_ADAPTER_TYPES.has(input.adapterType)) return;

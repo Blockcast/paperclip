@@ -830,6 +830,21 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
     await expect(assertGitSensitiveAdapterWorkspaceValid(fallbackInput())).resolves.toBeUndefined();
   });
 
+  it("rejects when the git checkout probe fails indeterminately instead of confirming a non-checkout", async () => {
+    await fs.mkdir(path.dirname(fallbackCwd), { recursive: true });
+    // A regular file at the fallback cwd path makes the "git rev-parse" probe
+    // fail with ENOTDIR, not ENOENT and not git's "not a git repository"
+    // fatal — the same shape of ambiguous failure a storage-layer fault would
+    // produce. The guard must reject dispatch rather than read this as proof
+    // the cwd isn't a checkout.
+    await fs.writeFile(fallbackCwd, "not a directory");
+    await expectWorkspaceValidationFailure(
+      fallbackInput(),
+      "k8s_agent_home_git_bootstrap_unsupported",
+      "Refusing to dispatch claude_k8s run isolation from the shared agent-home fallback cwd",
+    );
+  });
+
   it("allows stateless dispatch without issue context", async () => {
     await fs.mkdir(fallbackCwd, { recursive: true });
     await runGit(fallbackCwd, ["init"]);
@@ -851,6 +866,8 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
   });
 
   it("does not apply the k8s agent-home guard to opencode_k8s (BLO-18145: observed healthy through the same incident window)", async () => {
+    await fs.mkdir(fallbackCwd, { recursive: true });
+    await runGit(fallbackCwd, ["init"]);
     await expect(
       assertGitSensitiveAdapterWorkspaceValid(
         buildWorkspaceValidationInput({
@@ -867,6 +884,12 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
             projectId: null,
             workspaceId: null,
           }),
+          executionWorkspace: {
+            ...buildWorkspaceValidationInput().executionWorkspace,
+            baseCwd: fallbackCwd,
+            cwd: fallbackCwd,
+            source: "agent_home",
+          },
           persistedExecutionWorkspace: null,
           executionTarget: { kind: "remote" },
           k8sRunIsolation: { isolationMode: "run" },
