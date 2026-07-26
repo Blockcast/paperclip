@@ -29,6 +29,7 @@ import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
+  isRetryableInteractionContinuationInfrastructureFailure,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
 
@@ -809,6 +810,20 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue?.executionRunId).toBe(scheduled.run.id);
+  });
+
+  it("does not retry the permanent claude_k8s agent-home workspace failure", () => {
+    expect(
+      isRetryableInteractionContinuationInfrastructureFailure({
+        error: "workspace validation failed before dispatch",
+        errorCode: "workspace_validation_failed",
+        resultJson: {
+          workspaceValidation: {
+            reason: "k8s_agent_home_git_bootstrap_unsupported",
+          },
+        },
+      }),
+    ).toBe(false);
   });
 
   it("coalesces duplicate accepted interaction continuation infra retry schedules", async () => {

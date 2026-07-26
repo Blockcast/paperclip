@@ -828,10 +828,20 @@ function isSpawnLikeFailureMessage(value: unknown) {
   return /failed to start command|spawn\b|\bENOENT\b/i.test(value);
 }
 
-function isRetryableInteractionContinuationInfrastructureFailure(
+export function isRetryableInteractionContinuationInfrastructureFailure(
   run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "resultJson">,
 ) {
-  if (run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE || run.errorCode === "process_lost") {
+  if (run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE) {
+    const workspaceValidation = parseObject(parseObject(run.resultJson).workspaceValidation);
+    if (
+      readNonEmptyString(workspaceValidation.reason) ===
+      "k8s_agent_home_git_bootstrap_unsupported"
+    ) {
+      return false;
+    }
+    return true;
+  }
+  if (run.errorCode === "process_lost") {
     return true;
   }
 
@@ -2032,29 +2042,27 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   executionWorkspace: RealizedExecutionWorkspace;
   persistedExecutionWorkspace: ExecutionWorkspace | null;
   executionTarget: unknown;
+  k8sRunIsolation?: { isolationMode: "shared" | "run" | "workspace" } | null;
   environmentDriver?: string | null;
   leaseMetadata?: unknown;
 }) {
-  // BLO-18147: refuse to dispatch a claude_k8s run whose resolved workspace
-  // fell back to the shared per-agent AGENT_HOME cwd. That cwd is the source
-  // the in-pod entrypoint locally `git clone --shared`s from at startup
-  // (confirmed live from a running pod's own process tree); a clone failure
-  // there — e.g. under the cephfs storage pressure tracked by BLO-17793 —
-  // exits the container with git's raw 128 before `claude` even starts,
-  // burning Job backoff budget on a dispatch that was doomed from the start.
-  // Fail loud here instead, before any Job is created, so the run surfaces a
-  // clear, actionable control-plane error and the issue lands in a visible
-  // state (blocked/needs-workspace) rather than looping BackoffLimitExceeded.
+  const k8sIssue = input.issue;
+  const effectiveCwd = readNonEmptyString(input.executionWorkspace.cwd);
+  const agentFallbackCwd = resolveDefaultAgentWorkspaceDir(input.agentId);
+  // claude_k8s only clones the source checkout for per-run isolation. Key the
+  // invariant on that effective source path, not the resolver label: a missing
+  // project cwd can retain source="project_primary" while falling back here.
   if (
     K8S_GIT_SENSITIVE_ADAPTER_TYPES.has(input.adapterType) &&
+    k8sIssue &&
+    input.k8sRunIsolation?.isolationMode === "run" &&
     !input.resolvedWorkspace.realizationFailure &&
-    input.resolvedWorkspace.source === "agent_home"
+    effectiveCwd !== null &&
+    path.resolve(effectiveCwd) === path.resolve(agentFallbackCwd) &&
+    await isGitCheckout(effectiveCwd)
   ) {
-    const k8sIssue = input.issue;
     throw new WorkspaceValidationFailure(
-      k8sIssue
-        ? `Issue ${k8sIssue.identifier ?? k8sIssue.id} has no project or session execution workspace. Refusing to dispatch ${input.adapterType} from the shared agent-home fallback cwd "${input.resolvedWorkspace.cwd}" — its in-pod git bootstrap clones locally from this cwd and can exit 128 under storage pressure on the shared PVC (BLO-18147). Bind a project or execution workspace to this issue before retrying.`
-        : `Refusing to dispatch ${input.adapterType} from the shared agent-home fallback cwd "${input.resolvedWorkspace.cwd}" with no issue context (BLO-18147).`,
+      `Issue ${k8sIssue.identifier ?? k8sIssue.id} has no usable project or session execution workspace. Refusing to dispatch ${input.adapterType} run isolation from the shared agent-home fallback cwd "${effectiveCwd}" because its in-pod git bootstrap clones locally from this checkout and can exit 128 under storage pressure. Bind a project or execution workspace to this issue before retrying.`,
       {
         workspaceValidation: {
           reason: "k8s_agent_home_git_bootstrap_unsupported",
@@ -2062,7 +2070,8 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
           issueId: k8sIssue?.id ?? null,
           issueIdentifier: k8sIssue?.identifier ?? null,
           resolvedWorkspaceSource: input.resolvedWorkspace.source,
-          resolvedWorkspaceCwd: input.resolvedWorkspace.cwd,
+          resolvedWorkspaceCwd: effectiveCwd,
+          isolationMode: input.k8sRunIsolation.isolationMode,
         },
       },
     );
@@ -2085,9 +2094,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     readNonEmptyString(leaseMetadata.remoteCwd) ??
     readNonEmptyString(leaseProviderMetadata.remoteCwd);
 
-  const effectiveCwd = readNonEmptyString(input.executionWorkspace.cwd);
   const persistedCwd = readNonEmptyString(input.persistedExecutionWorkspace?.cwd);
-  const agentFallbackCwd = resolveDefaultAgentWorkspaceDir(input.agentId);
   const workspaceExpectation =
     Boolean(issue.projectWorkspaceId) ||
     Boolean(resolvedWorkspace.workspaceId) ||
@@ -18444,6 +18451,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         executionWorkspace,
         persistedExecutionWorkspace,
         executionTarget,
+        k8sRunIsolation,
         environmentDriver: selectedEnvironment.driver,
         leaseMetadata: activeEnvironmentLease.lease.metadata,
       });

@@ -758,36 +758,84 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
   });
 });
 
-describe("assertGitSensitiveAdapterWorkspaceValid rejects claude_k8s agent-home dispatch (BLO-18147)", () => {
-  // claude_k8s pods bootstrap their own git workspace in-pod by locally
-  // `git clone --shared`-ing from the resolved cwd. When no project/session
-  // workspace is available that cwd falls back to the shared AGENT_HOME dir;
-  // a clone failure there exits the container with git's raw 128 before
-  // `claude` starts, burning Job backoff budget. Refuse dispatch up front.
-  const fallbackCwd = resolveDefaultAgentWorkspaceDir("agent-1");
+describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s bootstrap", () => {
+  const agentId = "blo-18147-test-agent";
+  const fallbackCwd = resolveDefaultAgentWorkspaceDir(agentId);
+  const fallbackInput = (overrides: Partial<WorkspaceValidationInput> = {}) =>
+    buildWorkspaceValidationInput({
+      adapterType: "claude_k8s",
+      agentId,
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-1",
+        projectId: null,
+        projectWorkspaceId: null,
+      },
+      resolvedWorkspace: buildResolvedWorkspace({
+        cwd: fallbackCwd,
+        source: "agent_home",
+        projectId: null,
+        workspaceId: null,
+      }),
+      executionWorkspace: {
+        ...buildWorkspaceValidationInput().executionWorkspace,
+        baseCwd: fallbackCwd,
+        cwd: fallbackCwd,
+        source: "agent_home",
+      },
+      persistedExecutionWorkspace: null,
+      executionTarget: { kind: "remote" },
+      k8sRunIsolation: { isolationMode: "run" },
+      ...overrides,
+    });
 
-  it("rejects a claude_k8s run whose resolved workspace fell back to the shared agent-home cwd", async () => {
+  afterEach(async () => {
+    await fs.rm(fallbackCwd, { recursive: true, force: true });
+  });
+
+  it("rejects run isolation cloning a git checkout from the agent-home fallback", async () => {
+    await fs.mkdir(fallbackCwd, { recursive: true });
+    await runGit(fallbackCwd, ["init"]);
     await expectWorkspaceValidationFailure(
-      buildWorkspaceValidationInput({
-        adapterType: "claude_k8s",
-        issue: {
-          id: "issue-1",
-          identifier: "PAP-1",
-          projectId: null,
-          projectWorkspaceId: null,
-        },
-        resolvedWorkspace: buildResolvedWorkspace({
-          cwd: fallbackCwd,
-          source: "agent_home",
-          projectId: null,
-          workspaceId: null,
-        }),
-        persistedExecutionWorkspace: null,
-        executionTarget: { kind: "remote" },
+      fallbackInput(),
+      "k8s_agent_home_git_bootstrap_unsupported",
+      "Refusing to dispatch claude_k8s run isolation from the shared agent-home fallback cwd",
+    );
+  });
+
+  it("rejects the fallback cwd even when the resolver labels it project_primary", async () => {
+    await fs.mkdir(fallbackCwd, { recursive: true });
+    await runGit(fallbackCwd, ["init"]);
+    await expectWorkspaceValidationFailure(
+      fallbackInput({
+        resolvedWorkspace: buildResolvedWorkspace({ cwd: fallbackCwd, source: "project_primary" }),
       }),
       "k8s_agent_home_git_bootstrap_unsupported",
-      "Refusing to dispatch claude_k8s from the shared agent-home fallback cwd",
+      "Refusing to dispatch claude_k8s run isolation from the shared agent-home fallback cwd",
     );
+  });
+
+  it("allows shared isolation because it does not clone the source checkout", async () => {
+    await fs.mkdir(fallbackCwd, { recursive: true });
+    await runGit(fallbackCwd, ["init"]);
+    await expect(
+      assertGitSensitiveAdapterWorkspaceValid(
+        fallbackInput({ k8sRunIsolation: { isolationMode: "shared" } }),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("allows run isolation from a non-git agent-home source", async () => {
+    await fs.mkdir(fallbackCwd, { recursive: true });
+    await expect(assertGitSensitiveAdapterWorkspaceValid(fallbackInput())).resolves.toBeUndefined();
+  });
+
+  it("allows stateless dispatch without issue context", async () => {
+    await fs.mkdir(fallbackCwd, { recursive: true });
+    await runGit(fallbackCwd, ["init"]);
+    await expect(
+      assertGitSensitiveAdapterWorkspaceValid(fallbackInput({ issue: null })),
+    ).resolves.toBeUndefined();
   });
 
   it("does not reject a claude_k8s run bound to a project workspace", async () => {
@@ -796,6 +844,7 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects claude_k8s agent-home 
         buildWorkspaceValidationInput({
           adapterType: "claude_k8s",
           executionTarget: { kind: "remote" },
+          k8sRunIsolation: { isolationMode: "run" },
         }),
       ),
     ).resolves.toBeUndefined();
@@ -820,6 +869,7 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects claude_k8s agent-home 
           }),
           persistedExecutionWorkspace: null,
           executionTarget: { kind: "remote" },
+          k8sRunIsolation: { isolationMode: "run" },
         }),
       ),
     ).resolves.toBeUndefined();
