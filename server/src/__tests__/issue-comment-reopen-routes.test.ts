@@ -597,13 +597,19 @@ describe.sequential("issue comment reopen routes", () => {
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: "Progress update from the current execution run." });
     expect(commentRes.status, JSON.stringify(commentRes.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+
+    // Reset between the two requests so the PATCH assertions below cannot be
+    // satisfied by the POST's calls — the whole point of this test is that each
+    // endpoint independently lets the execution-run holder through.
+    mockIssueService.addComment.mockClear();
+    mockIssueService.update.mockClear();
 
     const patchRes = await request(await installActor(createApp(), recoveryActor))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
       .send({ comment: "Progress update via PATCH." });
     expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(200);
-
-    expect(mockIssueService.addComment).toHaveBeenCalled();
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
     expect(mockIssueService.update).toHaveBeenCalled();
   });
 

@@ -547,8 +547,22 @@ export function authorizationBoundaryLabel(reason: AuthorizationDecision["reason
     case "deny_unauthenticated":
       return "unauthenticated";
     default:
-      return "unknown";
+      return unlabelledBoundary(reason);
   }
+}
+
+// Only a deny_* reason has a boundary to name; an allow_*/inbox_* reason
+// reaching here means a caller passed a non-denial, which is a caller bug and
+// not worth failing the build over — "unknown" is the honest answer.
+//
+// The parameter type is the point: because it excludes every deny_* reason,
+// adding a new one to AuthorizationDecision without giving it a case above
+// narrows `reason` to something unassignable here and breaks the build, rather
+// than silently degrading that boundary to "unknown" in the error message.
+function unlabelledBoundary(
+  _reason: Exclude<AuthorizationDecision["reason"], `deny_${string}`>,
+): string {
+  return "unknown";
 }
 
 export function authorizationService(db: Db) {
