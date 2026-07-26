@@ -128,103 +128,112 @@ function createLiveRunsDbStub(rows: Array<Record<string, unknown>>) {
   const orderBy = vi.fn<(...values: unknown[]) => unknown>();
   let detailQueryCount = 0;
 
+  const db = {
+    selectDistinctOn: vi.fn().mockImplementation(() => {
+      const oldestQueuedByAgent = [
+        ...rows
+          .filter((row) => row.status === "queued" || row.status === "scheduled_retry")
+          .sort((a, b) =>
+            (a.createdAt as Date).getTime() - (b.createdAt as Date).getTime()
+            || String(a.id).localeCompare(String(b.id))
+          )
+          .reduce((byAgent, row) => {
+            if (!byAgent.has(String(row.agentId))) byAgent.set(String(row.agentId), row);
+            return byAgent;
+          }, new Map<string, Record<string, unknown>>())
+          .values(),
+      ];
+      const orderedQuery = {
+        then: (resolve: (value: Array<Record<string, unknown>>) => unknown) => Promise.resolve(oldestQueuedByAgent).then(resolve),
+      };
+      return {
+        from: vi.fn().mockReturnThis(),
+        innerJoin: vi.fn().mockReturnThis(),
+        where: vi.fn().mockReturnThis(),
+        orderBy: vi.fn().mockReturnValue(orderedQuery),
+      };
+    }),
+    select: vi.fn().mockImplementation((columns: Record<string, unknown>) => {
+      let queryLimit: number | undefined;
+      const isSummary = "queuedCount" in columns;
+      const isPrReviewDetail = "scheduledRetryAt" in columns && "contextSnapshot" in columns;
+      if (isPrReviewDetail) detailQueryCount += 1;
+      const isActiveDetail = isPrReviewDetail && detailQueryCount === 1;
+      const parserValid = (row: Record<string, unknown>) => {
+        const context = row.contextSnapshot as Record<string, unknown> | null;
+        return context?.reviewKind === "pr_review" && Number.isFinite(Number(context.githubPrNumber));
+      };
+      const detailRows = (isPrReviewDetail
+        ? rows
+          .filter(parserValid)
+          .filter((row) => isActiveDetail
+            ? ["queued", "scheduled_retry", "running"].includes(String(row.status))
+            : row.finishedAt != null)
+        : rows)
+        .sort((a, b) =>
+          ((isPrReviewDetail && !isActiveDetail ? b.finishedAt : b.createdAt) as Date).getTime()
+          - ((isPrReviewDetail && !isActiveDetail ? a.finishedAt : a.createdAt) as Date).getTime()
+          || String(b.id).localeCompare(String(a.id))
+        );
+      const activeSummary = [...new Map(
+        rows
+          .filter((row) => ["queued", "scheduled_retry", "running"].includes(String(row.status)))
+          .filter(parserValid)
+          .map((row) => {
+            const agentRows = rows.filter((candidate) =>
+              candidate.agentId === row.agentId
+              && ["queued", "scheduled_retry", "running"].includes(String(candidate.status))
+              && Number.isFinite(Number((candidate.contextSnapshot as Record<string, unknown> | null)?.githubPrNumber))
+            );
+            const queuedRows = agentRows.filter((candidate) =>
+              candidate.status === "queued" || candidate.status === "scheduled_retry"
+            );
+            return [row.agentId, {
+              agentId: row.agentId,
+              agentName: row.agentName,
+              activeCount: agentRows.length,
+              queuedCount: queuedRows.length,
+              oldestQueuedAt: queuedRows.length > 0
+                ? new Date(Math.min(...queuedRows.map((candidate) => (candidate.createdAt as Date).getTime())))
+                : null,
+            }];
+          }),
+      ).values()];
+      const orderedQuery = {
+        limit: (value: number) => {
+          limit(value);
+          queryLimit = value;
+          return orderedQuery;
+        },
+        then: (resolve: (value: Array<Record<string, unknown>>) => unknown) => Promise.resolve(
+          detailRows.slice(0, queryLimit),
+        ).then(resolve),
+      };
+      const query = {
+        from: vi.fn().mockReturnThis(),
+        innerJoin: vi.fn().mockReturnThis(),
+        where: vi.fn().mockReturnThis(),
+        groupBy: vi.fn().mockImplementation(() => Promise.resolve(activeSummary)),
+        orderBy: (...values: unknown[]) => {
+          orderBy(...values);
+          return orderedQuery;
+        },
+      };
+      return query;
+    }),
+  };
+  const transaction = vi.fn(async (
+    callback: (tx: typeof db) => Promise<unknown>,
+  ) => callback(db));
+
   return {
     db: {
-      selectDistinctOn: vi.fn().mockImplementation(() => {
-        const oldestQueuedByAgent = [
-          ...rows
-            .filter((row) => row.status === "queued" || row.status === "scheduled_retry")
-            .sort((a, b) =>
-              (a.createdAt as Date).getTime() - (b.createdAt as Date).getTime()
-              || String(a.id).localeCompare(String(b.id))
-            )
-            .reduce((byAgent, row) => {
-              if (!byAgent.has(String(row.agentId))) byAgent.set(String(row.agentId), row);
-              return byAgent;
-            }, new Map<string, Record<string, unknown>>())
-            .values(),
-        ];
-        const orderedQuery = {
-          then: (resolve: (value: Array<Record<string, unknown>>) => unknown) => Promise.resolve(oldestQueuedByAgent).then(resolve),
-        };
-        return {
-          from: vi.fn().mockReturnThis(),
-          innerJoin: vi.fn().mockReturnThis(),
-          where: vi.fn().mockReturnThis(),
-          orderBy: vi.fn().mockReturnValue(orderedQuery),
-        };
-      }),
-      select: vi.fn().mockImplementation((columns: Record<string, unknown>) => {
-        let queryLimit: number | undefined;
-        const isSummary = "queuedCount" in columns;
-        const isPrReviewDetail = "scheduledRetryAt" in columns && "contextSnapshot" in columns;
-        if (isPrReviewDetail) detailQueryCount += 1;
-        const isActiveDetail = isPrReviewDetail && detailQueryCount === 1;
-        const parserValid = (row: Record<string, unknown>) => {
-          const context = row.contextSnapshot as Record<string, unknown> | null;
-          return context?.reviewKind === "pr_review" && Number.isFinite(Number(context.githubPrNumber));
-        };
-        const detailRows = (isPrReviewDetail
-          ? rows
-            .filter(parserValid)
-            .filter((row) => isActiveDetail
-              ? ["queued", "scheduled_retry", "running"].includes(String(row.status))
-              : row.finishedAt != null)
-          : rows)
-          .sort((a, b) =>
-            ((isPrReviewDetail && !isActiveDetail ? b.finishedAt : b.createdAt) as Date).getTime()
-            - ((isPrReviewDetail && !isActiveDetail ? a.finishedAt : a.createdAt) as Date).getTime()
-            || String(b.id).localeCompare(String(a.id))
-          );
-        const activeSummary = [...new Map(
-          rows
-            .filter((row) => ["queued", "scheduled_retry", "running"].includes(String(row.status)))
-            .filter(parserValid)
-            .map((row) => {
-              const agentRows = rows.filter((candidate) =>
-                candidate.agentId === row.agentId
-                && ["queued", "scheduled_retry", "running"].includes(String(candidate.status))
-                && Number.isFinite(Number((candidate.contextSnapshot as Record<string, unknown> | null)?.githubPrNumber))
-              );
-              const queuedRows = agentRows.filter((candidate) =>
-                candidate.status === "queued" || candidate.status === "scheduled_retry"
-              );
-              return [row.agentId, {
-                agentId: row.agentId,
-                agentName: row.agentName,
-                activeCount: agentRows.length,
-                queuedCount: queuedRows.length,
-                oldestQueuedAt: queuedRows.length > 0
-                  ? new Date(Math.min(...queuedRows.map((candidate) => (candidate.createdAt as Date).getTime())))
-                  : null,
-              }];
-            }),
-        ).values()];
-        const orderedQuery = {
-          limit: (value: number) => {
-            limit(value);
-            queryLimit = value;
-            return orderedQuery;
-          },
-          then: (resolve: (value: Array<Record<string, unknown>>) => unknown) => Promise.resolve(
-            detailRows.slice(0, queryLimit),
-          ).then(resolve),
-        };
-        const query = {
-          from: vi.fn().mockReturnThis(),
-          innerJoin: vi.fn().mockReturnThis(),
-          where: vi.fn().mockReturnThis(),
-          groupBy: vi.fn().mockImplementation(() => Promise.resolve(activeSummary)),
-          orderBy: (...values: unknown[]) => {
-            orderBy(...values);
-            return orderedQuery;
-          },
-        };
-        return query;
-      }),
+      ...db,
+      transaction,
     },
     limit,
     orderBy,
+    transaction,
   };
 }
 
@@ -1166,6 +1175,51 @@ describe("PR review queue observability route", () => {
     expect(res.body).toMatchObject({
       truncated: false,
       truncatedSections: { activeRuns: false, terminalRuns: false },
+    });
+  });
+
+  it("reads queue aggregates and details from one repeatable-read snapshot", async () => {
+    const queuedRun = {
+      id: "transitioning-run",
+      agentId: routeAgentId,
+      agentName: "Ally",
+      status: "queued",
+      errorCode: null,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 812,
+        githubHeadSha: "abcdef123456",
+      },
+      createdAt: new Date("2026-07-25T11:00:00.000Z"),
+      startedAt: null,
+      finishedAt: null,
+      scheduledRetryAt: null,
+    };
+    const snapshot = createLiveRunsDbStub([{ ...queuedRun }]);
+    const live = createLiveRunsDbStub([{
+      ...queuedRun,
+      status: "succeeded",
+      startedAt: new Date("2026-07-25T11:01:00.000Z"),
+      finishedAt: new Date("2026-07-25T11:02:00.000Z"),
+    }]);
+    const transaction = vi.fn(async (
+      callback: (tx: typeof snapshot.db) => Promise<unknown>,
+      config: Record<string, unknown>,
+    ) => {
+      expect(config).toEqual({ isolationLevel: "repeatable read", accessMode: "read only" });
+      return callback(snapshot.db);
+    });
+    const app = await createApp({ ...live.db, transaction });
+
+    const res = await request(app).get("/api/companies/company-1/pr-review-queue");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(transaction).toHaveBeenCalledOnce();
+    expect(live.db.select).not.toHaveBeenCalled();
+    expect(res.body.agents[0]).toMatchObject({
+      queuedCount: 1,
+      runs: [expect.objectContaining({ id: "transitioning-run", disposition: "queued" })],
     });
   });
 

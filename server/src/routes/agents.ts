@@ -3893,60 +3893,65 @@ export function agentRoutes(
         else false
       end`,
     );
-    const baseQuery = () => db
-      .select(columns)
-      .from(heartbeatRuns)
-      .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id));
     const activePredicate = and(
       eq(heartbeatRuns.companyId, companyId),
       prReviewPredicate,
       inArray(heartbeatRuns.status, ["queued", "scheduled_retry", "running"]),
     );
-    const activeSummaryPromise = db
-      .select({
-        agentId: heartbeatRuns.agentId,
-        agentName: agentsTable.name,
-        activeCount: sql<number>`count(*)::int`,
-        queuedCount: sql<number>`count(*) filter (where ${heartbeatRuns.status} in ('queued', 'scheduled_retry'))::int`,
-        oldestQueuedAt: sql<Date | null>`min(${heartbeatRuns.createdAt}) filter (where ${heartbeatRuns.status} in ('queued', 'scheduled_retry'))`,
-      })
-      .from(heartbeatRuns)
-      .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
-      .where(activePredicate)
-      .groupBy(heartbeatRuns.agentId, agentsTable.name);
-    const activeRowsPromise =
-      baseQuery()
+    const [activeSummary, activeCandidates, oldestQueuedCandidates, terminalCandidates] = await db.transaction(async (tx) => {
+      const baseQuery = () => tx
+        .select(columns)
+        .from(heartbeatRuns)
+        .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id));
+      const activeSummaryPromise = tx
+        .select({
+          agentId: heartbeatRuns.agentId,
+          agentName: agentsTable.name,
+          activeCount: sql<number>`count(*)::int`,
+          queuedCount: sql<number>`count(*) filter (where ${heartbeatRuns.status} in ('queued', 'scheduled_retry'))::int`,
+          oldestQueuedAt: sql<Date | null>`min(${heartbeatRuns.createdAt}) filter (where ${heartbeatRuns.status} in ('queued', 'scheduled_retry'))`,
+        })
+        .from(heartbeatRuns)
+        .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
+        .where(activePredicate)
+        .groupBy(heartbeatRuns.agentId, agentsTable.name);
+      const activeRowsPromise = baseQuery()
         .where(activePredicate)
         .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
         .limit(limit + 1);
-    const oldestQueuedRowsPromise = db
-      .selectDistinctOn([heartbeatRuns.agentId], columns)
-      .from(heartbeatRuns)
-      .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
-      .where(
-        and(
-          eq(heartbeatRuns.companyId, companyId),
-          prReviewPredicate,
-          inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
-        ),
-      )
-      .orderBy(heartbeatRuns.agentId, asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
-    const terminalRowsPromise = baseQuery()
-      .where(
-        and(
-          eq(heartbeatRuns.companyId, companyId),
-          prReviewPredicate,
-          gte(heartbeatRuns.finishedAt, terminalCutoff),
-        ),
-      )
-      .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.id))
-      .limit(limit + 1);
-    const [activeSummary, activeCandidates, oldestQueuedCandidates, terminalCandidates] = await Promise.all([
-      activeSummaryPromise,
-      activeRowsPromise,
-      oldestQueuedRowsPromise,
-      terminalRowsPromise,
-    ]);
+      const oldestQueuedRowsPromise = tx
+        .selectDistinctOn([heartbeatRuns.agentId], columns)
+        .from(heartbeatRuns)
+        .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            prReviewPredicate,
+            inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+          ),
+        )
+        .orderBy(heartbeatRuns.agentId, asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+      const terminalRowsPromise = baseQuery()
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            prReviewPredicate,
+            gte(heartbeatRuns.finishedAt, terminalCutoff),
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.id))
+        .limit(limit + 1);
+
+      return Promise.all([
+        activeSummaryPromise,
+        activeRowsPromise,
+        oldestQueuedRowsPromise,
+        terminalRowsPromise,
+      ]);
+    }, {
+      isolationLevel: "repeatable read",
+      accessMode: "read only",
+    });
 
     const terminalRowsTruncated = terminalCandidates.length > limit;
     const activePrReviewRows = [...oldestQueuedCandidates, ...activeCandidates.slice(0, limit)]

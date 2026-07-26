@@ -39,6 +39,15 @@ BEGIN
         HINT = 'Run CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_company_finished_at_desc_idx ON heartbeat_runs USING btree (company_id, finished_at DESC, id DESC) WHERE finished_at IS NOT NULL, then retry migrations.';
     END IF;
 
+    -- Close the gap between the empty-table check and CREATE INDEX without
+    -- taking this lock on populated production tables.
+    LOCK TABLE "heartbeat_runs" IN SHARE MODE;
+    IF EXISTS (SELECT 1 FROM "heartbeat_runs" LIMIT 1) THEN
+      RAISE EXCEPTION USING
+        MESSAGE = 'migration 0205 requires online index precreation',
+        HINT = 'Run CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_company_finished_at_desc_idx ON heartbeat_runs USING btree (company_id, finished_at DESC, id DESC) WHERE finished_at IS NOT NULL, then retry migrations.';
+    END IF;
+
     CREATE INDEX "heartbeat_runs_company_finished_at_desc_idx"
       ON "heartbeat_runs" USING btree (
         "company_id",
