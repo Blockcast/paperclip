@@ -3,6 +3,10 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 const workflow = readFileSync(new URL("../.github/workflows/docker.yml", import.meta.url), "utf8");
+const imageHelper = readFileSync(
+  new URL("../deploy/helm/paperclip/templates/_helpers.tpl", import.meta.url),
+  "utf8",
+);
 
 function getDeployJobBlock() {
   const marker = "\n  deploy:\n";
@@ -57,4 +61,17 @@ test("Docker deploy job provisions Buildx before inspecting the artifact", () =>
   assert.notEqual(setup, -1, "deploy job must provision Buildx");
   assert.notEqual(inspect, -1, "deploy job must inspect the deploy artifact");
   assert.ok(setup < inspect, "deploy job must provision Buildx before artifact inspection");
+});
+
+test("Docker deploy binds Helm to the digest built for the approved SHA", () => {
+  const buildJob = getBuildJobBlock();
+  const deployJob = getDeployJobBlock();
+
+  assert.match(buildJob, /image_digest: \$\{\{ steps\.build\.outputs\.digest \}\}/);
+  assert.match(deployJob, /EXPECTED_DIGEST: \$\{\{ needs\.build-and-push\.outputs\.image_digest \}\}/);
+  assert.match(deployJob, /\[ "\$\{digest\}" != "\$\{EXPECTED_DIGEST\}" \]/);
+  assert.match(deployJob, /DIGEST: \$\{\{ steps\.artifact\.outputs\.digest \}\}/);
+  assert.match(deployJob, /--set-string image\.digest="\$\{DIGEST\}"/);
+  assert.match(imageHelper, /if \.Values\.image\.digest/);
+  assert.match(imageHelper, /printf "%s@%s" \.Values\.image\.repository \.Values\.image\.digest/);
 });

@@ -45,6 +45,7 @@ jobs:
       cancel-in-progress: true
     outputs:
       target_sha: ${{ steps.target.outputs.full }}
+      image_digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Validate target commit
         id: target
@@ -408,36 +409,42 @@ jobs:
           echo "tag ${TAG} missing after retries; failing this window — the next one retries" >&2
           exit 1
 
-      - name: Record deploy artifact
+      - name: Resolve deploy artifact
+        id: artifact
         if: ${{ steps.gate.outputs.proceed == 'true' }}
         env:
+          EXPECTED_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
           TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
         run: |
           set -euo pipefail
           image="harbor.blockcast.net/paperclip/paperclip:${TAG}"
           digest=$(docker buildx imagetools inspect "${image}" --format '{{json .Manifest.Digest}}' | tr -d '"')
           [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          if [ -n "${EXPECTED_DIGEST}" ] && [ "${digest}" != "${EXPECTED_DIGEST}" ]; then
+            echo "Tag ${image} resolved to ${digest}, expected build digest ${EXPECTED_DIGEST}" >&2
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
           {
             echo "### Paperclip deploy target"
             echo "- Commit: \`${{ steps.target.outputs.full }}\`"
             echo "- Image: \`${image}@${digest}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Use --set image.tag so the deployed tag tracks the just-built image
-      # without committing to values.blockcast.yaml. The committed values
-      # file remains the source of truth for non-CI deploys; CI runs are
-      # transparent in helm history (`helm get values paperclip` shows the
-      # override). Adjust by editing values.blockcast.yaml when you want
-      # the file to reflect the live tag.
+      # Pin the manifest digest resolved above so the image inspected for the
+      # approved commit is exactly the image Kubernetes pulls. The committed
+      # tag remains the readable source reference for non-CI deploys.
       - name: helm upgrade
         if: ${{ steps.gate.outputs.proceed == 'true' }}
         env:
+          DIGEST: ${{ steps.artifact.outputs.digest }}
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
           RELEASE: ${{ vars.PAPERCLIP_HELM_RELEASE || 'paperclip' }}
           TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
         run: |
-          set -e
-          echo "rolling out ${TAG} to ${NS}/${RELEASE}"
+          set -euo pipefail
+          [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "rolling out ${TAG}@${DIGEST} to ${NS}/${RELEASE}"
           # --timeout bumped 10m → 30m on 2026-05-23 after rev 316 + several
           # prior revs hit "context deadline exceeded" while the cluster was
           # in apiserver/kubelet-latency cascade (control-plane nodes at
@@ -451,6 +458,7 @@ jobs:
             -n "${NS}" \
             -f deploy/helm/paperclip/values.blockcast.yaml \
             --set image.tag="${TAG}" \
+            --set-string image.digest="${DIGEST}" \
             --wait --timeout 30m
           helm -n "${NS}" list | head -3
           kubectl -n "${NS}" get pod -l app.kubernetes.io/name=paperclip \

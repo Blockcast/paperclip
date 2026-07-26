@@ -63,7 +63,7 @@ The chart does **not** create an Ingress by default. Pick one:
 
 ## Upgrading
 
-The image is pinned via `image.tag` in `values.yaml`. Two common paths:
+The image is selected via `image.tag` in `values.yaml`. Set `image.digest` to pin the deployed manifest immutably; when present, it takes precedence over the tag. Two common paths:
 
 - **Follow upstream**: every upstream master push and stable tag publishes an image (`sha-<short>` and `vYYYY.MMM.P` respectively). Point `image.tag` at whichever channel you want to track.
 - **Manual**:
@@ -131,9 +131,10 @@ kubectl -n paperclip exec paperclip-0 -- \
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| image | object | `{"pullPolicy":"IfNotPresent","repository":"ghcr.io/paperclipai/paperclip","tag":"latest"}` | Container image settings. |
+| image | object | `{"digest":"","pullPolicy":"IfNotPresent","repository":"ghcr.io/paperclipai/paperclip","tag":"latest"}` | Container image settings. |
 | image.repository | string | `"ghcr.io/paperclipai/paperclip"` | Image repository. Upstream publishes to `ghcr.io/paperclipai/paperclip` on every master push and stable tag. |
 | image.tag | string | `"latest"` | Image tag. Override to a specific stable release (e.g. `v2026.416.0`) or pin to a `sha-<commit>` tag. |
+| image.digest | string | `""` | Image manifest digest. When set, this takes precedence over `tag` and pins the deployed artifact immutably. |
 | image.pullPolicy | string | `"IfNotPresent"` | Image pull policy. |
 | imagePullSecrets | list | `[]` | Image pull secrets. Only needed if the GHCR package is private. Example: `[{name: ghcr-pull}]`. |
 | nameOverride | string | `""` | Override the chart name used in resource names. |
