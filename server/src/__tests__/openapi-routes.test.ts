@@ -239,6 +239,7 @@ describe("openapi routes", () => {
     expect(spec.paths["/api/companies/{companyId}/pr-review-queue"].get["x-paperclip-authorization"]).toEqual({
       actor: "board",
     });
+    expect(spec.paths["/api/companies/{companyId}/pr-review-queue"].get.responses["400"]).toBeDefined();
     expect(spec.paths["/api/companies/{companyId}/cost-events"].post.responses["201"]).toBeDefined();
     expect(spec.paths["/api/companies/{companyId}/cost-events"].post.responses["403"]).toBeDefined();
     expect(spec.paths["/api/instance/database-backups"].post.responses["201"]).toBeDefined();

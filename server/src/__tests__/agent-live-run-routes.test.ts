@@ -192,6 +192,7 @@ function createLiveRunsDbStub(rows: Array<Record<string, unknown>>) {
               return [row.agentId, {
                 agentId: row.agentId,
                 agentName: row.agentName,
+                activeCount: agentRows.length,
                 queuedCount: queuedRows.length,
                 oldestQueuedAt: queuedRows.length > 0
                   ? new Date(Math.min(...queuedRows.map((candidate) => (candidate.createdAt as Date).getTime())))
@@ -1128,6 +1129,43 @@ describe("PR review queue observability route", () => {
     expect(res.body).toMatchObject({
       truncated: true,
       truncatedSections: { activeRuns: true, terminalRuns: false },
+    });
+  });
+
+  it("does not report active truncation when oldest supplementation returns every active run", async () => {
+    const contextSnapshot = {
+      reviewKind: "pr_review",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 812,
+      githubHeadSha: "abcdef123456",
+    };
+    const active = (id: string, agentId: string, agentName: string) => ({
+      id,
+      agentId,
+      agentName,
+      status: "queued",
+      errorCode: null,
+      contextSnapshot,
+      createdAt: new Date("2026-07-25T11:00:00.000Z"),
+      startedAt: null,
+      finishedAt: null,
+      scheduledRetryAt: null,
+    });
+    const { db } = createLiveRunsDbStub([
+      active("ally-only", routeAgentId, "Ally"),
+      active("second-only", "22222222-2222-4222-8222-222222222222", "Second Reviewer"),
+    ]);
+    const app = await createApp(db);
+
+    const res = await request(app).get("/api/companies/company-1/pr-review-queue?limit=1");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.agents.flatMap((agent: { runs: Array<{ id: string }> }) =>
+      agent.runs.map((run) => run.id)
+    )).toEqual(["ally-only", "second-only"]);
+    expect(res.body).toMatchObject({
+      truncated: false,
+      truncatedSections: { activeRuns: false, terminalRuns: false },
     });
   });
 

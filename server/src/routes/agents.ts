@@ -3906,6 +3906,7 @@ export function agentRoutes(
       .select({
         agentId: heartbeatRuns.agentId,
         agentName: agentsTable.name,
+        activeCount: sql<number>`count(*)::int`,
         queuedCount: sql<number>`count(*) filter (where ${heartbeatRuns.status} in ('queued', 'scheduled_retry'))::int`,
         oldestQueuedAt: sql<Date | null>`min(${heartbeatRuns.createdAt}) filter (where ${heartbeatRuns.status} in ('queued', 'scheduled_retry'))`,
       })
@@ -3947,7 +3948,6 @@ export function agentRoutes(
       terminalRowsPromise,
     ]);
 
-    const activeRowsTruncated = activeCandidates.length > limit;
     const terminalRowsTruncated = terminalCandidates.length > limit;
     const activePrReviewRows = [...oldestQueuedCandidates, ...activeCandidates.slice(0, limit)]
       .filter((row, index, allRows) =>
@@ -3955,6 +3955,8 @@ export function agentRoutes(
         && derivePaperclipPrReview(row.contextSnapshot) !== null
         && allRows.findIndex((candidate) => candidate.id === row.id) === index
       );
+    const activeRowsTruncated = activeSummary.reduce((count, summary) => count + summary.activeCount, 0)
+      > activePrReviewRows.length;
     const terminalRows = terminalCandidates.slice(0, limit).filter((row) =>
       row.finishedAt !== null && derivePaperclipPrReview(row.contextSnapshot) !== null
     );
