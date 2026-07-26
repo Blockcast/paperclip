@@ -1692,22 +1692,28 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .toBe(true);
   });
 
-  it("fails and retries a PR-review run whose missing Job left no outcome evidence", async () => {
+  it("fails and retries once when a PR-review request comment is not outcome evidence", async () => {
     const jobName = "agent-opencode-review-lost";
+    const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
     const { companyId, agentId, runId } = await seedRunFixture({
       adapterType: "opencode_k8s",
       agentStatus: "idle",
       externalRunId: jobName,
       contextSnapshot: {
         reviewKind: "pr_review",
-        taskKey: "pr_review:Blockcast/onprem-k8s:1648:075a9aeff53a229199ab0583e916f33c22459983",
+        taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
         githubRepoFullName: "Blockcast/onprem-k8s",
         githubPrNumber: 1648,
-        githubHeadSha: "075a9aeff53a229199ab0583e916f33c22459983",
+        githubHeadSha: headSha,
       },
     });
     await seedAdapterInvokeEvent({ companyId, agentId, runId });
     await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    await db
+      .update(heartbeatRuns)
+      .set({ resultJson: { summary: `@ally review exact head ${headSha}` } })
+      .where(eq(heartbeatRuns.id, runId));
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ found: false });
     mockListManagedAgentJobs.mockResolvedValueOnce([]);
     mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
       phase: "missing",
@@ -1718,6 +1724,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
 
     expect(result.runIds).toContain(runId);
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledWith({
+      repoFullName: "Blockcast/onprem-k8s",
+      prNumber: 1648,
+      headSha,
+    });
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledTimes(1);
     expect(await heartbeat.getRun(runId)).toMatchObject({
       status: "failed",
       errorCode: "job_missing",
