@@ -1605,6 +1605,111 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("preserves a recorded PR-review outcome when its external Job disappears", async () => {
+    const jobName = "agent-opencode-review-posted";
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: "pr_review:Blockcast/onprem-k8s:1648:head-sha",
+        repoFullName: "Blockcast/onprem-k8s",
+        githubPrNumber: 1648,
+        githubHeadSha: "head-sha",
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: {
+          summary: "Review posted successfully on Blockcast/onprem-k8s#1648 at head head-sha.",
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      createdByRunId: runId,
+      body: "Submitted GitHub review 4781882116 and recorded the terminal outcome.",
+    });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "succeeded",
+      errorCode: null,
+      resultJson: expect.objectContaining({
+        externalLifecycleRecovery: expect.objectContaining({
+          reason: "job_missing_recorded_outcome_preserved",
+        }),
+      }),
+    });
+    const retries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(retries).toHaveLength(0);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.filter((comment) => comment.body.includes("Submitted GitHub review 4781882116")))
+      .toHaveLength(1);
+    expect(comments.map((comment) => comment.body)).toContain(SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY);
+    const dispositionWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(dispositionWakeups.some((wakeup) => wakeup.reason === "finish_successful_run_handoff"))
+      .toBe(true);
+  });
+
+  it("fails and retries a PR-review run whose missing Job left no outcome evidence", async () => {
+    const jobName = "agent-opencode-review-lost";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: "pr_review:Blockcast/onprem-k8s:1648:head-sha",
+        repoFullName: "Blockcast/onprem-k8s",
+        githubPrNumber: 1648,
+        githubHeadSha: "head-sha",
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "failed",
+      errorCode: "job_missing",
+    });
+    const retries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: 1 });
+  });
+
   it("keeps a fresh ownerless run when the exact Job lookup is inconclusive", async () => {
     const jobName = "agent-opencode-inventory-inconclusive";
     const { companyId, agentId, runId } = await seedRunFixture({

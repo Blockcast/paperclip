@@ -156,6 +156,7 @@ import {
 } from "./heartbeat-stop-metadata.js";
 import {
   classifyRunLiveness,
+  hasConcreteActionEvidence,
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
 import {
@@ -14375,8 +14376,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
-  function externalLifecycleTerminalOutcome(jobStatus: AgentJobRunStatus | null) {
+  function externalLifecycleTerminalOutcome(
+    jobStatus: AgentJobRunStatus | null,
+    preserveRecordedOutcome = false,
+  ) {
     if (!jobStatus) {
+      if (preserveRecordedOutcome) {
+        return {
+          status: "succeeded" as const,
+          wakeupStatus: "completed" as const,
+          errorCode: null,
+          error: null,
+          recoveryReason: "job_missing_recorded_outcome_preserved",
+          jobPhase: "missing",
+          jobReason: null,
+          jobMessage: null,
+        };
+      }
       return {
         status: "failed" as const,
         wakeupStatus: "failed" as const,
@@ -14449,6 +14465,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     now: Date;
     staleKill?: boolean;
   }) {
+    let preserveRecordedOutcome = false;
+    if (!input.staleKill && !input.jobStatus) {
+      const livenessInput = await buildRunLivenessInput(input.run, parseObject(input.run.resultJson));
+      const reviewEvidence = evaluatePrReviewCompletionEvidence(
+        parseObject(input.run.contextSnapshot),
+        { resultJson: parseObject(input.run.resultJson) },
+      );
+      preserveRecordedOutcome = reviewEvidence.status === "posted_review" ||
+        reviewEvidence.status === "already_reviewed" ||
+        reviewEvidence.status === "archived_repo_skipped" ||
+        reviewEvidence.status === "self_review_skipped" ||
+        (
+          reviewEvidence.status === "not_applicable" &&
+          hasConcreteActionEvidence({
+            issueCommentsCreated: livenessInput.evidence?.issueCommentsCreated,
+            documentRevisionsCreated: livenessInput.evidence?.documentRevisionsCreated,
+            workProductsCreated: livenessInput.evidence?.workProductsCreated,
+          })
+        );
+    }
     const terminalOutcome = input.staleKill
       ? {
           status: "failed" as const,
@@ -14461,7 +14497,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           jobReason: input.jobStatus?.reason ?? null,
           jobMessage: input.jobStatus?.message ?? null,
         }
-      : externalLifecycleTerminalOutcome(input.jobStatus);
+      : externalLifecycleTerminalOutcome(input.jobStatus, preserveRecordedOutcome);
     if (!terminalOutcome) return false;
 
     const resultJson = mergeRunStopMetadataForAgent(
@@ -14552,16 +14588,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // reviewer path). Mirror the liveness retry decision so the bounded re-queue
     // fires for these reconciler-finalized failures as well. Non-pr / non-retryable
     // codes return false from the predicate and stay terminal (BLO-7913 leak guard).
-    if (terminalOutcome.status === "failed" && shouldScheduleAutomaticRunRetry(finalizedRun)) {
-      const retryAgent = await getAgent(finalizedRun.agentId);
-      if (retryAgent) {
-        await scheduleBoundedRetryForRun(
-          finalizedRun,
-          retryAgent,
-          resolveAutomaticRunRetryOpts(finalizedRun),
-        );
-        finalizedRun = (await getRun(finalizedRun.id)) ?? finalizedRun;
-      }
+    const finalizationAgent = await getAgent(finalizedRun.agentId);
+    if (
+      terminalOutcome.status === "failed" &&
+      shouldScheduleAutomaticRunRetry(finalizedRun) &&
+      finalizationAgent
+    ) {
+      await scheduleBoundedRetryForRun(
+        finalizedRun,
+        finalizationAgent,
+        resolveAutomaticRunRetryOpts(finalizedRun),
+      );
+      finalizedRun = (await getRun(finalizedRun.id)) ?? finalizedRun;
     }
 
     await releaseEnvironmentLeasesForRun({
@@ -14579,6 +14617,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     await finalizeAgentStatus(input.run.agentId, terminalOutcome.status);
     const promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun);
+    await handleRunLivenessContinuation(finalizedRun);
+    if (finalizationAgent) {
+      await handleSuccessfulRunHandoff(finalizedRun, finalizationAgent);
+    }
     await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
       eventType: "lifecycle",
       stream: "system",

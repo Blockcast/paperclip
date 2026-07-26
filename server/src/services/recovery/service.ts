@@ -610,6 +610,10 @@ export function classifyAdapterFailureForRecovery(
   };
 }
 
+export function isBlockingRelationCycleError(error: unknown) {
+  return error instanceof Error && error.message.includes("Blocking relations cannot contain cycles");
+}
+
 type ContinuationRetryClassification = {
   kind: "transient_infra" | "non_retryable" | "default";
   maxAttempts: number;
@@ -6271,7 +6275,26 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       update.status = "blocked";
     }
 
-    const updated = await issuesSvc.update(input.issue.id, update);
+    let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
+    try {
+      updated = await issuesSvc.update(input.issue.id, update);
+    } catch (error) {
+      if (!isBlockingRelationCycleError(error)) throw error;
+      logger.warn(
+        {
+          companyId: input.issue.companyId,
+          issueId: input.issue.id,
+          escalationIssueId: input.escalationIssueId,
+          incidentKey: input.finding.incidentKey,
+        },
+        "skipping cycle-forming liveness escalation blocker relation",
+      );
+      if (isAlreadyBlocked) return input.issue;
+      updated = await issuesSvc.update(input.issue.id, {
+        status: "blocked",
+        blockedByIssueIds: blockerIds,
+      });
+    }
     if (!updated) return null;
 
     await logActivity(db, {

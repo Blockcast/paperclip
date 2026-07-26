@@ -245,6 +245,36 @@ describe("successful run handoff decision", () => {
     });
   });
 
+  it("queues a status-only handoff for a preserved missing-Job PR review outcome", () => {
+    const decision = decide({
+      run: {
+        ...run,
+        contextSnapshot: {
+          issueId: "issue-1",
+          taskId: "issue-1",
+          wakeReason: "github_pr_review_requested",
+          reviewKind: "pr_review",
+          githubRepoFullName: "Blockcast/linux-amt",
+          githubPrNumber: 51,
+          githubHeadSha: "54900568",
+        },
+        resultJson: {
+          externalLifecycleRecovery: {
+            reason: "job_missing_recorded_outcome_preserved",
+          },
+        },
+      } as any,
+    });
+
+    expect(decision).toMatchObject({
+      kind: "enqueue",
+      targetAgentId: "agent-1",
+      payload: {
+        handoffReason: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+      },
+    });
+  });
+
   it("does not queue for issue monitor maintenance runs", () => {
     expect(decide({
       run: {

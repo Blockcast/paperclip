@@ -64,6 +64,7 @@ vi.mock("../adapters/index.ts", async () => {
 });
 
 import { heartbeatService } from "../services/heartbeat.ts";
+import { isBlockingRelationCycleError } from "../services/recovery/service.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { issueService } from "../services/issues.ts";
 import { runningProcesses } from "../adapters/index.ts";
@@ -71,6 +72,12 @@ import { DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS } from "../services/recovery/
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+it("recognizes only blocking-relation cycle failures for recovery fallback", () => {
+  expect(isBlockingRelationCycleError(new Error("Blocking relations cannot contain cycles"))).toBe(true);
+  expect(isBlockingRelationCycleError(new Error("Issue cannot be blocked by itself"))).toBe(false);
+  expect(isBlockingRelationCycleError("Blocking relations cannot contain cycles")).toBe(false);
+});
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
