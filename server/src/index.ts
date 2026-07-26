@@ -1163,9 +1163,13 @@ export async function startServer(): Promise<StartedServer> {
 
         // Lock cleanup must not be starved by failures in the broader recovery
         // sequence: stale checkout ownership can prevent every later run.
-        const swept = await heartbeat.sweepStaleIssueLocks();
-        if (swept.cleared > 0) {
-          logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
+        try {
+          const swept = await heartbeat.sweepStaleIssueLocks();
+          if (swept.cleared > 0) {
+            logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
+          }
+        } catch (err) {
+          logger.error({ err }, "startup stale-lock sweeper failed");
         }
 
         const promotion = await heartbeat.promoteDueScheduledRetries();

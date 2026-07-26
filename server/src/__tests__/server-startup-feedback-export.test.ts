@@ -377,6 +377,21 @@ describe("startServer feedback export wiring", () => {
     expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
   });
 
+  it("continues startup recovery when the stale-lock sweep fails", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    heartbeatServiceMock.sweepStaleIssueLocks.mockRejectedValueOnce(
+      new Error("stale-lock sweep failure"),
+    );
+
+    await startServer();
+
+    expect(heartbeatServiceMock.promoteDueScheduledRetries).toHaveBeenCalledTimes(1);
+    expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1);
+  });
+
   it("runs the periodic stale-lock sweep independently of other recovery failures", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
