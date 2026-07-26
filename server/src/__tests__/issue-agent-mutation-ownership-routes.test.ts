@@ -1796,6 +1796,35 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).toHaveBeenCalled();
   });
 
+  it("allows the creator of a delegated child issue to mutate it even though it is assigned to someone else (BLO-18113)", async () => {
+    // Regression for the gap Ally flagged on PR #790: decideIssueAccess already
+    // returns allow_issue_creator/allow_manager_chain for a non-assignee actor,
+    // but the route's own assignee-ownership gate downstream used to re-reject
+    // that same actor because it isn't the checked-out assignee.
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:comment" || input.action === "issue:mutate",
+      action: input.action,
+      reason: input.action === "issue:comment" || input.action === "issue:mutate" ? "allow_issue_creator" : "deny_missing_grant",
+      explanation:
+        input.action === "issue:comment" || input.action === "issue:mutate"
+          ? "Allowed because the actor created this issue."
+          : "Missing permission.",
+    }));
+    mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId, createdByAgentId: peerAgentId }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ assigneeAgentId: ownerAgentId, createdByAgentId: peerAgentId }),
+      ...patch,
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ comment: "Correction from the delegating creator" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
   it.each([
     ["todo", "patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Todo update" })],
     ["blocked", "patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Blocked update" })],
