@@ -1703,6 +1703,38 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         scheduledRetryAttempt: maxAttempts,
         maxAttempts,
       });
+
+      const terminalFixture = await seedMaxTurnFixture({ issueStatus: "done" });
+      const terminal = await heartbeat.scheduleBoundedRetry(terminalFixture.runId, {
+        now: terminalFixture.now,
+        retryReason,
+        wakeReason,
+        maxAttempts,
+        delayMs: 1_000,
+      });
+      expect(terminal).toMatchObject({
+        outcome: "not_scheduled",
+        errorCode: "issue_terminal_status",
+        issueId: terminalFixture.issueId,
+      });
+
+      const staleLockFixture = await seedMaxTurnFixture();
+      await db
+        .update(issues)
+        .set({ executionRunId: null })
+        .where(eq(issues.id, staleLockFixture.issueId));
+      const staleLock = await heartbeat.scheduleBoundedRetry(staleLockFixture.runId, {
+        now: staleLockFixture.now,
+        retryReason,
+        wakeReason,
+        maxAttempts,
+        delayMs: 1_000,
+      });
+      expect(staleLock).toMatchObject({
+        outcome: "not_scheduled",
+        errorCode: "issue_execution_lock_changed",
+        issueId: staleLockFixture.issueId,
+      });
     },
   );
 

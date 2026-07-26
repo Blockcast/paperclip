@@ -814,6 +814,14 @@ function resolveAutomaticRunRetryOpts(
   return undefined;
 }
 
+function requiresIssueExecutionRetryLock(retryReason: string | null | undefined) {
+  return (
+    retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
+    retryReason === CAPACITY_BLOCKED_HEARTBEAT_RETRY_REASON ||
+    retryReason === JOB_FAILED_HEARTBEAT_RETRY_REASON
+  );
+}
+
 function isResolvedInteractionContinuationWakeContext(contextSnapshot: unknown) {
   const context = parseObject(contextSnapshot);
   const interactionId = readNonEmptyString(context.interactionId);
@@ -11695,7 +11703,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     ) {
       return {
         allowed: false,
-        reason: "Scheduled max-turn continuation suppressed because the issue execution lock belongs to a different run",
+        reason: "Scheduled retry suppressed because the issue execution lock belongs to a different run",
         errorCode: "issue_execution_lock_changed",
         issueId,
         details: {
@@ -11873,7 +11881,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agent,
       contextSnapshot,
       retryReason: dueRun.scheduledRetryReason,
-      enforceIssueExecutionLock: dueRun.scheduledRetryReason === MAX_TURN_CONTINUATION_RETRY_REASON,
+      enforceIssueExecutionLock: requiresIssueExecutionRetryLock(dueRun.scheduledRetryReason),
     });
     if (!gate.allowed) {
       if (
@@ -12338,7 +12346,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : baseSchedule;
 
     const requiresIssueGate =
-      retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
+      requiresIssueExecutionRetryLock(retryReason) ||
       retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON;
     if (requiresIssueGate) {
       const gate = await evaluateScheduledRetryGate({
@@ -12346,7 +12354,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         agent,
         contextSnapshot,
         retryReason,
-        enforceIssueExecutionLock: retryReason === MAX_TURN_CONTINUATION_RETRY_REASON,
+        enforceIssueExecutionLock: requiresIssueExecutionRetryLock(retryReason),
       });
       if (!gate.allowed) {
         await appendRunEvent(run, await nextRunEventSeq(run.id), {
@@ -12495,7 +12503,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
 
-      if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON) {
+      if (requiresIssueExecutionRetryLock(retryReason)) {
         if (issueId) {
           await tx.execute(
             sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} for update`,
@@ -12564,7 +12572,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (!lockedIssue) {
             return {
               outcome: "not_scheduled",
-              reason: "Scheduled max-turn continuation suppressed because the target issue no longer exists",
+              reason: "Scheduled retry suppressed because the target issue no longer exists",
               errorCode: "issue_not_found",
               issueId,
               details: { issueId },
@@ -12574,7 +12582,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (lockedIssue.assigneeAgentId !== run.agentId) {
             return {
               outcome: "not_scheduled",
-              reason: "Scheduled max-turn continuation suppressed because issue ownership changed",
+              reason: "Scheduled retry suppressed because issue ownership changed",
               errorCode: "issue_reassigned",
               issueId,
               details: {
@@ -12588,14 +12596,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (lockedIssue.status === "cancelled" || lockedIssue.status === "done") {
             return {
               outcome: "not_scheduled",
-              reason: `Scheduled max-turn continuation suppressed because issue reached terminal status (${lockedIssue.status})`,
+              reason: `Scheduled retry suppressed because issue reached terminal status (${lockedIssue.status})`,
               errorCode: lockedIssue.status === "cancelled" ? "issue_cancelled" : "issue_terminal_status",
               issueId,
               details: { issueId, currentStatus: lockedIssue.status },
             };
           }
 
-          if (lockedIssue.status !== "in_progress") {
+          if (
+            retryReason === MAX_TURN_CONTINUATION_RETRY_REASON &&
+            lockedIssue.status !== "in_progress"
+          ) {
             return {
               outcome: "not_scheduled",
               reason: `Scheduled max-turn continuation suppressed because issue is no longer in_progress (current status: ${lockedIssue.status})`,
@@ -12608,8 +12619,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (lockedIssue.executionRunId !== run.id) {
             return {
               outcome: "not_scheduled",
-              reason:
-                "Scheduled max-turn continuation suppressed because the issue execution lock belongs to a different run",
+              reason: "Scheduled retry suppressed because the issue execution lock belongs to a different run",
               errorCode: "issue_execution_lock_changed",
               issueId,
               details: {
