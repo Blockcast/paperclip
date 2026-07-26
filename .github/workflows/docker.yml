@@ -1,10 +1,15 @@
 name: Docker
 
 on:
-  # Urgent path: manual dispatch deploys master tip immediately, bypassing
-  # the 6h debounce below. Commit messages containing "[deploy]" do the
-  # same on push.
+  # Urgent path: manual dispatch deploys an approved immutable master commit,
+  # bypassing the 6h debounce below. Commit messages containing "[deploy]" do
+  # the same on push.
   workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Full approved commit SHA, reachable from master
+        required: true
+        type: string
   push:
     branches:
       - "master"
@@ -41,6 +46,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_sha || github.sha }}
+
+      - name: Resolve and validate target commit
+        id: target
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin master
+          full=$(git rev-parse HEAD)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+            ! git merge-base --is-ancestor "${full}" origin/master; then
+            echo "Target ${full} is not reachable from master" >&2
+            exit 1
+          fi
+          {
+            echo "full=${full}"
+            echo "short=${full:0:7}"
+          } >> "$GITHUB_OUTPUT"
 
       # Self-hosted runner reuses its workspace across builds. A previous
       # build (or a developer session sharing the same checkout dir) may
@@ -165,8 +189,9 @@ jobs:
           images: |
             harbor.blockcast.net/paperclip/paperclip
           tags: |
-            type=sha,prefix=sha-,suffix=-k8s-vendored,format=short
-            type=raw,value=latest-k8s-vendored,enable={{is_default_branch}}
+            type=sha,prefix=sha-,suffix=-k8s-vendored,format=short,enable=${{ github.event_name != 'workflow_dispatch' }}
+            type=raw,value=sha-${{ steps.target.outputs.short }}-k8s-vendored,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=latest-k8s-vendored,enable=${{ github.ref == 'refs/heads/master' && github.event_name != 'workflow_dispatch' }}
 
       - name: Build and push
         id: build
@@ -203,9 +228,13 @@ jobs:
           secrets: |
             gh_token=${{ secrets.PAPERCLIP_BOARD_TOKEN }}
 
-      - name: Compute short sha
-        id: sha
-        run: echo "short=$(git rev-parse --short=7 ${{ github.sha }})" >> "$GITHUB_OUTPUT"
+      - name: Record built artifact
+        run: |
+          {
+            echo "### Paperclip image"
+            echo "- Commit: \`${{ steps.target.outputs.full }}\`"
+            echo "- Image: \`harbor.blockcast.net/paperclip/paperclip:sha-${{ steps.target.outputs.short }}-k8s-vendored@${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
     needs: build-and-push
@@ -223,10 +252,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_sha || github.sha }}
 
-      - name: Compute short sha
-        id: sha
-        run: echo "short=$(git rev-parse --short=7 ${{ github.sha }})" >> "$GITHUB_OUTPUT"
+      - name: Resolve and validate target commit
+        id: target
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin master
+          full=$(git rev-parse HEAD)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+            ! git merge-base --is-ancestor "${full}" origin/master; then
+            echo "Target ${full} is not reachable from master" >&2
+            exit 1
+          fi
+          {
+            echo "full=${full}"
+            echo "short=${full:0:7}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Write kubeconfig
         env:
@@ -309,8 +353,8 @@ jobs:
       # Verify it actually exists in Harbor before helm rolls the STS —
       # protects against a window firing between a merge and its build
       # finishing.
-      - name: Login to Harbor (tag check)
-        if: ${{ steps.gate.outputs.proceed == 'true' && github.event_name != 'push' }}
+      - name: Login to Harbor (artifact check)
+        if: ${{ steps.gate.outputs.proceed == 'true' }}
         uses: docker/login-action@v4
         with:
           registry: harbor.blockcast.net
@@ -320,7 +364,7 @@ jobs:
       - name: Verify image tag exists
         if: ${{ steps.gate.outputs.proceed == 'true' && github.event_name != 'push' }}
         env:
-          TAG: sha-${{ steps.sha.outputs.short }}-k8s-vendored
+          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
         run: |
           set -e
           for i in 1 2 3; do
@@ -334,6 +378,21 @@ jobs:
           echo "tag ${TAG} missing after retries; failing this window — the next one retries" >&2
           exit 1
 
+      - name: Record deploy artifact
+        if: ${{ steps.gate.outputs.proceed == 'true' }}
+        env:
+          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
+        run: |
+          set -euo pipefail
+          image="harbor.blockcast.net/paperclip/paperclip:${TAG}"
+          digest=$(docker buildx imagetools inspect "${image}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          {
+            echo "### Paperclip deploy target"
+            echo "- Commit: \`${{ steps.target.outputs.full }}\`"
+            echo "- Image: \`${image}@${digest}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # Use --set image.tag so the deployed tag tracks the just-built image
       # without committing to values.blockcast.yaml. The committed values
       # file remains the source of truth for non-CI deploys; CI runs are
@@ -345,7 +404,7 @@ jobs:
         env:
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
           RELEASE: ${{ vars.PAPERCLIP_HELM_RELEASE || 'paperclip' }}
-          TAG: sha-${{ steps.sha.outputs.short }}-k8s-vendored
+          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
         run: |
           set -e
           echo "rolling out ${TAG} to ${NS}/${RELEASE}"
