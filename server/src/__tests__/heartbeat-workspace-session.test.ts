@@ -758,6 +758,74 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
   });
 });
 
+describe("assertGitSensitiveAdapterWorkspaceValid rejects claude_k8s agent-home dispatch (BLO-18147)", () => {
+  // claude_k8s pods bootstrap their own git workspace in-pod by locally
+  // `git clone --shared`-ing from the resolved cwd. When no project/session
+  // workspace is available that cwd falls back to the shared AGENT_HOME dir;
+  // a clone failure there exits the container with git's raw 128 before
+  // `claude` starts, burning Job backoff budget. Refuse dispatch up front.
+  const fallbackCwd = resolveDefaultAgentWorkspaceDir("agent-1");
+
+  it("rejects a claude_k8s run whose resolved workspace fell back to the shared agent-home cwd", async () => {
+    await expectWorkspaceValidationFailure(
+      buildWorkspaceValidationInput({
+        adapterType: "claude_k8s",
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-1",
+          projectId: null,
+          projectWorkspaceId: null,
+        },
+        resolvedWorkspace: buildResolvedWorkspace({
+          cwd: fallbackCwd,
+          source: "agent_home",
+          projectId: null,
+          workspaceId: null,
+        }),
+        persistedExecutionWorkspace: null,
+        executionTarget: { kind: "remote" },
+      }),
+      "k8s_agent_home_git_bootstrap_unsupported",
+      "Refusing to dispatch claude_k8s from the shared agent-home fallback cwd",
+    );
+  });
+
+  it("does not reject a claude_k8s run bound to a project workspace", async () => {
+    await expect(
+      assertGitSensitiveAdapterWorkspaceValid(
+        buildWorkspaceValidationInput({
+          adapterType: "claude_k8s",
+          executionTarget: { kind: "remote" },
+        }),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("does not apply the k8s agent-home guard to opencode_k8s (BLO-18145: observed healthy through the same incident window)", async () => {
+    await expect(
+      assertGitSensitiveAdapterWorkspaceValid(
+        buildWorkspaceValidationInput({
+          adapterType: "opencode_k8s",
+          issue: {
+            id: "issue-1",
+            identifier: "PAP-1",
+            projectId: null,
+            projectWorkspaceId: null,
+          },
+          resolvedWorkspace: buildResolvedWorkspace({
+            cwd: fallbackCwd,
+            source: "agent_home",
+            projectId: null,
+            workspaceId: null,
+          }),
+          persistedExecutionWorkspace: null,
+          executionTarget: { kind: "remote" },
+        }),
+      ),
+    ).resolves.toBeUndefined();
+  });
+});
+
 describe("assertGitWorktreeBaseWorkspaceReady", () => {
   it("rejects projectless isolated git worktrees that resolved to agent_home", async () => {
     const fallbackCwd = resolveDefaultAgentWorkspaceDir("agent-1");

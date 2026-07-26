@@ -550,6 +550,17 @@ const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "opencode_local",
   "pi_local",
 ]);
+// BLO-18147: claude_k8s pods bootstrap their own git workspace in-pod by
+// locally `git clone --shared`-ing from the adapter's resolved cwd (confirmed
+// live from a running pod's entrypoint). When no project or session
+// workspace is available, that cwd falls back to the shared, actively-
+// mutated per-agent AGENT_HOME directory on the same storage-sensitive
+// cephfs PVC implicated in BLO-17793; a clone failure there surfaces as
+// git's raw exit 128 and kills the container before `claude` even starts,
+// burning Job backoff budget instead of a recoverable error. Scoped to
+// claude_k8s only — opencode_k8s pods were observed healthy through the same
+// incident window (BLO-18145) and are not known to share this bootstrap path.
+const K8S_GIT_SENSITIVE_ADAPTER_TYPES = new Set(["claude_k8s"]);
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -2024,6 +2035,39 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   environmentDriver?: string | null;
   leaseMetadata?: unknown;
 }) {
+  // BLO-18147: refuse to dispatch a claude_k8s run whose resolved workspace
+  // fell back to the shared per-agent AGENT_HOME cwd. That cwd is the source
+  // the in-pod entrypoint locally `git clone --shared`s from at startup
+  // (confirmed live from a running pod's own process tree); a clone failure
+  // there — e.g. under the cephfs storage pressure tracked by BLO-17793 —
+  // exits the container with git's raw 128 before `claude` even starts,
+  // burning Job backoff budget on a dispatch that was doomed from the start.
+  // Fail loud here instead, before any Job is created, so the run surfaces a
+  // clear, actionable control-plane error and the issue lands in a visible
+  // state (blocked/needs-workspace) rather than looping BackoffLimitExceeded.
+  if (
+    K8S_GIT_SENSITIVE_ADAPTER_TYPES.has(input.adapterType) &&
+    !input.resolvedWorkspace.realizationFailure &&
+    input.resolvedWorkspace.source === "agent_home"
+  ) {
+    const k8sIssue = input.issue;
+    throw new WorkspaceValidationFailure(
+      k8sIssue
+        ? `Issue ${k8sIssue.identifier ?? k8sIssue.id} has no project or session execution workspace. Refusing to dispatch ${input.adapterType} from the shared agent-home fallback cwd "${input.resolvedWorkspace.cwd}" — its in-pod git bootstrap clones locally from this cwd and can exit 128 under storage pressure on the shared PVC (BLO-18147). Bind a project or execution workspace to this issue before retrying.`
+        : `Refusing to dispatch ${input.adapterType} from the shared agent-home fallback cwd "${input.resolvedWorkspace.cwd}" with no issue context (BLO-18147).`,
+      {
+        workspaceValidation: {
+          reason: "k8s_agent_home_git_bootstrap_unsupported",
+          adapterType: input.adapterType,
+          issueId: k8sIssue?.id ?? null,
+          issueIdentifier: k8sIssue?.identifier ?? null,
+          resolvedWorkspaceSource: input.resolvedWorkspace.source,
+          resolvedWorkspaceCwd: input.resolvedWorkspace.cwd,
+        },
+      },
+    );
+  }
+
   if (!GIT_SENSITIVE_LOCAL_ADAPTER_TYPES.has(input.adapterType)) return;
 
   const executionTargetKind = readNonEmptyString((input.executionTarget as { kind?: unknown } | null)?.kind) ?? "local";
