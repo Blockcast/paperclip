@@ -6275,7 +6275,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       update.status = "blocked";
     }
 
-    let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
+    let persistedBlockerIds = nextBlockerIds;
+    let updated: Awaited<ReturnType<typeof issuesSvc.update>> | typeof input.issue;
     try {
       updated = await issuesSvc.update(input.issue.id, update);
     } catch (error) {
@@ -6289,11 +6290,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         },
         "skipping cycle-forming liveness escalation blocker relation",
       );
-      if (isAlreadyBlocked) return input.issue;
-      updated = await issuesSvc.update(input.issue.id, {
-        status: "blocked",
-        blockedByIssueIds: blockerIds,
-      });
+      persistedBlockerIds = blockerIds;
+      updated = isAlreadyBlocked
+        ? input.issue
+        : await issuesSvc.update(input.issue.id, {
+          status: "blocked",
+          blockedByIssueIds: blockerIds,
+        });
     }
     if (!updated) return null;
 
@@ -6310,7 +6313,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         source: "recovery.reconcile_issue_graph_liveness",
         incidentKey: input.finding.incidentKey,
         findingState: input.finding.state,
-        blockerIssueIds: nextBlockerIds,
+        blockerIssueIds: persistedBlockerIds,
         escalationIssueId: input.escalationIssueId,
         status: update.status ?? input.issue.status,
         previousStatus: input.issue.status,

@@ -156,7 +156,6 @@ import {
 } from "./heartbeat-stop-metadata.js";
 import {
   classifyRunLiveness,
-  hasConcreteActionEvidence,
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
 import {
@@ -14467,23 +14466,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }) {
     let preserveRecordedOutcome = false;
     if (!input.staleKill && !input.jobStatus) {
-      const livenessInput = await buildRunLivenessInput(input.run, parseObject(input.run.resultJson));
-      const reviewEvidence = evaluatePrReviewCompletionEvidence(
+      let reviewEvidence = evaluatePrReviewCompletionEvidence(
         parseObject(input.run.contextSnapshot),
         { resultJson: parseObject(input.run.resultJson) },
       );
+      if (reviewEvidence.status === "missing") {
+        try {
+          const prReview = derivePaperclipPrReview(parseObject(input.run.contextSnapshot));
+          if (prReview?.repoFullName && prReview.prNumber !== null) {
+            const verified = await githubHasReviewerEvidenceForPr({
+              repoFullName: prReview.repoFullName,
+              prNumber: prReview.prNumber,
+              headSha: prReview.headSha,
+            });
+            if ("found" in verified && verified.found) {
+              reviewEvidence = { status: "posted_review" };
+            }
+          }
+        } catch {
+          // GitHub verification is additive; failures retain the local missing verdict.
+        }
+      }
       preserveRecordedOutcome = reviewEvidence.status === "posted_review" ||
         reviewEvidence.status === "already_reviewed" ||
         reviewEvidence.status === "archived_repo_skipped" ||
-        reviewEvidence.status === "self_review_skipped" ||
-        (
-          reviewEvidence.status === "not_applicable" &&
-          hasConcreteActionEvidence({
-            issueCommentsCreated: livenessInput.evidence?.issueCommentsCreated,
-            documentRevisionsCreated: livenessInput.evidence?.documentRevisionsCreated,
-            workProductsCreated: livenessInput.evidence?.workProductsCreated,
-          })
-        );
+        reviewEvidence.status === "self_review_skipped";
     }
     const terminalOutcome = input.staleKill
       ? {
