@@ -3524,6 +3524,7 @@ export function issueRoutes(
       parentId: string | null;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      createdByAgentId?: string | null;
       status: string;
     },
     action: "issue:comment" | "issue:read" | "issue:mutate",
@@ -3539,6 +3540,7 @@ export function issueRoutes(
         parentIssueId: issue.parentId,
         assigneeAgentId: issue.assigneeAgentId,
         assigneeUserId: issue.assigneeUserId,
+        createdByAgentId: issue.createdByAgentId ?? null,
         status: issue.status,
       },
       scope: {
@@ -3569,6 +3571,7 @@ export function issueRoutes(
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      createdByAgentId?: string | null;
     },
   ) {
     if (req.actor.type !== "agent") return true;
@@ -3728,6 +3731,7 @@ export function issueRoutes(
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      createdByAgentId?: string | null;
       checkoutRunId?: string | null;
       executionRunId?: string | null;
       executionState?: unknown;
