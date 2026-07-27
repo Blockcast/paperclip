@@ -567,6 +567,80 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
+  // BLO-18152: POST /issues/:id/comments and PATCH /issues/:id { comment }
+  // write the same comment record, so an actor's authorization outcome must
+  // be identical on both — a source_scoped_recovery_action-style run that
+  // currently holds the issue's execution lock is not the assignee, so
+  // access.decide() denies the base issue:comment / issue:mutate boundary,
+  // but the current-execution-run bypass must allow both anyway.
+  it("allows the current execution-run holder through POST comments and PATCH {comment} even when access.decide denies the boundary", async () => {
+    const recoveryAgentId = "55555555-5555-4555-8555-555555555555";
+    const recoveryActor = agentActor(recoveryAgentId); // runId: "run-1"
+    const issueWithRecoveryLock = {
+      ...makeIssue("todo"),
+      checkoutRunId: "run-1",
+      executionRunId: "run-1",
+    };
+    mockIssueService.getById.mockResolvedValue(issueWithRecoveryLock);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issueWithRecoveryLock,
+      ...patch,
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: false,
+      action: input.action,
+      reason: "deny_low_trust_boundary",
+      explanation: "Simulated narrower per-request trust boundary (e.g. source_scoped_recovery_action).",
+    }));
+
+    const commentRes = await request(await installActor(createApp(), recoveryActor))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Progress update from the current execution run." });
+    expect(commentRes.status, JSON.stringify(commentRes.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+
+    // Reset between the two requests so the PATCH assertions below cannot be
+    // satisfied by the POST's calls — the whole point of this test is that each
+    // endpoint independently lets the execution-run holder through.
+    mockIssueService.addComment.mockClear();
+    mockIssueService.update.mockClear();
+
+    const patchRes = await request(await installActor(createApp(), recoveryActor))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "Progress update via PATCH." });
+    expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(200);
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("denies both POST comments and PATCH {comment} for an actor outside the boundary who does not hold the execution lock", async () => {
+    const outsideAgentId = "55555555-5555-4555-8555-555555555555";
+    const outsideActor = agentActor(outsideAgentId); // runId: "run-1"
+    // No checkoutRunId/executionRunId matches this actor's run: it is
+    // genuinely outside the boundary, not merely narrowly scoped.
+    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: false,
+      action: input.action,
+      reason: "deny_low_trust_boundary",
+      explanation: "Peer agent is outside this low-trust boundary.",
+    }));
+
+    const commentRes = await request(await installActor(createApp(), outsideActor))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "I should not be allowed." });
+    const patchRes = await request(await installActor(createApp(), outsideActor))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "I should not be allowed either." });
+
+    expect(commentRes.status, JSON.stringify(commentRes.body)).toBe(403);
+    expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(403);
+    expect(commentRes.body.error).toBe("Issue is outside this actor's authorization boundary (trust-boundary)");
+    expect(patchRes.body.error).toBe("Issue is outside this actor's authorization boundary (trust-boundary)");
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("implicitly reopens closed issues via POST comments when an agent is assigned", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
@@ -696,7 +770,10 @@ describe.sequential("issue comment reopen routes", () => {
         .send({ body: "Please continue this closed issue.", ...intent });
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
-      expect(res.body).toEqual({ error: "Issue is outside this actor's authorization boundary" });
+      expect(res.body).toEqual({
+        error: "Issue is outside this actor's authorization boundary (grant)",
+        details: { reason: "deny_missing_grant", boundary: "grant" },
+      });
       expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:comment" }));
       expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
       expect(mockIssueService.update).not.toHaveBeenCalled();

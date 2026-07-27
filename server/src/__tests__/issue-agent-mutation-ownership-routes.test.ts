@@ -958,7 +958,8 @@ describe("agent issue mutation checkout ownership", () => {
       .send({ body: "I was not mentioned." });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (grant)");
+    expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
@@ -974,7 +975,7 @@ describe("agent issue mutation checkout ownership", () => {
       .get(`/api/issues/${issueId}/comments`);
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (trust-boundary)");
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:read" }));
   });
 
@@ -990,7 +991,7 @@ describe("agent issue mutation checkout ownership", () => {
       .get(`/api/issues/${issueId}/interactions`);
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (trust-boundary)");
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:read" }));
     expect(mockIssueThreadInteractionService.listForIssue).not.toHaveBeenCalled();
   });
@@ -1036,7 +1037,7 @@ describe("agent issue mutation checkout ownership", () => {
       .get(`/api/issues/${issueId}/comments/comment-1`);
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (trust-boundary)");
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:read" }));
     expect(mockIssueService.getComment).not.toHaveBeenCalled();
   });
@@ -2315,20 +2316,27 @@ describe("agent issue mutation checkout ownership", () => {
       }));
     }
 
-    it("lets a watchdog run comment on a watched issue assigned to a different agent", async () => {
+    it("allows both POST comments and PATCH {comment} for a valid watchdog-scoped current run", async () => {
       denyBaseBoundary();
-      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
+      const watchedIssue = makeIssue({
+        assigneeAgentId: ownerAgentId,
+        executionRunId: watchdogRunId,
+      });
+      mockIssueService.getById.mockResolvedValue(watchedIssue);
+      mockIssueService.update.mockResolvedValue(watchedIssue);
 
       const app = await createApp(watchdogActor(), createWatchdogDb());
-      const res = await request(app).post(`/api/issues/${issueId}/comments`).send({ body: "Watchdog finding" });
+      const postRes = await request(app).post(`/api/issues/${issueId}/comments`).send({ body: "Watchdog finding" });
+      expect(postRes.status, JSON.stringify(postRes.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
 
-      expect(res.status, JSON.stringify(res.body)).toBe(201);
-      expect(mockIssueService.addComment).toHaveBeenCalledWith(
-        issueId,
-        "Watchdog finding",
-        expect.any(Object),
-        expect.any(Object),
-      );
+      mockIssueService.addComment.mockClear();
+      mockIssueService.update.mockClear();
+
+      const patchRes = await request(app).patch(`/api/issues/${issueId}`).send({ comment: "Watchdog finding" });
+      expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(200);
+      expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+      expect(mockIssueService.update).toHaveBeenCalledTimes(1);
     });
 
     it.each([
@@ -2574,18 +2582,25 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
-    it("denies an invalid watchdog run context even when the base boundary would allow it", async () => {
+    it("denies both POST comments and PATCH {comment} for an invalid watchdog-scoped current run", async () => {
       // Run context claims a watched issue, but no active persisted watchdog backs it.
       const app = await createApp(
         watchdogActor(),
         createWatchdogDb({ watchdogRows: [] }),
       );
-      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: peerAgentId }));
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        assigneeAgentId: peerAgentId,
+        executionRunId: watchdogRunId,
+      }));
 
-      const res = await request(app).patch(`/api/issues/${issueId}`).send({ status: "blocked" });
+      const postRes = await request(app).post(`/api/issues/${issueId}/comments`).send({ body: "Invalid watchdog" });
+      const patchRes = await request(app).patch(`/api/issues/${issueId}`).send({ comment: "Invalid watchdog" });
 
-      expect(res.status, JSON.stringify(res.body)).toBe(403);
-      expect(res.body.error).toBe("Task-watchdog run context is not backed by an active persisted watchdog.");
+      expect(postRes.status, JSON.stringify(postRes.body)).toBe(403);
+      expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(403);
+      expect(postRes.body.error).toBe("Task-watchdog run context is not backed by an active persisted watchdog.");
+      expect(patchRes.body.error).toBe("Task-watchdog run context is not backed by an active persisted watchdog.");
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
   });
