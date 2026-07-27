@@ -7,7 +7,7 @@ import type {
   UserSecretCoverageSummary,
   UserSecretDefinition,
 } from "@paperclipai/shared";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter } from "react-router";
 import { MyUserSecretsTab } from "@/pages/secrets/MyUserSecretsTab";
 import { UserSecretDefinitionsTab } from "@/pages/secrets/UserSecretDefinitionsTab";
 import { MissingUserSecretsBanner } from "@/pages/secrets/MissingUserSecretsBanner";

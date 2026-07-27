@@ -5,7 +5,7 @@ import { flushSync } from "react-dom";
 import type { AnchorHTMLAttributes, ReactElement, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter } from "react-router";
 import type { IssueRetryNowOutcome, IssueScheduledRetry } from "@paperclipai/shared";
 import { IssueBlockedNotice } from "./IssueBlockedNotice";
 import { ToastProvider } from "../context/ToastContext";

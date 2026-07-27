@@ -181,7 +181,7 @@ export interface HostNavigationLinkProps
 /**
  * Snapshot of the host router location, exposed to plugin UI through
  * `useHostLocation()`. Mirrors the relevant subset of `Location` from
- * `react-router-dom` so plugins can react to URL changes without importing
+ * `react-router` so plugins can react to URL changes without importing
  * router internals.
  *
  * @see PLUGIN_SPEC.md §19 — UI Extension Model
