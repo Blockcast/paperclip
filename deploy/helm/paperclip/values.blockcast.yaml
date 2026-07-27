@@ -150,9 +150,10 @@ env:
     # below, with the advisory (package, manifest path, GHSA/CVE, vulnerable
     # range, first patched version) unpacked into the wake contextSnapshot.
     # The agent bumps the dependency and shepherds the fix through CI. The
-    # repo webhook (Blockcast/paperclip hook 623235645) is subscribed to
-    # `dependabot_alert`; events are 200-ignored until the routing image is
-    # live, then routed here.
+    # repo webhooks for Blockcast/paperclip (623235645) and Blockcast/magma
+    # (626142749) are subscribed to `dependabot_alert`. Actionable events route
+    # here; fixed/dismissed events become permitted terminal-state receipts on
+    # the scoped Paperclip issue without querying the Dependabot alert API.
     - name: PAPERCLIP_DEPENDABOT_AGENT_ID
       value: "c0bccc75-a449-4ece-a789-ce40bdd8e785"
     # Severity floor for dependabot wakes (low|medium|high|critical). high

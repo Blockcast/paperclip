@@ -36,7 +36,7 @@ import {
   issueComments,
   issues,
 } from "@paperclipai/db";
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import {
@@ -702,7 +702,7 @@ const DEPENDABOT_SEVERITY_RANK: Record<string, number> = {
 };
 
 type DependabotAlertContext = {
-  action: "created" | "reintroduced" | "reopened";
+  action: "created" | "reintroduced" | "reopened" | "fixed" | "dismissed" | "auto_dismissed";
   alertNumber: number;
   severity: string;
   packageName: string | null;
@@ -728,11 +728,17 @@ function isActionableDependabotAlertAction(
   return action === "created" || action === "reintroduced" || action === "reopened";
 }
 
+function isTerminalDependabotAlertAction(
+  action: string | undefined,
+): action is "fixed" | "dismissed" | "auto_dismissed" {
+  return action === "fixed" || action === "dismissed" || action === "auto_dismissed";
+}
+
 function resolveDependabotAlertContext(
   payload: Record<string, unknown>,
 ): DependabotAlertContext | null {
   const action = payload.action as string | undefined;
-  if (!isActionableDependabotAlertAction(action)) return null;
+  if (!isActionableDependabotAlertAction(action) && !isTerminalDependabotAlertAction(action)) return null;
   const alert = payload.alert as Record<string, unknown> | undefined;
   if (!alert || typeof alert.number !== "number") return null;
   const advisory = alert.security_advisory as Record<string, unknown> | undefined;
@@ -888,6 +894,112 @@ async function resolveDependabotAlertIssue(
     const raced = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
     if (raced) return { id: raced.id, identifier: raced.identifier, reused: true };
     throw error;
+  }
+}
+
+function buildDependabotTerminalReceipt(input: {
+  repoFullName: string;
+  alert: DependabotAlertContext;
+  deliveryId: string | null;
+}): string {
+  const alertUrl =
+    input.alert.alertUrl ??
+    `https://github.com/${input.repoFullName}/security/dependabot/${input.alert.alertNumber}`;
+  return [
+    "[github-dependabot-receipt] Terminal Dependabot state received through the HMAC-verified GitHub webhook.",
+    `- Repository: \`${input.repoFullName}\``,
+    `- Alert: [#${input.alert.alertNumber}](${alertUrl})`,
+    `- Action: \`${input.alert.action}\``,
+    `- GitHub delivery: \`${input.deliveryId ?? "unavailable"}\``,
+    "- Evidence path: delivered `dependabot_alert` webhook; no Dependabot REST or GraphQL query was used.",
+  ].join("\n");
+}
+
+async function recordDependabotTerminalReceipt(
+  db: Db,
+  input: {
+    companyId: string;
+    assigneeAgentId: string;
+    originId: string;
+    repoFullName: string;
+    alert: DependabotAlertContext;
+    deliveryId: string | null;
+  },
+): Promise<void> {
+  let issue = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
+  if (!issue) {
+    issue = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.companyId),
+          eq(issues.originKind, GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND),
+          eq(issues.originId, input.originId),
+          isNull(issues.hiddenAt),
+        ),
+      )
+      .orderBy(desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+  const receiptBody = buildDependabotTerminalReceipt(input);
+
+  if (!issue) {
+    issue = await issueService(db).create(input.companyId, {
+      title: `Dependabot terminal receipt: ${input.repoFullName}#${input.alert.alertNumber} ${input.alert.action}`,
+      description: [
+        receiptBody,
+        "",
+        "## Acceptance criteria",
+        `- Dependabot alert #${input.alert.alertNumber} is recorded in a terminal state from a permitted webhook delivery.`,
+        "",
+        "## Verifying signal",
+        `- GitHub delivery \`${input.deliveryId ?? "unavailable"}\` is preserved in the system comment on this issue.`,
+      ].join("\n"),
+      status: "done",
+      priority: DEPENDABOT_SEVERITY_TO_ISSUE_PRIORITY[input.alert.severity] ?? "medium",
+      assigneeAgentId: input.assigneeAgentId,
+      originKind: GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND,
+      originId: input.originId,
+      originFingerprint: input.originId,
+    });
+  }
+
+  const externalKey = `${input.originId}:${input.alert.action}:${input.deliveryId ?? "no-delivery"}`;
+  const existingReceipt = await db
+    .select({ id: issueComments.id })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.issueId, issue.id),
+        sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+        sql`${issueComments.metadata}->>'externalKey' = ${externalKey}`,
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+
+  if (!existingReceipt) {
+    await db.insert(issueComments).values({
+      companyId: input.companyId,
+      issueId: issue.id,
+      authorType: "system",
+      body: receiptBody,
+      metadata: {
+        kind: "github_dependabot_terminal_receipt",
+        source: "github",
+        externalKey,
+        repoFullName: input.repoFullName,
+        alertNumber: input.alert.alertNumber,
+        action: input.alert.action,
+        deliveryId: input.deliveryId,
+      } as never,
+    });
+  }
+
+  if (issue.status !== "done") {
+    await issueService(db).update(issue.id, { status: "done" });
   }
 }
 
@@ -1603,7 +1715,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     const dependabotWakeFired = await (async () => {
       if (eventName !== "dependabot_alert" || !config.dependabotAgentId) return false;
       const action = payload.action as string | undefined;
-      if (!isActionableDependabotAlertAction(action)) return false;
+      if (!isActionableDependabotAlertAction(action) && !isTerminalDependabotAlertAction(action)) return false;
 
       const repository = payload.repository as Record<string, unknown> | undefined;
       const alertRepoFullName = (repository?.full_name as string | undefined) ?? null;
@@ -1629,10 +1741,6 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         return false;
       }
 
-      const floor =
-        DEPENDABOT_SEVERITY_RANK[config.dependabotMinSeverity ?? "high"] ?? DEPENDABOT_SEVERITY_RANK.high;
-      if ((DEPENDABOT_SEVERITY_RANK[alert.severity] ?? -1) < floor) return false;
-
       if (!alertRepoFullName) {
         logger.error(
           { event: eventName, deliveryId, action, alertNumber: alert.alertNumber },
@@ -1655,6 +1763,24 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
 
       const taskKey = `github-dependabot:${alertRepoFullName}#${alert.alertNumber}`;
+      if (isTerminalDependabotAlertAction(alert.action)) {
+        const companyId = await getAgentCompanyId(db, config.dependabotAgentId);
+        if (!companyId) return false;
+        await recordDependabotTerminalReceipt(db, {
+          companyId,
+          assigneeAgentId: config.dependabotAgentId,
+          originId: taskKey,
+          repoFullName: alertRepoFullName,
+          alert,
+          deliveryId,
+        });
+        return false;
+      }
+
+      const floor =
+        DEPENDABOT_SEVERITY_RANK[config.dependabotMinSeverity ?? "high"] ?? DEPENDABOT_SEVERITY_RANK.high;
+      if ((DEPENDABOT_SEVERITY_RANK[alert.severity] ?? -1) < floor) return false;
+
       const idempotencyKey =
         alert.action === "created"
           ? `${taskKey}:created`
