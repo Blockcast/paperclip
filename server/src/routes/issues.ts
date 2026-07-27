@@ -3554,7 +3554,7 @@ export function issueRoutes(
   // BLO-18152: every "Issue is outside this actor's authorization boundary"
   // response (issue:read, issue:comment, issue:mutate) renders through this
   // one function so the message always names which boundary fired instead of
-  // leaving the caller to guess whether it was a source-scope, trust-boundary,
+  // leaving the caller to guess whether it was a scope, trust-boundary,
   // membership, or company-mismatch rejection.
   function respondIssueBoundaryDenied(res: Response, decision: Awaited<ReturnType<typeof decideIssueAccess>>) {
     res.status(403).json({

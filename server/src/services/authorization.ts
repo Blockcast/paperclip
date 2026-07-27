@@ -530,7 +530,7 @@ export function authorizationDeniedDetails(decision: AuthorizationDecision) {
 export function authorizationBoundaryLabel(reason: AuthorizationDecision["reason"]): string {
   switch (reason) {
     case "deny_scope":
-      return "source-scope";
+      return "scope";
     case "deny_low_trust_boundary":
     case "deny_policy_restricted":
       return "trust-boundary";
