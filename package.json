@@ -130,7 +130,8 @@
   },
   "pnpm": {
     "patchedDependencies": {
-      "embedded-postgres@18.1.0-beta.16": "patches/embedded-postgres@18.1.0-beta.16.patch"
+      "embedded-postgres@18.1.0-beta.16": "patches/embedded-postgres@18.1.0-beta.16.patch",
+      "brace-expansion@5.0.8": "patches/brace-expansion@5.0.8.patch"
     },
     "overrides": {
       "rollup": ">=4.59.0",
@@ -150,8 +151,7 @@
       "ip-address": "^10.1.1",
       "picomatch": "^4.0.4",
       "@anthropic-ai/sdk": ">=0.91.1",
-      "brace-expansion@1": "^1.1.16",
-      "brace-expansion@5": "^5.0.7",
+      "brace-expansion": "^5.0.8",
       "@tootallnate/once": "^2.0.1",
       "form-data": ">=4.0.6",
       "@babel/core": ">=7.29.7 <8",
