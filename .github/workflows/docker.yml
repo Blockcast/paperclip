@@ -319,6 +319,18 @@ jobs:
           kubectl auth whoami -o yaml
           kubectl -n "$NS" get statefulset paperclip -o jsonpath='{.spec.replicas}{"\n"}'
 
+      - name: Login to Harbor (scheduled gate)
+        if: ${{ github.event_name == 'schedule' }}
+        uses: docker/login-action@v4
+        with:
+          registry: harbor.blockcast.net
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        if: ${{ github.event_name == 'schedule' }}
+        uses: docker/setup-buildx-action@v4
+
       # Debounce (BLO-12563): on plain push events, skip the rollout while
       # paperclip-0 is younger than 6h — per-merge deploys were recreating
       # the worker ~hourly and every roll strands whatever agent run is
@@ -329,20 +341,36 @@ jobs:
         id: gate
         env:
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
+          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
         run: |
-          set -e
+          set -euo pipefail
           if [ "${{ github.event_name }}" = "schedule" ]; then
             # BLO-12563: the 6h catch-up window must not double-roll a pod that a
             # recent push already rolled to tip. Skip only when paperclip-0 is
-            # <6h old AND already running the tip sha; otherwise deploy (a
+            # <6h old AND already running the tip digest; otherwise deploy (a
             # debounced commit is still waiting for this window).
             CREATED=$(kubectl -n "$NS" get pod paperclip-0 -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null || true)
             RUNNING_IMG=$(kubectl -n "$NS" get sts paperclip -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
-            TIP_SHORT=$(git rev-parse --short=7 HEAD)
+            image="harbor.blockcast.net/paperclip/paperclip:${TAG}"
+            digest=""
+            for i in 1 2 3; do
+              if digest=$(docker buildx imagetools inspect "${image}" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"') \
+                && [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                break
+              fi
+              digest=""
+              echo "tag ${TAG} not resolvable (attempt $i) — retrying in 60s (a push build may still be running)"
+              sleep 60
+            done
+            if [ -z "${digest}" ]; then
+              echo "tag ${TAG} missing after retries; failing this window — the next one retries" >&2
+              exit 1
+            fi
+            EXPECTED_IMG="harbor.blockcast.net/paperclip/paperclip@${digest}"
             if [ -n "$CREATED" ]; then
               AGE=$(( $(date +%s) - $(date -d "$CREATED" +%s) ))
-              if [ "$AGE" -lt 21600 ] && printf '%s' "$RUNNING_IMG" | grep -qF "sha-${TIP_SHORT}"; then
-                echo "schedule window: paperclip-0 ${AGE}s old and already running tip (sha-${TIP_SHORT}) — skipping catch-up roll"
+              if [ "$AGE" -lt 21600 ] && [ "$RUNNING_IMG" = "$EXPECTED_IMG" ]; then
+                echo "schedule window: paperclip-0 ${AGE}s old and already running tip (${EXPECTED_IMG}) — skipping catch-up roll"
                 echo "proceed=false" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
@@ -381,7 +409,7 @@ jobs:
       # protects against a window firing between a merge and its build
       # finishing.
       - name: Login to Harbor (artifact check)
-        if: ${{ steps.gate.outputs.proceed == 'true' }}
+        if: ${{ steps.gate.outputs.proceed == 'true' && github.event_name != 'schedule' }}
         uses: docker/login-action@v4
         with:
           registry: harbor.blockcast.net
@@ -389,7 +417,7 @@ jobs:
           password: ${{ secrets.HARBOR_PASSWORD }}
 
       - name: Set up Docker Buildx
-        if: ${{ steps.gate.outputs.proceed == 'true' }}
+        if: ${{ steps.gate.outputs.proceed == 'true' && github.event_name != 'schedule' }}
         uses: docker/setup-buildx-action@v4
 
       - name: Verify image tag exists

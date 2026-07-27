@@ -63,6 +63,20 @@ test("Docker deploy job provisions Buildx before inspecting the artifact", () =>
   assert.ok(setup < inspect, "deploy job must provision Buildx before artifact inspection");
 });
 
+test("scheduled deploy gate recognizes a recent digest-pinned tip", () => {
+  const deployJob = getDeployJobBlock();
+  const gateStart = deployJob.indexOf("- name: Deploy gate (6h debounce on push)");
+  const gateEnd = deployJob.indexOf("\n      - name:", gateStart + 1);
+  assert.notEqual(gateStart, -1, "deploy job must define the debounce gate");
+  assert.notEqual(gateEnd, -1, "debounce gate must be followed by another step");
+  const gate = deployJob.slice(gateStart, gateEnd);
+
+  assert.match(gate, /docker buildx imagetools inspect "\$\{image\}"/);
+  assert.match(gate, /EXPECTED_IMG="harbor\.blockcast\.net\/paperclip\/paperclip@\$\{digest\}"/);
+  assert.match(gate, /\[ "\$RUNNING_IMG" = "\$EXPECTED_IMG" \]/);
+  assert.doesNotMatch(gate, /grep -qF "sha-\$\{TIP_SHORT\}"/);
+});
+
 test("Docker deploy binds Helm to the digest built for the approved SHA", () => {
   const buildJob = getBuildJobBlock();
   const deployJob = getDeployJobBlock();
