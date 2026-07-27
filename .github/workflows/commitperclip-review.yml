@@ -38,6 +38,8 @@ jobs:
         with:
           base-ref: ${{ github.event.pull_request.base.sha }}
           head-ref: ${{ github.event.pull_request.head.sha }}
+          # Only affects unstable RSC APIs; the UI is a client-only Vite SPA.
+          allow-ghsas: GHSA-qwww-vcr4-c8h2
 
       # Only the commitperclip bot steps below use Node. On Blockcast the bot
       # key is absent (COMMITPERCLIP_ENABLED=false), so setting up Node here
