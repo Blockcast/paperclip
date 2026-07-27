@@ -153,7 +153,7 @@ const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_PARALLEL_READS = 8;
 function awaitingUserInputReason(body: string): string | null {
   const normalized = body.toLowerCase();
   const hasExplicitPhrase = [
-    /\bpick a\b/,
+    /\bpick (?:a|an)\b/,
     /\bconfirm\b/,
     /\blet me know\b/,
     /\bblocked on clarification\b/,

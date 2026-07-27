@@ -4196,13 +4196,13 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       ]);
     });
 
-    it("suppresses the wake when the latest agent comment awaits user input", async () => {
+    it("suppresses the wake when the latest agent comment asks the user to pick an option", async () => {
       const ctx = await setupBlockedDependentWithExecutive();
       await insertComment({
         companyId: ctx.companyId,
         issueId: ctx.blockedIssueId,
         authorAgentId: ctx.assigneeAgentId,
-        body: "Blocked awaiting Omar: @omar, can you confirm the preview hostname?",
+        body: "Please pick an option before work resumes.",
         createdAt: new Date(),
       });
 
@@ -4409,13 +4409,13 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       ]);
     });
 
-    it("suppresses the sweep when the latest agent comment genuinely awaits user input", async () => {
+    it("suppresses the sweep when the latest agent comment asks the user to pick an option", async () => {
       const ctx = await setupBlockedDependentWithExecutive();
       await insertComment({
         companyId: ctx.companyId,
         issueId: ctx.blockedIssueId,
         authorAgentId: ctx.assigneeAgentId,
-        body: "Blocked awaiting Omar: @omar, can you confirm the preview hostname?",
+        body: "Please pick an option before work resumes.",
         createdAt: new Date(),
       });
 
