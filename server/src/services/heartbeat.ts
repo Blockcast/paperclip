@@ -517,6 +517,9 @@ const CAPACITY_BLOCKED_HEARTBEAT_RETRY_REASON = "capacity_blocked";
 const CAPACITY_BLOCKED_HEARTBEAT_RETRY_WAKE_REASON = "capacity_blocked_retry";
 export const CAPACITY_BLOCKED_HEARTBEAT_RETRY_DELAY_MS = 90 * 1000;
 export const CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS = 20;
+export const JOB_FAILED_HEARTBEAT_RETRY_REASON = "job_failed";
+export const JOB_FAILED_HEARTBEAT_RETRY_WAKE_REASON = "job_failed_retry";
+export const JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS = 4;
 export const DEP_BLOCKED_RETRY_REASON = "dependency_blocked";
 export const DEP_BLOCKED_BASE_DELAY_MS = 5 * 60 * 1000;
 export const DEP_BLOCKED_MAX_DELAY_MS = 60 * 60 * 1000;
@@ -708,11 +711,21 @@ export function shouldScheduleAutomaticRunRetry(
     return isPrReviewRetryContext(parseObject(run.contextSnapshot));
   }
 
-  // BLO-9147 AC2: capacity-class dispatch refusals (k8s_concurrent_run_blocked)
-  // are re-queued for pr_review wakes with bounded backoff so the review lands
-  // once a slot frees. Non-PR wakes remain terminal (BLO-7913 leak guard).
+  const contextSnapshot = parseObject(run.contextSnapshot);
+  const isIssueRun = Boolean(readNonEmptyString(contextSnapshot.issueId));
+
+  // Capacity refusals are safe to retry for durable issue work as well as PR
+  // reviews. Timer and maintenance runs remain terminal to avoid retry leaks.
   if (run.errorCode === "k8s_concurrent_run_blocked") {
-    return isPrReviewRetryContext(parseObject(run.contextSnapshot));
+    return isIssueRun || isPrReviewRetryContext(contextSnapshot);
+  }
+
+  // A failed external-lifecycle Job may have performed non-idempotent work.
+  // Retry only when the reconciler durably proved adapter invocation never
+  // began; lock/status gates alone cannot make partial external writes safe.
+  if (run.errorCode === "job_failed") {
+    const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
+    return isIssueRun && recovery.adapterInvocationStarted === false;
   }
 
   // BLO-10448: scheduler-level transient infra failures where the agent pod
@@ -792,7 +805,26 @@ function resolveAutomaticRunRetryOpts(
       delayMs: CAPACITY_BLOCKED_HEARTBEAT_RETRY_DELAY_MS,
     };
   }
+  if (run.errorCode === "job_failed") {
+    return {
+      retryReason: JOB_FAILED_HEARTBEAT_RETRY_REASON,
+      wakeReason: JOB_FAILED_HEARTBEAT_RETRY_WAKE_REASON,
+      maxAttempts: JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+    };
+  }
   return undefined;
+}
+
+function requiresIssueExecutionRetryLock(retryReason: string | null | undefined) {
+  return (
+    retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
+    retryReason === CAPACITY_BLOCKED_HEARTBEAT_RETRY_REASON ||
+    retryReason === JOB_FAILED_HEARTBEAT_RETRY_REASON
+  );
+}
+
+function requiresInProgressIssueRetry(retryReason: string | null | undefined) {
+  return requiresIssueExecutionRetryLock(retryReason);
 }
 
 function isResolvedInteractionContinuationWakeContext(contextSnapshot: unknown) {
@@ -11659,24 +11691,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON && issue.status !== "in_progress") {
+    if (requiresInProgressIssueRetry(retryReason) && issue.status !== "in_progress") {
       return {
         allowed: false,
-        reason: `Scheduled max-turn continuation suppressed because issue is no longer in_progress (current status: ${issue.status})`,
+        reason: `Scheduled retry suppressed because issue is no longer in_progress (current status: ${issue.status})`,
         errorCode: "issue_not_in_progress",
         issueId,
         details: { issueId, currentStatus: issue.status, requiredStatus: "in_progress" },
       };
     }
 
-    if (
-      retryReason === MAX_TURN_CONTINUATION_RETRY_REASON &&
-      input.enforceIssueExecutionLock &&
-      issue.executionRunId !== run.id
-    ) {
+    if (input.enforceIssueExecutionLock && issue.executionRunId !== run.id) {
       return {
         allowed: false,
-        reason: "Scheduled max-turn continuation suppressed because the issue execution lock belongs to a different run",
+        reason: "Scheduled retry suppressed because the issue execution lock belongs to a different run",
         errorCode: "issue_execution_lock_changed",
         issueId,
         details: {
@@ -11854,7 +11882,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agent,
       contextSnapshot,
       retryReason: dueRun.scheduledRetryReason,
-      enforceIssueExecutionLock: dueRun.scheduledRetryReason === MAX_TURN_CONTINUATION_RETRY_REASON,
+      enforceIssueExecutionLock: requiresIssueExecutionRetryLock(dueRun.scheduledRetryReason),
     });
     if (!gate.allowed) {
       if (
@@ -12142,21 +12170,165 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    const promoted = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "queued",
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(heartbeatRuns.id, dueRun.id),
-          eq(heartbeatRuns.status, "scheduled_retry"),
-          lte(heartbeatRuns.scheduledRetryAt, now),
-        ),
-      )
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const promotionIssueId = readNonEmptyString(contextSnapshot.issueId);
+    const atomicPromotion = await db.transaction(async (tx) => {
+      let promotionGate: BlockedScheduledRetryGate | null = null;
+
+      if (promotionIssueId && requiresIssueExecutionRetryLock(dueRun.scheduledRetryReason)) {
+        const lockedIssue = await tx
+          .select({
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(and(eq(issues.companyId, dueRun.companyId), eq(issues.id, promotionIssueId)))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+
+        if (!lockedIssue) {
+          promotionGate = {
+            allowed: false,
+            reason: "Scheduled retry suppressed because the target issue no longer exists",
+            errorCode: "issue_not_found",
+            issueId: promotionIssueId,
+            details: { issueId: promotionIssueId },
+          };
+        } else if (lockedIssue.assigneeAgentId !== dueRun.agentId) {
+          promotionGate = {
+            allowed: false,
+            reason: "Scheduled retry suppressed because issue ownership changed",
+            errorCode: "issue_reassigned",
+            issueId: promotionIssueId,
+            details: {
+              issueId: promotionIssueId,
+              previousAssigneeAgentId: dueRun.agentId,
+              currentAssigneeAgentId: lockedIssue.assigneeAgentId,
+            },
+          };
+        } else if (lockedIssue.status === "cancelled" || lockedIssue.status === "done") {
+          promotionGate = {
+            allowed: false,
+            reason: `Scheduled retry suppressed because issue reached terminal status (${lockedIssue.status})`,
+            errorCode: lockedIssue.status === "cancelled" ? "issue_cancelled" : "issue_terminal_status",
+            issueId: promotionIssueId,
+            details: { issueId: promotionIssueId, currentStatus: lockedIssue.status },
+          };
+        } else if (requiresInProgressIssueRetry(dueRun.scheduledRetryReason) && lockedIssue.status !== "in_progress") {
+          promotionGate = {
+            allowed: false,
+            reason: `Scheduled retry suppressed because issue is no longer in_progress (current status: ${lockedIssue.status})`,
+            errorCode: "issue_not_in_progress",
+            issueId: promotionIssueId,
+            details: { issueId: promotionIssueId, currentStatus: lockedIssue.status, requiredStatus: "in_progress" },
+          };
+        } else if (lockedIssue.executionRunId !== dueRun.id) {
+          promotionGate = {
+            allowed: false,
+            reason: "Scheduled retry suppressed because the issue execution lock belongs to a different run",
+            errorCode: "issue_execution_lock_changed",
+            issueId: promotionIssueId,
+            details: {
+              issueId: promotionIssueId,
+              expectedExecutionRunId: dueRun.id,
+              currentExecutionRunId: lockedIssue.executionRunId,
+            },
+          };
+        }
+      }
+
+      if (promotionGate) {
+        const cancelled = await tx
+          .update(heartbeatRuns)
+          .set({
+            status: "cancelled",
+            finishedAt: now,
+            error: promotionGate.reason,
+            errorCode: promotionGate.errorCode,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(heartbeatRuns.id, dueRun.id),
+              eq(heartbeatRuns.status, "scheduled_retry"),
+              lte(heartbeatRuns.scheduledRetryAt, now),
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!cancelled) return { outcome: "not_promoted" as const, run: null };
+
+        if (cancelled.wakeupRequestId) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: now,
+              error: promotionGate.reason,
+              updatedAt: now,
+            })
+            .where(eq(agentWakeupRequests.id, cancelled.wakeupRequestId));
+        }
+        await tx
+          .update(issues)
+          .set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.companyId, cancelled.companyId),
+              eq(issues.id, promotionIssueId!),
+              eq(issues.executionRunId, cancelled.id),
+            ),
+          );
+        return { outcome: "gate_suppressed" as const, run: cancelled, gate: promotionGate };
+      }
+
+      const promoted = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "queued",
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(heartbeatRuns.id, dueRun.id),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            lte(heartbeatRuns.scheduledRetryAt, now),
+          ),
+        )
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      return { outcome: promoted ? "promoted" as const : "not_promoted" as const, run: promoted };
+    });
+
+    if (atomicPromotion.outcome === "gate_suppressed") {
+      await appendRunEvent(atomicPromotion.run, await nextRunEventSeq(atomicPromotion.run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: atomicPromotion.gate.reason,
+        payload: {
+          ...atomicPromotion.gate.details,
+          scheduledRetryAttempt: atomicPromotion.run.scheduledRetryAttempt,
+          scheduledRetryAt: atomicPromotion.run.scheduledRetryAt
+            ? new Date(atomicPromotion.run.scheduledRetryAt).toISOString()
+            : null,
+          scheduledRetryReason: atomicPromotion.run.scheduledRetryReason,
+        },
+      });
+      return {
+        outcome: "gate_suppressed",
+        run: atomicPromotion.run,
+        reason: atomicPromotion.gate.reason,
+        errorCode: atomicPromotion.gate.errorCode,
+      };
+    }
+
+    const promoted = atomicPromotion.run;
     if (!promoted) return { outcome: "not_promoted", run: null };
 
     if (promoted.scheduledRetryReason === DEP_BLOCKED_RETRY_REASON) {
@@ -12319,7 +12491,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : baseSchedule;
 
     const requiresIssueGate =
-      retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
+      requiresIssueExecutionRetryLock(retryReason) ||
       retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON;
     if (requiresIssueGate) {
       const gate = await evaluateScheduledRetryGate({
@@ -12327,7 +12499,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         agent,
         contextSnapshot,
         retryReason,
-        enforceIssueExecutionLock: retryReason === MAX_TURN_CONTINUATION_RETRY_REASON,
+        enforceIssueExecutionLock: requiresIssueExecutionRetryLock(retryReason),
       });
       if (!gate.allowed) {
         await appendRunEvent(run, await nextRunEventSeq(run.id), {
@@ -12476,7 +12648,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
 
-      if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON) {
+      if (requiresIssueExecutionRetryLock(retryReason)) {
         if (issueId) {
           await tx.execute(
             sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} for update`,
@@ -12545,7 +12717,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (!lockedIssue) {
             return {
               outcome: "not_scheduled",
-              reason: "Scheduled max-turn continuation suppressed because the target issue no longer exists",
+              reason: "Scheduled retry suppressed because the target issue no longer exists",
               errorCode: "issue_not_found",
               issueId,
               details: { issueId },
@@ -12555,7 +12727,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (lockedIssue.assigneeAgentId !== run.agentId) {
             return {
               outcome: "not_scheduled",
-              reason: "Scheduled max-turn continuation suppressed because issue ownership changed",
+              reason: "Scheduled retry suppressed because issue ownership changed",
               errorCode: "issue_reassigned",
               issueId,
               details: {
@@ -12569,17 +12741,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (lockedIssue.status === "cancelled" || lockedIssue.status === "done") {
             return {
               outcome: "not_scheduled",
-              reason: `Scheduled max-turn continuation suppressed because issue reached terminal status (${lockedIssue.status})`,
+              reason: `Scheduled retry suppressed because issue reached terminal status (${lockedIssue.status})`,
               errorCode: lockedIssue.status === "cancelled" ? "issue_cancelled" : "issue_terminal_status",
               issueId,
               details: { issueId, currentStatus: lockedIssue.status },
             };
           }
 
-          if (lockedIssue.status !== "in_progress") {
+          if (requiresInProgressIssueRetry(retryReason) && lockedIssue.status !== "in_progress") {
             return {
               outcome: "not_scheduled",
-              reason: `Scheduled max-turn continuation suppressed because issue is no longer in_progress (current status: ${lockedIssue.status})`,
+              reason: `Scheduled retry suppressed because issue is no longer in_progress (current status: ${lockedIssue.status})`,
               errorCode: "issue_not_in_progress",
               issueId,
               details: { issueId, currentStatus: lockedIssue.status, requiredStatus: "in_progress" },
@@ -12589,8 +12761,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (lockedIssue.executionRunId !== run.id) {
             return {
               outcome: "not_scheduled",
-              reason:
-                "Scheduled max-turn continuation suppressed because the issue execution lock belongs to a different run",
+              reason: "Scheduled retry suppressed because the issue execution lock belongs to a different run",
               errorCode: "issue_execution_lock_changed",
               issueId,
               details: {
@@ -13755,21 +13926,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON && issue.status !== "in_progress") {
+    if (requiresInProgressIssueRetry(retryReason) && issue.status !== "in_progress") {
       return {
         stale: true,
         errorCode: "issue_not_in_progress",
-        reason: `Cancelled because max-turn continuation issue is no longer in_progress (current status: ${issue.status}) before the queued run could start`,
+        reason: `Cancelled because retry issue is no longer in_progress (current status: ${issue.status}) before the queued run could start`,
         details: { issueId, currentStatus: issue.status, requiredStatus: "in_progress" },
       };
     }
 
-    if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON && issue.executionRunId !== run.id) {
+    if (requiresIssueExecutionRetryLock(retryReason) && issue.executionRunId !== run.id) {
       return {
         stale: true,
         errorCode: "issue_execution_lock_changed",
-        reason:
-          "Cancelled because max-turn continuation no longer owns the issue execution lock before the queued run could start",
+        reason: "Cancelled because retry no longer owns the issue execution lock before the queued run could start",
         details: {
           issueId,
           expectedExecutionRunId: run.id,
@@ -14507,6 +14677,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : externalLifecycleTerminalOutcome(input.jobStatus, preserveRecordedOutcome);
     if (!terminalOutcome) return false;
 
+    const adapterInvocationStarted = terminalOutcome.errorCode === "job_failed"
+      ? await hasAdapterInvocationEvent(input.run.id)
+      : null;
+
     const resultJson = mergeRunStopMetadataForAgent(
       { adapterType: input.adapterType, adapterConfig: parseObject(input.adapterConfig) },
       terminalOutcome.status,
@@ -14518,6 +14692,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             jobPhase: terminalOutcome.jobPhase,
             jobReason: terminalOutcome.jobReason,
             jobMessage: terminalOutcome.jobMessage,
+            ...(adapterInvocationStarted !== null ? { adapterInvocationStarted } : {}),
           },
         },
         errorCode: terminalOutcome.errorCode,
