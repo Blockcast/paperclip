@@ -57,6 +57,7 @@ import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-stat
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
 const mockTerminateLocalService = vi.hoisted(() => vi.fn());
+const mockGithubHasReviewerEvidenceForPr = vi.hoisted(() => vi.fn());
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn<
     (ctx: {
@@ -95,6 +96,16 @@ const mockAdapterExecute = vi.hoisted(() =>
 vi.mock("../telemetry.ts", () => ({
   getTelemetryClient: () => mockTelemetryClient,
 }));
+
+vi.mock("../services/github-app-auth.ts", async () => {
+  const actual = await vi.importActual<typeof import("../services/github-app-auth.ts")>(
+    "../services/github-app-auth.ts",
+  );
+  return {
+    ...actual,
+    githubHasReviewerEvidenceForPr: mockGithubHasReviewerEvidenceForPr,
+  };
+});
 
 const mockListLiveAgentJobRunIds = vi.hoisted(() =>
   vi.fn<() => Promise<Set<string> | null>>(async () => null),
@@ -446,6 +457,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
     mockTerminateLocalService.mockImplementation(localServiceSupervisor.terminateLocalService);
     mockHasActiveJobForAgent.mockImplementation(async () => false);
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValue({ found: false });
     mockAdapterExecute.mockImplementation(async () => ({
       exitCode: 0,
       signal: null,
@@ -1603,6 +1615,212 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       state: "released",
       releaseReason: "job_missing",
     });
+  });
+
+  it("preserves an exact-head GitHub review when its external Job disappears", async () => {
+    const jobName = "agent-opencode-review-posted";
+    const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+        githubRepoFullName: "Blockcast/onprem-k8s",
+        githubPrNumber: 1648,
+        githubHeadSha: headSha,
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: {
+          summary: "No locally recorded review outcome is available.",
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ found: true, via: "review" });
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      createdByRunId: runId,
+      body: "Submitted GitHub review 4781882116 and recorded the terminal outcome.",
+    });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledWith({
+      repoFullName: "Blockcast/onprem-k8s",
+      prNumber: 1648,
+      headSha,
+    });
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledTimes(1);
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "succeeded",
+      errorCode: null,
+      resultJson: expect.objectContaining({
+        externalLifecycleRecovery: expect.objectContaining({
+          reason: "job_missing_recorded_outcome_preserved",
+        }),
+      }),
+    });
+    const retries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(retries).toHaveLength(0);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.filter((comment) => comment.body.includes("Submitted GitHub review 4781882116")))
+      .toHaveLength(1);
+    expect(comments.map((comment) => comment.body)).toContain(SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY);
+    const dispositionWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(dispositionWakeups.some((wakeup) => wakeup.reason === "finish_successful_run_handoff"))
+      .toBe(true);
+  });
+
+  it("fails and retries once when a PR-review request comment is not outcome evidence", async () => {
+    const jobName = "agent-opencode-review-lost";
+    const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+        githubRepoFullName: "Blockcast/onprem-k8s",
+        githubPrNumber: 1648,
+        githubHeadSha: headSha,
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    await db
+      .update(heartbeatRuns)
+      .set({ resultJson: { summary: `@ally review exact head ${headSha}` } })
+      .where(eq(heartbeatRuns.id, runId));
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ found: false });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledWith({
+      repoFullName: "Blockcast/onprem-k8s",
+      prNumber: 1648,
+      headSha,
+    });
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledTimes(1);
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "failed",
+      errorCode: "job_missing",
+    });
+    const retries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: 1 });
+  });
+
+  it("does not treat generic run artifacts as a completed missing-Job outcome", async () => {
+    const jobName = "agent-opencode-progress-only";
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      createdByRunId: runId,
+      body: "Progress update written before the lifecycle Job disappeared.",
+    });
+    const documentId = randomUUID();
+    const revisionId = randomUUID();
+    await db.insert(documents).values({
+      id: documentId,
+      companyId,
+      title: "Incomplete recovery notes",
+      format: "markdown",
+      latestBody: "# Incomplete recovery notes",
+      latestRevisionId: revisionId,
+      latestRevisionNumber: 1,
+      createdByAgentId: agentId,
+      updatedByAgentId: agentId,
+    });
+    await db.insert(documentRevisions).values({
+      id: revisionId,
+      companyId,
+      documentId,
+      revisionNumber: 1,
+      title: "Incomplete recovery notes",
+      format: "markdown",
+      body: "# Incomplete recovery notes",
+      createdByAgentId: agentId,
+      createdByRunId: runId,
+    });
+    await db.insert(issueDocuments).values({
+      companyId,
+      issueId,
+      documentId,
+      key: "progress",
+    });
+    await db.insert(issueWorkProducts).values({
+      companyId,
+      issueId,
+      type: "report",
+      provider: "test",
+      externalId: "incomplete-recovery-notes",
+      title: "Incomplete recovery notes",
+      status: "draft",
+      createdByRunId: runId,
+    });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    expect(mockGithubHasReviewerEvidenceForPr).not.toHaveBeenCalled();
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "failed",
+      errorCode: "job_missing",
+    });
+    const handoffWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.reason, "finish_successful_run_handoff"),
+      ));
+    expect(handoffWakeups).toHaveLength(0);
   });
 
   it("keeps a fresh ownerless run when the exact Job lookup is inconclusive", async () => {
