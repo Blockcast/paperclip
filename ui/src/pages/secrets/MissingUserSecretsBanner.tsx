@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle } from "lucide-react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { Button } from "@/components/ui/button";
 import { secretsApi, type MyUserSecretEntry } from "../../api/secrets";
 import { queryKeys } from "../../lib/queryKeys";

@@ -26,7 +26,7 @@
  */
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
-import { useLocation as useRouterLocation, useNavigate as useRouterNavigate, type NavigateOptions } from "react-router-dom";
+import { useLocation as useRouterLocation, useNavigate as useRouterNavigate, type NavigateOptions } from "react-router";
 import type {
   PluginBridgeErrorCode,
   PluginLauncherBounds,

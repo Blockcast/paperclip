@@ -3,7 +3,7 @@
 import type { ReactNode } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Search, buildSearchUrl } from "./Search";
@@ -79,7 +79,7 @@ vi.mock("../api/auth", () => ({
 }));
 
 vi.mock("@/lib/router", async () => {
-  const actual = await vi.importActual<typeof import("react-router-dom")>("react-router-dom");
+  const actual = await vi.importActual<typeof import("react-router")>("react-router");
   return {
     ...actual,
     useNavigate: () => navigateMock,

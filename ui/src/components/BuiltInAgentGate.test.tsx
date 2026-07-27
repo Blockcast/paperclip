@@ -30,7 +30,7 @@ vi.mock("@/components/ConfigureBuiltInAgentModal", () => ({
     open ? <div data-testid="configure-modal" /> : null,
 }));
 
-vi.mock("react-router-dom", () => ({
+vi.mock("react-router", () => ({
   Link: ({ children, to }: { children: React.ReactNode; to: string }) => <a href={to}>{children}</a>,
 }));
 

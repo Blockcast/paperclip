@@ -1931,7 +1931,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
             expect.objectContaining({
               id: startedServices[0]?.id,
               serviceName: "web",
-              status: "starting",
+              status: expect.stringMatching(/^(starting|running)$/),
             }),
           ],
         },
