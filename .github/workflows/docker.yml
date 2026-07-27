@@ -1,10 +1,15 @@
 name: Docker
 
 on:
-  # Urgent path: manual dispatch deploys master tip immediately, bypassing
-  # the 6h debounce below. Commit messages containing "[deploy]" do the
-  # same on push.
+  # Urgent path: manual dispatch deploys an approved immutable master commit,
+  # bypassing the 6h debounce below. Commit messages containing "[deploy]" do
+  # the same on push.
   workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Full approved commit SHA, reachable from master
+        required: true
+        type: string
   push:
     branches:
       - "master"
@@ -38,9 +43,48 @@ jobs:
     concurrency:
       group: docker-${{ github.ref }}
       cancel-in-progress: true
+    outputs:
+      target_sha: ${{ steps.target.outputs.full }}
+      image_digest: ${{ steps.build.outputs.digest }}
     steps:
+      - name: Validate target commit
+        id: target
+        env:
+          TARGET_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.target_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${TARGET_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "target_sha must be a full 40-character hexadecimal commit SHA" >&2
+            exit 1
+          fi
+          full=$(printf '%s' "${TARGET_SHA}" | tr '[:upper:]' '[:lower:]')
+          {
+            echo "full=${full}"
+            echo "short=${full:0:7}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.target.outputs.full }}
+
+      - name: Verify target commit
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.full }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin master
+          full=$(git rev-parse HEAD | tr '[:upper:]' '[:lower:]')
+          if [ "${full}" != "${TARGET_SHA}" ]; then
+            echo "Checkout resolved to ${full}, expected ${TARGET_SHA}" >&2
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+            ! git merge-base --is-ancestor "${full}" origin/master; then
+            echo "Target ${full} is not reachable from master" >&2
+            exit 1
+          fi
 
       # Self-hosted runner reuses its workspace across builds. A previous
       # build (or a developer session sharing the same checkout dir) may
@@ -165,8 +209,9 @@ jobs:
           images: |
             harbor.blockcast.net/paperclip/paperclip
           tags: |
-            type=sha,prefix=sha-,suffix=-k8s-vendored,format=short
-            type=raw,value=latest-k8s-vendored,enable={{is_default_branch}}
+            type=sha,prefix=sha-,suffix=-k8s-vendored,format=short,enable=${{ github.event_name != 'workflow_dispatch' }}
+            type=raw,value=sha-${{ steps.target.outputs.short }}-k8s-vendored,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=latest-k8s-vendored,enable=${{ github.ref == 'refs/heads/master' && github.event_name != 'workflow_dispatch' }}
 
       - name: Build and push
         id: build
@@ -203,9 +248,13 @@ jobs:
           secrets: |
             gh_token=${{ secrets.PAPERCLIP_BOARD_TOKEN }}
 
-      - name: Compute short sha
-        id: sha
-        run: echo "short=$(git rev-parse --short=7 ${{ github.sha }})" >> "$GITHUB_OUTPUT"
+      - name: Record built artifact
+        run: |
+          {
+            echo "### Paperclip image"
+            echo "- Commit: \`${{ steps.target.outputs.full }}\`"
+            echo "- Image: \`harbor.blockcast.net/paperclip/paperclip:sha-${{ steps.target.outputs.short }}-k8s-vendored@${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
     needs: build-and-push
@@ -223,10 +272,32 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && needs.build-and-push.outputs.target_sha || github.sha }}
 
-      - name: Compute short sha
-        id: sha
-        run: echo "short=$(git rev-parse --short=7 ${{ github.sha }})" >> "$GITHUB_OUTPUT"
+      - name: Verify target commit
+        id: target
+        env:
+          TARGET_SHA: ${{ github.event_name == 'workflow_dispatch' && needs.build-and-push.outputs.target_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin master
+          full=$(git rev-parse HEAD | tr '[:upper:]' '[:lower:]')
+          expected=$(printf '%s' "${TARGET_SHA}" | tr '[:upper:]' '[:lower:]')
+          if [[ ! "${expected}" =~ ^[0-9a-f]{40}$ ]] || [ "${full}" != "${expected}" ]; then
+            echo "Checkout resolved to ${full}, expected full commit SHA ${expected}" >&2
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+            ! git merge-base --is-ancestor "${full}" origin/master; then
+            echo "Target ${full} is not reachable from master" >&2
+            exit 1
+          fi
+          {
+            echo "full=${full}"
+            echo "short=${full:0:7}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Write kubeconfig
         env:
@@ -248,6 +319,18 @@ jobs:
           kubectl auth whoami -o yaml
           kubectl -n "$NS" get statefulset paperclip -o jsonpath='{.spec.replicas}{"\n"}'
 
+      - name: Login to Harbor (scheduled gate)
+        if: ${{ github.event_name == 'schedule' }}
+        uses: docker/login-action@v4
+        with:
+          registry: harbor.blockcast.net
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        if: ${{ github.event_name == 'schedule' }}
+        uses: docker/setup-buildx-action@v4
+
       # Debounce (BLO-12563): on plain push events, skip the rollout while
       # paperclip-0 is younger than 6h — per-merge deploys were recreating
       # the worker ~hourly and every roll strands whatever agent run is
@@ -258,20 +341,36 @@ jobs:
         id: gate
         env:
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
+          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
         run: |
-          set -e
+          set -euo pipefail
           if [ "${{ github.event_name }}" = "schedule" ]; then
             # BLO-12563: the 6h catch-up window must not double-roll a pod that a
             # recent push already rolled to tip. Skip only when paperclip-0 is
-            # <6h old AND already running the tip sha; otherwise deploy (a
+            # <6h old AND already running the tip digest; otherwise deploy (a
             # debounced commit is still waiting for this window).
             CREATED=$(kubectl -n "$NS" get pod paperclip-0 -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null || true)
             RUNNING_IMG=$(kubectl -n "$NS" get sts paperclip -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
-            TIP_SHORT=$(git rev-parse --short=7 HEAD)
+            image="harbor.blockcast.net/paperclip/paperclip:${TAG}"
+            digest=""
+            for i in 1 2 3; do
+              if digest=$(docker buildx imagetools inspect "${image}" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"') \
+                && [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                break
+              fi
+              digest=""
+              echo "tag ${TAG} not resolvable (attempt $i) — retrying in 60s (a push build may still be running)"
+              sleep 60
+            done
+            if [ -z "${digest}" ]; then
+              echo "tag ${TAG} missing after retries; failing this window — the next one retries" >&2
+              exit 1
+            fi
+            EXPECTED_IMG="harbor.blockcast.net/paperclip/paperclip@${digest}"
             if [ -n "$CREATED" ]; then
               AGE=$(( $(date +%s) - $(date -d "$CREATED" +%s) ))
-              if [ "$AGE" -lt 21600 ] && printf '%s' "$RUNNING_IMG" | grep -qF "sha-${TIP_SHORT}"; then
-                echo "schedule window: paperclip-0 ${AGE}s old and already running tip (sha-${TIP_SHORT}) — skipping catch-up roll"
+              if [ "$AGE" -lt 21600 ] && [ "$RUNNING_IMG" = "$EXPECTED_IMG" ]; then
+                echo "schedule window: paperclip-0 ${AGE}s old and already running tip (${EXPECTED_IMG}) — skipping catch-up roll"
                 echo "proceed=false" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
@@ -309,18 +408,22 @@ jobs:
       # Verify it actually exists in Harbor before helm rolls the STS —
       # protects against a window firing between a merge and its build
       # finishing.
-      - name: Login to Harbor (tag check)
-        if: ${{ steps.gate.outputs.proceed == 'true' && github.event_name != 'push' }}
+      - name: Login to Harbor (artifact check)
+        if: ${{ steps.gate.outputs.proceed == 'true' && github.event_name != 'schedule' }}
         uses: docker/login-action@v4
         with:
           registry: harbor.blockcast.net
           username: ${{ secrets.HARBOR_USERNAME }}
           password: ${{ secrets.HARBOR_PASSWORD }}
 
+      - name: Set up Docker Buildx
+        if: ${{ steps.gate.outputs.proceed == 'true' && github.event_name != 'schedule' }}
+        uses: docker/setup-buildx-action@v4
+
       - name: Verify image tag exists
         if: ${{ steps.gate.outputs.proceed == 'true' && github.event_name != 'push' }}
         env:
-          TAG: sha-${{ steps.sha.outputs.short }}-k8s-vendored
+          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
         run: |
           set -e
           for i in 1 2 3; do
@@ -334,21 +437,74 @@ jobs:
           echo "tag ${TAG} missing after retries; failing this window — the next one retries" >&2
           exit 1
 
-      # Use --set image.tag so the deployed tag tracks the just-built image
-      # without committing to values.blockcast.yaml. The committed values
-      # file remains the source of truth for non-CI deploys; CI runs are
-      # transparent in helm history (`helm get values paperclip` shows the
-      # override). Adjust by editing values.blockcast.yaml when you want
-      # the file to reflect the live tag.
+      - name: Resolve deploy artifact
+        id: artifact
+        if: ${{ steps.gate.outputs.proceed == 'true' }}
+        env:
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
+          EXPECTED_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
+          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
+        run: |
+          set -euo pipefail
+          image="harbor.blockcast.net/paperclip/paperclip:${TAG}"
+          digest=$(docker buildx imagetools inspect "${image}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          case "${BUILD_RESULT}" in
+            success)
+              if [[ ! "${EXPECTED_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "Successful build did not provide a valid image digest: ${EXPECTED_DIGEST:-<empty>}" >&2
+                exit 1
+              fi
+              if [ "${digest}" != "${EXPECTED_DIGEST}" ]; then
+                echo "Tag ${image} resolved to ${digest}, expected build digest ${EXPECTED_DIGEST}" >&2
+                exit 1
+              fi
+              ;;
+            skipped)
+              if [ "${{ github.event_name }}" != "schedule" ] || [ -n "${EXPECTED_DIGEST}" ]; then
+                echo "An empty build digest is allowed only for a scheduled deploy-only run" >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "Unexpected build result: ${BUILD_RESULT}" >&2
+              exit 1
+              ;;
+          esac
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Paperclip deploy target"
+            echo "- Commit: \`${{ steps.target.outputs.full }}\`"
+            echo "- Image: \`${image}@${digest}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Pin the manifest digest resolved above so the image inspected for the
+      # approved commit is exactly the image Kubernetes pulls. The committed
+      # tag remains the readable source reference for non-CI deploys.
       - name: helm upgrade
         if: ${{ steps.gate.outputs.proceed == 'true' }}
         env:
+          DIGEST: ${{ steps.artifact.outputs.digest }}
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
           RELEASE: ${{ vars.PAPERCLIP_HELM_RELEASE || 'paperclip' }}
-          TAG: sha-${{ steps.sha.outputs.short }}-k8s-vendored
+          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
         run: |
-          set -e
-          echo "rolling out ${TAG} to ${NS}/${RELEASE}"
+          set -euo pipefail
+          [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "rolling out ${TAG}@${DIGEST} to ${NS}/${RELEASE}"
+          expected_image="harbor.blockcast.net/paperclip/paperclip@${DIGEST}"
+          rendered=$(helm template "${RELEASE}" ./deploy/helm/paperclip \
+            -n "${NS}" \
+            -f deploy/helm/paperclip/values.blockcast.yaml \
+            --set image.tag="${TAG}" \
+            --set-string image.digest="${DIGEST}")
+          rendered_images=$(printf '%s\n' "${rendered}" | awk \
+            '$1 == "image:" { gsub(/["'\''"]/, "", $2); if ($2 ~ /^harbor\.blockcast\.net\/paperclip\/paperclip([:@]|$)/) print $2 }')
+          if [ -z "${rendered_images}" ] || [ -n "$(printf '%s\n' "${rendered_images}" | grep -Fvx "${expected_image}" || true)" ]; then
+            echo "Chart did not render every Paperclip workload as ${expected_image}:" >&2
+            printf '%s\n' "${rendered_images:-<none>}" >&2
+            exit 1
+          fi
           # --timeout bumped 10m → 30m on 2026-05-23 after rev 316 + several
           # prior revs hit "context deadline exceeded" while the cluster was
           # in apiserver/kubelet-latency cascade (control-plane nodes at
@@ -362,6 +518,7 @@ jobs:
             -n "${NS}" \
             -f deploy/helm/paperclip/values.blockcast.yaml \
             --set image.tag="${TAG}" \
+            --set-string image.digest="${DIGEST}" \
             --wait --timeout 30m
           helm -n "${NS}" list | head -3
           kubectl -n "${NS}" get pod -l app.kubernetes.io/name=paperclip \
