@@ -1121,9 +1121,16 @@ export async function startServer(): Promise<StartedServer> {
       );
     } else {
       const startupHeartbeatRecovery = (async () => {
-        const reattachedExternalRuns = await heartbeat.resumeRunningExternalRuntimeRuns();
-        if (reattachedExternalRuns > 0) {
-          logger.info({ reattachedExternalRuns }, "reattached running external-runtime Jobs after restart");
+        try {
+          const reattachedExternalRuns = await heartbeat.resumeRunningExternalRuntimeRuns();
+          if (reattachedExternalRuns > 0) {
+            logger.info({ reattachedExternalRuns }, "reattached running external-runtime Jobs after restart");
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup external-runtime Job reattachment failed - orphan reaper will serve as degraded backstop",
+          );
         }
 
         try {

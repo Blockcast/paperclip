@@ -377,6 +377,20 @@ describe("startServer feedback export wiring", () => {
     expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
   });
 
+  it("sweeps stale locks when external-runtime reattachment fails", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    heartbeatServiceMock.resumeRunningExternalRuntimeRuns.mockRejectedValueOnce(
+      new Error("external-runtime reattachment failure"),
+    );
+
+    await startServer();
+
+    expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+  });
+
   it("continues startup recovery when the stale-lock sweep fails", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
