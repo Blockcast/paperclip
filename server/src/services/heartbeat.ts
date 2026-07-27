@@ -4117,9 +4117,10 @@ export function buildK8sRunIsolationDescriptor(input: {
   const cacheRoot = isolationMode === "shared"
     ? path.join(sharedHomeRoot, ".cache")
     : path.posix.join(ephemeralIsolationRoot!, "cache");
-  const tmpRoot = isolationMode === "shared"
-    ? path.join(sharedHomeRoot, ".cache", "tmp")
-    : path.posix.join(ephemeralIsolationRoot!, "tmp");
+  // Keep this root isolated but short: Chromium appends its singleton socket
+  // path and aborts when the resulting Unix socket exceeds the platform limit.
+  const tmpKey = createHash("sha256").update(isolationKey).digest("hex").slice(0, 16);
+  const tmpRoot = path.posix.join("/runtime-cache/t", tmpKey);
   const persistent = isolationMode === "run" ? "ephemeral" : "persistent";
 
   return {
