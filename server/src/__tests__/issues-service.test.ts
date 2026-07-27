@@ -4196,6 +4196,19 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       ]);
     });
 
+    it("suppresses the wake when the latest agent comment asks the user to pick an option", async () => {
+      const ctx = await setupBlockedDependentWithExecutive();
+      await insertComment({
+        companyId: ctx.companyId,
+        issueId: ctx.blockedIssueId,
+        authorAgentId: ctx.assigneeAgentId,
+        body: "Please pick an option before work resumes.",
+        createdAt: new Date(),
+      });
+
+      await expect(svc.listWakeableBlockedDependents(ctx.blockerId)).resolves.toEqual([]);
+    });
+
     it("uses the newest matching executive comment when multiple holds are present", async () => {
       const ctx = await setupBlockedDependentWithExecutive();
       const oldFuture = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
@@ -4385,6 +4398,37 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         issueId: ctx.blockedIssueId,
         authorAgentId: ctx.ctoAgentId,
         body: "Just a status update from the CTO, no hold marker here.",
+        createdAt: new Date(),
+      });
+
+      await expect(svc.listResolvedBlockerDependentsToSweep(ctx.companyId, sweepOpts)).resolves.toEqual([
+        expect.objectContaining({
+          id: ctx.blockedIssueId,
+          assigneeAgentId: ctx.assigneeAgentId,
+        }),
+      ]);
+    });
+
+    it("suppresses the sweep when the latest agent comment asks the user to pick an option", async () => {
+      const ctx = await setupBlockedDependentWithExecutive();
+      await insertComment({
+        companyId: ctx.companyId,
+        issueId: ctx.blockedIssueId,
+        authorAgentId: ctx.assigneeAgentId,
+        body: "Please pick an option before work resumes.",
+        createdAt: new Date(),
+      });
+
+      await expect(svc.listResolvedBlockerDependentsToSweep(ctx.companyId, sweepOpts)).resolves.toEqual([]);
+    });
+
+    it("does not treat BLO-18012's completed-work status report as awaiting user input", async () => {
+      const ctx = await setupBlockedDependentWithExecutive();
+      await insertComment({
+        companyId: ctx.companyId,
+        issueId: ctx.blockedIssueId,
+        authorAgentId: ctx.assigneeAgentId,
+        body: "**CTO — bookkeeping confirmed, sequencing respected, one new live finding**\n\n**Attempted:** Verified BLO-18012 state per CEO's 17:34/17:37 comments before doing any further work.\n\n**Found:** State is exactly as CEO described — `in_progress`, workspace-bound (`projectId 584f37b3`, `executionWorkspaceId 575c743b`, shared_workspace/project_primary), and this very run (`8ef4da9d-da05-48f4-ad79-bc68215d6b6f`, locked 17:39:53Z) is executing cleanly in that workspace — no exit-128, confirming the BLO-18147 workspace-binding fix continues to hold for this issue specifically.\n\nNew finding while checking the shared checkout at `/paperclip/.../584f37b3.../paperclip` (same physical directory BLO-18147's live run 378f95f7 is also using): `git status` briefly showed **661 tracked files deleted from the working tree** (confirmed 3 samples missing from disk: `DESIGN.md`, `.github/workflows/release-verify.yml`, `packages/shared/src/types/tool-access.ts`), while the git index matched HEAD (nothing staged — no destructive-commit risk materialized). A concurrent `find`/`du` timed out at 2 min. ~90s later, re-checking: the files were back on disk and `git status` was clean. Transient, self-resolving, CephFS-backed PVC at 83% (850G/1.0T). Posted as evidence to [BLO-18147](https://paperclip.blockcast.net/BLO/issues/BLO-18147) since it's live corroboration for the storage-stress hypothesis there and for BLO-17793.\n\n**Next:** No further action needed on BLO-18012 itself this run — respecting the sequencing instruction (behind BLO-18141, BLO-18140, BLO-18147). Picking up BLO-18141 next per that stated order.",
         createdAt: new Date(),
       });
 
@@ -5432,7 +5476,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     ).rejects.toMatchObject({ status: 422 });
   });
 
-  it("rejects blocked to todo promotion when the latest unanswered agent comment awaits user input", async () => {
+  it("allows a deliberate blocked to todo promotion when the latest agent comment awaits user input", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
     const commentId = randomUUID();
@@ -5471,15 +5515,9 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       createdAt: new Date("2026-05-16T10:08:00.000Z"),
     });
 
-    await expect(
-      svc.update(issueId, { status: "todo" }),
-    ).rejects.toMatchObject({
-      status: 409,
-      details: expect.objectContaining({
-        event: "sweep_blocked_promotion_skipped_awaiting_user",
-        counter: "sweep.blocked_promotion_skipped_awaiting_user",
-        commentId,
-      }),
+    await expect(svc.update(issueId, { status: "todo" })).resolves.toMatchObject({
+      id: issueId,
+      status: "todo",
     });
   });
 

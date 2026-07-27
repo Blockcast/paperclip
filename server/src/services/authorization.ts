@@ -516,7 +516,53 @@ export function authorizationDeniedDetails(decision: AuthorizationDecision) {
   return {
     ...(decision.code ? { code: decision.code } : {}),
     reason: decision.reason,
+    boundary: authorizationBoundaryLabel(decision.reason),
   };
+}
+
+// BLO-18152: a bare "outside this actor's authorization boundary" message
+// gives a rejected agent nothing to act on — it reads as "you are locked out
+// of this issue," which is only true for some of these reasons. Naming which
+// boundary fired lets the agent tell "you're missing a grant" (retry with a
+// mention/checkout) apart from "wrong company" (stop, this isn't yours) apart
+// from "your run's trust preset is scoped narrower than usual" (the
+// source_scoped_recovery_action case this ticket was filed from).
+export function authorizationBoundaryLabel(reason: AuthorizationDecision["reason"]): string {
+  switch (reason) {
+    case "deny_scope":
+      return "scope";
+    case "deny_low_trust_boundary":
+    case "deny_policy_restricted":
+      return "trust-boundary";
+    case "deny_missing_membership":
+      return "membership";
+    case "deny_company_boundary":
+      return "company-mismatch";
+    case "deny_missing_grant":
+    case "deny_no_grant":
+    case "deny_missing_consent":
+      return "grant";
+    case "deny_unsupported_action":
+      return "unsupported-action";
+    case "deny_unauthenticated":
+      return "unauthenticated";
+    default:
+      return unlabelledBoundary(reason);
+  }
+}
+
+// Only a deny_* reason has a boundary to name; an allow_*/inbox_* reason
+// reaching here means a caller passed a non-denial, which is a caller bug and
+// not worth failing the build over — "unknown" is the honest answer.
+//
+// The parameter type is the point: because it excludes every deny_* reason,
+// adding a new one to AuthorizationDecision without giving it a case above
+// narrows `reason` to something unassignable here and breaks the build, rather
+// than silently degrading that boundary to "unknown" in the error message.
+function unlabelledBoundary(
+  _reason: Exclude<AuthorizationDecision["reason"], `deny_${string}`>,
+): string {
+  return "unknown";
 }
 
 export function authorizationService(db: Db) {

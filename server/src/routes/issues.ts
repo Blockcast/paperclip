@@ -163,7 +163,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
 } from "../services/issues.js";
-import { authorizationDeniedDetails } from "../services/authorization.js";
+import { authorizationBoundaryLabel, authorizationDeniedDetails } from "../services/authorization.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -3551,10 +3551,22 @@ export function issueRoutes(
     });
   }
 
+  // BLO-18152: every "Issue is outside this actor's authorization boundary"
+  // response (issue:read, issue:comment, issue:mutate) renders through this
+  // one function so the message always names which boundary fired instead of
+  // leaving the caller to guess whether it was a scope, trust-boundary,
+  // membership, or company-mismatch rejection.
+  function respondIssueBoundaryDenied(res: Response, decision: Awaited<ReturnType<typeof decideIssueAccess>>) {
+    res.status(403).json({
+      error: `Issue is outside this actor's authorization boundary (${authorizationBoundaryLabel(decision.reason)})`,
+      details: authorizationDeniedDetails(decision),
+    });
+  }
+
   async function assertIssueReadAllowed(req: Request, res: Response, issue: Parameters<typeof decideIssueAccess>[1]) {
     const decision = await decideIssueAccess(req, issue, "issue:read");
     if (decision.allowed) return true;
-    res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
+    respondIssueBoundaryDenied(res, decision);
     return false;
   }
 
@@ -3569,6 +3581,8 @@ export function issueRoutes(
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
     },
   ) {
     if (req.actor.type !== "agent") return true;
@@ -3577,24 +3591,25 @@ export function issueRoutes(
       res.status(403).json({ error: "Agent authentication required" });
       return false;
     }
-    const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
-    if (watchdogScope.kind !== "none") {
-      const scopeResult = await taskWatchdogScopeAllowsIssueMutation(db, watchdogScope, issue);
-      if (scopeResult.kind === "invalid") {
-        res.status(403).json({
-          error: scopeResult.detail,
-          details: {
-            issueId: issue.id,
-            securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
-          },
-        });
-        return false;
+    const watchdogDecision = await assertTaskWatchdogScopedIssueMutationAllowed(req, res, issue);
+    if (watchdogDecision !== null) return watchdogDecision;
+    // BLO-18152: parity with assertAgentIssueMutationAllowed below — an agent
+    // whose run currently holds this issue's checkout/execution lock may
+    // always write to it, regardless of a narrower per-request trust
+    // boundary (e.g. a source_scoped_recovery_action wake) that
+    // decideIssueAccess would otherwise apply. Before this fix, only the
+    // PATCH mutate path granted this bypass, so the same actor+issue+run
+    // could get a 200 from PATCH {comment} and a 403 from this endpoint
+    // seconds apart.
+    if (isCurrentIssueExecutionRun(req, issue)) {
+      if (issue.status === "in_progress" && issue.assigneeAgentId === actorAgentId) {
+        if (!requireAgentRunId(req, res)) return false;
       }
-      return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue);
+      return true;
     }
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:comment");
     if (!boundaryDecision.allowed) {
-      res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
+      respondIssueBoundaryDenied(res, boundaryDecision);
       return false;
     }
     if (issue.status === "in_progress" && issue.assigneeAgentId === actorAgentId) {
@@ -3747,6 +3762,8 @@ export function issueRoutes(
     if (options.allowScopedRecoveryOwnerSourceMutation) {
       return true;
     }
+    const watchdogDecision = await assertTaskWatchdogScopedIssueMutationAllowed(req, res, issue);
+    if (watchdogDecision !== null) return watchdogDecision;
     if (isCurrentIssueExecutionRun(req, issue)) {
       return true;
     }
@@ -3755,33 +3772,10 @@ export function issueRoutes(
       const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
       return activeRecoveryAction?.ownerAgentId === actorAgentId;
     };
-    // Task-watchdog runs receive a scoped *grant* to mutate issues inside the
-    // watched subtree. This must be evaluated before the base assignee-ownership
-    // boundary below: that boundary denies an agent mutating an issue owned by a
-    // different agent, which is exactly the watchdog's primary job
-    // (SPEC-implementation §9.9 — comment, transition, reassign within the
-    // watched subtree). The watchdog scope can only widen access to the watched
-    // subtree; downstream status-transition, assignment, recovery, and budget
-    // guards in the route handlers still apply.
-    const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
-    if (watchdogScope.kind !== "none") {
-      const scopeResult = await taskWatchdogScopeAllowsIssueMutation(db, watchdogScope, issue);
-      if (scopeResult.kind === "invalid") {
-        res.status(403).json({
-          error: scopeResult.detail,
-          details: {
-            issueId: issue.id,
-            securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
-          },
-        });
-        return false;
-      }
-      return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue);
-    }
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
     if (!boundaryDecision.allowed) {
       if (await isActiveRecoveryActionOwner()) return true;
-      res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
+      respondIssueBoundaryDenied(res, boundaryDecision);
       return false;
     }
     if (await isActiveRecoveryActionOwner()) return true;
@@ -3949,8 +3943,25 @@ export function issueRoutes(
     opts: { allowWatchdogIssue?: boolean } = {},
   ) {
     if (req.actor.type !== "agent") return true;
+    return (await assertTaskWatchdogScopedIssueMutationAllowed(req, res, issue, opts)) ?? true;
+  }
+
+  // Task-watchdog runs receive a scoped grant to mutate issues inside the
+  // watched subtree. Resolve that scope before any current-run bypass so stale
+  // or forged watchdog context cannot inherit broader execution-lock authority.
+  async function assertTaskWatchdogScopedIssueMutationAllowed(
+    req: Request,
+    res: Response,
+    issue: {
+      id: string;
+      companyId: string;
+      parentId?: string | null;
+    },
+    opts: { allowWatchdogIssue?: boolean } = {},
+  ): Promise<boolean | null> {
+    if (req.actor.type !== "agent") return null;
     const scope = await resolveTaskWatchdogMutationScope(db, req.actor);
-    if (scope.kind === "none") return true;
+    if (scope.kind === "none") return null;
     const result = await taskWatchdogScopeAllowsIssueMutation(db, scope, issue, opts);
     if (result.kind !== "invalid") return assertFreshTaskWatchdogSourceMutation(res, scope, issue);
     res.status(403).json({
