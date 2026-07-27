@@ -68,9 +68,17 @@ test("Docker deploy binds Helm to the digest built for the approved SHA", () => 
   const deployJob = getDeployJobBlock();
 
   assert.match(buildJob, /image_digest: \$\{\{ steps\.build\.outputs\.digest \}\}/);
+  assert.match(deployJob, /BUILD_RESULT: \$\{\{ needs\.build-and-push\.result \}\}/);
   assert.match(deployJob, /EXPECTED_DIGEST: \$\{\{ needs\.build-and-push\.outputs\.image_digest \}\}/);
+  assert.match(deployJob, /success\)[\s\S]*EXPECTED_DIGEST[\s\S]*\^sha256:/);
+  assert.match(deployJob, /skipped\)[\s\S]*github\.event_name[\s\S]*schedule/);
   assert.match(deployJob, /\[ "\$\{digest\}" != "\$\{EXPECTED_DIGEST\}" \]/);
   assert.match(deployJob, /DIGEST: \$\{\{ steps\.artifact\.outputs\.digest \}\}/);
+  const render = deployJob.indexOf('rendered=$(helm template');
+  const upgrade = deployJob.indexOf('helm upgrade "${RELEASE}"');
+  assert.notEqual(render, -1, "deploy job must render the selected chart before upgrade");
+  assert.ok(render < upgrade, "deploy job must validate rendered images before upgrade");
+  assert.match(deployJob, /grep -Fvx "\$\{expected_image\}"/);
   assert.match(deployJob, /--set-string image\.digest="\$\{DIGEST\}"/);
   assert.match(imageHelper, /if \.Values\.image\.digest/);
   assert.match(imageHelper, /printf "%s@%s" \.Values\.image\.repository \.Values\.image\.digest/);

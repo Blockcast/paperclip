@@ -413,6 +413,7 @@ jobs:
         id: artifact
         if: ${{ steps.gate.outputs.proceed == 'true' }}
         env:
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
           EXPECTED_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
           TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
         run: |
@@ -420,10 +421,28 @@ jobs:
           image="harbor.blockcast.net/paperclip/paperclip:${TAG}"
           digest=$(docker buildx imagetools inspect "${image}" --format '{{json .Manifest.Digest}}' | tr -d '"')
           [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
-          if [ -n "${EXPECTED_DIGEST}" ] && [ "${digest}" != "${EXPECTED_DIGEST}" ]; then
-            echo "Tag ${image} resolved to ${digest}, expected build digest ${EXPECTED_DIGEST}" >&2
-            exit 1
-          fi
+          case "${BUILD_RESULT}" in
+            success)
+              if [[ ! "${EXPECTED_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "Successful build did not provide a valid image digest: ${EXPECTED_DIGEST:-<empty>}" >&2
+                exit 1
+              fi
+              if [ "${digest}" != "${EXPECTED_DIGEST}" ]; then
+                echo "Tag ${image} resolved to ${digest}, expected build digest ${EXPECTED_DIGEST}" >&2
+                exit 1
+              fi
+              ;;
+            skipped)
+              if [ "${{ github.event_name }}" != "schedule" ] || [ -n "${EXPECTED_DIGEST}" ]; then
+                echo "An empty build digest is allowed only for a scheduled deploy-only run" >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "Unexpected build result: ${BUILD_RESULT}" >&2
+              exit 1
+              ;;
+          esac
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
           {
             echo "### Paperclip deploy target"
@@ -445,6 +464,19 @@ jobs:
           set -euo pipefail
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "rolling out ${TAG}@${DIGEST} to ${NS}/${RELEASE}"
+          expected_image="harbor.blockcast.net/paperclip/paperclip@${DIGEST}"
+          rendered=$(helm template "${RELEASE}" ./deploy/helm/paperclip \
+            -n "${NS}" \
+            -f deploy/helm/paperclip/values.blockcast.yaml \
+            --set image.tag="${TAG}" \
+            --set-string image.digest="${DIGEST}")
+          rendered_images=$(printf '%s\n' "${rendered}" | awk \
+            '$1 == "image:" { gsub(/["'\''"]/, "", $2); if ($2 ~ /^harbor\.blockcast\.net\/paperclip\/paperclip([:@]|$)/) print $2 }')
+          if [ -z "${rendered_images}" ] || [ -n "$(printf '%s\n' "${rendered_images}" | grep -Fvx "${expected_image}" || true)" ]; then
+            echo "Chart did not render every Paperclip workload as ${expected_image}:" >&2
+            printf '%s\n' "${rendered_images:-<none>}" >&2
+            exit 1
+          fi
           # --timeout bumped 10m → 30m on 2026-05-23 after rev 316 + several
           # prior revs hit "context deadline exceeded" while the cluster was
           # in apiserver/kubelet-latency cascade (control-plane nodes at
