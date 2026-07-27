@@ -33,12 +33,40 @@ jobs:
         with:
           ref: master
 
+      - name: Guard React Router RSC advisory exception
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_REF: refs/pull/${{ github.event.pull_request.number }}/head
+        run: |
+          git fetch --no-tags --depth=1 origin "$PR_REF"
+          test "$(git rev-parse FETCH_HEAD)" = "$HEAD_SHA"
+
+          set +e
+          git grep -I -n -E 'unstable_RSC|react-server-dom' "$HEAD_SHA" -- \
+            pnpm-lock.yaml \
+            ':(glob)**/package.json' \
+            ':(glob)**/*.js' \
+            ':(glob)**/*.jsx' \
+            ':(glob)**/*.mjs' \
+            ':(glob)**/*.cjs' \
+            ':(glob)**/*.ts' \
+            ':(glob)**/*.tsx' \
+            ':(exclude).github/**'
+          grep_status=$?
+          set -e
+
+          if [ "$grep_status" -eq 0 ]; then
+            echo "GHSA-qwww-vcr4-c8h2 cannot be exempted when React Router RSC APIs or dependencies are present."
+            exit 1
+          fi
+          test "$grep_status" -eq 1
+
       - name: Dependency Review
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           base-ref: ${{ github.event.pull_request.base.sha }}
           head-ref: ${{ github.event.pull_request.head.sha }}
-          # Only affects unstable RSC APIs; the UI is a client-only Vite SPA.
+          # Only affects unstable RSC APIs, which the guard above rejects.
           allow-ghsas: GHSA-qwww-vcr4-c8h2
 
       # Only the commitperclip bot steps below use Node. On Blockcast the bot
