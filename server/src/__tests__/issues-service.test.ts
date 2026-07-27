@@ -4196,6 +4196,19 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       ]);
     });
 
+    it("suppresses the wake when the latest agent comment awaits user input", async () => {
+      const ctx = await setupBlockedDependentWithExecutive();
+      await insertComment({
+        companyId: ctx.companyId,
+        issueId: ctx.blockedIssueId,
+        authorAgentId: ctx.assigneeAgentId,
+        body: "Blocked awaiting Omar: @omar, can you confirm the preview hostname?",
+        createdAt: new Date(),
+      });
+
+      await expect(svc.listWakeableBlockedDependents(ctx.blockerId)).resolves.toEqual([]);
+    });
+
     it("uses the newest matching executive comment when multiple holds are present", async () => {
       const ctx = await setupBlockedDependentWithExecutive();
       const oldFuture = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();

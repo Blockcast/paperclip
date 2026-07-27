@@ -172,6 +172,7 @@ function awaitingUserInputReason(body: string): string | null {
 
 async function findBlockedPromotionsAwaitingUserInput(
   dbOrTx: any,
+  companyId: string,
   issueIds: string[],
 ) {
   if (issueIds.length === 0) return new Map<string, {
@@ -190,6 +191,7 @@ async function findBlockedPromotionsAwaitingUserInput(
     .from(issueComments)
     .where(
       and(
+        eq(issueComments.companyId, companyId),
         inArray(issueComments.issueId, issueIds),
         or(
           sql<boolean>`${issueComments.authorAgentId} IS NOT NULL`,
@@ -219,6 +221,7 @@ async function findBlockedPromotionsAwaitingUserInput(
     .from(issueComments)
     .where(
       and(
+        eq(issueComments.companyId, companyId),
         inArray(issueComments.issueId, awaitingComments.map((comment) => comment.issueId)),
         sql<boolean>`${issueComments.authorUserId} IS NOT NULL`,
       ),
@@ -6641,7 +6644,11 @@ export function issueService(db: Db) {
 
       const suppressedIssueIds = new Set<string>();
       if (blockedCandidateIds.length > 0) {
-        const awaitingUserInputByIssueId = await findBlockedPromotionsAwaitingUserInput(db, blockedCandidateIds);
+        const awaitingUserInputByIssueId = await findBlockedPromotionsAwaitingUserInput(
+          db,
+          blockerIssue.companyId,
+          blockedCandidateIds,
+        );
         for (const [issueId, awaitingUserInput] of awaitingUserInputByIssueId) {
           suppressedIssueIds.add(issueId);
           recordBlockedPromotionAwaitingUserSkip({
@@ -6782,6 +6789,7 @@ export function issueService(db: Db) {
         latestBlockerResolvedAt: Date | null;
       }> = [];
       const candidateStatusById = new Map(candidates.map((c) => [c.id, c.status]));
+      const candidateCompanyIdById = new Map(candidates.map((c) => [c.id, c.companyId]));
       for (const candidate of candidates) {
         const blockers = byDependent.get(candidate.id);
         if (!blockers || blockers.ids.length === 0 || !blockers.allDone) continue;
@@ -6921,7 +6929,25 @@ export function issueService(db: Db) {
         .map((r) => r.id);
       if (blockedResultIds.length === 0) return resultsAfterExplicitWaitingSuppression;
 
-      const awaitingUserInputByIssueId = await findBlockedPromotionsAwaitingUserInput(db, blockedResultIds);
+      const blockedResultIdsByCompanyId = new Map<string, string[]>();
+      for (const issueId of blockedResultIds) {
+        const candidateCompanyId = candidateCompanyIdById.get(issueId);
+        if (!candidateCompanyId) continue;
+        const ids = blockedResultIdsByCompanyId.get(candidateCompanyId) ?? [];
+        ids.push(issueId);
+        blockedResultIdsByCompanyId.set(candidateCompanyId, ids);
+      }
+      const awaitingUserInputByIssueId = new Map<string, {
+        commentId: string;
+        commentCreatedAt: Date;
+        reason: string;
+      }>();
+      for (const [candidateCompanyId, issueIds] of blockedResultIdsByCompanyId) {
+        const companyResults = await findBlockedPromotionsAwaitingUserInput(db, candidateCompanyId, issueIds);
+        for (const [issueId, awaitingUserInput] of companyResults) {
+          awaitingUserInputByIssueId.set(issueId, awaitingUserInput);
+        }
+      }
       for (const [issueId, awaitingUserInput] of awaitingUserInputByIssueId) {
         recordBlockedPromotionAwaitingUserSkip({
           issueId,
