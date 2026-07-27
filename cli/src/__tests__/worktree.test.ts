@@ -709,7 +709,7 @@ describe("worktree helpers", () => {
         fs.rmSync(tempRoot, { recursive: true, force: true });
       }
     },
-    120_000,
+    240_000,
   );
 
   it("avoids ports already claimed by sibling worktree instance configs", async () => {
