@@ -1178,6 +1178,32 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
+  it("lets an authorized agent comment and resume a blocked issue despite an awaiting-user latch", async () => {
+    const issue = {
+      ...makeIssue("blocked"),
+      checkoutRunId: "run-1",
+      executionRunId: "run-1",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockResolvedValue({ ...issue, status: "todo" });
+
+    const res = await request(await installActor(createApp(), agentActor()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Intentional manual resolution recorded; resume work.", resume: true });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      { status: "todo" },
+    );
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      "Intentional manual resolution recorded; resume work.",
+      { agentId: issue.assigneeAgentId, userId: undefined, runId: "run-1" },
+      expect.objectContaining({ authorType: "agent" }),
+    );
+  });
+
   it("passes validated comment presentation fields to trusted board comment writes", async () => {
     const app = await installActor(createApp());
     mockIssueService.getById.mockResolvedValue(makeIssue("todo"));

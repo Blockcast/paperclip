@@ -153,14 +153,14 @@ const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_PARALLEL_READS = 8;
 function awaitingUserInputReason(body: string): string | null {
   const normalized = body.toLowerCase();
   const hasExplicitPhrase = [
-    "pick a",
-    "confirm",
-    "let me know",
-    "blocked on clarification",
-    "blocked awaiting",
-    "awaiting user",
-    "awaiting your",
-  ].some((phrase) => normalized.includes(phrase));
+    /\bpick (?:a|an)\b/,
+    /\bconfirm\b/,
+    /\blet me know\b/,
+    /\bblocked on clarification\b/,
+    /\bblocked awaiting\b/,
+    /\bawaiting user\b/,
+    /\bawaiting your\b/,
+  ].some((phrase) => phrase.test(normalized));
   if (hasExplicitPhrase) return "explicit_phrase";
 
   const hasQuestion = body.includes("?");
@@ -170,21 +170,29 @@ function awaitingUserInputReason(body: string): string | null {
   return null;
 }
 
-async function findBlockedPromotionAwaitingUserInput(
+async function findBlockedPromotionsAwaitingUserInput(
   dbOrTx: any,
-  issue: Pick<typeof issues.$inferSelect, "id" | "companyId">,
+  companyId: string,
+  issueIds: string[],
 ) {
-  const latestAgentComment = await dbOrTx
-    .select({
+  if (issueIds.length === 0) return new Map<string, {
+    commentId: string;
+    commentCreatedAt: Date;
+    reason: string;
+  }>();
+
+  const latestAgentComments = await dbOrTx
+    .selectDistinctOn([issueComments.issueId], {
       id: issueComments.id,
+      issueId: issueComments.issueId,
       body: issueComments.body,
       createdAt: issueComments.createdAt,
     })
     .from(issueComments)
     .where(
       and(
-        eq(issueComments.companyId, issue.companyId),
-        eq(issueComments.issueId, issue.id),
+        eq(issueComments.companyId, companyId),
+        inArray(issueComments.issueId, issueIds),
         or(
           sql<boolean>`${issueComments.authorAgentId} IS NOT NULL`,
           sql<boolean>`${issueComments.createdByRunId} IS NOT NULL`,
@@ -192,34 +200,69 @@ async function findBlockedPromotionAwaitingUserInput(
         )!,
       ),
     )
-    .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
-    .limit(1)
-    .then((rows: Array<{ id: string; body: string; createdAt: Date }>) => rows[0] ?? null);
+    .orderBy(issueComments.issueId, desc(issueComments.createdAt), desc(issueComments.id)) as Array<{
+      id: string;
+      issueId: string;
+      body: string;
+      createdAt: Date;
+    }>;
 
-  if (!latestAgentComment) return null;
-  const reason = awaitingUserInputReason(latestAgentComment.body);
-  if (!reason) return null;
+  const awaitingComments = latestAgentComments.flatMap((comment) => {
+    const reason = awaitingUserInputReason(comment.body);
+    return reason ? [{ ...comment, reason }] : [];
+  });
+  if (awaitingComments.length === 0) return new Map();
 
-  const userReplyAfterAgentQuestion = await dbOrTx
-    .select({ id: issueComments.id })
+  const latestUserReplies = await dbOrTx
+    .selectDistinctOn([issueComments.issueId], {
+      issueId: issueComments.issueId,
+      createdAt: issueComments.createdAt,
+    })
     .from(issueComments)
     .where(
       and(
-        eq(issueComments.companyId, issue.companyId),
-        eq(issueComments.issueId, issue.id),
+        eq(issueComments.companyId, companyId),
+        inArray(issueComments.issueId, awaitingComments.map((comment) => comment.issueId)),
         sql<boolean>`${issueComments.authorUserId} IS NOT NULL`,
-        gt(issueComments.createdAt, latestAgentComment.createdAt),
       ),
     )
-    .limit(1)
-    .then((rows: Array<{ id: string }>) => rows[0] ?? null);
+    .orderBy(issueComments.issueId, desc(issueComments.createdAt), desc(issueComments.id)) as Array<{
+      issueId: string;
+      createdAt: Date;
+    }>;
+  const latestUserReplyByIssueId = new Map(
+    latestUserReplies.map((comment) => [comment.issueId, comment.createdAt] as const),
+  );
 
-  if (userReplyAfterAgentQuestion) return null;
-  return {
-    commentId: latestAgentComment.id,
-    commentCreatedAt: latestAgentComment.createdAt,
-    reason,
+  return new Map(awaitingComments.flatMap((comment) => {
+    const latestUserReply = latestUserReplyByIssueId.get(comment.issueId);
+    if (latestUserReply && latestUserReply > comment.createdAt) return [];
+    return [[comment.issueId, {
+      commentId: comment.id,
+      commentCreatedAt: comment.createdAt,
+      reason: comment.reason,
+    }] as const];
+  }));
+}
+
+function recordBlockedPromotionAwaitingUserSkip(input: {
+  issueId: string;
+  commentId: string;
+  commentCreatedAt: Date;
+  reason: string;
+  triggerPath: "blocker_done" | "resolved_blocker_sweep";
+}) {
+  const details = {
+    event: BLOCKED_PROMOTION_AWAITING_USER_EVENT,
+    counter: BLOCKED_PROMOTION_AWAITING_USER_COUNTER,
+    ...input,
+    commentCreatedAt: input.commentCreatedAt.toISOString(),
   };
+  logger.info(details, "automatic blocked issue wake skipped because latest agent comment awaits user input");
+  getTelemetryClient()?.track(BLOCKED_PROMOTION_AWAITING_USER_COUNTER, {
+    reason: input.reason,
+    triggerPath: input.triggerPath,
+  });
 }
 
 export const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS = 7;
@@ -6601,6 +6644,20 @@ export function issueService(db: Db) {
 
       const suppressedIssueIds = new Set<string>();
       if (blockedCandidateIds.length > 0) {
+        const awaitingUserInputByIssueId = await findBlockedPromotionsAwaitingUserInput(
+          db,
+          blockerIssue.companyId,
+          blockedCandidateIds,
+        );
+        for (const [issueId, awaitingUserInput] of awaitingUserInputByIssueId) {
+          suppressedIssueIds.add(issueId);
+          recordBlockedPromotionAwaitingUserSkip({
+            issueId,
+            ...awaitingUserInput,
+            triggerPath: "blocker_done",
+          });
+        }
+
         const commentRows = await db
           .select({
             id: issueComments.id,
@@ -6732,6 +6789,7 @@ export function issueService(db: Db) {
         latestBlockerResolvedAt: Date | null;
       }> = [];
       const candidateStatusById = new Map(candidates.map((c) => [c.id, c.status]));
+      const candidateCompanyIdById = new Map(candidates.map((c) => [c.id, c.companyId]));
       for (const candidate of candidates) {
         const blockers = byDependent.get(candidate.id);
         if (!blockers || blockers.ids.length === 0 || !blockers.allDone) continue;
@@ -6871,6 +6929,33 @@ export function issueService(db: Db) {
         .map((r) => r.id);
       if (blockedResultIds.length === 0) return resultsAfterExplicitWaitingSuppression;
 
+      const blockedResultIdsByCompanyId = new Map<string, string[]>();
+      for (const issueId of blockedResultIds) {
+        const candidateCompanyId = candidateCompanyIdById.get(issueId);
+        if (!candidateCompanyId) continue;
+        const ids = blockedResultIdsByCompanyId.get(candidateCompanyId) ?? [];
+        ids.push(issueId);
+        blockedResultIdsByCompanyId.set(candidateCompanyId, ids);
+      }
+      const awaitingUserInputByIssueId = new Map<string, {
+        commentId: string;
+        commentCreatedAt: Date;
+        reason: string;
+      }>();
+      for (const [candidateCompanyId, issueIds] of blockedResultIdsByCompanyId) {
+        const companyResults = await findBlockedPromotionsAwaitingUserInput(db, candidateCompanyId, issueIds);
+        for (const [issueId, awaitingUserInput] of companyResults) {
+          awaitingUserInputByIssueId.set(issueId, awaitingUserInput);
+        }
+      }
+      for (const [issueId, awaitingUserInput] of awaitingUserInputByIssueId) {
+        recordBlockedPromotionAwaitingUserSkip({
+          issueId,
+          ...awaitingUserInput,
+          triggerPath: "resolved_blocker_sweep",
+        });
+      }
+
       const pendingConfirmationRows = await db
         .select({ issueId: issueThreadInteractions.issueId })
         .from(issueThreadInteractions)
@@ -6879,7 +6964,10 @@ export function issueService(db: Db) {
           eq(issueThreadInteractions.kind, "request_confirmation"),
           eq(issueThreadInteractions.status, "pending"),
         ));
-      const suppressedIssueIds = new Set<string>(pendingConfirmationRows.map((row) => row.issueId));
+      const suppressedIssueIds = new Set<string>([
+        ...pendingConfirmationRows.map((row) => row.issueId),
+        ...awaitingUserInputByIssueId.keys(),
+      ]);
 
       const commentRows = await db
         .select({
@@ -7780,25 +7868,6 @@ export function issueService(db: Db) {
         delete issueData.executionWorkspaceId;
         delete issueData.executionWorkspacePreference;
         delete issueData.executionWorkspaceSettings;
-      }
-
-      if (existing.status === "blocked" && issueData.status === "todo") {
-        const awaitingUserInput = await findBlockedPromotionAwaitingUserInput(dbOrTx, existing);
-        if (awaitingUserInput) {
-          const details = {
-            event: BLOCKED_PROMOTION_AWAITING_USER_EVENT,
-            counter: BLOCKED_PROMOTION_AWAITING_USER_COUNTER,
-            issueId: existing.id,
-            commentId: awaitingUserInput.commentId,
-            commentCreatedAt: awaitingUserInput.commentCreatedAt.toISOString(),
-            reason: awaitingUserInput.reason,
-          };
-          logger.warn(details, "blocked to todo promotion skipped because latest agent comment awaits user input");
-          getTelemetryClient()?.track(BLOCKED_PROMOTION_AWAITING_USER_COUNTER, {
-            reason: awaitingUserInput.reason,
-          });
-          throw conflict("Blocked issue is awaiting user input", details);
-        }
       }
 
       if (issueData.status) {
