@@ -118,6 +118,128 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ---------------------------------------------------------------------------
+// Torn package-store detection (BLO-18384)
+// ---------------------------------------------------------------------------
+//
+// The shared plugin install directory's package-lock.json and its physical
+// node_modules/ tree are written by several uncoordinated steps across a
+// server boot (an early one-time SDK-fork vendor copy, per-plugin `npm
+// install` invocations that each touch the same shared package.json/lockfile,
+// and a post-install re-patch that overwrites specific dist files but not
+// package.json — see the `copyWorkspaceSdkFiles`/`autoInstallBundledPlugins`
+// sequence in index.ts). None of those steps are transactional with each
+// other, so a restart, OOM-kill, or deploy rollout landing between two of
+// them can leave package-lock.json recording one version of a shared
+// dependency (e.g. `@paperclipai/plugin-sdk`) while node_modules physically
+// holds a different one. Workers importing that dependency don't fail fast —
+// they hang on the RPC handshake until INITIALIZE_TIMEOUT_MS (60s) elapses,
+// and the plugin is then marked `error` with an opaque timeout message that
+// gives no hint of the real cause.
+//
+// This check runs read-only, before a worker is ever spawned, so it is safe
+// under interruption (nothing to leave half-written) and under concurrent
+// startup (multiple replicas/restarts can run it in parallel without
+// contention). On a detected mismatch we fail closed — throwing here routes
+// into activatePlugin's existing catch block, which marks the plugin `error`
+// with an actionable message, in well under a second instead of after a 60s
+// hang. We deliberately do NOT attempt an automatic `npm install` repair here:
+// silently mutating the shared store on every boot is exactly the "one-off
+// npm install treated as the complete fix" this ticket warns against, and can
+// itself race a concurrent install. Reconciliation is a deliberate, observed
+// operator action (or a future dedicated reconciliation job), not a side
+// effect of activation.
+export interface SharedDependencyConsistencyCheck {
+  packageName: string;
+  lockfileVersion: string | null;
+  installedVersion: string | null;
+  consistent: boolean;
+}
+
+async function readInstalledPackageVersion(
+  installDir: string,
+  packageName: string,
+): Promise<string | null> {
+  const pkgJsonPath = path.join(installDir, "node_modules", ...packageName.split("/"), "package.json");
+  if (!existsSync(pkgJsonPath)) return null;
+  try {
+    const raw = await readFile(pkgJsonPath, "utf-8");
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return typeof parsed["version"] === "string" ? parsed["version"] : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readLockfileVersion(
+  installDir: string,
+  packageName: string,
+): Promise<string | null> {
+  const lockfilePath = path.join(installDir, "package-lock.json");
+  if (!existsSync(lockfilePath)) return null;
+  try {
+    const raw = await readFile(lockfilePath, "utf-8");
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+
+    // npm lockfileVersion 2/3: keyed by node_modules-relative path.
+    const packagesSection = parsed["packages"] as Record<string, unknown> | undefined;
+    const packagesEntry = packagesSection?.[`node_modules/${packageName}`] as Record<string, unknown> | undefined;
+    if (packagesEntry && typeof packagesEntry["version"] === "string") {
+      return packagesEntry["version"];
+    }
+
+    // npm lockfileVersion 1 (and the back-compat "dependencies" block some
+    // v2/v3 lockfiles still carry): keyed by bare package name.
+    const dependenciesSection = parsed["dependencies"] as Record<string, unknown> | undefined;
+    const dependenciesEntry = dependenciesSection?.[packageName] as Record<string, unknown> | undefined;
+    if (dependenciesEntry && typeof dependenciesEntry["version"] === "string") {
+      return dependenciesEntry["version"];
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Compare the version of `packageName` recorded in `installDir`'s
+ * package-lock.json against the version physically installed under
+ * `installDir/node_modules`.
+ *
+ * Absence on either side is NOT treated as a mismatch — a missing lockfile
+ * (local dev without one) or a not-yet-installed package makes no claim to
+ * disagree with. Only two *present, differing* versions count as torn.
+ */
+export async function checkSharedDependencyConsistency(
+  installDir: string,
+  packageName: string = SDK_INSTALL_RACE_PACKAGE_MARKER,
+): Promise<SharedDependencyConsistencyCheck> {
+  const [lockfileVersion, installedVersion] = await Promise.all([
+    readLockfileVersion(installDir, packageName),
+    readInstalledPackageVersion(installDir, packageName),
+  ]);
+
+  const consistent =
+    lockfileVersion === null ||
+    installedVersion === null ||
+    lockfileVersion === installedVersion;
+
+  return { packageName, lockfileVersion, installedVersion, consistent };
+}
+
+function formatTornPackageStoreError(check: SharedDependencyConsistencyCheck, installDir: string): string {
+  const installedPath = path.join(installDir, "node_modules", ...check.packageName.split("/"));
+  return (
+    `Torn plugin store detected: package-lock.json for ${check.packageName} records ` +
+    `'${check.lockfileVersion}' but the installed package at ${installedPath} reports ` +
+    `'${check.installedVersion}'. Refusing to activate to avoid a silent worker ` +
+    `initialize timeout. Reconcile the shared plugin store (e.g. remove the stale ` +
+    `node_modules/${check.packageName} directory and re-run 'npm install --prefix ${installDir}') ` +
+    `before re-enabling this plugin.`
+  );
+}
+
 /**
  * Model-provider API keys that sandbox-provider plugins (e.g.
  * `@paperclipai/plugin-kubernetes`) are allowed to read from the
@@ -2220,6 +2342,22 @@ export function pluginLoader(
       activePlugin = await refreshPluginManifestFromPackage(activePlugin, packageRoot);
       manifest = activePlugin.manifestJson;
       const workerEntrypoint = resolveWorkerEntrypoint(activePlugin, localPluginDir);
+
+      // ------------------------------------------------------------------
+      // 1b. Fail closed on a torn shared package store (BLO-18384)
+      //
+      // Detect before spawning the worker, not after: a version mismatch
+      // between package-lock.json and the physically installed package
+      // doesn't raise ERR_MODULE_NOT_FOUND (the files are present, just
+      // wrong), so it isn't caught by the SDK_INSTALL_RACE retry below —
+      // the worker would instead hang on the initialize handshake for the
+      // full 60s INITIALIZE_TIMEOUT_MS before failing with an opaque
+      // timeout. This check is read-only and completes in milliseconds.
+      // ------------------------------------------------------------------
+      const sdkConsistency = await checkSharedDependencyConsistency(localPluginDir);
+      if (!sdkConsistency.consistent) {
+        throw new Error(formatTornPackageStoreError(sdkConsistency, localPluginDir));
+      }
 
       // ------------------------------------------------------------------
       // 2. Apply restricted database migrations before worker startup
