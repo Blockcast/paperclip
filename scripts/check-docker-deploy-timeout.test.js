@@ -63,18 +63,12 @@ test("Docker deploy job provisions Buildx before inspecting the artifact", () =>
   assert.ok(setup < inspect, "deploy job must provision Buildx before artifact inspection");
 });
 
-test("scheduled deploy gate recognizes a recent digest-pinned tip", () => {
+test("production deploy is manual-only and environment-protected", () => {
   const deployJob = getDeployJobBlock();
-  const gateStart = deployJob.indexOf("- name: Deploy gate (6h debounce on push)");
-  const gateEnd = deployJob.indexOf("\n      - name:", gateStart + 1);
-  assert.notEqual(gateStart, -1, "deploy job must define the debounce gate");
-  assert.notEqual(gateEnd, -1, "debounce gate must be followed by another step");
-  const gate = deployJob.slice(gateStart, gateEnd);
-
-  assert.match(gate, /docker buildx imagetools inspect "\$\{image\}"/);
-  assert.match(gate, /EXPECTED_IMG="harbor\.blockcast\.net\/paperclip\/paperclip@\$\{digest\}"/);
-  assert.match(gate, /\[ "\$RUNNING_IMG" = "\$EXPECTED_IMG" \]/);
-  assert.doesNotMatch(gate, /grep -qF "sha-\$\{TIP_SHORT\}"/);
+  assert.match(deployJob, /if: \$\{\{ github\.event_name == 'workflow_dispatch'/);
+  assert.match(deployJob, /environment:\n\s+name: paperclip-production/);
+  assert.doesNotMatch(workflow, /^  schedule:/m);
+  assert.doesNotMatch(deployJob, /github\.event_name == 'push'/);
 });
 
 test("Docker deploy binds Helm to the digest built for the approved SHA", () => {
@@ -84,8 +78,8 @@ test("Docker deploy binds Helm to the digest built for the approved SHA", () => 
   assert.match(buildJob, /image_digest: \$\{\{ steps\.build\.outputs\.digest \}\}/);
   assert.match(deployJob, /BUILD_RESULT: \$\{\{ needs\.build-and-push\.result \}\}/);
   assert.match(deployJob, /EXPECTED_DIGEST: \$\{\{ needs\.build-and-push\.outputs\.image_digest \}\}/);
-  assert.match(deployJob, /success\)[\s\S]*EXPECTED_DIGEST[\s\S]*\^sha256:/);
-  assert.match(deployJob, /skipped\)[\s\S]*github\.event_name[\s\S]*schedule/);
+  assert.match(deployJob, /BUILD_RESULT[^]*!= "success"/);
+  assert.match(deployJob, /EXPECTED_DIGEST[^]*\^sha256:/);
   assert.match(deployJob, /\[ "\$\{digest\}" != "\$\{EXPECTED_DIGEST\}" \]/);
   assert.match(deployJob, /DIGEST: \$\{\{ steps\.artifact\.outputs\.digest \}\}/);
   const render = deployJob.indexOf('rendered=$(helm template');
