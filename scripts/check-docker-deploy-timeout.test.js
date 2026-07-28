@@ -65,10 +65,14 @@ test("Docker deploy job provisions Buildx before inspecting the artifact", () =>
 
 test("production deploy is manual-only and environment-protected", () => {
   const deployJob = getDeployJobBlock();
-  assert.match(deployJob, /if: \$\{\{ github\.event_name == 'workflow_dispatch'/);
+  const conditionMatch = deployJob.match(/^    if:\s*\$\{\{\s*(.*?)\s*\}\}\s*$/m);
+  assert.ok(conditionMatch, "deploy job must declare an if condition");
+  assert.equal(
+    conditionMatch[1].replace(/\s+/g, " "),
+    "github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success'",
+  );
   assert.match(deployJob, /environment:\n\s+name: paperclip-production/);
   assert.doesNotMatch(workflow, /^  schedule:/m);
-  assert.doesNotMatch(deployJob, /github\.event_name == 'push'/);
 });
 
 test("Docker deploy binds Helm to the digest built for the approved SHA", () => {
