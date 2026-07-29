@@ -346,11 +346,13 @@ const CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE = "issue_continuation_waiting_on
 // failing check nor a first probe. Give the actual cause instead. (BLO-18784)
 const WORKSPACE_PREFLIGHT_RECOVERY_GUIDANCE: Record<string, string> = {
   workspace_git_submodule_unavailable:
-    "the git submodule preflight (`git submodule status --recursive`) reported the execution " +
-    "workspace's submodules as unusable. Inspect the shared checkout for conflicted gitlinks or " +
-    "submodules still uninitialized after the automatic repair, resolve them, then re-run. Note a " +
-    "merely slow inspection no longer strands an issue, so reaching this handoff means a submodule " +
-    "fault was actually detected rather than the check timing out.",
+    "the git submodule preflight (`git submodule status --recursive`) could not leave the execution " +
+    "workspace's submodules in a usable state. A merely slow inspection no longer strands an issue, " +
+    "so this handoff means one of two things: a submodule fault was actually detected (conflicted " +
+    "gitlinks, or still uninitialized after the automatic repair), or the repair commands themselves " +
+    "failed -- which can be transient, e.g. a network/auth failure fetching a submodule. Check the " +
+    "run's failure output to tell them apart: if the repair failed transiently, re-running may be " +
+    "sufficient; if a gitlink is genuinely conflicted, resolve it in the shared checkout first.",
   workspace_repo_mismatch:
     "the execution workspace is checked out from a different repository than the issue expects. " +
     "Repoint or re-provision the workspace, then re-run.",
@@ -362,7 +364,8 @@ function describeWorkspacePreflightRecoveryCause(latestRun: LatestIssueRun): str
   return WORKSPACE_PREFLIGHT_RECOVERY_GUIDANCE[errorCode] ?? null;
 }
 
-const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
+const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
+const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
 
 type ContinuationRetryClassification = {
