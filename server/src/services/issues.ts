@@ -7601,6 +7601,35 @@ export function issueService(db: Db) {
           const workspace = await assertValidExecutionWorkspace(companyId, null, executionWorkspaceId, tx);
           issueData.projectId = workspace.projectId;
         }
+        // BLO-18760: an issue created with none of the inheritance signals
+        // above (no parent, no explicit workspace) is *born* with
+        // projectId: null and, on its first run, falls back onto the
+        // per-agent fallback workspace — a long-lived, shared directory that
+        // can accumulate a real (but unrelated, concurrently-touched) git
+        // checkout from past work, making a local `git clone --shared` from
+        // it a coin-flip to fail with a fatal git error before the agent
+        // ever starts. Give the issue a real managed checkout instead of
+        // leaving it workspace-less, but only when the signal is
+        // unambiguous: exactly one non-archived project the assignee leads.
+        // Anything murkier (no assignee, no lead project, or more than one
+        // candidate) is left alone rather than guessing at which repo the
+        // agent meant.
+        if (issueData.projectId == null && issueData.assigneeAgentId) {
+          const ledProjects = await tx
+            .select({ id: projects.id })
+            .from(projects)
+            .where(
+              and(
+                eq(projects.companyId, companyId),
+                eq(projects.leadAgentId, issueData.assigneeAgentId),
+                isNull(projects.archivedAt),
+              ),
+            )
+            .limit(2);
+          if (ledProjects.length === 1) {
+            issueData.projectId = ledProjects[0].id;
+          }
+        }
         const projectGoalId = await getProjectDefaultGoalId(tx, companyId, issueData.projectId);
         // Cache the project policy lookup for this insert. Both the
         // default-settings block and the assignee-environment-promotion block

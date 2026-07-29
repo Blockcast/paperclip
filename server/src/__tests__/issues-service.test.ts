@@ -2897,6 +2897,153 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  it("BLO-18760: defaults projectId to the assignee's sole led project when no other workspace signal is present", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Board-filed issue with no project",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    expect(issue.projectId).toBe(projectId);
+  });
+
+  it("BLO-18760: leaves projectId null when the assignee leads no project", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "IC",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Board-filed issue, no project anywhere",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    expect(issue.projectId).toBeNull();
+  });
+
+  it("BLO-18760: leaves projectId null when the assignee leads more than one project (ambiguous)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values([
+      { id: randomUUID(), companyId, name: "Project A", status: "in_progress", leadAgentId: agentId },
+      { id: randomUUID(), companyId, name: "Project B", status: "in_progress", leadAgentId: agentId },
+    ]);
+
+    const issue = await svc.create(companyId, {
+      title: "Board-filed issue, ambiguous lead project",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    expect(issue.projectId).toBeNull();
+  });
+
+  it("BLO-18760: does not override an explicitly-provided projectId", async () => {
+    const companyId = randomUUID();
+    const ledProjectId = randomUUID();
+    const explicitProjectId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values([
+      { id: ledProjectId, companyId, name: "Led project", status: "in_progress", leadAgentId: agentId },
+      { id: explicitProjectId, companyId, name: "Explicit project", status: "in_progress" },
+    ]);
+
+    const issue = await svc.create(companyId, {
+      title: "Explicitly-bound issue",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      projectId: explicitProjectId,
+    });
+
+    expect(issue.projectId).toBe(explicitProjectId);
+  });
+
   it("inherits responsible user for agent-created child issues", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
