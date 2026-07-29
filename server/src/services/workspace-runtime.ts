@@ -163,8 +163,13 @@ function readPositiveIntEnv(name: string, fallback: number): number {
   const raw = process.env[name]?.trim();
   if (!raw) return fallback;
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
-  return Math.trunc(parsed);
+  // Require an exact positive integer rather than truncating. A fractional value
+  // like "0.5" satisfies a bare `> 0` check and then truncates to 0, which does
+  // not fall back -- it disables `executeProcess`'s timeout (0 is not `> 0`
+  // there) or skips the retry loop entirely. Both fail open silently, which is
+  // the opposite of what an operator tuning this value would expect.
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return fallback;
+  return parsed;
 }
 
 function readSubmoduleInspectSettings(): { timeoutMs: number; attempts: number; retryDelayMs: number } {
@@ -1034,20 +1039,38 @@ function buildNonInteractiveGitEnv(): NodeJS.ProcessEnv {
 /**
  * Result of probing submodule readiness.
  *
- * The distinction matters: `ok: false` means we could not determine the state,
+ * `ok: false` means the probe *stalled* -- we could not determine the state,
  * which is NOT evidence that submodules are broken. Callers must not strand a
  * live issue on an inconclusive probe -- see `ensureGitSubmodulesReady`.
+ *
+ * Deterministic failures never reach this type: they throw. See
+ * `inspectGitSubmoduleReadiness`.
  */
 type GitSubmoduleInspection =
   | { ok: true; entries: GitSubmoduleReadinessEntry[] }
   | { ok: false; reason: string; attempts: number };
 
+/**
+ * Probe submodule readiness, retrying stalls.
+ *
+ * Two failure modes, deliberately handled differently:
+ *
+ * - **Stall** (`GitCommandTimeoutError`): inconclusive. Retried, then reported as
+ *   `ok: false` so the caller can degrade to a warning. This is the BLO-18784 fix.
+ * - **Any other failure** (non-zero exit, missing git binary, malformed
+ *   `.gitmodules`, corrupt checkout, permission error): deterministic evidence
+ *   that the checkout is unusable. Throws `WorkspaceGitSubmoduleError`, as it did
+ *   before BLO-18784. Retrying would burn every budget to reach the same answer,
+ *   and degrading past it would start an agent in a workspace we already know is
+ *   broken -- the timeout fix must not widen into a general fail-open.
+ */
 async function inspectGitSubmoduleReadiness(
   cwd: string,
   env: NodeJS.ProcessEnv,
+  stage: "initial" | "post_repair",
 ): Promise<GitSubmoduleInspection> {
   const settings = readSubmoduleInspectSettings();
-  let lastReason = "unknown error";
+  let lastTimeoutReason: string | null = null;
 
   for (let attempt = 1; attempt <= settings.attempts; attempt += 1) {
     try {
@@ -1059,27 +1082,33 @@ async function inspectGitSubmoduleReadiness(
       });
       return { ok: true, entries: parseGitSubmoduleReadiness(output) };
     } catch (error) {
-      lastReason = error instanceof Error ? error.message : String(error);
-      // Only a stall is worth retrying. A non-zero exit is deterministic, so
-      // retrying it would just burn every budget to reach the same answer.
       if (!(error instanceof GitCommandTimeoutError)) {
-        return { ok: false, reason: lastReason, attempts: attempt };
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new WorkspaceGitSubmoduleError(
+          `Could not inspect git submodules for execution workspace "${cwd}" ` +
+            `(${stage === "post_repair" ? "verification after repair" : "initial check"}): ${reason}`,
+        );
       }
+      lastTimeoutReason = error.message;
       if (attempt < settings.attempts) {
         await delay(settings.retryDelayMs * attempt);
       }
     }
   }
 
-  return { ok: false, reason: lastReason, attempts: settings.attempts };
+  return {
+    ok: false,
+    reason: lastTimeoutReason ?? "git submodule status --recursive did not complete",
+    attempts: settings.attempts,
+  };
 }
 
 function describeSubmoduleInspectionDegradation(cwd: string, inspection: { reason: string; attempts: number }): string {
   return (
     `Could not inspect git submodules for execution workspace "${cwd}" after ${inspection.attempts} attempt(s): ` +
-    `${inspection.reason}. Continuing without the submodule readiness check -- the inspection is inconclusive, ` +
-    `not a detected fault. If a submodule really is missing, the agent's own build/test step will fail with a ` +
-    `specific error.`
+    `${inspection.reason}. Continuing without the submodule readiness check -- the probe stalled, so the ` +
+    `inspection is inconclusive rather than a detected fault. If a submodule really is missing, the agent's own ` +
+    `build/test step will fail with a specific error.`
   );
 }
 
@@ -1138,11 +1167,12 @@ async function ensureGitSubmodulesReady(input: {
   if (!gitmodulesExists) return [];
 
   const env = buildNonInteractiveGitEnv();
-  const inspection = await inspectGitSubmoduleReadiness(input.cwd, env);
+  const inspection = await inspectGitSubmoduleReadiness(input.cwd, env, "initial");
   if (!inspection.ok) {
-    // Degrade to a warning rather than throwing. Stranding an in-progress issue
-    // because a read-only probe on a network filesystem was slow is strictly
-    // worse than letting the run proceed. See BLO-18784.
+    // The probe stalled (deterministic failures threw above). Degrade to a
+    // warning rather than throwing: stranding an in-progress issue because a
+    // read-only probe on a network filesystem was slow is strictly worse than
+    // letting the run proceed. See BLO-18784.
     const warning = describeSubmoduleInspectionDegradation(input.cwd, inspection);
     await recordSubmoduleInspectionDegradation(input.recorder, {
       cwd: input.cwd,
@@ -1223,10 +1253,11 @@ async function ensureGitSubmodulesReady(input: {
     );
   }
 
-  const verification = await inspectGitSubmoduleReadiness(input.cwd, env);
+  const verification = await inspectGitSubmoduleReadiness(input.cwd, env, "post_repair");
   if (!verification.ok) {
-    // The repair commands themselves succeeded; only the re-check was
-    // inconclusive. Report both rather than discarding the successful repair.
+    // The repair commands themselves succeeded and only the re-check stalled (a
+    // definitive verification failure threw above, so success is never claimed
+    // over one). Report both rather than discarding the successful repair.
     await recordSubmoduleInspectionDegradation(input.recorder, {
       cwd: input.cwd,
       reason: verification.reason,

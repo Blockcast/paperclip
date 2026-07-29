@@ -348,11 +348,13 @@ const WORKSPACE_PREFLIGHT_RECOVERY_GUIDANCE: Record<string, string> = {
   workspace_git_submodule_unavailable:
     "the git submodule preflight (`git submodule status --recursive`) could not leave the execution " +
     "workspace's submodules in a usable state. A merely slow inspection no longer strands an issue, " +
-    "so this handoff means one of two things: a submodule fault was actually detected (conflicted " +
-    "gitlinks, or still uninitialized after the automatic repair), or the repair commands themselves " +
-    "failed -- which can be transient, e.g. a network/auth failure fetching a submodule. Check the " +
-    "run's failure output to tell them apart: if the repair failed transiently, re-running may be " +
-    "sufficient; if a gitlink is genuinely conflicted, resolve it in the shared checkout first.",
+    "so this handoff means one of three things: a submodule fault was actually detected (conflicted " +
+    "gitlinks, or still uninitialized after the automatic repair); the repair commands themselves " +
+    "failed -- which can be transient, e.g. a network/auth failure fetching a submodule; or the " +
+    "inspection itself failed deterministically (malformed `.gitmodules`, corrupt checkout, " +
+    "permission error, missing git binary). Check the run's failure output to tell them apart: if the " +
+    "repair failed transiently, re-running may be sufficient; if a gitlink is genuinely conflicted or " +
+    "`.gitmodules` will not parse, fix the shared checkout first.",
   workspace_repo_mismatch:
     "the execution workspace is checked out from a different repository than the issue expects. " +
     "Repoint or re-provision the workspace, then re-run.",

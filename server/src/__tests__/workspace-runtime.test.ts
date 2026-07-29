@@ -37,6 +37,7 @@ import {
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
   type RealizedExecutionWorkspace,
+  WorkspaceGitSubmoduleError,
   WorkspaceRepoMismatchError,
 } from "../services/workspace-runtime.js";
 import { readLocalServicePortOwner, writeLocalServiceRegistryRecord } from "../services/local-service-supervisor.js";
@@ -2486,6 +2487,177 @@ describe("realizeExecutionWorkspace", () => {
       restore("PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS", previous.timeout);
       restore("PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS", previous.attempts);
       restore("PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS", previous.delay);
+    }
+  }, 20_000);
+
+  it("still fails the run when the initial submodule inspection exits non-zero", async () => {
+    // BLO-18784 follow-up: the timeout degrade must not widen into a general
+    // fail-open. A malformed `.gitmodules` is a deterministic failure -- the
+    // checkout really is unusable -- so it must stay fatal rather than starting
+    // an agent with no valid preflight.
+    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    // `git submodule status --recursive` exits 128 ("bad config line") on this.
+    await fs.writeFile(path.join(repoRoot, ".gitmodules"), "this is not valid config [[[\n", "utf8");
+
+    await expect(
+      realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-inspect-broken",
+          workspaceId: "workspace-submodule-inspect-broken",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-inspect-broken",
+          identifier: "PAP-SUBMODULE-INSPECT-BROKEN",
+          title: "Fail loudly on a corrupt .gitmodules",
+        },
+        agent: {
+          id: "agent-submodule-inspect-broken",
+          name: "Codex Coder",
+          companyId: "company-submodule-inspect-broken",
+        },
+        recorder,
+      }),
+    ).rejects.toThrow(WorkspaceGitSubmoduleError);
+
+    // It must not have been reported as an inconclusive stall.
+    expect(
+      operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+    ).toBe(false);
+  }, 20_000);
+
+  it("still fails the run when the post-repair submodule verification exits non-zero", async () => {
+    // The post-repair re-check has its own consumer, so it needs its own guard:
+    // otherwise a definitive verification failure could be reported as
+    // "Initialized git submodules before starting" -- claiming success over a
+    // workspace we know is broken.
+    //
+    // A fixture alone cannot isolate this branch: any corruption that breaks
+    // `submodule status --recursive` also breaks the `submodule update
+    // --recursive` repair, which throws earlier. So shim `git` on PATH and fail
+    // only the *second* `submodule status --recursive` -- the verification call.
+    const { repoRoot, submodulePath } = await createTempRepoWithSubmodule();
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+    const counterPath = path.join(shimDir, "status-calls");
+    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+    const shimPath = path.join(shimDir, "git");
+    await fs.writeFile(
+      shimPath,
+      [
+        "#!/bin/sh",
+        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+        `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
+        "  calls=$((calls + 1))",
+        `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
+        '  if [ "$calls" -ge 2 ]; then',
+        "    echo 'fatal: simulated deterministic submodule status failure' >&2",
+        "    exit 128",
+        "  fi",
+        "fi",
+        `exec ${JSON.stringify(realGit)} "$@"`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(shimPath, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+
+    try {
+      await expect(
+        realizeExecutionWorkspace({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-submodule-verify-broken",
+            workspaceId: "workspace-submodule-verify-broken",
+            repoUrl: null,
+            repoRef: "main",
+          },
+          config: {},
+          issue: {
+            id: "issue-submodule-verify-broken",
+            identifier: "PAP-SUBMODULE-VERIFY-BROKEN",
+            title: "Fail loudly when post-repair verification is definitive",
+          },
+          agent: {
+            id: "agent-submodule-verify-broken",
+            name: "Codex Coder",
+            companyId: "company-submodule-verify-broken",
+          },
+          recorder,
+        }),
+      ).rejects.toThrow(WorkspaceGitSubmoduleError);
+
+      // Prove the failure came from the verification call, not the initial one:
+      // the repair must have run, and the shim must have seen two status calls.
+      expect(
+        operations.some(
+          (operation) => operation.metadata?.action === "repair_uninitialized_submodules",
+        ),
+      ).toBe(true);
+      expect(await fs.readFile(counterPath, "utf8")).toBe("2");
+      expect(
+        operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+      ).toBe(false);
+      expect(await fs.stat(path.join(repoRoot, submodulePath, "codec.txt"))).toBeTruthy();
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await fs.rm(shimDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("ignores a non-integer submodule inspection override instead of truncating it to zero", async () => {
+    // `Math.trunc(0.5)` is 0, which does not fall back: 0 attempts skips the
+    // retry loop (degrading a healthy workspace) and a 0ms timeout disables
+    // `executeProcess`'s timer entirely. Both fail open silently, so a
+    // non-integer override must be rejected outright.
+    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const previousAttempts = process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS;
+    process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS = "0.5";
+
+    try {
+      const realized = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-bad-override",
+          workspaceId: "workspace-submodule-bad-override",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-bad-override",
+          identifier: "PAP-SUBMODULE-BAD-OVERRIDE",
+          title: "Reject a fractional attempts override",
+        },
+        agent: {
+          id: "agent-submodule-bad-override",
+          name: "Codex Coder",
+          companyId: "company-submodule-bad-override",
+        },
+        recorder,
+      });
+
+      // The healthy checkout is inspected normally: no degradation at all.
+      expect(
+        realized.warnings.filter((warning) => warning.includes("Could not inspect git submodules")),
+      ).toEqual([]);
+      expect(
+        operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+      ).toBe(false);
+    } finally {
+      if (previousAttempts === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS;
+      else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS = previousAttempts;
     }
   }, 20_000);
 
