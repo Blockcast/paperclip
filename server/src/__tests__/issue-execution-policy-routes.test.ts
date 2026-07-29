@@ -759,6 +759,114 @@ describe("issue execution policy routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  // BLO-18790 / BLO-18782 / BLO-18783 / BLO-18168 (same defect, filed four times).
+  // The monitor on BLO-12852 sat dead for ~4h across three runs because writes shaped as
+  // top-level `monitor` / `monitorNextCheckAt` were stripped by the non-strict body schema:
+  // HTTP 200, `updatedAt` bumped, nothing persisted. A `triggered` monitor was never the cause.
+  describe("monitor re-arm on a triggered monitor (BLO-18790)", () => {
+    // Mirrors BLO-12852's observed row exactly: triggered, no nextCheckAt, 18 attempts burned,
+    // maxAttempts null, and executionPolicy null (the monitor lives only in the columns + state).
+    const wedgedIssue = () => ({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      checkoutRunId: "run-1",
+      executionRunId: "run-1",
+      createdByUserId: "local-board",
+      identifier: "PAP-12852",
+      title: "Wedged triggered monitor",
+      executionPolicy: null,
+      executionState: {
+        status: "idle",
+        monitor: {
+          status: "triggered",
+          nextCheckAt: null,
+          lastTriggeredAt: "2026-07-29T18:51:23.137Z",
+          attemptCount: 18,
+          maxAttempts: null,
+          notes: "stale signature written at 18:51Z",
+          scheduledBy: "assignee",
+          clearedAt: null,
+          clearReason: null,
+        },
+      },
+      monitorAttemptCount: 18,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date("2026-07-29T18:51:23.137Z"),
+      monitorNotes: "stale signature written at 18:51Z",
+      monitorScheduledBy: "assignee",
+    });
+
+    it("persists a re-arm through executionPolicy.monitor despite triggered state and 18 burned attempts", async () => {
+      const issue = wedgedIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({
+          executionPolicy: {
+            monitor: {
+              nextCheckAt: "2099-12-01T13:00:00.000Z",
+              notes: "signature=unchanged; next=2099-12-01T13:00:00.000Z",
+              scheduledBy: "assignee",
+            },
+          },
+        });
+
+      expect(res.status).toBe(200);
+      // The exact bug was 200-with-unchanged-row, so assert the row actually moved rather than
+      // just that the request succeeded.
+      const patch = mockIssueService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+      expect(patch.monitorNextCheckAt).toEqual(new Date("2099-12-01T13:00:00.000Z"));
+      expect(patch.monitorNotes).toBe("signature=unchanged; next=2099-12-01T13:00:00.000Z");
+      expect(patch.monitorNextCheckAt).not.toBeNull();
+      expect(patch.monitorNotes).not.toBe(issue.monitorNotes);
+      expect((patch.executionState as { monitor: { status: string } }).monitor.status).toBe("scheduled");
+    });
+
+    it.each([
+      ["monitor", { nextCheckAt: "2099-12-01T13:00:00.000Z", notes: "sig", scheduledBy: "assignee" }],
+      ["monitorNextCheckAt", "2099-12-01T13:00:00.000Z"],
+      ["monitorNotes", "sig"],
+    ])("rejects a misplaced top-level `%s` instead of accepting and ignoring it", async (key, value) => {
+      const issue = wedgedIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ [key]: value });
+
+      // A 200 here is the regression: it means the key was silently dropped again.
+      expect(res.status).not.toBe(200);
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(JSON.stringify(res.body)).toContain("executionPolicy.monitor");
+      // Nothing may be written when the body is rejected.
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
+
   it("triggers a scheduled monitor immediately from the dedicated route", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",

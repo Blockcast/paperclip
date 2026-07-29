@@ -4,6 +4,7 @@ import {
   addIssueCommentSchema,
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
+  MISPLACED_ISSUE_MONITOR_INPUT_KEYS,
   resolveIssueRecoveryActionSchema,
   respondIssueThreadInteractionSchema,
   suggestedTaskDraftSchema,
@@ -333,6 +334,56 @@ describe("issue validators", () => {
     });
 
     expect(parsed.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
+  });
+
+  // BLO-18790: these keys used to be stripped by the non-strict object schema, so a caller that
+  // guessed the wrong monitor shape got 200 OK with nothing persisted and no way to notice.
+  describe("misplaced monitor input keys (BLO-18790)", () => {
+    it.each(MISPLACED_ISSUE_MONITOR_INPUT_KEYS)("rejects top-level `%s` on update instead of stripping it", (key) => {
+      const parsed = updateIssueSchema.safeParse({
+        [key]: key === "monitor"
+          ? { nextCheckAt: "2099-12-01T12:00:00.000Z", notes: "signature=unchanged" }
+          : "2099-12-01T12:00:00.000Z",
+      });
+
+      expect(parsed.success).toBe(false);
+      if (parsed.success) return;
+      const message = parsed.error.issues.map((issue) => issue.message).join("\n");
+      // The message has to name the shape that actually works, otherwise this is just a
+      // differently-shaped dead end for the caller.
+      expect(message).toContain("executionPolicy.monitor");
+      expect(message).toContain(key);
+    });
+
+    it("rejects top-level `monitor` on create as well, so both paths agree", () => {
+      const parsed = createIssueSchema.safeParse({
+        title: "Watch a PR",
+        status: "in_progress",
+        monitor: { nextCheckAt: "2099-12-01T12:00:00.000Z" },
+      });
+
+      expect(parsed.success).toBe(false);
+    });
+
+    it("still accepts the nested executionPolicy.monitor shape", () => {
+      const parsed = updateIssueSchema.parse({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2099-12-01T12:00:00.000Z",
+            notes: "signature=unchanged",
+            scheduledBy: "assignee",
+          },
+        },
+      });
+
+      expect(parsed.executionPolicy?.monitor?.nextCheckAt).toBe("2099-12-01T12:00:00.000Z");
+      expect(parsed.executionPolicy?.monitor?.notes).toBe("signature=unchanged");
+    });
+
+    it("does not fire on an absent or explicitly-undefined key", () => {
+      expect(updateIssueSchema.safeParse({ title: "No monitor here" }).success).toBe(true);
+      expect(updateIssueSchema.safeParse({ monitorNextCheckAt: undefined }).success).toBe(true);
+    });
   });
 
   it("accepts the cheap model profile in issue assignee adapter overrides", () => {
