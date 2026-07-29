@@ -4302,7 +4302,27 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (blockedByIssueIds.length === 0) return null;
     }
 
-    const updated = await issuesSvc.update(issue.id, { status: "blocked", blockedByIssueIds });
+    // The reachability check above and this write are not atomic: another relation
+    // update can add a path from `issue` to one of these blockers between the read and
+    // this write. The issue service re-validates on write and throws in that case -
+    // catch it here so one race falls through to the caller's existing no-dependency
+    // `in_review` park instead of aborting the whole periodic recovery sweep.
+    let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
+    try {
+      updated = await issuesSvc.update(issue.id, { status: "blocked", blockedByIssueIds });
+    } catch (error) {
+      if (!isBlockingRelationCycleError(error)) throw error;
+      logger.warn(
+        {
+          companyId: issue.companyId,
+          issueId: issue.id,
+          identifier: issue.identifier,
+          blockedByIssueIds,
+        },
+        "review-wait blocker write raced a concurrent relation update and formed a cycle; parking without dependency",
+      );
+      return null;
+    }
     if (!updated) return null;
 
     const waitingOn = formatIssueLinksForComment(
