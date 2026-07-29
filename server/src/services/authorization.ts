@@ -83,6 +83,7 @@ export type AuthorizationResource =
       parentIssueId?: string | null;
       assigneeAgentId?: string | null;
       assigneeUserId?: string | null;
+      createdByAgentId?: string | null;
       originKind?: string | null;
       originId?: string | null;
       status?: string | null;
@@ -103,6 +104,7 @@ export type AuthorizationDecision = {
     | "allow_consented_change"
     | "allow_legacy_agent_creator"
     | "allow_issue_mention_grant"
+    | "allow_issue_creator"
     | "allow_self"
     | "allow_company_agent"
     | "allow_company_member"
@@ -1934,6 +1936,28 @@ export function authorizationService(db: Db) {
           action: input.action,
           reason: "allow_company_agent",
           explanation: "Allowed because the issue has no agent assignee.",
+        });
+      }
+      // BLO-18113 / BLO-18797: once an issue is assigned away, the actor loses
+      // every write path back onto it — there is no grant fallback for these two
+      // actions (permissionKeyForAction returns null above), so an actor who is
+      // not the assignee falls straight through to deny_missing_grant. That
+      // stranded two legitimate actors: the agent who created and delegated the
+      // issue, and the assignee's manager in the reporting chain (who could
+      // already force checkout management on the same issue via
+      // tasks:manage_active_checkouts, but could not comment on it).
+      if (resource?.createdByAgentId === actorAgentId) {
+        return allow({
+          action: input.action,
+          reason: "allow_issue_creator",
+          explanation: "Allowed because the actor created this issue.",
+        });
+      }
+      if (await isManagerOf(companyId, actorAgentId, resource.assigneeAgentId)) {
+        return allow({
+          action: input.action,
+          reason: "allow_manager_chain",
+          explanation: "Allowed because the actor manages the issue assignee in the reporting chain.",
         });
       }
       if (

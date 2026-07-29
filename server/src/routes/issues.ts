@@ -3524,6 +3524,7 @@ export function issueRoutes(
       parentId: string | null;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      createdByAgentId?: string | null;
       status: string;
     },
     action: "issue:comment" | "issue:read" | "issue:mutate",
@@ -3539,6 +3540,7 @@ export function issueRoutes(
         parentIssueId: issue.parentId,
         assigneeAgentId: issue.assigneeAgentId,
         assigneeUserId: issue.assigneeUserId,
+        createdByAgentId: issue.createdByAgentId ?? null,
         status: issue.status,
       },
       scope: {
@@ -3581,6 +3583,7 @@ export function issueRoutes(
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      createdByAgentId?: string | null;
       checkoutRunId?: string | null;
       executionRunId?: string | null;
     },
@@ -3743,6 +3746,7 @@ export function issueRoutes(
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      createdByAgentId?: string | null;
       checkoutRunId?: string | null;
       executionRunId?: string | null;
       executionState?: unknown;
@@ -3779,6 +3783,17 @@ export function issueRoutes(
       return false;
     }
     if (await isActiveRecoveryActionOwner()) return true;
+    // BLO-18113 / BLO-18797: decideIssueAccess just admitted this actor via
+    // allow_issue_creator / allow_manager_chain. Both reasons are only ever
+    // returned for an actor that is NOT the assignee (authorization.ts
+    // short-circuits assignee === actor to allow_self first), so falling through
+    // into the assignee-ownership gate below would immediately re-reject the
+    // actor it had just admitted — 403 "Agent cannot mutate another agent's
+    // issue", or 409 when the issue is in_progress. Mirrors the
+    // isActiveRecoveryActionOwner bypass directly above.
+    if (boundaryDecision.reason === "allow_issue_creator" || boundaryDecision.reason === "allow_manager_chain") {
+      return true;
+    }
     if (issue.assigneeAgentId === null) {
       return true;
     }

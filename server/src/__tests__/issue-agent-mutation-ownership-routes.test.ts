@@ -1797,6 +1797,102 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).toHaveBeenCalled();
   });
 
+  // BLO-18797 / BLO-18113: decideIssueAccess admits a non-assignee actor via
+  // allow_issue_creator / allow_manager_chain, but the route's own
+  // assignee-ownership gate downstream used to re-reject that same actor (403
+  // "Agent cannot mutate another agent's issue", or 409 while in_progress).
+  // These deliberately deny tasks:manage_active_checkouts so the only thing
+  // that can carry the request is the boundary-reason short-circuit itself.
+  describe("creator / manager-chain boundary reasons survive the route ownership gate (BLO-18797)", () => {
+    function decideAllowingOnly(issueBoundaryReason: string) {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+        const isIssueBoundary = input.action === "issue:mutate" || input.action === "issue:comment";
+        return {
+          allowed: isIssueBoundary,
+          action: input.action,
+          reason: isIssueBoundary ? issueBoundaryReason : "deny_missing_grant",
+          explanation: isIssueBoundary ? `Allowed via ${issueBoundaryReason}.` : "Missing permission.",
+        };
+      });
+    }
+
+    for (const reason of ["allow_manager_chain", "allow_issue_creator"] as const) {
+      it(`lets a ${reason} actor PATCH status and blockedByIssueIds on an issue assigned to another agent`, async () => {
+        const blockerId = "99999999-9999-4999-8999-999999999999";
+        decideAllowingOnly(reason);
+        mockIssueService.getById.mockResolvedValue(
+          makeIssue({ assigneeAgentId: ownerAgentId, createdByAgentId: peerAgentId }),
+        );
+        mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+          ...makeIssue({ assigneeAgentId: ownerAgentId, createdByAgentId: peerAgentId }),
+          ...patch,
+        }));
+
+        const res = await request(await createApp(peerActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send({ status: "todo", blockedByIssueIds: [blockerId] });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        // Not admitted by the pre-existing checkout-management override — that
+        // action is denied by decideAllowingOnly above.
+        expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+        expect(mockIssueService.update).toHaveBeenCalled();
+        const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
+        expect(patch).toMatchObject({ status: "todo" });
+        expect(patch.blockedByIssueIds).toEqual([blockerId]);
+      });
+
+      it(`lets a ${reason} actor POST a comment on an issue assigned to another agent`, async () => {
+        decideAllowingOnly(reason);
+        mockIssueService.getById.mockResolvedValue(
+          makeIssue({ assigneeAgentId: ownerAgentId, createdByAgentId: peerAgentId }),
+        );
+        mockIssueService.addComment.mockResolvedValue({
+          id: "aaaaaaaa-1111-4aaa-8aaa-aaaaaaaaaaaa",
+          issueId,
+          body: "Recovery handoff from the manager",
+          authorType: "agent",
+          authorAgentId: peerAgentId,
+        });
+
+        const res = await request(await createApp(peerActor()))
+          .post(`/api/issues/${issueId}/comments`)
+          .send({ body: "Recovery handoff from the manager" });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(201);
+        expect(mockIssueService.addComment).toHaveBeenCalled();
+      });
+    }
+
+    it("still rejects an unrelated agent whose boundary decision is deny_missing_grant", async () => {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: false,
+        action: input.action,
+        reason: "deny_missing_grant",
+        explanation: "Missing permission.",
+      }));
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ assigneeAgentId: ownerAgentId, createdByAgentId: staleAgentId }),
+      );
+
+      const patchRes = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo" });
+
+      expect(patchRes.status).toBe(403);
+      expect(patchRes.body?.details?.reason).toBe("deny_missing_grant");
+
+      const commentRes = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Should not land" });
+
+      expect(commentRes.status).toBe(403);
+      expect(commentRes.body?.details?.reason).toBe("deny_missing_grant");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+  });
+
   it.each([
     ["todo", "patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Todo update" })],
     ["blocked", "patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Blocked update" })],
