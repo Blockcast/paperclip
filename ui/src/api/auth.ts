@@ -178,6 +178,15 @@ export const authApi = {
     return { url };
   },
 
+  signInOAuth2: async (input: { providerId: "dex"; callbackURL: string }): Promise<{ url: string }> => {
+    const payload = (await authPost("/sign-in/oauth2", input)) as { url?: unknown } | null;
+    const url = typeof payload?.url === "string" ? payload.url : null;
+    if (!url) {
+      throw new AuthApiError("OAuth sign-in did not return a redirect URL.", 502, payload);
+    }
+    return { url };
+  },
+
   getProfile: async (): Promise<CurrentUserProfile> => {
     const res = await fetch("/api/auth/profile", {
       credentials: "include",
