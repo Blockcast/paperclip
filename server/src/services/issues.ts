@@ -7847,6 +7847,16 @@ export function issueService(db: Db) {
         actorUserId?: string | null;
       },
       dbOrTx: any = db,
+      // BLO-18643 follow-up: an optional compare-and-swap guard on the write itself.
+      // A caller that read the row earlier (e.g. under an advisory lock, in a separate
+      // statement or transaction) and validated its status before deciding to mutate
+      // has no guarantee that status is still current by the time this runs -- any
+      // non-lock-holding writer (a human reviewer's PATCH, a different code path) can
+      // land in between. `expectedStatus` folds that check into the UPDATE's WHERE
+      // clause so the write is atomic: if the row's status has moved on, zero rows
+      // match, the update is a no-op, and this returns null exactly like "row missing"
+      // does today -- instead of unconditionally overwriting whatever the row now says.
+      options?: { expectedStatus?: string[] },
     ) => {
       const existing = await dbOrTx
         .select()
@@ -8124,7 +8134,11 @@ export function issueService(db: Db) {
         const updated = await tx
           .update(issues)
           .set(patch)
-          .where(eq(issues.id, id))
+          .where(
+            options?.expectedStatus
+              ? and(eq(issues.id, id), inArray(issues.status, options.expectedStatus))
+              : eq(issues.id, id),
+          )
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;

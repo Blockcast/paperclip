@@ -36,6 +36,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueDocuments,
+  issueLabels,
   issuePlanDecompositions,
   issueRecoveryActions,
   issueRelations,
@@ -44,6 +45,7 @@ import {
   issueTreeHolds,
   issueWorkProducts,
   issues,
+  labels,
   projects,
   projectWorkspaces,
   workspaceOperations,
@@ -4447,6 +4449,47 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(
         activity.some((event) => (event.details as { status?: string } | null)?.status === "blocked"),
       ).toBe(false);
+    },
+  );
+
+  it(
+    "BLO-18614/BLO-18643: a genuine review-park failure (evidence gate rejects in_review) still " +
+      "escalates to blocked instead of being silently skipped",
+    async () => {
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "issue_continuation_waiting_on_review",
+        runError: "Continuation parked: issue is waiting on review/approval",
+      });
+
+      // Label the issue "pr" (DEFAULT_EVIDENCE_REGISTRY requires "pr-link" for that
+      // label) and leave it with no PR-link evidence, so the in_review transition's
+      // evidence gate returns verdict "block" (unlabeledFallback is false because the
+      // label matched a registry entry) and issuesSvc.update throws `unprocessable`
+      // inside parkNoDependencyReviewWaitingIssue. This is a genuine park failure, not
+      // a race with an earlier successful park -- distinct from the BLO-18643 case
+      // above where `fresh.status !== "in_progress"` because someone already parked it.
+      const labelId = randomUUID();
+      await db.insert(labels).values({ id: labelId, companyId, name: "pr", color: "#000000" });
+      await db.insert(issueLabels).values({ issueId, labelId, companyId });
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.reviewWaitingParked).toBe(0);
+      expect(result.escalated).toBe(1);
+      expect(result.issueIds).toEqual([issueId]);
+
+      const escalated = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(escalated?.status).toBe("blocked");
+
+      const recoveryActions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+      expect(recoveryActions).toHaveLength(1);
     },
   );
 

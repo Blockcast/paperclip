@@ -2693,6 +2693,99 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(result?.description).toHaveLength(1200);
     expect(result?.description?.endsWith("—")).toBe(true);
   });
+
+  // BLO-18643 follow-up (Ally PR #807 review): escalateStrandedAssignedIssue reads
+  // the issue's status under a per-issue advisory lock, then -- after several awaited
+  // steps that don't hold that lock -- writes `status: "blocked"` unconditionally. A
+  // writer that never takes the same advisory lock (a human reviewer's PATCH, a
+  // different code path) can land in that window and get silently clobbered. The
+  // `expectedStatus` option folds the status check into the UPDATE's own WHERE clause
+  // so the write is atomic regardless of what ran in between the read and the write.
+  it("update() with expectedStatus is a no-op when the row's status moved on since the caller last read it", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Race window target",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    // Simulate a concurrent writer -- e.g. a human reviewer -- that transitions the
+    // issue without holding the recovery service's advisory lock, landing in the
+    // window between escalateStrandedAssignedIssue's guarded read and its write.
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, issueId));
+
+    const result = await svc.update(
+      issueId,
+      { status: "blocked" },
+      db,
+      { expectedStatus: ["in_progress", "blocked"] },
+    );
+    expect(result).toBeNull();
+
+    const stillInReview = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(stillInReview?.status).toBe("in_review");
+  });
+
+  it("update() with expectedStatus writes normally when the row's status still matches", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "No race",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    const result = await svc.update(
+      issueId,
+      { status: "blocked" },
+      db,
+      { expectedStatus: ["in_progress", "blocked"] },
+    );
+    expect(result?.status).toBe("blocked");
+  });
 });
 
 describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
