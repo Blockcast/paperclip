@@ -341,8 +341,28 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
 // than escalating it as stranded.
 const CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE = "issue_continuation_waiting_on_review";
 
-const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
-const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
+// Recovery handoffs for workspace-preflight failures used to route the operator to
+// a generic "restore a live execution path" instruction, which names neither the
+// failing check nor a first probe. Give the actual cause instead. (BLO-18784)
+const WORKSPACE_PREFLIGHT_RECOVERY_GUIDANCE: Record<string, string> = {
+  workspace_git_submodule_unavailable:
+    "the git submodule preflight (`git submodule status --recursive`) reported the execution " +
+    "workspace's submodules as unusable. Inspect the shared checkout for conflicted gitlinks or " +
+    "submodules still uninitialized after the automatic repair, resolve them, then re-run. Note a " +
+    "merely slow inspection no longer strands an issue, so reaching this handoff means a submodule " +
+    "fault was actually detected rather than the check timing out.",
+  workspace_repo_mismatch:
+    "the execution workspace is checked out from a different repository than the issue expects. " +
+    "Repoint or re-provision the workspace, then re-run.",
+};
+
+function describeWorkspacePreflightRecoveryCause(latestRun: LatestIssueRun): string | null {
+  const errorCode = readNonEmptyString(latestRun?.errorCode);
+  if (!errorCode) return null;
+  return WORKSPACE_PREFLIGHT_RECOVERY_GUIDANCE[errorCode] ?? null;
+}
+
+const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
 
 type ContinuationRetryClassification = {
@@ -3234,6 +3254,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       : "none";
     const retryReason = readNonEmptyString(parseObject(input.latestRun?.contextSnapshot)?.retryReason) ?? "none";
     const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+    const workspacePreflightCause = describeWorkspacePreflightRecoveryCause(input.latestRun);
 
     return [
       "Paperclip stopped automatic stranded-work recovery for this recovery issue.",
@@ -3246,7 +3267,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       failureSummary ? `- Failure: ${failureSummary.trim()}` : "- Failure: none recorded",
       "- Guard: recovery issues do not create nested `stranded_issue_recovery` issues.",
       "",
-      "Next action: the current recovery owner should inspect the failed run evidence, restore a live execution path or record the manual resolution, then move this recovery issue out of `blocked`.",
+      workspacePreflightCause
+        ? `Next action: ${workspacePreflightCause} Then move this recovery issue out of \`blocked\`.`
+        : "Next action: the current recovery owner should inspect the failed run evidence, restore a live execution path or record the manual resolution, then move this recovery issue out of `blocked`.",
     ].join("\n");
   }
 
@@ -3570,6 +3593,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (!updated) return null;
 
       const prefix = await getCompanyIssuePrefix(fresh.companyId);
+      const workspacePreflightHandoffCause = describeWorkspacePreflightRecoveryCause(input.latestRun);
       const recoveryOwner = action.ownerAgentId ? await getAgent(action.ownerAgentId) : null;
       const sourceAssignee = fresh.assigneeAgentId ? await getAgent(fresh.assigneeAgentId) : null;
       let notice: SuccessfulRunHandoffNotice | null = null;
@@ -3594,7 +3618,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           "",
           `- Recovery action: \`${action.id}\``,
           `- Recovery owner: ${agentUiLink(recoveryOwner, prefix)}`,
-          "- Next action: the recovery owner should restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
+          workspacePreflightHandoffCause
+            ? `- Next action: ${workspacePreflightHandoffCause}`
+            : "- Next action: the recovery owner should restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
         ].join("\n")
         : [
           "",

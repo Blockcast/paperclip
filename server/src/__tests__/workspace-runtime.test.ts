@@ -2406,6 +2406,70 @@ describe("realizeExecutionWorkspace", () => {
     })).toBe(true);
   }, 20_000);
 
+  it("degrades to a warning instead of failing the run when submodule inspection times out", async () => {
+    // BLO-18784: `git submodule status --recursive` is ~96% filesystem latency on
+    // a shared CephFS checkout, so a single slow probe used to raise a fatal
+    // WorkspaceGitSubmoduleError and strand a healthy in_progress issue at
+    // `blocked`. A timeout means the inspection was inconclusive, not that the
+    // submodules are broken, so the run must survive it.
+    const { repoRoot, submodulePath } = await createTempRepoWithSubmodule();
+    const previous = {
+      timeout: process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS,
+      attempts: process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS,
+      delay: process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS,
+    };
+    // 1ms budget guarantees every attempt times out; short backoff keeps the test fast.
+    process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = "1";
+    process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS = "2";
+    process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS = "1";
+
+    try {
+      const realized = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-inspect-timeout",
+          workspaceId: "workspace-submodule-inspect-timeout",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-inspect-timeout",
+          identifier: "PAP-SUBMODULE-INSPECT-TIMEOUT",
+          title: "Survive submodule inspection timeout",
+        },
+        agent: {
+          id: "agent-submodule-inspect-timeout",
+          name: "Codex Coder",
+          companyId: "company-submodule-inspect-timeout",
+        },
+      });
+
+      // The run is realized, not aborted.
+      expect(realized.strategy).toBe("project_primary");
+      expect(realized.cwd).toBe(repoRoot);
+
+      const degraded = realized.warnings.find((warning) => warning.includes("Could not inspect git submodules"));
+      expect(degraded).toBeDefined();
+      expect(degraded).toContain("after 2 attempt(s)");
+      expect(degraded).toContain("timed out after 1ms");
+      expect(degraded).toContain("inconclusive");
+      // It must not have silently claimed the submodule was repaired.
+      expect(realized.warnings).not.toContain(
+        `Initialized git submodules before starting: ${submodulePath}`,
+      );
+    } finally {
+      const restore = (name: string, value: string | undefined) => {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      };
+      restore("PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS", previous.timeout);
+      restore("PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS", previous.attempts);
+      restore("PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS", previous.delay);
+    }
+  }, 20_000);
+
   it("repairs worktree submodules before running provision commands", async () => {
     const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: false });
     const scriptsDir = path.join(repoRoot, "scripts");

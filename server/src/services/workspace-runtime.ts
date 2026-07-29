@@ -139,6 +139,51 @@ const runtimeServiceLeasesByRun = new Map<string, string[]>();
 const DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES = 256 * 1024;
 const WORKSPACE_SUBMODULE_REPAIR_TIMEOUT_MS = 5 * 60 * 1000;
 
+// `git submodule status --recursive` is ~96% filesystem latency, not CPU: on the
+// shared pim-multicast-gateway checkout only ~50ms of a 1160ms run is git work,
+// the rest is metadata round-trips across 9 sequential submodule--helper walks on
+// CephFS. Measured on that workspace (BLO-18784): warm p50 1163ms / p99 1356ms
+// (n=20), cold worst case 5903ms (5.1x), and 2.3x further amplification under
+// induced metadata load. 60s = 44x warm p99 = 10.2x cold worst case, and clears
+// the composed cold-x-load amplification (~13.6s) by 4.4x.
+//
+// The budget is deliberately a backstop, NOT the safety mechanism. Because the
+// cost tracks an unbounded-variance quantity, no constant makes a single attempt
+// safe -- that is what the retry + non-fatal degrade below are for.
+const WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = 60_000;
+const WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS = 3;
+const WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS = 1_000;
+
+/**
+ * Env overrides for the submodule-inspection budget. Read at call time so they
+ * can be tuned on a running server without a deploy, and so tests can force a
+ * timeout deterministically instead of waiting out a real stall.
+ */
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.trunc(parsed);
+}
+
+function readSubmoduleInspectSettings(): { timeoutMs: number; attempts: number; retryDelayMs: number } {
+  return {
+    timeoutMs: readPositiveIntEnv(
+      "PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS",
+      WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS,
+    ),
+    attempts: readPositiveIntEnv(
+      "PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS",
+      WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS,
+    ),
+    retryDelayMs: readPositiveIntEnv(
+      "PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS",
+      WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS,
+    ),
+  };
+}
+
 type ProcessOutputCapture = {
   text: string;
   truncated: boolean;
@@ -582,6 +627,19 @@ async function executeProcess(input: {
   };
 }
 
+/**
+ * Raised when a git subprocess exceeded its wall-clock budget. Distinguished from
+ * a non-zero exit so callers can retry a transient stall without also retrying a
+ * deterministic failure (e.g. "not a git repository"). The message is unchanged
+ * from the historical string so existing `gitErrorIncludes` matching still works.
+ */
+class GitCommandTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GitCommandTimeoutError";
+  }
+}
+
 async function runGit(
   args: string[],
   cwd: string,
@@ -597,7 +655,7 @@ async function runGit(
     maxStderrBytes: options.maxStderrBytes,
   });
   if (proc.timedOut) {
-    throw new Error(`git ${args.join(" ")} timed out after ${options.timeoutMs}ms`);
+    throw new GitCommandTimeoutError(`git ${args.join(" ")} timed out after ${options.timeoutMs}ms`);
   }
   if (proc.code !== 0) {
     throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
@@ -973,14 +1031,56 @@ function buildNonInteractiveGitEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-async function readGitSubmoduleReadiness(cwd: string, env: NodeJS.ProcessEnv): Promise<GitSubmoduleReadinessEntry[]> {
-  const output = await runGit(["submodule", "status", "--recursive"], cwd, {
-    env,
-    timeoutMs: 30_000,
-    maxStdoutBytes: 256 * 1024,
-    maxStderrBytes: 64 * 1024,
-  });
-  return parseGitSubmoduleReadiness(output);
+/**
+ * Result of probing submodule readiness.
+ *
+ * The distinction matters: `ok: false` means we could not determine the state,
+ * which is NOT evidence that submodules are broken. Callers must not strand a
+ * live issue on an inconclusive probe -- see `ensureGitSubmodulesReady`.
+ */
+type GitSubmoduleInspection =
+  | { ok: true; entries: GitSubmoduleReadinessEntry[] }
+  | { ok: false; reason: string; attempts: number };
+
+async function inspectGitSubmoduleReadiness(
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+): Promise<GitSubmoduleInspection> {
+  const settings = readSubmoduleInspectSettings();
+  let lastReason = "unknown error";
+
+  for (let attempt = 1; attempt <= settings.attempts; attempt += 1) {
+    try {
+      const output = await runGit(["submodule", "status", "--recursive"], cwd, {
+        env,
+        timeoutMs: settings.timeoutMs,
+        maxStdoutBytes: 256 * 1024,
+        maxStderrBytes: 64 * 1024,
+      });
+      return { ok: true, entries: parseGitSubmoduleReadiness(output) };
+    } catch (error) {
+      lastReason = error instanceof Error ? error.message : String(error);
+      // Only a stall is worth retrying. A non-zero exit is deterministic, so
+      // retrying it would just burn every budget to reach the same answer.
+      if (!(error instanceof GitCommandTimeoutError)) {
+        return { ok: false, reason: lastReason, attempts: attempt };
+      }
+      if (attempt < settings.attempts) {
+        await delay(settings.retryDelayMs * attempt);
+      }
+    }
+  }
+
+  return { ok: false, reason: lastReason, attempts: settings.attempts };
+}
+
+function describeSubmoduleInspectionDegradation(cwd: string, inspection: { reason: string; attempts: number }): string {
+  return (
+    `Could not inspect git submodules for execution workspace "${cwd}" after ${inspection.attempts} attempt(s): ` +
+    `${inspection.reason}. Continuing without the submodule readiness check -- the inspection is inconclusive, ` +
+    `not a detected fault. If a submodule really is missing, the agent's own build/test step will fail with a ` +
+    `specific error.`
+  );
 }
 
 async function ensureGitSubmodulesReady(input: {
@@ -993,15 +1093,16 @@ async function ensureGitSubmodulesReady(input: {
   if (!gitmodulesExists) return [];
 
   const env = buildNonInteractiveGitEnv();
-  let entries: GitSubmoduleReadinessEntry[];
-  try {
-    entries = await readGitSubmoduleReadiness(input.cwd, env);
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    throw new WorkspaceGitSubmoduleError(
-      `Could not inspect git submodules for execution workspace "${input.cwd}": ${reason}`,
-    );
+  const inspection = await inspectGitSubmoduleReadiness(input.cwd, env);
+  if (!inspection.ok) {
+    // Degrade to a warning rather than throwing. Stranding an in-progress issue
+    // because a read-only probe on a network filesystem was slow is strictly
+    // worse than letting the run proceed. See BLO-18784.
+    const warning = describeSubmoduleInspectionDegradation(input.cwd, inspection);
+    return [warning];
   }
+
+  const entries = inspection.entries;
 
   const conflicted = entries.filter((entry) => entry.state === "conflicted");
   if (conflicted.length > 0) {
@@ -1071,10 +1172,18 @@ async function ensureGitSubmodulesReady(input: {
     );
   }
 
-  const remaining = await readGitSubmoduleReadiness(input.cwd, env);
-  if (remaining.length > 0) {
+  const verification = await inspectGitSubmoduleReadiness(input.cwd, env);
+  if (!verification.ok) {
+    // The repair commands themselves succeeded; only the re-check was
+    // inconclusive. Report both rather than discarding the successful repair.
+    return [
+      `Initialized git submodules before starting: ${missingPaths.join(", ")}`,
+      describeSubmoduleInspectionDegradation(input.cwd, verification),
+    ];
+  }
+  if (verification.entries.length > 0) {
     throw new WorkspaceGitSubmoduleError(
-      `Execution workspace "${input.cwd}" still has unavailable git submodules after repair: ${remaining.map((entry) => entry.path).join(", ")}`,
+      `Execution workspace "${input.cwd}" still has unavailable git submodules after repair: ${verification.entries.map((entry) => entry.path).join(", ")}`,
     );
   }
 
