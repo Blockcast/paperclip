@@ -632,6 +632,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
   let settled = false;
   let stopDeadline = Number.POSITIVE_INFINITY;
   let settleResolve: (() => void) | null = null;
+  let wakePoll: (() => void) | null = null;
   const settledPromise = new Promise<void>((resolve) => {
     settleResolve = resolve;
   });
@@ -639,6 +640,27 @@ export async function startSandboxCallbackBridgeWorker(input: {
     ((request: SandboxCallbackBridgeRequest) => authorizeSandboxCallbackBridgeRequestWithRoutes(request));
   const buildWorkerFailureMessage = (error: unknown) =>
     `Sandbox callback bridge worker failed: ${error instanceof Error ? error.message : String(error)}`;
+  const wakeWorker = () => {
+    const wake = wakePoll;
+    wakePoll = null;
+    wake?.();
+  };
+  const waitForNextPoll = async () => {
+    await new Promise<void>((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timeout);
+        if (wakePoll === finish) {
+          wakePoll = null;
+        }
+        resolve();
+      };
+      const timeout = setTimeout(finish, pollIntervalMs);
+      wakePoll = finish;
+    });
+  };
 
   const processRequestFile = async (fileName: string) => {
     const requestPath = path.posix.join(directories.requestsDir, fileName);
@@ -741,7 +763,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
           if (stopping) {
             break;
           }
-          await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+          await waitForNextPoll();
           continue;
         }
         for (const fileName of fileNames) {
@@ -782,6 +804,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       stopping = true;
       const drainMs = normalizeTimeoutMs(options.drainTimeoutMs, DEFAULT_BRIDGE_STOP_TIMEOUT_MS);
       stopDeadline = Date.now() + drainMs;
+      wakeWorker();
       if (!settled) {
         await Promise.race([
           settledPromise,
