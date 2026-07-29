@@ -8,11 +8,13 @@ const imageHelper = readFileSync(
   "utf8",
 );
 
-function getDeployJobBlock() {
+function getDeployJobBlock(source = workflow) {
   const marker = "\n  deploy:\n";
-  const start = workflow.indexOf(marker);
+  const start = source.indexOf(marker);
   assert.notEqual(start, -1, "docker.yml must define a deploy job");
-  return workflow.slice(start + marker.length);
+  const remainder = source.slice(start + marker.length);
+  const nextJob = remainder.search(/^  [A-Za-z0-9_-]+:\s*$/m);
+  return nextJob === -1 ? remainder : remainder.slice(0, nextJob);
 }
 
 function getBuildJobBlock() {
@@ -61,6 +63,12 @@ test("Docker deploy job provisions Buildx before inspecting the artifact", () =>
   assert.notEqual(setup, -1, "deploy job must provision Buildx");
   assert.notEqual(inspect, -1, "deploy job must inspect the deploy artifact");
   assert.ok(setup < inspect, "deploy job must provision Buildx before artifact inspection");
+});
+
+test("deploy job assertions cannot match a later job", () => {
+  const deployJob = getDeployJobBlock(`${workflow}\n  later-job:\n    name: later-job-only\n`);
+
+  assert.doesNotMatch(deployJob, /later-job-only/);
 });
 
 test("production deploy is manual-only and environment-protected", () => {
