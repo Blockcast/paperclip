@@ -152,7 +152,7 @@ function executionStateWithMonitor(
   };
 }
 
-function derivePersistedMonitorState(input: {
+export function derivePersistedMonitorState(input: {
   issue: IssueLike;
   state: IssueExecutionState | null;
   policy: IssueExecutionPolicy | null;

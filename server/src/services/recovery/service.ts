@@ -41,6 +41,7 @@ import { issueTreeControlService } from "../issue-tree-control.js";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
+  derivePersistedMonitorState,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../issue-execution-policy.js";
@@ -3972,7 +3973,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   function hasActiveMonitorPath(issue: typeof issues.$inferSelect) {
-    return Boolean(issue.monitorNextCheckAt && issue.monitorNextCheckAt.getTime() > Date.now());
+    if (issue.monitorNextCheckAt && issue.monitorNextCheckAt.getTime() > Date.now()) return true;
+
+    // BLO-18643: a monitor that has already fired (`status: "triggered"`) but has not
+    // yet been rescheduled or cleared is still an active watch, not an absent one --
+    // the assignee's next continuation run (or the monitor's own scheduler) owns
+    // re-arming `monitorNextCheckAt`. Reading "fired, not yet rescheduled" as "no
+    // monitor" let the stranded-assigned sweep race the park gate and re-escalate a
+    // deliberate review wait to `blocked` (BLO-16146 recurrence).
+    const monitor = derivePersistedMonitorState({
+      issue,
+      state: parseIssueExecutionState(issue.executionState),
+      policy: null,
+    });
+    return monitor?.status === "triggered";
   }
 
   async function parkReviewWaitingContinuationIssue(input: {
@@ -4302,6 +4316,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .where(eq(issues.id, input.issue.id))
         .limit(1);
       if (!fresh) return null;
+      // BLO-18643: mirror the park paths' own re-check (parkReviewWaitingContinuationIssue /
+      // parkNoDependencyReviewWaitingIssue both bail if `fresh.status` has moved past the
+      // status the candidate was read at). Without this, a park that committed first --
+      // under the same per-issue advisory lock, whether from a concurrent transaction or an
+      // earlier sweep pass -- gets silently clobbered back to `blocked` here. Whichever side
+      // reaches its expected-status re-check second is now a no-op.
+      //
+      // `blocked` is explicitly allowed through in addition to `previousStatus`: it's this
+      // function's own steady-state output, and repeated/concurrent escalation attempts on an
+      // already-`blocked` issue are expected to keep updating the same active recovery action
+      // (attempt-count bookkeeping, wake suppression) rather than no-op. Only a status this
+      // function did NOT produce -- e.g. `in_review` from a park that raced it -- is a signal
+      // that some other terminal action already claimed this issue for this cause.
+      if (fresh.status !== input.previousStatus && fresh.status !== "blocked") return null;
 
       const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
       const { action, hasNewActivitySinceLastAttempt } = await ensureSourceScopedStrandedRecoveryAction({
@@ -5495,8 +5523,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             if (parked) {
               result.reviewWaitingParked += 1;
               result.issueIds.push(issue.id);
-              continue;
+            } else {
+              // BLO-18643: `parked` is null both on a genuine failure and -- the common
+              // case on a re-run -- because the issue was already parked `in_review` by
+              // an earlier pass (parkNoDependencyReviewWaitingIssue's own guard requires
+              // `status === "in_progress"`). Either way, this cause is never a stranded
+              // escalation: falling through here previously let the second sweep pass
+              // clobber a just-parked issue back to `blocked` 21s later.
+              result.skipped += 1;
             }
+            continue;
           }
         }
 

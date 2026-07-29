@@ -4361,6 +4361,95 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).toBe(true);
   });
 
+  it(
+    "BLO-18643: does not re-escalate a review-waiting park to blocked when its monitor already " +
+      "fired and was never rescheduled",
+    async () => {
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "issue_continuation_waiting_on_review",
+        runError: "Continuation parked: issue is waiting on review/approval",
+      });
+
+      // Replay BLO-18614's exact monitor shape: the monitor already fired
+      // (`status: "triggered"`) and was never rescheduled (`monitorNextCheckAt: null`).
+      await db
+        .update(issues)
+        .set({
+          monitorNextCheckAt: null,
+          monitorLastTriggeredAt: new Date("2026-07-29T03:52:37.000Z"),
+          monitorAttemptCount: 1,
+          monitorScheduledBy: "assignee",
+          monitorNotes: "PR #806 (Blockcast/paperclip): watching for CI green + Ally review decision before merge.",
+        })
+        .where(eq(issues.id, issueId));
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const firstResult = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(firstResult.reviewWaitingParked).toBe(1);
+      expect(firstResult.escalated).toBe(0);
+      expect(firstResult.issueIds).toEqual([issueId]);
+
+      const parked = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(parked?.status).toBe("in_review");
+      expect(parked?.assigneeAgentId).toBe(agentId);
+
+      // Simulate the next sweep tick (BLO-18614 recurred 21s later) finding the same
+      // now-`in_review` issue with the same cancelled/waiting-on-review latest run: it
+      // must be a no-op, not a second, clobbering escalation to `blocked`.
+      const secondResult = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(secondResult.escalated).toBe(0);
+      expect(secondResult.reviewWaitingParked).toBe(0);
+      expect(secondResult.issueIds).not.toContain(issueId);
+
+      const stillParked = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(stillParked?.status).toBe("in_review");
+      await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+
+      // No recovery action or recovery issue was ever created for this deliberate wait.
+      const recoveryActions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+      expect(recoveryActions).toHaveLength(0);
+
+      const recoveryIssues = await db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+      expect(recoveryIssues).toHaveLength(0);
+
+      // The monitor is now recognized as an active watch, so the park goes through the
+      // monitor-path branch (which relies on the monitor's own visible notes rather than
+      // posting a redundant comment) -- not the no-monitor fallback. Either way, no
+      // escalation comment ever lands on the thread.
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      for (const comment of comments) {
+        expect(comment.body).not.toContain("Moving it to `blocked`");
+      }
+
+      const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+      expect(
+        activity.some(
+          (event) =>
+            event.action === "issue.updated" &&
+            (event.details as { source?: string } | null)?.source ===
+              "recovery.reconcile_review_waiting_continuation",
+        ),
+      ).toBe(true);
+      expect(
+        activity.some((event) => (event.details as { status?: string } | null)?.status === "blocked"),
+      ).toBe(false);
+    },
+  );
+
   // BLO-16182: process_lost is reclassified as transient_infra (3 attempts +
   // 60s backoff). These two guard the COMBINED attempt cap end-to-end through
   // reconcileStrandedAssignedIssues: the continuation sweep and the in-reaper
