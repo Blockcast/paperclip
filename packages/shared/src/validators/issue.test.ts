@@ -387,15 +387,20 @@ describe("issue validators", () => {
       expect(updateIssueSchema.safeParse({ monitorNextCheckAt: undefined }).success).toBe(true);
     });
 
-    // An update REPLACES executionPolicy rather than merging into it, so guidance that says
-    // "send executionPolicy without a monitor key" invites `{"executionPolicy":{}}` — which also
-    // erases stages/reviewPreset/authorizationPolicy. Both agent-facing strings must say so.
+    // An update REPLACES executionPolicy rather than merging into it. That bites arming and
+    // re-arming as hard as it bites clearing: a monitor-only body is a policy with no stages, so
+    // it erases stages/reviewPreset/authorizationPolicy on any issue that had them. Guidance that
+    // only warns about the clear path teaches a destructive re-arm, so assert both agent-facing
+    // strings cover the whole verb set.
     it.each([
       ["validation message", misplacedIssueMonitorInputMessage("monitorNextCheckAt")],
       ["executionPolicy.monitor description", issueExecutionPolicySchema.shape.monitor.description ?? ""],
-    ])("warns in the %s that clearing a monitor replaces the whole policy", (_label, text) => {
-      expect(text).toMatch(/replaces the whole policy|REPLACES the whole `executionPolicy`/);
+    ])("warns in the %s that any policy write — arm, re-arm or clear — replaces the whole policy", (_label, text) => {
+      expect(text).toMatch(/replaces the whole|REPLACES the whole `executionPolicy`/i);
       expect(text).toContain("complete");
+      // The warning must not be scoped to clearing only.
+      expect(text).toMatch(/re-arm/i);
+      expect(text).toMatch(/only on an issue|ONLY on an issue/);
       for (const clobbered of ["stages", "reviewPreset", "authorizationPolicy"]) {
         expect(text).toContain(clobbered);
       }
