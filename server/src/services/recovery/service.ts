@@ -6326,6 +6326,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         },
         "skipping cycle-forming liveness escalation blocker relation",
       );
+      if (blockerIds.length === 0) {
+        // No pre-existing blocker to fall back to. Forcing `blocked` here
+        // would strand the issue with an empty blockedByIssueIds set --
+        // blocked, but with no dependency edge to ever unblock it. Leave
+        // the issue's current status untouched so its existing continuation
+        // path (e.g. the same liveness finding re-triggering next sweep)
+        // keeps working, and persist nothing that didn't actually happen.
+        return input.issue;
+      }
       persistedBlockerIds = blockerIds;
       updated = isAlreadyBlocked
         ? input.issue
