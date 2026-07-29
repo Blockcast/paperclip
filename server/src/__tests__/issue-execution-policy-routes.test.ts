@@ -812,6 +812,17 @@ describe("issue execution policy routes", () => {
           { type: "review", participants: [{ type: "agent", agentId: REVIEWER_AGENT_ID }] },
         ],
         reviewPreset: { id: "low_trust_review", version: 1, rawOutputDisposition: "quarantine" },
+        // The security-sensitive one: a trust boundary that confines the issue's agents and tools.
+        // Losing this to a monitor write silently widens what the assignee is allowed to do, so it
+        // gets the same drop/preserve assertions as `stages` and `reviewPreset` below.
+        authorizationPolicy: {
+          trustPreset: "low_trust_review",
+          trustBoundary: {
+            mode: "low_trust_review",
+            allowedAgentIds: [REVIEWER_AGENT_ID],
+            allowedToolClasses: ["read"],
+          },
+        },
         monitor: {
           nextCheckAt: "2099-11-01T13:00:00.000Z",
           notes: "armed",
@@ -941,6 +952,7 @@ describe("issue execution policy routes", () => {
 
       expect(issue.executionPolicy?.stages).toHaveLength(1);
       expect(issue.executionPolicy?.reviewPreset).toBeTruthy();
+      expect(issue.executionPolicy?.authorizationPolicy).toBeTruthy();
 
       const res = await patchIssue({
         executionPolicy: {
@@ -954,12 +966,19 @@ describe("issue execution policy routes", () => {
 
       expect(res.status).toBe(200);
       const patch = mockIssueService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
-      const nextPolicy = patch.executionPolicy as { stages?: unknown[]; reviewPreset?: unknown } | null;
+      const nextPolicy = patch.executionPolicy as {
+        stages?: unknown[];
+        reviewPreset?: unknown;
+        authorizationPolicy?: unknown;
+      } | null;
       // The monitor is armed as asked...
       expect(patch.monitorNextCheckAt).toEqual(new Date("2099-12-01T13:00:00.000Z"));
-      // ...and the review stage + preset the caller never mentioned are gone with it.
+      // ...and the review stage, preset and trust boundary the caller never mentioned are gone
+      // with it. The `authorizationPolicy` loss is the one with teeth: it silently un-confines the
+      // issue rather than just skipping a review.
       expect(nextPolicy?.stages ?? []).toHaveLength(0);
       expect(nextPolicy?.reviewPreset ?? null).toBeNull();
+      expect(nextPolicy?.authorizationPolicy ?? null).toBeNull();
     });
 
     // ...and the pattern the guidance actually prescribes: read the current policy, re-send it
@@ -989,12 +1008,24 @@ describe("issue execution policy routes", () => {
       const nextPolicy = patch.executionPolicy as {
         stages: Array<{ type: string; participants: Array<{ agentId: string | null }> }>;
         reviewPreset?: { id: string } | null;
+        authorizationPolicy?: {
+          trustPreset?: string;
+          trustBoundary?: { mode?: string; allowedAgentIds?: string[]; allowedToolClasses?: string[] };
+        } | null;
       };
       expect(patch.monitorNextCheckAt).toEqual(new Date("2099-12-01T13:00:00.000Z"));
       expect(patch.monitorNotes).toBe("signature=unchanged");
       expect(nextPolicy.stages).toHaveLength(1);
       expect(nextPolicy.stages[0]?.participants[0]?.agentId).toBe(REVIEWER_AGENT_ID);
       expect(nextPolicy.reviewPreset?.id).toBe("low_trust_review");
+      // The trust boundary survives intact, nested fields included — a re-arm must not quietly
+      // relax it, so assert the contents rather than mere presence.
+      expect(nextPolicy.authorizationPolicy?.trustPreset).toBe("low_trust_review");
+      expect(nextPolicy.authorizationPolicy?.trustBoundary).toEqual({
+        mode: "low_trust_review",
+        allowedAgentIds: [REVIEWER_AGENT_ID],
+        allowedToolClasses: ["read"],
+      });
     });
   });
 
