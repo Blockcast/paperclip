@@ -865,6 +865,57 @@ describe("issue execution policy routes", () => {
       // Nothing may be written when the body is rejected.
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
+
+    // Why the schema guidance tells callers to re-send the COMPLETE policy with only `monitor`
+    // omitted, rather than the shorter-looking `{"executionPolicy":{}}`: the update replaces the
+    // whole policy, so the terse form silently drops the review stages too.
+    it("drops unrelated policy fields when a monitor clear sends a bare executionPolicy", async () => {
+      const issue = {
+        ...wedgedIssue(),
+        executionPolicy: normalizeIssueExecutionPolicy({
+          mode: "normal",
+          commentRequired: true,
+          stages: [
+            {
+              type: "review",
+              participants: [{ type: "agent", agentId: "44444444-4444-4444-8444-444444444444" }],
+            },
+          ],
+          monitor: {
+            nextCheckAt: "2099-11-01T13:00:00.000Z",
+            notes: "armed",
+            scheduledBy: "assignee",
+          },
+        }),
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      expect(issue.executionPolicy?.stages).toHaveLength(1);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ executionPolicy: {} });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+      // The monitor clear lands...
+      expect(patch.monitorNextCheckAt).toBeNull();
+      // ...but it takes the whole policy with it: normalizeIssueExecutionPolicy collapses a
+      // stage-less, monitor-less policy to null, so the review stage asserted above is gone.
+      // This is why the schema guidance says to re-send the COMPLETE policy minus `monitor`.
+      expect("executionPolicy" in patch).toBe(true);
+      expect(patch.executionPolicy).toBeNull();
+    });
   });
 
   it("triggers a scheduled monitor immediately from the dedicated route", async () => {

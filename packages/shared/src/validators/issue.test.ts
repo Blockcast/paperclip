@@ -4,7 +4,9 @@ import {
   addIssueCommentSchema,
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
+  issueExecutionPolicySchema,
   MISPLACED_ISSUE_MONITOR_INPUT_KEYS,
+  misplacedIssueMonitorInputMessage,
   resolveIssueRecoveryActionSchema,
   respondIssueThreadInteractionSchema,
   suggestedTaskDraftSchema,
@@ -383,6 +385,28 @@ describe("issue validators", () => {
     it("does not fire on an absent or explicitly-undefined key", () => {
       expect(updateIssueSchema.safeParse({ title: "No monitor here" }).success).toBe(true);
       expect(updateIssueSchema.safeParse({ monitorNextCheckAt: undefined }).success).toBe(true);
+    });
+
+    // An update REPLACES executionPolicy rather than merging into it, so guidance that says
+    // "send executionPolicy without a monitor key" invites `{"executionPolicy":{}}` — which also
+    // erases stages/reviewPreset/authorizationPolicy. Both agent-facing strings must say so.
+    it.each([
+      ["validation message", misplacedIssueMonitorInputMessage("monitorNextCheckAt")],
+      ["executionPolicy.monitor description", issueExecutionPolicySchema.shape.monitor.description ?? ""],
+    ])("warns in the %s that clearing a monitor replaces the whole policy", (_label, text) => {
+      expect(text).toMatch(/replaces the whole policy|REPLACES the whole `executionPolicy`/);
+      expect(text).toContain("complete");
+      for (const clobbered of ["stages", "reviewPreset", "authorizationPolicy"]) {
+        expect(text).toContain(clobbered);
+      }
+    });
+
+    // attemptCount survives a re-arm and is compared against the *incoming* maxAttempts, so
+    // "re-arming resets a wedged monitor" is only true when maxAttempts is omitted.
+    it("qualifies the re-arm-resets-a-wedged-monitor claim with the attemptCount caveat", () => {
+      const text = issueExecutionPolicySchema.shape.monitor.description ?? "";
+      expect(text).toContain("attemptCount");
+      expect(text).toContain("maxAttempts");
     });
   });
 
