@@ -4134,6 +4134,45 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows.map((row) => row.blockerIssueId));
   }
 
+  async function findCycleFormingBlockerIssueIds(
+    companyId: string,
+    issueId: string,
+    blockerIssueIds: string[],
+  ) {
+    const candidates = new Set(blockerIssueIds);
+    const cycleForming = new Set<string>();
+    if (candidates.size === 0) return cycleForming;
+
+    const rows = await db
+      .select({
+        blockerIssueId: issueRelations.issueId,
+        blockedIssueId: issueRelations.relatedIssueId,
+      })
+      .from(issueRelations)
+      .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.type, "blocks")));
+
+    const adjacency = new Map<string, string[]>();
+    for (const row of rows) {
+      const blocked = adjacency.get(row.blockerIssueId) ?? [];
+      blocked.push(row.blockedIssueId);
+      adjacency.set(row.blockerIssueId, blocked);
+    }
+
+    const queue = [...(adjacency.get(issueId) ?? [])];
+    const visited = new Set<string>([issueId]);
+    while (queue.length > 0 && cycleForming.size < candidates.size) {
+      const current = queue.shift()!;
+      if (candidates.has(current)) {
+        cycleForming.add(current);
+      }
+      if (visited.has(current)) continue;
+      visited.add(current);
+      queue.push(...(adjacency.get(current) ?? []));
+    }
+
+    return cycleForming;
+  }
+
   async function unresolvedBlockerHumanDecisionEscalationState(companyId: string, issueId: string) {
     const blockerRows = await db
       .select({
@@ -4227,15 +4266,70 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           notInArray(issues.status, ["done", "cancelled"]),
         ),
       );
-    const blockedByIssueIds = [
-      ...new Set([...existingBlockers.map((row) => row.id), ...openChildren.map((row) => row.id)]),
-    ];
-    if (blockedByIssueIds.length === 0) return null;
+    const blockerRowsById = new Map<string, { id: string; identifier: string | null; source: string }>();
+    for (const row of existingBlockers) {
+      blockerRowsById.set(row.id, { ...row, source: "existing_unresolved_blocker" });
+    }
+    for (const row of openChildren) {
+      if (!blockerRowsById.has(row.id)) {
+        blockerRowsById.set(row.id, { ...row, source: "open_child" });
+      }
+    }
 
-    const updated = await issuesSvc.update(issue.id, { status: "blocked", blockedByIssueIds });
+    let blockedByIssueIds = [...blockerRowsById.keys()];
+    if (blockedByIssueIds.length === 0) return null;
+    const cycleFormingBlockerIds = await findCycleFormingBlockerIssueIds(
+      issue.companyId,
+      issue.id,
+      blockedByIssueIds,
+    );
+    if (cycleFormingBlockerIds.size > 0) {
+      const skippedBlockers = [...cycleFormingBlockerIds]
+        .map((id) => blockerRowsById.get(id))
+        .filter((row): row is { id: string; identifier: string | null; source: string } => Boolean(row));
+      logger.warn(
+        {
+          companyId: issue.companyId,
+          issueId: issue.id,
+          identifier: issue.identifier,
+          skippedBlockerIssueIds: skippedBlockers.map((row) => row.id),
+          skippedBlockerIdentifiers: skippedBlockers.map((row) => row.identifier).filter(Boolean),
+          skippedBlockerSources: skippedBlockers.map((row) => ({ id: row.id, source: row.source })),
+        },
+        "skipping cycle-forming review-wait blocker relations",
+      );
+      blockedByIssueIds = blockedByIssueIds.filter((id) => !cycleFormingBlockerIds.has(id));
+      if (blockedByIssueIds.length === 0) return null;
+    }
+
+    // The reachability check above and this write are not atomic: another relation
+    // update can add a path from `issue` to one of these blockers between the read and
+    // this write. The issue service re-validates on write and throws in that case -
+    // catch it here so one race falls through to the caller's existing no-dependency
+    // `in_review` park instead of aborting the whole periodic recovery sweep.
+    let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
+    try {
+      updated = await issuesSvc.update(issue.id, { status: "blocked", blockedByIssueIds });
+    } catch (error) {
+      if (!isBlockingRelationCycleError(error)) throw error;
+      logger.warn(
+        {
+          companyId: issue.companyId,
+          issueId: issue.id,
+          identifier: issue.identifier,
+          blockedByIssueIds,
+        },
+        "review-wait blocker write raced a concurrent relation update and formed a cycle; parking without dependency",
+      );
+      return null;
+    }
     if (!updated) return null;
 
-    const waitingOn = formatIssueLinksForComment([...openChildren, ...existingBlockers]);
+    const waitingOn = formatIssueLinksForComment(
+      blockedByIssueIds
+        .map((id) => blockerRowsById.get(id))
+        .filter((row): row is { id: string; identifier: string | null; source: string } => Boolean(row)),
+    );
     await issuesSvc.addComment(
       issue.id,
       `This task is waiting on ${waitingOn} to finish. ` +
