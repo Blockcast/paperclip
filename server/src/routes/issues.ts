@@ -3789,9 +3789,24 @@ export function issueRoutes(
     // short-circuits assignee === actor to allow_self first), so falling through
     // into the assignee-ownership gate below would immediately re-reject the
     // actor it had just admitted — 403 "Agent cannot mutate another agent's
-    // issue", or 409 when the issue is in_progress. Mirrors the
-    // isActiveRecoveryActionOwner bypass directly above.
-    if (boundaryDecision.reason === "allow_issue_creator" || boundaryDecision.reason === "allow_manager_chain") {
+    // issue". Mirrors the isActiveRecoveryActionOwner bypass directly above.
+    //
+    // Deliberately gated on status !== "in_progress". The
+    // `issue.assigneeAgentId !== actorAgentId` block below carries TWO distinct
+    // guards: the assignee-ownership 403, and the 409 that protects an
+    // assignee's *live run*. Returning early above both would let any issue
+    // creator — who needs no org relationship and no grant, since tasks:assign
+    // resolves company-wide — cancel a peer's running heartbeat with
+    // PATCH { status: "cancelled" }. Managers are not constrained by this: on an
+    // in_progress issue they still pass below via
+    // hasActiveCheckoutManagementOverride, since authorization.ts grants
+    // tasks:manage_active_checkouts through the same isManagerOf predicate. So
+    // the manager-driven recovery case this was written for still works.
+    if (
+      (boundaryDecision.reason === "allow_issue_creator" ||
+        boundaryDecision.reason === "allow_manager_chain") &&
+      issue.status !== "in_progress"
+    ) {
       return true;
     }
     if (issue.assigneeAgentId === null) {
