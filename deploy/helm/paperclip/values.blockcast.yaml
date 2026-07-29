@@ -67,6 +67,14 @@ env:
       value: authenticated
     - name: PAPERCLIP_DEPLOYMENT_EXPOSURE
       value: private
+    # Disable better-auth's open email-password sign-up endpoint
+    # (`/api/auth/sign-up/email`). The `/signup` frontend page remains
+    # reachable but the API call it makes will be rejected. Existing
+    # users + invite-based onboarding (POST /api/invites/:token/accept)
+    # keep working. Plumbed via server/src/config.ts → authDisableSignUp
+    # → server/src/auth/better-auth.ts `emailAndPassword.disableSignUp`.
+    - name: PAPERCLIP_AUTH_DISABLE_SIGN_UP
+      value: "true"
     - name: PAPERCLIP_UI_DEV_MIDDLEWARE
       value: "false"
     - name: PAPERCLIP_CODEX_USE_HOST_HOME
