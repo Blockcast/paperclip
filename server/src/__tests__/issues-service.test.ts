@@ -3176,6 +3176,161 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(issue.projectId).toBe(completedProjectId);
   });
 
+  // Ally review (PR #811, Important): the inference is scoped to ROOT creates. A child of
+  // an intentionally-projectless parent must stay projectless -- inferring would split
+  // parent and child across project, default goal, workspace policy, and repository, so
+  // the child would quietly work against a different repo than the parent it reports into.
+  // Both of the next two tests are needed: `parentId` and `workspaceInheritanceIssueId`
+  // are independent signals, and the guard has to hold when only one of them is present.
+  it("BLO-18760: leaves a child of a projectless parent projectless even when its assignee leads exactly one project", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    // Unassigned, so the root-create inference does not fire and the parent stays
+    // genuinely projectless -- the precondition this test needs.
+    const parent = await svc.create(companyId, {
+      title: "Intentionally projectless parent",
+      status: "todo",
+    });
+    expect(parent.projectId).toBeNull();
+
+    const child = await svc.create(companyId, {
+      parentId: parent.id,
+      title: "Child of a projectless parent",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+
+    expect(child.projectId).toBeNull();
+  });
+
+  // The `parentId == null` half of the guard is load-bearing on its own:
+  // `skipExecutionWorkspaceInheritance` nulls `workspaceInheritanceIssueId` while a parent
+  // still exists, which is exactly what the `inheritStrategyOnly` sub-issue path passes.
+  // Guarding only on `workspaceInheritanceIssueId` (the literal review suggestion) would
+  // let this case through.
+  it("BLO-18760: leaves a child projectless when workspace inheritance is skipped but a parent exists", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    const parent = await svc.create(companyId, {
+      title: "Intentionally projectless parent (skip-inheritance)",
+      status: "todo",
+    });
+    expect(parent.projectId).toBeNull();
+
+    const child = await svc.create(companyId, {
+      parentId: parent.id,
+      title: "Child with inheritance skipped",
+      status: "todo",
+      assigneeAgentId: agentId,
+      skipExecutionWorkspaceInheritance: true,
+    });
+
+    expect(child.projectId).toBeNull();
+  });
+
+  // The mirror case: no parent, but an explicit inheritance source. `parentId == null`
+  // alone would let this through, so the `workspaceInheritanceIssueId` half is load-bearing
+  // too.
+  it("BLO-18760: leaves projectId null when inheriting from an explicit projectless source issue", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    const source = await svc.create(companyId, {
+      title: "Projectless workspace source",
+      status: "todo",
+    });
+    expect(source.projectId).toBeNull();
+
+    const issue = await svc.create(companyId, {
+      title: "Issue inheriting from a projectless source",
+      status: "todo",
+      assigneeAgentId: agentId,
+      inheritExecutionWorkspaceFromIssueId: source.id,
+    });
+
+    expect(issue.projectId).toBeNull();
+  });
+
   it("inherits responsible user for agent-created child issues", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

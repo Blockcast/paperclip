@@ -7631,7 +7631,24 @@ export function issueService(db: Db) {
         //    active one. Project status describes the *work*, not the repo. Archived is
         //    excluded because archival is the one signal that the checkout itself is no
         //    longer maintained.
-        if (issueData.projectId == null && issueData.assigneeAgentId) {
+        //
+        // 3. Root creates ONLY. A child whose parent is *intentionally* projectless must
+        //    stay projectless rather than be inferred onto its assignee's led project:
+        //    projectId carries the default goal, the execution-workspace policy, and the
+        //    repository, so inferring here would silently split parent and child across
+        //    all three — a child quietly doing work against a different repo than the
+        //    parent it reports into. Both guards are load-bearing and neither implies the
+        //    other: `workspaceInheritanceIssueId` is null when a caller passes
+        //    `skipExecutionWorkspaceInheritance` even though a parent exists (the
+        //    `inheritStrategyOnly` sub-issue path does exactly this), and it is non-null
+        //    for an explicit `inheritExecutionWorkspaceFromIssueId` with no parent at all.
+        //    Intake — the case BLO-18760 exists to fix — has neither.
+        if (
+          issueData.projectId == null &&
+          issueData.assigneeAgentId &&
+          issueData.parentId == null &&
+          workspaceInheritanceIssueId == null
+        ) {
           const ledProjects = await tx
             .select({ id: projects.id })
             .from(projects)
