@@ -4313,10 +4313,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // The advisory lock is xact-scoped on this tx's connection; once we
     // commit/return, waiting peers wake up and record their next attempt
     // against the same active source-scoped action.
-    const outcome = await db.transaction(async (tx): Promise<{
-      updated: Awaited<ReturnType<typeof issuesSvc.update>>;
-      wake: Parameters<typeof enqueueSourceScopedStrandedRecoveryWake>[0] | null;
-    }> => {
+    return await db.transaction(async (tx) => {
       await tx.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${input.issue.companyId} || ':' || ${input.issue.id}, 0))`,
       );
@@ -4324,34 +4321,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // Re-read source issue under the lock so the recovery action records
       // the latest owner/status evidence and repeated sweeps reuse the same
       // source-scoped action instead of creating issue-backed fallbacks.
-      //
-      // BLO-18760 (Ally review on PR #811): `FOR UPDATE` is what makes the status claim
-      // below all-or-nothing. The advisory lock only serializes this function against
-      // itself, and the `expectedStatus` compare-and-swap only protects the *write*.
-      // Neither stops a non-lock-holding writer — a reviewer's PATCH to `in_review` —
-      // from landing between this read and that write; the CAS then correctly no-ops, but
-      // the recovery action, provider-quota monitor, and wake created in between have
-      // already escaped for an issue that is no longer stranded, leaving stale recovery
-      // state and waking an owner to act on a reviewer-owned issue. The row lock closes
-      // that window by construction: a competing `update(issues)` either commits before
-      // this read (so we observe it and bail below, having done nothing) or blocks until
-      // we commit.
-      //
-      // Consequence: everything in this transaction that writes `issues` MUST go through
-      // `tx`, never `db`. A write on a second pooled connection would block on our own row
-      // lock while this session sits idle-in-transaction waiting in Node — no cycle for
-      // Postgres to detect, so an unrecoverable hang rather than a deadlock error. That is
-      // why the wake is deferred to after commit (`deps.enqueueWakeup` does
-      // `update(issues) set execution_run_id = null` at heartbeat.ts:21566 when the target
-      // has a live `scheduled_retry` run) and why `addComment` is passed `tx` below (it
-      // updates the issues row and fires migration 0076's `last_activity_at` trigger).
       const [fresh] = await tx
         .select()
         .from(issues)
         .where(eq(issues.id, input.issue.id))
-        .limit(1)
-        .for("update");
-      if (!fresh) return { updated: null, wake: null };
+        .limit(1);
+      if (!fresh) return null;
       // BLO-18643: mirror the park paths' own re-check (parkReviewWaitingContinuationIssue /
       // parkNoDependencyReviewWaitingIssue both bail if `fresh.status` has moved past the
       // status the candidate was read at). Without this, a park that committed first --
@@ -4365,9 +4340,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // (attempt-count bookkeeping, wake suppression) rather than no-op. Only a status this
       // function did NOT produce -- e.g. `in_review` from a park that raced it -- is a signal
       // that some other terminal action already claimed this issue for this cause.
-      if (fresh.status !== input.previousStatus && fresh.status !== "blocked") {
-        return { updated: null, wake: null };
-      }
+      if (fresh.status !== input.previousStatus && fresh.status !== "blocked") return null;
 
       const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
       const { action, hasNewActivitySinceLastAttempt } = await ensureSourceScopedStrandedRecoveryAction({
@@ -4393,17 +4366,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         needsHumanDecision,
       } = await unresolvedBlockerHumanDecisionEscalationState(fresh.companyId, fresh.id);
 
-      // Deferred to after commit — see the `FOR UPDATE` comment above. Capturing the args
-      // here (rather than enqueueing) also fixes a latent phantom wake: the wake used to
-      // fire *before* the guarded status write, so a no-op CAS or a rolled-back
-      // transaction still woke an owner about an escalation that never happened.
-      const wake: Parameters<typeof enqueueSourceScopedStrandedRecoveryWake>[0] = {
+      await enqueueSourceScopedStrandedRecoveryWake({
         action,
         issue: fresh,
         latestRun: input.latestRun,
         recoveryCause,
         hasNewActivitySinceLastAttempt,
-      };
+      });
 
       const updated = await issuesSvc.update(
         input.issue.id,
@@ -4412,20 +4381,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           blockedByIssueIds: blockerIds,
           assigneeAgentId: action.ownerAgentId ?? fresh.assigneeAgentId,
         },
-        tx,
+        db,
         // BLO-18643 follow-up: the advisory lock above only serializes this function
         // against itself (concurrent sweeps / re-entrant calls) -- it does nothing
         // against a writer that never takes it, e.g. a human reviewer's PATCH landing
         // between the `fresh.status` re-check above and this write. Fold the same
         // expected-status set into the UPDATE itself so that race can't silently
-        // clobber a legitimate concurrent transition back to `blocked`. Belt-and-braces
-        // now that the read holds `FOR UPDATE`: the row lock makes the window
-        // unreachable, and this keeps the write self-guarding if that lock is ever
-        // dropped or this block is lifted out of the transaction.
+        // clobber a legitimate concurrent transition back to `blocked`.
         { expectedStatus: [input.previousStatus, "blocked"] },
       );
-      if (!updated) return { updated: null, wake: null };
-      if (isProviderQuotaWait) return { updated, wake };
+      if (!updated) return null;
+      if (isProviderQuotaWait) return updated;
 
       const prefix = await getCompanyIssuePrefix(fresh.companyId);
       const recoveryOwner = action.ownerAgentId ? await getAgent(action.ownerAgentId) : null;
@@ -4486,14 +4452,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               authorType: "system",
               presentation: notice.presentation,
               metadata: notice.metadata,
-            }, tx);
+            });
           } else {
             await issuesSvc.addComment(
               fresh.id,
               `${input.comment ?? "Automatic stranded-work recovery needs manual attention."}${recoveryLine}`,
               {},
               { authorType: "system" },
-              tx,
             );
           }
         }
@@ -4552,16 +4517,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         });
       }
 
-      return { updated, wake };
+      return updated;
     });
-
-    // Post-commit: the status claim is durable, so this can no longer wake an owner for an
-    // escalation that did not happen, and it is off the `FOR UPDATE` row lock so
-    // `deps.enqueueWakeup`'s own `update(issues)` cannot hang against it.
-    if (outcome.updated && outcome.wake) {
-      await enqueueSourceScopedStrandedRecoveryWake(outcome.wake);
-    }
-    return outcome.updated;
   }
 
   function buildZeroTokenStartupFailureComment(input: {
