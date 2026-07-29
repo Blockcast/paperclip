@@ -2413,6 +2413,7 @@ describe("realizeExecutionWorkspace", () => {
     // `blocked`. A timeout means the inspection was inconclusive, not that the
     // submodules are broken, so the run must survive it.
     const { repoRoot, submodulePath } = await createTempRepoWithSubmodule();
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
     const previous = {
       timeout: process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS,
       attempts: process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS,
@@ -2444,6 +2445,7 @@ describe("realizeExecutionWorkspace", () => {
           name: "Codex Coder",
           companyId: "company-submodule-inspect-timeout",
         },
+        recorder,
       });
 
       // The run is realized, not aborted.
@@ -2459,6 +2461,23 @@ describe("realizeExecutionWorkspace", () => {
       expect(realized.warnings).not.toContain(
         `Initialized git submodules before starting: ${submodulePath}`,
       );
+
+      // The degradation must leave a structured, countable record -- not just a
+      // run-log line. This change removes the recovery action that used to make
+      // these stalls visible, so without this row "no recovery actions" could
+      // not be distinguished from "we stopped reporting".
+      const degradedOp = operations.find(
+        (operation) => operation.metadata?.action === "submodule_inspection_degraded",
+      );
+      expect(degradedOp).toBeDefined();
+      expect(degradedOp?.phase).toBe("worktree_prepare");
+      expect(degradedOp?.result.status).toBe("skipped");
+      expect(degradedOp?.metadata).toMatchObject({
+        stage: "initial",
+        attempts: 2,
+        timeoutMs: 1,
+      });
+      expect(String(degradedOp?.metadata?.reason)).toContain("timed out after 1ms");
     } finally {
       const restore = (name: string, value: string | undefined) => {
         if (value === undefined) delete process.env[name];

@@ -1083,6 +1083,51 @@ function describeSubmoduleInspectionDegradation(cwd: string, inspection: { reaso
   );
 }
 
+/**
+ * Record a degraded (skipped) submodule readiness check as a structured
+ * workspace operation.
+ *
+ * Without this the degradation is only a line in the run log. That matters
+ * because this change converts a loud failure (`workspace_git_submodule_
+ * unavailable`, which raised a recovery action) into a soft warning: absence of
+ * recovery actions would then be indistinguishable between "the stalls stopped"
+ * and "we stopped reporting the stalls". A `skipped` operation row keeps the
+ * occurrence countable, so a chronically slow checkout is still visible.
+ *
+ * Best-effort: bookkeeping must not defeat the point of degrading. If the
+ * recorder itself fails we swallow it and still let the run proceed -- the
+ * human-readable warning is returned to the caller either way.
+ */
+async function recordSubmoduleInspectionDegradation(
+  recorder: WorkspaceOperationRecorder | null | undefined,
+  input: { cwd: string; reason: string; attempts: number; stage: "initial" | "post_repair" },
+): Promise<void> {
+  if (!recorder) return;
+  const settings = readSubmoduleInspectSettings();
+  try {
+    await recorder.recordOperation({
+      phase: "worktree_prepare",
+      command: formatCommandForDisplay("git", ["submodule", "status", "--recursive"]),
+      cwd: input.cwd,
+      metadata: {
+        cwd: input.cwd,
+        action: "submodule_inspection_degraded",
+        stage: input.stage,
+        attempts: input.attempts,
+        timeoutMs: settings.timeoutMs,
+        reason: input.reason,
+      },
+      run: async () => ({
+        status: "skipped",
+        exitCode: null,
+        system: `${describeSubmoduleInspectionDegradation(input.cwd, input)}\n`,
+      }),
+    });
+  } catch {
+    // Intentionally ignored -- see doc comment.
+  }
+}
+
 async function ensureGitSubmodulesReady(input: {
   cwd: string;
   recorder?: WorkspaceOperationRecorder | null;
@@ -1099,6 +1144,12 @@ async function ensureGitSubmodulesReady(input: {
     // because a read-only probe on a network filesystem was slow is strictly
     // worse than letting the run proceed. See BLO-18784.
     const warning = describeSubmoduleInspectionDegradation(input.cwd, inspection);
+    await recordSubmoduleInspectionDegradation(input.recorder, {
+      cwd: input.cwd,
+      reason: inspection.reason,
+      attempts: inspection.attempts,
+      stage: "initial",
+    });
     return [warning];
   }
 
@@ -1176,6 +1227,12 @@ async function ensureGitSubmodulesReady(input: {
   if (!verification.ok) {
     // The repair commands themselves succeeded; only the re-check was
     // inconclusive. Report both rather than discarding the successful repair.
+    await recordSubmoduleInspectionDegradation(input.recorder, {
+      cwd: input.cwd,
+      reason: verification.reason,
+      attempts: verification.attempts,
+      stage: "post_repair",
+    });
     return [
       `Initialized git submodules before starting: ${missingPaths.join(", ")}`,
       describeSubmoduleInspectionDegradation(input.cwd, verification),
