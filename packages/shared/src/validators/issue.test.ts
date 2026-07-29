@@ -4,6 +4,9 @@ import {
   addIssueCommentSchema,
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
+  issueExecutionPolicySchema,
+  MISPLACED_ISSUE_MONITOR_INPUT_KEYS,
+  misplacedIssueMonitorInputMessage,
   resolveIssueRecoveryActionSchema,
   respondIssueThreadInteractionSchema,
   suggestedTaskDraftSchema,
@@ -333,6 +336,83 @@ describe("issue validators", () => {
     });
 
     expect(parsed.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
+  });
+
+  // BLO-18790: these keys used to be stripped by the non-strict object schema, so a caller that
+  // guessed the wrong monitor shape got 200 OK with nothing persisted and no way to notice.
+  describe("misplaced monitor input keys (BLO-18790)", () => {
+    it.each(MISPLACED_ISSUE_MONITOR_INPUT_KEYS)("rejects top-level `%s` on update instead of stripping it", (key) => {
+      const parsed = updateIssueSchema.safeParse({
+        [key]: key === "monitor"
+          ? { nextCheckAt: "2099-12-01T12:00:00.000Z", notes: "signature=unchanged" }
+          : "2099-12-01T12:00:00.000Z",
+      });
+
+      expect(parsed.success).toBe(false);
+      if (parsed.success) return;
+      const message = parsed.error.issues.map((issue) => issue.message).join("\n");
+      // The message has to name the shape that actually works, otherwise this is just a
+      // differently-shaped dead end for the caller.
+      expect(message).toContain("executionPolicy.monitor");
+      expect(message).toContain(key);
+    });
+
+    it("rejects top-level `monitor` on create as well, so both paths agree", () => {
+      const parsed = createIssueSchema.safeParse({
+        title: "Watch a PR",
+        status: "in_progress",
+        monitor: { nextCheckAt: "2099-12-01T12:00:00.000Z" },
+      });
+
+      expect(parsed.success).toBe(false);
+    });
+
+    it("still accepts the nested executionPolicy.monitor shape", () => {
+      const parsed = updateIssueSchema.parse({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2099-12-01T12:00:00.000Z",
+            notes: "signature=unchanged",
+            scheduledBy: "assignee",
+          },
+        },
+      });
+
+      expect(parsed.executionPolicy?.monitor?.nextCheckAt).toBe("2099-12-01T12:00:00.000Z");
+      expect(parsed.executionPolicy?.monitor?.notes).toBe("signature=unchanged");
+    });
+
+    it("does not fire on an absent or explicitly-undefined key", () => {
+      expect(updateIssueSchema.safeParse({ title: "No monitor here" }).success).toBe(true);
+      expect(updateIssueSchema.safeParse({ monitorNextCheckAt: undefined }).success).toBe(true);
+    });
+
+    // An update REPLACES executionPolicy rather than merging into it. That bites arming and
+    // re-arming as hard as it bites clearing: a monitor-only body is a policy with no stages, so
+    // it erases stages/reviewPreset/authorizationPolicy on any issue that had them. Guidance that
+    // only warns about the clear path teaches a destructive re-arm, so assert both agent-facing
+    // strings cover the whole verb set.
+    it.each([
+      ["validation message", misplacedIssueMonitorInputMessage("monitorNextCheckAt")],
+      ["executionPolicy.monitor description", issueExecutionPolicySchema.shape.monitor.description ?? ""],
+    ])("warns in the %s that any policy write — arm, re-arm or clear — replaces the whole policy", (_label, text) => {
+      expect(text).toMatch(/replaces the whole|REPLACES the whole `executionPolicy`/i);
+      expect(text).toContain("complete");
+      // The warning must not be scoped to clearing only.
+      expect(text).toMatch(/re-arm/i);
+      expect(text).toMatch(/only on an issue|ONLY on an issue/);
+      for (const clobbered of ["stages", "reviewPreset", "authorizationPolicy"]) {
+        expect(text).toContain(clobbered);
+      }
+    });
+
+    // attemptCount survives a re-arm and is compared against the *incoming* maxAttempts, so
+    // "re-arming resets a wedged monitor" is only true when maxAttempts is omitted.
+    it("qualifies the re-arm-resets-a-wedged-monitor claim with the attemptCount caveat", () => {
+      const text = issueExecutionPolicySchema.shape.monitor.description ?? "";
+      expect(text).toContain("attemptCount");
+      expect(text).toContain("maxAttempts");
+    });
   });
 
   it("accepts the cheap model profile in issue assignee adapter overrides", () => {
