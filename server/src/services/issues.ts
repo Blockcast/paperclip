@@ -7614,6 +7614,23 @@ export function issueService(db: Db) {
         // Anything murkier (no assignee, no lead project, or more than one
         // candidate) is left alone rather than guessing at which repo the
         // agent meant.
+        //
+        // Two policy decisions encoded here, both deliberate (Ally review, PR #811):
+        //
+        // 1. `== null` treats an *explicit* `projectId: null` the same as omitting the
+        //    field. This is required, not incidental: the board/UI create path posts an
+        //    explicit null, which is precisely the intake case BLO-18760 exists to fix.
+        //    Honoring explicit null as "definitely no project" would make this a no-op
+        //    for the only caller that matters. A caller that genuinely wants a
+        //    workspace-less issue can still get one by leaving the issue unassigned, or
+        //    by assigning an agent with no (or an ambiguous) lead project.
+        //
+        // 2. `archivedAt` is the ONLY exclusion. A `completed` or `paused` project stays
+        //    a candidate on purpose — what the issue inherits is the project's git
+        //    checkout, and that checkout is just as valid on a finished project as an
+        //    active one. Project status describes the *work*, not the repo. Archived is
+        //    excluded because archival is the one signal that the checkout itself is no
+        //    longer maintained.
         if (issueData.projectId == null && issueData.assigneeAgentId) {
           const ledProjects = await tx
             .select({ id: projects.id })

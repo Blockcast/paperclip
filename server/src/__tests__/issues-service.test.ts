@@ -3044,6 +3044,138 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(issue.projectId).toBe(explicitProjectId);
   });
 
+  // Ally review (PR #811): the `== null` check treats an explicit `projectId: null`
+  // identically to omitting the field. That is the intended contract, and it is the case
+  // that actually matters -- the board/UI create path posts an explicit null, so if this
+  // inferred nothing the BLO-18760 fix would never fire in production.
+  it("BLO-18760: infers the led project when projectId is explicitly null (same as omitted)", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Board-filed issue posting an explicit null projectId",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      projectId: null,
+    });
+
+    expect(issue.projectId).toBe(projectId);
+  });
+
+  // Ally review (PR #811): archival is the only exclusion, so an archived led project
+  // must not be inferred even though it is the agent's sole lead.
+  it("BLO-18760: excludes archived led projects from inference", async () => {
+    const companyId = randomUUID();
+    const archivedProjectId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: archivedProjectId,
+      companyId,
+      name: "Archived project",
+      status: "in_progress",
+      leadAgentId: agentId,
+      archivedAt: new Date(),
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Issue whose assignee only leads an archived project",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    expect(issue.projectId).toBeNull();
+  });
+
+  // Ally review (PR #811): documents the deliberate other half of that policy -- project
+  // status describes the work, not the repo, so a completed/paused project's checkout is
+  // still a valid thing to inherit. Guards against someone "tightening" this to
+  // status === "in_progress" and silently reopening the strand for finished projects.
+  it("BLO-18760: still infers a completed (non-archived) led project", async () => {
+    const companyId = randomUUID();
+    const completedProjectId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: completedProjectId,
+      companyId,
+      name: "Completed project",
+      status: "completed",
+      leadAgentId: agentId,
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Issue whose assignee leads a completed project",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    expect(issue.projectId).toBe(completedProjectId);
+  });
+
   it("inherits responsible user for agent-created child issues", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
