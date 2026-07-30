@@ -25,6 +25,7 @@ import {
   ensurePersistedExecutionWorkspaceAvailable,
   ensureServerWorkspaceLinksCurrent,
   ensureRuntimeServicesForRun,
+  executeProcessForTests,
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
   reconcilePersistedRuntimeServicesOnStartup,
@@ -3973,6 +3974,77 @@ describe("resolveWorkspaceRuntimeReadinessTimeoutSec", () => {
       }),
     ).toBe(30);
   });
+});
+
+describe("executeProcess (timeout classification)", () => {
+  // BLO-18784 follow-up. `close` fires only once every writer on the inherited
+  // pipes is done, which can be long after the command itself exited: `git
+  // submodule status --recursive` forks per submodule, so one straggler is
+  // enough. Clearing the budget on `close` therefore let the timer fire against
+  // a command that had already returned a definitive status, and `runGit` --
+  // which checks `timedOut` before the exit code -- turned git's exit 128 into a
+  // retryable stall that degrades to a non-fatal warning. A broken checkout
+  // would have failed open.
+  it("keeps a nonzero exit definitive when a descendant holds stdio past the budget", async () => {
+    // Exits 128 immediately while a backgrounded grandchild keeps stdout open
+    // for 5s -- well past both the 300ms budget and the 2s drain grace.
+    const started = Date.now();
+    const result = await executeProcessForTests({
+      command: "sh",
+      args: ["-c", "sh -c 'sleep 5' & exit 128"],
+      cwd: os.tmpdir(),
+      timeoutMs: 300,
+    });
+
+    expect(result.code).toBe(128);
+    expect(result.timedOut).toBe(false);
+    // Settled on the drain bound rather than waiting out the straggler.
+    expect(Date.now() - started).toBeLessThan(4_000);
+  }, 15_000);
+
+  it("still reports a timeout, and reaps the tree, when the command itself stalls", async () => {
+    // Nothing exits on its own here: the budget has to kill it. Signalling only
+    // the direct child leaves the descendant running -- against the same
+    // checkout we have already given up waiting for, which is how one stalled
+    // probe makes the *next* one slower. The marker file is the observable
+    // proof: it is only ever written if the grandchild outlived the timeout.
+    const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reap-"));
+    const markerPath = path.join(markerDir, "survived");
+    const started = Date.now();
+
+    try {
+      const result = await executeProcessForTests({
+        command: "sh",
+        args: ["-c", `sh -c 'sleep 2; : > ${JSON.stringify(markerPath)}' & wait`],
+        cwd: os.tmpdir(),
+        timeoutMs: 300,
+      });
+
+      expect(result.timedOut).toBe(true);
+      expect(result.code).not.toBe(0);
+      // Settled on the timeout rather than hanging until the descendant finished.
+      expect(Date.now() - started).toBeLessThan(5_000);
+
+      // Outlive the grandchild's own sleep, then confirm it never got there.
+      await new Promise((resolve) => setTimeout(resolve, 2_500));
+      await expect(fs.stat(markerPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await fs.rm(markerDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("reports a clean exit unchanged", async () => {
+    const result = await executeProcessForTests({
+      command: "sh",
+      args: ["-c", "printf 'ok\\n'"],
+      cwd: os.tmpdir(),
+      timeoutMs: 10_000,
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.timedOut).toBe(false);
+    expect(result.stdout).toBe("ok\n");
+  }, 15_000);
 });
 
 describe("resolveShell (shell fallback)", () => {

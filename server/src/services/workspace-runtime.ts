@@ -137,6 +137,16 @@ const runtimeServicesById = new Map<string, RuntimeServiceRecord>();
 const runtimeServicesByReuseKey = new Map<string, string>();
 const runtimeServiceLeasesByRun = new Map<string, string[]>();
 const DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES = 256 * 1024;
+/**
+ * How long to keep draining stdio after the spawned command has already exited.
+ *
+ * `close` waits for every writer on the inherited pipes, so a descendant that
+ * outlives the command can hold it open long after the command's own status is
+ * known. Settling on a bound rather than on `close` keeps that from turning into
+ * an unbounded wait. Healthy commands emit `close` within a tick of `exit`, so
+ * this only elapses in the pathological case.
+ */
+const PROCESS_STDIO_DRAIN_GRACE_MS = 2_000;
 const WORKSPACE_SUBMODULE_REPAIR_TIMEOUT_MS = 5 * 60 * 1000;
 
 // `git submodule status --recursive` is ~96% filesystem latency, not CPU: on the
@@ -663,27 +673,54 @@ async function executeProcess(input: {
     timedOut: boolean;
   }>((resolve, reject) => {
     let timedOut = false;
+    let settled = false;
+    let timeoutTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
     let killTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+    let drainTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+    const stdout = createProcessOutputCapture(input.maxStdoutBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
+    const stderr = createProcessOutputCapture(input.maxStderrBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
     const child = spawn(input.command, input.args, {
       cwd: input.cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: input.env ?? process.env,
+      // Lead a process group so a timeout can reap the whole tree. `git
+      // submodule status --recursive` forks per submodule; signalling only the
+      // command we spawned leaves those children running against the same
+      // checkout -- still doing IO we have given up waiting for, and still
+      // holding the stdio pipes that `close` waits on. Platform-guarded to match
+      // the runtime-service spawn: on Windows `detached` means a new console,
+      // not a process group, and `terminateChildProcess` falls back there anyway.
+      detached: process.platform !== "win32",
     });
+
+    const clearTimers = () => {
+      if (timeoutTimer) globalThis.clearTimeout(timeoutTimer);
+      if (killTimer) globalThis.clearTimeout(killTimer);
+      if (drainTimer) globalThis.clearTimeout(drainTimer);
+      timeoutTimer = null;
+      killTimer = null;
+      drainTimer = null;
+    };
+    const settle = (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      resolve({ stdout, stderr, code, timedOut });
+    };
+
     const timeoutMs =
       typeof input.timeoutMs === "number" && Number.isFinite(input.timeoutMs) && input.timeoutMs > 0
         ? Math.trunc(input.timeoutMs)
         : null;
-    const timeoutTimer = timeoutMs
-      ? globalThis.setTimeout(() => {
-          timedOut = true;
-          child.kill("SIGTERM");
-          killTimer = globalThis.setTimeout(() => {
-            child.kill("SIGKILL");
-          }, 5_000);
-        }, timeoutMs)
-      : null;
-    const stdout = createProcessOutputCapture(input.maxStdoutBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
-    const stderr = createProcessOutputCapture(input.maxStderrBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
+    if (timeoutMs) {
+      timeoutTimer = globalThis.setTimeout(() => {
+        timedOut = true;
+        terminateChildProcess(child, "SIGTERM");
+        killTimer = globalThis.setTimeout(() => {
+          terminateChildProcess(child, "SIGKILL");
+        }, 5_000);
+      }, timeoutMs);
+    }
     child.stdout?.on("data", (chunk) => {
       stdout.append(String(chunk));
     });
@@ -691,14 +728,30 @@ async function executeProcess(input: {
       stderr.append(String(chunk));
     });
     child.on("error", (error) => {
-      if (timeoutTimer) globalThis.clearTimeout(timeoutTimer);
-      if (killTimer) globalThis.clearTimeout(killTimer);
+      if (settled) return;
+      settled = true;
+      clearTimers();
       reject(error);
     });
-    child.on("close", (code) => {
+    // `exit` fires when the command itself terminates; `close` additionally
+    // waits for every writer on the inherited pipes, which can include
+    // descendants that outlive it. Stopping the budget here is what keeps the
+    // two apart: once the command has exited, its status is definitive, so a
+    // descendant holding a pipe open must not be allowed to let the timer fire
+    // and relabel a deterministic failure (e.g. git's exit 128) as a timeout.
+    child.on("exit", (code) => {
       if (timeoutTimer) globalThis.clearTimeout(timeoutTimer);
       if (killTimer) globalThis.clearTimeout(killTimer);
-      resolve({ stdout, stderr, code, timedOut });
+      timeoutTimer = null;
+      killTimer = null;
+      // Bound the wait for the remaining stdio. Without this a lingering
+      // descendant means `close` never arrives and the promise never settles --
+      // the timeout budget stops being enforced at all, which is a worse
+      // failure than the one it was meant to catch.
+      drainTimer ??= globalThis.setTimeout(() => settle(code), PROCESS_STDIO_DRAIN_GRACE_MS);
+    });
+    child.on("close", (code) => {
+      settle(code);
     });
   });
   const stdout = proc.stdout.finish();
@@ -714,6 +767,17 @@ async function executeProcess(input: {
     stderrBytes: stderr.totalBytes,
   };
 }
+
+/**
+ * Test seam for `executeProcess`.
+ *
+ * The exit-vs-close distinction it now draws is only observable here: proving it
+ * needs a command that returns a definitive status while a descendant still
+ * holds the inherited pipes, which no real `git` invocation can be made to do on
+ * demand. Not reachable from configuration, same rationale as
+ * `setSubmoduleInspectSettingsForTests`.
+ */
+export const executeProcessForTests = executeProcess;
 
 /**
  * Raised when a git subprocess exceeded its wall-clock budget. Distinguished from
@@ -794,6 +858,12 @@ async function runGit(
     maxStdoutBytes: options.maxStdoutBytes,
     maxStderrBytes: options.maxStderrBytes,
   });
+  // Timeout first, and only sound because `executeProcess` stops the budget the
+  // moment git itself exits: `timedOut` therefore means the timer fired while
+  // git was still running, never that a descendant held the pipes open past a
+  // status git had already returned. Without that invariant this ordering would
+  // relabel a deterministic exit 128 as a retryable stall and let a broken
+  // checkout through the degrade path.
   if (proc.timedOut) {
     throw new GitCommandTimeoutError(`git ${args.join(" ")} timed out after ${options.timeoutMs}ms`, {
       stdout: proc.stdout,
@@ -1564,18 +1634,28 @@ async function validateLinkedGitWorktree(input: {
   return { valid: true };
 }
 
-function terminateChildProcess(child: ChildProcess) {
+/**
+ * Signal a child and, where the platform allows it, everything it spawned.
+ *
+ * The negative pid targets the process group, which is why callers that may need
+ * this must spawn `detached` (a non-detached child shares *our* group, so the
+ * negative pid would either miss or, worse, hit us). Falls back to the direct
+ * child when the group is already gone or the platform has no groups.
+ */
+function terminateChildProcess(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM") {
   if (!child.pid) return;
   if (process.platform !== "win32") {
     try {
-      process.kill(-child.pid, "SIGTERM");
+      process.kill(-child.pid, signal);
       return;
     } catch {
       // Fall through to the direct child kill.
     }
   }
-  if (!child.killed) {
-    child.kill("SIGTERM");
+  try {
+    child.kill(signal);
+  } catch {
+    // Already reaped; nothing left to signal.
   }
 }
 
