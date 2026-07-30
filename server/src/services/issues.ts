@@ -66,6 +66,7 @@ import {
   issueCommentPresentationSchema,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
+  SYSTEM_ISSUE_DOCUMENT_KEYS,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
@@ -1884,6 +1885,76 @@ function preserveDurableLandingEvidence<T extends { allDetected?: unknown }>(
   );
   if (carried.length === 0) return fresh;
   return { ...fresh, allDetected: [...freshDetected, ...carried] };
+}
+
+/**
+ * Work-product types that count as a durable, inspectable deliverable for the
+ * done gate. Deliberately narrow: `pull_request` / `branch` / `commit` are
+ * already covered by the pr-link path, and `preview_url` / `runtime_service`
+ * describe ephemeral infrastructure rather than a reviewable artifact.
+ */
+const DURABLE_ARTIFACT_WORK_PRODUCT_TYPES = ["artifact", "document"] as const;
+
+/**
+ * Document keys that must NOT satisfy the done gate.
+ *
+ * `plan` is authored at the START of the work, so accepting it would let every
+ * issue that was ever planned self-certify completion — the plan is a statement
+ * of intent, not a deliverable. The system keys are scaffolding the platform
+ * writes on the agent's behalf (`continuation-summary` is emitted automatically
+ * when a run hands off), so neither is evidence the agent produced anything.
+ */
+const DONE_GATE_NON_QUALIFYING_DOCUMENT_KEYS: readonly string[] = [
+  ...SYSTEM_ISSUE_DOCUMENT_KEYS,
+  "plan",
+];
+
+/**
+ * Does this issue carry a durable artifact that a real run produced? (BLO-19081)
+ *
+ * See the docblock in `done-gate.ts` for why this exists and why it is not a
+ * hole in the gate. Two qualifying shapes, both requiring run attribution:
+ *
+ *  - an issue document (excluding plan/system keys) with a non-empty body and
+ *    at least one revision stamped `createdByRunId`;
+ *  - an `artifact`/`document` work product stamped `createdByRunId`.
+ *
+ * `createdByRunId` is written from the authenticated actor's run context in the
+ * route layer, never from the request body, so it cannot be forged by a client.
+ *
+ * Call this LAZILY — only when the cheaper gate checks have already decided to
+ * block — so the common update path pays no extra query.
+ */
+async function fetchDurableArtifactEvidence(dbOrTx: any, issueId: string): Promise<boolean> {
+  const [documentRows, workProductRows] = await Promise.all([
+    dbOrTx
+      .select({ key: issueDocuments.key })
+      .from(issueDocuments)
+      .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
+      .innerJoin(documentRevisions, eq(documentRevisions.documentId, documents.id))
+      .where(
+        and(
+          eq(issueDocuments.issueId, issueId),
+          notInArray(issueDocuments.key, [...DONE_GATE_NON_QUALIFYING_DOCUMENT_KEYS]),
+          isNotNull(documentRevisions.createdByRunId),
+          isNotNull(documents.latestBody),
+          ne(documents.latestBody, ""),
+        ),
+      )
+      .limit(1),
+    dbOrTx
+      .select({ id: issueWorkProducts.id })
+      .from(issueWorkProducts)
+      .where(
+        and(
+          eq(issueWorkProducts.issueId, issueId),
+          inArray(issueWorkProducts.type, [...DURABLE_ARTIFACT_WORK_PRODUCT_TYPES]),
+          isNotNull(issueWorkProducts.createdByRunId),
+        ),
+      )
+      .limit(1),
+  ]);
+  return documentRows.length > 0 || workProductRows.length > 0;
 }
 
 async function fetchEvidenceForIssue(
@@ -7920,18 +7991,26 @@ export function issueService(db: Db) {
 
       // Done-execution gate (narrated-completion hardening, instance flag
       // `enableDoneExecutionGate`, default off). Blocks an agent self-marking
-      // an issue `done` when no real execution run ever occurred and no
-      // pr-link evidence was recorded — the failure mode where agents post
-      // "## Done" via the board API without shipping code. Never gates human
-      // actors. See server/src/services/done-gate.ts.
+      // an issue `done` when no real execution run ever occurred, no pr-link
+      // evidence was recorded, and no run-attributed durable artifact exists —
+      // the failure mode where agents post "## Done" via the board API without
+      // shipping code. Never gates human actors. See done-gate.ts.
+      //
+      // Both expensive lookups (the evidence refresh and the durable-artifact
+      // query) run ONLY once the cheap checks have already decided to block, so
+      // the ordinary update path is unaffected. `hasDurableArtifactEvidence:
+      // false` in the pre-check is what makes that laziness correct: it can
+      // only cause us to look harder, never to skip a block.
       let doneTransitionEvidenceVerdict: Awaited<ReturnType<typeof runEvidenceGate>> | null = null;
       let doneGateEvidenceVerdict = existing.lastEvidenceVerdict;
+      let doneGateHasDurableArtifact = false;
       const doneGateInput = {
         fromStatus: existing.status,
         toStatus: issueData.status,
         existingExecutionRunId: existing.executionRunId,
         lastEvidenceVerdict: doneGateEvidenceVerdict,
         isAgentActor: actorAgentId != null,
+        hasDurableArtifactEvidence: false,
       };
       if (experimental.enableDoneExecutionGate && shouldBlockNarratedDone(doneGateInput)) {
         try {
@@ -7955,6 +8034,19 @@ export function issueService(db: Db) {
             "done-execution gate: evidence refresh failed; preserving block posture",
           );
         }
+        try {
+          doneGateHasDurableArtifact = await fetchDurableArtifactEvidence(dbOrTx, id);
+        } catch (err) {
+          // Fail CLOSED: an artifact lookup we could not complete is not
+          // evidence, so leave the flag false and let the gate block.
+          logger.warn(
+            {
+              issueId: id,
+              err: err instanceof Error ? err.message : String(err),
+            },
+            "done-execution gate: durable-artifact lookup failed; preserving block posture",
+          );
+        }
       }
 
       if (
@@ -7965,10 +8057,11 @@ export function issueService(db: Db) {
           existingExecutionRunId: existing.executionRunId,
           lastEvidenceVerdict: doneGateEvidenceVerdict,
           isAgentActor: actorAgentId != null,
+          hasDurableArtifactEvidence: doneGateHasDurableArtifact,
         })
       ) {
         throw unprocessable(
-          "Issue cannot be marked done without execution evidence (no execution run and no pr-link evidence)",
+          "Issue cannot be marked done without execution evidence (no execution run, no pr-link evidence, and no run-attributed durable artifact). Attach a PR link, or write the deliverable to an issue document (PUT /api/issues/:id/documents/:key) before closing — a comment body is not sufficient.",
           { reason: "no_execution_run_and_no_pr_evidence", issueId: id },
         );
       }
