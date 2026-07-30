@@ -487,6 +487,37 @@ const RATE_LIMIT_HEARTBEAT_RETRY_MAX_ATTEMPTS = 12;
 // poll interval lets the sweep re-check capacity soon. PEN-382.
 export const CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS = 5 * 60 * 1000;
 export const CCROTATE_CAPACITY_RETRY_REASON = "ccrotate_capacity";
+
+/**
+ * Context-snapshot key holding how many GitHub review-request *deliveries* a
+ * single `scheduled_retry` run will settle (BLO-18859 review follow-up).
+ *
+ * A capacity deferral counts `deferred` once per delivery, but same-task-key
+ * deliveries coalesce onto one run — so without this tally the promoter's
+ * single `queued` would leave N-1 deliveries permanently stranded between
+ * `received` and `queued`, which is exactly the shape real loss has.
+ */
+export const GITHUB_REVIEW_DELIVERY_COUNT_KEY = "githubReviewDeliveryCount";
+
+/**
+ * Upper bound applied when replaying {@link GITHUB_REVIEW_DELIVERY_COUNT_KEY}
+ * into counter increments. The value is derived from committed rows, so a
+ * corrupt or hand-edited snapshot must not be able to spin the promoter.
+ */
+const GITHUB_REVIEW_DELIVERY_COUNT_MAX = 1000;
+
+/**
+ * Read a coalesced-delivery tally off a run snapshot, clamped to
+ * `[1, GITHUB_REVIEW_DELIVERY_COUNT_MAX]`. Absent/garbage means "one delivery",
+ * which is what every run written before this key existed represents.
+ */
+export function readGithubReviewDeliveryCount(snapshot: Record<string, unknown>): number {
+  const raw = snapshot[GITHUB_REVIEW_DELIVERY_COUNT_KEY];
+  const parsed = typeof raw === "number" ? raw : Number.parseInt(String(raw ?? ""), 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return 1;
+  return Math.min(Math.floor(parsed), GITHUB_REVIEW_DELIVERY_COUNT_MAX);
+}
+
 function readIntegerEnv(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw == null || raw.trim() === "") return fallback;
@@ -11998,14 +12029,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // trigger with no review — so it settles as `dead_lettered` and
             // pages via the existing dead-letter alert, rather than as a
             // policy suppression (BLO-18859 review follow-up).
-            const exhaustedGithubReviewReason = githubPrReviewWakeReasonFromRunSnapshot(
-              parseObject(exhausted.contextSnapshot),
-            );
+            const exhaustedSnapshot = parseObject(exhausted.contextSnapshot);
+            const exhaustedGithubReviewReason =
+              githubPrReviewWakeReasonFromRunSnapshot(exhaustedSnapshot);
             if (exhaustedGithubReviewReason !== null) {
-              recordGithubReviewRequestDelivery({
-                state: "dead_lettered",
-                reason: exhaustedGithubReviewReason,
-              });
+              // Per delivery, not per run: every delivery that coalesced onto
+              // this run was counted `deferred`, and all of them die with it.
+              const lostDeliveries = readGithubReviewDeliveryCount(exhaustedSnapshot);
+              for (let i = 0; i < lostDeliveries; i++) {
+                recordGithubReviewRequestDelivery({
+                  state: "dead_lettered",
+                  reason: exhaustedGithubReviewReason,
+                });
+              }
             }
             await appendRunEvent(exhausted, await nextRunEventSeq(exhausted.id), {
               eventType: "lifecycle",
@@ -12395,15 +12431,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // and until this increment existed a successfully-delayed review sat at
     // `received=1, deferred=1, queued=0` forever — indistinguishable from loss.
     //
-    // Exactly-once per run: the promoting UPDATE is conditional on the row
-    // still being `scheduled_retry`, so a concurrent promoter's UPDATE matches
-    // no rows and returns null above. Per *run*, not per delivery — a second
-    // delivery for the same PR coalesces onto this run by task key (that dedup
-    // is the point, see the redelivery test), so N same-key deferrals settle as
-    // one `queued`.
+    // Exactly-once per *delivery*, which is the granularity the rest of the
+    // funnel uses: the promoting UPDATE is conditional on the row still being
+    // `scheduled_retry`, so a concurrent promoter's UPDATE matches no rows and
+    // returns null above — and every delivery that coalesced onto this run
+    // bumped the tally as it was counted `deferred`. Replaying the tally here
+    // is what keeps `received = queued + suppressed + dead_lettered + in-flight`
+    // closed when N deliveries settle as one run.
     const promotedGithubReviewReason = githubPrReviewWakeReasonFromRunSnapshot(contextSnapshot);
     if (promotedGithubReviewReason !== null) {
-      recordGithubReviewRequestDelivery({ state: "queued", reason: promotedGithubReviewReason });
+      const settledDeliveries = readGithubReviewDeliveryCount(contextSnapshot);
+      for (let i = 0; i < settledDeliveries; i++) {
+        recordGithubReviewRequestDelivery({ state: "queued", reason: promotedGithubReviewReason });
+      }
     }
 
     await appendRunEvent(promoted, await nextRunEventSeq(promoted.id), {
@@ -21377,7 +21417,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         wakeTriggerDetail: triggerDetail,
         penstockProvider: gateResult.provider,
         penstockModel: gateResult.model,
-        ...(githubReviewWakeReason !== null ? { githubReviewWakeReason } : {}),
+        ...(githubReviewWakeReason !== null
+          ? { githubReviewWakeReason, [GITHUB_REVIEW_DELIVERY_COUNT_KEY]: 1 }
+          : {}),
         ...(resumeAtIso ? { penstockResumeAt: resumeAtIso } : {}),
       };
 
@@ -21400,9 +21442,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           requestedByActorId: opts.requestedByActorId,
           idempotencyKey: opts.idempotencyKey,
         });
-        if (coalescedRun) return coalescedRun;
+        if (coalescedRun) {
+          // BLO-18859 review follow-up: this delivery was counted `deferred`
+          // like any other, but coalescing means it will be settled by a run
+          // that already exists — and the promoter emits one `queued` per run.
+          // Left alone, N same-key deliveries produce N `deferred` and a single
+          // `queued`, a permanent received-without-queued gap that reads as
+          // loss. The rest of the funnel counts per *delivery* (the inline
+          // webhook path records `queued` on a coalesced run too), so carry the
+          // tally on the run and let the promoter close all of them at once.
+          //
+          // Incremented in SQL rather than through the merged snapshot because
+          // mergeCoalescedContextSnapshot is a last-writer-wins spread: the
+          // incoming `1` would clobber the accumulated count.
+          if (githubReviewWakeReason === null) {
+            return { run: coalescedRun, coalesced: true };
+          }
+          const bumped = await tx
+            .update(heartbeatRuns)
+            .set({
+              contextSnapshot: sql`jsonb_set(
+                coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb),
+                ${`{${GITHUB_REVIEW_DELIVERY_COUNT_KEY}}`}::text[],
+                to_jsonb(
+                  coalesce(
+                    nullif(${heartbeatRuns.contextSnapshot} ->> ${GITHUB_REVIEW_DELIVERY_COUNT_KEY}, '')::int,
+                    1
+                  ) + 1
+                )
+              )`,
+              updatedAt: new Date(),
+            })
+            .where(eq(heartbeatRuns.id, coalescedRun.id))
+            .returning()
+            .then((rows) => rows[0] ?? coalescedRun);
+          return { run: bumped, coalesced: true };
+        }
 
-        return tx
+        const created = await tx
           .insert(heartbeatRuns)
           .values({
             companyId: agent.companyId,
@@ -21426,6 +21503,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
           .returning()
           .then((rows) => rows[0]);
+        return { run: created, coalesced: false };
       });
     }
 
@@ -23328,6 +23406,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function publishGithubReviewDeadLetterGauge(now: Date) {
     try {
       const cutoff = new Date(now.getTime() - GITHUB_DEAD_LETTER_GAUGE_WINDOW_MS);
+      const byReason: Record<string, number> = {};
+
+      // Source 1: dispatch chains that burned their retry budget.
+      //
+      // The SQL pre-filter is a deliberate *superset* of the JS predicate: it
+      // only requires that the GitHub markers appear somewhere in the payload,
+      // and the authoritative classification still happens below. That keeps
+      // the single source of truth in `githubPrReviewWakeReason` while making
+      // sure unrelated exhausted wakes can no longer consume the row cap and
+      // hide real dead letters (BLO-18859 review follow-up). Newest-first
+      // ordering makes the cap drop the least actionable rows rather than an
+      // arbitrary set.
       const rows = await db
         .select({ payload: agentWakeupRequests.payload })
         .from(agentWakeupRequests)
@@ -23335,11 +23425,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           and(
             eq(agentWakeupRequests.status, "dispatch_failed_exhausted"),
             gte(agentWakeupRequests.finishedAt, cutoff),
+            sql`${agentWakeupRequests.payload}::text ilike '%github%'`,
           ),
         )
+        .orderBy(desc(agentWakeupRequests.finishedAt))
         .limit(GITHUB_DEAD_LETTER_GAUGE_SCAN_LIMIT);
 
-      const byReason: Record<string, number> = {};
       for (const row of rows) {
         const payload = parseObject(row.payload);
         const retryState = parseObject(payload.dispatchRetry) as { originalOpts?: WakeupOptions };
@@ -23347,6 +23438,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (reason === null) continue;
         byReason[reason] = (byReason[reason] ?? 0) + 1;
       }
+
+      // Source 2: provider-capacity retries that outlived their budget.
+      //
+      // These never touch `agent_wakeup_requests` — the capacity path parks the
+      // delivery on a `scheduled_retry` heartbeat run and, when the pool never
+      // recovers, cancels that run. It is just as terminal as an exhausted
+      // dispatch chain (nothing re-drives a cancelled run) and increments the
+      // same `dead_lettered` counter, so omitting it here meant a restart
+      // before the first scrape — or during the alert's `for` window — silently
+      // erased the loss. Scoping to the capacity retry reason keeps ordinary
+      // operator cancellations out of the gauge.
+      const capacityRows = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.status, "cancelled"),
+            eq(heartbeatRuns.errorCode, "rate_limit_exhausted"),
+            eq(heartbeatRuns.scheduledRetryReason, CCROTATE_CAPACITY_RETRY_REASON),
+            gte(heartbeatRuns.finishedAt, cutoff),
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.finishedAt))
+        .limit(GITHUB_DEAD_LETTER_GAUGE_SCAN_LIMIT);
+
+      for (const row of capacityRows) {
+        const snapshot = parseObject(row.contextSnapshot);
+        const reason = githubPrReviewWakeReasonFromRunSnapshot(snapshot);
+        if (reason === null) continue;
+        // One cancelled run can bury several coalesced deliveries.
+        byReason[reason] = (byReason[reason] ?? 0) + readGithubReviewDeliveryCount(snapshot);
+      }
+
       setGithubReviewRequestDeadLetterUnresolved(byReason);
     } catch (err) {
       logger.warn({ err }, "failed to publish github review dead-letter gauge (BLO-18859)");

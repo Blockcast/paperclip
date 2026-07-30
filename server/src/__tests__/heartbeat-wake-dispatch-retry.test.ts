@@ -18,7 +18,11 @@ import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns } from "@paperclipai/db";
-import { heartbeatService } from "../services/heartbeat.js";
+import {
+  CCROTATE_CAPACITY_RETRY_REASON,
+  GITHUB_REVIEW_DELIVERY_COUNT_KEY,
+  heartbeatService,
+} from "../services/heartbeat.js";
 import {
   GITHUB_REVIEW_REQUEST_DEAD_LETTER_UNRESOLVED_METRIC,
   GITHUB_REVIEW_REQUEST_DELIVERY_METRIC,
@@ -835,8 +839,53 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         expect(await deliveryCount("dead_lettered")).toBe(0);
       });
 
-      it("settles a deferred delivery as `suppressed` on a non-alerting cause when promotion is gated", async () => {
+      it("settles every coalesced delivery, not just the run, when N defer onto one retry", async () => {
         const { agentId } = await seedCompanyAndAgent();
+        const capacityDenied = heartbeatWithCapacityDenied();
+
+        // Two deliveries for the same PR land while the pool is exhausted. They
+        // share a task key, so the second coalesces onto the run the first
+        // parked — that dedup is intended and must stay.
+        for (const _ of [0, 1]) {
+          expect(
+            await capacityDenied.wakeup(agentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "github_pr_review_submitted",
+              payload: GITHUB_REVIEW_PAYLOAD,
+            }),
+          ).toBeNull();
+        }
+
+        // Both deliveries were deferred; exactly one run holds them.
+        expect(await deliveryCount("deferred")).toBe(2);
+        expect(await deliveryCount("queued")).toBe(0);
+        const parked = await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "scheduled_retry")),
+          );
+        expect(parked).toHaveLength(1);
+
+        await db
+          .update(heartbeatRuns)
+          .set({ scheduledRetryAt: new Date(Date.now() - 60_000) })
+          .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "scheduled_retry")));
+        await heartbeatService(db, { skipQueuedRunDispatch: true }).promoteDueScheduledRetries(new Date());
+
+        // The regression this pins: promotion used to emit one `queued` per
+        // *run*, so N coalesced deliveries closed as a single settle and left a
+        // permanent received-without-queued gap — arithmetically identical to
+        // the loss the alert is supposed to catch. The rest of the funnel counts
+        // per delivery (the inline webhook path records `queued` for a coalesced
+        // run too), so this path has to as well.
+        expect(await deliveryCount("queued")).toBe(2);
+        expect(await deliveryCount("suppressed")).toBe(0);
+        expect(await deliveryCount("dead_lettered")).toBe(0);
+      });
+
+      it("settles a deferred delivery as `suppressed` on a non-alerting cause when promotion is gated", async () => {        const { agentId } = await seedCompanyAndAgent();
 
         expect(
           await heartbeatWithCapacityDenied().wakeup(agentId, {
@@ -926,6 +975,60 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         // ...and yet the loss is still visible. That difference is the whole
         // point of the gauge.
         expect(await deadLetterGauge()).toBe(1);
+      });
+
+      it("counts a cancelled provider-capacity retry, which never writes a wakeup-request row", async () => {
+        const { agentId, companyId } = await seedCompanyAndAgent();
+        const now = new Date();
+        // The capacity path is the other durable dead-letter source, and it
+        // looks nothing like the first: it parks the delivery on a heartbeat run
+        // and *cancels that run* when the pool never recovers, without ever
+        // touching agent_wakeup_requests. Just as terminal — nothing re-drives a
+        // cancelled run — so a gauge that only scanned wakeup requests let a
+        // restart before the first scrape, or during the alert's `for` window,
+        // erase the loss completely.
+        await db.insert(heartbeatRuns).values({
+          id: randomUUID(),
+          companyId,
+          agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "cancelled",
+          errorCode: "rate_limit_exhausted",
+          scheduledRetryReason: CCROTATE_CAPACITY_RETRY_REASON,
+          finishedAt: now,
+          contextSnapshot: {
+            githubReviewWakeReason: "github_pr_review_submitted",
+            // Two deliveries had coalesced onto this run before it died.
+            [GITHUB_REVIEW_DELIVERY_COUNT_KEY]: 2,
+          },
+        });
+
+        const result = await heartbeat.reconcileFailedWakeDispatches(now);
+        expect(result.exhausted).toBe(0);
+        expect(await deliveryCount("dead_lettered")).toBe(0);
+        // Both buried deliveries are visible to the alert after the restart.
+        expect(await deadLetterGauge()).toBe(2);
+      });
+
+      it("ignores an ordinary cancelled run that carries no capacity-retry reason", async () => {
+        const { agentId, companyId } = await seedCompanyAndAgent();
+        const now = new Date();
+        // Scoping matters: operators cancel runs routinely, and a gauge that
+        // counted every cancelled GitHub run would page on normal operation.
+        await db.insert(heartbeatRuns).values({
+          id: randomUUID(),
+          companyId,
+          agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "cancelled",
+          finishedAt: now,
+          contextSnapshot: { githubReviewWakeReason: "github_pr_review_submitted" },
+        });
+
+        await heartbeat.reconcileFailedWakeDispatches(now);
+        expect(await deadLetterGauge()).toBe(0);
       });
 
       it("stays at zero for a non-GitHub wake that dead-lettered", async () => {
