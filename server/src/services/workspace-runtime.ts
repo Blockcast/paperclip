@@ -177,16 +177,23 @@ const WORKSPACE_SUBMODULE_INSPECT_MAX_RETRY_DELAY_MS = 30_000;
 // that state, and it is indistinguishable from a deliberate tightening without a
 // floor.
 //
-// 5s sits below the measured cold worst case (5903ms, see above), so any smaller
-// budget cannot complete on a cold checkout and would degrade every first touch:
-// that is disabling the check, not tuning it. It is still ~3.7x warm p99
-// (1356ms), so it remains usable if an operator genuinely wants to tighten the
-// backstop during an incident.
+// 15s is the smallest floor that keeps the floor itself outside the hazard it
+// exists to exclude. The bound has to be a budget under which a *healthy*
+// checkout still completes, and the slowest healthy inspection measured on the
+// shared CephFS tree is the composed cold-x-load case, ~13.6s (5.1x cold cache
+// x 2.3x induced metadata load, see above) -- so anything at or below that lets
+// an operator sit exactly at the minimum and still degrade every cold first
+// touch, which is the fail-open this floor is for. 15s clears it, and is 2.5x
+// the cold worst case (5903ms) and 11x warm p99 (1356ms).
+//
+// It is deliberately not tighter. A floor between warm p99 and the cold worst
+// case would look like it permits tightening during an incident, but the values
+// it permits are exactly the ones that stop the check from running.
 //
 // No floor on `attempts` or `retryDelayMs`: the minimum each can reach is 1, and
 // neither disables the check. `attempts=1` is a coherent "do not retry" choice
 // (the pre-BLO-18784 behaviour), and a 1ms backoff only retries sooner.
-const WORKSPACE_SUBMODULE_INSPECT_MIN_TIMEOUT_MS = 5_000;
+const WORKSPACE_SUBMODULE_INSPECT_MIN_TIMEOUT_MS = 15_000;
 
 /**
  * Env overrides for the submodule-inspection budget. Read at call time so they
