@@ -144,6 +144,19 @@ export const ORPHANED_MANAGED_POD_REAPED_METRIC = "paperclip_orphaned_managed_po
  *   sometimes an outage (`heartbeat.scheduling_suppressed` left on). Break down
  *   by {@link GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC}'s `cause` label to tell
  *   those apart — that is the counter to alert on, not this state as a whole.
+ * - `deferred`: the provider-capacity (penstock/ccrotate) gate declined to
+ *   dispatch *now* and `persistProviderCapacityRetry` committed a
+ *   `heartbeat_runs` row with `status = "scheduled_retry"`, which the scheduler
+ *   re-drives once capacity returns. This is the ONE `return null` out of
+ *   `enqueueWakeup` that is not a durable skip, so it must not be folded into
+ *   `suppressed`: it is late, not lost. Folding it in was doubly wrong — it
+ *   claimed a review had been terminally declined, and because the gate writes
+ *   no `skipped` row the cause fell through to
+ *   {@link UNKNOWN_GITHUB_SUPPRESSION_CAUSE}, which the outage alert pages on.
+ *   A provider rate-limit would have paged as "reviews are being dropped".
+ *   Not terminal, so it is excluded from the funnel invariant below; a
+ *   sustained rate means reviews are arriving slowly, which is a capacity
+ *   signal (see `paperclip_ccrotate_capacity_deferred_total`), not a loss one.
  * - `retried`: one re-dispatch attempt after a transient (non-HttpError)
  *   dispatch failure — both the in-process attempts in
  *   `wakeupWithDispatchRetry` and each later `reconcileFailedWakeDispatches`
@@ -157,15 +170,16 @@ export const ORPHANED_MANAGED_POD_REAPED_METRIC = "paperclip_orphaned_managed_po
  *
  * The invariant an operator reads: every `received` delivery reaches exactly one
  * terminal state, so `received == queued + suppressed + dead_lettered` once the
- * retry chains in flight have settled. In steady state `received` ≈ `queued`
+ * retry chains and `deferred` re-drives in flight have settled. In steady state
+ * `received` ≈ `queued`
  * and both `suppressed` and `dead_lettered` are flat at zero. A non-zero
  * `dead_lettered` rate means an
  * `@ally` review request will never produce a run, which is the BLO-18847
  * symptom this counter exists to make visible.
  *
- * Cardinality: `state` is closed at 5 and `reason` is coerced to
+ * Cardinality: `state` is closed at 6 and `reason` is coerced to
  * {@link KNOWN_GITHUB_WAKE_REASONS} (else "other"), so the series count is
- * bounded at `5 * (KNOWN_GITHUB_WAKE_REASONS.length + 1)` — independent of
+ * bounded at `6 * (KNOWN_GITHUB_WAKE_REASONS.length + 1)` — independent of
  * repo, PR number, delivery id, and agent roster. Those high-cardinality
  * identifiers stay on the structured log lines, matching the guardrail
  * {@link CONCURRENT_RUN_BLOCKED_METRIC} documents above.
@@ -181,6 +195,7 @@ export const KNOWN_GITHUB_DELIVERY_STATES = [
   "received",
   "queued",
   "suppressed",
+  "deferred",
   "retried",
   "dead_lettered",
 ] as const;
@@ -640,15 +655,19 @@ function ensureRegistry(): {
       name: GITHUB_REVIEW_REQUEST_DELIVERY_METRIC,
       help:
         "Count of GitHub review-request reviewer-wake deliveries by funnel state "
-        + "(received/queued/suppressed/retried/dead_lettered) and bounded wake reason "
+        + "(received/queued/suppressed/deferred/retried/dead_lettered) and bounded wake reason "
         + "(BLO-18859). 'received' counts deliveries that cleared every suppression gate "
         + "and are about to dispatch (NOT raw arrivals); 'queued' means a durable "
         + "agent_wakeup_requests row committed AND a run was actually enqueued; "
         + "'suppressed' means a scheduling gate declined the wake (skipped row, no run, "
-        + "terminal); 'retried' counts each re-dispatch attempt after a transient "
+        + "terminal) — see "
+        + GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC
+        + " for which gate; 'deferred' means the provider-capacity gate parked it as a "
+        + "scheduled_retry run (late, NOT lost, and NOT terminal); 'retried' counts each "
+        + "re-dispatch attempt after a transient "
         + "failure; 'dead_lettered' means terminally lost without operator action "
         + "(dispatch_failed_exhausted, or the durable safety-net write itself failing). "
-        + "In steady state received ~= queued and suppressed/dead_lettered are flat at zero.",
+        + "In steady state received ~= queued and suppressed/deferred/dead_lettered are flat at zero.",
       labelNames: ["state", "reason"],
       registers: [registry],
     });
@@ -657,7 +676,7 @@ function ensureRegistry(): {
     // entirely and a healthy fleet renders as "No data" on the funnel panel —
     // indistinguishable from a broken scrape. It matters most for
     // `dead_lettered`, where absent-vs-zero is exactly the difference between
-    // "nothing was lost" and "we cannot tell". 5 states x 8 reasons = 40
+    // "nothing was lost" and "we cannot tell". 6 states x 8 reasons = 48
     // constant-zero series, which is negligible next to the roster-scaled
     // counters above.
     for (const state of KNOWN_GITHUB_DELIVERY_STATES) {

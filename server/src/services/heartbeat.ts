@@ -21403,6 +21403,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           provider: penstockGateResult.provider,
         });
         await persistProviderCapacityRetry(penstockGateResult);
+        // Signal the deferral to the caller *after* the scheduled_retry run is
+        // committed, so nothing can read "deferred" for a retry that does not
+        // exist. This is the only `return null` below that leaves
+        // durableSkipReason null on purpose: no skipped row is written because
+        // the wake is not declined, just postponed (BLO-18859 review
+        // follow-up).
+        if (suppression) suppression.providerCapacityDeferred = true;
         return null;
       }
     }
@@ -22823,8 +22830,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    *
    * Stays `null` when a wake succeeds, or when it fails without any gate having
    * written a durable skipped row.
+   *
+   * `providerCapacityDeferred` marks the one `return null` that is NOT a
+   * decline at all: the penstock/ccrotate capacity gate, which commits a
+   * `scheduled_retry` heartbeat run the scheduler re-drives later. It needs its
+   * own flag rather than a `durableSkipReason` string because it writes no
+   * `skipped` row — so without it the null return is indistinguishable from a
+   * durable skip, gets counted terminal `suppressed`, and (having no reason)
+   * lands on the `other` cause the outage alert pages on. A provider rate-limit
+   * would page as "reviews are being dropped".
    */
-  type WakeSuppressionOutcome = { durableSkipReason: string | null };
+  type WakeSuppressionOutcome = {
+    durableSkipReason: string | null;
+    providerCapacityDeferred: boolean;
+  };
 
   async function wakeupWithDispatchRetry(agentId: string, opts: WakeupOptions = {}) {
     const githubReviewReason = githubPrReviewWakeReason(opts);
@@ -22832,20 +22851,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // wake durably, so the terminal `suppressed` metric below carries the real
     // cause. Reset per attempt: a transient retry re-runs every gate, and a
     // stale reason from a previous attempt would mislabel this one.
-    const suppression: WakeSuppressionOutcome = { durableSkipReason: null };
+    const suppression: WakeSuppressionOutcome = {
+      durableSkipReason: null,
+      providerCapacityDeferred: false,
+    };
     let lastError: unknown;
     for (let attempt = 0; attempt <= WAKE_DISPATCH_RETRY_BACKOFF_MS.length; attempt++) {
       suppression.durableSkipReason = null;
+      suppression.providerCapacityDeferred = false;
       try {
         const result = await enqueueWakeup(agentId, opts, suppression);
         if (!result && githubReviewReason !== null) {
-          // enqueueWakeup declined rather than failed: a status="skipped" row is
-          // committed and no run exists. Terminal -- no reconciler pass re-arms
-          // a skipped row.
-          recordGithubReviewRequestSuppressed({
-            reason: githubReviewReason,
-            cause: suppression.durableSkipReason,
-          });
+          if (suppression.providerCapacityDeferred) {
+            // Late, not lost: a scheduled_retry run is committed and the
+            // scheduler re-drives it when provider capacity returns. Not
+            // terminal, so it must stay off the suppression counter the outage
+            // alert reads.
+            recordGithubReviewRequestDelivery({ state: "deferred", reason: githubReviewReason });
+          } else {
+            // enqueueWakeup declined rather than failed: a status="skipped" row is
+            // committed and no run exists. Terminal -- no reconciler pass re-arms
+            // a skipped row.
+            recordGithubReviewRequestSuppressed({
+              reason: githubReviewReason,
+              cause: suppression.durableSkipReason,
+            });
+          }
         }
         return result;
       } catch (err) {
@@ -23004,7 +23035,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Declared outside the try because the HttpError branch below needs the
       // cause too: `agent.not_invokable` writes its durable skipped row and
       // then throws.
-      const suppression: WakeSuppressionOutcome = { durableSkipReason: null };
+      const suppression: WakeSuppressionOutcome = {
+        durableSkipReason: null,
+        providerCapacityDeferred: false,
+      };
       try {
         const recoveredRun = await enqueueWakeup(row.agentId, originalOpts, suppression);
         if (!recoveredRun) {
@@ -23015,26 +23049,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // delivery that is in fact terminally undelivered. Use the existing
           // superseded terminal state (the reconciler never re-arms it) and
           // count `suppressed` so the funnel still balances honestly.
+          //
+          // The provider-capacity gate is the exception: it committed a
+          // `scheduled_retry` run, so this row genuinely IS superseded by that
+          // run — but the delivery is postponed, not declined, and counting it
+          // `suppressed` would both mislabel it and (having no skip reason)
+          // page the outage alert via the `other` cause on an ordinary provider
+          // rate-limit (BLO-18859 review follow-up).
           await db
             .update(agentWakeupRequests)
             .set({
               status: "dispatch_superseded",
-              error: "re-dispatch was declined by a scheduling gate (enqueueWakeup returned null)",
+              error: suppression.providerCapacityDeferred
+                ? "re-dispatch was deferred by the provider-capacity gate (scheduled_retry run committed)"
+                : "re-dispatch was declined by a scheduling gate (enqueueWakeup returned null)",
               finishedAt: now,
               updatedAt: now,
             })
             .where(eq(agentWakeupRequests.id, row.id));
           superseded += 1;
           if (githubReviewReason !== null) {
-            recordGithubReviewRequestSuppressed({
-              reason: githubReviewReason,
-              cause: suppression.durableSkipReason,
-            });
+            if (suppression.providerCapacityDeferred) {
+              recordGithubReviewRequestDelivery({ state: "deferred", reason: githubReviewReason });
+            } else {
+              recordGithubReviewRequestSuppressed({
+                reason: githubReviewReason,
+                cause: suppression.durableSkipReason,
+              });
+            }
           }
           logger.warn(
-            { agentId: row.agentId, wakeupRequestId: row.id, attempts, cause: suppression.durableSkipReason },
-            "wake dispatch re-attempt was suppressed by a scheduling gate; marking superseded "
-              + "rather than recovered (BLO-18859)",
+            {
+              agentId: row.agentId,
+              wakeupRequestId: row.id,
+              attempts,
+              cause: suppression.durableSkipReason,
+              providerCapacityDeferred: suppression.providerCapacityDeferred,
+            },
+            suppression.providerCapacityDeferred
+              ? "wake dispatch re-attempt was deferred by the provider-capacity gate; marking "
+                + "superseded in favour of the scheduled_retry run (BLO-18859)"
+              : "wake dispatch re-attempt was suppressed by a scheduling gate; marking superseded "
+                + "rather than recovered (BLO-18859)",
           );
           continue;
         }

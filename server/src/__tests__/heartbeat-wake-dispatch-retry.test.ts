@@ -17,7 +17,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { agents, agentWakeupRequests, companies, createDb } from "@paperclipai/db";
+import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import { heartbeatService } from "../services/heartbeat.js";
 import {
   GITHUB_REVIEW_REQUEST_DELIVERY_METRIC,
@@ -708,6 +708,88 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
           }),
         ).rejects.toThrow();
 
+        expect(await deliveryCount("suppressed")).toBe(0);
+        expect(await suppressionCount()).toBe(0);
+      });
+    });
+
+    // The provider-capacity gate is the one `return null` out of enqueueWakeup
+    // that is NOT a durable skip: it commits a `heartbeat_runs` row with
+    // status="scheduled_retry" and the scheduler re-drives the wake when
+    // capacity returns. Counting it as terminal `suppressed` claims a review
+    // was permanently declined when it is merely late, and because it writes no
+    // skipped row its cause falls through to `other` — which the
+    // suppression-outage alert pages on. A provider rate-limit would therefore
+    // page as "reviews are being dropped".
+    describe("provider-capacity deferral is late, not lost", () => {
+      /** heartbeatService with the injectable penstock gate forced to deny. */
+      function heartbeatWithCapacityDenied() {
+        return heartbeatService(db, {
+          skipQueuedRunDispatch: true,
+          penstockAvailabilityGate: {
+            async checkAdapter() {
+              return {
+                allow: false as const,
+                provider: "anthropic" as const,
+                reason: "penstock.model_capacity_unavailable" as const,
+                model: "claude-opus-4-8",
+                resumeAt: null,
+                retryAfterSeconds: 60,
+              };
+            },
+            _resetForTesting() {},
+          },
+        });
+      }
+
+      it("counts `deferred`, not `suppressed`, and never lands on an alerting cause", async () => {
+        const { agentId } = await seedCompanyAndAgent();
+
+        const run = await heartbeatWithCapacityDenied().wakeup(agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "github_pr_review_submitted",
+          payload: GITHUB_REVIEW_PAYLOAD,
+        });
+        // The gate declines *this* dispatch and returns null, same shape as a
+        // durable skip — which is exactly why it needs distinguishing.
+        expect(run).toBeNull();
+
+        expect(await deliveryCount("deferred")).toBe(1);
+        // Not terminal: a retry is already scheduled.
+        expect(await deliveryCount("suppressed")).toBe(0);
+        expect(await deliveryCount("dead_lettered")).toBe(0);
+        // Nothing on the suppression counter at all, so no cause — least of all
+        // the `other` bucket the outage alert selects — can page on it.
+        expect(await suppressionCount()).toBe(0);
+        expect(await suppressionCount("other")).toBe(0);
+
+        // Ground it against the durable record: no skipped row, and a
+        // scheduled_retry run the scheduler will pick up.
+        const skippedRows = await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "skipped")));
+        expect(skippedRows).toHaveLength(0);
+        const retryRuns = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, agentId));
+        expect(retryRuns.map((row) => row.status)).toContain("scheduled_retry");
+      });
+
+      it("leaves the counters untouched for a non-GitHub wake deferred the same way", async () => {
+        const { agentId } = await seedCompanyAndAgent();
+
+        const run = await heartbeatWithCapacityDenied().wakeup(agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: { taskKey: "issue:BLO-1" },
+        });
+        expect(run).toBeNull();
+
+        expect(await deliveryCount("deferred")).toBe(0);
         expect(await deliveryCount("suppressed")).toBe(0);
         expect(await suppressionCount()).toBe(0);
       });

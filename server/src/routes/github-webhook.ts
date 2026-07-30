@@ -1729,8 +1729,9 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               repoFullName: context.repoFullName,
               wakeReason: context.wakeReason,
             },
-            "github webhook reviewer wake was suppressed by a scheduling gate; no run queued "
-              + "(check agent_wakeup_requests for the skipped row's reason)",
+            "github webhook reviewer wake did not queue a run; a gate declined it "
+              + "(check agent_wakeup_requests for the skipped row's reason) or the "
+              + "provider-capacity gate deferred it to a scheduled_retry run",
           );
           // Matches every other suppression gate in this closure, so the 200
           // response body cannot claim reviewerWakeFired for a wake that did
