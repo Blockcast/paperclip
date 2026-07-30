@@ -100,8 +100,10 @@ the review bot can formally review your PR:
 GitHub forbids an identity from submitting a **formal review** (`APPROVE` /
 `REQUEST_CHANGES`) on a PR it authored. So when a PR is authored by the App, the
 review bot (also the App) can only leave a *comment* — never a formal review.
-Authoring under the **user seat** makes author ≠ reviewer, so the bot can post a
-real `gh pr review`.
+Authoring under the **user seat** makes author ≠ reviewer, so the review bot can
+post a real `gh pr review` **as the App**. That is the only reason the user seat
+is in this workflow: it moves *your authorship* off the App identity so the
+*reviewer* is free to review. It does not make you a reviewer.
 
 **When the user-seat token is mounted, author your PR under it** — push the
 branch and create the PR with it — and use it for the final merge too:
@@ -132,6 +134,11 @@ Rules:
   `gh pr merge`/auto-merge. Use the **default App token** for everything else
   (comments, replies, status, reads) so the Paperclip↔GitHub integration keeps
   working.
+- **Never submit a formal review under the user-seat token.** No `gh pr review`
+  with it — not `--approve`, not `--request-changes`, not `--comment`. Never post
+  an `ally-verdict:` marker or a `Reviewed head: <sha>` line under it, on a review
+  or in a comment. This holds even when the review is honest and even when the
+  change is yours: the prohibition is on the *credential*, not on your intent.
 - If the file does **not** exist, the user-seat lane is not provisioned for this
   repo — do not improvise a token. Author and merge under the default token as
   before; the review bot will fall back to comment-mode review, and a maintainer
@@ -139,9 +146,31 @@ Rules:
 - Only merge when the merge checklist above is satisfied (checks green, comments
   resolved).
 
+### Why the user seat must never post a review
+
+The user-seat token authenticates as the `allyblockcast` **user** — the same
+identity the review bot's own formal approvals come from. GitHub records only
+that shared identity, so a review you post under it is **indistinguishable from
+the reviewer's own**, to a human reader and to CI alike.
+
+The `review/ally-complete` merge gate keys off exactly that: an `APPROVED` review
+from an `allyblockcast` login. An approval posted under the seat therefore clears
+the gate for a change no reviewer ever looked at, and nothing in the audit trail
+can afterwards tell the two apart. Only the reviewer's own pipeline may produce a
+review that clears that gate.
+
+So when you are looking at a red `review/ally-complete` on your own PR, the
+sanctioned move is to **get a review** — re-request one (see the repo's review
+handoff convention) and wait. Posting the approval yourself is not a shortcut
+past a slow reviewer; it is a forged review, and it has already shipped a
+data-loss bug to master that the real review had caught.
+
 ## Anti-patterns
 
 - PR description that says "see commits". Reviewers should not need to read the log.
 - Mixing refactor and behavior change in the same PR with no separation in the body.
 - "Address feedback" commits that bundle unrelated edits. One commit per round of feedback is fine; one commit for everything in flight is not.
 - Force-pushing during active review without telling the reviewer.
+- Approving your own PR under the user-seat merge token to turn the review gate
+  green. That is a forged review, not a merge unblock — see the credential rules
+  above.
