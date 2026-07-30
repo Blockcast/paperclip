@@ -125,7 +125,8 @@ test("overrides a pre-existing GH_TOKEN/GITHUB_TOKEN in the caller's env (BLO-13
   });
 });
 
-test("logs a diagnostic to stderr and falls back when the token file exists but isn't readable (BLO-13241 review S2)", (t) => {  // chmod-based unreadability is meaningless for root (root bypasses
+test("logs a diagnostic to stderr and falls back when the token file exists but isn't readable (BLO-13241 review S2)", (t) => {
+  // chmod-based unreadability is meaningless for root (root bypasses
   // permission bits entirely), which is how this repo's Docker build and
   // some CI runners execute. Skip rather than false-fail there.
   if (typeof process.getuid === "function" && process.getuid() === 0) {
