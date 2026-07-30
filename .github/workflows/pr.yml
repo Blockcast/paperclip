@@ -247,7 +247,7 @@ jobs:
     name: verify
     if: ${{ always() }}
     needs: [typecheck_release_registry, general_tests, build]
-    runs-on: default
+    runs-on: arc-light
     timeout-minutes: 5
 
     steps:
