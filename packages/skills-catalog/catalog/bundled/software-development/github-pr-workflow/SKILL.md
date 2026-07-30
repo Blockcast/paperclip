@@ -91,19 +91,23 @@ You have two GitHub identities available, and which one you use decides whether
 the review bot can formally review your PR:
 
 - **Default App-installation token** — identity `app/allyblockcast[bot]`. Works
-  for commits, PR creation, comments, status, and reads. This is also the
-  identity the **review bot** posts as.
+  for commits, PR creation, comments, status, and reads. The review bot posts its
+  **comment-mode** reviews under this identity.
 - **User-seat token** — mounted at `/paperclip/.secrets/github-merge-token/token`
   when provisioned. This is the **`allyblockcast` user** account, a *distinct*
-  GitHub identity from the `app/allyblockcast[bot]` App.
+  GitHub identity from the `app/allyblockcast[bot]` App. The review bot posts its
+  **formal approvals** under this same seat, and it is the identity used for the
+  final merge.
 
 GitHub forbids an identity from submitting a **formal review** (`APPROVE` /
-`REQUEST_CHANGES`) on a PR it authored. So when a PR is authored by the App, the
-review bot (also the App) can only leave a *comment* — never a formal review.
-Authoring under the **user seat** makes author ≠ reviewer, so the review bot can
-post a real `gh pr review` **as the App**. That is the only reason the user seat
-is in this workflow: it moves *your authorship* off the App identity so the
-*reviewer* is free to review. It does not make you a reviewer.
+`REQUEST_CHANGES`) on a PR it authored, so the author and the reviewer must be
+different identities.
+
+Holding the user-seat token does **not** make you a reviewer. In this workflow it
+is a *push / create / merge* credential and nothing more — the review bot's own
+approvals come from that very same login, which is exactly why you must never
+submit a review under it (see
+[Why the user seat must never post a review](#why-the-user-seat-must-never-post-a-review)).
 
 **When the user-seat token is mounted, author your PR under it** — push the
 branch and create the PR with it — and use it for the final merge too:
