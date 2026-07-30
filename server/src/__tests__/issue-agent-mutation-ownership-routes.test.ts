@@ -1976,6 +1976,38 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(mockIssueService.addComment).not.toHaveBeenCalled();
     });
+
+    // BLO-18797 review follow-up (Ally, PR #814). assertAgentIssueMutationAllowed
+    // backs ~25 routes. The first cut of this fix put the boundary-reason
+    // short-circuit *inside* the shared helper with no opt-in, so every one of
+    // those routes inherited it — most alarmingly DELETE /issues/:id, which
+    // calls svc.remove. That turned "I created this issue and delegated it"
+    // into "I can destroy it out from under the assignee", which is a strictly
+    // wider grant than the delegate-recovery PATCH the fix was written for.
+    //
+    // The short-circuit is now opt-in (allowCreatorOrManagerChainOwnership) and
+    // PATCH /issues/:id is the only caller that passes it. This asserts the
+    // negative for the destructive route. Asserting svc.remove was never called
+    // matters as much as the status code: a 403 emitted after the delete had
+    // already run would still satisfy a status-only assertion.
+    for (const reason of ["allow_manager_chain", "allow_issue_creator"] as const) {
+      it(`does not let a ${reason} actor DELETE another agent's issue`, async () => {
+        decideAllowingOnly(reason);
+        mockIssueService.getById.mockResolvedValue(
+          makeIssue({
+            status: "todo",
+            assigneeAgentId: ownerAgentId,
+            createdByAgentId: peerAgentId,
+          }),
+        );
+
+        const res = await request(await createApp(peerActor())).delete(`/api/issues/${issueId}`);
+
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(res.body?.error).toContain("cannot mutate another agent's issue");
+        expect(mockIssueService.remove).not.toHaveBeenCalled();
+      });
+    }
   });
 
   it.each([

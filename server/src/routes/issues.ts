@@ -3755,6 +3755,17 @@ export function issueRoutes(
       allowBlockedCorrection?: boolean;
       allowScopedRecoveryOwnerSourceMutation?: boolean;
       allowRecoveryActionOwner?: boolean;
+      /**
+       * BLO-18797: opt in to the allow_issue_creator / allow_manager_chain
+       * ownership bypass below. Off by default and deliberately so — this
+       * helper backs ~25 routes, including DELETE /issues/:id, the document
+       * delete/lock paths, work-product mutation and approval unlinking.
+       * Honouring the bypass unconditionally would hand every one of those to
+       * any issue creator, which is a far wider grant than the
+       * delegate-recovery PATCH this was written for. Pass it only from a
+       * route whose blast radius you have actually checked.
+       */
+      allowCreatorOrManagerChainOwnership?: boolean;
     } = {},
   ) {
     if (req.actor.type !== "agent") return true;
@@ -3791,7 +3802,13 @@ export function issueRoutes(
     // actor it had just admitted — 403 "Agent cannot mutate another agent's
     // issue". Mirrors the isActiveRecoveryActionOwner bypass directly above.
     //
-    // Deliberately gated on status !== "in_progress". The
+    // Opt-in per route. This helper guards ~25 routes; only PATCH /issues/:id
+    // passes allowCreatorOrManagerChainOwnership. Every other caller — most
+    // pointedly DELETE /issues/:id — keeps the pre-existing behaviour, so
+    // creating an issue does not become a licence to destroy it after handing
+    // it to someone else.
+    //
+    // Also gated on status !== "in_progress". The
     // `issue.assigneeAgentId !== actorAgentId` block below carries TWO distinct
     // guards: the assignee-ownership 403, and the 409 that protects an
     // assignee's *live run*. Returning early above both would let any issue
@@ -3803,6 +3820,7 @@ export function issueRoutes(
     // tasks:manage_active_checkouts through the same isManagerOf predicate. So
     // the manager-driven recovery case this was written for still works.
     if (
+      options.allowCreatorOrManagerChainOwnership &&
       (boundaryDecision.reason === "allow_issue_creator" ||
         boundaryDecision.reason === "allow_manager_chain") &&
       issue.status !== "in_progress"
@@ -8041,6 +8059,10 @@ export function issueRoutes(
       {
         allowBlockedCorrection: true,
         allowScopedRecoveryOwnerSourceMutation,
+        // BLO-18797: the delegate-recovery path. A manager (or the issue's
+        // creator) needs to move a stuck delegate's issue out of `blocked`
+        // and clear a stale blocker edge. Scoped to this route only.
+        allowCreatorOrManagerChainOwnership: true,
       },
     ))) return;
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
