@@ -1064,6 +1064,16 @@ function buildPrReviewerWakeIdempotencyKey(
   // @ally comment requests are scoped to the GitHub comment id so a later
   // explicit re-review comment can wake Ally again.
   //
+  // github_pr_ready_for_review is scoped to the delivery id for the same
+  // reason (BLO-18953). It is the sanctioned way for an agent to request a
+  // re-review, and every draft->ready toggle is a fresh, deliberate request.
+  // Keying it on repo+pr+reason alone made it self-poisoning: `coalesced` is
+  // an IDEMPOTENT_REVIEWER_WAKE_STATUS and is terminal (the row is inserted
+  // with finishedAt already set and never transitions), so once ONE toggle was
+  // coalesced, every future toggle on that PR was dropped at this precheck
+  // forever. Observed on Blockcast/paperclip#822. GitHub reuses the delivery id
+  // when it retries a delivery, so genuine redeliveries still dedup.
+  //
   // Every other reason, including github_pr_synchronized, keys on
   // repo+prNumber+reason alone. This deliberately omits head sha and delivery
   // id so the idempotency precheck can skip duplicate in-flight wake requests
@@ -1073,13 +1083,23 @@ function buildPrReviewerWakeIdempotencyKey(
   // finishes still enqueues a fresh reviewer wake rather than being blocked by
   // the earlier completed review. Active run coalescing is controlled by
   // buildPrReviewerTaskKey plus enqueueWakeup's same-task-scope logic.
-  const commentScopedSuffix =
-    context.wakeReason === "github_pr_review_requested"
-      ? `${context.wakeReason}:comment:${context.commentId ?? deliveryId ?? "unknown"}`
-      : context.wakeReason;
-  return `pr_review:${repo}:${context.prNumber}:${commentScopedSuffix}`;
+  const requestScopedSuffix = (() => {
+    if (context.wakeReason === "github_pr_review_requested") {
+      return `${context.wakeReason}:comment:${context.commentId ?? deliveryId ?? "unknown"}`;
+    }
+    if (context.wakeReason === "github_pr_ready_for_review") {
+      return `${context.wakeReason}:delivery:${deliveryId ?? "unknown"}`;
+    }
+    return context.wakeReason;
+  })();
+  return `pr_review:${repo}:${context.prNumber}:${requestScopedSuffix}`;
 }
 
+// Deliberately PR-scoped, with no head sha: this key also scopes the reviewer
+// affinity lookup (findActivePrReviewerForTask), the withPrReviewerTaskLock
+// serialization, and the cancel-queued-runs-on-close sweep, all of which must
+// stay stable across heads for one PR. Head-awareness for review requests lives
+// in heartbeat's coalescing decision instead (BLO-18953).
 function buildPrReviewerTaskKey(context: ResolvedEventContext & { prNumber: number }) {
   const repo = context.repoFullName ?? "unknown";
   return `pr_review:${repo}:${context.prNumber}`;

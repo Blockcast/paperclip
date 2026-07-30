@@ -262,6 +262,52 @@ describe("github-webhook pure helpers", () => {
     expect(__test_shouldFirePrReviewerWake(converted)).toBe(false);
   });
 
+  it("scopes the ready_for_review idempotency key to the delivery so every toggle is a fresh request (BLO-18953)", () => {
+    const readyAt = (sha: string) =>
+      __test_resolveEventContext("pull_request", {
+        action: "ready_for_review",
+        pull_request: {
+          number: 822,
+          title: "Anchor review marker at byte 0",
+          draft: false,
+          html_url: "https://github.com/Blockcast/paperclip/pull/822",
+          head: { ref: "cto/blo-18865", sha },
+        },
+        repository: { full_name: "Blockcast/paperclip" },
+      });
+
+    const firstToggle = readyAt("ea8697d1");
+    const secondToggle = readyAt("3f6db574");
+    if (
+      !__test_shouldFirePrReviewerWake(firstToggle) ||
+      !__test_shouldFirePrReviewerWake(secondToggle)
+    ) {
+      throw new Error("expected ready_for_review contexts to fire a reviewer wake");
+    }
+
+    // Keyed on repo+pr+reason alone, the first toggle's wake row — which lands
+    // on the terminal `coalesced` status, an IDEMPOTENT_REVIEWER_WAKE_STATUS —
+    // blocked every later toggle on the PR forever. Delivery scoping keeps each
+    // deliberate draft->ready transition its own request.
+    expect(__test_buildPrReviewerWakeIdempotencyKey(firstToggle, "delivery-ready-1")).toBe(
+      "pr_review:Blockcast/paperclip:822:github_pr_ready_for_review:delivery:delivery-ready-1",
+    );
+    expect(__test_buildPrReviewerWakeIdempotencyKey(secondToggle, "delivery-ready-2")).not.toBe(
+      __test_buildPrReviewerWakeIdempotencyKey(firstToggle, "delivery-ready-1"),
+    );
+
+    // A GitHub redelivery reuses the delivery id, so genuine retries still dedup.
+    expect(__test_buildPrReviewerWakeIdempotencyKey(secondToggle, "delivery-ready-2")).toBe(
+      __test_buildPrReviewerWakeIdempotencyKey(secondToggle, "delivery-ready-2"),
+    );
+
+    // The task key stays PR-scoped: it also scopes reviewer affinity, the task
+    // lock, and the cancel-on-close sweep.
+    expect(__test_buildPrReviewerTaskKey(secondToggle)).toBe(
+      __test_buildPrReviewerTaskKey(firstToggle),
+    );
+  });
+
   it("extracts the PR author login from pull_request.opened for the self-review-skip gate (BLO-9293)", () => {
     const ctx = __test_resolveEventContext("pull_request", {
       action: "opened",
