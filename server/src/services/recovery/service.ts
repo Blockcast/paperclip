@@ -3828,18 +3828,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
   }
 
-  async function enqueueSourceScopedStrandedRecoveryWake(input: {
-    action: Awaited<ReturnType<typeof recoveryActionsSvc.upsertSourceScoped>>;
-    issue: typeof issues.$inferSelect;
-    latestRun: LatestIssueRun;
-    recoveryCause: StrandedRecoveryCause;
-    hasNewActivitySinceLastAttempt: boolean;
-  }) {
-    const plan = resolveSourceScopedStrandedRecoveryWakePlan(input);
-    if (!plan) return;
-    await deps.enqueueWakeup(plan.agentId, plan.opts);
-  }
-
   /**
    * BLO-18829: the wake decision, split out from its dispatch.
    *
