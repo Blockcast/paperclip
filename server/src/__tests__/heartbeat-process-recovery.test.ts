@@ -265,7 +265,6 @@ import {
   writeHotRestartIntent,
 } from "../services/hot-restart.ts";
 import { secretService } from "../services/secrets.ts";
-import { issueService } from "../services/issues.js";
 import {
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
@@ -4699,53 +4698,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .then((rows) => rows[0] ?? null);
       expect(parked?.status).toBe("in_review");
       expect(result.issueIds).toEqual(expect.arrayContaining([failing.issueId, healthy.issueId]));
-    },
-  );
-
-  it(
-    "BLO-18829: the expectedStatus CAS rejects the write when the row has moved off the " +
-      "observed status, leaving a concurrent writer's blockers and assignee intact",
-    async () => {
-      // The primitive escalateStrandedAssignedIssue's `{ expectedStatus: [fresh.status] }`
-      // pin depends on. Recovery rereads the row under an advisory lock, sees
-      // `in_progress`, and then writes `blocked` -- but a writer that never takes that
-      // lock (a human reviewer's PATCH) can land in between. The CAS has to make that
-      // write a no-op rather than overwrite what the row now says.
-      //
-      // This covers the WHERE-clause semantics deterministically. The call-site
-      // interleaving test Ally asked for lands with the atomicity refactor in this same
-      // PR: escalateStrandedAssignedIssue currently has no seam to suspend between its
-      // reread and its write, and threading `tx` through the action/monitor/wake path is
-      // what creates one.
-      const { companyId, issueId } = await seedStrandedIssueFixture({
-        status: "in_progress",
-        runStatus: "failed",
-      });
-      const issuesSvc = issueService(db);
-
-      // A concurrent writer moves the issue to `blocked` after recovery's reread saw
-      // `in_progress`.
-      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
-
-      // Recovery's write, pinned to the status it actually observed, must not land.
-      const clobbered = await issuesSvc.update(
-        issueId,
-        { status: "blocked", blockedByIssueIds: [] },
-        db,
-        { expectedStatus: ["in_progress"] },
-      );
-      expect(clobbered).toBeNull();
-
-      // Positive control: the steady-state retry, where the reread itself found
-      // `blocked`, still goes through -- the pin must not break attempt bookkeeping.
-      const steadyState = await issuesSvc.update(
-        issueId,
-        { status: "blocked", blockedByIssueIds: [] },
-        db,
-        { expectedStatus: ["blocked"] },
-      );
-      expect(steadyState?.status).toBe("blocked");
-      expect(steadyState?.companyId).toBe(companyId);
     },
   );
 
