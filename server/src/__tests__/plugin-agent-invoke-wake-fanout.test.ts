@@ -61,7 +61,7 @@ describeEmbeddedPostgres("plugin agents.invoke wake fan-out", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-invoke-fanout-");
     db = createDb(tempDb.connectionString);
-    heartbeat = heartbeatService(db);
+    heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
   }, 20_000);
 
   afterEach(async () => {
@@ -125,7 +125,15 @@ describeEmbeddedPostgres("plugin agents.invoke wake fan-out", () => {
   }
 
   function hostServices(db: ReturnType<typeof createDb>) {
-    return buildHostServices(db, "github-plugin-record-id", "paperclip.github", createEventBusStub());
+    return buildHostServices(
+      db,
+      "github-plugin-record-id",
+      "paperclip.github",
+      createEventBusStub(),
+      undefined,
+      undefined,
+      { heartbeatOptions: { skipQueuedRunDispatch: true } },
+    );
   }
 
   it("gives ten concurrent review requests ten distinct durable runs while the agent is busy", async () => {
@@ -298,7 +306,7 @@ describeEmbeddedPostgres("plugin agents.invoke wake fan-out", () => {
     // The pre-fix payload shape, sent straight at the heartbeat service. This
     // pins the mechanism the fix routes around; if coalescing semantics change,
     // this test should be revisited alongside the invoke path.
-    const run = await heartbeatService(db).wakeup(agentId, {
+    const run = await heartbeat.wakeup(agentId, {
       source: "automation",
       triggerDetail: "system",
       reason: "pr_review_requested",
