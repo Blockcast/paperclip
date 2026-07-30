@@ -2634,6 +2634,103 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(byId.get(unblockedId)?.blockedBy).toEqual([]);
   });
 
+  it("reports the same blocker set on list rows and single-issue reads", async () => {
+    // Regression guard for BLO-19046. Two shapes taken from the field reports:
+    // BLO-15080 (exactly one blocker) and BLO-18836 (two blockers). The failure
+    // this pins is not a wrong array but a *missing* one: an absent `blockedBy`
+    // deserializes to undefined, every `?? []` consumer renders that as "no
+    // blockers", and triage inverts silently.
+    const companyId = randomUUID();
+    const singleBlockedId = randomUUID();
+    const singleBlockerId = randomUUID();
+    const doubleBlockedId = randomUUID();
+    const doubleBlockerAId = randomUUID();
+    const doubleBlockerBId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      { id: singleBlockerId, companyId, title: "H1 design dependency", status: "blocked", priority: "low" },
+      { id: singleBlockedId, companyId, title: "H4 Rust PathMux port", status: "blocked", priority: "low" },
+      { id: doubleBlockerAId, companyId, title: "Bearer provisioning", status: "in_progress", priority: "high" },
+      { id: doubleBlockerBId, companyId, title: "Scope review", status: "todo", priority: "high" },
+      { id: doubleBlockedId, companyId, title: "Track D TO bearer", status: "blocked", priority: "critical" },
+    ]);
+
+    await db.insert(issueRelations).values([
+      { companyId, issueId: singleBlockerId, relatedIssueId: singleBlockedId, type: "blocks" },
+      { companyId, issueId: doubleBlockerAId, relatedIssueId: doubleBlockedId, type: "blocks" },
+      { companyId, issueId: doubleBlockerBId, relatedIssueId: doubleBlockedId, type: "blocks" },
+    ]);
+
+    type WithBlockedBy = { id: string; blockedBy?: Array<{ id: string }> };
+    const ids = (rows?: Array<{ id: string }>) => [...(rows ?? [])].map((row) => row.id).sort();
+
+    // The list must not silently claim emptiness when it simply did not hydrate.
+    const unhydrated = (await svc.list(companyId)) as WithBlockedBy[];
+    for (const row of unhydrated) {
+      expect(row.blockedBy).toBeUndefined();
+    }
+
+    const hydrated = (await svc.list(companyId, { includeBlockedBy: true })) as WithBlockedBy[];
+    const listById = new Map(hydrated.map((row) => [row.id, row]));
+
+    for (const issueId of [singleBlockedId, doubleBlockedId, singleBlockerId]) {
+      const fromList = ids(listById.get(issueId)?.blockedBy);
+      const fromSingle = ids((await svc.getRelationSummaries(issueId)).blockedBy);
+      expect(fromList).toEqual(fromSingle);
+    }
+
+    // And the sets are the expected non-empty ones, so the assertion above cannot
+    // pass by both sides being empty.
+    expect(ids(listById.get(singleBlockedId)?.blockedBy)).toEqual([singleBlockerId].sort());
+    expect(ids(listById.get(doubleBlockedId)?.blockedBy)).toEqual([doubleBlockerAId, doubleBlockerBId].sort());
+  });
+
+  it("zeroes blockerAttention on non-blocked rows even when blockers exist", async () => {
+    // BLO-19046: blockerAttention is computed only for rows whose status is
+    // literally `blocked`; every other row gets an all-zero default. That zero
+    // means "not computed", NOT "no blockers", and is the second silent-empty
+    // trap in this family. Pinned so the semantics stay documented rather than
+    // being mistaken for a summary of `blockedBy`.
+    const companyId = randomUUID();
+    const blockerId = randomUUID();
+    const todoDependentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Real blocker", status: "todo", priority: "high" },
+      { id: todoDependentId, companyId, title: "Dependent still in todo", status: "todo", priority: "high" },
+    ]);
+
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: todoDependentId,
+      type: "blocks",
+    });
+
+    type Row = { id: string; blockedBy?: Array<{ id: string }>; blockerAttention?: { unresolvedBlockerCount: number } };
+    const rows = (await svc.list(companyId, { includeBlockedBy: true })) as Row[];
+    const dependent = rows.find((row) => row.id === todoDependentId);
+
+    // The blocker edge is real and `blockedBy` reports it...
+    expect(dependent?.blockedBy?.map((row) => row.id)).toEqual([blockerId]);
+    // ...while blockerAttention reports zero purely because status !== "blocked".
+    expect(dependent?.blockerAttention?.unresolvedBlockerCount).toBe(0);
+  });
+
   it("trims list payload fields that can grow large on issue index routes", async () => {
     const companyId = randomUUID();
     const issueId = randomUUID();
