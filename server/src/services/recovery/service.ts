@@ -76,6 +76,11 @@ import {
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
+  dispatchRecoveryWakes,
+  requeueStaleRecoveryWakes,
+  stageRecoveryWake,
+} from "./wake-outbox.js";
+import {
   isZeroTokenStartupFailureRun,
   isZeroTokenSessionResetRetryRun,
   ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
@@ -152,6 +157,26 @@ type RecoveryWakeup = (
   agentId: string,
   opts?: RecoveryWakeupOptions,
 ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
+
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+type DbOrTransaction = Db | DbTransaction;
+
+/**
+ * BLO-18829: thrown to abort the escalation transaction when the expected-status CAS
+ * loses the race to a concurrent writer.
+ *
+ * The CAS no-op'ing is a correct, expected outcome -- but the recovery action, the
+ * provider-quota monitor and the staged wake have all been written on this transaction
+ * by that point. Returning `null` would COMMIT them, leaving active recovery state for
+ * an issue that is no longer stranded. Throwing rolls them back; the catch at the call
+ * site converts it back to `null` so callers see the same "did not escalate" contract.
+ */
+class EscalationStatusRaceLost extends Error {
+  constructor() {
+    super("stranded escalation expected-status CAS lost the race");
+    this.name = "EscalationStatusRaceLost";
+  }
+}
 
 type ResolvedDependencyWakeBackstopSource =
   | "issue_graph_liveness.backstop"
@@ -3619,7 +3644,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    /**
+     * BLO-18829: when supplied, the recovery-action write joins the caller's transaction
+     * so a lost expected-status CAS rolls it back instead of leaving an active action
+     * behind for an issue that is no longer stranded.
+     */
+    dbOrTx?: DbOrTransaction;
   }) {
+    const dbOrTx = input.dbOrTx ?? db;
     const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
     const routing = await resolveStrandedRecoveryRouting({
       issue: input.issue,
@@ -3635,7 +3667,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     // Read existing action before upsert so we can compare lastAttemptAt against
     // issue.lastActivityAt and suppress duplicate non-assignee wakes when nothing changed.
-    const existingAction = await recoveryActionsSvc.getActiveForIssue(input.issue.companyId, input.issue.id);
+    const existingAction = await recoveryActionsSvc.getActiveForIssue(input.issue.companyId, input.issue.id, dbOrTx);
     const previousAttemptAt = existingAction?.lastAttemptAt
       ? new Date(existingAction.lastAttemptAt as Date | string)
       : null;
@@ -3711,18 +3743,35 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         : null,
       maxAttempts: null,
       lastAttemptAt: now,
-    });
+    }, dbOrTx);
 
     return { action, hasNewActivitySinceLastAttempt };
   }
 
-  async function enqueueSourceScopedStrandedRecoveryWake(input: {
+  /**
+   * BLO-18829: stage the recovery-owner wake as an outbox row on the caller's
+   * transaction instead of dispatching it inline.
+   *
+   * Inline dispatch ran BEFORE the expected-status CAS, so a concurrent writer moving the
+   * issue out of `previousStatus` left a wake behind for an issue that was never escalated.
+   * Moving the dispatch after the CAS instead would under-wake: a wake lost after commit
+   * has no retry path, because `reconcileStrandedAssignedIssues` does not select `blocked`
+   * issues, so the issue strands permanently. And `enqueueWakeup` cannot be pulled into
+   * this transaction -- it opens its own `db.transaction(...)` blocks on other pooled
+   * connections, which would block on this function's own advisory lock.
+   *
+   * Staging on the tx gets both: a lost CAS rolls the wake back, and a won CAS commits a
+   * durable wake that `dispatchRecoveryWakes` delivers with retry.
+   */
+  async function stageSourceScopedStrandedRecoveryWake(input: {
     action: Awaited<ReturnType<typeof recoveryActionsSvc.upsertSourceScoped>>;
     issue: typeof issues.$inferSelect;
     latestRun: LatestIssueRun;
     recoveryCause: StrandedRecoveryCause;
     hasNewActivitySinceLastAttempt: boolean;
+    dbOrTx?: DbOrTransaction;
   }) {
+    const dbOrTx = input.dbOrTx ?? db;
     if (input.recoveryCause === "provider_quota" && !input.action.ownerAgentId) return;
     if (input.recoveryCause === "workspace_validation_failed" || input.recoveryCause === "configuration_incomplete") return;
     if (!input.action.ownerAgentId) return;
@@ -3730,7 +3779,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     if (!input.hasNewActivitySinceLastAttempt && ownerIsNonAssignee && input.action.attemptCount > 1) {
       const assigneeAgentId = input.issue.assigneeAgentId;
       if (!assigneeAgentId) return;
-      await deps.enqueueWakeup(assigneeAgentId, {
+      await stageRecoveryWake(dbOrTx, {
+        companyId: input.issue.companyId,
+        sourceIssueId: input.issue.id,
+        recoveryActionId: input.action.id,
+        agentId: assigneeAgentId,
+        recoveryCause: input.recoveryCause,
+        idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}:assignee_fallback`,
+        wakeOptions: {
         source: "assignment",
         triggerDetail: "system",
         reason: "source_scoped_recovery_action",
@@ -3757,10 +3813,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           recoveryCause: input.recoveryCause,
           suppressedNonAssigneeWake: true,
         }, "status_only"),
+        },
       });
       return;
     }
-    await deps.enqueueWakeup(input.action.ownerAgentId, {
+    await stageRecoveryWake(dbOrTx, {
+      companyId: input.issue.companyId,
+      sourceIssueId: input.issue.id,
+      recoveryActionId: input.action.id,
+      agentId: input.action.ownerAgentId,
+      recoveryCause: input.recoveryCause,
+      idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}`,
+      wakeOptions: {
       source: "assignment",
       triggerDetail: "system",
       reason: "source_scoped_recovery_action",
@@ -3785,6 +3849,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         strandedRunId: input.latestRun?.id ?? null,
         recoveryCause: input.recoveryCause,
       }, "status_only"),
+      },
     });
   }
 
@@ -3808,8 +3873,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     latestRun: LatestIssueRun;
     actionId: string;
     agentId: string;
+    /**
+     * BLO-18829: when supplied, both the existing-monitor probe and the monitor writes
+     * run on the caller's transaction, so a lost expected-status CAS rolls the scheduled
+     * retry back instead of parking a provider-quota monitor on a non-stranded issue.
+     */
+    dbOrTx?: DbOrTransaction;
   }) {
-    const existing = await db
+    const dbOrTx = input.dbOrTx ?? db;
+    const existing = await dbOrTx
       .select()
       .from(heartbeatRuns)
       .where(and(
@@ -3825,7 +3897,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     const now = new Date();
     const retryAt = readProviderQuotaRetryAt(input.latestRun, now);
-    return db.transaction(async (tx) => {
+    // BLO-18829: reuse the caller's transaction when there is one. Opening a nested
+    // `db.transaction` here would grab a second pooled connection and block on the
+    // caller's `pg_advisory_xact_lock`, which is the unrecoverable-hang shape from
+    // `956c5b016` rather than a deadlock Postgres can break.
+    const runMonitorWrites = async (tx: DbOrTransaction) => {
       const wakeup = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -3890,7 +3966,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         })
         .where(eq(issueRecoveryActions.id, input.actionId));
       return scheduledRun;
-    });
+    };
+    return input.dbOrTx ? runMonitorWrites(input.dbOrTx) : db.transaction(runMonitorWrites);
   }
 
   function buildRecoveryIssueInPlaceEscalationComment(input: {
@@ -4313,7 +4390,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // The advisory lock is xact-scoped on this tx's connection; once we
     // commit/return, waiting peers wake up and record their next attempt
     // against the same active source-scoped action.
-    return await db.transaction(async (tx) => {
+    const escalated = await db.transaction(async (tx) => {
       await tx.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${input.issue.companyId} || ':' || ${input.issue.id}, 0))`,
       );
@@ -4350,6 +4427,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         recoveryCause,
         recoveryOwnerAgentId: input.recoveryOwnerAgentId,
         successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
+        dbOrTx: tx,
       });
       const isProviderQuotaWait = recoveryCause === "provider_quota" &&
         !action.ownerAgentId && Boolean(action.returnOwnerAgentId);
@@ -4359,6 +4437,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           latestRun: input.latestRun,
           actionId: action.id,
           agentId: action.returnOwnerAgentId,
+          dbOrTx: tx,
         });
       }
       const {
@@ -4366,12 +4445,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         needsHumanDecision,
       } = await unresolvedBlockerHumanDecisionEscalationState(fresh.companyId, fresh.id);
 
-      await enqueueSourceScopedStrandedRecoveryWake({
+      await stageSourceScopedStrandedRecoveryWake({
         action,
         issue: fresh,
         latestRun: input.latestRun,
         recoveryCause,
         hasNewActivitySinceLastAttempt,
+        dbOrTx: tx,
       });
 
       const updated = await issuesSvc.update(
@@ -4381,7 +4461,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           blockedByIssueIds: blockerIds,
           assigneeAgentId: action.ownerAgentId ?? fresh.assigneeAgentId,
         },
-        db,
+        // BLO-18829: on `tx`, not `db`. Every side effect above now writes on this same
+        // transaction, so when the CAS below loses the race they all roll back together
+        // instead of leaving an active recovery action, a provider-quota monitor, and a
+        // staged wake behind for an issue that was never escalated.
+        tx,
         // BLO-18643 follow-up: the advisory lock above only serializes this function
         // against itself (concurrent sweeps / re-entrant calls) -- it does nothing
         // against a writer that never takes it, e.g. a human reviewer's PATCH landing
@@ -4390,7 +4474,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         // clobber a legitimate concurrent transition back to `blocked`.
         { expectedStatus: [input.previousStatus, "blocked"] },
       );
-      if (!updated) return null;
+      if (!updated) {
+        // CAS lost. Roll the whole transaction back so the staged side effects go with
+        // it -- returning null would COMMIT them, which is exactly the BLO-18829 bug.
+        throw new EscalationStatusRaceLost();
+      }
       if (isProviderQuotaWait) return updated;
 
       const prefix = await getCompanyIssuePrefix(fresh.companyId);
@@ -4433,7 +4521,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         recoveryCause === "configuration_incomplete";
       if (shouldPostEscalationComment) {
         const escalationCommentMarker = `Recovery action: \`${action.id}\``;
-        const hasEscalationComment = await db
+        const hasEscalationComment = await tx
           .select({ id: issueComments.id, body: issueComments.body, metadata: issueComments.metadata })
           .from(issueComments)
           .where(and(eq(issueComments.issueId, fresh.id), eq(issueComments.authorType, "system")))
@@ -4448,22 +4536,30 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
         if (!hasEscalationComment) {
           if (notice) {
+            // BLO-18829: on `tx`. `issue_comments` has an FK to `issues`, and the issues
+            // row is write-locked by this transaction now -- inserting the comment from a
+            // second pooled connection would wait for a key-share lock on a row whose
+            // holder is idle-in-transaction awaiting this very call. Postgres sees no
+            // cycle, so that is an unrecoverable hang (the `956c5b016` failure mode).
             await issuesSvc.addComment(fresh.id, notice.body, {}, {
               authorType: "system",
               presentation: notice.presentation,
               metadata: notice.metadata,
-            });
+            }, tx);
           } else {
             await issuesSvc.addComment(
               fresh.id,
               `${input.comment ?? "Automatic stranded-work recovery needs manual attention."}${recoveryLine}`,
               {},
               { authorType: "system" },
+              tx,
             );
           }
         }
       }
 
+      // `activity_log` has no FK to `issues` (entityId is untyped), so this write does not
+      // need a key-share lock on the locked issues row and is safe on `db`.
       await logActivity(db, {
         companyId: fresh.companyId,
         actorType: "system",
@@ -4518,7 +4614,29 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       return updated;
+    }).catch((err) => {
+      // BLO-18829: the CAS-lost sentinel is a successful no-op, not a failure. It exists
+      // only to force the rollback that discards the staged side effects; every other
+      // error still propagates.
+      if (err instanceof EscalationStatusRaceLost) return null;
+      throw err;
     });
+
+    // Dispatch the staged wake now that the escalation is durably committed. Best-effort:
+    // the row survives a failure here (or this process dying), and `sweepRecoveryWakeOutbox`
+    // retries it with backoff -- which is what keeps a committed `blocked` issue from
+    // stranding with no wake, the failure mode that ruled out simply moving the inline
+    // wake after the CAS.
+    if (escalated) {
+      await dispatchRecoveryWakes(db, deps.enqueueWakeup, { sourceIssueId: input.issue.id })
+        .catch((err) => {
+          logger.warn(
+            { err, issueId: input.issue.id },
+            "recovery-wake-outbox: post-commit dispatch failed; leaving row for the sweeper",
+          );
+        });
+    }
+    return escalated;
   }
 
   function buildZeroTokenStartupFailureComment(input: {
@@ -7283,6 +7401,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { escalated: true, ownerAgentId, ownerType: ownerAgentId ? "agent" : "board" };
   }
 
+  /**
+   * BLO-18829: retry path for staged recovery wakes whose post-commit dispatch never
+   * landed (dispatch threw, or the process died between COMMIT and dispatch).
+   *
+   * This is what makes the outbox safe to prefer over inline dispatch: a committed
+   * escalation's wake is durable, so it cannot be lost. Without this the fix would trade
+   * the benign over-wake for a permanent strand, because `reconcileStrandedAssignedIssues`
+   * does not select `blocked` issues and so would never re-notice the issue.
+   *
+   * Call from the periodic recovery sweep.
+   */
+  async function sweepRecoveryWakeOutbox() {
+    await requeueStaleRecoveryWakes(db);
+    return dispatchRecoveryWakes(db, deps.enqueueWakeup);
+  }
+
   return {
     escalateStalledSelfReviewPr,
     buildRunOutputSilence,
@@ -7299,5 +7433,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     reconcileResolvedDependencyWakeBackstop,
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,
+    sweepRecoveryWakeOutbox,
   };
 }

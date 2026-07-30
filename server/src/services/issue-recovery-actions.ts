@@ -123,8 +123,12 @@ export function issueRecoveryActionService(db: Db) {
     }
   }
 
-  async function getActiveForIssue(companyId: string, sourceIssueId: string): Promise<IssueRecoveryAction | null> {
-    const row = await db
+  async function getActiveForIssue(
+    companyId: string,
+    sourceIssueId: string,
+    dbOrTx: DbOrTransaction = db,
+  ): Promise<IssueRecoveryAction | null> {
+    const row = await dbOrTx
       .select()
       .from(issueRecoveryActions)
       .where(
@@ -163,6 +167,7 @@ export function issueRecoveryActionService(db: Db) {
   async function retryUpsertSourceScoped(
     input: UpsertIssueRecoveryActionInput,
     retryCount: number,
+    dbOrTx: DbOrTransaction,
     error?: unknown,
   ): Promise<IssueRecoveryAction> {
     if (retryCount >= MAX_UPSERT_RETRIES) {
@@ -171,18 +176,19 @@ export function issueRecoveryActionService(db: Db) {
         `Failed to upsert active recovery action for issue ${input.sourceIssueId} after ${MAX_UPSERT_RETRIES} retries`,
       );
     }
-    return upsertSourceScopedUnlocked(input, retryCount + 1);
+    return upsertSourceScopedUnlocked(input, retryCount + 1, dbOrTx);
   }
 
   async function upsertSourceScopedUnlocked(
     input: UpsertIssueRecoveryActionInput,
     retryCount = 0,
+    dbOrTx: DbOrTransaction = db,
   ): Promise<IssueRecoveryAction> {
-    const existing = await getActiveForIssue(input.companyId, input.sourceIssueId);
+    const existing = await getActiveForIssue(input.companyId, input.sourceIssueId, dbOrTx);
     const now = new Date();
     const ownerType = input.ownerType ?? (input.ownerAgentId ? "agent" : "board");
     if (existing) {
-      const [updated] = await db
+      const [updated] = await dbOrTx
         .update(issueRecoveryActions)
         .set({
           recoveryIssueId: input.recoveryIssueId ?? null,
@@ -216,13 +222,13 @@ export function issueRecoveryActionService(db: Db) {
         )
         .returning();
       if (!updated) {
-        return retryUpsertSourceScoped(input, retryCount);
+        return retryUpsertSourceScoped(input, retryCount, dbOrTx);
       }
       return toReadModel(updated!);
     }
 
-    try {
-      const [created] = await db
+    const insertRow = (handle: DbOrTransaction) =>
+      handle
         .insert(issueRecoveryActions)
         .values({
           companyId: input.companyId,
@@ -247,17 +253,35 @@ export function issueRecoveryActionService(db: Db) {
           lastAttemptAt: input.lastAttemptAt ?? now,
         })
         .returning();
+
+    try {
+      // BLO-18829: when running on a caller-supplied transaction, the INSERT must sit
+      // inside a SAVEPOINT (`tx.transaction(...)`). A unique violation aborts the whole
+      // enclosing transaction in Postgres (subsequent statements fail 25P02), so without
+      // the savepoint the `isUniqueRecoveryActionConflict` retry below would itself throw
+      // and a recoverable conflict would surface as a failed escalation.
+      const [created] = dbOrTx === db
+        ? await insertRow(db)
+        : await (dbOrTx as DbTransaction).transaction((savepoint) => insertRow(savepoint));
       return toReadModel(created!);
     } catch (error) {
       if (!isUniqueRecoveryActionConflict(error)) throw error;
-      return retryUpsertSourceScoped(input, retryCount, error);
+      return retryUpsertSourceScoped(input, retryCount, dbOrTx, error);
     }
   }
 
   async function upsertSourceScoped(
     input: UpsertIssueRecoveryActionInput,
+    dbOrTx: DbOrTransaction = db,
   ): Promise<IssueRecoveryAction> {
-    return runExclusiveUpsert(input, () => upsertSourceScopedUnlocked(input));
+    // BLO-18829: `runExclusiveUpsert` is an in-process promise mutex keyed
+    // `companyId:sourceIssueId` -- the same key the stranded-escalation caller already
+    // holds a `pg_advisory_xact_lock` on. Awaiting a JS mutex while holding a Postgres
+    // lock (and vice versa) forms a cycle Postgres cannot see, i.e. an unrecoverable
+    // hang rather than a deadlock error. When the caller supplies a transaction it has
+    // already provided this exact mutual exclusion, so skip the mutex.
+    if (dbOrTx !== db) return upsertSourceScopedUnlocked(input, 0, dbOrTx);
+    return runExclusiveUpsert(input, () => upsertSourceScopedUnlocked(input, 0, db));
   }
 
   async function resolveActiveForIssue(
