@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { BetterAuthOptions } from "better-auth";
 import { getCookies } from "better-auth/cookies";
 import {
+  buildDexOAuthProviderConfigFromEnv,
   buildBetterAuthAdvancedOptions,
   buildBetterAuthRateLimitOptions,
   deriveAuthCookiePrefix,
@@ -11,12 +12,29 @@ import {
 
 const ORIGINAL_INSTANCE_ID = process.env.PAPERCLIP_INSTANCE_ID;
 const ORIGINAL_PUBLIC_URL = process.env.PAPERCLIP_PUBLIC_URL;
+const ORIGINAL_DEX_ENV = {
+  issuer: process.env.PAPERCLIP_DEX_OIDC_ISSUER,
+  clientId: process.env.PAPERCLIP_DEX_OIDC_CLIENT_ID,
+  clientSecret: process.env.PAPERCLIP_DEX_OIDC_CLIENT_SECRET,
+  providerId: process.env.PAPERCLIP_DEX_OIDC_PROVIDER_ID,
+  scopes: process.env.PAPERCLIP_DEX_OIDC_SCOPES,
+};
 
 afterEach(() => {
   if (ORIGINAL_INSTANCE_ID === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
   else process.env.PAPERCLIP_INSTANCE_ID = ORIGINAL_INSTANCE_ID;
   if (ORIGINAL_PUBLIC_URL === undefined) delete process.env.PAPERCLIP_PUBLIC_URL;
   else process.env.PAPERCLIP_PUBLIC_URL = ORIGINAL_PUBLIC_URL;
+  if (ORIGINAL_DEX_ENV.issuer === undefined) delete process.env.PAPERCLIP_DEX_OIDC_ISSUER;
+  else process.env.PAPERCLIP_DEX_OIDC_ISSUER = ORIGINAL_DEX_ENV.issuer;
+  if (ORIGINAL_DEX_ENV.clientId === undefined) delete process.env.PAPERCLIP_DEX_OIDC_CLIENT_ID;
+  else process.env.PAPERCLIP_DEX_OIDC_CLIENT_ID = ORIGINAL_DEX_ENV.clientId;
+  if (ORIGINAL_DEX_ENV.clientSecret === undefined) delete process.env.PAPERCLIP_DEX_OIDC_CLIENT_SECRET;
+  else process.env.PAPERCLIP_DEX_OIDC_CLIENT_SECRET = ORIGINAL_DEX_ENV.clientSecret;
+  if (ORIGINAL_DEX_ENV.providerId === undefined) delete process.env.PAPERCLIP_DEX_OIDC_PROVIDER_ID;
+  else process.env.PAPERCLIP_DEX_OIDC_PROVIDER_ID = ORIGINAL_DEX_ENV.providerId;
+  if (ORIGINAL_DEX_ENV.scopes === undefined) delete process.env.PAPERCLIP_DEX_OIDC_SCOPES;
+  else process.env.PAPERCLIP_DEX_OIDC_SCOPES = ORIGINAL_DEX_ENV.scopes;
 });
 
 describe("Better Auth cookie scoping", () => {
@@ -211,6 +229,45 @@ describe("Better Auth cookie scoping", () => {
     ]));
     expect(trustedOrigins).not.toContain("https://board.example.test:3100");
     expect(trustedOrigins).not.toContain("http://board.example.test:3100");
+  });
+});
+
+describe("Dex OAuth provider config", () => {
+  it("is disabled until all required server-side env vars are present", () => {
+    delete process.env.PAPERCLIP_DEX_OIDC_ISSUER;
+    process.env.PAPERCLIP_DEX_OIDC_CLIENT_ID = "paperclip";
+    process.env.PAPERCLIP_DEX_OIDC_CLIENT_SECRET = "secret";
+
+    expect(buildDexOAuthProviderConfigFromEnv()).toBeNull();
+  });
+
+  it("builds a generic OAuth provider for Dex", () => {
+    process.env.PAPERCLIP_DEX_OIDC_ISSUER = "https://dex.sfo12.bcast.id/";
+    process.env.PAPERCLIP_DEX_OIDC_CLIENT_ID = "paperclip";
+    process.env.PAPERCLIP_DEX_OIDC_CLIENT_SECRET = "secret";
+
+    expect(buildDexOAuthProviderConfigFromEnv()).toEqual({
+      providerId: "dex",
+      issuer: "https://dex.sfo12.bcast.id",
+      discoveryUrl: "https://dex.sfo12.bcast.id/.well-known/openid-configuration",
+      clientId: "paperclip",
+      clientSecret: "secret",
+      scopes: ["openid", "email", "profile", "groups"],
+      pkce: true,
+    });
+  });
+
+  it("honors provider id and scope overrides", () => {
+    process.env.PAPERCLIP_DEX_OIDC_ISSUER = "https://dex.example.test";
+    process.env.PAPERCLIP_DEX_OIDC_CLIENT_ID = "paperclip-dev";
+    process.env.PAPERCLIP_DEX_OIDC_CLIENT_SECRET = "secret";
+    process.env.PAPERCLIP_DEX_OIDC_PROVIDER_ID = "blockcast";
+    process.env.PAPERCLIP_DEX_OIDC_SCOPES = "openid email groups";
+
+    expect(buildDexOAuthProviderConfigFromEnv()).toMatchObject({
+      providerId: "blockcast",
+      scopes: ["openid", "email", "groups"],
+    });
   });
 });
 

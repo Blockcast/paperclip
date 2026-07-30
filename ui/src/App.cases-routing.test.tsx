@@ -12,7 +12,7 @@ import type { ReactNode } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter } from "react-router";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // jsdom's CSS parser rejects the custom-property marker rule stitches inserts
@@ -46,7 +46,7 @@ beforeAll(() => {
 // owns the "No company matches prefix" NotFound. For routing we only need it to
 // resolve the :companyPrefix segment and render its nested routes.
 vi.mock("./components/Layout", async () => {
-  const { Outlet } = await import("react-router-dom");
+  const { Outlet } = await import("react-router");
   return { Layout: () => <Outlet /> };
 });
 

@@ -163,7 +163,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
 } from "../services/issues.js";
-import { authorizationDeniedDetails } from "../services/authorization.js";
+import { authorizationBoundaryLabel, authorizationDeniedDetails } from "../services/authorization.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -3553,10 +3553,22 @@ export function issueRoutes(
     });
   }
 
+  // BLO-18152: every "Issue is outside this actor's authorization boundary"
+  // response (issue:read, issue:comment, issue:mutate) renders through this
+  // one function so the message always names which boundary fired instead of
+  // leaving the caller to guess whether it was a scope, trust-boundary,
+  // membership, or company-mismatch rejection.
+  function respondIssueBoundaryDenied(res: Response, decision: Awaited<ReturnType<typeof decideIssueAccess>>) {
+    res.status(403).json({
+      error: `Issue is outside this actor's authorization boundary (${authorizationBoundaryLabel(decision.reason)})`,
+      details: authorizationDeniedDetails(decision),
+    });
+  }
+
   async function assertIssueReadAllowed(req: Request, res: Response, issue: Parameters<typeof decideIssueAccess>[1]) {
     const decision = await decideIssueAccess(req, issue, "issue:read");
     if (decision.allowed) return true;
-    res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
+    respondIssueBoundaryDenied(res, decision);
     return false;
   }
 
@@ -3572,6 +3584,8 @@ export function issueRoutes(
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
       createdByAgentId?: string | null;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
     },
   ) {
     if (req.actor.type !== "agent") return true;
@@ -3580,24 +3594,25 @@ export function issueRoutes(
       res.status(403).json({ error: "Agent authentication required" });
       return false;
     }
-    const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
-    if (watchdogScope.kind !== "none") {
-      const scopeResult = await taskWatchdogScopeAllowsIssueMutation(db, watchdogScope, issue);
-      if (scopeResult.kind === "invalid") {
-        res.status(403).json({
-          error: scopeResult.detail,
-          details: {
-            issueId: issue.id,
-            securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
-          },
-        });
-        return false;
+    const watchdogDecision = await assertTaskWatchdogScopedIssueMutationAllowed(req, res, issue);
+    if (watchdogDecision !== null) return watchdogDecision;
+    // BLO-18152: parity with assertAgentIssueMutationAllowed below — an agent
+    // whose run currently holds this issue's checkout/execution lock may
+    // always write to it, regardless of a narrower per-request trust
+    // boundary (e.g. a source_scoped_recovery_action wake) that
+    // decideIssueAccess would otherwise apply. Before this fix, only the
+    // PATCH mutate path granted this bypass, so the same actor+issue+run
+    // could get a 200 from PATCH {comment} and a 403 from this endpoint
+    // seconds apart.
+    if (isCurrentIssueExecutionRun(req, issue)) {
+      if (issue.status === "in_progress" && issue.assigneeAgentId === actorAgentId) {
+        if (!requireAgentRunId(req, res)) return false;
       }
-      return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue);
+      return true;
     }
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:comment");
     if (!boundaryDecision.allowed) {
-      res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
+      respondIssueBoundaryDenied(res, boundaryDecision);
       return false;
     }
     if (issue.status === "in_progress" && issue.assigneeAgentId === actorAgentId) {
@@ -3608,6 +3623,61 @@ export function issueRoutes(
 
   function isIssueMentionGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
     return decision !== true && decision.reason === "allow_issue_mention_grant";
+  }
+
+  // A recovery-handoff grant (BLO-18906) is comment-only by construction: it
+  // exists so the agent a recovery transfer took the issue from can still write
+  // its diagnosis down. It must never carry a state transition, so the comment
+  // route strips reopen/resume for it on EVERY status — unlike the mention-grant
+  // neutering below, which only covers closed issues. Recovery leaves the issue
+  // `blocked`, and on a blocked issue `reopen: true` would move it to `todo`.
+  function isRecoveryHandoffGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    return decision !== true && decision.reason === "allow_recovery_handoff_grant";
+  }
+
+  // The decision reason alone is not a sufficient test for "this caller is a
+  // recovery-transferred previous owner". assertAgentIssueCommentAllowed short-
+  // circuits with a bare `true` when isCurrentIssueExecutionRun matches (the
+  // BLO-18152 parity bypass), which discards the reason — so any caller that
+  // reached the route through a run lock rather than through decideIssueAccess
+  // would read as "not a handoff grant" and keep the transitions the grant is
+  // supposed to withhold. Resolve it from the recovery row instead, so the
+  // comment-only contract holds no matter which allow-path let the caller in.
+  //
+  // Mirrors the authorization-service predicate: active action, actor is
+  // `previousOwnerAgentId`, ownership moved to someone else, and that someone
+  // is still the assignee.
+  async function isRecoveryHandoffPreviousOwner(
+    req: Request,
+    issue: { id: string; companyId: string; assigneeAgentId: string | null },
+  ) {
+    if (req.actor.type !== "agent") return false;
+    const actorAgentId = req.actor.agentId;
+    if (!actorAgentId) return false;
+    if (req.actor.companyId !== issue.companyId) return false;
+    // The assignee is never a handoff caller, so the common path never pays for
+    // the lookup — and a lookup failure can never affect an ordinary assignee.
+    if (issue.assigneeAgentId === actorAgentId) return false;
+    let action: Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>>;
+    try {
+      action = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+    } catch (err) {
+      // Fail closed: if we cannot tell whether this non-assignee is a handoff
+      // caller, withhold the state transitions rather than granting them. The
+      // comment itself still lands — only reopen/resume and comment-triggered
+      // auto-approval are refused, which is the conservative direction for an
+      // authorization boundary.
+      logger.warn({
+        err,
+        issueId: issue.id,
+        companyId: issue.companyId,
+        actorAgentId,
+      }, "recovery handoff lookup failed; treating comment as comment-only");
+      return true;
+    }
+    if (!action || action.previousOwnerAgentId !== actorAgentId) return false;
+    if (!action.ownerAgentId || action.ownerAgentId === actorAgentId) return false;
+    return action.ownerAgentId === issue.assigneeAgentId;
   }
 
   async function filterIssuesForActor<T extends Parameters<typeof decideIssueAccess>[1]>(req: Request, rows: T[]) {
@@ -3751,6 +3821,8 @@ export function issueRoutes(
     if (options.allowScopedRecoveryOwnerSourceMutation) {
       return true;
     }
+    const watchdogDecision = await assertTaskWatchdogScopedIssueMutationAllowed(req, res, issue);
+    if (watchdogDecision !== null) return watchdogDecision;
     if (isCurrentIssueExecutionRun(req, issue)) {
       return true;
     }
@@ -3759,33 +3831,10 @@ export function issueRoutes(
       const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
       return activeRecoveryAction?.ownerAgentId === actorAgentId;
     };
-    // Task-watchdog runs receive a scoped *grant* to mutate issues inside the
-    // watched subtree. This must be evaluated before the base assignee-ownership
-    // boundary below: that boundary denies an agent mutating an issue owned by a
-    // different agent, which is exactly the watchdog's primary job
-    // (SPEC-implementation §9.9 — comment, transition, reassign within the
-    // watched subtree). The watchdog scope can only widen access to the watched
-    // subtree; downstream status-transition, assignment, recovery, and budget
-    // guards in the route handlers still apply.
-    const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
-    if (watchdogScope.kind !== "none") {
-      const scopeResult = await taskWatchdogScopeAllowsIssueMutation(db, watchdogScope, issue);
-      if (scopeResult.kind === "invalid") {
-        res.status(403).json({
-          error: scopeResult.detail,
-          details: {
-            issueId: issue.id,
-            securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
-          },
-        });
-        return false;
-      }
-      return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue);
-    }
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
     if (!boundaryDecision.allowed) {
       if (await isActiveRecoveryActionOwner()) return true;
-      res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
+      respondIssueBoundaryDenied(res, boundaryDecision);
       return false;
     }
     if (await isActiveRecoveryActionOwner()) return true;
@@ -3962,8 +4011,25 @@ export function issueRoutes(
     opts: { allowWatchdogIssue?: boolean } = {},
   ) {
     if (req.actor.type !== "agent") return true;
+    return (await assertTaskWatchdogScopedIssueMutationAllowed(req, res, issue, opts)) ?? true;
+  }
+
+  // Task-watchdog runs receive a scoped grant to mutate issues inside the
+  // watched subtree. Resolve that scope before any current-run bypass so stale
+  // or forged watchdog context cannot inherit broader execution-lock authority.
+  async function assertTaskWatchdogScopedIssueMutationAllowed(
+    req: Request,
+    res: Response,
+    issue: {
+      id: string;
+      companyId: string;
+      parentId?: string | null;
+    },
+    opts: { allowWatchdogIssue?: boolean } = {},
+  ): Promise<boolean | null> {
+    if (req.actor.type !== "agent") return null;
     const scope = await resolveTaskWatchdogMutationScope(db, req.actor);
-    if (scope.kind === "none") return true;
+    if (scope.kind === "none") return null;
     const result = await taskWatchdogScopeAllowsIssueMutation(db, scope, issue, opts);
     if (result.kind !== "invalid") return assertFreshTaskWatchdogSourceMutation(res, scope, issue);
     res.status(403).json({
@@ -10184,8 +10250,40 @@ export function issueRoutes(
       !reopenRequested &&
       !resumeRequested &&
       isIssueMentionGrantDecision(commentAccessDecision);
-    const effectiveReopenRequested = mentionGrantedPeerAgentCommentOnly ? false : reopenRequested;
-    const effectiveResumeRequested = mentionGrantedPeerAgentCommentOnly ? false : resumeRequested;
+    // Comment-only on every status, not just closed ones: recovery leaves the
+    // issue `blocked`, where an un-neutered `reopen` would transition it to
+    // `todo` — a status change the handoff grant must not confer (BLO-18906).
+    // Refuse explicitly rather than silently dropping the flag, and refuse here
+    // rather than deferring to assertAgentIssueMutationAllowed: that helper's
+    // isCurrentIssueExecutionRun bypass still matches the previous owner's stale
+    // execution lock, which would hand back the very transition recovery removed.
+    //
+    // Detect the handoff caller from the recovery row as well as from the
+    // decision reason. The reason is absent whenever assertAgentIssueComment-
+    // Allowed took its own current-execution-run short-circuit and returned a
+    // bare `true`, so a reason-only test would let exactly the stale-lock case
+    // this guard exists for slip past it.
+    const recoveryHandoffGrantedCommentOnly =
+      req.actor.type === "agent" &&
+      (isRecoveryHandoffGrantDecision(commentAccessDecision) ||
+        await isRecoveryHandoffPreviousOwner(req, issue));
+    if (recoveryHandoffGrantedCommentOnly && (reopenRequested || resumeRequested)) {
+      res.status(403).json({
+        error: "Recovery handoff grant is comment-only",
+        details: {
+          issueId: issue.id,
+          assigneeAgentId: issue.assigneeAgentId,
+          actorAgentId: req.actor.agentId,
+          reason: "allow_recovery_handoff_grant",
+          hint: "Post the handoff evidence as a plain comment; the recovery owner controls status.",
+        },
+      });
+      return;
+    }
+    const commentOnlyGrantedPeerAgent =
+      mentionGrantedPeerAgentCommentOnly || recoveryHandoffGrantedCommentOnly;
+    const effectiveReopenRequested = commentOnlyGrantedPeerAgent ? false : reopenRequested;
+    const effectiveResumeRequested = commentOnlyGrantedPeerAgent ? false : resumeRequested;
     if (
       isClosed &&
       req.actor.type === "agent" &&
@@ -10397,6 +10495,16 @@ export function issueRoutes(
       const shouldAutoApproveReviewComment =
         currentIssue.status === "in_review" &&
         currentExecutionState?.status === "pending" &&
+        // A recovery-handoff caller is comment-only, so its comment must never
+        // be read as a review decision (BLO-18906). Without this, an approval-
+        // shaped comment from a previous owner who happens to still be named as
+        // the pending stage participant would transition the issue to `done` and
+        // insert an execution decision — a state mutation the grant does not
+        // confer, reached without ever passing an `issue:mutate` check.
+        // Deliberately NOT extended to `mentionGrantedPeerAgentCommentOnly`: a
+        // mentioned non-assignee reviewer approving its own stage is the
+        // established path this branch exists to serve.
+        !recoveryHandoffGrantedCommentOnly &&
         actorMatchesExecutionParticipant(actor, currentExecutionState.currentParticipant ?? null) &&
         isApprovalReviewComment(req.body.body);
 

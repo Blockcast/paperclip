@@ -363,6 +363,79 @@ describe("startServer feedback export wiring", () => {
     expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(2);
   });
 
+  it("sweeps stale locks before a later startup recovery phase fails", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    heartbeatServiceMock.reconcileStrandedAssignedIssues.mockRejectedValueOnce(
+      new Error("unrelated recovery failure"),
+    );
+
+    await startServer();
+
+    expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+  });
+
+  it("sweeps stale locks when external-runtime reattachment fails", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    heartbeatServiceMock.resumeRunningExternalRuntimeRuns.mockRejectedValueOnce(
+      new Error("external-runtime reattachment failure"),
+    );
+
+    await startServer();
+
+    expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+  });
+
+  it("continues startup recovery when the stale-lock sweep fails", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    heartbeatServiceMock.sweepStaleIssueLocks.mockRejectedValueOnce(
+      new Error("stale-lock sweep failure"),
+    );
+
+    await startServer();
+
+    expect(heartbeatServiceMock.promoteDueScheduledRetries).toHaveBeenCalledTimes(1);
+    expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs the periodic stale-lock sweep independently of other recovery failures", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+      heartbeatServiceMock.sweepStaleIssueLocks.mockClear();
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockRejectedValueOnce(
+        new Error("unrelated recovery failure"),
+      );
+
+      intervalCallback?.();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   it("refuses authenticated public startup without an external database URL", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       deploymentExposure: "public",

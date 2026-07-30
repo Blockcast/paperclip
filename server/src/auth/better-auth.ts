@@ -3,6 +3,8 @@ import type { IncomingHttpHeaders } from "node:http";
 import { betterAuth, type Auth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { toNodeHandler } from "better-auth/node";
+import { genericOAuth } from "better-auth/plugins/generic-oauth";
+import type { GenericOAuthConfig } from "better-auth/plugins/generic-oauth";
 import type { Db } from "@paperclipai/db";
 import {
   authAccounts,
@@ -12,7 +14,12 @@ import {
 } from "@paperclipai/db";
 import type { Config } from "../config.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
-import { parseIdTokenGroups, reconcileMicrosoftUser } from "./microsoft-rbac.js";
+import {
+  loadDexRbacConfig,
+  parseIdTokenGroups,
+  reconcileDexUser,
+  reconcileMicrosoftUser,
+} from "./microsoft-rbac.js";
 
 export type BetterAuthSessionUser = {
   id: string;
@@ -39,6 +46,7 @@ type BetterAuthInstance = BetterAuthHandlerTarget & BetterAuthSessionResolver;
 
 const AUTH_COOKIE_PREFIX_FALLBACK = "default";
 const AUTH_COOKIE_PREFIX_INVALID_SEGMENTS_RE = /[^a-zA-Z0-9_-]+/g;
+const DEFAULT_DEX_OIDC_SCOPES = ["openid", "email", "profile", "groups"] as const;
 
 export function deriveAuthCookiePrefix(instanceId = resolvePaperclipInstanceId()): string {
   const scopedInstanceId = instanceId
@@ -74,6 +82,35 @@ export function buildBetterAuthRateLimitOptions(input: {
 }) {
   return {
     enabled: shouldEnableAuthRateLimit(input),
+  };
+}
+
+function trimTrailingSlash(value: string): string {
+  return value.replace(/\/+$/g, "");
+}
+
+export function buildDexOAuthProviderConfigFromEnv(): GenericOAuthConfig | null {
+  const issuerRaw = process.env.PAPERCLIP_DEX_OIDC_ISSUER?.trim();
+  const clientId = process.env.PAPERCLIP_DEX_OIDC_CLIENT_ID?.trim();
+  const clientSecret = process.env.PAPERCLIP_DEX_OIDC_CLIENT_SECRET?.trim();
+  if (!issuerRaw || !clientId || !clientSecret) return null;
+
+  const issuer = trimTrailingSlash(issuerRaw);
+  const providerId = process.env.PAPERCLIP_DEX_OIDC_PROVIDER_ID?.trim() || "dex";
+  const scopesRaw = process.env.PAPERCLIP_DEX_OIDC_SCOPES?.trim();
+  const scopes = (scopesRaw
+    ? scopesRaw.split(/\s+/)
+    : [...DEFAULT_DEX_OIDC_SCOPES]
+  ).filter((scope) => scope.length > 0);
+
+  return {
+    providerId,
+    issuer,
+    discoveryUrl: `${issuer}/.well-known/openid-configuration`,
+    clientId,
+    clientSecret,
+    scopes,
+    pkce: true,
   };
 }
 
@@ -172,12 +209,33 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
   // Redirect URI on the Entra app is `${publicUrl}/api/auth/callback/microsoft`,
   // which better-auth wires up automatically when given a socialProviders.microsoft
   // block. The Entra app issues a `groups` claim (configured server-side)
-  // that downstream RBAC can consume off `account.providerData.id_token`;
-  // claim→role mapping is a follow-up, not this PR.
+  // that the account hooks below map to Paperclip company/RBAC state.
   const microsoftClientId = process.env.MICROSOFT_CLIENT_ID?.trim() || undefined;
   const microsoftClientSecret = process.env.MICROSOFT_CLIENT_SECRET?.trim() || undefined;
   const microsoftTenantId = process.env.MICROSOFT_TENANT_ID?.trim() || undefined;
   const microsoftOidcEnabled = Boolean(microsoftClientId && microsoftClientSecret && microsoftTenantId);
+  const dexOAuthConfig = buildDexOAuthProviderConfigFromEnv();
+  const dexRbacConfig = loadDexRbacConfig();
+
+  const reconcileOauthAccountGroups = async (
+    account: { providerId?: string; userId?: string; idToken?: string | null },
+    hook: "create" | "update",
+  ) => {
+    if (!account?.userId) return;
+    if (account.providerId !== "microsoft" && account.providerId !== dexRbacConfig.providerId) return;
+
+    try {
+      const groups = parseIdTokenGroups(account.idToken ?? null);
+      if (groups.length === 0) return;
+      if (account.providerId === "microsoft") {
+        await reconcileMicrosoftUser(db, account.userId, groups);
+      } else {
+        await reconcileDexUser(db, account.userId, groups, dexRbacConfig);
+      }
+    } catch (err) {
+      console.error(`[better-auth] ${account.providerId} rbac reconcile (${hook}) failed:`, err);
+    }
+  };
 
   const authConfig = {
     baseURL: baseUrl,
@@ -192,10 +250,33 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
         verification: authVerifications,
       },
     }),
+    ...(dexOAuthConfig
+      ? {
+          plugins: [
+            genericOAuth({
+              config: [dexOAuthConfig],
+            }),
+          ],
+        }
+      : {}),
     emailAndPassword: {
       enabled: true,
       requireEmailVerification: false,
       disableSignUp: config.authDisableSignUp,
+    },
+    databaseHooks: {
+      account: {
+        create: {
+          after: async (account: { providerId?: string; userId?: string; idToken?: string | null }) => {
+            await reconcileOauthAccountGroups(account, "create");
+          },
+        },
+        update: {
+          after: async (account: { providerId?: string; userId?: string; idToken?: string | null }) => {
+            await reconcileOauthAccountGroups(account, "update");
+          },
+        },
+      },
     },
     ...(microsoftOidcEnabled
       ? {
@@ -204,45 +285,6 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
               clientId: microsoftClientId!,
               clientSecret: microsoftClientSecret!,
               tenantId: microsoftTenantId!,
-            },
-          },
-          // BLO-6295 piece D: reconcile Entra group claim → paperclip RBAC.
-          // The account.create.after hook fires once when the Microsoft
-          // identity is first linked; account.update.after fires on every
-          // subsequent signin (better-auth updates the access/id token).
-          // Both call the same reconcile function — it's idempotent and
-          // ssh-users → operator membership / AdminAgents → pending approval
-          // both no-op when the state already matches. Failures are logged
-          // and swallowed: a Graph hiccup must not block the user signing
-          // in (the daily reconciler will catch up).
-          databaseHooks: {
-            account: {
-              create: {
-                after: async (account: { providerId?: string; userId?: string; idToken?: string | null }) => {
-                  if (account?.providerId !== "microsoft") return;
-                  if (!account.userId) return;
-                  try {
-                    const groups = parseIdTokenGroups(account.idToken ?? null);
-                    if (groups.length === 0) return;
-                    await reconcileMicrosoftUser(db, account.userId, groups);
-                  } catch (err) {
-                    console.error("[better-auth] microsoft rbac reconcile (create) failed:", err);
-                  }
-                },
-              },
-              update: {
-                after: async (account: { providerId?: string; userId?: string; idToken?: string | null }) => {
-                  if (account?.providerId !== "microsoft") return;
-                  if (!account.userId) return;
-                  try {
-                    const groups = parseIdTokenGroups(account.idToken ?? null);
-                    if (groups.length === 0) return;
-                    await reconcileMicrosoftUser(db, account.userId, groups);
-                  } catch (err) {
-                    console.error("[better-auth] microsoft rbac reconcile (update) failed:", err);
-                  }
-                },
-              },
             },
           },
         }

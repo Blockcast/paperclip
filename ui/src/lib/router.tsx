@@ -1,6 +1,6 @@
 import * as React from "react";
-import * as RouterDom from "react-router-dom";
-import type { NavigateOptions, To } from "react-router-dom";
+import * as RouterDom from "react-router";
+import type { NavigateOptions, To } from "react-router";
 import type { Issue } from "@paperclipai/shared";
 import { useCompany } from "@/context/CompanyContext";
 import { IssueLinkQuicklook } from "@/components/IssueLinkQuicklook";
@@ -55,7 +55,7 @@ export function useCaseHref(): (...segments: string[]) => string {
   );
 }
 
-export * from "react-router-dom";
+export * from "react-router";
 
 type CompanyLinkProps = React.ComponentProps<typeof RouterDom.Link> & {
   disableIssueQuicklook?: boolean;

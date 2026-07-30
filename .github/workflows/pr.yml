@@ -17,7 +17,7 @@ env:
 
 jobs:
   policy:
-    runs-on: default
+    runs-on: arc-light
     timeout-minutes: 5
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
@@ -79,6 +79,9 @@ jobs:
 
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
+
+      - name: Test gh token wrapper
+        run: node --test ./scripts/gh-token-wrapper.test.mjs
 
       - name: Test general-server shard partition
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
@@ -247,7 +250,7 @@ jobs:
     name: verify
     if: ${{ always() }}
     needs: [typecheck_release_registry, general_tests, build]
-    runs-on: default
+    runs-on: arc-light
     timeout-minutes: 5
 
     steps:

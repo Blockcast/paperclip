@@ -4,7 +4,7 @@ import { act, createRef, forwardRef, useImperativeHandle, useState } from "react
 import { flushSync } from "react-dom";
 import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Agent } from "@paperclipai/shared";
 import {
