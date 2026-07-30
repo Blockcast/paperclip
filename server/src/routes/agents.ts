@@ -90,6 +90,8 @@ import {
   isTruthyRuntimeEnvValue,
   resolveWorktreeRunExecutionActivationState,
 } from "../services/instance-settings.js";
+import { isIssueHeldByForeignRun } from "../services/issue-run-holding.js";
+import { logger } from "../middleware/logger.js";
 import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
 import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/adapter-codex-local";
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
@@ -2349,8 +2351,43 @@ export function agentRoutes(
       recoveryActionsSvc.listActiveForIssues(req.actor.companyId, issueIds),
     ]);
 
+    // BLO-19001: never offer an issue that a *different* live run already holds.
+    //
+    // Dispatch enforces one-live-run-per-issue only for runs that already carry
+    // an issueId. An autonomous heartbeat run carries none, so it is dispatched
+    // freely and then self-selects here — landing on an issue a sibling run of
+    // this same agent is mid-way through. Under a shared worktree both runs then
+    // edit one tree, and a routine `rm -rf node_modules` in one destroys the
+    // other's state.
+    //
+    // Suppressed rather than flagged: a flag only works if every agent honours
+    // it, and in the observed incident an in-thread warning did not stop the
+    // next run from selecting the same issue 8 minutes later.
+    const callerRunId = req.actor.runId ?? null;
+    const nowMs = Date.now();
+    const offeredRows = eligibleRows.filter((issue) => {
+      const held = isIssueHeldByForeignRun({
+        activeRun: issue.activeRun,
+        callerRunId,
+        nowMs,
+      });
+      if (held) {
+        logger.info(
+          {
+            agentId: req.actor.agentId,
+            issueId: issue.id,
+            identifier: issue.identifier,
+            callerRunId,
+            holdingRunId: issue.activeRun?.id ?? null,
+          },
+          "inbox-lite: withheld issue already held by another live run of this agent",
+        );
+      }
+      return !held;
+    });
+
     res.json(
-      eligibleRows.map((issue) => ({
+      offeredRows.map((issue) => ({
         id: issue.id,
         identifier: issue.identifier,
         title: issue.title,

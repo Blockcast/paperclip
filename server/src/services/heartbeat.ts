@@ -206,6 +206,7 @@ import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
 } from "./issue-tree-control.js";
+import { RUN_STALE_SILENCE_MS } from "./issue-run-holding.js";
 import {
   continuationSummaryParksExecutor,
   getIssueContinuationSummaryDocument,
@@ -926,7 +927,10 @@ const EXTERNAL_LIFECYCLE_ADAPTERS = new Set([
 // Jobs immediately; this threshold only applies when that probe returns
 // null. Kept generous so a slow probe + a healthy long-running Claude
 // session don't collide.
-const EXTERNAL_LIFECYCLE_STALE_MS = 15 * 60 * 1000;
+// Shared with issue-run-holding.ts for one named 15-minute slot-accounting
+// threshold. Issue/worktree ownership stays more conservative: a running row
+// holds its issue until it reaches a terminal/missing lifecycle state.
+const EXTERNAL_LIFECYCLE_STALE_MS = RUN_STALE_SILENCE_MS;
 // External-lifecycle adapters create a DB run before the adapter.invoke event
 // is appended. Startup and periodic reapers can overlap that setup window;
 // give slow pre-run hooks and kube Job creation time to reach adapter.invoke.
@@ -16836,13 +16840,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Per-issue dedupe: if a queued run targets an issue that already has a
       // running sibling (this iteration's claim OR a prior tick's still-running
       // run), suppress it instead of letting two dispatches race for the same
-      // k8s Job slot. Cross-agent and null-issueId (autonomous) runs are
-      // unaffected — withAgentStartLock already scopes this to one agent and
-      // the gate only fires when issueId is present. Stale runs are excluded
-      // (consistent with Fix #1 above) so a queued retry for a stale issue
-      // can proceed once the stale run's job is gone.
+      // k8s Job slot/worktree. Cross-agent and null-issueId (autonomous) runs
+      // are unaffected — withAgentStartLock already scopes this to one agent
+      // and the gate only fires when issueId is present. Unlike the slot gate
+      // above, issue ownership is not released merely because a running row has
+      // been silent for 15 minutes; an external Job can be quiet and still edit
+      // its shared worktree. Reaper/lifecycle checks must move the old run out
+      // of "running" before a queued same-issue retry can proceed.
       const inFlightIssueIds = new Set<string>();
-      for (const row of nonStaleRunningRuns) {
+      for (const row of runningRunRows) {
         const id = readNonEmptyString(parseObject(row.contextSnapshot).issueId);
         if (id) inFlightIssueIds.add(id);
       }
