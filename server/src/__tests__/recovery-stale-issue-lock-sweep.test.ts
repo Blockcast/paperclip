@@ -60,6 +60,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     const agentId = randomUUID();
     const failedRunId = randomUUID();
     const runningRunId = randomUUID();
+    const queuedRunId = randomUUID();
 
     await db.insert(companies).values({
       id: companyId,
@@ -95,9 +96,18 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
         invocationSource: "manual",
         startedAt: new Date(),
       },
+      {
+        // BLO-18995: never-started run — queued, startedAt null.
+        id: queuedRunId,
+        companyId,
+        agentId,
+        status: "queued",
+        invocationSource: "automation",
+        startedAt: null,
+      },
     ]);
 
-    return { companyId, agentId, failedRunId, runningRunId };
+    return { companyId, agentId, failedRunId, runningRunId, queuedRunId };
   }
 
   it("clears lock columns when checkoutRunId points at a terminal heartbeat run", async () => {
@@ -222,5 +232,125 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     const second = await heartbeat.sweepStaleIssueLocks();
     expect(first.cleared).toBe(1);
     expect(second.cleared).toBe(0);
+  });
+
+  // BLO-18995: four enqueue paths stamp executionRunId/executionLockedAt at
+  // *enqueue* time next to a freshly-inserted `queued` run instead of lazily at
+  // claim time. `queued` is neither missing nor terminal, so isCleanable()
+  // returned false forever and this sweeper — the designated backstop — never
+  // cleared the lock, while enqueueWakeup parked every later wake for the issue
+  // as `deferred_issue_execution` behind a holder that may never start. There
+  // was no timeout anywhere in the path. Observed live on BLO-18939.
+  it("clears an execution lock held past the timeout by a run that never started (BLO-18995)", async () => {
+    const { companyId, agentId, queuedRunId } = await seed();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Pre-claim lock held by a never-started run",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: queuedRunId,
+      // Past STALE_PRE_CLAIM_ISSUE_LOCK_MS (6h).
+      executionLockedAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const row = await db
+      .select({
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ executionRunId: null, executionLockedAt: null });
+
+    // The run itself is untouched — clearing the lock must not cancel queued
+    // work; claimQueuedRun re-acquires the lock if the run is later claimed.
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRunId))
+      .then((rows) => rows[0]);
+    expect(run?.status).toBe("queued");
+
+    const audit = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.stale_lock_cleared"))
+      .then((rows) => rows[0]);
+    expect((audit?.details as { reason?: string } | null)?.reason).toBe("pre_claim_lock_expired");
+  });
+
+  it("preserves a pre-claim execution lock that is still within the timeout (BLO-18995)", async () => {
+    // The timeout must be a real bound, not an immediate release: a queued run
+    // legitimately waits behind a backlog, and clearing its lock early would
+    // let duplicate wakes queue for the same issue.
+    const { companyId, agentId, queuedRunId } = await seed();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Pre-claim lock still fresh",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: queuedRunId,
+      executionLockedAt: new Date(Date.now() - 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(0);
+    const row = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.executionRunId).toBe(queuedRunId);
+  });
+
+  it("does not clear a live checkout lock just because the execution lock expired (BLO-18995)", async () => {
+    // The sweeper nulls checkoutRunId and executionRunId in one UPDATE, so the
+    // new pre-claim-expiry allowance must not become a blanket bypass of the
+    // checkout check. An issue whose checkoutRunId points at a live run keeps
+    // its checkout lock no matter how stale the execution lock is.
+    const { companyId, agentId, runningRunId, queuedRunId } = await seed();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Expired execution lock, live checkout lock",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      checkoutRunId: runningRunId,
+      executionRunId: queuedRunId,
+      executionLockedAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(0);
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: runningRunId, executionRunId: queuedRunId });
   });
 });

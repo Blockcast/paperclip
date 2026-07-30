@@ -87,6 +87,18 @@ export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
+// BLO-18995: how long an issue execution lock may be held by a run that has
+// not yet been claimed (status still `queued`/`scheduled_retry`, startedAt
+// null) before sweepStaleIssueLocks treats it as stale and clears it.
+//
+// Chosen well above any legitimate queue wait so this never races the
+// dispatcher: a queued run is forced to the front of its agent's queue once it
+// passes the 2h STARVATION_FULL_ESCALATION_MS floor in heartbeat.ts, so 6h
+// leaves several hours of drain headroom past that escalation even for a
+// heavily backlogged agent. Clearing the lock does not cancel or deprioritize
+// the run — it only stops subsequent wakes for the issue from being parked
+// behind a holder that may never start.
+export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 // BLO-7113: re-fire suppression for `stale_active_run_evaluation` wrappers.
 // When the underlying `runs.status='running'` row is the canonical
@@ -7131,6 +7143,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         companyId: issues.companyId,
         checkoutRunId: issues.checkoutRunId,
         executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
       })
       .from(issues)
       .where(
@@ -7161,10 +7174,47 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       return TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);
     };
 
+    // BLO-18995: a lock can also be held by a run that never started. Four
+    // enqueue paths stamp executionRunId/executionLockedAt at *enqueue* time
+    // alongside a freshly-inserted `queued` run (enqueueMissingIssueCommentRetry,
+    // enqueueProcessLossRetry, and the two recovery-wake inserts), rather than
+    // lazily at claim time the way claimQueuedRun does. `queued` is neither
+    // missing nor terminal, so isCleanable() above returns false forever and
+    // this sweeper — the designated backstop — never clears it. Meanwhile
+    // enqueueWakeup parks every subsequent wake for that issue as
+    // `deferred_issue_execution` behind the apparent live holder, and those
+    // deferred wakes are only promoted by releaseIssueExecutionAndPromote when
+    // the holding run finishes. A run that is never claimed therefore strands
+    // them indefinitely, with no timeout anywhere in the path. Observed in
+    // production: BLO-18939 held executionLockedAt for a run still `queued`
+    // with startedAt null.
+    //
+    // Bound it: once a pre-claim lock has been held longer than
+    // STALE_PRE_CLAIM_ISSUE_LOCK_MS, treat it as cleanable. Clearing is safe
+    // and does not cancel the run — claimQueuedRun's lock update is guarded by
+    // `or(isNull(executionRunId), eq(executionRunId, claimed.id))`, so the run
+    // simply re-acquires the lock if and when it is finally claimed, and the
+    // per-issue dedupe in startNextQueuedRunForAgent still prevents two runs
+    // for one issue from executing concurrently.
+    const isPreClaimLockExpired = (runId: string | null, lockedAt: Date | null) => {
+      if (!runId || !lockedAt) return false;
+      const status = runStatusById.get(runId);
+      if (status !== "queued" && status !== "scheduled_retry") return false;
+      return Date.now() - lockedAt.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
+    };
+
     for (const issue of candidates) {
-      if (!isCleanable(issue.checkoutRunId) || !isCleanable(issue.executionRunId)) {
-        continue;
-      }
+      const executionLockExpired = isPreClaimLockExpired(
+        issue.executionRunId,
+        issue.executionLockedAt,
+      );
+      // Guards are kept separate on purpose. The update below nulls the
+      // checkout *and* execution columns together, so the new pre-claim-expiry
+      // allowance must not become a blanket bypass of the checkout check: an
+      // issue whose checkoutRunId points at a live (non-terminal) run keeps its
+      // checkout lock no matter how stale the execution lock is.
+      if (!isCleanable(issue.checkoutRunId)) continue;
+      if (!isCleanable(issue.executionRunId) && !executionLockExpired) continue;
 
       const updated = await db
         .update(issues)
@@ -7208,6 +7258,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           clearedCheckoutRunId: issue.checkoutRunId,
           clearedExecutionRunId: issue.executionRunId,
           referencedRunStatuses: Object.fromEntries(runStatusById),
+          // BLO-18995: distinguishes the original terminal/missing-run path from
+          // the pre-claim lock timeout, so an operator reading the audit trail
+          // can tell whether a lock was released because its run finished or
+          // because it was never claimed within STALE_PRE_CLAIM_ISSUE_LOCK_MS.
+          reason: executionLockExpired ? "pre_claim_lock_expired" : "run_terminal_or_missing",
+          ...(executionLockExpired
+            ? {
+              preClaimLockHeldMs: issue.executionLockedAt
+                ? Date.now() - issue.executionLockedAt.getTime()
+                : null,
+              preClaimLockTimeoutMs: STALE_PRE_CLAIM_ISSUE_LOCK_MS,
+            }
+            : {}),
         },
       });
     }
