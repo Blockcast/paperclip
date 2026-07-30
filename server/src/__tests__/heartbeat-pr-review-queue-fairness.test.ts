@@ -337,7 +337,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
             wakeReason: "github_pr_synchronized",
             githubHeadSha: "aef0402c0eb1bd2d302a4b549390b48672b5e080",
           },
-          idempotencyKey: `${taskKey}:github_pr_synchronized`,
+          idempotencyKey: `${taskKey}:github_pr_synchronized:delivery:delivery-${index}`,
         })
       ),
     );
@@ -358,11 +358,11 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
     expect(wakeups.filter((wake) => wake.status === "coalesced")).toHaveLength(11);
   });
 
-  // BLO-18953: the wake used here is a push (github_pr_synchronized), NOT an
-  // explicit review request. A push is genuinely covered by a review run that
-  // is about to read head, so merging into it is correct. Explicit review
-  // requests take the opposite branch — see the sibling test below.
-  it("coalesces a push wake when a same-task run starts while enqueue waits for the agent lock", async () => {
+  // BLO-18953: a synchronize push refreshes reviewer expectations for the
+  // current head. A review run that becomes running while this enqueue waits
+  // for the agent lock has already snapshotted an older head, so the push
+  // needs its own queued follow-up.
+  it("queues a synchronize follow-up when a same-task run starts while enqueue waits for the agent lock", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runningRunId = randomUUID();
@@ -432,50 +432,56 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
       contextSnapshot: {
         taskKey,
         reviewKind: "pr_review",
+        prRole: "reviewer",
         wakeReason: "github_pr_synchronized",
         githubRepoFullName: "Blockcast/penstock-llm-proxy-core",
         githubPrNumber: 691,
       },
-      idempotencyKey: `${taskKey}:github_pr_synchronized`,
+      idempotencyKey: `${taskKey}:github_pr_synchronized:delivery:push-delivery`,
     });
 
-    const lockWaitDeadline = Date.now() + 10_000;
-    let enqueueIsWaitingForLock = false;
-    while (Date.now() < lockWaitDeadline) {
-      const waitingRows = await db.execute(sql<{ waiting: boolean }>`
-        select exists (
-          select 1
-          from pg_stat_activity
-          where datname = current_database()
-            and pid <> pg_backend_pid()
-            and wait_event_type = 'Lock'
-            and query ~* 'select id from agents.*for update'
-        ) as waiting
-      `);
-      if (Array.from(waitingRows)[0]?.waiting) {
-        enqueueIsWaitingForLock = true;
-        break;
+    let result: Awaited<typeof enqueue> | undefined;
+    try {
+      const lockWaitDeadline = Date.now() + 10_000;
+      let enqueueIsWaitingForLock = false;
+      while (Date.now() < lockWaitDeadline) {
+        const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+              and query ~* 'select id from agents.*for update'
+          ) as waiting
+        `);
+        if (Array.from(waitingRows)[0]?.waiting) {
+          enqueueIsWaitingForLock = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
       }
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(enqueueIsWaitingForLock).toBe(true);
+    } finally {
+      releaseRunLock();
+      await inFlightRun;
+      result = await enqueue;
     }
-    expect(enqueueIsWaitingForLock).toBe(true);
-
-    releaseRunLock();
-    await inFlightRun;
-    const result = await enqueue;
 
     const runs = await db
       .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId));
-    expect(runs).toEqual([{ id: runningRunId, status: "running" }]);
-    expect(result?.id).toBe(runningRunId);
+    expect(runs).toHaveLength(2);
+    expect(runs.find((run) => run.id === runningRunId)?.status).toBe("running");
+    expect(result?.id).not.toBe(runningRunId);
+    expect(runs.find((run) => run.id === result?.id)?.status).toBe("queued");
 
     const wakeups = await db
       .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId));
-    expect(wakeups).toEqual([{ status: "coalesced", runId: runningRunId }]);
+    expect(wakeups).toEqual([{ status: "queued", runId: result?.id }]);
   });
 
   // BLO-18953: the lossy half of the same race. A review already in flight
@@ -563,30 +569,33 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
       idempotencyKey: `${taskKey}:github_pr_review_requested:comment:1`,
     });
 
-    const lockWaitDeadline = Date.now() + 10_000;
-    let enqueueIsWaitingForLock = false;
-    while (Date.now() < lockWaitDeadline) {
-      const waitingRows = await db.execute(sql<{ waiting: boolean }>`
-        select exists (
-          select 1
-          from pg_stat_activity
-          where datname = current_database()
-            and pid <> pg_backend_pid()
-            and wait_event_type = 'Lock'
-            and query ~* 'select id from agents.*for update'
-        ) as waiting
-      `);
-      if (Array.from(waitingRows)[0]?.waiting) {
-        enqueueIsWaitingForLock = true;
-        break;
+    let result: Awaited<typeof enqueue> | undefined;
+    try {
+      const lockWaitDeadline = Date.now() + 10_000;
+      let enqueueIsWaitingForLock = false;
+      while (Date.now() < lockWaitDeadline) {
+        const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+              and query ~* 'select id from agents.*for update'
+          ) as waiting
+        `);
+        if (Array.from(waitingRows)[0]?.waiting) {
+          enqueueIsWaitingForLock = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
       }
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(enqueueIsWaitingForLock).toBe(true);
+    } finally {
+      releaseRunLock();
+      await inFlightRun;
+      result = await enqueue;
     }
-    expect(enqueueIsWaitingForLock).toBe(true);
-
-    releaseRunLock();
-    await inFlightRun;
-    const result = await enqueue;
 
     const runs = await db
       .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })

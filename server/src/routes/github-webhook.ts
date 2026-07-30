@@ -641,9 +641,10 @@ function resolveEventContext(
       // (merged or abandoned).
       //
       // synchronize fires once per push. We don't fan out one reviewer run per
-      // push: active reviewer runs are coalesced by the PR-scoped task key, and
-      // duplicate wake rows are skipped by a stable PR+reason idempotency
-      // precheck. Both are head-sha- and delivery-independent for synchronize.
+      // push: queued reviewer runs are coalesced by the PR-scoped task key, and
+      // GitHub redeliveries dedup by delivery-scoped idempotency. A running
+      // reviewer already snapshotted an older head, so the first synchronize
+      // that arrives while it runs gets its own queued follow-up.
       // See shouldFirePrReviewerWake / buildPrReviewerTaskKey /
       // buildPrReviewerWakeIdempotencyKey.
       if (
@@ -1064,21 +1065,22 @@ function buildPrReviewerWakeIdempotencyKey(
   // @ally comment requests are scoped to the GitHub comment id so a later
   // explicit re-review comment can wake Ally again.
   //
-  // github_pr_ready_for_review is scoped to the delivery id for the same
-  // reason (BLO-18953). It is the sanctioned way for an agent to request a
-  // re-review, and every draft->ready toggle is a fresh, deliberate request.
-  // Keying it on repo+pr+reason alone made it self-poisoning: `coalesced` is
-  // an IDEMPOTENT_REVIEWER_WAKE_STATUS and is terminal (the row is inserted
-  // with finishedAt already set and never transitions), so once ONE toggle was
-  // coalesced, every future toggle on that PR was dropped at this precheck
-  // forever. Observed on Blockcast/paperclip#822. GitHub reuses the delivery id
-  // when it retries a delivery, so genuine redeliveries still dedup.
+  // github_pr_ready_for_review and github_pr_synchronized are scoped to the
+  // delivery id for the same reason (BLO-18953). Each draft->ready toggle and
+  // each push is a fresh request for the current head. Keying either on
+  // repo+pr+reason alone made it self-poisoning: `coalesced` is an
+  // IDEMPOTENT_REVIEWER_WAKE_STATUS and is terminal (the row is inserted with
+  // finishedAt already set and never transitions), so once ONE event was
+  // coalesced, every future event of that reason on that PR was dropped at this
+  // precheck forever. Observed on Blockcast/paperclip#822 and on synchronize
+  // pushes that arrived during an older-head running review. GitHub reuses the
+  // delivery id when it retries a delivery, so genuine redeliveries still
+  // dedup.
   //
-  // Every other reason, including github_pr_synchronized, keys on
-  // repo+prNumber+reason alone. This deliberately omits head sha and delivery
-  // id so the idempotency precheck can skip duplicate in-flight wake requests
-  // for the same PR+reason (a review already queued/running covers the latest
-  // head). Note: `completed` is intentionally NOT an idempotent status (see
+  // Every other reason keys on repo+prNumber+reason alone. This deliberately
+  // omits head sha and delivery id so the idempotency precheck can skip
+  // duplicate in-flight wake requests for the same PR+reason. Note:
+  // `completed` is intentionally NOT an idempotent status (see
   // IDEMPOTENT_REVIEWER_WAKE_STATUSES), so a fixup pushed AFTER a review
   // finishes still enqueues a fresh reviewer wake rather than being blocked by
   // the earlier completed review. Active run coalescing is controlled by
@@ -1087,7 +1089,10 @@ function buildPrReviewerWakeIdempotencyKey(
     if (context.wakeReason === "github_pr_review_requested") {
       return `${context.wakeReason}:comment:${context.commentId ?? deliveryId ?? "unknown"}`;
     }
-    if (context.wakeReason === "github_pr_ready_for_review") {
+    if (
+      context.wakeReason === "github_pr_ready_for_review" ||
+      context.wakeReason === "github_pr_synchronized"
+    ) {
       return `${context.wakeReason}:delivery:${deliveryId ?? "unknown"}`;
     }
     return context.wakeReason;
@@ -1409,20 +1414,16 @@ const IDEMPOTENT_REVIEWER_WAKE_STATUSES = [
   "scheduled",
   "deferred_issue_execution",
   "coalesced",
-  // `completed` is deliberately EXCLUDED. For reasons whose idempotency key
-  // omits the head sha (github_pr_synchronized keys on repo+prNumber+reason
-  // alone -- see buildPrReviewerWakeIdempotencyKey), a COMPLETED reviewer wake
-  // for an earlier push would otherwise permanently block every future
-  // synchronize on that PR: the reviewer reviews the first pushed head once and
+  // `completed` is deliberately EXCLUDED. For PR-review events that refresh
+  // current-head expectations, a COMPLETED reviewer wake for an earlier head
+  // must not block a future event: the reviewer reviews the first head once and
   // never re-reviews any later head, so `review/ally-complete` stays pending on
   // a stale head forever (observed 2026-07-11: a batch of PRs whose authors
   // pushed fixups after the first review sat permanently un-re-reviewed). This
   // is the same failure mode already called out below for
   // `dispatch_failed_exhausted` -- a fresh webhook event deserves its own
-  // attempt. Rapid-push coalescing is preserved: the in-flight statuses above
-  // (queued/claimed/running/...) still dedup wake rows while a review is
-  // pending, and taskKey-scoped coalescing in enqueueWakeup still prevents any
-  // real duplicate execution.
+  // attempt. Rapid-push coalescing is preserved by taskKey-scoped coalescing in
+  // enqueueWakeup.
   // BLO-14395: a wake that hit an unexpected dispatch failure is durably
   // tracked under these statuses (see wakeupWithDispatchRetry /
   // reconcileFailedWakeDispatches in heartbeat.ts). `dispatch_failed` defers
@@ -1430,15 +1431,13 @@ const IDEMPOTENT_REVIEWER_WAKE_STATUSES = [
   // 15m) and `dispatch_superseded` means a retry already resolved to a
   // business-rule outcome -- both are "already handled, don't re-dispatch".
   //
-  // `dispatch_failed_exhausted` is deliberately EXCLUDED: for reasons whose
-  // idempotency key omits the head sha (e.g. github_pr_synchronized, keyed
-  // by repo+prNumber+reason alone -- see buildPrReviewerWakeIdempotencyKey),
-  // including it here would let one exhausted retry chain permanently block
-  // every future same-reason event on that PR, since reconciliation never
-  // re-arms eligibility for new events once a row is exhausted. A fresh
-  // webhook event deserves its own attempt; the taskKey-scoped coalescing in
-  // enqueueWakeup already prevents any real duplicate execution if the
-  // exhausted retry chain and the fresh attempt ever raced.
+  // `dispatch_failed_exhausted` is deliberately EXCLUDED: including it here
+  // would let one exhausted retry chain permanently block every future
+  // same-reason event on that PR, since reconciliation never re-arms
+  // eligibility for new events once a row is exhausted. A fresh webhook event
+  // deserves its own attempt; the taskKey-scoped coalescing in enqueueWakeup
+  // already prevents any real duplicate execution if the exhausted retry chain
+  // and the fresh attempt ever raced.
   "dispatch_failed",
   "dispatch_recovered",
   "dispatch_superseded",
@@ -2055,12 +2054,13 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     const actionableReviewFeedback = isActionableReviewFeedbackContext(context);
 
     // synchronize and converted_to_draft are reviewer-lifecycle signals. The
-    // reviewer wake above is PR-scoped: active runs coalesce on taskKey, and
-    // duplicate request rows are skipped by the idempotency precheck. The
-    // author-assignee wake below is deliberately not driven by either event:
-    // the author just pushed or drafted the PR, so waking them would be
-    // redundant. The author still gets woken by check_run/workflow_run on
-    // terminal CI and by review-submitted/@ally feedback, as before.
+    // reviewer wake above is PR-scoped for task affinity/coalescing, while
+    // synchronize idempotency is delivery-scoped so every push can refresh the
+    // current head if a prior review is already running. The author-assignee
+    // wake below is deliberately not driven by either event: the author just
+    // pushed or drafted the PR, so waking them would be redundant. The author
+    // still gets woken by check_run/workflow_run on terminal CI and by
+    // review-submitted/@ally feedback, as before.
     const synchronizeReviewerOnly = context.wakeReason === "github_pr_synchronized";
     const suppressAuthorWake =
       synchronizeReviewerOnly || context.wakeReason === "github_pr_converted_to_draft";

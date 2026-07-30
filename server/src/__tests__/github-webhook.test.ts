@@ -117,7 +117,7 @@ describe("github-webhook pure helpers", () => {
     ).toBeNull();
   });
 
-  it("resolves pull_request synchronize with stable PR-scoped reviewer keys across rapid pushes", () => {
+  it("resolves pull_request synchronize with PR-scoped task keys and delivery-scoped idempotency", () => {
     const ctx1 = __test_resolveEventContext("pull_request", {
       action: "synchronize",
       pull_request: {
@@ -157,16 +157,16 @@ describe("github-webhook pure helpers", () => {
     if (!__test_shouldFirePrReviewerWake(ctx1) || !__test_shouldFirePrReviewerWake(ctx2)) {
       throw new Error("expected synchronize pull_request contexts with PR numbers");
     }
-    // taskKey controls active-run coalescing; idempotencyKey controls duplicate
-    // wake-row prechecks. For synchronize both deliberately omit head sha and
-    // delivery id, so rapid pushes stay PR-scoped instead of per-push.
+    // taskKey controls reviewer affinity and queued-run coalescing. The
+    // idempotency key is delivery-scoped so a coalesced push cannot poison
+    // every future synchronize event for the PR.
     expect(__test_buildPrReviewerTaskKey(ctx1)).toBe("pr_review:Blockcast/paperclip:318");
     expect(__test_buildPrReviewerTaskKey(ctx2)).toBe(__test_buildPrReviewerTaskKey(ctx1));
     expect(__test_buildPrReviewerWakeIdempotencyKey(ctx1, "delivery-push-2")).toBe(
-      "pr_review:Blockcast/paperclip:318:github_pr_synchronized",
+      "pr_review:Blockcast/paperclip:318:github_pr_synchronized:delivery:delivery-push-2",
     );
     expect(__test_buildPrReviewerWakeIdempotencyKey(ctx2, "delivery-push-3")).toBe(
-      __test_buildPrReviewerWakeIdempotencyKey(ctx1, "delivery-push-2"),
+      "pr_review:Blockcast/paperclip:318:github_pr_synchronized:delivery:delivery-push-3",
     );
   });
 
@@ -1380,7 +1380,8 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(wakes.every((wake) => wake.agentId === firstReviewerId)).toBe(true);
     expect(wakes).toContainEqual(expect.objectContaining({
       status: "coalesced",
-      idempotencyKey: "pr_review:Blockcast/magma:976:github_pr_synchronized",
+      idempotencyKey:
+        "pr_review:Blockcast/magma:976:github_pr_synchronized:delivery:delivery-review-pool-affinity-synchronized",
     }));
   });
 
@@ -1537,11 +1538,11 @@ describeEmbeddedPostgres("github-webhook route", () => {
       })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, reviewerAgentId));
-    expect(reviewerWakes).toHaveLength(1);
-    expect(reviewerWakes[0]).toMatchObject({
+    expect(reviewerWakes).toHaveLength(2);
+    expect(reviewerWakes).toContainEqual(expect.objectContaining({
       status: "queued",
       reason: "github_pr_synchronized",
-      idempotencyKey: "pr_review:Blockcast/magma:981:github_pr_synchronized",
+      idempotencyKey: "pr_review:Blockcast/magma:981:github_pr_synchronized:delivery:delivery-sync-1",
       payload: expect.objectContaining({
         taskKey: "pr_review:Blockcast/magma:981",
         source: "github",
@@ -1553,6 +1554,22 @@ describeEmbeddedPostgres("github-webhook route", () => {
         paperclipIdentifiers: ["BLO-3182"],
         reviewKind: "pr_review",
       }),
+    }));
+    expect(reviewerWakes).toContainEqual(expect.objectContaining({
+      status: "coalesced",
+      reason: "github_pr_synchronized",
+      idempotencyKey: "pr_review:Blockcast/magma:981:github_pr_synchronized:delivery:delivery-sync-2",
+    }));
+
+    const reviewerRuns = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, reviewerAgentId));
+    expect(reviewerRuns).toHaveLength(1);
+    expect(reviewerRuns[0]?.contextSnapshot).toMatchObject({
+      taskKey: "pr_review:Blockcast/magma:981",
+      githubHeadSha: "push2sha",
+      githubDeliveryId: "delivery-sync-2",
     });
 
     const authorWakesAfterSynchronize = await db
@@ -1805,17 +1822,17 @@ describeEmbeddedPostgres("github-webhook route", () => {
     });
 
     // Simulate a prior synchronize event whose wake dispatch retried and
-    // exhausted (5 attempts, all failed) -- this durably persists a row
-    // under the SAME idempotency key every future synchronize event on this
-    // PR will also compute, since that key omits head sha (repo+prNumber+reason
-    // only; see buildPrReviewerWakeIdempotencyKey).
-    const idempotencyKey = "pr_review:Blockcast/paperclip:630:github_pr_synchronized";
+    // exhausted (5 attempts, all failed) under the old stable key. Fresh
+    // synchronize deliveries must not be blocked by that stale row.
+    const staleIdempotencyKey = "pr_review:Blockcast/paperclip:630:github_pr_synchronized";
+    const freshIdempotencyKey =
+      "pr_review:Blockcast/paperclip:630:github_pr_synchronized:delivery:delivery-post-exhaustion";
     await db.insert(agentWakeupRequests).values({
       companyId,
       agentId: reviewerAgentId,
       source: "github",
       reason: "github_pr_synchronized",
-      idempotencyKey,
+      idempotencyKey: staleIdempotencyKey,
       status: "dispatch_failed_exhausted",
       payload: { taskKey: "pr_review:Blockcast/paperclip:630" },
     });
@@ -1837,7 +1854,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .where(
         and(
           eq(agentWakeupRequests.agentId, reviewerAgentId),
-          eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+          eq(agentWakeupRequests.idempotencyKey, freshIdempotencyKey),
           eq(agentWakeupRequests.status, "queued"),
         ),
       );
@@ -1873,16 +1890,18 @@ describeEmbeddedPostgres("github-webhook route", () => {
       repository: { full_name: "Blockcast/paperclip" },
     });
 
-    // A prior synchronize was reviewed to COMPLETION on an earlier head. Its
-    // wake row persists under the head-sha-omitting idempotency key that every
-    // future synchronize on this PR also computes.
-    const idempotencyKey = "pr_review:Blockcast/paperclip:813:github_pr_synchronized";
+    // A prior synchronize was reviewed to COMPLETION on an earlier head under
+    // the old stable key. Fresh synchronize deliveries must not be blocked by
+    // that stale row.
+    const staleIdempotencyKey = "pr_review:Blockcast/paperclip:813:github_pr_synchronized";
+    const freshIdempotencyKey =
+      "pr_review:Blockcast/paperclip:813:github_pr_synchronized:delivery:delivery-fixup-after-completed-review";
     await db.insert(agentWakeupRequests).values({
       companyId,
       agentId: reviewerAgentId,
       source: "github",
       reason: "github_pr_synchronized",
-      idempotencyKey,
+      idempotencyKey: staleIdempotencyKey,
       status: "completed",
       payload: { taskKey: "pr_review:Blockcast/paperclip:813", headSha: "oldhead" },
     });
@@ -1908,7 +1927,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .where(
         and(
           eq(agentWakeupRequests.agentId, reviewerAgentId),
-          eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+          eq(agentWakeupRequests.idempotencyKey, freshIdempotencyKey),
           eq(agentWakeupRequests.status, "queued"),
         ),
       );

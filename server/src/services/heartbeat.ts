@@ -6268,7 +6268,9 @@ async function coalesceQueuedGithubStateWake(input: {
     })
     .where(and(eq(heartbeatRuns.id, existingRun.id), eq(heartbeatRuns.status, "queued")))
     .returning()
-    .then((rows) => rows[0] ?? existingRun);
+    .then((rows) => rows[0] ?? null);
+
+  if (!mergedRun) return null;
 
   let coalescedEventCount: number | null = null;
   if (mergedRun.wakeupRequestId) {
@@ -6378,7 +6380,9 @@ async function coalescePendingTaskScopeWake(input: {
       ),
     )
     .returning()
-    .then((rows) => rows[0] ?? existingRun);
+    .then((rows) => rows[0] ?? null);
+
+  if (!mergedRun) return null;
 
   if (mergedRun.wakeupRequestId) {
     await input.tx
@@ -6795,14 +6799,14 @@ export function evaluatePrReviewCompletionEvidence(
   };
 }
 
-// Reviewer wake reasons that are an *explicit* "review this now" request: an
-// @ally comment / requested_reviewer, and the draft->ready toggle. Contrast
-// with github_pr_synchronized (a push, deduped upstream by a stable
-// repo+pr+reason idempotency key) and github_pr_opened/reopened, where a wake
+// Reviewer wake reasons that must refresh review work for the current head:
+// an @ally comment / requested_reviewer, the draft->ready toggle, and a PR
+// synchronize push. Contrast with github_pr_opened/reopened, where a wake
 // already in flight genuinely covers the event.
 const EXPLICIT_PR_REVIEW_REQUEST_WAKE_REASONS = new Set([
   "github_pr_review_requested",
   "github_pr_ready_for_review",
+  "github_pr_synchronized",
 ]);
 
 // BLO-18953: an explicit review request must never be absorbed into a review
@@ -6814,8 +6818,8 @@ const EXPLICIT_PR_REVIEW_REQUEST_WAKE_REASONS = new Set([
 // will never re-read head". Coalescing into a `queued` run is benign — that run
 // reads head when it starts. Coalescing into a `running` one silently drops the
 // request: observed on Blockcast/pim-multicast-gateway#1888 (human @ally
-// comment) and Blockcast/paperclip#822 (ready_for_review), both left with a
-// review pinned to a stale head.
+// comment), Blockcast/paperclip#822 (ready_for_review), and synchronize pushes
+// that arrived while a previous-head review was already running.
 //
 // Head-sha comparison is NOT a workable discriminator here: the issue_comment
 // branch of resolveEventContext never populates headSha (GitHub's issue_comment
@@ -22639,32 +22643,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         coalescedTargetRun.contextSnapshot,
         enrichedContextSnapshot,
       );
+      const observedStatus = coalescedTargetRun.status;
       const mergedRun = await db
         .update(heartbeatRuns)
         .set({
           contextSnapshot: mergedContextSnapshot,
           updatedAt: new Date(),
         })
-        .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
+        .where(and(eq(heartbeatRuns.id, coalescedTargetRun.id), eq(heartbeatRuns.status, observedStatus)))
         .returning()
-        .then((rows) => rows[0] ?? coalescedTargetRun);
+        .then((rows) => rows[0] ?? null);
 
-      await db.insert(agentWakeupRequests).values({
-        companyId: agent.companyId,
-        agentId,
-        source,
-        triggerDetail,
-        reason,
-        payload,
-        status: "coalesced",
-        coalescedCount: 1,
-        requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
-        runId: mergedRun.id,
-        finishedAt: new Date(),
-      });
-      return mergedRun;
+      if (mergedRun) {
+        await db.insert(agentWakeupRequests).values({
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          reason,
+          payload,
+          status: "coalesced",
+          coalescedCount: 1,
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          runId: mergedRun.id,
+          finishedAt: new Date(),
+        });
+        return mergedRun;
+      }
     }
 
     const queueOutcome = await db.transaction(async (tx) => {

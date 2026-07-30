@@ -42,7 +42,7 @@ import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
 import { createMilestonesService } from "./milestones.js";
 import { documentService } from "./documents.js";
-import { heartbeatService } from "./heartbeat.js";
+import { heartbeatService, type HeartbeatServiceOptions } from "./heartbeat.js";
 import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
@@ -548,7 +548,11 @@ export function buildHostServices(
   eventBus: PluginEventBus,
   notifyWorker?: (method: string, params: unknown) => void,
   lifecycleManager?: PluginLifecycleManager,
-  options: { pluginWorkerManager?: PluginWorkerManager; manifest?: import("@paperclipai/shared").PaperclipPluginManifestV1 } = {},
+  options: {
+    pluginWorkerManager?: PluginWorkerManager;
+    manifest?: import("@paperclipai/shared").PaperclipPluginManifestV1;
+    heartbeatOptions?: HeartbeatServiceOptions;
+  } = {},
 ): HostServices & { dispose(): void } {
   const registry = pluginRegistryService(db);
   const stateStore = pluginStateStore(db);
@@ -587,7 +591,8 @@ export function buildHostServices(
     manifest: options.manifest,
   });
   const heartbeat = heartbeatService(db, {
-    pluginWorkerManager: options.pluginWorkerManager,
+    ...options.heartbeatOptions,
+    pluginWorkerManager: options.pluginWorkerManager ?? options.heartbeatOptions?.pluginWorkerManager,
   });
   const projects = projectService(db);
   const executionWorkspaces = executionWorkspaceService(db);
