@@ -5,7 +5,10 @@ description: >
   Before moving a Paperclip issue to `in_review`, produce the label-keyed
   evidence required by the server's artifact-evidence gate. Use on any
   transition to `in_review` or completion claim; missing evidence records a
-  `block` verdict (warn-only in Phase 1, HTTP 422 in Phase 2).
+  `block` verdict (warn-only in Phase 1, HTTP 422 in Phase 2). Also covers the
+  separate `done` gate (`no_execution_run_and_no_pr_evidence`) — read the
+  "Closing to `done`" section before closing an issue, especially work that
+  produces no commit.
 ---
 
 # Evidence Before in_review
@@ -244,10 +247,49 @@ These have all happened on real issues and the gate exists to catch them:
 - If verdict is `block` (or `warn` for unlabeled): re-read your `in_review` comment. The `missing` array on the verdict points you exactly at what's missing. Add the evidence. Comment again, then re-send `status: "in_review"` — the gate re-evaluates on every PATCH that carries `status: "in_review"`, including `in_review` → `in_review`, and rewrites `lastEvidenceVerdict`. Confirm it actually re-ran by checking that `lastEvidenceVerdictEvaluatedAt` moved; a 200 alone is not proof the verdict changed. Only a real transition *into* `in_review` can be rejected with a 422, so re-evaluating on an already-`in_review` issue refreshes the verdict without risk of failing the patch.
 - Check `diagnostics` before re-posting evidence. `no-done-when-heading` / `missing-done-when-bullets` mean the fix is in the **description** (add or rename a recognized criteria heading), not in another comment — no amount of evidence will clear those.
 
+## Closing to `done`: a second, different gate (BLO-19081)
+
+There is a **separate** gate on the `done` transition. Passing the `in_review` gate does not get you through it, and it fails with a different error:
+
+```json
+{"details":{"reason":"no_execution_run_and_no_pr_evidence"}}
+```
+
+Do not discover this at 422. Produce the right artifact **before** you attempt the close. Exactly three things satisfy it:
+
+1. **`executionRunId` non-null on the pre-update row.** Do not plan around this — it is a *lock*, not a record. `issues.update()` nulls it on **any** transition away from `in_progress`, so if you go `in_progress → in_review → done` it is already `null` by the time you close, even though a real run did the work. It only helps when you close straight out of `in_progress` in one PATCH.
+2. **`pr-link` evidence** in the stored verdict (`allDetected` / `evidenceFound`) — a full GitHub PR URL in an allowed repo. This is the normal path for code work, and it survives the comment window (see `landing-artifact` above).
+3. **A run-attributed durable artifact on the issue.** This is the path for work that produces no commit.
+
+### If your work produces no commit
+
+Investigations, config archaeology, premise audits, and operational receipts have nothing to put in a PR. Before closing, promote the deliverable out of the comment thread into an issue document:
+
+```
+PUT /api/issues/{issueId}/documents/findings
+{ "title": "Findings", "body": "## Findings\n..." }
+```
+
+Then `PATCH {status: "done"}` passes. What qualifies:
+
+- an **issue document** with a non-empty body, **excluding** the `plan` key and system keys (`continuation-summary`, `pipeline-case-body`);
+- an **`artifact`** or **`document`** work product.
+
+Either must carry `createdByRunId`, which the server stamps from your run context — so write the artifact **from inside the run that closes the issue**, not via a runless board-API call.
+
+### What will not work
+
+- **A comment body.** However long or well-sourced, prose in a comment never satisfies this gate. That is deliberate and it is under test; do not try to shape a comment to pass.
+- **The `plan` document.** A plan is authored at the start of the work, so it is intent, not deliverable.
+- **A `pull_request` work product row** without a real PR URL — the `pr-link` path owns that.
+
+This is also the right thing independent of the gate: a finding that a follow-up issue must consume, or that a design will cite later, belongs in a durable, revisionable, deep-linkable document — not comment #7 of a thread that keeps growing.
+
 ## Reference
 
 - Pure evaluator: `server/src/services/evidence-gate.ts`
 - Label registry: `server/src/services/evidence-shapes.ts`
 - Wiring: `server/src/services/evidence-gate-wiring.ts`
+- Done gate: `server/src/services/done-gate.ts` (predicate), call site in `server/src/services/issues.ts`
 - Schema: `issues.last_evidence_verdict` (jsonb, nullable)
-- Tracking: BLO-4461 (parent), BLO-4829 (evaluator), BLO-4824 (wiring), BLO-4828 (Phase-2 enforce), BLO-17560 (`landing-artifact` shape)
+- Tracking: BLO-4461 (parent), BLO-4829 (evaluator), BLO-4824 (wiring), BLO-4828 (Phase-2 enforce), BLO-17560 (`landing-artifact` shape), BLO-19081 (done-gate durable-artifact path)
