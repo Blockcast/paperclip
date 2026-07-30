@@ -4133,6 +4133,87 @@ describe("executeProcess (timeout classification)", () => {
     }
   }, 15_000);
 
+  it("keeps SIGKILL armed when the group leader exits after timeout but a descendant ignores SIGTERM", async () => {
+    // The timeout path first sends SIGTERM, then escalates to SIGKILL. If the
+    // direct child exits after SIGTERM, that must not cancel the pending SIGKILL:
+    // a descendant may have ignored SIGTERM and still be running against the
+    // workspace after the drain-grace fallback resolves this call.
+    const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reap-ignore-term-"));
+    const markerPath = path.join(markerDir, "survived");
+    const started = Date.now();
+
+    try {
+      const result = await executeProcessForTests({
+        command: "sh",
+        args: [
+          "-c",
+          [
+            `sh -c 'trap "" TERM; sleep 7; : > ${JSON.stringify(markerPath)}' &`,
+            `trap "exit 0" TERM`,
+            "wait",
+          ].join("\n"),
+        ],
+        cwd: os.tmpdir(),
+        timeoutMs: 300,
+      });
+
+      expect(result.timedOut).toBe(true);
+      expect(Date.now() - started).toBeLessThan(5_000);
+
+      // Wait beyond the descendant's marker delay. The marker appears only if the
+      // SIGKILL escalation was canceled after the group leader exited.
+      await new Promise((resolve) => setTimeout(resolve, 7_500));
+      await expect(fs.stat(markerPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await fs.rm(markerDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("destroys captured stdio when drain grace expires after a clean exit", async () => {
+    // A command can exit 0 while a descendant still owns the inherited pipes.
+    // Drain grace must resolve the call, but it also has to close our captured
+    // stream handles; otherwise the pipe, listeners, and output accumulators live
+    // until the descendant eventually exits.
+    const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-stdio-drain-"));
+    const markerPath = path.join(markerDir, "write-after-drain");
+    const writerScript = `
+      const fs = require("node:fs");
+      setTimeout(() => {
+        fs.writeSync(1, "late output after drain\\n");
+        fs.writeFileSync(${JSON.stringify(markerPath)}, "survived");
+      }, 3500);
+    `;
+    const launcherScript = `
+      const { spawn } = require("node:child_process");
+      const child = spawn(process.execPath, ["-e", ${JSON.stringify(writerScript)}], {
+        stdio: ["ignore", "inherit", "inherit"],
+      });
+      child.unref();
+      process.exit(0);
+    `;
+    const started = Date.now();
+
+    try {
+      const result = await executeProcessForTests({
+        command: process.execPath,
+        args: ["-e", launcherScript],
+        cwd: os.tmpdir(),
+        timeoutMs: 10_000,
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.timedOut).toBe(false);
+      expect(Date.now() - started).toBeLessThan(3_500);
+
+      // Without destroying the captured streams, the descendant keeps stdout open,
+      // writes successfully, and leaves the marker after this call has returned.
+      await new Promise((resolve) => setTimeout(resolve, 2_500));
+      await expect(fs.stat(markerPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await fs.rm(markerDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   it("reports a clean exit unchanged", async () => {
     const result = await executeProcessForTests({
       command: "sh",

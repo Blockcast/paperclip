@@ -679,6 +679,12 @@ async function executeProcess(input: {
     let drainTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
     const stdout = createProcessOutputCapture(input.maxStdoutBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
     const stderr = createProcessOutputCapture(input.maxStderrBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
+    const onStdoutData = (chunk: Buffer | string) => {
+      stdout.append(String(chunk));
+    };
+    const onStderrData = (chunk: Buffer | string) => {
+      stderr.append(String(chunk));
+    };
     const child = spawn(input.command, input.args, {
       cwd: input.cwd,
       stdio: ["ignore", "pipe", "pipe"],
@@ -701,10 +707,29 @@ async function executeProcess(input: {
       killTimer = null;
       drainTimer = null;
     };
-    const settle = (code: number | null) => {
+    const clearNonKillTimers = () => {
+      if (timeoutTimer) globalThis.clearTimeout(timeoutTimer);
+      if (drainTimer) globalThis.clearTimeout(drainTimer);
+      timeoutTimer = null;
+      drainTimer = null;
+    };
+    const cleanupCapturedStreams = (destroy: boolean) => {
+      child.stdout?.off("data", onStdoutData);
+      child.stderr?.off("data", onStderrData);
+      if (destroy) {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      }
+    };
+    const settle = (code: number | null, options?: { destroyStreams?: boolean; keepKillTimer?: boolean }) => {
       if (settled) return;
       settled = true;
-      clearTimers();
+      cleanupCapturedStreams(options?.destroyStreams ?? false);
+      if (options?.keepKillTimer) {
+        clearNonKillTimers();
+      } else {
+        clearTimers();
+      }
       resolve({ stdout, stderr, code, timedOut });
     };
 
@@ -717,19 +742,18 @@ async function executeProcess(input: {
         timedOut = true;
         terminateChildProcess(child, "SIGTERM");
         killTimer = globalThis.setTimeout(() => {
+          killTimer = null;
           terminateChildProcess(child, "SIGKILL");
         }, 5_000);
+        killTimer.unref?.();
       }, timeoutMs);
     }
-    child.stdout?.on("data", (chunk) => {
-      stdout.append(String(chunk));
-    });
-    child.stderr?.on("data", (chunk) => {
-      stderr.append(String(chunk));
-    });
+    child.stdout?.on("data", onStdoutData);
+    child.stderr?.on("data", onStderrData);
     child.on("error", (error) => {
       if (settled) return;
       settled = true;
+      cleanupCapturedStreams(true);
       clearTimers();
       reject(error);
     });
@@ -746,17 +770,22 @@ async function executeProcess(input: {
       // grace period to call a no-op.
       if (settled) return;
       if (timeoutTimer) globalThis.clearTimeout(timeoutTimer);
-      if (killTimer) globalThis.clearTimeout(killTimer);
       timeoutTimer = null;
-      killTimer = null;
+      if (!timedOut && killTimer) {
+        globalThis.clearTimeout(killTimer);
+        killTimer = null;
+      }
       // Bound the wait for the remaining stdio. Without this a lingering
       // descendant means `close` never arrives and the promise never settles --
       // the timeout budget stops being enforced at all, which is a worse
       // failure than the one it was meant to catch.
-      drainTimer ??= globalThis.setTimeout(() => settle(code), PROCESS_STDIO_DRAIN_GRACE_MS);
+      drainTimer ??= globalThis.setTimeout(
+        () => settle(code, { destroyStreams: true, keepKillTimer: timedOut }),
+        PROCESS_STDIO_DRAIN_GRACE_MS,
+      );
     });
     child.on("close", (code) => {
-      settle(code);
+      settle(code, { keepKillTimer: timedOut });
     });
   });
   const stdout = proc.stdout.finish();
