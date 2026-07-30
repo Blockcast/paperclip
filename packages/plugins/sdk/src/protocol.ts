@@ -1642,8 +1642,26 @@ export interface WorkerToHostMethods {
     result: Agent,
   ];
   "agents.invoke": [
-    params: { agentId: string; companyId: string; prompt: string; reason?: string },
-    result: { runId: string },
+    params: {
+      agentId: string;
+      companyId: string;
+      prompt: string;
+      reason?: string;
+      /**
+       * Stable identifier for the unit of work this invoke represents, e.g.
+       * `pr_review:<repo>:<number>`. Wakes carrying different task keys are
+       * never coalesced into one another's runs; wakes sharing a task key are.
+       * Omit only when every invoke is genuinely independent work.
+       */
+      taskKey?: string;
+      /**
+       * Delivery-level dedup key, e.g. a GitHub `x-github-delivery` GUID.
+       * A repeat invoke with the same key returns the original run instead of
+       * queueing a second one.
+       */
+      idempotencyKey?: string;
+    },
+    result: { runId: string; deduplicated?: boolean },
   ];
   "agents.updateAdapterOverrides": [
     params: { agentId: string; companyId: string; overrides: Record<string, unknown> | null },
