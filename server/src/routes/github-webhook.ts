@@ -196,6 +196,78 @@ function hasAllyConsolidatedReviewHeader(body: string | null | undefined): boole
   return typeof body === "string" && /\bAlly\s*(?:—|-|:)\s*Consolidated\s+PR\s+Review\b/i.test(body);
 }
 
+// Narrow variant, used ONLY to disqualify an agent review request (BLO-18865).
+//
+// `hasAllyConsolidatedReviewHeader` scans the whole body, which is right at its
+// other call site (isActionablePrReviewComment, where a body carrying the header
+// counts as review feedback no matter who relayed it — a WIDENING use). Reusing
+// it here was too broad in the opposite direction: a legitimate marked request
+// that merely MENTIONS the review in prose ("your Ally — Consolidated PR Review
+// flagged X") was silently dropped. A silently dropped review request is the
+// exact failure this marker exists to fix, so the exclusion is scoped to the
+// shape Ally's own output actually has: the header on its own line, as a
+// Markdown heading or bold run.
+//
+// This keeps the #583 layer intact — Ally echoing the marker at byte 0 still
+// carries its `## Ally — Consolidated PR Review` line and is still rejected —
+// while a quoted (`> ## Ally — ...`) or indented copy reads as a quote, not as
+// Ally's output, and no longer suppresses a real request. The heading/bold
+// prefix is optional so a format change on Ally's side does not silently lapse
+// the guard; only a mid-line prose reference is let through.
+const ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN =
+  /^[ \t]{0,3}(?:#{1,6}[ \t]+|\*\*[ \t]*)?Ally[ \t]*(?:—|–|-|:)[ \t]*Consolidated[ \t]+PR[ \t]+Review\b/im;
+
+function hasAllyConsolidatedReviewHeading(body: string | null | undefined): boolean {
+  return typeof body === "string" && ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN.test(body);
+}
+
+// Explicit "a Paperclip agent is asking for review" marker (BLO-18865).
+//
+// Agents post PR comments through the Paperclip GitHub App, so their comment
+// author login IS the reviewer bot's own login (allyblockcast[bot]).
+// Author login therefore cannot separate "agent requesting a review" from
+// "the reviewer bot's own output", and the author-scoped guard below dropped
+// every agent-issued @ally request — leaving agents with no comment-based and
+// no push-based way to get a re-review (observed on Blockcast/paperclip#814:
+// two pushes and two @ally comments produced nothing over 2h19m).
+//
+// The marker restores that path. Two properties keep the #583 self-refire
+// loop dead, and both matter — do not relax either without re-reading the
+// guard comment at the reviewerRequest assignment:
+//
+//   1. ANCHORED TO LITERAL BYTE 0 of the body — not "the first non-whitespace
+//      character". The loop in #583 was driven by bot-authored bodies that
+//      mention the alias *somewhere* — a salutation, or the bot's own reply
+//      quoting the alias as an example. A marker Ally merely quotes back while
+//      explaining a request it is answering lands mid-body, so it cannot
+//      re-arm the trigger.
+//
+//      Allowing leading whitespace would reopen exactly that hole: four spaces
+//      at the start of a Markdown body is an indented CODE BLOCK, i.e. the
+//      canonical way a reviewer renders "here is the marker you should use".
+//      `    <!-- paperclip:review-request -->\n    @ally review` is a quoted
+//      example, but with `^\s*` it satisfies both this pattern and the alias
+//      mention, and each such comment carries a fresh comment-scoped
+//      idempotency key — a self-refire loop with no dedup backstop. So: no
+//      `\s*` prefix, ever. A real requester controls its own body and can put
+//      the marker first.
+//   2. NEVER on Ally's own review output. A body whose consolidated-review
+//      header stands on its own line is not a request regardless of any marker,
+//      so Ally echoing the marker into its own review verdict still enqueues
+//      nothing. See ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN for why this is
+//      matched on the heading shape rather than anywhere in the body.
+//
+// Trailing attributes are allowed (e.g. `<!-- paperclip:review-request
+// agent=cto -->`) so the marker can carry provenance without a parser change.
+// The token must be followed by whitespace or the closing `-->` so that a
+// longer lookalike token (`paperclip:review-request-something`) is not a match.
+const PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN =
+  /^<!--[ \t]*paperclip:review-request(?:[ \t][^>]*)?[ \t]*-->/i;
+
+function hasPrReviewerAgentRequestMarker(body: string | null | undefined): boolean {
+  return typeof body === "string" && PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN.test(body);
+}
+
 // Negation cues that flip an otherwise-actionable bare phrase into a confirmation
 // that nothing is required — e.g. Ally's COMMENTED, zero-finding review 4682219268
 // on TC PR #1115 said "Clean. No changes requested from this lens", which the bare
@@ -572,7 +644,19 @@ function resolveEventContext(
         commentAuthorLogin,
         options.prReviewerBotLogin,
       );
-      const reviewerRequest = !commentAuthorIsReviewerBot && hasPrReviewerRequestMention(commentBody);
+      // BLO-18865: the author-scoped guard above also caught every Paperclip
+      // AGENT asking for a review, because agent PR comments are posted
+      // through the GitHub App under the reviewer bot's own login. An explicit,
+      // start-of-body marker re-opens that path for agents while keeping the
+      // #583 loop closed — see PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN for why
+      // the anchoring and the review-header exclusion are both load-bearing.
+      const agentReviewRequest =
+        commentAuthorIsReviewerBot &&
+        hasPrReviewerAgentRequestMarker(commentBody) &&
+        !hasAllyConsolidatedReviewHeading(commentBody);
+      const reviewerRequest =
+        (!commentAuthorIsReviewerBot || agentReviewRequest) &&
+        hasPrReviewerRequestMention(commentBody);
       const reviewFeedback = isActionablePrReviewComment(
         commentBody,
         commentAuthorLogin,
@@ -1034,7 +1118,23 @@ function isReviewerSelfEchoReview(
 
 function shouldFirePrReviewerWake(context: ResolvedEventContext | null): context is ResolvedEventContext & { prNumber: number } {
   if (!context || !context.wakeReason || typeof context.prNumber !== "number") return false;
-  if (context.prDraft && context.wakeReason !== "github_pr_ready_for_review") return false;
+  // A draft PR is work in progress: suppress the AUTOMATIC reasons (opened,
+  // synchronize, reopened, review_submitted) so pushes to a draft don't spend a
+  // review pass per commit. Draft PRs are consequently never reviewed until
+  // they are marked ready — the agent instructions say so plainly (BLO-18865).
+  //
+  // github_pr_review_requested is exempt because it is an EXPLICIT ask, not
+  // churn: draft state should not silently swallow someone (or some agent)
+  // asking for review. Note this exemption is belt-and-braces today — the
+  // issue_comment branch of resolveEventContext does not populate prDraft, so
+  // comment-driven requests never reach the draft check. It is here so that
+  // populating prDraft on that branch later cannot silently re-strand agents,
+  // and it is covered by a direct predicate test.
+  if (
+    context.prDraft &&
+    context.wakeReason !== "github_pr_ready_for_review" &&
+    context.wakeReason !== "github_pr_review_requested"
+  ) return false;
   return new Set([
     "github_pr_opened",
     "github_pr_reopened",
@@ -1546,7 +1646,11 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     //       the same per-agent lock used by close retirement, and duplicate
     //       wake requests are skipped by the PR+reason idempotency precheck, so
     //       rapid pushes don't fan out per push.
-    //   - issue_comment.created with @ally — explicit operator re-review request
+    //   - issue_comment.created with @ally — explicit operator re-review request.
+    //       A Paperclip agent gets the same path by prefixing the comment with
+    //       `<!-- paperclip:review-request -->` (BLO-18865); without that marker
+    //       its comment is indistinguishable from the reviewer bot's own output
+    //       by author login and is dropped.
     //   - pull_request_review.submitted — request a counter-review pass; the
     //       reviewer's OWN posted review is filtered as a self-echo (BLO-15799,
     //       see isReviewerSelfEchoReview).
@@ -2090,6 +2194,28 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     // redundant. The author still gets woken by check_run/workflow_run on
     // terminal CI and by review-submitted/@ally feedback, as before.
     const synchronizeReviewerOnly = context.wakeReason === "github_pr_synchronized";
+    // BLO-18865: a marker-carrying agent review request deliberately does NOT
+    // suppress the author wake, even though the requester is usually the PR
+    // author and the wake is then redundant.
+    //
+    // The marker proves only that the shared Paperclip GitHub App posted it —
+    // every agent shares that identity, so it carries no requester identity at
+    // all. Suppressing on it would also drop the author's notification when a
+    // MANAGER or a peer agent requests review on someone else's PR, which is
+    // the case the notification exists for. Trading a real notification for a
+    // redundant-wake saving is the wrong side of this issue: BLO-18865 exists
+    // because dropped review signals strand work for hours.
+    //
+    // Do not re-add suppression here on the marker alone. It needs a trusted
+    // requester identity (an outbound-comment record written by the run that
+    // posted the comment) checked against the matched issue's assignee; the
+    // marker's `agent=` attribute is self-asserted and is not that.
+    //
+    // Redundant self-wakes are already bounded: the author wake is
+    // comment-scoped-idempotent (one per request comment, replays skipped as
+    // duplicate_pr_author_wake), and the reason is "review requested", which
+    // no agent treats as an instruction to request review again. That is the
+    // same shape a human @ally request has always had.
     const suppressAuthorWake =
       synchronizeReviewerOnly || context.wakeReason === "github_pr_converted_to_draft";
     if (
@@ -2329,6 +2455,9 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
 // Test-only re-exports.
 export const __test_extractPaperclipIdentifiers = extractPaperclipIdentifiers;
 export const __test_hasPrReviewerRequestMention = hasPrReviewerRequestMention;
+export const __test_hasPrReviewerAgentRequestMarker = hasPrReviewerAgentRequestMarker;
+export const __test_hasAllyConsolidatedReviewHeading = hasAllyConsolidatedReviewHeading;
+export const __test_hasAllyConsolidatedReviewHeader = hasAllyConsolidatedReviewHeader;
 export const __test_verifyGithubSignature = verifyGithubSignature;
 export const __test_resolveEventContext = resolveEventContext;
 export const __test_shouldFirePrReviewerWake = shouldFirePrReviewerWake;
