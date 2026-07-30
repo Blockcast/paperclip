@@ -6,6 +6,7 @@ import {
   agentWakeupRequests,
   agents,
   companies,
+  companyMemberships,
   costEvents,
   createDb,
   heartbeatRuns,
@@ -14,6 +15,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import { heartbeatService } from "../services/heartbeat.js";
 
@@ -53,20 +55,20 @@ if (!embeddedPostgresSupport.supported) {
  */
 describeEmbeddedPostgres("plugin agents.invoke wake fan-out", () => {
   let db!: ReturnType<typeof createDb>;
+  let heartbeat!: ReturnType<typeof heartbeatService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-invoke-fanout-");
     db = createDb(tempDb.connectionString);
+    heartbeat = heartbeatService(db);
   }, 20_000);
 
   afterEach(async () => {
-    await db.delete(activityLog);
-    await db.delete(costEvents);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agents);
-    await db.delete(companies);
+    // Shared helper: cancels active runs and drains in-flight executions before
+    // truncating, so a dispatched run can't leak a process into the next test or
+    // trip an FK on teardown.
+    await cleanupHeartbeatTestState(db, heartbeat);
   });
 
   afterAll(async () => {
@@ -76,11 +78,23 @@ describeEmbeddedPostgres("plugin agents.invoke wake fan-out", () => {
   async function seedBusyAgent() {
     const companyId = randomUUID();
     const agentId = randomUUID();
+    const ownerUserId = `owner-${randomUUID()}`;
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
       issuePrefix: issuePrefix(companyId),
       requireBoardApprovalForNewAgents: false,
+      // Wake dispatch requires a resolvable responsible user (#8825); these
+      // tests assert that distinct invokes actually *dispatch* rather than
+      // coalesce, so they reach that path and need an owner to resolve to.
+      defaultResponsibleUserId: ownerUserId,
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: ownerUserId,
+      membershipRole: "owner",
+      status: "active",
     });
     await db.insert(agents).values({
       id: agentId,
@@ -260,7 +274,26 @@ describeEmbeddedPostgres("plugin agents.invoke wake fan-out", () => {
   }, 60_000);
 
   it("characterizes the original loss: keyless wakes coalesce into an unrelated active run", async () => {
-    const { companyId, agentId, activeRunId } = await seedBusyAgent();
+    const { companyId, agentId } = await seedBusyAgent();
+
+    // The burst shape from the incident: the first keyless request is already
+    // queued behind the agent's occupied slot, and the next one arrives with an
+    // equally keyless payload. `isSameTaskScope(null, null)` is true, so it lands
+    // on that unrelated run instead of getting its own.
+    //
+    // The target is deliberately `queued`, not `running`: a `running` row with no
+    // tracked process is a zombie, and `filterZombieCoalesceTarget` now refuses
+    // it as a coalesce target. Queued runs pass through unchanged, so this pins
+    // the scope-collision mechanism rather than the zombie path.
+    const priorRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: priorRunId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "automation",
+      contextSnapshot: {},
+    });
 
     // The pre-fix payload shape, sent straight at the heartbeat service. This
     // pins the mechanism the fix routes around; if coalescing semantics change,
@@ -274,7 +307,7 @@ describeEmbeddedPostgres("plugin agents.invoke wake fan-out", () => {
       requestedByActorId: "github-plugin-record-id",
     });
 
-    expect(run?.id).toBe(activeRunId);
+    expect(run?.id).toBe(priorRunId);
     const wakeups = await db
       .select()
       .from(agentWakeupRequests)
