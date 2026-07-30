@@ -1,7 +1,7 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvalComments, approvals } from "@paperclipai/db";
-import { notFound, unprocessable } from "../errors.js";
+import { conflict, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
@@ -251,6 +251,57 @@ export function approvalService(db: Db) {
         .where(eq(approvals.id, id))
         .returning()
         .then((rows) => rows[0]);
+    },
+
+    withdraw: async (
+      id: string,
+      reason: string,
+      actor: { userId?: string | null } = {},
+    ) => {
+      const existing = await getExistingApproval(id);
+      if (existing.status !== "pending") {
+        throw conflict("Only pending approvals can be withdrawn", {
+          approvalId: id,
+          status: existing.status,
+        });
+      }
+
+      const now = new Date();
+      // Status-guarded so a concurrent board decision wins rather than being
+      // silently overwritten by a withdrawal racing it.
+      const updated = await db
+        .update(approvals)
+        .set({
+          status: "withdrawn",
+          decisionNote: reason,
+          decidedByUserId: actor.userId ?? null,
+          decidedAt: now,
+          updatedAt: now,
+        })
+        .where(and(eq(approvals.id, id), eq(approvals.status, "pending")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (!updated) {
+        const latest = await getExistingApproval(id);
+        throw conflict("Only pending approvals can be withdrawn", {
+          approvalId: id,
+          status: latest.status,
+        });
+      }
+
+      // A hire_agent approval parks its agent in `pending_approval`. Rejecting
+      // terminates it; withdrawing must too, or the agent is stranded frozen
+      // with no remaining approval to decide it.
+      if (updated.type === "hire_agent") {
+        const payload = updated.payload as Record<string, unknown>;
+        const payloadAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
+        if (payloadAgentId) {
+          await agentsSvc.terminate(payloadAgentId);
+        }
+      }
+
+      return updated;
     },
 
     listComments: async (approvalId: string) => {

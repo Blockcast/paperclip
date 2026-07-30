@@ -167,3 +167,81 @@ describe("approvalService.findOpenHireApprovalForAgent", () => {
     expect(result).toBeNull();
   });
 });
+
+describe("approvalService.withdraw", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAgentService.terminate.mockResolvedValue(undefined);
+  });
+
+  it("marks a pending approval withdrawn and stores the reason", async () => {
+    const withdrawn = {
+      ...createApproval("withdrawn"),
+      type: "budget_override_required",
+      decisionNote: "cap already raised past the ask",
+    };
+    const dbStub = createDbStub([[createApproval("pending")]], [withdrawn]);
+
+    const svc = approvalService(dbStub.db as any);
+    const result = await svc.withdraw("approval-1", "cap already raised past the ask");
+
+    expect(result.status).toBe("withdrawn");
+    expect(result.decisionNote).toBe("cap already raised past the ask");
+  });
+
+  it("uses a terminal status distinct from rejected", async () => {
+    const withdrawn = { ...createApproval("withdrawn"), type: "budget_override_required" };
+    const dbStub = createDbStub([[createApproval("pending")]], [withdrawn]);
+
+    const svc = approvalService(dbStub.db as any);
+    const result = await svc.withdraw("approval-1", "moot");
+
+    expect(result.status).toBe("withdrawn");
+    expect(result.status).not.toBe("rejected");
+  });
+
+  it("throws 409 for an already-decided approval without mutating it", async () => {
+    const dbStub = createDbStub([[createApproval("approved")]], []);
+
+    const svc = approvalService(dbStub.db as any);
+    await expect(svc.withdraw("approval-1", "too late")).rejects.toMatchObject({
+      status: 409,
+    });
+    // Guard runs before any UPDATE is issued.
+    expect(dbStub.returning).not.toHaveBeenCalled();
+  });
+
+  it("throws 409 when a concurrent decision wins the status-guarded update", async () => {
+    // First select sees pending; the guarded UPDATE matches no row because
+    // another worker already decided it; the re-read reports the real status.
+    const dbStub = createDbStub(
+      [[createApproval("pending")], [createApproval("approved")]],
+      [],
+    );
+
+    const svc = approvalService(dbStub.db as any);
+    await expect(svc.withdraw("approval-1", "racing")).rejects.toMatchObject({
+      status: 409,
+    });
+  });
+
+  it("terminates the pending agent when a hire_agent approval is withdrawn", async () => {
+    // Otherwise the agent is stranded in pending_approval with no approval left to decide it.
+    const dbStub = createDbStub([[createApproval("pending")]], [createApproval("withdrawn")]);
+
+    const svc = approvalService(dbStub.db as any);
+    await svc.withdraw("approval-1", "hire no longer needed");
+
+    expect(mockAgentService.terminate).toHaveBeenCalledWith("agent-1");
+  });
+
+  it("does not terminate an agent for non-hire approval types", async () => {
+    const withdrawn = { ...createApproval("withdrawn"), type: "budget_override_required" };
+    const dbStub = createDbStub([[createApproval("pending")]], [withdrawn]);
+
+    const svc = approvalService(dbStub.db as any);
+    await svc.withdraw("approval-1", "moot");
+
+    expect(mockAgentService.terminate).not.toHaveBeenCalled();
+  });
+});

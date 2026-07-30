@@ -7,6 +7,7 @@ import {
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
+  withdrawApprovalSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import {
@@ -327,6 +328,39 @@ export function approvalRoutes(
       entityId: approval.id,
       details: { type: approval.type },
     });
+    res.json(redactApprovalPayload(approval));
+  });
+
+  router.post("/approvals/:id/withdraw", validate(withdrawApprovalSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
+    if (!existing) return;
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, existing.companyId))) return;
+
+    // Scoped exactly like resubmit: a requester may rescind its own ask, but
+    // never another agent's. Board actors retain full reach.
+    if (req.actor.type === "agent" && req.actor.agentId !== existing.requestedByAgentId) {
+      res.status(403).json({ error: "Only requesting agent can withdraw this approval" });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+    const reason = req.body.reason as string;
+    const approval = await svc.withdraw(id, reason, {
+      userId: actor.actorType === "user" ? actor.actorId : null,
+    });
+
+    await logActivity(db, {
+      companyId: approval.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      action: "approval.withdrawn",
+      entityType: "approval",
+      entityId: approval.id,
+      details: { type: approval.type, reason },
+    });
+
     res.json(redactApprovalPayload(approval));
   });
 
