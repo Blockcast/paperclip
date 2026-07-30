@@ -1,9 +1,9 @@
-// BLO-19001: is another live run already holding this issue?
+// BLO-19001: is another run already holding this issue?
 //
 // Two places need that answer, and they must agree:
 //
 //   1. Dispatch — startNextQueuedRunForAgent refuses to start a queued run
-//      whose issue already has a non-stale running sibling
+//      whose issue already has a running sibling
 //      (heartbeat.ts, "Per-issue dedupe").
 //   2. Self-selection — GET /agents/me/inbox-lite. An autonomous heartbeat run
 //      carries no contextSnapshot.issueId, so it slips past (1) entirely and
@@ -11,17 +11,18 @@
 //      one a sibling run of the same agent is already working; under a shared
 //      worktree both then edit one tree and one can delete the other's state.
 //
-// A duplicated staleness threshold is how these two drift apart, so the
-// canonical definition lives here and heartbeat.ts imports it.
+// Use the conservative ownership answer here: while the DB says a sibling run
+// is running, do not hand the same issue to another autonomous run. A silent
+// external Kubernetes Job can still be active and editing its worktree.
 //
-// Note: this is about wall-clock *holding* of an issue. It is unrelated to
-// run-liveness.ts, which classifies whether a finished run's output was
-// actionable.
+// Note: this is about issue/worktree ownership. It is distinct from heartbeat
+// slot accounting and run-liveness.ts, which classify capacity and whether a
+// finished run's output was actionable.
 
 /**
- * A run is treated as stale once it has been silent this long. Only a non-stale
- * run holds its issue: a run whose Job died without writing a terminal status
- * must not keep the issue locked forever.
+ * A run is treated as stale for heartbeat slot accounting once it has been
+ * silent this long. Do not use this as issue/worktree ownership authority:
+ * external jobs can be quiet while still editing their workspace.
  */
 export const RUN_STALE_SILENCE_MS = 15 * 60 * 1000;
 
@@ -50,28 +51,24 @@ export function runLastSignalMs(run: ActiveRunSignals): number | null {
 }
 
 /**
- * True when the run is `running` and has shown a sign of life inside the
- * staleness window.
+ * True when the run is `running`.
  *
  * A `queued` run is deliberately not holding: it has not started, owns no
  * worktree, and dispatch already cancels it if a running sibling claims the
  * issue first. Treating queued as holding would hide large amounts of ordinary
  * work from the inbox.
  *
- * A `running` row with no signal at all is treated as stale, not live — it is
- * indistinguishable from a run whose process died during startup, and holding
- * an issue on that basis strands it.
+ * A `running` row with no signal at all still holds the issue. Silence alone is
+ * not proof that an external runtime lost ownership; takeover needs a terminal
+ * run or an authoritative lifecycle check outside this helper.
  */
-export function isRunHoldingIssue(run: ActiveRunSignals, nowMs: number): boolean {
-  if (run.status !== "running") return false;
-  const signalMs = runLastSignalMs(run);
-  if (signalMs == null) return false;
-  return signalMs >= nowMs - RUN_STALE_SILENCE_MS;
+export function isRunHoldingIssue(run: ActiveRunSignals, _nowMs: number): boolean {
+  return run.status === "running";
 }
 
 /**
- * Whether an issue must be withheld from the caller because a *different* live
- * run already holds it.
+ * Whether an issue must be withheld from the caller because a *different*
+ * running run already holds it.
  *
  * Fails OPEN when `callerRunId` is absent: a caller that sent no
  * x-paperclip-run-id gets the unfiltered list. Failing closed would hide an

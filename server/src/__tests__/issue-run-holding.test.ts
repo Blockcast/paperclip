@@ -61,11 +61,11 @@ describe("isRunHoldingIssue", () => {
     expect(isRunHoldingIssue(runAt(60_000), NOW)).toBe(true);
   });
 
-  it("stops holding once silent past the staleness window", () => {
-    expect(isRunHoldingIssue(runAt(RUN_STALE_SILENCE_MS + 1_000), NOW)).toBe(false);
+  it("keeps holding a running run past the heartbeat staleness window", () => {
+    expect(isRunHoldingIssue(runAt(RUN_STALE_SILENCE_MS + 1_000), NOW)).toBe(true);
   });
 
-  it("still holds exactly at the staleness boundary", () => {
+  it("holds exactly at the heartbeat staleness boundary", () => {
     expect(isRunHoldingIssue(runAt(RUN_STALE_SILENCE_MS), NOW)).toBe(true);
   });
 
@@ -79,12 +79,10 @@ describe("isRunHoldingIssue", () => {
     }
   });
 
-  it("does not hold a running row that never emitted any signal", () => {
-    // Indistinguishable from a run whose process died during startup; holding
-    // the issue on that basis would strand it.
-    expect(
-      isRunHoldingIssue({ id: OTHER, status: "running", startedAt: null }, NOW),
-    ).toBe(false);
+  it("holds a running row that has not emitted a timestamp signal", () => {
+    expect(isRunHoldingIssue({ id: OTHER, status: "running", startedAt: null }, NOW)).toBe(
+      true,
+    );
   });
 
   it("counts a fresh lastUsefulActionAt even when startedAt is long past", () => {
@@ -123,14 +121,14 @@ describe("isIssueHeldByForeignRun", () => {
     }
   });
 
-  it("releases a stale foreign run so its issue can be picked up again", () => {
+  it("withholds a stale-looking foreign run while it is still marked running", () => {
     expect(
       isIssueHeldByForeignRun({
         activeRun: runAt(RUN_STALE_SILENCE_MS + 1_000),
         callerRunId: CALLER,
         nowMs: NOW,
       }),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("does not withhold when there is no active run", () => {
