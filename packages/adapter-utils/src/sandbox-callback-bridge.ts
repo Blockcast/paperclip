@@ -384,8 +384,14 @@ export function createFileSystemSandboxCallbackBridgeQueueClient(): SandboxCallb
     },
     readTextFile: async (remotePath) => await fs.readFile(remotePath, "utf8"),
     writeTextFile: async (remotePath, body) => {
+      const tempPath = `${remotePath}.tmp`;
       await fs.mkdir(path.posix.dirname(remotePath), { recursive: true });
-      await fs.writeFile(remotePath, body, "utf8");
+      try {
+        await fs.writeFile(tempPath, body, "utf8");
+        await fs.rename(tempPath, remotePath);
+      } finally {
+        await fs.rm(tempPath, { force: true }).catch(() => undefined);
+      }
     },
     writeResponseFile: async (responsePath, body, options = {}) => {
       const responseDir = path.posix.dirname(responsePath);
@@ -514,30 +520,35 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
     },
     writeTextFile: async (remotePath, body) => {
       const remoteDir = path.posix.dirname(remotePath);
-      const tempPath = `${remotePath}.paperclip-upload.b64`;
-      const decodedTempPath = `${remotePath}.paperclip-upload.tmp`;
+      // Staging names are per-invocation: two callers writing the same
+      // destination concurrently must not share a scratch file, or one
+      // decode can clobber the other's half-appended base64.
+      const uploadToken = randomUUID();
+      const uploadPath = `${remotePath}.${uploadToken}.paperclip-upload.b64`;
+      const decodedPath = `${remotePath}.${uploadToken}.paperclip-upload.tmp`;
       await runChecked(
         `prepare upload ${remotePath}`,
-        [
-          `mkdir -p ${shellQuote(remoteDir)}`,
-          `rm -f ${shellQuote(tempPath)} ${shellQuote(decodedTempPath)}`,
-          `: > ${shellQuote(tempPath)}`,
-        ].join(" && "),
+        `mkdir -p ${shellQuote(remoteDir)} && rm -f ${shellQuote(uploadPath)} ${shellQuote(decodedPath)} && : > ${shellQuote(uploadPath)}`,
       );
       const base64Body = toBuffer(Buffer.from(body, "utf8")).toString("base64");
       for (const chunk of base64Chunks(base64Body)) {
         await runChecked(
           `append upload chunk ${remotePath}`,
-          `printf '%s' ${shellQuote(chunk)} >> ${shellQuote(tempPath)}`,
+          `printf '%s' ${shellQuote(chunk)} >> ${shellQuote(uploadPath)}`,
         );
       }
       await runChecked(
         `finalize upload ${remotePath}`,
         [
-          `base64 -d < ${shellQuote(tempPath)} > ${shellQuote(decodedTempPath)}`,
-          `mv -f ${shellQuote(decodedTempPath)} ${shellQuote(remotePath)}`,
-          `rm -f ${shellQuote(tempPath)}`,
-        ].join(" && "),
+          `base64 -d < ${shellQuote(uploadPath)} > ${shellQuote(decodedPath)}`,
+          "status=$?",
+          'if [ "$status" -eq 0 ]; then',
+          `  mv -f ${shellQuote(decodedPath)} ${shellQuote(remotePath)}`,
+          "  status=$?",
+          "fi",
+          `rm -f ${shellQuote(uploadPath)} ${shellQuote(decodedPath)}`,
+          'exit "$status"',
+        ].join("\n"),
       );
     },
     writeResponseFile: async (responsePath, body, options = {}) => {

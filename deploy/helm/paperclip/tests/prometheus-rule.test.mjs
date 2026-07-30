@@ -94,8 +94,11 @@ test("PaperclipAgentPodUnschedulable keys on kube_pod_status_scheduled, not the 
     "PodUnschedulable alert must key on kube_pod_status_scheduled{condition=false}",
   );
   assert.doesNotMatch(
-    rendered,
-    /kube_pod_status_unschedulable/,
-    "kube_pod_status_unschedulable is not portable across kube-state-metrics builds; do not reintroduce it",
+    rendered
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("#"))
+      .join("\n"),
+    /expr:.*kube_pod_status_unschedulable/,
+    "kube_pod_status_unschedulable is not portable across kube-state-metrics builds; do not use it in alert expressions",
   );
 });

@@ -168,7 +168,13 @@ WORKDIR /vendor
 # production pin cd52a58. Adds Claude Opus 5, Claude Opus 5 1M, and Bedrock
 # Opus 5 model catalog entries without bundling later retry-semantics changes.
 # Focused models suite and typecheck pass.
-ARG CLAUDE_K8S_REF=c4f92ffcafbd6b286b291d0ad2e49557401d884d
+# Bumped 2026-07-29 to c9b3b2c: start run-isolated claude_k8s Jobs from the
+# stable run root before deleting/recloning the per-run workspace. Starting in
+# that workspace invalidated the shell cwd and made Git fail with getcwd() /
+# index-pack errors. Also appends a redacted failed-pod container log tail to
+# partial-run errors. PR kkroo/paperclip-adapter-claude-k8s#28; focused
+# execute/job-manifest suite 230/230 and typecheck pass.
+ARG CLAUDE_K8S_REF=c9b3b2c1c979d2db121f0c1129a06a38356678e7
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
