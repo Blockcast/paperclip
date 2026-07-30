@@ -2,7 +2,7 @@ import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvals, issueApprovals, issues } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
-import { redactEventPayload } from "../redaction.js";
+import { redactAgentConfigPayload } from "../redaction.js";
 
 interface LinkActor {
   agentId?: string | null;
@@ -66,7 +66,9 @@ export function issueApprovalService(db: Db) {
         .orderBy(desc(issueApprovals.createdAt));
       return result.map((approval) => ({
         ...approval,
-        payload: redactEventPayload(approval.payload) ?? {},
+        // hire_agent payloads embed an agent config; use the structural
+        // redactor so nested env bindings stay masked (BLO-18969).
+        payload: redactAgentConfigPayload(approval.payload) ?? {},
       }));
     },
 

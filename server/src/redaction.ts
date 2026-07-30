@@ -58,14 +58,62 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
-function sanitizeValue(value: unknown): unknown {
+/**
+ * `agentConfig` switches on the structural rules described on
+ * {@link redactAgentConfigPayload}. Off (the default) keeps the generic
+ * key-name behaviour every other event payload relies on.
+ */
+type SanitizeOptions = { agentConfig?: boolean };
+
+/**
+ * A `secret_ref` / `user_secret_ref` binding is a pointer, and neither
+ * `envBindingSecretRefSchema` nor `envBindingUserSecretRefSchema` has a `value`
+ * field. So a `value` on one only ever means a resolved plaintext secret rode
+ * along, whatever its `projectionClass` claims — drop it (BLO-18969 AC3).
+ */
+function stripResolvedSecretValue(binding: Record<string, unknown>): Record<string, unknown> {
+  if (!("value" in binding)) return binding;
+  const { value: _resolved, ...pointer } = binding;
+  return pointer;
+}
+
+function sanitizeValue(value: unknown, options?: SanitizeOptions): unknown {
   if (value === null || value === undefined) return value;
-  if (Array.isArray(value)) return value.map(sanitizeValue);
-  if (isSecretRefBinding(value)) return value;
-  if (isUserSecretRefBinding(value)) return value;
-  if (isPlainBinding(value)) return { type: "plain", value: sanitizeValue(value.value) };
+  if (Array.isArray(value)) return value.map((entry) => sanitizeValue(entry, options));
+  if (isSecretRefBinding(value) || isUserSecretRefBinding(value)) {
+    return options?.agentConfig ? stripResolvedSecretValue(value) : value;
+  }
+  if (isPlainBinding(value)) {
+    // In an agent config a plain binding IS credential material, by
+    // construction — the key it hangs off tells us nothing.
+    return options?.agentConfig
+      ? { type: "plain", value: REDACTED_EVENT_VALUE }
+      : { type: "plain", value: sanitizeValue(value.value, options) };
+  }
   if (!isPlainObject(value)) return value;
-  return sanitizeRecord(value);
+  return sanitizeRecord(value, options);
+}
+
+/**
+ * Every value of an `env` map is credential-bearing regardless of its key, so
+ * mask the value and keep the shape: a binding stays a binding (the UI renders
+ * it, and the write path restores it on round-trip), a legacy bare string —
+ * still accepted by `envBindingSchema` — becomes the sentinel string.
+ */
+function sanitizeAgentEnvRecord(record: Record<string, unknown>): Record<string, unknown> {
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (isSecretRefBinding(value) || isUserSecretRefBinding(value)) {
+      redacted[key] = stripResolvedSecretValue(value);
+      continue;
+    }
+    if (isPlainBinding(value)) {
+      redacted[key] = { type: "plain", value: REDACTED_EVENT_VALUE };
+      continue;
+    }
+    redacted[key] = typeof value === "string" ? REDACTED_EVENT_VALUE : sanitizeValue(value, { agentConfig: true });
+  }
+  return redacted;
 }
 
 function isSecretRefBinding(value: unknown): value is { type: "secret_ref"; secretId: string; version?: unknown } {
@@ -99,9 +147,13 @@ function sanitizeCommandArgs(args: unknown[]): unknown[] {
   });
 }
 
-export function sanitizeRecord(record: Record<string, unknown>): Record<string, unknown> {
+export function sanitizeRecord(record: Record<string, unknown>, options?: SanitizeOptions): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
+    if (options?.agentConfig && key === "env" && isPlainObject(value)) {
+      redacted[key] = sanitizeAgentEnvRecord(value);
+      continue;
+    }
     if (COMMAND_ARGS_PAYLOAD_KEY_RE.test(key) && Array.isArray(value)) {
       redacted[key] = sanitizeCommandArgs(value);
       continue;
@@ -112,11 +164,11 @@ export function sanitizeRecord(record: Record<string, unknown>): Record<string, 
     }
     if (SECRET_PAYLOAD_KEY_RE.test(key)) {
       if (isSecretRefBinding(value)) {
-        redacted[key] = sanitizeValue(value);
+        redacted[key] = sanitizeValue(value, options);
         continue;
       }
       if (isUserSecretRefBinding(value)) {
-        redacted[key] = sanitizeValue(value);
+        redacted[key] = sanitizeValue(value, options);
         continue;
       }
       if (isPlainBinding(value)) {
@@ -130,7 +182,7 @@ export function sanitizeRecord(record: Record<string, unknown>): Record<string, 
       redacted[key] = REDACTED_EVENT_VALUE;
       continue;
     }
-    redacted[key] = sanitizeValue(value);
+    redacted[key] = sanitizeValue(value, options);
   }
   return redacted;
 }
@@ -139,6 +191,32 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
   if (!payload) return null;
   if (!isPlainObject(payload)) return payload;
   return sanitizeRecord(payload);
+}
+
+/**
+ * Stricter sibling of {@link redactEventPayload} for anything that embeds an
+ * agent configuration: `adapterConfig`, `runtimeConfig`, a config-revision
+ * snapshot, or a hire-approval payload.
+ *
+ * `redactEventPayload` decides what to mask from the key's *name*, which is the
+ * wrong test here. A `{type:"plain",value}` binding in an agent config is
+ * credential material by construction, so an ordinary-looking key kept its
+ * plaintext on the wire — `runtimeConfig.modelProfiles.*.adapterConfig.env`
+ * entries such as `SIGNING_MATERIAL`, or a bare `FOO`, were echoed verbatim
+ * (BLO-18969).
+ *
+ * Two structural rules, applied at any depth, on top of the generic ones:
+ *  - every `{type:"plain",value}` binding is masked;
+ *  - every value of an `env` map is masked, covering the legacy bare-string
+ *    form that `envBindingSchema` still accepts.
+ *
+ * `secret_ref` / `user_secret_ref` bindings stay readable — they are pointers —
+ * but lose any resolved `value`.
+ */
+export function redactAgentConfigPayload(payload: unknown): Record<string, unknown> | null {
+  if (!payload) return null;
+  if (!isPlainObject(payload)) return payload as Record<string, unknown> | null;
+  return sanitizeRecord(payload, { agentConfig: true });
 }
 
 export function redactSensitiveText(input: string): string {
