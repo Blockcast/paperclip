@@ -127,26 +127,68 @@ App: close the PR, then re-create it from the *same branch and SHA* with the
 default credential (GitHub permits only one open PR per head/base, so the close
 must come first). No force-push and no CI re-plumbing is needed.
 
+Closing is the destructive step, so everything the replacement needs must be
+captured and re-validated *before* it, and any failure after it must put the
+original PR back. Two ways this goes wrong if you improvise it: the branch moves
+between capture and re-create, so the "same SHA" promise silently breaks; or
+`gh pr create` fails and leaves the branch with the review artifact closed and
+no replacement open.
+
 ```sh
-# Capture head, base, title and body BEFORE closing — a closed PR is still
-# readable, but reconstructing these by hand is how a re-opened PR silently
-# acquires a different base (and so a different diff and a different check set).
+REPO=<org>/<repo>
+NUM=<number>
+
+# Capture head, base, title, body AND the exact head SHA BEFORE closing.
 # Never assume `master`: stacked PRs and repos with another default branch
-# target something else.
-gh pr view <number> --repo <org>/<repo> \
-  --json headRefName,baseRefName,title,body > /tmp/pr-<number>.json
+# target something else. Reconstructing any of this by hand is how a re-opened
+# PR silently acquires a different base — a different diff and check set.
+gh pr view "$NUM" --repo "$REPO" \
+  --json headRefName,baseRefName,headRefOid,title,body > "/tmp/pr-$NUM.json"
 
-gh pr close <number> --repo <org>/<repo>
+HEAD_REF="$(jq -r .headRefName "/tmp/pr-$NUM.json")"
+ORIG_SHA="$(jq -r .headRefOid  "/tmp/pr-$NUM.json")"
+BASE_REF="$(jq -r .baseRefName "/tmp/pr-$NUM.json")"
 
-gh pr create --repo <org>/<repo> \
-  --head  "$(jq -r .headRefName /tmp/pr-<number>.json)" \
-  --base  "$(jq -r .baseRefName /tmp/pr-<number>.json)" \
-  --title "$(jq -r .title       /tmp/pr-<number>.json)" \
-  --body  "$(jq -r .body        /tmp/pr-<number>.json)"
+# Re-validate the SHA against the remote immediately before closing, and abort
+# instead of closing on a mismatch: if the branch has moved, the replacement PR
+# would open on a head nobody reviewed. Ask GitHub, not the local checkout —
+# a stale local ref would confirm the wrong thing.
+REMOTE_SHA="$(gh api "repos/$REPO/git/ref/heads/$HEAD_REF" --jq .object.sha)"
+if [ "$REMOTE_SHA" != "$ORIG_SHA" ]; then
+  echo "abort: origin/$HEAD_REF is $REMOTE_SHA, expected $ORIG_SHA" >&2
+  exit 1
+fi
+
+gh pr close "$NUM" --repo "$REPO"
+
+# From here the original is closed, so every failure path reopens it.
+NEW_URL="$(gh pr create --repo "$REPO" \
+  --head  "$HEAD_REF" \
+  --base  "$BASE_REF" \
+  --title "$(jq -r .title "/tmp/pr-$NUM.json")" \
+  --body  "$(jq -r .body  "/tmp/pr-$NUM.json")")" || {
+  echo "create failed; reopening $NUM" >&2
+  gh pr reopen "$NUM" --repo "$REPO"
+  exit 1
+}
+
+# Verification is part of the recovery, not a follow-up step: a replacement on a
+# different head or base is not a recovery, and leaving it open while the
+# original stays closed is worse than not having tried.
+NEW_NUM="${NEW_URL##*/}"
+if [ "$(gh pr view "$NEW_NUM" --repo "$REPO" --json headRefOid --jq .headRefOid)" != "$ORIG_SHA" ] ||
+   [ "$(gh pr view "$NEW_NUM" --repo "$REPO" --json baseRefName --jq .baseRefName)" != "$BASE_REF" ]; then
+  echo "abort: #$NEW_NUM does not match $ORIG_SHA onto $BASE_REF; reopening $NUM" >&2
+  gh pr close "$NEW_NUM" --repo "$REPO"
+  gh pr reopen "$NUM" --repo "$REPO"
+  exit 1
+fi
+
+echo "recovered $NUM -> $NEW_NUM at $ORIG_SHA onto $BASE_REF"
 ```
 
-Confirm the new PR reports the same `baseRefName` and `headRefOid` as the old one
-before you treat the recovery as done.
+The recovery is done only when that final check passes. If it aborted, you are
+back on the original PR with nothing lost — diagnose before retrying.
 
 Pushing under the seat is also unsafe where branch protection sets
 `require_last_push_approval` — the most recent pusher cannot approve, so a

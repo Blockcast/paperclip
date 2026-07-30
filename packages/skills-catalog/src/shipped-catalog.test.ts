@@ -37,6 +37,62 @@ const SKILL_FRONTMATTER_ROOTS = [
   path.join(REPO_ROOT, "packages/teams-catalog/catalog"),
 ];
 
+const GITHUB_PR_WORKFLOW_SKILL = new URL(
+  "../catalog/bundled/software-development/github-pr-workflow/SKILL.md",
+  import.meta.url,
+);
+
+/** Fence info strings whose contents a reader is expected to actually run. */
+const EXECUTABLE_FENCE_INFO = new Set(["sh", "bash", "shell", "zsh", "console", "shell-session"]);
+
+/**
+ * Operations whose credential must stay the default App token: they author,
+ * publish, or formally review a PR.
+ */
+const AUTHORING_COMMAND_PATTERNS = [
+  { name: "git push", pattern: /\bgit\s+push\b/ },
+  { name: "gh pr create", pattern: /\bgh\s+pr\s+create\b/ },
+  { name: "gh pr merge", pattern: /\bgh\s+pr\s+merge\b/ },
+  { name: "gh pr review", pattern: /\bgh\s+pr\s+review\b/ },
+];
+
+/**
+ * Any attempt to point git/gh at a non-default credential. The agent image's
+ * `gh` wrapper re-reads `PAPERCLIP_GITHUB_TOKEN_FILE` on every invocation, so a
+ * token file is the only selector that works — but `GH_TOKEN`, `--with-token`
+ * and `gh auth` recipes are rejected too: they silently do *nothing* in these
+ * pods, so documenting one next to an authoring command is a bug either way.
+ */
+const CREDENTIAL_SELECTOR_PATTERNS = [
+  { name: "token-file selection", pattern: /PAPERCLIP_GITHUB_TOKEN_FILE\s*=/ },
+  { name: "literal seat-token path", pattern: /github-merge-token/ },
+  { name: "GH_TOKEN assignment", pattern: /\bGH_TOKEN\s*=/ },
+  { name: "GITHUB_TOKEN assignment", pattern: /\bGITHUB_TOKEN\s*=/ },
+  { name: "gh auth --with-token", pattern: /--with-token\b/ },
+  { name: "gh auth login/switch", pattern: /\bgh\s+auth\s+(?:login|switch)\b/ },
+];
+
+/** Fenced blocks in a Markdown document, with info string and 1-based opening line. */
+function fencedBlocks(markdown: string): { info: string; body: string; line: number }[] {
+  const blocks: { info: string; body: string; line: number }[] = [];
+  let open: { info: string; line: number; body: string[] } | null = null;
+
+  for (const [index, line] of markdown.split(/\r?\n/).entries()) {
+    const fence = /^\s*```(.*)$/.exec(line);
+    if (!fence) {
+      open?.body.push(line);
+      continue;
+    }
+    if (open) {
+      blocks.push({ info: open.info, body: open.body.join("\n"), line: open.line });
+      open = null;
+    } else {
+      open = { info: fence[1]!.trim().toLowerCase(), line: index + 1, body: [] };
+    }
+  }
+  return blocks;
+}
+
 function listSkillFiles(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
     const entryPath = path.join(dir, entry.name);
@@ -196,21 +252,69 @@ describe("shipped skills catalog", () => {
   });
 
   it("authors PRs under the App token and never under the user seat", async () => {
-    const content = await readFile(
-      new URL("../catalog/bundled/software-development/github-pr-workflow/SKILL.md", import.meta.url),
-      "utf8",
-    );
+    const content = await readFile(GITHUB_PR_WORKFLOW_SKILL, "utf8");
 
     // The review bot's formal APPROVE comes from the `allyblockcast` user seat, so a
     // seat-authored PR makes author == approver and can never clear `review/ally-complete`.
     expect(content).toContain("Author and push under the default App token.");
     expect(content).not.toContain("author your PR under it");
-    expect(content).not.toContain('PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE"');
 
     // The seat is not a reviewing credential either.
     expect(content).toContain("Never submit a formal review under the user-seat token.");
+  });
 
-    // The wrapped `gh` overrides GH_TOKEN from a token file, so setting it selects nothing.
-    expect(content).not.toContain('GH_TOKEN="$AUTHOR_TOKEN"');
+  it("never selects a non-default credential in an authoring or review recipe", async () => {
+    const content = await readFile(GITHUB_PR_WORKFLOW_SKILL, "utf8");
+
+    const authoringBlocks = fencedBlocks(content)
+      .filter((block) => EXECUTABLE_FENCE_INFO.has(block.info))
+      .filter((block) => AUTHORING_COMMAND_PATTERNS.some(({ pattern }) => pattern.test(block.body)));
+
+    // Anti-vacuity guard: if the fence extractor or the fence languages drift, the
+    // scan below would "pass" having inspected nothing. Pin that it found recipes.
+    expect(
+      authoringBlocks.length,
+      "expected >=1 shell fence running git push / gh pr create|merge|review",
+    ).toBeGreaterThan(0);
+
+    // Structural, not string-matched: any spelling of credential selection next to
+    // an authoring command fails, so seat authoring cannot return under a renamed
+    // variable or a literal token path.
+    const violations = authoringBlocks.flatMap((block) => {
+      const commands = AUTHORING_COMMAND_PATTERNS.filter(({ pattern }) => pattern.test(block.body))
+        .map(({ name }) => name)
+        .join(", ");
+      return CREDENTIAL_SELECTOR_PATTERNS.filter(({ pattern }) => pattern.test(block.body)).map(
+        ({ name }) => `fence at line ${block.line} (${commands}): ${name}`,
+      );
+    });
+
+    expect(violations).toEqual([]);
+  });
+
+  it("keeps the seat-authored PR recovery SHA-preserving and failure-safe", async () => {
+    const content = await readFile(GITHUB_PR_WORKFLOW_SKILL, "utf8");
+
+    const recovery = fencedBlocks(content)
+      .filter((block) => EXECUTABLE_FENCE_INFO.has(block.info))
+      .find((block) => /\bgh\s+pr\s+close\b/.test(block.body));
+    expect(recovery, "expected a shell fence recovering a seat-authored PR").toBeDefined();
+    if (!recovery) return;
+
+    const closeIndex = recovery.body.search(/\bgh\s+pr\s+close\b/);
+    const beforeClose = recovery.body.slice(0, closeIndex);
+    const afterClose = recovery.body.slice(closeIndex);
+
+    // Closing is destructive, so the head SHA must be captured AND re-validated
+    // against the remote before it — otherwise a branch that moved between
+    // capture and re-create silently reopens on a head nobody reviewed.
+    expect(beforeClose).toMatch(/--json[^\n]*headRefOid/);
+    expect(beforeClose).toMatch(/git\/ref\/heads/);
+    expect(beforeClose).toMatch(/\bexit\s+1\b/);
+
+    // Every failure path after the close must put the original PR back, so a
+    // failed create never leaves the branch with no open review artifact.
+    expect(afterClose).toMatch(/\bgh\s+pr\s+reopen\b/);
+    expect(afterClose).toMatch(/\bgh\s+pr\s+create\b/);
   });
 });
