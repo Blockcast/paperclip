@@ -12,10 +12,35 @@
 # so non-agent uses of the image (or a build where the secret was never
 # mounted) are unaffected — this is not a hard dependency on the file
 # existing.
+#
+# A second, volume-free delivery path exists for credentials bound per-agent
+# rather than mounted fleet-wide: see PAPERCLIP_GITHUB_TOKEN_VALUE below.
 set -eu
 
 TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
 REAL_GH="${GH_TOKEN_WRAPPER_REAL_GH:-/usr/bin/gh.real}"
+
+# PAPERCLIP_GITHUB_TOKEN_VALUE carries a token *value* rather than a path, for
+# credentials delivered by the scoped secret-binding path (per-agent /
+# per-project env bindings) instead of by a mounted secret volume. It exists so
+# a credential can be given to specific agents without mounting it into every
+# agent pod: the k8s adapters propagate every main-container secret volume into
+# every Job pod with no agent or tenant filter (BLO-18927, BLO-18970), so a
+# volume-delivered secret is necessarily fleet-wide.
+#
+# Precedence: value > file. Both are *explicit caller selections* of an identity
+# for one invocation — the same trust model the FILE variable already had, since
+# a caller could always point that at a file it wrote. This is deliberately NOT
+# GH_TOKEN: the override below must keep clobbering GH_TOKEN unconditionally
+# (BLO-13241), so GH_TOKEN cannot double as an input without reopening that bug.
+if [ -n "${PAPERCLIP_GITHUB_TOKEN_VALUE:-}" ]; then
+  TOKEN="$(printf '%s' "${PAPERCLIP_GITHUB_TOKEN_VALUE}" | tr -d '\r\n')"
+  if [ -n "${TOKEN}" ]; then
+    export GH_TOKEN="${TOKEN}"
+    export GITHUB_TOKEN="${TOKEN}"
+  fi
+  exec "${REAL_GH}" "$@"
+fi
 
 if [ -r "${TOKEN_FILE}" ]; then
   TOKEN="$(tr -d '\r\n' < "${TOKEN_FILE}" 2>/dev/null || true)"
