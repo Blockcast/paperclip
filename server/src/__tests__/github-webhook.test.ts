@@ -25,6 +25,7 @@ import {
   __test_buildIssueBackLinkBody,
   __test_buildPrReviewerTaskKey,
   __test_buildPrReviewerWakeIdempotencyKey,
+  __test_buildPrReviewFeedbackComment,
   __test_commentsContainBackLinkMarker,
   __test_extractPaperclipIdentifiers,
   __test_hasActionablePrReviewFeedback,
@@ -3578,6 +3579,102 @@ describe("hasActionablePrReviewFeedback — reviewer taxonomy", () => {
   it("still suppresses a negation cue close to the match within the same sentence", () => {
     const body = "Clean pass, no changes requested at this time.";
     expect(__test_hasActionablePrReviewFeedback(body)).toBe(false);
+  });
+
+  // BLO-19067: Ally's APPROVED review on Network-Operator-Portal#591 read
+  // "Looks good. No Critical or Important issues found." The uncounted-heading
+  // branch matched the trailing "Important issues" mid-sentence, classified a
+  // clean approval as actionable, and bounced the PR back to its author.
+  it("does not treat a prose denial of findings as an uncounted findings heading", () => {
+    const body = [
+      "## Ally — Consolidated PR Review",
+      "",
+      "Looks good. No Critical or Important issues found.",
+      "",
+      "### Recommended Action",
+      "1. Merge after required CI completes.",
+    ].join("\n");
+    expect(__test_hasActionablePrReviewFeedback(body, "approved")).toBe(false);
+  });
+
+  it("still matches an uncounted findings heading behind list or emphasis decoration", () => {
+    expect(__test_hasActionablePrReviewFeedback("- Important Issues\n- Auth check bypassed.")).toBe(true);
+    expect(__test_hasActionablePrReviewFeedback("**Critical Issues**\nprobePort mismatch.")).toBe(true);
+  });
+});
+
+describe("PR review feedback comment heading (BLO-19067)", () => {
+  // The heading and the directive beneath it are the highest-salience text in
+  // the wake this comment produces. Hardcoding them to the changes-requested
+  // case told the author of an APPROVED PR to make another implementation
+  // pass; the resulting no-op push invalidates the approval and restarts a
+  // 2.2h CI suite.
+  const reviewPayload = (state: string, body: string) => ({
+    action: "submitted",
+    pull_request: {
+      number: 591,
+      title: "fix(nop): dynamic-service card spacing",
+      head: { ref: "fix/BLO-18833", sha: "1db166824d532cda20e321ebb26c6e4702e0dd32" },
+    },
+    review: {
+      body,
+      state,
+      html_url: "https://github.com/Blockcast/Network-Operator-Portal/pull/591#pullrequestreview-1",
+      user: { login: "allyblockcast" },
+    },
+    repository: { full_name: "Blockcast/Network-Operator-Portal" },
+  });
+
+  const commentFor = (state: string, body = "### Critical Issues (1)\n- probePort mismatch.") => {
+    const ctx = __test_resolveEventContext("pull_request_review", reviewPayload(state, body));
+    expect(ctx).not.toBeNull();
+    return __test_buildPrReviewFeedbackComment(ctx!);
+  };
+
+  it("titles an APPROVED review as approved, with no implementation-pass directive", () => {
+    const comment = commentFor("approved");
+    expect(comment).toContain("## Review Approved");
+    expect(comment).not.toContain("Changes Requested");
+    expect(comment).not.toContain("requires another implementation pass");
+    expect(comment).toContain("- State: approved");
+  });
+
+  it("titles a CHANGES_REQUESTED review as changes requested", () => {
+    const comment = commentFor("changes_requested");
+    expect(comment).toContain("## Changes Requested");
+    expect(comment).toContain("requires another implementation pass");
+    expect(comment).not.toContain("Review Approved");
+  });
+
+  it("distinguishes a COMMENTED review from both other states", () => {
+    const comment = commentFor("commented");
+    expect(comment).toContain("## Review Comments");
+    expect(comment).not.toContain("Changes Requested");
+    expect(comment).not.toContain("Review Approved");
+    expect(comment).not.toContain("requires another implementation pass");
+  });
+
+  it("keeps the changes-requested wording when no review state is present", () => {
+    // Body-heuristic path: an `issue_comment` review carries no formal state
+    // and only reaches this builder when the body already carries findings.
+    const ctx = __test_resolveEventContext("issue_comment", {
+      action: "created",
+      issue: {
+        number: 591,
+        pull_request: { url: "https://api.github.com/repos/Blockcast/Network-Operator-Portal/pulls/591" },
+        user: { login: "codex-bot" },
+      },
+      comment: {
+        id: 1,
+        body: "### Important Issues (1)\n\nI1: wrong route.",
+        html_url: "https://github.com/Blockcast/Network-Operator-Portal/pull/591#issuecomment-1",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/Network-Operator-Portal" },
+    });
+    expect(ctx).not.toBeNull();
+    const comment = __test_buildPrReviewFeedbackComment(ctx!);
+    expect(comment).toContain("## Changes Requested");
   });
 });
 
