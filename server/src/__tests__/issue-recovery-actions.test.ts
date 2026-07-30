@@ -25,6 +25,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { issueService } from "../services/issues.js";
 import { recoveryService } from "../services/recovery/service.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -2304,6 +2305,62 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       );
       const [reconciled] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
       expect(reconciled).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: coderId,
+      });
+    });
+
+    // Ally's review of PR #824: the sibling test above deliberately leaves the
+    // dead adopter holding the lock, so it never exercises what production
+    // actually does next. `clearCheckoutRunIfTerminal` nulls BOTH lock columns
+    // once the adopter is terminal (services/issues.ts) — after which
+    // `getCheckoutAdoptingRun` has no run id to resolve and returns null. The
+    // handover marker is still the newest run scoped to this issue and always
+    // will be, so without the successor-less branch every later sweep walks the
+    // same path and the no-run/no-lock guard skips the issue forever: a genuine
+    // strand that never gets recovered.
+    it("recovers the adopted issue after the adopter terminates and production cleanup clears the lock", async () => {
+      const { companyId, coderId, sourceIssueId, adoptingRunId } = await seedAdoptedCheckout({
+        adoptingRunStatus: "running",
+      });
+
+      const res = await request(createApp(agentActor(companyId, coderId, adoptingRunId)))
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send({ title: "Annotated while stalled" });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      // The adopter finishes NORMALLY — not the "died holding the lock" shape.
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date("2026-07-29T12:30:00.000Z") })
+        .where(eq(heartbeatRuns.id, adoptingRunId));
+
+      // Drive the real cleanup helper rather than nulling the columns by hand,
+      // so the test fails if that helper's clearing behaviour ever changes.
+      await expect(issueService(db).clearCheckoutRunIfTerminal(sourceIssueId)).resolves.toBe(true);
+      const [afterCleanup] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(afterCleanup).toMatchObject({ checkoutRunId: null, executionRunId: null });
+
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const result = await recovery.reconcileStrandedAssignedIssues();
+
+      // Recovered, not skipped: the assignee is woken to continue its own
+      // issue. The wake call is the signal rather than `continuationRequeued`,
+      // because the mocked `enqueueWakeup` returns null and the counter only
+      // moves on a truthy queue result.
+      expect(result).toMatchObject({ escalated: 0 });
+      expect(enqueueWakeup).toHaveBeenCalledWith(
+        coderId,
+        expect.objectContaining({
+          reason: "issue_continuation_needed",
+          payload: expect.objectContaining({ issueId: sourceIssueId }),
+        }),
+      );
+      // And still no escalation citing the handover marker as the cause.
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+      const [afterSweep] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(afterSweep).toMatchObject({
         status: "in_progress",
         assigneeAgentId: coderId,
       });

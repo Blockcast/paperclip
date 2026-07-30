@@ -4985,6 +4985,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      // Set when this issue's newest run is a handover marker whose successor
+      // can no longer be identified. Distinguishes "adopted, then the lock was
+      // cleaned up" from "this issue genuinely has no run history at all" —
+      // the no-run/no-lock guard below must skip only the latter.
+      let adoptionHandoverLostSuccessor = false;
       // BLO-18860: never judge an issue on a checkout-adoption cancellation.
       // The adopting run is by construction the assignee's own *live* run, so
       // this issue has continuity, not a lost execution path — but the
@@ -5011,6 +5016,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           result.skipped += 1;
           continue;
         }
+        // No successor run resolvable: the adopter went terminal and
+        // `clearCheckoutRunIfTerminal` (services/issues.ts) nulled BOTH lock
+        // columns, so `getCheckoutAdoptingRun` has no id left to look up. That
+        // is the ordinary cleanup sequence, not an anomaly. Record it — the
+        // handover marker stays the newest run scoped to this issue forever, so
+        // without this flag the no-run/no-lock guard below would skip the issue
+        // on this sweep and on every sweep after it, stranding for good an
+        // issue whose only crime was being adopted once.
+        adoptionHandoverLostSuccessor = !adoptingRun;
         latestRun = adoptingRun;
       }
       if (latestRun?.status === "succeeded" && await hasPersistedDurableWaitPath(issue)) {
@@ -5468,7 +5482,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
-      if (!latestRun && !issue.checkoutRunId && !issue.executionRunId) {
+      // No run evidence and no lock: nothing to recover from. A lost-successor
+      // handover is the exception — there the absence of both is the *result*
+      // of normal adoption cleanup, and the issue still needs a live path, so
+      // let it fall through to the continuation re-dispatch at the end.
+      if (
+        !latestRun &&
+        !issue.checkoutRunId &&
+        !issue.executionRunId &&
+        !adoptionHandoverLostSuccessor
+      ) {
         result.skipped += 1;
         continue;
       }
