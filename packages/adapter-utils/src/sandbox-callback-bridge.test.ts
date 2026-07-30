@@ -292,11 +292,18 @@ describe("sandbox callback bridge", () => {
       "utf8",
     );
 
+    let responseRaw: string | null = null;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      responseRaw = await readFile(path.posix.join(directories.responsesDir, "req-1.json"), "utf8")
+        .catch(() => null);
+      if (responseRaw) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
     await worker.stop({ drainTimeoutMs: 1_000 });
 
-    const response = JSON.parse(
-      await readFile(path.posix.join(directories.responsesDir, "req-1.json"), "utf8"),
-    ) as { status: number; body: string };
+    expect(responseRaw).toBeTruthy();
+    const response = JSON.parse(responseRaw!) as { status: number; body: string };
     expect(handled).toBe(0);
     expect(response.status).toBe(403);
     expect(JSON.parse(response.body)).toEqual({
