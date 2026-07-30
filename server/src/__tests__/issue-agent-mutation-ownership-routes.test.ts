@@ -1014,7 +1014,142 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.remove).not.toHaveBeenCalled();
   });
 
-  it("rejects non-mentioned peer agents from posting comments", async () => {    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+  // The comment route's current-execution-run short-circuit returns a bare
+  // `true`, discarding the decision reason. A previous owner whose stale
+  // execution lock still matches therefore reaches the route WITHOUT an
+  // allow_recovery_handoff_grant decision to key off, so the comment-only
+  // contract has to be resolved from the recovery row instead.
+  it("keeps the handoff comment-only when a stale execution lock bypasses the boundary decision", async () => {
+    const staleLockIssue = () => makeIssue({
+      status: "blocked",
+      assigneeAgentId: peerAgentId,
+      // Recovery moved the assignee to peerAgentId, but this run id is the
+      // previous owner's — the shape the current-run bypass matches on.
+      executionRunId: ownerRunId,
+      checkoutRunId: ownerRunId,
+    });
+    // Deny every boundary action: the ONLY way through is the current-run bypass.
+    const denyEverything = async (input: { action: string }) => ({
+      allowed: false,
+      action: input.action,
+      reason: "deny_missing_grant",
+      explanation: "Missing permission.",
+    });
+
+    mockIssueService.getById.mockResolvedValue(staleLockIssue());
+    mockAccessService.decide.mockImplementation(denyEverything);
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction() as never);
+
+    const commentRes = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Handoff evidence from the run that just lost the issue." });
+    expect(commentRes.status, JSON.stringify(commentRes.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    for (const transition of [{ reopen: true }, { resume: true }]) {
+      mockIssueService.addComment.mockClear();
+      mockIssueService.update.mockClear();
+      mockIssueService.getById.mockResolvedValue(staleLockIssue());
+      mockAccessService.decide.mockImplementation(denyEverything);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction() as never);
+
+      const res = await request(await createApp(ownerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Handoff plus a status grab.", ...transition });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Recovery handoff grant is comment-only");
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    }
+  });
+
+  // A comment-only grant must not become a review decision by another route:
+  // the in_review auto-approval branch transitions the issue to `done` and
+  // records an execution decision without ever consulting issue:mutate.
+  it("does not let a recovery handoff comment auto-approve an in_review issue", async () => {
+    const { normalizeIssueExecutionPolicy } = await import("../services/issue-execution-policy.js");
+    // The stage still names the previous owner as its reviewer, so the actor
+    // matches currentParticipant even though recovery moved the assignee away.
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          type: "review",
+          participants: [{ type: "agent", agentId: ownerAgentId }],
+        },
+      ],
+    })!;
+    const inReviewIssue = makeIssue({
+      status: "in_review",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: policy.stages[0].id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: ownerAgentId },
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+    const reviewBody = "## Review: APPROVED";
+    mockIssueService.getById.mockResolvedValue(inReviewIssue);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-recovery-handoff-approval",
+      issueId,
+      companyId,
+      body: reviewBody,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      authorAgentId: ownerAgentId,
+      authorUserId: null,
+    });
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction() as never);
+
+    const res = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: reviewBody });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+    // The comment lands; the state transition does not.
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // A transient lookup failure must not become a way to keep the transition:
+  // the comment still lands, the state change does not.
+  it("fails closed on a recovery-action lookup error, keeping the comment but refusing reopen", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+    mockIssueRecoveryActionService.getActiveForIssue.mockRejectedValue(new Error("database timeout"));
+
+    const commentRes = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Handoff evidence." });
+    expect(commentRes.status, JSON.stringify(commentRes.body)).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    mockIssueService.addComment.mockClear();
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+    mockIssueRecoveryActionService.getActiveForIssue.mockRejectedValue(new Error("database timeout"));
+
+    const reopenRes = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Handoff plus a status grab.", reopen: true });
+    expect(reopenRes.status, JSON.stringify(reopenRes.body)).toBe(403);
+    expect(reopenRes.body.error).toBe("Recovery handoff grant is comment-only");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-mentioned peer agents from posting comments", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: input.action === "issue:read",
       action: input.action,
       reason: input.action === "issue:read" ? "allow_explicit_grant" : "deny_missing_grant",

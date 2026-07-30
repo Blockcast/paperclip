@@ -1362,7 +1362,69 @@ describeEmbeddedPostgres("authorization service", () => {
     })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
   });
 
-  it("allows a mentioned non-assignee to comment when the mention author is the issue assignee", async () => {    const company = await createCompany(db, "MentionCommentAssigneeGrant");
+  it("lapses the recovery handoff grant when the issue is reassigned away from the recovery owner", async () => {
+    const company = await createCompany(db, "RecoveryHandoffReassigned");
+    const project = await createProject(db, company.id, "RecoveryHandoffReassignedTarget");
+    const previousOwner = await createAgent(db, company.id, { role: "engineer" });
+    const recoveryOwner = await createAgent(db, company.id, { role: "cto" });
+    const thirdAgent = await createAgent(db, company.id, { role: "qa" });
+    const issue = await createIssue(db, company.id, {
+      title: "Recovery-transferred then reassigned again",
+      projectId: project.id,
+      assigneeAgentId: recoveryOwner.id,
+    });
+
+    await db.insert(issueRecoveryActions).values({
+      companyId: company.id,
+      sourceIssueId: issue.id,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: recoveryOwner.id,
+      previousOwnerAgentId: previousOwner.id,
+      returnOwnerAgentId: previousOwner.id,
+      cause: "stranded_assigned_issue",
+      fingerprint: `fingerprint-${randomUUID()}`,
+      nextAction: "Hand the diagnosis to the recovery owner.",
+    });
+
+    const authorization = authorizationService(db);
+    const actor = { type: "agent", agentId: previousOwner.id, companyId: company.id, source: "agent_key" } as const;
+    const resourceFor = (assigneeAgentId: string) =>
+      ({
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        projectId: issue.projectId,
+        assigneeAgentId,
+        status: "blocked",
+      }) as const;
+
+    // Baseline: while the recovery owner still holds the issue, the channel is open.
+    await expect(authorization.decide({
+      actor,
+      action: "issue:comment",
+      resource: resourceFor(recoveryOwner.id),
+    })).resolves.toMatchObject({ allowed: true, reason: "allow_recovery_handoff_grant" });
+
+    // A second reassignment moves the issue to an agent the recovery action says
+    // nothing about. The action row is untouched and still names previousOwner,
+    // but the grant is bound to authoritative issue state, so it lapses rather
+    // than following the issue onto a third agent's plate.
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: thirdAgent.id })
+      .where(eq(issues.id, issue.id));
+
+    await expect(authorization.decide({
+      actor,
+      action: "issue:comment",
+      resource: resourceFor(thirdAgent.id),
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+  });
+
+  it("allows a mentioned non-assignee to comment when the mention author is the issue assignee", async () => {
+    const company = await createCompany(db, "MentionCommentAssigneeGrant");
     const allowedProject = await createProject(db, company.id, "MentionAssigneeAllowed");
     const targetProject = await createProject(db, company.id, "MentionAssigneeTarget");
     const assigneeAgent = await createAgent(db, company.id, { role: "coach" });

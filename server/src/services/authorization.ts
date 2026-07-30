@@ -1389,6 +1389,10 @@ export function authorizationService(db: Db) {
   //   * state-bounded — only while the recovery action is active/escalated.
   //     Resolving or cancelling it lapses the grant, and a resolved row can
   //     never be revived (`upsertSourceScoped` only ever updates an active row).
+  //   * owner-bound   — the row's `ownerAgentId` must still be the issue's
+  //     `assigneeAgentId`. A second reassignment away from the recovery owner
+  //     lapses the grant too, so the channel only ever exists between the agent
+  //     the issue was taken from and the agent currently holding it.
   //
   // `previousOwnerAgentId` is written server-side from `issues.assigneeAgentId`
   // under an advisory lock (`recovery/service.ts` ensureSourceScopedStranded-
@@ -1411,13 +1415,27 @@ export function authorizationService(db: Db) {
         kind: issueRecoveryActions.kind,
         cause: issueRecoveryActions.cause,
         ownerAgentId: issueRecoveryActions.ownerAgentId,
+        assigneeAgentId: issues.assigneeAgentId,
       })
       .from(issueRecoveryActions)
+      // Join authoritative issue state rather than trusting the recovery row
+      // alone: the row records who the transfer handed the issue to at the time
+      // it fired, which is not the same claim as "that agent still holds it".
+      .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
       .where(and(
         eq(issueRecoveryActions.companyId, input.companyId),
         eq(issueRecoveryActions.sourceIssueId, input.issueId),
         eq(issueRecoveryActions.previousOwnerAgentId, input.actorAgentId),
         inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+        // The transfer target must STILL be the assignee. Without this, a second
+        // reassignment (owner → some third agent) while the action stays active
+        // would leave the original previous owner holding a comment channel onto
+        // an issue neither of them owns any more; and an action kind that names
+        // an owner without itself moving `assigneeAgentId` would become a grant
+        // retroactively as soon as anything else reassigned the issue.
+        // NULL `ownerAgentId` also fails this comparison (SQL `NULL = x` is not
+        // true), which is the wanted outcome for board/system-owned rows.
+        eq(issues.assigneeAgentId, issueRecoveryActions.ownerAgentId),
       ))
       .limit(1);
     if (!row) return false;
@@ -1425,7 +1443,10 @@ export function authorizationService(db: Db) {
     // system-owned actions (null `ownerAgentId`) leave the assignee in place,
     // so the previous owner is still the assignee and `allow_self` already
     // covered it before we got here — such rows must not widen anything.
+    // Belt-and-braces after the join predicate above, which already excludes
+    // both shapes; keep it so the invariant survives a query rewrite.
     if (!row.ownerAgentId || row.ownerAgentId === input.actorAgentId) return false;
+    if (row.assigneeAgentId !== row.ownerAgentId) return false;
     logger.info({
       actorAgentId: input.actorAgentId,
       issueId: input.issueId,
