@@ -355,6 +355,18 @@ function assertExplicitPinnedWorktreeIssueRunnable(input: {
   }
 }
 
+function hasExplicitExecutionWorkspaceOverride(input: {
+  executionWorkspaceId?: string | null;
+  executionWorkspacePreference?: string | null;
+  executionWorkspaceSettings?: unknown;
+}) {
+  return (
+    input.executionWorkspaceId != null ||
+    input.executionWorkspacePreference != null ||
+    input.executionWorkspaceSettings != null
+  );
+}
+
 function readStringFromRecord(record: unknown, key: string) {
   if (!record || typeof record !== "object") return null;
   const value = (record as Record<string, unknown>)[key];
@@ -7112,12 +7124,9 @@ export function issueService(db: Db) {
         ...issueData
       } = data;
       const inheritStrategyOnly = executionWorkspaceInheritanceMode === "strategy_only";
-      const hasExplicitExecutionWorkspaceOverride =
-        issueData.executionWorkspaceId !== undefined ||
-        issueData.executionWorkspacePreference !== undefined ||
-        issueData.executionWorkspaceSettings !== undefined;
+      const hasExplicitWorkspaceOverride = hasExplicitExecutionWorkspaceOverride(issueData);
       const inheritedPreRealizationWorkspaceSettings =
-        inheritStrategyOnly && !hasExplicitExecutionWorkspaceOverride
+        inheritStrategyOnly && !hasExplicitWorkspaceOverride
           ? buildPreRealizationExecutionWorkspaceSettings(parent.executionWorkspaceSettings)
           : null;
       let child = await issueService(db).create(parent.companyId, {
@@ -7558,10 +7567,7 @@ export function issueService(db: Db) {
         const workspaceInheritanceIssueId = skipExecutionWorkspaceInheritance
           ? null
           : inheritExecutionWorkspaceFromIssueId ?? issueData.parentId ?? null;
-        const hasExplicitExecutionWorkspaceOverride =
-          issueData.executionWorkspaceId !== undefined ||
-          issueData.executionWorkspacePreference !== undefined ||
-          issueData.executionWorkspaceSettings !== undefined;
+        const hasExplicitWorkspaceOverride = hasExplicitExecutionWorkspaceOverride(issueData);
         if (workspaceInheritanceIssueId) {
           const workspaceSource = await getWorkspaceInheritanceIssue(tx, companyId, workspaceInheritanceIssueId);
           if (issueData.projectId == null && workspaceSource.projectId) {
@@ -7572,7 +7578,7 @@ export function issueService(db: Db) {
           }
           if (
             isolatedWorkspacesEnabled &&
-            !hasExplicitExecutionWorkspaceOverride &&
+            !hasExplicitWorkspaceOverride &&
             workspaceSource.executionWorkspaceId
           ) {
             const sourceWorkspace = await tx
@@ -7673,6 +7679,9 @@ export function issueService(db: Db) {
         //    and inference would instead quietly bind it to whichever project the
         //    assignee happens to lead. A caller who names a workspace mode has said
         //    something about where this runs; honour it and let the validation speak.
+        //    Nullable API payloads are not workspace intent: explicit null workspace
+        //    fields mean "no workspace override" and follow the same inference path as
+        //    omitted fields, matching `projectId: null` above.
         //    Intake sends none of these fields, so the fix still fires where it matters.
         //    Inert when `enableIsolatedWorkspaces` is off, and correctly so: create()
         //    deletes all three fields in that mode, so the flag is already false — and
@@ -7683,7 +7692,7 @@ export function issueService(db: Db) {
           issueData.assigneeAgentId &&
           issueData.parentId == null &&
           workspaceInheritanceIssueId == null &&
-          !hasExplicitExecutionWorkspaceOverride
+          !hasExplicitWorkspaceOverride
         ) {
           const ledProjects = await tx
             .select({ id: projects.id })

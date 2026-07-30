@@ -2996,6 +2996,54 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(issue.projectId).toBe(projectId);
   });
 
+  // Ally review (PR #811): API clients may serialize nullable workspace fields as null.
+  // Those nulls do not carry workspace intent and must not suppress the same root-create
+  // project inference that `projectId: null` uses.
+  it("BLO-18760: infers the led project when nullable workspace override fields are explicitly null", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Board-filed issue posting explicit null workspace fields",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      projectId: null,
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+      executionWorkspaceSettings: null,
+    });
+
+    expect(issue.projectId).toBe(projectId);
+  });
+
   // Ally review (PR #811): archival is the only exclusion, so an archived led project
   // must not be inferred even though it is the agent's sole lead.
   it("BLO-18760: excludes archived led projects from inference", async () => {
