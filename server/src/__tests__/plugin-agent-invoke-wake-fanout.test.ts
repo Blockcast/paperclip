@@ -61,7 +61,7 @@ describeEmbeddedPostgres("plugin agents.invoke wake fan-out", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-invoke-fanout-");
     db = createDb(tempDb.connectionString);
-    heartbeat = heartbeatService(db);
+    heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
   }, 20_000);
 
   afterEach(async () => {

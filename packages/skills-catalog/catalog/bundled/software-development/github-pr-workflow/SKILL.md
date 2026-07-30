@@ -109,18 +109,17 @@ approvals come from that very same login, which is exactly why you must never
 submit a review under it (see
 [Why the user seat must never post a review](#why-the-user-seat-must-never-post-a-review)).
 
-**When the user-seat token is mounted, author your PR under it** — push the
-branch and create the PR with it — and use it for the final merge too:
+**Even when the user-seat token is mounted, author your PR under the default
+App-installation token** — push the branch and create the PR without
+`PAPERCLIP_GITHUB_TOKEN_FILE`. Reserve the user-seat token for the final merge
+after the review checklist is satisfied:
 
 ```sh
 USER_TOKEN_FILE=/paperclip/.secrets/github-merge-token/token
 
-# push the branch + open the PR as the allyblockcast USER (formally reviewable)
-PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE" \
-  git -c http.https://github.com/.extraheader= \
-  push -u origin "$(git branch --show-current)"
-PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE" \
-  gh pr create --repo <org>/<repo> --title ... --body ...
+# push the branch + open the PR as app/allyblockcast[bot]
+git push -u origin "$(git branch --show-current)"
+gh pr create --repo <org>/<repo> --title ... --body ...
 
 # ... later, after the review checklist is satisfied:
 PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE" \
@@ -129,15 +128,14 @@ PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE" \
 
 The agent image wraps `gh` and deliberately replaces `GH_TOKEN` with the token
 read from `PAPERCLIP_GITHUB_TOKEN_FILE` on every invocation. Setting `GH_TOKEN`
-does not switch identities in these pods; select the user-seat token file as
-shown above. The same environment override reaches the `gh` credential helper
-used by `git push`.
+does not switch identities in these pods; select the user-seat token file only
+for the merge command shown above.
 
 Rules:
-- Use the **user-seat token** for the branch push, `gh pr create`, and
-  `gh pr merge`/auto-merge. Use the **default App token** for everything else
-  (comments, replies, status, reads) so the Paperclip↔GitHub integration keeps
-  working.
+- Use the **default App token** for the branch push, `gh pr create`, comments,
+  replies, status, and reads. Use the **user-seat token** only for
+  `gh pr merge`/auto-merge after checks are green and reviewer comments are
+  resolved.
 - **Never submit a formal review under the user-seat token.** No `gh pr review`
   with it — not `--approve`, not `--request-changes`, not `--comment`. Never post
   an `ally-verdict:` marker or a `Reviewed head: <sha>` line under it, on a review
