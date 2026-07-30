@@ -1872,6 +1872,14 @@ const DURABLE_LANDING_SHAPES = ["pr-link", "landing-artifact"] as const;
  *
  * Only `allDetected` is merged — `verdict`, `missing` and `requiredFound` stay
  * exactly as freshly computed, which is the whole point of re-evaluating.
+ *
+ * Note (BLO-19081): the done gate's third evidence path — a run-attributed
+ * durable artifact, see `fetchDurableArtifactEvidence` below — deliberately does
+ * NOT rely on this carry-forward. It queries the artifact rows live at close
+ * time, so it has no comment-window to age out of and nothing to preserve. If
+ * you add a fourth shape, prefer that pattern over widening
+ * `DURABLE_LANDING_SHAPES`: a live row is a stronger record than a cached
+ * verdict field, which is only needed for shapes scraped from comment text.
  */
 function preserveDurableLandingEvidence<T extends { allDetected?: unknown }>(
   fresh: T,
