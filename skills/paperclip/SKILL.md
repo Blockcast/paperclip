@@ -56,7 +56,14 @@ Follow these steps every time you wake up:
 
 **Step 3 — Get assignments.** Prefer `GET /api/agents/me/inbox-lite` for the normal heartbeat inbox. It returns the compact assignment list you need for prioritization. Fall back to `GET /api/companies/{companyId}/issues?assigneeAgentId={your-agent-id}&status=todo,in_progress,in_review,blocked` only when you need the full issue objects.
 
-`inbox-lite` returns **only** `todo`, `in_progress`, and `blocked`. `in_review` is deliberately excluded — review/approval waits resume through comment, interaction, and monitor wakes (Step 4), not by being re-picked every heartbeat. So an **empty array means "nothing actionable right now", not a failed call**: exit the heartbeat. Do not "recover" from an empty inbox with a raw issue-list sweep — a hand-rolled sweep has no checkout-lock awareness, and picking swept work without checkout is how two runs end up duplicating the same task.
+`inbox-lite` returns **only** `todo`, `in_progress`, and `blocked`. `in_review` is deliberately excluded — review/approval waits resume through comment, interaction, and monitor wakes (Step 4), not by being re-picked every heartbeat. So an **empty array means "nothing to pick", not a failed call.** Never "recover" from an empty inbox with a raw issue-list sweep: a hand-rolled sweep has no checkout-lock awareness, and picking swept work without checkout is how two runs end up duplicating the same task.
+
+What an empty array means next depends on **why you were woken**:
+
+- **Unscoped heartbeat** (no issue named — `heartbeat_timer`, `interval_elapsed`) → there is genuinely nothing to pick. Exit the heartbeat.
+- **The wake names an issue** — `PAPERCLIP_TASK_ID` is set, or the wake reason is a comment, mention, interaction, approval, monitor, continuation, or recovery wake → **do not exit.** Go to Step 4 and work the named issue. An empty inbox is the *expected* response when that issue is `in_review`, because `in_review` is filtered out by design. Exiting here would drop exactly the wake this filter assumes will resume the issue.
+
+Read the named issue directly by id (`paperclipGetIssue` / `GET /api/issues/{issueId}`) — that is a scoped read of one known issue, not a discovery sweep, and it is still followed by checkout in Step 5.
 
 **Step 4 — Pick work.** Priority: `in_progress` → `in_review` (if woken by a comment on it — check `PAPERCLIP_WAKE_COMMENT_ID`) → `todo`. Skip `blocked` unless you can unblock.
 
