@@ -5725,6 +5725,7 @@ export function issueRoutes(
       activeRecoveryAction,
       linkedCases,
       inboxArchiveFields,
+      activeRun,
     ] = await Promise.all([
       resolveIssueProjectAndGoal(issue),
       svc.getAncestors(issue.id),
@@ -5739,6 +5740,13 @@ export function issueRoutes(
       recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
       listIssueLinkedCases(db, issue.companyId, issue.id),
       inboxArchiveFieldsPromise,
+      // BLO-19001: agents compare their own $PAPERCLIP_RUN_ID against the run
+      // holding this issue before touching a shared worktree. `executionRunId`
+      // alone cannot answer that — it can point at a run that already finished
+      // — so ship the run's lifecycle status with it. Same shape `inbox-lite`
+      // returns, and null (no run, or the recorded run is terminal) means the
+      // issue is not held.
+      svc.getActiveRun(issue),
     ]);
     const recoveryActionsByRelationIssue = await relationRecoveryActionMap(
       recoveryActionsSvc,
@@ -5767,6 +5775,7 @@ export function issueRoutes(
       ...inboxArchiveFields,
       goalId: goal?.id ?? issue.goalId,
       ancestors,
+      activeRun,
       ...(blockerAttention ? { blockerAttention } : {}),
       productivityReview,
       successfulRunHandoff: successfulRunHandoffStates.get(issue.id) ?? null,

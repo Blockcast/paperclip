@@ -2094,7 +2094,7 @@ type IssueBlockerAttentionAgentRow = {
 
 async function activeRunMapForIssues(
   dbOrTx: any,
-  issueRows: IssueWithLabels[],
+  issueRows: Array<Pick<IssueRow, "executionRunId">>,
 ): Promise<Map<string, IssueActiveRunRow>> {
   const map = new Map<string, IssueActiveRunRow>();
   const runIds = issueRows
@@ -5940,6 +5940,27 @@ export function issueService(db: Db) {
 
     getByIdentifier: async (identifier: string) => {
       return getIssueByIdentifier(identifier);
+    },
+
+    /**
+     * The run currently holding this issue, or null.
+     *
+     * BLO-19001: single-issue counterpart to the `activeRun` the list paths
+     * attach via `withActiveRuns`. `getById` deliberately stays lean, so the
+     * issue-detail route composes this in alongside its other enrichments.
+     *
+     * Null covers both "no run recorded" and "the recorded run has already
+     * terminalized" — `activeRunMapForIssues` only returns rows whose status is
+     * in ACTIVE_RUN_STATUSES. That is the distinction a caller needs: a stale
+     * `executionRunId` left behind by a finished run reads as not-held, while a
+     * live sibling run reads as held.
+     */
+    getActiveRun: async (
+      issue: Pick<IssueRow, "executionRunId">,
+    ): Promise<IssueActiveRunRow | null> => {
+      if (!issue.executionRunId) return null;
+      const map = await activeRunMapForIssues(db, [issue]);
+      return map.get(issue.executionRunId) ?? null;
     },
 
     /**
