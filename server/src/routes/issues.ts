@@ -3746,7 +3746,8 @@ export function issueRoutes(
       keys.includes("status") &&
       keys.includes("blockedByIssueIds") &&
       body.status === "todo" &&
-      Array.isArray(body.blockedByIssueIds)
+      Array.isArray(body.blockedByIssueIds) &&
+      body.blockedByIssueIds.length === 0
     );
   }
 

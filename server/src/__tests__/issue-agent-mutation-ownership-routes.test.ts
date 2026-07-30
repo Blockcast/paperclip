@@ -1820,8 +1820,7 @@ describe("agent issue mutation checkout ownership", () => {
     }
 
     for (const reason of ["allow_manager_chain", "allow_issue_creator"] as const) {
-      it(`lets a ${reason} actor PATCH status and blockedByIssueIds on a non-active issue assigned to another agent`, async () => {
-        const blockerId = "99999999-9999-4999-8999-999999999999";
+      it(`lets a ${reason} actor clear blockers and move a blocked issue assigned to another agent to todo`, async () => {
         decideAllowingOnly(reason);
         const stored = makeIssue({
           status: "blocked",
@@ -1836,7 +1835,7 @@ describe("agent issue mutation checkout ownership", () => {
 
         const res = await request(await createApp(peerActor()))
           .patch(`/api/issues/${issueId}`)
-          .send({ status: "todo", blockedByIssueIds: [blockerId] });
+          .send({ status: "todo", blockedByIssueIds: [] });
 
         expect(res.status, JSON.stringify(res.body)).toBe(200);
         // Not admitted by the pre-existing checkout-management override — that
@@ -1845,7 +1844,7 @@ describe("agent issue mutation checkout ownership", () => {
         expect(mockIssueService.update).toHaveBeenCalled();
         const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
         expect(patch).toMatchObject({ status: "todo" });
-        expect(patch.blockedByIssueIds).toEqual([blockerId]);
+        expect(patch.blockedByIssueIds).toEqual([]);
       });
     }
 
@@ -1853,6 +1852,7 @@ describe("agent issue mutation checkout ownership", () => {
       { title: "Not recovery" },
       { status: "done", blockedByIssueIds: [] },
       { status: "cancelled", blockedByIssueIds: [] },
+      { status: "todo", blockedByIssueIds: ["99999999-9999-4999-8999-999999999999"] },
       { status: "todo", blockedByIssueIds: [], description: "Too broad" },
     ]) {
       it(`rejects a manager-chain blocked-issue PATCH outside the recovery shape: ${JSON.stringify(body)}`, async () => {
