@@ -151,8 +151,12 @@ export function issueRecoveryActionService(db: Db) {
     }
   }
 
-  async function getActiveForIssue(companyId: string, sourceIssueId: string): Promise<IssueRecoveryAction | null> {
-    const row = await db
+  async function getActiveForIssue(
+    companyId: string,
+    sourceIssueId: string,
+    dbOrTx: DbOrTransaction = db,
+  ): Promise<IssueRecoveryAction | null> {
+    const row = await dbOrTx
       .select()
       .from(issueRecoveryActions)
       .where(
@@ -191,6 +195,7 @@ export function issueRecoveryActionService(db: Db) {
   async function retryUpsertSourceScoped(
     input: UpsertIssueRecoveryActionInput,
     retryCount: number,
+    dbOrTx: DbOrTransaction,
     error?: unknown,
   ): Promise<IssueRecoveryAction> {
     if (retryCount >= MAX_UPSERT_RETRIES) {
@@ -199,14 +204,15 @@ export function issueRecoveryActionService(db: Db) {
         `Failed to upsert active recovery action for issue ${input.sourceIssueId} after ${MAX_UPSERT_RETRIES} retries`,
       );
     }
-    return upsertSourceScopedUnlocked(input, retryCount + 1);
+    return upsertSourceScopedUnlocked(input, dbOrTx, retryCount + 1);
   }
 
   async function upsertSourceScopedUnlocked(
     input: UpsertIssueRecoveryActionInput,
+    dbOrTx: DbOrTransaction = db,
     retryCount = 0,
   ): Promise<IssueRecoveryAction> {
-    const existing = await getActiveForIssue(input.companyId, input.sourceIssueId);
+    const existing = await getActiveForIssue(input.companyId, input.sourceIssueId, dbOrTx);
     const now = new Date();
     const ownerType = input.ownerType ?? (input.ownerAgentId ? "agent" : "board");
     if (existing) {
@@ -257,7 +263,7 @@ export function issueRecoveryActionService(db: Db) {
       const wakeHorizonAt = isNewlyBoundedSequence
         ? (input.timeoutAt ?? null)
         : carriedWakeHorizonAt;
-      const [updated] = await db
+      const [updated] = await dbOrTx
         .update(issueRecoveryActions)
         .set({
           recoveryIssueId: input.recoveryIssueId ?? null,
@@ -314,59 +320,72 @@ export function issueRecoveryActionService(db: Db) {
         )
         .returning();
       if (!updated) {
-        return retryUpsertSourceScoped(input, retryCount);
+        return retryUpsertSourceScoped(input, retryCount, dbOrTx);
       }
       return toReadModel(updated!);
     }
 
     try {
-      const [created] = await db
-        .insert(issueRecoveryActions)
-        .values({
-          companyId: input.companyId,
-          sourceIssueId: input.sourceIssueId,
-          recoveryIssueId: input.recoveryIssueId ?? null,
-          kind: input.kind,
-          status: "active",
-          ownerType,
-          ownerAgentId: input.ownerAgentId ?? null,
-          ownerUserId: input.ownerUserId ?? null,
-          previousOwnerAgentId: input.previousOwnerAgentId ?? null,
-          returnOwnerAgentId: input.returnOwnerAgentId ?? null,
-          cause: input.cause,
-          fingerprint: input.fingerprint,
-          evidence: withSourceScopedWakeHorizonEvidence(
-            input.evidence ?? {},
-            (input.maxAttempts ?? null) !== null ? (input.timeoutAt ?? null) : null,
-          ),
-          nextAction: input.nextAction,
-          wakePolicy: input.wakePolicy ?? null,
-          monitorPolicy: input.monitorPolicy ?? null,
-          attemptCount: 1,
-          maxAttempts: input.maxAttempts ?? null,
-          timeoutAt: input.timeoutAt ?? null,
-          lastAttemptAt: input.lastAttemptAt ?? now,
-        })
-        .returning();
+      // BLO-18829: a unique violation aborts the *whole* enclosing transaction in
+      // Postgres, so the retry below could not issue another statement on it. When we
+      // are running inside a caller's transaction, take a savepoint around the insert
+      // so a conflict rolls back only this attempt and the retry can proceed. On the
+      // plain-`db` path there is no enclosing transaction to poison, so the insert
+      // runs directly and behaves exactly as before.
+      const insertCreated = async (executor: DbOrTransaction) =>
+        executor
+          .insert(issueRecoveryActions)
+          .values({
+            companyId: input.companyId,
+            sourceIssueId: input.sourceIssueId,
+            recoveryIssueId: input.recoveryIssueId ?? null,
+            kind: input.kind,
+            status: "active",
+            ownerType,
+            ownerAgentId: input.ownerAgentId ?? null,
+            ownerUserId: input.ownerUserId ?? null,
+            previousOwnerAgentId: input.previousOwnerAgentId ?? null,
+            returnOwnerAgentId: input.returnOwnerAgentId ?? null,
+            cause: input.cause,
+            fingerprint: input.fingerprint,
+            evidence: withSourceScopedWakeHorizonEvidence(
+              input.evidence ?? {},
+              (input.maxAttempts ?? null) !== null ? (input.timeoutAt ?? null) : null,
+            ),
+            nextAction: input.nextAction,
+            wakePolicy: input.wakePolicy ?? null,
+            monitorPolicy: input.monitorPolicy ?? null,
+            attemptCount: 1,
+            maxAttempts: input.maxAttempts ?? null,
+            timeoutAt: input.timeoutAt ?? null,
+            lastAttemptAt: input.lastAttemptAt ?? now,
+          })
+          .returning()
+          .then((rows: Array<typeof issueRecoveryActions.$inferSelect>) => rows[0]!);
+
+      const created = dbOrTx === db
+        ? await insertCreated(dbOrTx)
+        : await (dbOrTx as { transaction: <T>(fn: (sp: DbOrTransaction) => Promise<T>) => Promise<T> })
+          .transaction((sp) => insertCreated(sp));
       return toReadModel(created!);
     } catch (error) {
       if (!isUniqueRecoveryActionConflict(error)) throw error;
-      return retryUpsertSourceScoped(input, retryCount, error);
+      return retryUpsertSourceScoped(input, retryCount, dbOrTx, error);
     }
   }
 
   async function upsertSourceScoped(
     input: UpsertIssueRecoveryActionInput,
+    dbOrTx: DbOrTransaction = db,
   ): Promise<IssueRecoveryAction> {
-    return runExclusiveUpsert(input, () => upsertSourceScopedUnlocked(input));
+    return runExclusiveUpsert(input, () => upsertSourceScopedUnlocked(input, dbOrTx));
   }
 
   // BLO-18996 (review follow-up): give back an attempt that was reserved but never spent.
   //
-  // `upsertSourceScoped` increments `attemptCount` as part of the escalation UPDATE, which
-  // commits on this service's own connection — NOT inside the caller's escalation
-  // transaction. So by the time the caller tries to wake the owner, the attempt is already
-  // durably spent, and a wake enqueue that reaches nobody leaves the budget consumed anyway.
+  // `upsertSourceScoped` increments `attemptCount` as part of the recovery-action write.
+  // By the time the caller tries to wake the owner after commit, the attempt is durably
+  // spent, and a wake enqueue that reaches nobody leaves the budget consumed anyway.
   // Five such sweeps would retire the action's whole budget without a single wake, and the
   // exhaustion notice would then claim the owner had been woken five times.
   //
