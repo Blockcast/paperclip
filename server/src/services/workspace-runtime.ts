@@ -740,6 +740,11 @@ async function executeProcess(input: {
     // descendant holding a pipe open must not be allowed to let the timer fire
     // and relabel a deterministic failure (e.g. git's exit 128) as a timeout.
     child.on("exit", (code) => {
+      // `error` can settle (and reject) without an `exit`, but the reverse
+      // ordering is possible too; arming the drain after we have settled would
+      // leave a timer nothing clears, holding the event loop open for its full
+      // grace period to call a no-op.
+      if (settled) return;
       if (timeoutTimer) globalThis.clearTimeout(timeoutTimer);
       if (killTimer) globalThis.clearTimeout(killTimer);
       timeoutTimer = null;
