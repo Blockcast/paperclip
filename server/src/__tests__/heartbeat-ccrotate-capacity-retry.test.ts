@@ -329,11 +329,23 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     expect(promotion.promoted).toBe(1);
 
     const promoted = await db
-      .select({ status: heartbeatRuns.status })
+      .select({
+        status: heartbeatRuns.status,
+        error: heartbeatRuns.error,
+        errorCode: heartbeatRuns.errorCode,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+      })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId))
       .then((rows) => rows[0] ?? null);
     expect(promoted?.status).toBe("queued");
+    expect(promoted).toMatchObject({
+      error: null,
+      errorCode: null,
+      scheduledRetryReason: "ccrotate_capacity",
+      scheduledRetryAttempt: 0,
+    });
 
     const closedEscalation = await db
       .select({ status: issues.status, completedAt: issues.completedAt })

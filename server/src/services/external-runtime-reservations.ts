@@ -171,6 +171,8 @@ export async function claimRunWithExternalRuntimeSlot(
         .update(heartbeatRuns)
         .set({
           status: "running",
+          error: null,
+          errorCode: null,
           startedAt: run.startedAt ?? claimedAt,
           updatedAt: claimedAt,
         })
