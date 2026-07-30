@@ -249,6 +249,7 @@ import {
   recordOrphanedManagedPodReaped,
   recordProcessLost,
   recordProcessLostLivenessNull,
+  recordGithubReviewRequestDelivery,
   setExternalLifecycleRunningRuns,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
@@ -22770,7 +22771,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // backoff long after this request has returned.
   const WAKE_DISPATCH_RETRY_BACKOFF_MS = [300, 1200];
 
+  /**
+   * BLO-18859: is this wake a GitHub PR-review reviewer wake, and if so what
+   * reason did the receiver mint it under? Returns null for every other wake so
+   * the delivery counter stays scoped to the GitHub review-request funnel —
+   * `wakeupWithDispatchRetry` is the generic wake path used by every caller, so
+   * an unconditional increment here would count issue-assigned, monitor, and
+   * sweep wakes as "review-request deliveries".
+   *
+   * Keyed on the `payload.source === "github"` + `payload.reviewKind ===
+   * "pr_review"` pair the receiver already stamps (see the reviewer wake in
+   * routes/github-webhook.ts) rather than a new marker field, so it works
+   * unchanged for rows written before this change and for the reconciler, which
+   * only has the round-tripped `originalOpts` to go on.
+   */
+  function githubPrReviewWakeReason(opts: WakeupOptions | null | undefined): string | null {
+    const payload = opts?.payload as Record<string, unknown> | null | undefined;
+    if (!payload || typeof payload !== "object") return null;
+    if (payload.source !== "github" || payload.reviewKind !== "pr_review") return null;
+    // A matched wake with an absent/non-string reason still counts; the metric
+    // helper collapses it to the bounded "other" series.
+    return typeof opts?.reason === "string" ? opts.reason : "";
+  }
+
   async function wakeupWithDispatchRetry(agentId: string, opts: WakeupOptions = {}) {
+    const githubReviewReason = githubPrReviewWakeReason(opts);
     let lastError: unknown;
     for (let attempt = 0; attempt <= WAKE_DISPATCH_RETRY_BACKOFF_MS.length; attempt++) {
       try {
@@ -22779,6 +22804,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         lastError = err;
         if (err instanceof HttpError) throw err;
         if (attempt < WAKE_DISPATCH_RETRY_BACKOFF_MS.length) {
+          // Counted before sleeping so the increment reflects the retry we are
+          // committed to, once per re-dispatch attempt. A business-rule
+          // HttpError returns above and is not a retry.
+          if (githubReviewReason !== null) {
+            recordGithubReviewRequestDelivery({ state: "retried", reason: githubReviewReason });
+          }
           await new Promise((resolve) => setTimeout(resolve, WAKE_DISPATCH_RETRY_BACKOFF_MS[attempt]));
         }
       }
@@ -22821,12 +22852,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           idempotencyKey: opts.idempotencyKey ?? null,
         });
       } else {
+        // Terminal loss: no durable row exists, so no reconciler pass will ever
+        // pick this wake up. This is the original "lost forever, no record"
+        // mode, so it is dead-lettered immediately rather than after retry
+        // exhaustion (BLO-18859).
+        if (githubReviewReason !== null) {
+          recordGithubReviewRequestDelivery({ state: "dead_lettered", reason: githubReviewReason });
+        }
         logger.error(
           { agentId, err: lastError },
           "wake dispatch retry exhausted and agent could not be resolved; dropping without a durable record",
         );
       }
     } catch (persistErr) {
+      // Same terminal loss as the no-agent branch above: the safety-net insert
+      // itself failed, so nothing will retry this wake.
+      if (githubReviewReason !== null) {
+        recordGithubReviewRequestDelivery({ state: "dead_lettered", reason: githubReviewReason });
+      }
       logger.error(
         { err: persistErr, agentId, originalErr: lastError },
         "failed to persist durable wake-dispatch-failed record after retry exhaustion",
@@ -22883,6 +22926,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const attempts = (retryState.attempts ?? 0) + 1;
       const originalOpts = retryState.originalOpts ?? {};
+      // Recovered from the round-tripped originalOpts, so a row written before
+      // this change still classifies correctly on its next reconcile pass.
+      const githubReviewReason = githubPrReviewWakeReason(originalOpts);
+
+      // Each reconcile pass is one re-dispatch attempt, counted up-front so a
+      // pass that throws in an unexpected place still shows as a retry.
+      if (githubReviewReason !== null) {
+        recordGithubReviewRequestDelivery({ state: "retried", reason: githubReviewReason });
+      }
 
       try {
         await enqueueWakeup(row.agentId, originalOpts);
@@ -22891,6 +22943,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .set({ status: "dispatch_recovered", finishedAt: now, updatedAt: now })
           .where(eq(agentWakeupRequests.id, row.id));
         recovered += 1;
+        // The delivery reached the queued state after all, just later than the
+        // inline path. Counting it here keeps the funnel arithmetic closed
+        // (received = queued + dead_lettered + in-flight chains); without it a
+        // reconciler-recovered delivery would leave a permanent phantom
+        // received-without-queued gap that reads as loss (BLO-18859).
+        if (githubReviewReason !== null) {
+          recordGithubReviewRequestDelivery({ state: "queued", reason: githubReviewReason });
+        }
       } catch (err) {
         if (err instanceof HttpError) {
           await db
@@ -22917,6 +22977,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             })
             .where(eq(agentWakeupRequests.id, row.id));
           exhausted += 1;
+          // Terminal: the row is now dispatch_failed_exhausted and the
+          // reconciler never re-arms it, so this review request will never
+          // produce a run without operator action (BLO-18859).
+          if (githubReviewReason !== null) {
+            recordGithubReviewRequestDelivery({ state: "dead_lettered", reason: githubReviewReason });
+          }
           logger.error(
             { agentId: row.agentId, wakeupRequestId: row.id, attempts, err },
             "wake dispatch retry exhausted after max attempts; giving up (BLO-14395)",

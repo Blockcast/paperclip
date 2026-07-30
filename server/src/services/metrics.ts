@@ -105,6 +105,89 @@ export const PROCESS_LOST_LIVENESS_NULL_METRIC = "paperclip_process_lost_livenes
  * while their pods keep running (the wedged-container leak this reaper closes).
  */
 export const ORPHANED_MANAGED_POD_REAPED_METRIC = "paperclip_orphaned_managed_pod_reaped_total";
+/**
+ * GitHub review-request delivery-state counter (BLO-18859, parent BLO-18848).
+ * One series per (`state`, `reason`) so an operator can read the full delivery
+ * funnel for reviewer wakes driven by the in-tree GitHub receiver
+ * (`routes/github-webhook.ts`) rather than inferring it from logs.
+ *
+ * The four states are deliberately a funnel, not a partition of arrivals:
+ * - `received`: the delivery cleared every suppression gate (signature,
+ *   self-echo, idempotency dedup, reviewer selection) and we are about to
+ *   dispatch a wake. Skipped/deduped deliveries are correct no-ops and are
+ *   NOT counted, so `received` measures intent-to-wake, not raw arrivals.
+ * - `queued`: `heartbeat.wakeup` returned, i.e. a durable
+ *   `agent_wakeup_requests` row is committed and the wake can no longer be
+ *   lost by this process dying. Also emitted when
+ *   `reconcileFailedWakeDispatches` recovers a `dispatch_failed` row, since
+ *   that delivery did reach the queued state — just later than the inline
+ *   path. Never both for one delivery: if the inline dispatch throws, the
+ *   receiver's `queued` line is skipped and only the reconciler can emit it.
+ * - `retried`: one re-dispatch attempt after a transient (non-HttpError)
+ *   dispatch failure — both the in-process attempts in
+ *   `wakeupWithDispatchRetry` and each later `reconcileFailedWakeDispatches`
+ *   pass. Counted per attempt, so it is a rate of dispatch flakiness.
+ * - `dead_lettered`: the delivery is terminally lost without operator action.
+ *   Two paths reach it: the reconciler marking a row
+ *   `dispatch_failed_exhausted` after `DISPATCH_RETRY_MAX_ATTEMPTS`, and
+ *   `wakeupWithDispatchRetry` failing to persist its durable safety-net row at
+ *   all (agent unresolvable, or the insert itself threw) — the latter is the
+ *   original "lost forever, no record" mode and is the more urgent of the two.
+ *
+ * The invariant an operator reads: in steady state `received` ≈ `queued` and
+ * `dead_lettered` is flat at zero. A non-zero `dead_lettered` rate means an
+ * `@ally` review request will never produce a run, which is the BLO-18847
+ * symptom this counter exists to make visible.
+ *
+ * Cardinality: `state` is closed at 4 and `reason` is coerced to
+ * {@link KNOWN_GITHUB_WAKE_REASONS} (else "other"), so the series count is
+ * bounded at `4 * (KNOWN_GITHUB_WAKE_REASONS.length + 1)` — independent of
+ * repo, PR number, delivery id, and agent roster. Those high-cardinality
+ * identifiers stay on the structured log lines, matching the guardrail
+ * {@link CONCURRENT_RUN_BLOCKED_METRIC} documents above.
+ */
+export const GITHUB_REVIEW_REQUEST_DELIVERY_METRIC = "paperclip_github_review_request_delivery_total";
+
+/**
+ * The four delivery states. Closed set — see
+ * {@link GITHUB_REVIEW_REQUEST_DELIVERY_METRIC} for what each one means and
+ * why `received` counts intent-to-wake rather than raw arrivals.
+ */
+export const KNOWN_GITHUB_DELIVERY_STATES = [
+  "received",
+  "queued",
+  "retried",
+  "dead_lettered",
+] as const;
+
+export type GithubReviewRequestDeliveryState = (typeof KNOWN_GITHUB_DELIVERY_STATES)[number];
+
+/**
+ * Bounded `reason` allow-list for {@link GITHUB_REVIEW_REQUEST_DELIVERY_METRIC},
+ * mirroring the `context.wakeReason` values the GitHub receiver mints for
+ * reviewer wakes. Anything outside this set (including a missing reason)
+ * collapses to {@link UNKNOWN_GITHUB_WAKE_REASON} so a future event type cannot
+ * silently inflate cardinality before the allow-list is updated.
+ */
+export const KNOWN_GITHUB_WAKE_REASONS = [
+  "github_pr_opened",
+  "github_pr_ready_for_review",
+  "github_pr_reopened",
+  "github_pr_review_requested",
+  "github_pr_review_submitted",
+  "github_pr_review_feedback",
+  "github_pr_synchronized",
+] as const;
+
+export const UNKNOWN_GITHUB_WAKE_REASON = "other";
+
+const knownGithubWakeReasonSet: ReadonlySet<string> = new Set(KNOWN_GITHUB_WAKE_REASONS);
+
+export function normalizeGithubWakeReason(reason: string | null | undefined): string {
+  return typeof reason === "string" && knownGithubWakeReasonSet.has(reason)
+    ? reason
+    : UNKNOWN_GITHUB_WAKE_REASON;
+}
 
 /**
  * Bounded `reason` allow-list (mirrors the adapter-lane reasons defined in
@@ -291,6 +374,7 @@ let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | n
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let processLostLivenessNull: Counter | null = null;
 let orphanedManagedPodReaped: Counter<"adapter"> | null = null;
+let githubReviewRequestDelivery: Counter<"state" | "reason"> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -306,6 +390,7 @@ function ensureRegistry(): {
   externalLifecycleRunningRunsGauge: Gauge<"adapter">;
   processLostLivenessNullCounter: Counter;
   orphanedManagedPodReapedCounter: Counter<"adapter">;
+  githubReviewRequestDeliveryCounter: Counter<"state" | "reason">;
 } {
   if (
     !registry
@@ -321,6 +406,7 @@ function ensureRegistry(): {
     || !externalLifecycleRunningRuns
     || !processLostLivenessNull
     || !orphanedManagedPodReaped
+    || !githubReviewRequestDelivery
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -431,6 +517,33 @@ function ensureRegistry(): {
       labelNames: ["adapter"],
       registers: [registry],
     });
+    githubReviewRequestDelivery = new Counter({
+      name: GITHUB_REVIEW_REQUEST_DELIVERY_METRIC,
+      help:
+        "Count of GitHub review-request reviewer-wake deliveries by funnel state "
+        + "(received/queued/retried/dead_lettered) and bounded wake reason (BLO-18859). "
+        + "'received' counts deliveries that cleared every suppression gate and are about "
+        + "to dispatch (NOT raw arrivals); 'queued' means a durable agent_wakeup_requests "
+        + "row committed; 'retried' counts each re-dispatch attempt after a transient "
+        + "failure; 'dead_lettered' means terminally lost without operator action "
+        + "(dispatch_failed_exhausted, or the durable safety-net write itself failing). "
+        + "In steady state received ~= queued and dead_lettered is flat at zero.",
+      labelNames: ["state", "reason"],
+      registers: [registry],
+    });
+    // Zero-initialize the full bounded grid so every series is present from
+    // process start. Without this, prom-client omits a never-incremented series
+    // entirely and a healthy fleet renders as "No data" on the funnel panel —
+    // indistinguishable from a broken scrape. It matters most for
+    // `dead_lettered`, where absent-vs-zero is exactly the difference between
+    // "nothing was lost" and "we cannot tell". 4 states x 7 reasons = 28
+    // constant-zero series, which is negligible next to the roster-scaled
+    // counters above.
+    for (const state of KNOWN_GITHUB_DELIVERY_STATES) {
+      for (const reason of [...KNOWN_GITHUB_WAKE_REASONS, UNKNOWN_GITHUB_WAKE_REASON]) {
+        githubReviewRequestDelivery.inc({ state, reason }, 0);
+      }
+    }
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -449,6 +562,7 @@ function ensureRegistry(): {
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     processLostLivenessNullCounter: processLostLivenessNull,
     orphanedManagedPodReapedCounter: orphanedManagedPodReaped,
+    githubReviewRequestDeliveryCounter: githubReviewRequestDelivery,
   };
 }
 
@@ -683,6 +797,25 @@ export function recordOrphanedManagedPodReaped(labels?: { adapterType?: string }
   });
 }
 
+/**
+ * Record one GitHub review-request delivery funnel transition (BLO-18859).
+ * `state` is a compile-time-closed union; `reason` is coerced to the bounded
+ * {@link KNOWN_GITHUB_WAKE_REASONS} allow-list so an unrecognized or absent
+ * wake reason lands on "other" instead of minting a new series. Returns the
+ * emitted labels so call sites can echo them on their structured log line.
+ */
+export function recordGithubReviewRequestDelivery(input: {
+  state: GithubReviewRequestDeliveryState;
+  reason: string | null | undefined;
+}): { state: string; reason: string } {
+  const labels = {
+    state: input.state,
+    reason: normalizeGithubWakeReason(input.reason),
+  };
+  ensureRegistry().githubReviewRequestDeliveryCounter.inc(labels);
+  return labels;
+}
+
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
   const reg = getMetricsRegistry();
   const depBlockedSnapshot = snapshotDepBlockedMetrics();
@@ -722,6 +855,7 @@ export function __resetMetricsForTest(): void {
   externalLifecycleRunningRuns = null;
   processLostLivenessNull = null;
   orphanedManagedPodReaped = null;
+  githubReviewRequestDelivery = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
 }

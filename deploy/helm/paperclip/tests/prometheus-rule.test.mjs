@@ -99,3 +99,41 @@ test("PaperclipAgentPodUnschedulable keys on kube_pod_status_scheduled, not the 
     "kube_pod_status_unschedulable is not portable across kube-state-metrics builds; do not reintroduce it",
   );
 });
+
+test("PaperclipGithubReviewRequestDeadLettered fires on any dead-lettered delivery and is silent at zero (BLO-18859)", () => {
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.match(rendered, /alert: PaperclipGithubReviewRequestDeadLettered/);
+  // Pin the state selector: the alert is meaningless if a future edit drops
+  // it and starts summing all four funnel states (received/queued would fire
+  // it continuously in normal operation).
+  assert.match(
+    rendered,
+    /increase\(paperclip_github_review_request_delivery_total\{state="dead_lettered"\}\[[^\]]+\]\)/,
+    "dead-letter alert must select only state=dead_lettered",
+  );
+  // `> 0` is the silent-in-steady-state guarantee: the counter is
+  // zero-initialized, so increase() over a flat series is 0 and never fires.
+  // A threshold of >= 0 or a missing comparison would fire permanently.
+  assert.match(
+    rendered,
+    /state="dead_lettered"\}\[[^\]]+\]\)\) > 0/,
+    "dead-letter alert must fire only on a strictly positive increase",
+  );
+});

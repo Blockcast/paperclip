@@ -42,6 +42,26 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import {
+  GITHUB_REVIEW_REQUEST_DELIVERY_METRIC,
+  __resetMetricsForTest,
+  getMetricsRegistry,
+} from "../services/metrics.js";
+
+/**
+ * Sum {@link GITHUB_REVIEW_REQUEST_DELIVERY_METRIC} across every `reason`
+ * series for one funnel state (BLO-18859).
+ */
+async function deliveryCount(state: string): Promise<number> {
+  const metric = getMetricsRegistry().getSingleMetric(GITHUB_REVIEW_REQUEST_DELIVERY_METRIC);
+  if (!metric) throw new Error(`${GITHUB_REVIEW_REQUEST_DELIVERY_METRIC} is not registered`);
+  const data = (await metric.get()) as {
+    values: Array<{ labels: Record<string, string>; value: number }>;
+  };
+  return data.values
+    .filter((entry) => entry.labels.state === state)
+    .reduce((sum, entry) => sum + entry.value, 0);
+}
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1244,6 +1264,54 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(heartbeatRuns)
       .where(inArray(heartbeatRuns.agentId, [firstReviewerId, secondReviewerId]));
     expect(runs).toHaveLength(1);
+  });
+
+  it("counts a review-request delivery as received+queued once, and does not count a deduped replay (BLO-18859)", async () => {
+    __resetMetricsForTest();
+    const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+
+    const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+    const payload = {
+      action: "opened",
+      pull_request: {
+        number: 18859,
+        title: "Delivery funnel counters",
+        body: null,
+        head: { ref: "platform/blo-18859-github-delivery-metrics" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const send = () =>
+      request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-18859-funnel")
+        .set("content-type", "application/json")
+        .send(body);
+
+    const first = await send();
+    expect(first.status).toBe(200);
+    expect(first.body.reviewerWakeFired).toBe(true);
+
+    // One delivery that cleared every gate and durably queued: both states move
+    // together, and nothing was retried or lost.
+    expect(await deliveryCount("received")).toBe(1);
+    expect(await deliveryCount("queued")).toBe(1);
+    expect(await deliveryCount("retried")).toBe(0);
+    expect(await deliveryCount("dead_lettered")).toBe(0);
+
+    const replay = await send();
+    expect(replay.status).toBe(200);
+    expect(replay.body.reviewerWakeFired).toBe(false);
+
+    // The replay is suppressed by the idempotency gate, which is a correct
+    // no-op — NOT a received delivery. Counting it would make `received` track
+    // GitHub's redelivery behavior instead of intent-to-wake, and would show a
+    // permanent received/queued gap on a healthy fleet.
+    expect(await deliveryCount("received")).toBe(1);
+    expect(await deliveryCount("queued")).toBe(1);
   });
 
   it("keeps follow-up PR review wakes with the reviewer already handling that PR", async () => {

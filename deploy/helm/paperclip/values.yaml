@@ -345,6 +345,10 @@ prometheusRule:
   unschedulablePodThreshold: 0
   # -- How long agent pods must stay Unschedulable before warning (transient blips self-resolve; this catches sustained starvation).
   unschedulableFor: 15m
+  # -- Rolling window for the GitHub review-request dead-letter rate (BLO-18859). Any dead-lettered delivery in this window fires; the counter is flat at zero in steady state.
+  githubDeliveryDeadLetterWindow: 30m
+  # -- How long a non-zero dead-letter rate must persist before firing. Kept short: a dead-lettered delivery is already terminal, so there is nothing to self-resolve.
+  githubDeliveryDeadLetterFor: 5m
   # -- Additional PrometheusRule groups appended verbatim.
   additionalGroups: []
 

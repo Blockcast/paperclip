@@ -53,6 +53,7 @@ import {
   githubPostIssueComment,
 } from "../services/github-app-auth.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { recordGithubReviewRequestDelivery } from "../services/metrics.js";
 import {
   recordMergedPullRequest,
   enrichAuthoredLocForRow,
@@ -1645,6 +1646,14 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             return false;
           }
 
+          // BLO-18859: every suppression gate is behind us and a reviewer is
+          // resolved, so this delivery is now committed to producing a wake.
+          // Counting `received` here (rather than at signature verification)
+          // makes `received - queued` a measure of real loss between intent and
+          // durability — deduped/self-echo/no-reviewer deliveries are correct
+          // no-ops and would otherwise swamp that gap in steady state.
+          recordGithubReviewRequestDelivery({ state: "received", reason: context.wakeReason });
+
           await heartbeat.wakeup(reviewerAgentId, {
             source: "automation",
             triggerDetail: "system",
@@ -1688,6 +1697,11 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             // later explicit re-review comment can wake Ally again.
             idempotencyKey,
           });
+          // The durable agent_wakeup_requests row is committed; from here the
+          // wake survives this process dying. Any transient dispatch failure
+          // inside wakeup() has already been retried and counted as `retried`
+          // by wakeupWithDispatchRetry, so this only fires on real durability.
+          recordGithubReviewRequestDelivery({ state: "queued", reason: context.wakeReason });
           return true;
         });
       } catch (err) {

@@ -72,6 +72,24 @@ spec:
           annotations:
             summary: "Paperclip reaper is blind to kube Job liveness"
             description: "The reaper hit more than {{ .Values.prometheusRule.processLostLivenessNullWindowCount }} null kube Job-status lists in 15m, so it is falling back to the staleness heuristic while blind (BLO-16184 denominator guard). Any concurrent LOW process_lost count is UNRELIABLE — a 0 means 'could not see', not 'healthy'; a spike may be kube-outage-driven. Check the K8s API and the paperclip ServiceAccount RBAC."
+    - name: paperclip-github-delivery
+      rules:
+        - alert: PaperclipGithubReviewRequestDeadLettered
+          # BLO-18859: keys on the dead_lettered state of the delivery funnel
+          # counter, which is zero-initialized at process start — so an absent
+          # series means a broken scrape, not a healthy fleet, and a 0 here is a
+          # real 0. increase() over the window catches a single dead-letter
+          # (threshold > 0) because one lost @ally review request is already a
+          # user-visible failure: the PR sits with a posted trigger and no
+          # review, which is the BLO-18847 symptom. Deliberately NOT rate()-per-
+          # second — that rounds a lone event toward zero on a wide window.
+          expr: sum(increase(paperclip_github_review_request_delivery_total{state="dead_lettered"}[{{ .Values.prometheusRule.githubDeliveryDeadLetterWindow }}])) > 0
+          for: {{ .Values.prometheusRule.githubDeliveryDeadLetterFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip GitHub review-request delivery dead-lettered (an @ally review will never run)"
+            description: "At least one GitHub review-request reviewer wake was dead-lettered in the last {{ .Values.prometheusRule.githubDeliveryDeadLetterWindow }} (BLO-18859). Dead-lettered is TERMINAL — the reconciler never re-arms it, so the affected PR has a posted review trigger and will never get a review until someone re-triggers it. Two paths reach this state: a durable agent_wakeup_requests row exhausted DISPATCH_RETRY_MAX_ATTEMPTS (query `select id, agent_id, reason, error from agent_wakeup_requests where status = 'dispatch_failed_exhausted' order by updated_at desc`), or wakeupWithDispatchRetry could not persist its safety-net row at all — the latter leaves NO row and is visible only in the logs ('dropping without a durable record' / 'failed to persist durable wake-dispatch-failed record'). Break down by the `reason` label to see which event type is failing. Read alongside the received/queued/retried states of the same counter: a rising `retried` with no dead-letters is dispatch flakiness absorbed by the retry chain, not loss."
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

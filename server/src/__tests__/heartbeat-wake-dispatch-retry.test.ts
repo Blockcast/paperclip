@@ -16,9 +16,14 @@
 //     into a business-rule outcome instead.
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { agents, agentWakeupRequests, companies, createDb } from "@paperclipai/db";
 import { heartbeatService } from "../services/heartbeat.js";
+import {
+  GITHUB_REVIEW_REQUEST_DELIVERY_METRIC,
+  __resetMetricsForTest,
+  getMetricsRegistry,
+} from "../services/metrics.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -47,6 +52,72 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
   afterEach(async () => {
     await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
   });
+
+  // BLO-18859: the delivery counter is process-global, so each test starts from
+  // a clean registry rather than inheriting another test's increments.
+  beforeEach(() => {
+    __resetMetricsForTest();
+  });
+
+  /**
+   * Sum {@link GITHUB_REVIEW_REQUEST_DELIVERY_METRIC} across every `reason`
+   * series for one funnel state. Summing (rather than reading a single series)
+   * keeps these assertions independent of which wake reason the fixture used
+   * and of the zero-initialized grid.
+   */
+  async function deliveryCount(state: string): Promise<number> {
+    const metric = getMetricsRegistry().getSingleMetric(GITHUB_REVIEW_REQUEST_DELIVERY_METRIC);
+    expect(metric, `${GITHUB_REVIEW_REQUEST_DELIVERY_METRIC} must be registered`).toBeTruthy();
+    const data = (await metric!.get()) as { values: Array<{ labels: Record<string, string>; value: number }> };
+    return data.values
+      .filter((entry) => entry.labels.state === state)
+      .reduce((sum, entry) => sum + entry.value, 0);
+  }
+
+  /**
+   * Wrap a drizzle db so the next `failures` inserts throw a plain Error —
+   * the non-HttpError class that wakeupWithDispatchRetry treats as a transient
+   * dispatch failure and retries. `enqueueWakeup` performs its durable write
+   * inside `db.transaction`, so the transaction callback's `tx` is wrapped too;
+   * intercepting only the outer db would never see the insert that matters.
+   *
+   * `failures: 1` models a transient blip (first attempt fails, retry
+   * succeeds); a large value models a hard outage that exhausts the chain.
+   */
+  function dbWithFailingInserts(target: typeof db, failures: number) {
+    let remaining = failures;
+    const wrap = (obj: object): typeof db => new Proxy(obj, {
+      get(rawTarget, prop) {
+        if (prop === "insert") {
+          return (...args: unknown[]) => {
+            if (remaining > 0) {
+              remaining -= 1;
+              throw new Error("simulated transient dispatch failure (BLO-18859)");
+            }
+            return (rawTarget as Record<string, (...a: unknown[]) => unknown>).insert(...args);
+          };
+        }
+        if (prop === "transaction") {
+          return (callback: (tx: unknown) => unknown, ...rest: unknown[]) =>
+            (rawTarget as Record<string, (...a: unknown[]) => unknown>).transaction(
+              (tx: object) => callback(wrap(tx)),
+              ...rest,
+            );
+        }
+        const value = Reflect.get(rawTarget, prop);
+        // Bind to the raw target, not the proxy: drizzle methods reach for
+        // private internals and break if `this` is the Proxy.
+        return typeof value === "function" ? value.bind(rawTarget) : value;
+      },
+    }) as unknown as typeof db;
+    return wrap(target as unknown as object);
+  }
+
+  const GITHUB_REVIEW_PAYLOAD = {
+    taskKey: "pr_review:Blockcast/paperclip#18859",
+    source: "github",
+    reviewKind: "pr_review",
+  } as const;
 
   afterAll(async () => {
     await tempDb?.cleanup();
@@ -253,5 +324,168 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
 
     const [row] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId));
     expect(row?.status).toBe("dispatch_superseded");
+  });
+
+  // BLO-18859: the four-state delivery counter. These assert the two states
+  // that live on the heartbeat side of the funnel (`retried`, `dead_lettered`);
+  // `received`/`queued` are emitted by the receiver route and covered in
+  // github-webhook.test.ts.
+  describe("GitHub review-request delivery counters (BLO-18859)", () => {
+    it("counts one `retried` per re-dispatch attempt and does not dead-letter while a durable row survives", async () => {
+      const { agentId } = await seedCompanyAndAgent();
+      const circular: Record<string, unknown> = { ...GITHUB_REVIEW_PAYLOAD };
+      circular.self = circular;
+
+      await expect(
+        heartbeat.wakeup(agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "github_pr_review_requested",
+          payload: circular,
+        }),
+      ).rejects.toThrow();
+
+      // The in-process backoff is [300ms, 1200ms] => two re-dispatch attempts
+      // after the initial one. Pinning 2 (not >= 1) catches an off-by-one that
+      // double-counts the first attempt as a retry.
+      expect(await deliveryCount("retried")).toBe(2);
+      // A durable dispatch_failed row exists, so reconciliation still owns this
+      // wake — it is retry-pending, NOT terminally lost.
+      expect(await deliveryCount("dead_lettered")).toBe(0);
+      const failedRows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "dispatch_failed")));
+      expect(failedRows).toHaveLength(1);
+    });
+
+    it("leaves the counter untouched for a non-GitHub wake that fails the same way", async () => {
+      const { agentId } = await seedCompanyAndAgent();
+      // Same failure, but no source/reviewKind markers: wakeupWithDispatchRetry
+      // is the generic wake path, so without scoping this would count every
+      // issue-assigned and monitor wake as a review-request delivery.
+      const circular: Record<string, unknown> = { taskKey: "issue:BLO-1" };
+      circular.self = circular;
+
+      await expect(
+        heartbeat.wakeup(agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: circular,
+        }),
+      ).rejects.toThrow();
+
+      expect(await deliveryCount("retried")).toBe(0);
+      expect(await deliveryCount("dead_lettered")).toBe(0);
+    });
+
+    it("counts exactly one `retried` for a transient failure that recovers, with no duplicate run", async () => {
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const wakeupRequestId = randomUUID();
+      const now = new Date();
+      // A due dispatch_failed row is exactly what a transient dispatch failure
+      // leaves behind; one reconcile pass is one re-dispatch attempt.
+      await db.insert(agentWakeupRequests).values({
+        id: wakeupRequestId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_review_requested",
+        payload: {
+          dispatchRetry: {
+            attempts: 1,
+            nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+            originalOpts: {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "github_pr_review_requested",
+              payload: GITHUB_REVIEW_PAYLOAD,
+            },
+          },
+        },
+        status: "dispatch_failed",
+      });
+
+      const result = await heartbeat.reconcileFailedWakeDispatches(now);
+      expect(result.recovered).toBe(1);
+      expect(result.exhausted).toBe(0);
+
+      expect(await deliveryCount("retried")).toBe(1);
+      expect(await deliveryCount("dead_lettered")).toBe(0);
+      // The delivery reached the queued state, just via the reconciler rather
+      // than inline — so the funnel closes instead of showing phantom loss.
+      expect(await deliveryCount("queued")).toBe(1);
+
+      const [reconciled] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId));
+      expect(reconciled?.status).toBe("dispatch_recovered");
+
+      // "No duplicate run": the recovery produced exactly one queued wake, not
+      // one per retry attempt.
+      const queuedRows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "queued")));
+      expect(queuedRows).toHaveLength(1);
+    });
+
+    it("dead-letters exactly once when the retry chain exhausts, alongside exactly one dispatch_failed_exhausted row", async () => {
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const wakeupRequestId = randomUUID();
+      const now = new Date();
+      // attempts: 4 => this pass computes attempts = 5 = DISPATCH_RETRY_MAX_ATTEMPTS,
+      // so it is the pass that exhausts the chain.
+      await db.insert(agentWakeupRequests).values({
+        id: wakeupRequestId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_review_requested",
+        payload: {
+          dispatchRetry: {
+            attempts: 4,
+            nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+            originalOpts: {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "github_pr_review_requested",
+              payload: GITHUB_REVIEW_PAYLOAD,
+            },
+          },
+        },
+        status: "dispatch_failed",
+      });
+
+      // Seeded with the real db above; the reconcile pass runs against a db
+      // whose inserts all fail, so the re-dispatch throws a non-HttpError while
+      // the status update itself still commits.
+      const failingHeartbeat = heartbeatService(dbWithFailingInserts(db, Number.MAX_SAFE_INTEGER), {
+        skipQueuedRunDispatch: true,
+      });
+      const result = await failingHeartbeat.reconcileFailedWakeDispatches(now);
+      expect(result.exhausted).toBe(1);
+      expect(result.recovered).toBe(0);
+
+      expect(await deliveryCount("dead_lettered")).toBe(1);
+      // The exhausting pass is still a re-dispatch attempt.
+      expect(await deliveryCount("retried")).toBe(1);
+
+      const exhaustedRows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.status, "dispatch_failed_exhausted"),
+          ),
+        );
+      expect(exhaustedRows).toHaveLength(1);
+      expect(exhaustedRows[0]!.id).toBe(wakeupRequestId);
+    });
   });
 });
