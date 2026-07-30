@@ -151,10 +151,10 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     const fetchMock = vi.fn(async (url: string | URL) => {
       const u = String(url);
       if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
-      if (u.includes(`/commits/${HEAD_SHA}/statuses`)) return jsonResponse(options.latestStatuses ?? []);
+      if (/\/commits\/[^/]+\/statuses(?:\?|$)/.test(u)) return jsonResponse(options.latestStatuses ?? []);
       if (u.includes("/pulls/") && u.includes("/reviews")) return jsonResponse(options.reviews ?? []);
       if (u.includes("/issues/") && u.includes("/comments")) return jsonResponse(options.comments ?? []);
-      if (u.includes(`/statuses/${HEAD_SHA}`)) {
+      if (/\/statuses\/[0-9a-f]{7,40}(?:\?|$)/i.test(u)) {
         const status = options.postStatus ?? 201;
         return jsonResponse({ id: 1 }, status < 400, status);
       }
@@ -191,6 +191,67 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(true);
     const events = await readRunEvents(runId);
     expect(events.at(-1)?.message).toContain("Set PR-review gate status review/ally-complete to failure");
+  });
+
+  it("does not double-process one delivery when pollers race", async () => {
+    setCreds();
+    const { delivery } = await seedRun();
+    const fetchMock = stubGithub({ latestStatuses: [], reviews: [], comments: [] });
+
+    const results = await Promise.all([
+      pollGitHubCommitStatusDeliveriesOnce(db),
+      pollGitHubCommitStatusDeliveriesOnce(db),
+    ]);
+
+    expect(results.sort()).toEqual([0, 1]);
+    expect(await readDelivery(delivery.id)).toMatchObject({ status: "delivered" });
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`)).length).toBe(1);
+  });
+
+  it("reclaims expired processing rows during normal polling", async () => {
+    const { delivery } = await seedRun();
+    const staleProcessingAt = new Date(Date.now() - 11 * 60 * 1_000);
+    await db
+      .update(githubCommitStatusDeliveries)
+      .set({ status: "processing", nextAttemptAt: staleProcessingAt, updatedAt: staleProcessingAt })
+      .where(eq(githubCommitStatusDeliveries.id, delivery.id));
+
+    await expect(pollGitHubCommitStatusDeliveriesOnce(db)).resolves.toBe(1);
+
+    expect(await readDelivery(delivery.id)).toMatchObject({
+      status: "failed_permanent",
+      lastError: "missing_github_app_credentials",
+      lastErrorKind: "permanent",
+    });
+  });
+
+  it("treats same-second GitHub statuses as fresh enough to avoid overwrite", async () => {
+    setCreds();
+    const { delivery } = await seedRun();
+    const queuedAt = new Date("2026-07-25T12:00:00.900Z");
+    await db
+      .update(githubCommitStatusDeliveries)
+      .set({ createdAt: queuedAt, nextAttemptAt: queuedAt, updatedAt: queuedAt })
+      .where(eq(githubCommitStatusDeliveries.id, delivery.id));
+    const fetchMock = stubGithub({
+      latestStatuses: [
+        {
+          context: "review/ally-complete",
+          state: "failure",
+          created_at: "2026-07-25T12:00:00Z",
+        },
+      ],
+      reviews: [],
+      comments: [],
+    });
+
+    await pollGitHubCommitStatusDeliveriesOnce(db);
+
+    expect(await readDelivery(delivery.id)).toMatchObject({
+      status: "skipped",
+      lastResult: { reason: "newer_or_same_second_status_exists" },
+    });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(false);
   });
 
   it("skips the failure write when reviewer evidence now exists on GitHub", async () => {

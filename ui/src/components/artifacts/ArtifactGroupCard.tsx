@@ -1,5 +1,5 @@
 import { Layers } from "lucide-react";
-import type { To } from "react-router-dom";
+import type { To } from "react-router";
 import type { CompanyArtifactGroup } from "@/api/artifacts";
 import { Link } from "@/lib/router";
 import { ArtifactPreview } from "@/components/artifacts/ArtifactCard";

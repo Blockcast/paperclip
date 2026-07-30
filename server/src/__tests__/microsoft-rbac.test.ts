@@ -1,6 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
 import {
+  loadDexRbacConfig,
   parseIdTokenGroups,
+  reconcileDexUser,
   reconcileMicrosoftUser,
   loadMicrosoftRbacConfig,
 } from "../auth/microsoft-rbac.js";
@@ -84,6 +86,44 @@ describe("loadMicrosoftRbacConfig", () => {
       delete process.env.MICROSOFT_BLOCKCAST_COMPANY_ID;
       delete process.env.MICROSOFT_SSH_USERS_GROUP_ID;
       delete process.env.MICROSOFT_ADMIN_AGENTS_GROUP_ID;
+    }
+  });
+});
+
+describe("loadDexRbacConfig", () => {
+  it("loads Workspace group email mappings from env", () => {
+    const saved = {
+      providerId: process.env.PAPERCLIP_DEX_OIDC_PROVIDER_ID,
+      companyId: process.env.PAPERCLIP_DEX_BLOCKCAST_COMPANY_ID,
+      operatorGroup: process.env.PAPERCLIP_DEX_OPERATOR_GROUP,
+      adminGroup: process.env.PAPERCLIP_DEX_ADMIN_GROUP,
+      adminApprovalType: process.env.PAPERCLIP_DEX_ADMIN_APPROVAL_TYPE,
+    };
+    process.env.PAPERCLIP_DEX_OIDC_PROVIDER_ID = "dex-google";
+    process.env.PAPERCLIP_DEX_BLOCKCAST_COMPANY_ID = "co-blockcast";
+    process.env.PAPERCLIP_DEX_OPERATOR_GROUP = "infra-pve-sudo@blockcast.net";
+    process.env.PAPERCLIP_DEX_ADMIN_GROUP = "paperclip-admins@blockcast.net";
+    process.env.PAPERCLIP_DEX_ADMIN_APPROVAL_TYPE = "paperclip_admin_elevation";
+    try {
+      expect(loadDexRbacConfig()).toEqual({
+        providerId: "dex-google",
+        blockcastCompanyId: "co-blockcast",
+        operatorGroupId: "infra-pve-sudo@blockcast.net",
+        adminGroupId: "paperclip-admins@blockcast.net",
+        adminApprovalType: "paperclip_admin_elevation",
+        payloadSource: "dex_groups_claim",
+      });
+    } finally {
+      if (saved.providerId === undefined) delete process.env.PAPERCLIP_DEX_OIDC_PROVIDER_ID;
+      else process.env.PAPERCLIP_DEX_OIDC_PROVIDER_ID = saved.providerId;
+      if (saved.companyId === undefined) delete process.env.PAPERCLIP_DEX_BLOCKCAST_COMPANY_ID;
+      else process.env.PAPERCLIP_DEX_BLOCKCAST_COMPANY_ID = saved.companyId;
+      if (saved.operatorGroup === undefined) delete process.env.PAPERCLIP_DEX_OPERATOR_GROUP;
+      else process.env.PAPERCLIP_DEX_OPERATOR_GROUP = saved.operatorGroup;
+      if (saved.adminGroup === undefined) delete process.env.PAPERCLIP_DEX_ADMIN_GROUP;
+      else process.env.PAPERCLIP_DEX_ADMIN_GROUP = saved.adminGroup;
+      if (saved.adminApprovalType === undefined) delete process.env.PAPERCLIP_DEX_ADMIN_APPROVAL_TYPE;
+      else process.env.PAPERCLIP_DEX_ADMIN_APPROVAL_TYPE = saved.adminApprovalType;
     }
   });
 });
@@ -216,5 +256,28 @@ describe("reconcileMicrosoftUser (mocked db)", () => {
     expect(result.addedMembership).toBe(false);
     expect(result.pendingAdminElevation).toBe(false);
     expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it("uses Dex Workspace group emails for operator grants", async () => {
+    const db = makeDb();
+    db.select = vi.fn(() => ({
+      from: () => ({ where: () => ({ limit: () => [] }) }),
+    }));
+    const result = await reconcileDexUser(
+      db,
+      "user-1",
+      ["Infra-PVE-Sudo@Blockcast.Net"],
+      {
+        providerId: "dex",
+        blockcastCompanyId: "co-blockcast",
+        operatorGroupId: "infra-pve-sudo@blockcast.net",
+        adminGroupId: null,
+        adminApprovalType: "dex_admin_elevation",
+        payloadSource: "dex_groups_claim",
+      },
+    );
+    expect(result.addedMembership).toBe(true);
+    expect(result.pendingAdminElevation).toBe(false);
+    expect(db.insert).toHaveBeenCalledTimes(1);
   });
 });

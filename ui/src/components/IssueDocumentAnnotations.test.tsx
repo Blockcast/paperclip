@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { useState } from "react";
-import { createRoot } from "react-dom/client";
+import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type {
   DocumentAnnotationThreadWithComments,
@@ -285,20 +285,33 @@ function Harness({
 
 describe("IssueDocumentAnnotations", () => {
   let container: HTMLDivElement;
+  let roots: Root[];
 
   beforeEach(() => {
     container = document.createElement("div");
     document.body.appendChild(container);
+    roots = [];
     vi.clearAllMocks();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await act(() => {
+      for (const root of roots.splice(0)) {
+        root.unmount();
+      }
+    });
     container.remove();
   });
 
+  function createTestRoot() {
+    const root = createRoot(container);
+    roots.push(root);
+    return root;
+  }
+
   it("renders the open count chip and opens the panel on click", async () => {
     mockAnnotationsApi.list.mockResolvedValue([makeThread()]);
-    const root = createRoot(container);
+    const root = createTestRoot();
     const queryClient = makeQueryClient();
     const doc = makeDoc();
 
@@ -356,7 +369,7 @@ describe("IssueDocumentAnnotations", () => {
       return originalGetBoundingClientRect.call(this);
     });
 
-    const root = createRoot(container);
+    const root = createTestRoot();
     const queryClient = makeQueryClient();
     const doc = makeDoc();
 
@@ -377,9 +390,11 @@ describe("IssueDocumentAnnotations", () => {
       const panel = container.querySelector('[data-testid="document-annotation-panel"]') as HTMLElement | null;
       expect(anchor).not.toBeNull();
       expect(panel).not.toBeNull();
-      expect(anchor!.style.left).toBe("524px");
-      expect(anchor!.style.width).toBe("360px");
-      expect(panel!.style.width).toBe("360px");
+      await vi.waitFor(() => {
+        expect(anchor!.style.left).toBe("524px");
+        expect(anchor!.style.width).toBe("360px");
+        expect(panel!.style.width).toBe("360px");
+      });
       expect(parseFloat(anchor!.style.left) + parseFloat(anchor!.style.width)).toBeLessThanOrEqual(884);
     } finally {
       rectSpy.mockRestore();
@@ -413,7 +428,7 @@ describe("IssueDocumentAnnotations", () => {
       return originalGetBoundingClientRect.call(this);
     });
 
-    const root = createRoot(container);
+    const root = createTestRoot();
     const queryClient = makeQueryClient();
     const doc = makeDoc();
 
@@ -434,8 +449,10 @@ describe("IssueDocumentAnnotations", () => {
       expect(anchor).not.toBeNull();
       // The document body ends at 640; the panel should clear it with a margin
       // rather than sitting flush against the document's right edge.
-      expect(parseFloat(anchor!.style.left)).toBeGreaterThan(640);
-      expect(anchor!.style.left).toBe("664px");
+      await vi.waitFor(() => {
+        expect(parseFloat(anchor!.style.left)).toBeGreaterThan(640);
+        expect(anchor!.style.left).toBe("664px");
+      });
     } finally {
       rectSpy.mockRestore();
     }
@@ -443,7 +460,7 @@ describe("IssueDocumentAnnotations", () => {
 
   it("auto-opens the panel and focuses the thread when deep-linked", async () => {
     mockAnnotationsApi.list.mockResolvedValue([makeThread({ id: "thread-99" })]);
-    const root = createRoot(container);
+    const root = createTestRoot();
     const queryClient = makeQueryClient();
     const doc = makeDoc();
 
@@ -457,15 +474,17 @@ describe("IssueDocumentAnnotations", () => {
     await flush();
     await flush();
 
-    const panel = container.querySelector('[data-testid="document-annotation-panel"]');
-    expect(panel).not.toBeNull();
-    const focusedThread = container.querySelector('[data-thread-id="thread-99"][data-focused]');
-    expect(focusedThread).not.toBeNull();
+    await vi.waitFor(() => {
+      const panel = container.querySelector('[data-testid="document-annotation-panel"]');
+      expect(panel).not.toBeNull();
+      const focusedThread = container.querySelector('[data-thread-id="thread-99"][data-focused]');
+      expect(focusedThread).not.toBeNull();
+    });
   });
 
   it("shows a disabled reason in the panel when the draft is dirty", async () => {
     mockAnnotationsApi.list.mockResolvedValue([makeThread()]);
-    const root = createRoot(container);
+    const root = createTestRoot();
     const queryClient = makeQueryClient();
     const doc = makeDoc();
 
@@ -492,7 +511,7 @@ describe("IssueDocumentAnnotations", () => {
       makeThread({ id: "resolved-1", status: "resolved" }),
       makeThread({ id: "orphan-1", anchorState: "orphaned" }),
     ]);
-    const root = createRoot(container);
+    const root = createTestRoot();
     const queryClient = makeQueryClient();
     const doc = makeDoc();
 
@@ -507,8 +526,10 @@ describe("IssueDocumentAnnotations", () => {
     await flush();
 
     // Open + resolved both render without any filter interaction.
-    expect(container.querySelector('[data-thread-id="open-1"]')).not.toBeNull();
-    expect(container.querySelector('[data-thread-id="resolved-1"]')).not.toBeNull();
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-thread-id="open-1"]')).not.toBeNull();
+      expect(container.querySelector('[data-thread-id="resolved-1"]')).not.toBeNull();
+    });
     // Orphaned threads can't be anchored in the doc, so they stay hidden.
     expect(container.querySelector('[data-thread-id="orphan-1"]')).toBeNull();
 
@@ -526,7 +547,7 @@ describe("IssueDocumentAnnotations", () => {
       makeThread({ id: "thread-early", normalizedStart: 10, markdownStart: 10 }),
       makeThread({ id: "thread-mid", normalizedStart: 400, markdownStart: 400 }),
     ]);
-    const root = createRoot(container);
+    const root = createTestRoot();
     const queryClient = makeQueryClient();
     const doc = makeDoc();
 
@@ -581,7 +602,7 @@ describe("IssueDocumentAnnotations", () => {
         ],
       }),
     ]);
-    const root = createRoot(container);
+    const root = createTestRoot();
     const queryClient = makeQueryClient();
     const doc = makeDoc();
 
@@ -637,7 +658,7 @@ describe("IssueDocumentAnnotations", () => {
 
   it("does not render a persistent New comment on selection hint when panel is open", async () => {
     mockAnnotationsApi.list.mockResolvedValue([]);
-    const root = createRoot(container);
+    const root = createTestRoot();
     const queryClient = makeQueryClient();
     const doc = makeDoc();
 
@@ -659,7 +680,7 @@ describe("IssueDocumentAnnotations", () => {
 
   it("keeps a captured selection from opening the composer until the layer requests a comment", async () => {
     mockAnnotationsApi.list.mockResolvedValue([]);
-    const root = createRoot(container);
+    const root = createTestRoot();
     const queryClient = makeQueryClient();
     const doc = makeDoc();
 
@@ -704,7 +725,7 @@ describe("IssueDocumentAnnotations", () => {
   it("creates a thread from a captured selection and refreshes the shared annotations query", async () => {
     mockAnnotationsApi.list.mockResolvedValue([]);
     mockAnnotationsApi.create.mockResolvedValue(makeThread({ id: "created-1" }));
-    const root = createRoot(container);
+    const root = createTestRoot();
     const queryClient = makeQueryClient();
     const doc = makeDoc();
 
@@ -755,7 +776,7 @@ describe("IssueDocumentAnnotations", () => {
   it("keeps the composer visible with the draft when creating a thread fails", async () => {
     mockAnnotationsApi.list.mockResolvedValue([]);
     mockAnnotationsApi.create.mockRejectedValue(new Error("Annotation anchor does not match the current document revision"));
-    const root = createRoot(container);
+    const root = createTestRoot();
     const queryClient = makeQueryClient();
     const doc = makeDoc();
 
@@ -803,7 +824,7 @@ describe("IssueDocumentAnnotations", () => {
   it("submits a new anchored comment with ⌘↵", async () => {
     mockAnnotationsApi.list.mockResolvedValue([]);
     mockAnnotationsApi.create.mockResolvedValue(makeThread({ id: "created-1" }));
-    const root = createRoot(container);
+    const root = createTestRoot();
     const queryClient = makeQueryClient();
     const doc = makeDoc();
 
@@ -840,7 +861,7 @@ describe("IssueDocumentAnnotations", () => {
   it("submits a reply with ⌘↵", async () => {
     mockAnnotationsApi.list.mockResolvedValue([makeThread({ id: "open-1" })]);
     mockAnnotationsApi.addComment.mockResolvedValue(makeThread({ id: "open-1" }).comments[0]);
-    const root = createRoot(container);
+    const root = createTestRoot();
     const queryClient = makeQueryClient();
     const doc = makeDoc();
 
@@ -876,7 +897,7 @@ describe("IssueDocumentAnnotations", () => {
   it("keeps a reply draft visible when submitting the reply fails", async () => {
     mockAnnotationsApi.list.mockResolvedValue([makeThread({ id: "open-1" })]);
     mockAnnotationsApi.addComment.mockRejectedValue(new Error("Failed to add reply"));
-    const root = createRoot(container);
+    const root = createTestRoot();
     const queryClient = makeQueryClient();
     const doc = makeDoc();
 
@@ -925,7 +946,7 @@ describe("IssueDocumentAnnotations", () => {
       makeThread({ id: "resolved-1", status: "resolved" }),
     ]);
     mockAnnotationsApi.updateStatus.mockResolvedValue(makeThread({ id: "open-1", status: "resolved" }));
-    const root = createRoot(container);
+    const root = createTestRoot();
     const queryClient = makeQueryClient();
     const doc = makeDoc();
 
@@ -983,7 +1004,7 @@ describe("IssueDocumentAnnotations", () => {
       })),
     });
     mockAnnotationsApi.list.mockResolvedValue([makeThread()]);
-    const root = createRoot(container);
+    const root = createTestRoot();
     const queryClient = makeQueryClient();
     const doc = makeDoc();
 

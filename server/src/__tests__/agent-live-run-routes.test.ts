@@ -40,6 +40,16 @@ function registerModuleMocks() {
 
   vi.doMock("../services/heartbeat.js", () => ({
     heartbeatService: () => mockHeartbeatService,
+    derivePaperclipPrReview: (context: Record<string, unknown> | null) => {
+      if (!context || context.reviewKind !== "pr_review") return null;
+      const prNumber = Number(context.githubPrNumber);
+      if (!Number.isFinite(prNumber)) return null;
+      return {
+        repoFullName: context.githubRepoFullName ?? null,
+        prNumber,
+        headSha: context.githubHeadSha ?? null,
+      };
+    },
   }));
 
   vi.doMock("../services/instance-settings.js", () => ({
@@ -114,23 +124,116 @@ async function createApp(
 }
 
 function createLiveRunsDbStub(rows: Array<Record<string, unknown>>) {
-  const limit = vi.fn(async (value: number) => rows.slice(0, value));
-  const orderedQuery = {
-    limit,
-    then: (resolve: (value: Array<Record<string, unknown>>) => unknown) => Promise.resolve(rows).then(resolve),
+  const limit = vi.fn<(value: number) => unknown>();
+  const orderBy = vi.fn<(...values: unknown[]) => unknown>();
+  let detailQueryCount = 0;
+
+  const db = {
+    selectDistinctOn: vi.fn().mockImplementation(() => {
+      const oldestQueuedByAgent = [
+        ...rows
+          .filter((row) => row.status === "queued" || row.status === "scheduled_retry")
+          .sort((a, b) =>
+            (a.createdAt as Date).getTime() - (b.createdAt as Date).getTime()
+            || String(a.id).localeCompare(String(b.id))
+          )
+          .reduce((byAgent, row) => {
+            if (!byAgent.has(String(row.agentId))) byAgent.set(String(row.agentId), row);
+            return byAgent;
+          }, new Map<string, Record<string, unknown>>())
+          .values(),
+      ];
+      const orderedQuery = {
+        then: (resolve: (value: Array<Record<string, unknown>>) => unknown) => Promise.resolve(oldestQueuedByAgent).then(resolve),
+      };
+      return {
+        from: vi.fn().mockReturnThis(),
+        innerJoin: vi.fn().mockReturnThis(),
+        where: vi.fn().mockReturnThis(),
+        orderBy: vi.fn().mockReturnValue(orderedQuery),
+      };
+    }),
+    select: vi.fn().mockImplementation((columns: Record<string, unknown>) => {
+      let queryLimit: number | undefined;
+      const isSummary = "queuedCount" in columns;
+      const isPrReviewDetail = "scheduledRetryAt" in columns && "contextSnapshot" in columns;
+      if (isPrReviewDetail) detailQueryCount += 1;
+      const isActiveDetail = isPrReviewDetail && detailQueryCount === 1;
+      const parserValid = (row: Record<string, unknown>) => {
+        const context = row.contextSnapshot as Record<string, unknown> | null;
+        return context?.reviewKind === "pr_review" && Number.isFinite(Number(context.githubPrNumber));
+      };
+      const detailRows = (isPrReviewDetail
+        ? rows
+          .filter(parserValid)
+          .filter((row) => isActiveDetail
+            ? ["queued", "scheduled_retry", "running"].includes(String(row.status))
+            : row.finishedAt != null)
+        : rows)
+        .sort((a, b) =>
+          ((isPrReviewDetail && !isActiveDetail ? b.finishedAt : b.createdAt) as Date).getTime()
+          - ((isPrReviewDetail && !isActiveDetail ? a.finishedAt : a.createdAt) as Date).getTime()
+          || String(b.id).localeCompare(String(a.id))
+        );
+      const activeSummary = [...new Map(
+        rows
+          .filter((row) => ["queued", "scheduled_retry", "running"].includes(String(row.status)))
+          .filter(parserValid)
+          .map((row) => {
+            const agentRows = rows.filter((candidate) =>
+              candidate.agentId === row.agentId
+              && ["queued", "scheduled_retry", "running"].includes(String(candidate.status))
+              && Number.isFinite(Number((candidate.contextSnapshot as Record<string, unknown> | null)?.githubPrNumber))
+            );
+            const queuedRows = agentRows.filter((candidate) =>
+              candidate.status === "queued" || candidate.status === "scheduled_retry"
+            );
+            return [row.agentId, {
+              agentId: row.agentId,
+              agentName: row.agentName,
+              activeCount: agentRows.length,
+              queuedCount: queuedRows.length,
+              oldestQueuedAt: queuedRows.length > 0
+                ? new Date(Math.min(...queuedRows.map((candidate) => (candidate.createdAt as Date).getTime())))
+                : null,
+            }];
+          }),
+      ).values()];
+      const orderedQuery = {
+        limit: (value: number) => {
+          limit(value);
+          queryLimit = value;
+          return orderedQuery;
+        },
+        then: (resolve: (value: Array<Record<string, unknown>>) => unknown) => Promise.resolve(
+          detailRows.slice(0, queryLimit),
+        ).then(resolve),
+      };
+      const query = {
+        from: vi.fn().mockReturnThis(),
+        innerJoin: vi.fn().mockReturnThis(),
+        where: vi.fn().mockReturnThis(),
+        groupBy: vi.fn().mockImplementation(() => Promise.resolve(activeSummary)),
+        orderBy: (...values: unknown[]) => {
+          orderBy(...values);
+          return orderedQuery;
+        },
+      };
+      return query;
+    }),
   };
-  const query = {
-    from: vi.fn().mockReturnThis(),
-    innerJoin: vi.fn().mockReturnThis(),
-    where: vi.fn().mockReturnThis(),
-    orderBy: vi.fn().mockReturnValue(orderedQuery),
-  };
+  const transaction = vi.fn(async (
+    callback: (tx: typeof db) => Promise<unknown>,
+  ) => callback(db));
 
   return {
     db: {
-      select: vi.fn().mockReturnValue(query),
+      ...db,
+      transaction,
     },
     limit,
+    orderBy,
+    transaction,
   };
 }
 
@@ -706,5 +809,459 @@ describe("agent live run routes", () => {
         actorId: "local-board",
       },
     });
+  });
+});
+
+describe("PR review queue observability route", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.doUnmock("../services/agents.js");
+    vi.doUnmock("../services/heartbeat.js");
+    vi.doUnmock("../services/index.js");
+    vi.doUnmock("../services/instance-settings.js");
+    vi.doUnmock("../services/issues.js");
+    vi.doUnmock("../adapters/index.js");
+    vi.doUnmock("../routes/agents.js");
+    vi.doUnmock("../routes/authz.js");
+    vi.doUnmock("../middleware/index.js");
+    registerModuleMocks();
+    vi.clearAllMocks();
+  });
+
+  it("groups queued, running, and terminal PR-review runs by reviewer", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-25T12:00:00.000Z"));
+    const contextSnapshot = {
+      reviewKind: "pr_review",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 812,
+      githubHeadSha: "abcdef123456",
+    };
+    const { db } = createLiveRunsDbStub([
+      {
+        id: "queued-old",
+        agentId: routeAgentId,
+        agentName: "Ally",
+        status: "queued",
+        errorCode: null,
+        contextSnapshot,
+        createdAt: new Date("2026-07-25T11:20:00.000Z"),
+        startedAt: null,
+        finishedAt: null,
+      },
+      {
+        id: "queued-new",
+        agentId: routeAgentId,
+        agentName: "Ally",
+        status: "queued",
+        errorCode: null,
+        contextSnapshot,
+        createdAt: new Date("2026-07-25T11:50:00.000Z"),
+        startedAt: null,
+        finishedAt: null,
+      },
+      {
+        id: "running",
+        agentId: routeAgentId,
+        agentName: "Ally",
+        status: "running",
+        errorCode: null,
+        contextSnapshot,
+        createdAt: new Date("2026-07-25T11:40:00.000Z"),
+        startedAt: new Date("2026-07-25T11:45:00.000Z"),
+        finishedAt: null,
+        scheduledRetryAt: null,
+      },
+      {
+        id: "scheduled-retry",
+        agentId: routeAgentId,
+        agentName: "Ally",
+        status: "scheduled_retry",
+        errorCode: null,
+        contextSnapshot,
+        createdAt: new Date("2026-07-25T11:10:00.000Z"),
+        startedAt: null,
+        finishedAt: null,
+        scheduledRetryAt: new Date("2026-07-25T12:10:00.000Z"),
+      },
+      {
+        id: "succeeded",
+        agentId: routeAgentId,
+        agentName: "Ally",
+        status: "succeeded",
+        errorCode: null,
+        contextSnapshot,
+        createdAt: new Date("2026-07-25T10:00:00.000Z"),
+        startedAt: new Date("2026-07-25T10:10:00.000Z"),
+        finishedAt: new Date("2026-07-25T10:20:00.000Z"),
+      },
+      {
+        id: "missing-output",
+        agentId: routeAgentId,
+        agentName: "Ally",
+        status: "failed",
+        errorCode: "pr_review_output_missing",
+        contextSnapshot,
+        createdAt: new Date("2026-07-25T09:00:00.000Z"),
+        startedAt: new Date("2026-07-25T09:05:00.000Z"),
+        finishedAt: new Date("2026-07-25T09:30:00.000Z"),
+      },
+      {
+        id: "other-error",
+        agentId: "22222222-2222-4222-8222-222222222222",
+        agentName: "Second Reviewer",
+        status: "failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { ...contextSnapshot, githubPrNumber: 813 },
+        createdAt: new Date("2026-07-25T08:00:00.000Z"),
+        startedAt: new Date("2026-07-25T08:01:00.000Z"),
+        finishedAt: new Date("2026-07-25T08:04:00.000Z"),
+      },
+    ]);
+    const app = await createApp(db);
+
+    const res = await request(app).get("/api/companies/company-1/pr-review-queue");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.generatedAt).toBe("2026-07-25T12:00:00.000Z");
+    expect(res.body.agents).toHaveLength(2);
+    expect(res.body.agents[0]).toMatchObject({
+      agentId: routeAgentId,
+      agentName: "Ally",
+      queuedCount: 3,
+      oldestQueuedAt: "2026-07-25T11:10:00.000Z",
+      oldestQueuedAgeMs: 3_000_000,
+    });
+    expect(res.body.agents[0].runs.map((run: { disposition: string; ageMs: number }) => [run.disposition, run.ageMs]))
+      .toEqual([
+        ["queued", 600_000],
+        ["dispatched", 1_200_000],
+        ["queued", 2_400_000],
+        ["scheduled_retry", 3_000_000],
+        ["succeeded", 1_200_000],
+        ["pr_review_output_missing", 1_800_000],
+      ]);
+    expect(res.body.agents[0].runs[0]).toMatchObject({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 812,
+      headSha: "abcdef123456",
+    });
+    expect(res.body.agents[0].runs.find((run: { id: string }) => run.id === "scheduled-retry"))
+      .toMatchObject({
+        disposition: "scheduled_retry",
+        scheduledRetryAt: "2026-07-25T12:10:00.000Z",
+      });
+    expect(res.body.agents[1]).toMatchObject({
+      agentName: "Second Reviewer",
+      queuedCount: 0,
+      oldestQueuedAgeMs: null,
+    });
+    expect(res.body.agents[1].runs[0].disposition).toBe("adapter_failed");
+    vi.useRealTimers();
+  });
+
+  it("does not let capped terminal history evict active runs", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-25T12:00:00.000Z"));
+    const contextSnapshot = {
+      reviewKind: "pr_review",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 812,
+      githubHeadSha: "abcdef123456",
+    };
+    const terminal = (id: string, createdAt: string, finishedAt: string, context = contextSnapshot) => ({
+      id,
+      agentId: routeAgentId,
+      agentName: "Ally",
+      status: "succeeded",
+      errorCode: null,
+      contextSnapshot: context,
+      createdAt: new Date(createdAt),
+      startedAt: new Date(createdAt),
+      finishedAt: new Date(finishedAt),
+      scheduledRetryAt: null,
+    });
+    const { db } = createLiveRunsDbStub([
+      terminal("malformed", "2026-07-25T11:58:00.000Z", "2026-07-25T11:59:30.000Z", { reviewKind: "pr_review" }),
+      terminal("terminal-new", "2026-07-25T11:57:00.000Z", "2026-07-25T11:59:00.000Z"),
+      terminal("terminal-old", "2026-07-25T11:56:00.000Z", "2026-07-25T11:58:00.000Z"),
+      {
+        id: "active-oldest",
+        agentId: routeAgentId,
+        agentName: "Ally",
+        status: "queued",
+        errorCode: null,
+        contextSnapshot,
+        createdAt: new Date("2026-07-25T08:00:00.000Z"),
+        startedAt: null,
+        finishedAt: null,
+        scheduledRetryAt: null,
+      },
+    ]);
+    const app = await createApp(db);
+
+    const res = await request(app).get("/api/companies/company-1/pr-review-queue?limit=1");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.agents[0]).toMatchObject({
+      queuedCount: 1,
+      oldestQueuedAt: "2026-07-25T08:00:00.000Z",
+      oldestQueuedAgeMs: 14_400_000,
+    });
+    expect(res.body.agents[0].runs.map((run: { id: string }) => run.id))
+      .toEqual(["terminal-new", "active-oldest"]);
+    vi.useRealTimers();
+  });
+
+  it("filters malformed terminal candidates in SQL and uses one stable bounded query", async () => {
+    const contextSnapshot = {
+      reviewKind: "pr_review",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 812,
+      githubHeadSha: "abcdef123456",
+    };
+    const terminal = (id: string, context: Record<string, unknown>) => ({
+      id,
+      agentId: routeAgentId,
+      agentName: "Ally",
+      status: "succeeded",
+      errorCode: null,
+      contextSnapshot: context,
+      createdAt: new Date("2026-07-25T11:00:00.000Z"),
+      startedAt: new Date("2026-07-25T11:01:00.000Z"),
+      finishedAt: new Date("2026-07-25T11:02:00.000Z"),
+      scheduledRetryAt: null,
+    });
+    const rows = [
+      ...Array.from({ length: 100 }, (_, index) => terminal(`malformed-${index}`, { reviewKind: "pr_review" })),
+      terminal("valid", contextSnapshot),
+    ];
+    const { db, limit, orderBy } = createLiveRunsDbStub(rows);
+    const app = await createApp(db);
+
+    const res = await request(app).get("/api/companies/company-1/pr-review-queue?limit=1");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.agents[0].runs.map((run: { id: string }) => run.id)).toEqual(["valid"]);
+    expect(limit).toHaveBeenCalledTimes(2);
+    expect(limit).toHaveBeenNthCalledWith(1, 2);
+    expect(limit).toHaveBeenNthCalledWith(2, 2);
+    expect(orderBy).toHaveBeenCalledTimes(2);
+    expect(orderBy.mock.calls.every((call) => call.length === 2)).toBe(true);
+    expect(res.body).toMatchObject({
+      detailLimit: 1,
+      truncated: false,
+      truncatedSections: { activeRuns: false, terminalRuns: false },
+    });
+  });
+
+  it("bounds terminal history by completion order rather than creation order", async () => {
+    const contextSnapshot = {
+      reviewKind: "pr_review",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 812,
+      githubHeadSha: "abcdef123456",
+    };
+    const terminal = (id: string, createdAt: string, finishedAt: string) => ({
+      id,
+      agentId: routeAgentId,
+      agentName: "Ally",
+      status: "succeeded",
+      errorCode: null,
+      contextSnapshot,
+      createdAt: new Date(createdAt),
+      startedAt: new Date(createdAt),
+      finishedAt: new Date(finishedAt),
+      scheduledRetryAt: null,
+    });
+    const { db } = createLiveRunsDbStub([
+      terminal("created-later", "2026-07-25T11:00:00.000Z", "2026-07-25T11:20:00.000Z"),
+      terminal("finished-later", "2026-07-25T10:00:00.000Z", "2026-07-25T11:50:00.000Z"),
+    ]);
+    const app = await createApp(db);
+
+    const res = await request(app).get("/api/companies/company-1/pr-review-queue?limit=1");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.agents[0].runs.map((run: { id: string }) => run.id)).toEqual(["finished-later"]);
+    expect(res.body).toMatchObject({
+      truncated: true,
+      truncatedSections: { activeRuns: false, terminalRuns: true },
+    });
+  });
+
+  it("caps recent active detail while preserving each reviewer's oldest queued target", async () => {
+    const contextSnapshot = {
+      reviewKind: "pr_review",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 812,
+      githubHeadSha: "abcdef123456",
+    };
+    const active = (id: string, createdAt: string, agentId = routeAgentId, agentName = "Ally") => ({
+      id,
+      agentId,
+      agentName,
+      status: "queued",
+      errorCode: null,
+      contextSnapshot,
+      createdAt: new Date(createdAt),
+      startedAt: null,
+      finishedAt: null,
+      scheduledRetryAt: null,
+    });
+    const { db } = createLiveRunsDbStub([
+      active("same-time-a", "2026-07-25T11:00:00.000Z"),
+      active("same-time-b", "2026-07-25T11:00:00.000Z"),
+      active("ally-oldest", "2026-07-25T10:00:00.000Z"),
+      active(
+        "second-oldest",
+        "2026-07-25T10:30:00.000Z",
+        "22222222-2222-4222-8222-222222222222",
+        "Second Reviewer",
+      ),
+    ]);
+    const app = await createApp(db);
+
+    const res = await request(app).get("/api/companies/company-1/pr-review-queue?limit=1");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.agents[0]).toMatchObject({
+      queuedCount: 3,
+      oldestQueuedAt: "2026-07-25T10:00:00.000Z",
+    });
+    expect(res.body.agents[0].runs.map((run: { id: string }) => run.id)).toEqual(["same-time-b", "ally-oldest"]);
+    expect(res.body.agents[1]).toMatchObject({
+      agentName: "Second Reviewer",
+      queuedCount: 1,
+    });
+    expect(res.body.agents[1].runs.map((run: { id: string }) => run.id)).toEqual(["second-oldest"]);
+    expect(res.body).toMatchObject({
+      truncated: true,
+      truncatedSections: { activeRuns: true, terminalRuns: false },
+    });
+  });
+
+  it("does not report active truncation when oldest supplementation returns every active run", async () => {
+    const contextSnapshot = {
+      reviewKind: "pr_review",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 812,
+      githubHeadSha: "abcdef123456",
+    };
+    const active = (id: string, agentId: string, agentName: string) => ({
+      id,
+      agentId,
+      agentName,
+      status: "queued",
+      errorCode: null,
+      contextSnapshot,
+      createdAt: new Date("2026-07-25T11:00:00.000Z"),
+      startedAt: null,
+      finishedAt: null,
+      scheduledRetryAt: null,
+    });
+    const { db } = createLiveRunsDbStub([
+      active("ally-only", routeAgentId, "Ally"),
+      active("second-only", "22222222-2222-4222-8222-222222222222", "Second Reviewer"),
+    ]);
+    const app = await createApp(db);
+
+    const res = await request(app).get("/api/companies/company-1/pr-review-queue?limit=1");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.agents.flatMap((agent: { runs: Array<{ id: string }> }) =>
+      agent.runs.map((run) => run.id)
+    )).toEqual(["ally-only", "second-only"]);
+    expect(res.body).toMatchObject({
+      truncated: false,
+      truncatedSections: { activeRuns: false, terminalRuns: false },
+    });
+  });
+
+  it("reads queue aggregates and details from one repeatable-read snapshot", async () => {
+    const queuedRun = {
+      id: "transitioning-run",
+      agentId: routeAgentId,
+      agentName: "Ally",
+      status: "queued",
+      errorCode: null,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 812,
+        githubHeadSha: "abcdef123456",
+      },
+      createdAt: new Date("2026-07-25T11:00:00.000Z"),
+      startedAt: null,
+      finishedAt: null,
+      scheduledRetryAt: null,
+    };
+    const snapshot = createLiveRunsDbStub([{ ...queuedRun }]);
+    const live = createLiveRunsDbStub([{
+      ...queuedRun,
+      status: "succeeded",
+      startedAt: new Date("2026-07-25T11:01:00.000Z"),
+      finishedAt: new Date("2026-07-25T11:02:00.000Z"),
+    }]);
+    const transaction = vi.fn(async (
+      callback: (tx: typeof snapshot.db) => Promise<unknown>,
+      config: Record<string, unknown>,
+    ) => {
+      expect(config).toEqual({ isolationLevel: "repeatable read", accessMode: "read only" });
+      return callback(snapshot.db);
+    });
+    const app = await createApp({ ...live.db, transaction });
+
+    const res = await request(app).get("/api/companies/company-1/pr-review-queue");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(transaction).toHaveBeenCalledOnce();
+    expect(live.db.select).not.toHaveBeenCalled();
+    expect(res.body.agents[0]).toMatchObject({
+      queuedCount: 1,
+      runs: [expect.objectContaining({ id: "transitioning-run", disposition: "queued" })],
+    });
+  });
+
+  it.each([
+    "?limit=0",
+    "?limit=1.5",
+    "?limit=1001",
+    "?limit=not-a-number",
+    "?lookbackHours=0",
+    "?lookbackHours=24.5",
+    "?lookbackHours=169",
+  ])("rejects invalid queue query parameters: %s", async (query) => {
+    const { db } = createLiveRunsDbStub([]);
+    const app = await createApp(db);
+    const res = await request(app).get(`/api/companies/company-1/pr-review-queue${query}`);
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Validation error");
+  });
+
+  it("rejects agent credentials", async () => {
+    const { db } = createLiveRunsDbStub([]);
+    const app = await createApp(db, {
+      type: "agent",
+      agentId: routeAgentId,
+      companyId: "company-1",
+      source: "agent_jwt",
+      runId: "run-1",
+    });
+    const res = await request(app).get("/api/companies/company-1/pr-review-queue");
+    expect(res.status).toBe(403);
+  });
+
+  it("rejects board users outside the company boundary", async () => {
+    const { db } = createLiveRunsDbStub([]);
+    const app = await createApp(db, {
+      type: "board",
+      userId: "board-user",
+      companyIds: ["company-2"],
+      source: "session",
+      isInstanceAdmin: false,
+    });
+    const res = await request(app).get("/api/companies/company-1/pr-review-queue");
+    expect(res.status).toBe(403);
   });
 });

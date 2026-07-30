@@ -1380,6 +1380,20 @@
       "when": 1784602822728,
       "tag": "0204_heartbeat_run_issue_recency_index",
       "breakpoints": true
+    },
+    {
+      "idx": 205,
+      "version": "7",
+      "when": 1785020000000,
+      "tag": "0205_heartbeat_runs_company_finished_at_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 206,
+      "version": "7",
+      "when": 1785020001000,
+      "tag": "0206_github_commit_status_deliveries",
+      "breakpoints": true
     }
   ]
 }

@@ -890,6 +890,65 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(events.some((event) => event.action === "issue.blockers.updated")).toBe(true);
   });
 
+  it("rejects a cycle-forming escalation edge and logs the persisted blocker set", async () => {
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain({
+      blockerStatus: "backlog",
+      blockerAssigneeAgentId: "coder",
+    });
+    const escalationIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: escalationIssueId,
+      companyId,
+      title: "Existing liveness unblock work",
+      status: "todo",
+      priority: "high",
+      parentId: blockerIssueId,
+      assigneeAgentId: managerId,
+      issueNumber: 5,
+      identifier: `P${companyId.replace(/-/g, "").slice(0, 4)}-5`,
+      originKind: "harness_liveness_escalation",
+      originId: "malformed-legacy-incident-key",
+      originFingerprint: [
+        "harness_liveness_leaf",
+        companyId,
+        "blocked_by_assigned_backlog_issue",
+        blockerIssueId,
+      ].join(":"),
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockedIssueId,
+      relatedIssueId: escalationIssueId,
+      type: "blocks",
+    });
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
+
+    expect(result.findings).toBe(1);
+    expect(result.existingEscalations).toBe(1);
+    const persistedBlockers = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, blockedIssueId));
+    expect(persistedBlockers.map((row) => row.blockerIssueId)).toEqual([blockerIssueId]);
+    const reverseEdge = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, escalationIssueId));
+    expect(reverseEdge.map((row) => row.blockerIssueId)).toEqual([blockedIssueId]);
+    const blockerEvent = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "issue.blockers.updated"),
+        eq(activityLog.entityId, blockedIssueId),
+      ))
+      .then((rows) => rows.at(-1));
+    expect(blockerEvent?.details).toMatchObject({ blockerIssueIds: [blockerIssueId] });
+  });
+
   it("skips budget-blocked direct owners and assigns recovery to the manager fallback", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, coderId, blockedIssueId, blockerIssueId } = await seedBlockedChain();

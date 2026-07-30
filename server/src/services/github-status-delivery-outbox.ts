@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, lt, lte, sql } from "drizzle-orm";
+import { and, eq, inArray, lt, sql } from "drizzle-orm";
 import {
   githubCommitStatusDeliveries,
   heartbeatRunEvents,
@@ -74,6 +74,20 @@ function classifyReviewerEvidenceError(error: string): { retryable: boolean; rea
   return { retryable: true, reason: `reviewer_evidence_${error}` };
 }
 
+function deliveryClaimWhere(row: DeliveryRow) {
+  return and(
+    eq(githubCommitStatusDeliveries.id, row.id),
+    eq(githubCommitStatusDeliveries.status, "processing"),
+    eq(githubCommitStatusDeliveries.updatedAt, row.updatedAt),
+  );
+}
+
+function statusCreatedAtOrAfterQueueSecond(statusCreatedAt: number, queuedAt: Date): boolean {
+  if (!Number.isFinite(statusCreatedAt)) return false;
+  const queuedAtSecond = Math.floor(queuedAt.getTime() / 1000) * 1000;
+  return statusCreatedAt >= queuedAtSecond;
+}
+
 async function appendDeliveryRunEvent(
   db: Db,
   row: DeliveryRow,
@@ -119,7 +133,7 @@ async function markTerminal(
   result: Record<string, unknown>,
 ): Promise<void> {
   const now = new Date();
-  await db
+  const [updated] = await db
     .update(githubCommitStatusDeliveries)
     .set({
       status,
@@ -129,7 +143,15 @@ async function markTerminal(
       lastErrorKind: status === "failed_permanent" ? "permanent" : status === "failed" ? "retry_exhausted" : null,
       lastResult: result,
     })
-    .where(eq(githubCommitStatusDeliveries.id, row.id));
+    .where(deliveryClaimWhere(row))
+    .returning({ id: githubCommitStatusDeliveries.id });
+  if (!updated) {
+    logger.info(
+      { deliveryId: row.id, attemptedStatus: status },
+      "github-status-delivery-outbox: stale delivery claim ignored terminal update",
+    );
+    return;
+  }
 
   await appendDeliveryRunEvent(db, row, level, message, {
     deliveryId: row.id,
@@ -150,19 +172,28 @@ async function retryOrFailDelivery(
 ): Promise<void> {
   const attempts = row.attempts + 1;
   const now = new Date();
+  const retryAt = nextAttemptAt(attempts, now);
   const exhausted = attempts >= MAX_ATTEMPTS;
-  await db
+  const [updated] = await db
     .update(githubCommitStatusDeliveries)
     .set({
       status: exhausted ? "failed" : "queued",
       attempts,
-      nextAttemptAt: exhausted ? row.nextAttemptAt : nextAttemptAt(attempts, now),
+      nextAttemptAt: exhausted ? row.nextAttemptAt : retryAt,
       lastError: reason,
       lastErrorKind: exhausted ? "retry_exhausted" : "transient",
       lastResult: result,
       updatedAt: now,
     })
-    .where(eq(githubCommitStatusDeliveries.id, row.id));
+    .where(deliveryClaimWhere(row))
+    .returning({ id: githubCommitStatusDeliveries.id });
+  if (!updated) {
+    logger.info(
+      { deliveryId: row.id, reason },
+      "github-status-delivery-outbox: stale delivery claim ignored retry update",
+    );
+    return;
+  }
 
   await appendDeliveryRunEvent(
     db,
@@ -180,7 +211,7 @@ async function retryOrFailDelivery(
       deliveryStatus: exhausted ? "failed" : "queued",
       attempts,
       maxAttempts: MAX_ATTEMPTS,
-      nextAttemptAt: exhausted ? null : nextAttemptAt(attempts, now).toISOString(),
+      nextAttemptAt: exhausted ? null : retryAt.toISOString(),
       reason,
       ...result,
     },
@@ -219,8 +250,8 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
   }
   const latestCommitStatus = latestStatus.status;
   const statusCreatedAt = latestCommitStatus?.createdAt ? Date.parse(latestCommitStatus.createdAt) : NaN;
-  const statusCreatedAfterQueue = Number.isFinite(statusCreatedAt) && statusCreatedAt > row.createdAt.getTime();
-  if (latestCommitStatus?.state === "success" || statusCreatedAfterQueue) {
+  const statusAtOrAfterQueue = statusCreatedAtOrAfterQueueSecond(statusCreatedAt, row.createdAt);
+  if (latestCommitStatus?.state === "success" || statusAtOrAfterQueue) {
     await markTerminal(
       db,
       row,
@@ -228,7 +259,7 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
       "info",
       `Skipped PR-review gate status failure for ${row.context} on ${row.repoFullName}@${row.sha.slice(0, 7)} because a newer status already exists`,
       {
-        reason: latestCommitStatus?.state === "success" ? "existing_success_status" : "newer_status_exists",
+        reason: latestCommitStatus?.state === "success" ? "existing_success_status" : "newer_or_same_second_status_exists",
         latestStatus: latestCommitStatus,
       },
     );
@@ -344,11 +375,11 @@ export async function enqueueGithubCommitStatusDelivery(
   return row;
 }
 
-export async function resetStaleGitHubCommitStatusDeliveries(db: Db): Promise<number> {
-  const staleBefore = new Date(Date.now() - STALE_PROCESSING_MS);
+export async function resetStaleGitHubCommitStatusDeliveries(db: Db, now = new Date()): Promise<number> {
+  const staleBefore = new Date(now.getTime() - STALE_PROCESSING_MS);
   const rows = await db
     .update(githubCommitStatusDeliveries)
-    .set({ status: "queued", updatedAt: new Date() })
+    .set({ status: "queued", nextAttemptAt: now, updatedAt: now })
     .where(
       and(
         eq(githubCommitStatusDeliveries.status, "processing"),
@@ -359,34 +390,43 @@ export async function resetStaleGitHubCommitStatusDeliveries(db: Db): Promise<nu
   if (rows.length > 0) {
     logger.warn(
       { count: rows.length },
-      "github-status-delivery-outbox: requeued stale processing rows on startup",
+      "github-status-delivery-outbox: requeued stale processing rows",
     );
   }
   return rows.length;
 }
 
+async function claimDueGitHubCommitStatusDeliveries(db: Db, now: Date): Promise<DeliveryRow[]> {
+  const claimed = await db.transaction(async (tx) => {
+    const lockedRows = Array.from(await tx.execute(sql<{ id: string }>`
+      select ${githubCommitStatusDeliveries.id} as "id"
+      from ${githubCommitStatusDeliveries}
+      where ${githubCommitStatusDeliveries.status} = 'queued'
+        and ${githubCommitStatusDeliveries.nextAttemptAt} <= ${now}
+      order by ${githubCommitStatusDeliveries.nextAttemptAt} asc, ${githubCommitStatusDeliveries.createdAt} asc
+      limit ${CLAIM_BATCH}
+      for update skip locked
+    `)) as Array<{ id: string }>;
+    const ids = lockedRows.map((row) => row.id);
+    if (ids.length === 0) return [];
+    return tx
+      .update(githubCommitStatusDeliveries)
+      .set({ status: "processing", updatedAt: now })
+      .where(inArray(githubCommitStatusDeliveries.id, ids))
+      .returning();
+  });
+
+  return claimed.sort(
+    (left, right) =>
+      left.nextAttemptAt.getTime() - right.nextAttemptAt.getTime()
+      || left.createdAt.getTime() - right.createdAt.getTime(),
+  );
+}
+
 export async function pollGitHubCommitStatusDeliveriesOnce(db: Db): Promise<number> {
   const now = new Date();
-  const claimed = await db
-    .update(githubCommitStatusDeliveries)
-    .set({ status: "processing", updatedAt: now })
-    .where(
-      inArray(
-        githubCommitStatusDeliveries.id,
-        db
-          .select({ id: githubCommitStatusDeliveries.id })
-          .from(githubCommitStatusDeliveries)
-          .where(
-            and(
-              eq(githubCommitStatusDeliveries.status, "queued"),
-              lte(githubCommitStatusDeliveries.nextAttemptAt, now),
-            ),
-          )
-          .orderBy(asc(githubCommitStatusDeliveries.nextAttemptAt), asc(githubCommitStatusDeliveries.createdAt))
-          .limit(CLAIM_BATCH),
-      ),
-    )
-    .returning();
+  await resetStaleGitHubCommitStatusDeliveries(db, now);
+  const claimed = await claimDueGitHubCommitStatusDeliveries(db, now);
 
   for (const row of claimed) {
     try {

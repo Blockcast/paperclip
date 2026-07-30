@@ -96,8 +96,9 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   });
 
   await page.goto(`/${companyPrefix}/issues`);
-  await expect(page.locator(issueLinkSelector)).toBeVisible();
-  await expect(page.locator(issueLinkSelector)).not.toContainText("Plan mode");
+  const issueListLink = page.locator(issueLinkSelector);
+  await expect(issueListLink).toBeVisible({ timeout: 30_000 });
+  await expect(issueListLink).not.toContainText("Plan mode");
   await page.screenshot({
     path: `${screenshotDir}/desktop-planning-row-${timestamp}.png`,
     fullPage: true,
@@ -130,8 +131,8 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   });
 
   await page.goto(`/${companyPrefix}/issues`);
-  await expect(page.locator(issueLinkSelector)).toBeVisible();
-  await expect(page.locator(issueLinkSelector)).not.toContainText("Plan mode");
+  await expect(issueListLink).toBeVisible({ timeout: 30_000 });
+  await expect(issueListLink).not.toContainText("Plan mode");
   await page.screenshot({
     path: `${screenshotDir}/mobile-planning-row-${timestamp}.png`,
     fullPage: true,

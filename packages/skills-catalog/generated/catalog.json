@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "packageName": "@paperclipai/skills-catalog",
   "packageVersion": "0.3.1",
-  "generatedAt": "2026-07-18T08:18:38.699Z",
+  "generatedAt": "2026-07-30T16:16:43.215Z",
   "skills": [
     {
       "id": "paperclipai:bundled:docs:doc-maintenance",
@@ -409,11 +409,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 6590,
-          "sha256": "3a22fa995854c7e75235ea3e36f7f0b2a05e9d4152cd274e4f6a71ba9c94ee58"
+          "sizeBytes": 8453,
+          "sha256": "debe3765844710d3833c031169c0e0af91711827c5f9c2926662d575e50f3d97"
         }
       ],
-      "contentHash": "sha256:e9fbca81e2baf6f2bfed41725ed19d3e1129c7ea70a9d8f08af31ef295fd67a2"
+      "contentHash": "sha256:73061ea63d4db627f2809d848661dacd922c395358d44d2c7cd633c240f0feb5"
     },
     {
       "id": "paperclipai:optional:browser:agent-browser",

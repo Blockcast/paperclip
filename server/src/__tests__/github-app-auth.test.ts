@@ -175,11 +175,16 @@ describe("githubHasReviewerEvidenceForPr", () => {
     });
   });
 
-  it("finds a bot comment that references the head SHA (comment-mode review)", async () => {
+  it("finds a canonical bot comment with one exact-head attestation", async () => {
     setCreds();
     stubGithub({
       reviews: [],
-      comments: [{ user: { login: "allyblockcast[bot]" }, body: `Reviewed at head ${headSha.slice(0, 12)} — LGTM.` }],
+      comments: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha}\n\nNo findings.`,
+        },
+      ],
     });
     await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
       found: true,
@@ -187,30 +192,35 @@ describe("githubHasReviewerEvidenceForPr", () => {
     });
   });
 
-  it("BLO-12280: credits a post-merge review comment even when it omits the head SHA", async () => {
+  it("rejects a bot-authored review request even when it contains the exact head SHA", async () => {
     setCreds();
     stubGithub({
       reviews: [],
       comments: [
         {
           user: { login: "allyblockcast[bot]" },
-          body: "@ally please review the networking/load-balancing domain wiring",
-        },
-        {
-          user: { login: "allyblockcast[bot]" },
-          body: [
-            "## Review: Networking/Load-balancing Argo Domains",
-            "",
-            "**Status**: LOOKS GOOD 0C/0I/2S (post-merge)",
-            "",
-            "The AppProject blast radius is bounded and manual-sync/no-finalizer safety is preserved.",
-          ].join("\n"),
+          body: `@ally review exact head ${headSha}`,
         },
       ],
     });
     await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
-      found: true,
-      via: "comment",
+      found: false,
+    });
+  });
+
+  it("rejects a consolidated comment with duplicate full-SHA attestations", async () => {
+    setCreds();
+    stubGithub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          body: `## Ally — Consolidated PR Review\nReviewed head: ${headSha}\nReviewed head: ${headSha}`,
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: false,
     });
   });
 
@@ -237,7 +247,7 @@ describe("githubHasReviewerEvidenceForPr", () => {
     stubGithub({
       prHead: headSha,
       reviews: [],
-      comments: [{ user: { login: "allyblockcast[bot]" }, body: `## Ally — Consolidated PR Review  _reviewed head: ${headSha}` }],
+      comments: [{ user: { login: "allyblockcast[bot]" }, body: `## Ally — Consolidated PR Review\n_reviewed head: ${headSha}_` }],
     });
     await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha: null })).resolves.toEqual({
       found: true,

@@ -1121,9 +1121,16 @@ export async function startServer(): Promise<StartedServer> {
       );
     } else {
       const startupHeartbeatRecovery = (async () => {
-        const reattachedExternalRuns = await heartbeat.resumeRunningExternalRuntimeRuns();
-        if (reattachedExternalRuns > 0) {
-          logger.info({ reattachedExternalRuns }, "reattached running external-runtime Jobs after restart");
+        try {
+          const reattachedExternalRuns = await heartbeat.resumeRunningExternalRuntimeRuns();
+          if (reattachedExternalRuns > 0) {
+            logger.info({ reattachedExternalRuns }, "reattached running external-runtime Jobs after restart");
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup external-runtime Job reattachment failed - orphan reaper will serve as degraded backstop",
+          );
         }
 
         try {
@@ -1159,6 +1166,17 @@ export async function startServer(): Promise<StartedServer> {
               );
             }
           }
+        }
+
+        // Lock cleanup must not be starved by failures in the broader recovery
+        // sequence: stale checkout ownership can prevent every later run.
+        try {
+          const swept = await heartbeat.sweepStaleIssueLocks();
+          if (swept.cleared > 0) {
+            logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
+          }
+        } catch (err) {
+          logger.error({ err }, "startup stale-lock sweeper failed");
         }
 
         const promotion = await heartbeat.promoteDueScheduledRetries();
@@ -1199,11 +1217,6 @@ export async function startServer(): Promise<StartedServer> {
         const scanned = await heartbeat.scanSilentActiveRuns();
         if (scanned.created > 0 || scanned.escalated > 0) {
           logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
-        }
-
-        const swept = await heartbeat.sweepStaleIssueLocks();
-        if (swept.cleared > 0) {
-          logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
         }
 
         const reviewed = await heartbeat.reconcileProductivityReviews();
@@ -1305,6 +1318,17 @@ export async function startServer(): Promise<StartedServer> {
 
         if (heartbeatSchedulerStopped) return;
         if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
+          trackHeartbeatSchedulerWork(heartbeat
+            .sweepStaleIssueLocks()
+            .then((swept) => {
+              if (swept.cleared > 0) {
+                logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+              }
+            })
+            .catch((err) => {
+              logger.error({ err }, "periodic stale-lock sweeper failed");
+            }));
+
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
           trackHeartbeatSchedulerWork(heartbeat
@@ -1346,12 +1370,6 @@ export async function startServer(): Promise<StartedServer> {
               const scanned = await heartbeat.scanSilentActiveRuns();
               if (scanned.created > 0 || scanned.escalated > 0) {
                 logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
-              }
-            })
-            .then(async () => {
-              const swept = await heartbeat.sweepStaleIssueLocks();
-              if (swept.cleared > 0) {
-                logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
               }
             })
             .then(async () => {

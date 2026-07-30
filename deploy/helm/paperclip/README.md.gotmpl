@@ -63,7 +63,7 @@ The chart does **not** create an Ingress by default. Pick one:
 
 ## Upgrading
 
-The image is pinned via `image.tag` in `values.yaml`. Two common paths:
+The image is selected via `image.tag` in `values.yaml`. Set `image.digest` to pin the deployed manifest immutably; when present, it takes precedence over the tag. Two common paths:
 
 - **Follow upstream**: every upstream master push and stable tag publishes an image (`sha-<short>` and `vYYYY.MMM.P` respectively). Point `image.tag` at whichever channel you want to track.
 - **Manual**:

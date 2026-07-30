@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useInfiniteQuery } from "@tanstack/react-query";
 import { ArrowLeft, Check, Layers, Package, Search, X } from "lucide-react";
-import type { To } from "react-router-dom";
+import type { To } from "react-router";
 import {
   artifactsApi,
   type ArtifactGroupBy,
