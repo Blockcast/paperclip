@@ -1,0 +1,231 @@
+import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import {
+  clusterIssueDuplicates,
+  describeIssueDuplicateCandidate,
+  extractIssueDuplicateFeatures,
+  findIssueDuplicateCandidates,
+  type IssueDuplicateDocument,
+} from "./issue-duplicate-matcher.js";
+
+/**
+ * The four real filings of the monitor defect from 2026-07-29 (BLO-18799).
+ * Titles and descriptions are verbatim from the database so the regression is
+ * anchored to the actual incident rather than a paraphrase of it.
+ */
+interface FilingFixture {
+  identifier: string;
+  title: string;
+  description: string;
+  createdAt: string;
+}
+
+const filings: FilingFixture[] = JSON.parse(
+  readFileSync(
+    fileURLToPath(new URL("./__fixtures__/issue-duplicate-monitor-filings.json", import.meta.url)),
+    "utf8",
+  ),
+) as FilingFixture[];
+
+const asDocument = (filing: FilingFixture): IssueDuplicateDocument => ({
+  id: filing.identifier,
+  identifier: filing.identifier,
+  title: filing.title,
+  description: filing.description,
+});
+
+/**
+ * Unrelated-but-same-project issues. These share the Paperclip vocabulary
+ * (agent, issue, run, server test, acceptance criteria) and the same issue
+ * template, which is exactly the false-positive shape the guard must survive.
+ */
+const distractors: IssueDuplicateDocument[] = [
+  {
+    id: "distractor-ui-density",
+    identifier: "BLO-17001",
+    title: "Issue list rows wrap at 1280px, hiding the assignee avatar column",
+    description: [
+      "The issue list table in `ui/src/pages/IssueList.tsx` wraps its trailing columns",
+      "below 1280px viewport width, so the assignee avatar and priority chip drop out of",
+      "view. `IssueRow` sets a fixed `min-width` on the title cell which forces the",
+      "overflow.",
+      "",
+      "## Acceptance criteria",
+      "- Assignee avatar and priority chip stay visible down to 1024px.",
+      "- No horizontal scrollbar appears on the issue list at 1024px.",
+      "",
+      "## Verifying signal",
+      "- Server test is not applicable; add a `ui` snapshot test at 1024px and 1280px.",
+      "- Manual: load /BLO/issues at both widths and confirm the columns render.",
+    ].join("\n"),
+  },
+  {
+    id: "distractor-worker-backoff",
+    identifier: "BLO-17002",
+    title: "Worker retry backoff resets on process restart, hammering the adapter",
+    description: [
+      "`server/src/services/workers.ts` keeps retry backoff state in memory, so a worker",
+      "restart resets `attemptCount` to zero and the adapter gets retried immediately.",
+      "Under a crashloop this produces a request storm against the adapter endpoint.",
+      "",
+      "The backoff schedule should be derived from a persisted `nextAttemptAt` column",
+      "instead of an in-process counter.",
+      "",
+      "## Acceptance criteria",
+      "- Backoff survives a worker restart: `nextAttemptAt` is read from the database.",
+      "- A crashlooping worker issues at most one adapter request per backoff window.",
+      "",
+      "## Verifying signal",
+      "- Server test asserting backoff is preserved across a simulated restart.",
+      "- Dashboard: adapter request rate stays flat during a worker rollout.",
+    ].join("\n"),
+  },
+  {
+    id: "distractor-label-filter",
+    identifier: "BLO-17003",
+    title: "Label filter on the issue list ignores labels applied at creation time",
+    description: [
+      "Filtering the issue list by label misses issues whose `labelIds` were supplied to",
+      "`paperclipCreateIssue` at creation, because `syncIssueLabels` runs after the",
+      "response is returned and the filter reads a stale materialized column.",
+      "",
+      "## Acceptance criteria",
+      "- An issue created with `labelIds` appears under that label filter immediately.",
+      "",
+      "## Verifying signal",
+      "- Server test creating an issue with `labelIds` then filtering by that label.",
+    ].join("\n"),
+  },
+];
+
+describe("extractIssueDuplicateFeatures", () => {
+  it("classifies symbols, paths, references and prose terms", () => {
+    const features = extractIssueDuplicateFeatures({
+      title: "`paperclipUpdateIssue` drops the monitor param",
+      description: [
+        "See `server/src/routes/issues.ts:8242` and BLO-18168, plus PR #806.",
+        "The nested `executionPolicy.monitor` shape persists correctly.",
+      ].join("\n"),
+    });
+
+    expect(features.get("paperclipupdateissue")).toBe("symbol");
+    expect(features.get("executionpolicy.monitor")).toBe("symbol");
+    // Dotted symbols also contribute their trailing component.
+    expect(features.get("monitor")).toBe("symbol");
+    // Line numbers are stripped so two issues citing different lines still match.
+    expect(features.get("server/src/routes/issues.ts")).toBe("path");
+    expect(features.get("blo-18168")).toBe("reference");
+    expect(features.get("#806")).toBe("reference");
+    expect(features.get("nested")).toBe("term");
+  });
+
+  it("does not treat prose slashes or bare short words as paths or symbols", () => {
+    const features = extractIssueDuplicateFeatures({
+      title: "Either and/or is fine",
+      description: "Runs 24/7 with no issue.",
+    });
+    expect(features.has("and/or")).toBe(false);
+    expect(features.has("24/7")).toBe(false);
+  });
+});
+
+describe("findIssueDuplicateCandidates — the four real monitor filings", () => {
+  it("has all four filings in the fixture", () => {
+    expect(filings.map((filing) => filing.identifier).sort()).toEqual([
+      "BLO-18168",
+      "BLO-18782",
+      "BLO-18783",
+      "BLO-18790",
+    ]);
+  });
+
+  it("clusters all four filings as a single duplicate group", () => {
+    const clusters = clusterIssueDuplicates([...filings.map(asDocument), ...distractors]);
+
+    expect(clusters).toHaveLength(1);
+    expect([...clusters[0]!.identifiers].sort()).toEqual([
+      "BLO-18168",
+      "BLO-18782",
+      "BLO-18783",
+      "BLO-18790",
+    ]);
+  });
+
+  it.each([1, 2, 3])(
+    "flags filing #%i+1 as a duplicate of every earlier filing",
+    (index) => {
+      const subject = asDocument(filings[index]!);
+      const corpus = [...filings.slice(0, index).map(asDocument), ...distractors];
+
+      const { candidates } = findIssueDuplicateCandidates(subject, corpus);
+
+      const flagged = candidates.map((candidate) => candidate.identifier).sort();
+      const earlier = filings.slice(0, index).map((filing) => filing.identifier).sort();
+      expect(flagged).toEqual(earlier);
+    },
+  );
+
+  it("explains a match with the shared evidence tokens", () => {
+    const subject = asDocument(filings[3]!);
+    const { candidates } = findIssueDuplicateCandidates(subject, [
+      asDocument(filings[0]!),
+      ...distractors,
+    ]);
+
+    expect(candidates).toHaveLength(1);
+    const [candidate] = candidates;
+    const tokens = candidate!.sharedFeatures.map((feature) => feature.token);
+    // The evidence that title matching could never see.
+    expect(tokens).toContain("monitornextcheckat");
+    expect(describeIssueDuplicateCandidate(candidate!)).toContain("BLO-18168");
+  });
+});
+
+describe("findIssueDuplicateCandidates — precision", () => {
+  it("does not flag distinct issues that share a project and vocabulary", () => {
+    for (const subject of distractors) {
+      const corpus = [
+        ...distractors.filter((entry) => entry.id !== subject.id),
+        ...filings.map(asDocument),
+      ];
+      const { candidates } = findIssueDuplicateCandidates(subject, corpus);
+      expect(
+        candidates.map((candidate) => candidate.identifier),
+        `${subject.identifier} should not match anything`,
+      ).toEqual([]);
+    }
+  });
+
+  it("returns no candidates against an empty corpus", () => {
+    expect(findIssueDuplicateCandidates(asDocument(filings[0]!), []).candidates).toEqual([]);
+  });
+
+  it("never matches a document against itself", () => {
+    const document = asDocument(filings[0]!);
+    expect(findIssueDuplicateCandidates(document, [document]).candidates).toEqual([]);
+  });
+});
+
+describe("anti-vacuity: the previous title-only matcher fails these cases", () => {
+  /** The pre-BLO-18799 guard, reproduced verbatim in behaviour. */
+  const normalizeTitle = (title: string) => title.trim().replace(/\s+/g, " ").toLowerCase();
+  const titleOnlyMatches = (a: FilingFixture, b: FilingFixture) =>
+    normalizeTitle(a.title) === normalizeTitle(b.title);
+
+  it("finds no duplicate among the four filings by normalized title", () => {
+    const pairs = filings.flatMap((left, i) =>
+      filings.slice(i + 1).map((right) => titleOnlyMatches(left, right)),
+    );
+    expect(pairs).toHaveLength(6);
+    expect(pairs.some(Boolean)).toBe(false);
+  });
+
+  it("would therefore have created all four issues", () => {
+    const created: FilingFixture[] = [];
+    for (const filing of filings) {
+      if (!created.some((existing) => titleOnlyMatches(existing, filing))) created.push(filing);
+    }
+    expect(created).toHaveLength(4);
+  });
+});

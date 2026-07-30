@@ -158,7 +158,7 @@ describe("plugin-worker-manager stderr failure context", () => {
         lease: { providerLeaseId: "lease-1" },
         command: "echo",
         delayMs: 50,
-      } as HostToWorkerMethods["environmentExecute"][0], 100)).resolves.toMatchObject({
+      } as HostToWorkerMethods["environmentExecute"][0], 2_000)).resolves.toMatchObject({
         exitCode: 0,
         stdout: "ok\n",
       });

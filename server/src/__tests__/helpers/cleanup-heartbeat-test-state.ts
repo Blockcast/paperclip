@@ -4,6 +4,7 @@ import {
   type createDb,
   heartbeatRuns,
 } from "@paperclipai/db";
+import { runWithTransientDbRetry } from "../../lib/db-retry.js";
 import type { heartbeatService } from "../../services/heartbeat.ts";
 
 type Db = ReturnType<typeof createDb>;
@@ -94,7 +95,12 @@ export async function cleanupHeartbeatTestState(
   await heartbeat.drainInFlightExecutions(drainTimeoutMs);
 
   const truncateList = ['"companies"', ...extraTruncateTables.map((t) => `"${t}"`)].join(", ");
-  await db.execute(sql.raw(`TRUNCATE TABLE ${truncateList} CASCADE`));
+  await runWithTransientDbRetry(async () => {
+    await db.execute(sql.raw(`TRUNCATE TABLE ${truncateList} CASCADE`));
+  }, {
+    maxAttempts: 5,
+    baseDelayMs: 50,
+  });
 }
 
 async function cancelActiveRunsForCleanup(

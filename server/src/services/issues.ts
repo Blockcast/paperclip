@@ -678,6 +678,10 @@ type IssueActiveRunRow = {
   startedAt: Date | null;
   finishedAt: Date | null;
   createdAt: Date;
+  // BLO-19001: liveness signals, so a consumer can tell a run that is actually
+  // holding this issue from one that has been silent long enough to be stale.
+  lastOutputAt: Date | null;
+  lastUsefulActionAt: Date | null;
 };
 type IssueScheduledRetryRow = {
   runId: string;
@@ -2071,6 +2075,8 @@ async function activeRunMapForIssues(
         startedAt: heartbeatRuns.startedAt,
         finishedAt: heartbeatRuns.finishedAt,
         createdAt: heartbeatRuns.createdAt,
+        lastOutputAt: heartbeatRuns.lastOutputAt,
+        lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
       })
       .from(heartbeatRuns)
       .where(
