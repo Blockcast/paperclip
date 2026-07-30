@@ -198,18 +198,6 @@ test("strips trailing newline/CR from a token supplied by value", () => {
   });
 });
 
-test("an empty token value falls through to the token file", () => {
-  // An unset binding must not silently blank out the default identity.
-  withTempDir((dir) => {
-    const result = runWrapper(dir, {
-      tokenFileContent: "ghs_apptoken\n",
-      tokenValue: "",
-    });
-    assert.equal(result.GH_TOKEN, "ghs_apptoken");
-    assert.equal(result.GITHUB_TOKEN, "ghs_apptoken");
-  });
-});
-
 // Every rejection below is asserted with BOTH a readable token file and
 // ambient GH_TOKEN/GITHUB_TOKEN present, because those are the two things a
 // fall-through would silently authenticate as. Asserting only the exit code
@@ -235,6 +223,7 @@ function runMalformedValue(dir, tokenValue) {
 }
 
 for (const [label, tokenValue] of [
+  ["empty", ""],
   ["CRLF only", "\r\n"],
   ["spaces only", "   "],
   ["tabs only", "\t\t"],

@@ -33,7 +33,7 @@ REAL_GH="${GH_TOKEN_WRAPPER_REAL_GH:-/usr/bin/gh.real}"
 # a caller could always point that at a file it wrote. This is deliberately NOT
 # GH_TOKEN: the override below must keep clobbering GH_TOKEN unconditionally
 # (BLO-13241), so GH_TOKEN cannot double as an input without reopening that bug.
-if [ -n "${PAPERCLIP_GITHUB_TOKEN_VALUE:-}" ]; then
+if [ "${PAPERCLIP_GITHUB_TOKEN_VALUE+x}" = x ]; then
   # Trim surrounding whitespace only — a secret that arrives via a templated
   # env binding routinely picks up a trailing newline, and tabs/spaces are just
   # as likely as CR/LF from a YAML block scalar. Deliberately a trim rather than
