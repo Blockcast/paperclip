@@ -4961,27 +4961,31 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
 
-    // BLO-18829: set inside the transaction once the status write has actually landed,
-    // consumed after commit. Stays null on every path that does not escalate, so a
-    // rolled-back or no-op escalation can never dispatch a wake.
-    let pendingWakeDispatch: {
+    type PendingWakeDispatch = {
       outboxRowId: string;
       agentId: string;
       opts: RecoveryWakeupOptions;
-    } | null = null;
-    let pendingWakeAttemptRefund: SourceScopedStrandedRecoveryWakeInput | null = null;
+    };
+    type PendingWakeAttemptRefund = SourceScopedStrandedRecoveryWakeInput;
 
     // BLO-18829: the escalation comment / activity log / needs-human-decision event, all
     // of which must run AFTER commit -- see the note at the assignment site for the
     // trigger-mediated hang that running them inside the transaction causes.
-    let postCommitNotifications: {
+    type PostCommitNotifications = {
       fresh: typeof issues.$inferSelect;
       action: Awaited<ReturnType<typeof recoveryActionsSvc.upsertSourceScoped>>;
       isProviderQuotaWait: boolean;
       recoveryCause: StrandedRecoveryCause;
       blockerIds: string[];
       needsHumanDecision: boolean;
-    } | null = null;
+    };
+
+    type StrandedEscalationResult = {
+      escalated: typeof issues.$inferSelect;
+      pendingWakeDispatch: PendingWakeDispatch | null;
+      pendingWakeAttemptRefund: PendingWakeAttemptRefund | null;
+      postCommitNotifications: PostCommitNotifications;
+    };
 
     // Serialize escalation per (company, source-issue) so concurrent
     // reconcile sweeps don't fight over the same recovery-action upsert,
@@ -4989,7 +4993,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // The advisory lock is xact-scoped on this tx's connection; once we
     // commit/return, waiting peers wake up and record their next attempt
     // against the same active source-scoped action.
-    const escalated = await db.transaction(async (tx) => {
+    const escalationResult = await db.transaction(async (tx): Promise<StrandedEscalationResult | null> => {
       await tx.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${input.issue.companyId} || ':' || ${input.issue.id}, 0))`,
       );
@@ -5105,10 +5109,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // sentinel is caught immediately outside the transaction and mapped back to null,
       // so the callee contract ("null means we did not escalate") is unchanged.
       if (!updated) throw new StrandedEscalationCasMissError();
-      pendingWakeDispatch = wakePlan && wakeOutboxRow
+      const pendingWakeDispatch = wakePlan && wakeOutboxRow
         ? { outboxRowId: wakeOutboxRow.id, agentId: wakePlan.agentId, opts: wakePlan.opts }
         : null;
-      pendingWakeAttemptRefund =
+      const pendingWakeAttemptRefund =
         !wakePlan && sourceScopedWakePlanMissNeedsRefund(wakeInput) ? wakeInput : null;
       // BLO-18829: everything past the CAS is notification, not part of the atomic unit,
       // and it MUST NOT run while this transaction is still open. `issuesSvc.addComment`
@@ -5120,8 +5124,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // so it hangs rather than erroring. That is the same unrecoverable wait as the
       // reverted `956c5b016` row lock, reached through a trigger instead of an explicit
       // FOR UPDATE. Hand the work out and run it after commit.
-      postCommitNotifications = { fresh, action, isProviderQuotaWait, recoveryCause, blockerIds, needsHumanDecision };
-      return updated;
+      const postCommitNotifications = { fresh, action, isProviderQuotaWait, recoveryCause, blockerIds, needsHumanDecision };
+      return { escalated: updated, pendingWakeDispatch, pendingWakeAttemptRefund, postCommitNotifications };
     }).catch((err) => {
       // The CAS lost the race: the transaction has already rolled back, taking the
       // recovery action, the provider-quota monitor, and the wake outbox row with it.
@@ -5130,7 +5134,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       throw err;
     });
 
-    if (!escalated || !postCommitNotifications) return escalated ?? null;
+    if (!escalationResult) return null;
+    const { escalated, pendingWakeDispatch, pendingWakeAttemptRefund, postCommitNotifications } = escalationResult;
     const { fresh, action, isProviderQuotaWait, recoveryCause, blockerIds, needsHumanDecision } =
       postCommitNotifications;
 
