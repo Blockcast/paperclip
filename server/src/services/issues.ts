@@ -7601,6 +7601,16 @@ export function issueService(db: Db) {
           const workspace = await assertValidExecutionWorkspace(companyId, null, executionWorkspaceId, tx);
           issueData.projectId = workspace.projectId;
         }
+        // Note for the inference below: reaching it with `projectId == null` PROVES both
+        // workspace ids are also null, so it needs no separate guard against them.
+        // `execution_workspaces.project_id` and `project_workspaces.project_id` are both
+        // `NOT NULL` (packages/db/src/schema/execution_workspaces.ts:20,
+        // project_workspaces.ts:19; DDL in migrations/0035_marvelous_satana.sql, never
+        // relaxed since). So each block above either assigns a non-null projectId or
+        // throws — a *projectless* explicit/inherited workspace is not a representable
+        // state. Raised twice in review (PR #811) as a case where inference would fight
+        // the re-validation at ~7729 and fail the create; recorded here because the
+        // reasoning is non-local and the counterexample is unwritable as a test.
         // BLO-18760: an issue created with none of the inheritance signals
         // above (no parent, no explicit workspace) is *born* with
         // projectId: null and, on its first run, falls back onto the
