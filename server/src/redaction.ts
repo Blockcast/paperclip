@@ -66,14 +66,29 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 type SanitizeOptions = { agentConfig?: boolean };
 
 /**
- * A `secret_ref` / `user_secret_ref` binding is a pointer, and neither
- * `envBindingSecretRefSchema` nor `envBindingUserSecretRefSchema` has a `value`
- * field. So a `value` on one only ever means a resolved plaintext secret rode
- * along, whatever its `projectionClass` claims — drop it (BLO-18969 AC3).
+ * A `secret_ref` / `user_secret_ref` binding is a pointer. Preserve only its
+ * schema-owned pointer fields; a `value` or any other unknown field can only be
+ * resolved plaintext or untrusted baggage riding along with it.
  */
-function stripResolvedSecretValue(binding: Record<string, unknown>): Record<string, unknown> {
-  if (!("value" in binding)) return binding;
-  const { value: _resolved, ...pointer } = binding;
+function sanitizeSecretRefPointer(binding: Record<string, unknown>): Record<string, unknown> {
+  const pointer: Record<string, unknown> = {
+    type: "secret_ref",
+    secretId: binding.secretId,
+  };
+  for (const key of ["version", "projectionClass", "projectionAllowlistKey"] as const) {
+    if (key in binding) pointer[key] = binding[key];
+  }
+  return pointer;
+}
+
+function sanitizeUserSecretRefPointer(binding: Record<string, unknown>): Record<string, unknown> {
+  const pointer: Record<string, unknown> = {
+    type: "user_secret_ref",
+    key: binding.key,
+  };
+  for (const key of ["version", "required", "allowMissingOverride"] as const) {
+    if (key in binding) pointer[key] = binding[key];
+  }
   return pointer;
 }
 
@@ -81,7 +96,10 @@ function sanitizeValue(value: unknown, options?: SanitizeOptions): unknown {
   if (value === null || value === undefined) return value;
   if (Array.isArray(value)) return value.map((entry) => sanitizeValue(entry, options));
   if (isSecretRefBinding(value) || isUserSecretRefBinding(value)) {
-    return options?.agentConfig ? stripResolvedSecretValue(value) : value;
+    if (!options?.agentConfig) return value;
+    return isSecretRefBinding(value)
+      ? sanitizeSecretRefPointer(value)
+      : sanitizeUserSecretRefPointer(value);
   }
   if (isPlainBinding(value)) {
     // In an agent config a plain binding IS credential material, by
@@ -96,22 +114,26 @@ function sanitizeValue(value: unknown, options?: SanitizeOptions): unknown {
 
 /**
  * Every value of an `env` map is credential-bearing regardless of its key, so
- * mask the value and keep the shape: a binding stays a binding (the UI renders
- * it, and the write path restores it on round-trip), a legacy bare string —
- * still accepted by `envBindingSchema` — becomes the sentinel string.
+ * mask the value and keep only safe shapes: a pointer stays a pointer, a plain
+ * binding stays a redacted plain binding, and every legacy or malformed value
+ * becomes the sentinel string.
  */
 function sanitizeAgentEnvRecord(record: Record<string, unknown>): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
-    if (isSecretRefBinding(value) || isUserSecretRefBinding(value)) {
-      redacted[key] = stripResolvedSecretValue(value);
+    if (isSecretRefBinding(value)) {
+      redacted[key] = sanitizeSecretRefPointer(value);
+      continue;
+    }
+    if (isUserSecretRefBinding(value)) {
+      redacted[key] = sanitizeUserSecretRefPointer(value);
       continue;
     }
     if (isPlainBinding(value)) {
       redacted[key] = { type: "plain", value: REDACTED_EVENT_VALUE };
       continue;
     }
-    redacted[key] = typeof value === "string" ? REDACTED_EVENT_VALUE : sanitizeValue(value, { agentConfig: true });
+    redacted[key] = REDACTED_EVENT_VALUE;
   }
   return redacted;
 }
@@ -217,6 +239,12 @@ export function redactAgentConfigPayload(payload: unknown): Record<string, unkno
   if (!payload) return null;
   if (!isPlainObject(payload)) return payload as Record<string, unknown> | null;
   return sanitizeRecord(payload, { agentConfig: true });
+}
+
+export function redactApprovalPayloadByType(type: unknown, payload: unknown): Record<string, unknown> {
+  if (!payload || !isPlainObject(payload)) return {};
+  if (type === "hire_agent") return redactAgentConfigPayload(payload) ?? {};
+  return redactEventPayload(payload) ?? {};
 }
 
 export function redactSensitiveText(input: string): string {

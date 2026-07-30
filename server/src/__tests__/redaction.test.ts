@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   REDACTED_EVENT_VALUE,
   redactAgentConfigPayload,
+  redactApprovalPayloadByType,
   redactEventPayload,
   redactSensitiveText,
   sanitizeRecord,
@@ -207,6 +208,7 @@ describe("redactAgentConfigPayload", () => {
           type: "secret_ref",
           secretId: "44444444-4444-4444-8444-444444444444",
           projectionClass: "unclassified",
+          extra: "not-schema-owned",
           value: SECRET,
         },
       },
@@ -220,6 +222,61 @@ describe("redactAgentConfigPayload", () => {
           projectionClass: "unclassified",
         },
       },
+    });
+  });
+
+  it("masks malformed object-valued env entries wholesale", () => {
+    expect(redactAgentConfigPayload({
+      runtimeConfig: {
+        custom: {
+          env: {
+            FOO: { legacyValue: SECRET },
+            BAR: { type: "unknown", value: SECRET },
+            PLAIN: { type: "plain", value: SECRET, label: "ignored" },
+            USER: {
+              type: "user_secret_ref",
+              key: "github_token",
+              version: "latest",
+              required: false,
+              allowMissingOverride: true,
+              value: SECRET,
+              extra: "ignored",
+            },
+          },
+        },
+      },
+    })).toEqual({
+      runtimeConfig: {
+        custom: {
+          env: {
+            FOO: REDACTED_EVENT_VALUE,
+            BAR: REDACTED_EVENT_VALUE,
+            PLAIN: { type: "plain", value: REDACTED_EVENT_VALUE },
+            USER: {
+              type: "user_secret_ref",
+              key: "github_token",
+              version: "latest",
+              required: false,
+              allowMissingOverride: true,
+            },
+          },
+        },
+      },
+    });
+  });
+
+  it("uses structural redaction only for hire approval payloads", () => {
+    const payload = {
+      title: "Pick deployment target",
+      env: { target: "production" },
+      colorChoice: { type: "plain", value: "blue" },
+    };
+
+    expect(redactApprovalPayloadByType("request_board_approval", structuredClone(payload))).toEqual(payload);
+    expect(redactApprovalPayloadByType("hire_agent", structuredClone(payload))).toEqual({
+      title: "Pick deployment target",
+      env: { target: REDACTED_EVENT_VALUE },
+      colorChoice: { type: "plain", value: REDACTED_EVENT_VALUE },
     });
   });
 

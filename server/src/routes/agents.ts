@@ -149,6 +149,15 @@ function restoreRedactedAdapterValue(incoming: unknown, existing: unknown): unkn
   if (incoming === REDACTED_EVENT_VALUE) {
     return existing === undefined ? OMIT_REDACTED_ADAPTER_VALUE : existing;
   }
+  if (
+    incoming
+    && typeof incoming === "object"
+    && !Array.isArray(incoming)
+    && (incoming as { type?: unknown; value?: unknown }).type === "plain"
+    && (incoming as { type?: unknown; value?: unknown }).value === REDACTED_EVENT_VALUE
+  ) {
+    return existing === undefined ? OMIT_REDACTED_ADAPTER_VALUE : existing;
+  }
   if (Array.isArray(incoming)) {
     const existingArray = Array.isArray(existing) ? existing : [];
     return incoming.flatMap((value, index) => {
@@ -1290,12 +1299,24 @@ export function agentRoutes(
     return mergedRuntimeConfig;
   }
 
+  function restoreRedactedRuntimeConfigValues(
+    existingRuntimeConfig: unknown,
+    requestedRuntimeConfig: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const existingRecord = asRecord(existingRuntimeConfig) ?? {};
+    const restoredRuntimeConfig = containsRedactedAdapterValue(requestedRuntimeConfig)
+      ? (restoreRedactedAdapterValue(requestedRuntimeConfig, existingRecord) as Record<string, unknown>)
+      : requestedRuntimeConfig;
+    return restoreRedactedRuntimeConfigAdapterConfigs(existingRuntimeConfig, restoredRuntimeConfig);
+  }
+
   /**
    * `runtimeConfig.modelProfiles.*.adapterConfig` is a real adapter config —
    * it holds env bindings and is normalized for persistence like any other —
    * so a response redacts it and a naive save posts the sentinel back.
-   * `normalizeEnvConfig` would reject that with a 422; restore it against the
-   * stored config instead, exactly as the top-level adapterConfig does.
+   * `normalizeEnvConfig` would reject the short env sentinel with a 422; restore
+   * it against the stored config instead, exactly as the top-level adapterConfig
+   * does.
    */
   function restoreRedactedRuntimeConfigAdapterConfigs(
     existingRuntimeConfig: unknown,
@@ -3290,7 +3311,7 @@ export function agentRoutes(
         res.status(422).json({ error: "runtimeConfig must be an object" });
         return;
       }
-      requestedRuntimeConfig = restoreRedactedRuntimeConfigAdapterConfigs(
+      requestedRuntimeConfig = restoreRedactedRuntimeConfigValues(
         existing.runtimeConfig,
         mergeRuntimeConfigPatchForAgentUpdate(existing.runtimeConfig, runtimeConfig),
       );

@@ -17,22 +17,18 @@ import {
   secretService,
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
-import { redactAgentConfigPayload } from "../redaction.js";
+import { redactApprovalPayloadByType } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
 
-// A `hire_agent` payload embeds the requested adapterConfig/runtimeConfig, so
-// approvals are an agent-config surface and need the structural redactor: the
-// generic key-name one left nested env bindings readable, and payloads stored
-// before BLO-18969 still carry them.
-function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(approval: T): T {
+function redactApprovalPayload<T extends { type: string; payload: Record<string, unknown> }>(approval: T): T {
   return {
     ...approval,
-    payload: redactAgentConfigPayload(approval.payload) ?? {},
+    payload: redactApprovalPayloadByType(approval.type, approval.payload),
   };
 }
 
-function approvalResolutionResponse<T extends { payload: Record<string, unknown> }>(
+function approvalResolutionResponse<T extends { type: string; payload: Record<string, unknown> }>(
   approval: T,
   applied: boolean,
 ): T & { applied: boolean } {

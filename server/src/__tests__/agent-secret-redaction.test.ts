@@ -587,6 +587,48 @@ describe("agent secret redaction on mutating responses", () => {
     });
     expect(JSON.stringify(res.body)).not.toContain(ORDINARY_KEY_SECRET);
   });
+
+  it("restores recursive runtimeConfig sentinels before persisting PATCH updates", async () => {
+    const runtimeSecretAgent = {
+      ...baseAgent,
+      runtimeConfig: {
+        credentials: { type: "plain", value: ORDINARY_KEY_SECRET },
+        mode: "production",
+      },
+    };
+    mockAgentService.getById.mockResolvedValue(runtimeSecretAgent);
+    mockAgentService.update.mockImplementation(async (_id, patch) => ({
+      ...runtimeSecretAgent,
+      ...(patch as Record<string, unknown>),
+    }));
+
+    const app = createApp(boardActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({
+        runtimeConfig: {
+          credentials: { type: "plain", value: "***REDACTED***" },
+          mode: "maintenance",
+        },
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalledWith(
+      agentId,
+      expect.objectContaining({
+        runtimeConfig: {
+          credentials: { type: "plain", value: ORDINARY_KEY_SECRET },
+          mode: "maintenance",
+        },
+      }),
+      expect.anything(),
+    );
+    expect(res.body.runtimeConfig.credentials).toEqual({
+      type: "plain",
+      value: "***REDACTED***",
+    });
+    expect(JSON.stringify(res.body)).not.toContain(ORDINARY_KEY_SECRET);
+  });
 });
 
 describe("stripRedactedEnvBindingsFromAdapterConfig — round-trip guard", () => {
@@ -726,6 +768,17 @@ describe("stripRedactedEnvBindingsFromAdapterConfig — round-trip guard", () =>
     };
 
     expect(stripRedactedEnvBindingsFromAdapterConfig(incoming, existing)).toEqual(existing);
+  });
+
+  it("drops nested plain binding sentinels that have no existing value", () => {
+    const incoming = {
+      credentials: { type: "plain", value: "***REDACTED***" },
+      model: "openai/gpt-5.6-sol",
+    };
+
+    expect(stripRedactedEnvBindingsFromAdapterConfig(incoming, null)).toEqual({
+      model: "openai/gpt-5.6-sol",
+    });
   });
 
   it("drops recursive redaction sentinels that have no existing value", () => {
