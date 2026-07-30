@@ -8473,7 +8473,16 @@ export function issueRoutes(
               ...updateFields,
               actorAgentId: actor.agentId ?? null,
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
-              ...(delegateRecoveryPatchInFlight ? { expectedCurrentStatus: "blocked" } : {}),
+              ...(delegateRecoveryPatchInFlight
+                ? {
+                    expectedCurrentStatus: "blocked",
+                    // BLO-18797: allow_manager_chain was granted because this
+                    // assignee is a report of the actor. Pin it too, or a
+                    // reassignment to an unrelated agent that keeps the row
+                    // blocked would still satisfy an id+status predicate.
+                    expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
+                  }
+                : {}),
             },
             tx,
           );
@@ -8499,7 +8508,14 @@ export function issueRoutes(
           ...updateFields,
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
-          ...(delegateRecoveryPatchInFlight ? { expectedCurrentStatus: "blocked" } : {}),
+          ...(delegateRecoveryPatchInFlight
+            ? {
+                expectedCurrentStatus: "blocked",
+                // See the transactional branch above: the assignee is an
+                // authorization-relevant snapshot field for allow_manager_chain.
+                expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
+              }
+            : {}),
         });
       }
     } catch (err) {

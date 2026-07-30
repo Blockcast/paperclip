@@ -1105,4 +1105,54 @@ describe("sandbox callback bridge", () => {
     // or one decode clobbers the other's half-appended base64.
     expect(stagingPaths.size).toBe(2);
   });
+
+  it("removes both staging files when a chunk append aborts mid-upload", async () => {
+    // Per-invocation tokens mean the next attempt picks a fresh name and can
+    // never sweep this one's scratch files, so a failed upload that skips
+    // cleanup leaks them permanently.
+    const runner = {
+      execute: vi.fn(async (input: {
+        command: string;
+        args?: string[];
+        cwd?: string;
+        env?: Record<string, string>;
+        stdin?: string;
+        timeoutMs?: number;
+      }): Promise<RunProcessResult> => {
+        const script = input.args?.join("\n") ?? "";
+        const failed = script.includes("printf '%s'");
+        return {
+          exitCode: failed ? 1 : 0,
+          signal: null,
+          timedOut: false,
+          stdout: "",
+          stderr: failed ? "disk full" : "",
+          pid: null,
+          startedAt: new Date().toISOString(),
+        };
+      }),
+    };
+
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({
+      runner,
+      remoteCwd: "/workspace",
+      timeoutMs: 30_000,
+    });
+
+    const target = "/workspace/queue/000000000001.json";
+    await expect(client.writeTextFile(target, "{\"ok\":true}\n")).rejects.toThrow();
+
+    const scripts = runner.execute.mock.calls.map(([input]) => input.args?.join("\n") ?? "");
+    const token = scripts
+      .join("\n")
+      .match(/000000000001\.json\.([0-9a-f-]{36})\.paperclip-upload\.b64/)?.[1];
+    expect(token).toBeDefined();
+
+    // The finalize script (which carries the happy-path rm) never ran, so the
+    // only cleanup available is the failure-path sweep.
+    expect(scripts.some((script) => script.includes("base64 -d <"))).toBe(false);
+    const cleanup = scripts.at(-1) ?? "";
+    expect(cleanup).toContain(`rm -f '${target}.${token}.paperclip-upload.b64'`);
+    expect(cleanup).toContain(`'${target}.${token}.paperclip-upload.tmp'`);
+  });
 });

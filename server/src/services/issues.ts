@@ -7858,6 +7858,18 @@ export function issueService(db: Db) {
          * concurrent transaction.
          */
         expectedCurrentStatus?: string;
+        /**
+         * BLO-18797: the same optimistic-concurrency guard for the assignee.
+         * `allow_manager_chain` is granted *because* the row's assignee is a
+         * report of the actor, so the assignee is an authorization-relevant
+         * snapshot field exactly like the status: a reassignment that lands
+         * between the route's read and this write would leave the actor
+         * clearing an unrelated agent's blockers under a grant that no longer
+         * holds. Pinned in the UPDATE's WHERE clause for the same reason as
+         * the status — only the WHERE is re-evaluated against the latest row
+         * version when the statement blocks on a concurrent transaction.
+         */
+        expectedCurrentAssigneeAgentId?: string | null;
       },
       dbOrTx: any = db,
     ) => {
@@ -7874,6 +7886,7 @@ export function issueService(db: Db) {
         actorAgentId,
         actorUserId,
         expectedCurrentStatus,
+        expectedCurrentAssigneeAgentId,
         ...issueData
       } = data;
 
@@ -7882,6 +7895,16 @@ export function issueService(db: Db) {
           issueId: id,
           expectedStatus: expectedCurrentStatus,
           currentStatus: existing.status,
+        });
+      }
+      if (
+        expectedCurrentAssigneeAgentId !== undefined &&
+        existing.assigneeAgentId !== expectedCurrentAssigneeAgentId
+      ) {
+        throw conflict("Issue assignee changed before the update could be applied", {
+          issueId: id,
+          expectedAssigneeAgentId: expectedCurrentAssigneeAgentId,
+          currentAssigneeAgentId: existing.assigneeAgentId,
         });
       }
       const experimental = await instanceSettings.getExperimental();
@@ -8143,25 +8166,38 @@ export function issueService(db: Db) {
           projectGoalId: nextProjectGoalId,
           defaultGoalId: defaultCompanyGoal?.id ?? null,
         });
+        const writePreconditions = [
+          ...(expectedCurrentStatus === undefined ? [] : [eq(issues.status, expectedCurrentStatus)]),
+          ...(expectedCurrentAssigneeAgentId === undefined
+            ? []
+            : [
+                expectedCurrentAssigneeAgentId === null
+                  ? isNull(issues.assigneeAgentId)
+                  : eq(issues.assigneeAgentId, expectedCurrentAssigneeAgentId),
+              ]),
+        ];
         const updated = await tx
           .update(issues)
           .set(patch)
           .where(
-            expectedCurrentStatus === undefined
+            writePreconditions.length === 0
               ? eq(issues.id, id)
-              : and(eq(issues.id, id), eq(issues.status, expectedCurrentStatus)),
+              : and(eq(issues.id, id), ...writePreconditions),
           )
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) {
-          // With expectedCurrentStatus set, zero matched rows means a concurrent
-          // writer changed the status after the snapshot check above — the
-          // precondition genuinely failed, so surface 409 rather than the 404
-          // that a bare `return null` would produce.
-          if (expectedCurrentStatus !== undefined) {
-            throw conflict("Issue status changed before the update could be applied", {
+          // With a precondition set, zero matched rows means a concurrent writer
+          // changed an authorization-relevant field after the snapshot check
+          // above — the precondition genuinely failed, so surface 409 rather
+          // than the 404 that a bare `return null` would produce.
+          if (writePreconditions.length > 0) {
+            throw conflict("Issue changed before the update could be applied", {
               issueId: id,
-              expectedStatus: expectedCurrentStatus,
+              ...(expectedCurrentStatus === undefined ? {} : { expectedStatus: expectedCurrentStatus }),
+              ...(expectedCurrentAssigneeAgentId === undefined
+                ? {}
+                : { expectedAssigneeAgentId: expectedCurrentAssigneeAgentId }),
             });
           }
           return null;

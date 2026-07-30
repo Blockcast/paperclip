@@ -2010,7 +2010,7 @@ describe("agent issue mutation checkout ownership", () => {
     // protection the narrow patch shape exists to preserve. The route now
     // pins the precondition through to the write.
     for (const reason of ["allow_manager_chain", "allow_issue_creator"] as const) {
-      it(`pins status=blocked through to the write for a ${reason} delegate recovery`, async () => {
+      it(`pins status=blocked and the assignee through to the write for a ${reason} delegate recovery`, async () => {
         decideAllowingOnly(reason);
         const stored = makeIssue({
           status: "blocked",
@@ -2030,6 +2030,11 @@ describe("agent issue mutation checkout ownership", () => {
         expect(res.status, JSON.stringify(res.body)).toBe(200);
         const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
         expect(patch.expectedCurrentStatus).toBe("blocked");
+        // BLO-18797 review follow-up #3 (Ally, PR #814). Status alone is not
+        // enough: allow_manager_chain is granted *because* this assignee is a
+        // report of the actor, so a reassignment to an unrelated agent that
+        // leaves the row blocked would still satisfy an id+status predicate.
+        expect(patch.expectedCurrentAssigneeAgentId).toBe(ownerAgentId);
       });
     }
 
@@ -2083,6 +2088,7 @@ describe("agent issue mutation checkout ownership", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
       expect(patch.expectedCurrentStatus).toBeUndefined();
+      expect(patch.expectedCurrentAssigneeAgentId).toBeUndefined();
     });
   });
 

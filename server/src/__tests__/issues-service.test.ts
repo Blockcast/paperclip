@@ -8168,8 +8168,68 @@ describeEmbeddedPostgres("issueService.update expectedCurrentStatus (BLO-18797)"
     expect(row?.executionRunId).toBe(runId);
   });
 
-  it("leaves ordinary updates unguarded when no expected status is supplied", async () => {
-    const { issueId } = await seedBlockedIssue();
+  it("rejects with 409 when the row is reassigned before the write, leaving blockers intact", async () => {
+    const { companyId, issueId, agentId } = await seedBlockedIssue();
+
+    const blockerId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: "Upstream blocker",
+      status: "todo",
+      priority: "high",
+    });
+    await db.insert(issueRelations).values({
+      id: randomUUID(),
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    // allow_manager_chain was granted because the assignee was a report of the
+    // actor. Hand the row to an unrelated agent while it stays `blocked`: an
+    // id+status predicate alone would still match, and the manager would clear
+    // a stranger's blockers under a grant that no longer holds.
+    const unrelatedAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: unrelatedAgentId,
+      companyId,
+      name: "UnrelatedEngineer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(issues).set({ assigneeAgentId: unrelatedAgentId }).where(eq(issues.id, issueId));
+
+    await expect(
+      svc.update(issueId, {
+        status: "todo",
+        blockedByIssueIds: [],
+        expectedCurrentStatus: "blocked",
+        expectedCurrentAssigneeAgentId: agentId,
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+
+    const row = await db
+      .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("blocked");
+    expect(row?.assigneeAgentId).toBe(unrelatedAgentId);
+
+    const remainingBlockers = await db
+      .select({ issueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, issueId));
+    expect(remainingBlockers.map((relation) => relation.issueId)).toEqual([blockerId]);
+  });
+
+  it("leaves ordinary updates unguarded when no expected status is supplied", async () => {    const { issueId } = await seedBlockedIssue();
 
     await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
 

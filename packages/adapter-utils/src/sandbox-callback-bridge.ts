@@ -526,30 +526,49 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       const uploadToken = randomUUID();
       const uploadPath = `${remotePath}.${uploadToken}.paperclip-upload.b64`;
       const decodedPath = `${remotePath}.${uploadToken}.paperclip-upload.tmp`;
-      await runChecked(
-        `prepare upload ${remotePath}`,
-        `mkdir -p ${shellQuote(remoteDir)} && rm -f ${shellQuote(uploadPath)} ${shellQuote(decodedPath)} && : > ${shellQuote(uploadPath)}`,
-      );
-      const base64Body = toBuffer(Buffer.from(body, "utf8")).toString("base64");
-      for (const chunk of base64Chunks(base64Body)) {
-        await runChecked(
-          `append upload chunk ${remotePath}`,
-          `printf '%s' ${shellQuote(chunk)} >> ${shellQuote(uploadPath)}`,
-        );
-      }
-      await runChecked(
-        `finalize upload ${remotePath}`,
-        [
-          `base64 -d < ${shellQuote(uploadPath)} > ${shellQuote(decodedPath)}`,
-          "status=$?",
-          'if [ "$status" -eq 0 ]; then',
-          `  mv -f ${shellQuote(decodedPath)} ${shellQuote(remotePath)}`,
-          "  status=$?",
-          "fi",
+      // Per-invocation names mean a later attempt picks a fresh token and can
+      // never sweep an earlier one's scratch files, so anything we abandon here
+      // leaks permanently. The happy path unlinks both inside the finalize
+      // script (one round trip instead of two); this catch covers every way out
+      // before that runs — most pointedly a failed chunk append.
+      const discardStagingFiles = async () => {
+        await runShell(
+          input.runner,
+          input.remoteCwd,
           `rm -f ${shellQuote(uploadPath)} ${shellQuote(decodedPath)}`,
-          'exit "$status"',
-        ].join("\n"),
-      );
+          timeoutMs,
+          shellCommand,
+        ).catch(() => undefined);
+      };
+      try {
+        await runChecked(
+          `prepare upload ${remotePath}`,
+          `mkdir -p ${shellQuote(remoteDir)} && rm -f ${shellQuote(uploadPath)} ${shellQuote(decodedPath)} && : > ${shellQuote(uploadPath)}`,
+        );
+        const base64Body = toBuffer(Buffer.from(body, "utf8")).toString("base64");
+        for (const chunk of base64Chunks(base64Body)) {
+          await runChecked(
+            `append upload chunk ${remotePath}`,
+            `printf '%s' ${shellQuote(chunk)} >> ${shellQuote(uploadPath)}`,
+          );
+        }
+        await runChecked(
+          `finalize upload ${remotePath}`,
+          [
+            `base64 -d < ${shellQuote(uploadPath)} > ${shellQuote(decodedPath)}`,
+            "status=$?",
+            'if [ "$status" -eq 0 ]; then',
+            `  mv -f ${shellQuote(decodedPath)} ${shellQuote(remotePath)}`,
+            "  status=$?",
+            "fi",
+            `rm -f ${shellQuote(uploadPath)} ${shellQuote(decodedPath)}`,
+            'exit "$status"',
+          ].join("\n"),
+        );
+      } catch (error) {
+        await discardStagingFiles();
+        throw error;
+      }
     },
     writeResponseFile: async (responsePath, body, options = {}) => {
       const responseDir = path.posix.dirname(responsePath);
