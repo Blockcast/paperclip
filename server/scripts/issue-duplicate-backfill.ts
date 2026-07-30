@@ -31,18 +31,42 @@ import {
   type IssueDuplicateDocument,
 } from "@paperclipai/shared/issue-duplicate-matcher";
 
+/**
+ * Flags fail loudly rather than degrading: a calibration run whose `--company`
+ * silently widened to every company, or whose `--distinctive 0` quietly
+ * disabled the evidence floor, reports numbers that look real and are not
+ * reproducible from the command line that produced them.
+ */
 function parseFlag(name: string): string | null {
   const index = process.argv.indexOf(name);
   if (index < 0) return null;
   const value = process.argv[index + 1];
-  return value && !value.startsWith("--") ? value : null;
+  if (value === undefined || value.startsWith("--")) {
+    throw new Error(`${name} requires a value (got ${value === undefined ? "end of arguments" : value})`);
+  }
+  return value;
 }
 
-function parseNumberFlag(name: string, fallback: number): number {
+interface NumberFlagRange {
+  min?: number;
+  max?: number;
+  integer?: boolean;
+}
+
+function parseNumberFlag(name: string, fallback: number, range: NumberFlagRange = {}): number {
   const raw = parseFlag(name);
   if (raw === null) return fallback;
   const parsed = Number(raw);
   if (!Number.isFinite(parsed)) throw new Error(`${name} must be a number, got ${raw}`);
+  if (range.integer && !Number.isInteger(parsed)) {
+    throw new Error(`${name} must be an integer, got ${raw}`);
+  }
+  if (range.min !== undefined && parsed < range.min) {
+    throw new Error(`${name} must be >= ${range.min}, got ${raw}`);
+  }
+  if (range.max !== undefined && parsed > range.max) {
+    throw new Error(`${name} must be <= ${range.max}, got ${raw}`);
+  }
   return parsed;
 }
 
@@ -56,15 +80,19 @@ async function main() {
 
   const companyId = parseFlag("--company");
   const projectId = parseFlag("--project");
-  const days = parseNumberFlag("--days", 30);
-  const show = parseNumberFlag("--show", 10);
+  const days = parseNumberFlag("--days", 30, { min: 1 });
+  const show = parseNumberFlag("--show", 10, { min: 0, integer: true });
   const dumpCorpus = parseFlag("--dump-corpus");
   const originKinds = parseFlag("--origin")?.split(",").map((kind) => kind.trim()).filter(Boolean) ?? null;
   const options = {
-    scoreThreshold: parseNumberFlag("--score", ISSUE_DUPLICATE_MATCHER_DEFAULTS.scoreThreshold),
+    scoreThreshold: parseNumberFlag("--score", ISSUE_DUPLICATE_MATCHER_DEFAULTS.scoreThreshold, {
+      min: 0,
+      max: 1,
+    }),
     minSharedDistinctiveFeatures: parseNumberFlag(
       "--distinctive",
       ISSUE_DUPLICATE_MATCHER_DEFAULTS.minSharedDistinctiveFeatures,
+      { min: 1, integer: true },
     ),
   };
 
