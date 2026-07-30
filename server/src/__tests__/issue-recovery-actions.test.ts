@@ -1084,7 +1084,20 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
-  it("keeps the source issue blocked when source-scoped wakeup is claimed synchronously", async () => {
+  // BLO-18829: this test used to assert the source issue was still `blocked` after a
+  // wakeup that synchronously claims it. That outcome was only reachable because
+  // escalation dispatched its wake BEFORE its own status write, so the status write ran
+  // last and clobbered the claim back to `blocked` -- the same "recovery overwrites a
+  // legitimate concurrent transition" bug BLO-18643 fixes for human writers. The wake is
+  // now dispatched after the escalation commits, so a woken owner that claims the issue
+  // is the legitimate last writer and its `in_progress` stands.
+  //
+  // What still matters, and what this now asserts, is that the escalation itself is
+  // durable and correctly bookkept: it commits `blocked` (asserted on the returned row,
+  // which is the escalation's own write rather than whatever raced it afterwards), keeps
+  // reusing the one active source-scoped action with an incrementing attempt count, and
+  // posts exactly one escalation comment.
+  it("commits the blocked escalation and preserves a synchronous wakeup claim afterward", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, managerId));
     const enqueueWakeup = vi.fn(async () => {
@@ -1108,22 +1121,27 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       createdAt: new Date(),
     } as const;
 
-    await recovery.escalateStrandedAssignedIssue({
+    const firstEscalation = await recovery.escalateStrandedAssignedIssue({
       issue: sourceIssue,
       previousStatus: "in_progress",
       latestRun: firstLatestRun,
       comment: "Automatic continuation recovery failed.",
     });
 
+    // The escalation's own write committed `blocked` with the recovery owner attached...
+    expect(firstEscalation?.status).toBe("blocked");
+    expect(firstEscalation?.assigneeAgentId).toBe(coderId);
+    // ...and the wake it dispatched afterwards claimed the issue, which now stands.
+    expect(enqueueWakeup).toHaveBeenCalled();
     const [afterFirst] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
-    expect(afterFirst?.status).toBe("blocked");
+    expect(afterFirst?.status).toBe("in_progress");
     expect(afterFirst?.assigneeAgentId).toBe(coderId);
 
     const secondLatestRun = {
       ...firstLatestRun,
       id: randomUUID(),
     };
-    await recovery.escalateStrandedAssignedIssue({
+    const secondEscalation = await recovery.escalateStrandedAssignedIssue({
       issue: sourceIssue,
       previousStatus: "in_progress",
       latestRun: secondLatestRun,
@@ -1144,12 +1162,69 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       cause: "stranded_assigned_issue",
       attemptCount: 2,
     });
+    // Re-escalation of the (re-claimed, `in_progress`) issue committed `blocked` again --
+    // the steady-state path still works -- and its wake re-claimed it again afterwards.
+    expect(secondEscalation?.status).toBe("blocked");
     const [afterSecond] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
-    expect(afterSecond?.status).toBe("blocked");
+    expect(afterSecond?.status).toBe("in_progress");
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id));
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("Recovery action:");
+  });
+
+  it("BLO-18829: a lost expectedStatus CAS rolls back the recovery action and the wake outbox row", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    // Deterministically land a concurrent writer in the window the CAS exists to guard:
+    // after escalation's under-advisory-lock status re-read (a plain SELECT, which sees
+    // `in_progress`) and before its status write. Holding FOR UPDATE on the source issue
+    // row parks escalation on its recovery-action INSERT, because that insert's
+    // `source_issue_id` FK needs FOR KEY SHARE on this row and FOR UPDATE conflicts with
+    // it. We then move the issue to `in_review` and commit, so escalation resumes and its
+    // CAS -- pinned to the `in_progress` it observed -- matches zero rows.
+    let escalation: ReturnType<typeof recovery.escalateStrandedAssignedIssue> | null = null;
+    await db.transaction(async (tx) => {
+      await tx.select().from(issues).where(eq(issues.id, sourceIssue.id)).for("update");
+      escalation = recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun,
+        comment: "Automatic continuation recovery failed.",
+      });
+      // Let escalation reach the re-read and block on the FK lock before we move the row.
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      await tx.update(issues).set({ status: "in_review" }).where(eq(issues.id, sourceIssue.id));
+    });
+
+    await expect(escalation!).resolves.toBeNull();
+
+    // The concurrent transition stands...
+    const [after] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(after?.status).toBe("in_review");
+    // ...and nothing escaped for an issue that was never escalated.
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(actionRows).toHaveLength(0);
+    const wakeRows = await db.select().from(agentWakeupRequests);
+    expect(wakeRows).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it("does not create nested recovery artifacts when issue-backed fallback work itself fails", async () => {
