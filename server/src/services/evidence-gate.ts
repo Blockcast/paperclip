@@ -197,11 +197,16 @@ function detectChecklistDoneWhen(
 ): boolean {
   if (!issueDescription) {
     // No description = no acceptance criteria to map against. The shape is
-    // undetectable, not satisfied — `evaluateEvidence` drops it from the
-    // required set when inapplicable, so returning false here cannot block;
-    // it just keeps `evidenceFound` honest. (Previously this returned a
-    // vacuous `true`, which let unlabeled issues with no criteria reach a
-    // `pass` verdict with zero artifacts.)
+    // undetectable, and it stays REQUIRED: an issue with no criteria at all
+    // should not reach in_review, so this reports `missing` and (unlabeled)
+    // `warn` / (labeled) `block`. (Previously this returned a vacuous `true`,
+    // which let unlabeled issues with no criteria reach a `pass` verdict with
+    // zero artifacts.)
+    //
+    // NB: this comment used to claim `evaluateEvidence` drops the shape from
+    // the required set when inapplicable. It does not, and never did — it only
+    // adds a diagnostic. The false claim cost a debugging cycle in BLO-19047;
+    // the remedy is to fix the description, not to weaken the requirement.
     return false;
   }
   const doneWhenBullets = countDoneWhenBullets(issueDescription);
@@ -229,13 +234,31 @@ function detectChecklistDoneWhen(
   return taggedRowCount >= doneWhenBullets;
 }
 
+/**
+ * Headings that introduce a per-criterion acceptance list. `Done when` was
+ * the only recognized spelling until BLO-19047, which made the shape
+ * unsatisfiable for every issue written to the company issue-creation policy
+ * (that policy mandates `## Acceptance criteria`). Synonyms are matched
+ * case-insensitively; the trailing `\b` keeps `## Acceptance criteria` from
+ * also matching a prose line that merely starts with the same words.
+ */
+const DONE_WHEN_HEADING_RE =
+  /^##+\s*(?:Done when|Acceptance criteria|Success criteria|Exit criteria)\b/im;
+
 export function countDoneWhenBullets(description: string): number {
-  const doneWhenIdx = description.search(/^##+\s*Done when\b/im);
+  const doneWhenIdx = description.search(DONE_WHEN_HEADING_RE);
   if (doneWhenIdx === -1) return 0;
   const rest = description.slice(doneWhenIdx);
-  // Stop at next heading.
-  const nextHeading = rest.slice(2).search(/^##+\s/m);
-  const section = nextHeading === -1 ? rest : rest.slice(0, nextHeading + 2);
+  // Consume the heading LINE, then stop at the next heading. Skipping a fixed
+  // two characters instead (the old `rest.slice(2)`) silently broke any heading
+  // deeper than `###`: for `#### Acceptance criteria` the two leftover `#`s
+  // matched `^##+\s` at offset 0, so the section was cut to "##" and every
+  // bullet under it was lost. (BLO-19047)
+  const headingLineEnd = rest.indexOf("\n");
+  if (headingLineEnd === -1) return 0;
+  const body = rest.slice(headingLineEnd + 1);
+  const nextHeading = body.search(/^##+\s/m);
+  const section = nextHeading === -1 ? body : body.slice(0, nextHeading);
   const bullets = section.match(/^[-*]\s+/gm);
   return bullets ? bullets.length : 0;
 }
@@ -446,6 +469,12 @@ export function evaluateEvidence(
     !!input.issue.description && countDoneWhenBullets(input.issue.description) > 0;
   if (!doneWhenApplicable && required.includes("checklist:done-when")) {
     diagnostics.push(input.issue.description ? "missing-done-when-bullets" : "missing-description");
+    // Name the remedy. `missing: ["checklist:done-when"]` on its own reads as
+    // "attach more evidence", but no comment can ever satisfy this shape — the
+    // fix is in the DESCRIPTION: add criteria bullets under a heading the gate
+    // recognizes. Agents burned whole runs re-posting evidence tables against
+    // an `## Acceptance criteria` heading the matcher didn't accept (BLO-19047).
+    if (input.issue.description) diagnostics.push("no-done-when-heading");
   }
   const requiredDoneWhenBulletsRemoved =
     input.doneWhenBulletsRemoved && required.includes("checklist:done-when");

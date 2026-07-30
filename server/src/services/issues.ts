@@ -8027,10 +8027,21 @@ export function issueService(db: Db) {
 
       // Evaluation failures remain fail-open, but a computed block verdict
       // rejects every new transition to in_review.
-      if (
-        issueData.status === "in_review" &&
-        existing.status !== "in_review"
-      ) {
+      //
+      // The gate re-evaluates on EVERY patch that carries `status: "in_review"`,
+      // including in_review → in_review. It used to be transition-only, which
+      // silently froze `lastEvidenceVerdict` at its first evaluation: an agent
+      // following the documented remediation loop ("add the missing evidence,
+      // comment again, re-send in_review") got a 200 with an unchanged stale
+      // verdict and no way to tell "gate ran and still fails" from "gate never
+      // ran" — the same silent-no-op class as BLO-18790. (BLO-19047)
+      //
+      // Only a real transition INTO in_review can throw. A re-evaluation on an
+      // already-in_review issue refreshes the recorded verdict but never
+      // rejects the patch, so unrelated edits (labels, description, assignee)
+      // to an in_review issue cannot start failing with a 422.
+      if (issueData.status === "in_review") {
+        const isInReviewTransition = existing.status !== "in_review";
         let inReviewVerdict: Awaited<ReturnType<typeof runEvidenceGate>> | null = null;
         try {
           const verdict = await runEvidenceGate(
@@ -8057,8 +8068,11 @@ export function issueService(db: Db) {
               diagnostics: verdict.diagnostics,
               overridden: verdict.overridden,
               overrideReason: verdict.overrideReason,
+              inReviewTransition: isInReviewTransition,
             },
-            `evidence-gate: ${verdict.verdict} on in_review transition`,
+            `evidence-gate: ${verdict.verdict} on ${
+              isInReviewTransition ? "in_review transition" : "in_review re-evaluation"
+            }`,
           );
         } catch (err) {
           logger.warn(
@@ -8070,7 +8084,7 @@ export function issueService(db: Db) {
           );
         }
 
-        if (inReviewVerdict?.verdict === "block") {
+        if (isInReviewTransition && inReviewVerdict?.verdict === "block") {
           throw unprocessable("missing-evidence", {
             code: "missing-evidence",
             missing: inReviewVerdict.missing,
