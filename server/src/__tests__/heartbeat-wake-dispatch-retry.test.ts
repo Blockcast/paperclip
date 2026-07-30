@@ -21,6 +21,7 @@ import { agents, agentWakeupRequests, companies, createDb } from "@paperclipai/d
 import { heartbeatService } from "../services/heartbeat.js";
 import {
   GITHUB_REVIEW_REQUEST_DELIVERY_METRIC,
+  GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC,
   __resetMetricsForTest,
   getMetricsRegistry,
 } from "../services/metrics.js";
@@ -71,6 +72,21 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
     const data = (await metric!.get()) as { values: Array<{ labels: Record<string, string>; value: number }> };
     return data.values
       .filter((entry) => entry.labels.state === state)
+      .reduce((sum, entry) => sum + entry.value, 0);
+  }
+
+  /**
+   * Sum {@link GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC} for one suppression
+   * cause, or across every cause when `cause` is omitted. The all-causes sum is
+   * what pins the cross-counter invariant these two metrics exist to keep:
+   * `sum(suppression_total) == delivery_total{state="suppressed"}`.
+   */
+  async function suppressionCount(cause?: string): Promise<number> {
+    const metric = getMetricsRegistry().getSingleMetric(GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC);
+    expect(metric, `${GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC} must be registered`).toBeTruthy();
+    const data = (await metric!.get()) as { values: Array<{ labels: Record<string, string>; value: number }> };
+    return data.values
+      .filter((entry) => cause === undefined || entry.labels.cause === cause)
       .reduce((sum, entry) => sum + entry.value, 0);
   }
 
@@ -476,6 +492,12 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       // ...but the delivery did NOT reach the queued state.
       expect(await deliveryCount("queued")).toBe(0);
       expect(await deliveryCount("suppressed")).toBe(1);
+      // The cause is the literal skip reason enqueueWakeup wrote on the durable
+      // skipped row, so an operator can join the firing series straight back to
+      // `agent_wakeup_requests where status = 'skipped'`. A paused company is an
+      // EXPECTED decline, so this cause is excluded from the outage alert.
+      expect(await suppressionCount("company.inactive")).toBe(1);
+      expect(await suppressionCount()).toBe(1);
       // Suppressed is a deliberate decline, not a dispatch failure.
       expect(await deliveryCount("dead_lettered")).toBe(0);
 
@@ -546,6 +568,149 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         );
       expect(exhaustedRows).toHaveLength(1);
       expect(exhaustedRows[0]!.id).toBe(wakeupRequestId);
+    });
+
+    // The two HttpError holes Ally's review of 901a4009 found. Both are
+    // *durable business-rule skips*: enqueueWakeup writes a status="skipped" row
+    // and then throws, so the delivery is terminally undelivered while the
+    // pre-fix accounting -- which only handled `enqueueWakeup` resolving null --
+    // left it at `received = 1` with no terminal state, forever. The funnel
+    // invariant `received == queued + suppressed + dead_lettered` is the thing
+    // being restored here, so each test pins the whole terminal row, not just
+    // the state that moved.
+    describe("terminal HttpError refusals (BLO-18859 review follow-up)", () => {
+      it("counts `suppressed` when the agent goes non-invokable during inline dispatch", async () => {
+        // A paused agent makes getAgentInvokability decline: enqueueWakeup
+        // writes the durable agent.not_invokable skipped row and then throws a
+        // 409. wakeupWithDispatchRetry rethrows an HttpError without retrying,
+        // so the *only* record of this delivery's fate used to be that row.
+        const { agentId } = await seedCompanyAndAgent({ agentStatus: "paused" });
+
+        await expect(
+          heartbeat.wakeup(agentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "github_pr_review_submitted",
+            payload: GITHUB_REVIEW_PAYLOAD,
+          }),
+        ).rejects.toThrow();
+
+        expect(await deliveryCount("suppressed")).toBe(1);
+        // Labelled with the real gate, not a generic bucket -- this is what the
+        // outage alert filters on, and `agent.not_invokable` is an expected
+        // decline (an operator paused the reviewer) so it must NOT page.
+        expect(await suppressionCount("agent.not_invokable")).toBe(1);
+        expect(await suppressionCount()).toBe(1);
+        // An HttpError is a business-rule refusal, never a transient dispatch
+        // failure: nothing is retried and nothing is dead-lettered.
+        expect(await deliveryCount("retried")).toBe(0);
+        expect(await deliveryCount("dead_lettered")).toBe(0);
+        expect(await deliveryCount("queued")).toBe(0);
+
+        // The durable evidence the cause label points at.
+        const skipped = await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "skipped")));
+        expect(skipped).toHaveLength(1);
+        expect(skipped[0]!.reason).toBe("agent.not_invokable");
+        // No run was queued for a delivery that reported as suppressed.
+        const queuedRows = await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "queued")));
+        expect(queuedRows).toHaveLength(0);
+      });
+
+      it("falls back to `dispatch_rejected` when the refusal wrote no durable skipped row", async () => {
+        // An unresolvable agent throws notFound before any gate can write a
+        // skipped row, so there is no reason to read off the sink. The delivery
+        // is still terminal, and `dispatch_rejected` IS pageable: the receiver
+        // resolved a reviewer that the dispatch path then refused, which no
+        // amount of waiting fixes.
+        await expect(
+          heartbeat.wakeup(randomUUID(), {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "github_pr_review_submitted",
+            payload: GITHUB_REVIEW_PAYLOAD,
+          }),
+        ).rejects.toThrow();
+
+        expect(await deliveryCount("suppressed")).toBe(1);
+        expect(await suppressionCount("dispatch_rejected")).toBe(1);
+        expect(await suppressionCount()).toBe(1);
+        expect(await deliveryCount("dead_lettered")).toBe(0);
+        expect(await deliveryCount("retried")).toBe(0);
+      });
+
+      it("counts `suppressed` when the agent goes non-invokable before reconciliation", async () => {
+        // Same refusal, other dispatch site: the reconciler's HttpError branch
+        // stamps dispatch_superseded, which its own query never picks up again.
+        // Terminal, and previously uncounted.
+        const { agentId, companyId } = await seedCompanyAndAgent({ agentStatus: "paused" });
+        const wakeupRequestId = randomUUID();
+        const now = new Date();
+        await db.insert(agentWakeupRequests).values({
+          id: wakeupRequestId,
+          companyId,
+          agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: "github_pr_review_submitted",
+          payload: {
+            dispatchRetry: {
+              attempts: 1,
+              nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+              originalOpts: {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "github_pr_review_submitted",
+                payload: GITHUB_REVIEW_PAYLOAD,
+              },
+            },
+          },
+          status: "dispatch_failed",
+        });
+
+        const result = await heartbeat.reconcileFailedWakeDispatches(now);
+        expect(result.superseded).toBe(1);
+        expect(result.recovered).toBe(0);
+        expect(result.exhausted).toBe(0);
+
+        // The pass is a re-dispatch attempt, so `retried` still moves...
+        expect(await deliveryCount("retried")).toBe(1);
+        // ...and now the terminal outcome is recorded too.
+        expect(await deliveryCount("suppressed")).toBe(1);
+        expect(await suppressionCount("agent.not_invokable")).toBe(1);
+        expect(await deliveryCount("queued")).toBe(0);
+        expect(await deliveryCount("dead_lettered")).toBe(0);
+
+        const [reconciled] = await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, wakeupRequestId));
+        expect(reconciled?.status).toBe("dispatch_superseded");
+      });
+
+      it("leaves both counters untouched for a non-GitHub wake refused the same way", async () => {
+        // The scoping guard, on the new code path: without it every paused-agent
+        // issue-assigned and monitor wake in the fleet would show up as a
+        // suppressed review-request delivery.
+        const { agentId } = await seedCompanyAndAgent({ agentStatus: "paused" });
+
+        await expect(
+          heartbeat.wakeup(agentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_assigned",
+            payload: { taskKey: "issue:BLO-1" },
+          }),
+        ).rejects.toThrow();
+
+        expect(await deliveryCount("suppressed")).toBe(0);
+        expect(await suppressionCount()).toBe(0);
+      });
     });
   });
 });

@@ -250,6 +250,8 @@ import {
   recordProcessLost,
   recordProcessLostLivenessNull,
   recordGithubReviewRequestDelivery,
+  recordGithubReviewRequestSuppressed,
+  GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED,
   setExternalLifecycleRunningRuns,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
@@ -21029,7 +21031,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return true;
   }
 
-  async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {
+  async function enqueueWakeup(
+    agentId: string,
+    opts: WakeupOptions = {},
+    suppression?: WakeSuppressionOutcome,
+  ) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = { ...(opts.contextSnapshot ?? {}) };
@@ -21070,6 +21076,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         finishedAt: new Date(),
         ...patch,
       });
+      // Recorded only after the insert commits, so a caller reading the sink
+      // never attributes a suppression to a row that does not exist. Every
+      // `return null` gate below and the two skip-then-throw gates
+      // (`budget.blocked`, `agent.not_invokable`) funnel through here, which is
+      // what lets `wakeupWithDispatchRetry` and the reconciler label the
+      // terminal `suppressed` metric with a real cause instead of guessing
+      // from the outcome shape (BLO-18859 review follow-up).
+      if (suppression) suppression.durableSkipReason = skipReason;
     };
     const writeSkippedHeartbeatRequest = async (skipReason: string, details: Record<string, unknown>) => {
       await writeSkippedRequest(skipReason, {
@@ -22798,15 +22812,62 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return typeof opts?.reason === "string" ? opts.reason : "";
   }
 
+  /**
+   * Out-parameter through which {@link enqueueWakeup} tells its caller *why* it
+   * declined a wake (BLO-18859 review follow-up). Needed because the two shapes
+   * a decline arrives in — a `null` return and a thrown `HttpError` — both hide
+   * the gate that fired, while the durable `agent_wakeup_requests.reason` the
+   * gate wrote is exactly the label the suppression metric and its alert need.
+   * A sink is cheaper than widening `enqueueWakeup`'s return type, which is
+   * consumed as `run | null` by dozens of call sites that do not care.
+   *
+   * Stays `null` when a wake succeeds, or when it fails without any gate having
+   * written a durable skipped row.
+   */
+  type WakeSuppressionOutcome = { durableSkipReason: string | null };
+
   async function wakeupWithDispatchRetry(agentId: string, opts: WakeupOptions = {}) {
     const githubReviewReason = githubPrReviewWakeReason(opts);
+    // Filled in by enqueueWakeup's writeSkippedRequest when a gate declines the
+    // wake durably, so the terminal `suppressed` metric below carries the real
+    // cause. Reset per attempt: a transient retry re-runs every gate, and a
+    // stale reason from a previous attempt would mislabel this one.
+    const suppression: WakeSuppressionOutcome = { durableSkipReason: null };
     let lastError: unknown;
     for (let attempt = 0; attempt <= WAKE_DISPATCH_RETRY_BACKOFF_MS.length; attempt++) {
+      suppression.durableSkipReason = null;
       try {
-        return await enqueueWakeup(agentId, opts);
+        const result = await enqueueWakeup(agentId, opts, suppression);
+        if (!result && githubReviewReason !== null) {
+          // enqueueWakeup declined rather than failed: a status="skipped" row is
+          // committed and no run exists. Terminal -- no reconciler pass re-arms
+          // a skipped row.
+          recordGithubReviewRequestSuppressed({
+            reason: githubReviewReason,
+            cause: suppression.durableSkipReason,
+          });
+        }
+        return result;
       } catch (err) {
         lastError = err;
-        if (err instanceof HttpError) throw err;
+        if (err instanceof HttpError) {
+          // A business-rule refusal is as terminal as a `null` return: nothing
+          // retries it here and nothing reconciles it later. Counting it keeps
+          // `received == queued + suppressed + dead_lettered` closed; without
+          // this an agent that goes non-invokable between reviewer selection
+          // and dispatch left `received = 1` with no terminal outcome forever
+          // (BLO-18859 review follow-up). `budget.blocked` and
+          // `agent.not_invokable` reach here having written a durable skipped
+          // row, so they carry their own cause; an unresolvable agent or
+          // responsible user writes none and falls back to `dispatch_rejected`.
+          if (githubReviewReason !== null) {
+            recordGithubReviewRequestSuppressed({
+              reason: githubReviewReason,
+              cause: suppression.durableSkipReason ?? GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED,
+            });
+          }
+          throw err;
+        }
         if (attempt < WAKE_DISPATCH_RETRY_BACKOFF_MS.length) {
           // Counted before sleeping so the increment reflects the retry we are
           // committed to, once per re-dispatch attempt. A business-rule
@@ -22940,8 +23001,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         recordGithubReviewRequestDelivery({ state: "retried", reason: githubReviewReason });
       }
 
+      // Declared outside the try because the HttpError branch below needs the
+      // cause too: `agent.not_invokable` writes its durable skipped row and
+      // then throws.
+      const suppression: WakeSuppressionOutcome = { durableSkipReason: null };
       try {
-        const recoveredRun = await enqueueWakeup(row.agentId, originalOpts);
+        const recoveredRun = await enqueueWakeup(row.agentId, originalOpts, suppression);
         if (!recoveredRun) {
           // enqueueWakeup declined the wake rather than failing it: it wrote a
           // status="skipped" row and returned null. Marking the original row
@@ -22961,10 +23026,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .where(eq(agentWakeupRequests.id, row.id));
           superseded += 1;
           if (githubReviewReason !== null) {
-            recordGithubReviewRequestDelivery({ state: "suppressed", reason: githubReviewReason });
+            recordGithubReviewRequestSuppressed({
+              reason: githubReviewReason,
+              cause: suppression.durableSkipReason,
+            });
           }
           logger.warn(
-            { agentId: row.agentId, wakeupRequestId: row.id, attempts },
+            { agentId: row.agentId, wakeupRequestId: row.id, attempts, cause: suppression.durableSkipReason },
             "wake dispatch re-attempt was suppressed by a scheduling gate; marking superseded "
               + "rather than recovered (BLO-18859)",
           );
@@ -22995,6 +23063,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             })
             .where(eq(agentWakeupRequests.id, row.id));
           superseded += 1;
+          // `dispatch_superseded` is terminal — the reconciler's query only
+          // picks up `dispatch_failed` rows, so nothing re-arms this one. Left
+          // uncounted, a reviewer whose agent went non-invokable between the
+          // original dispatch and this pass kept `received = 1` with no
+          // terminal outcome forever (BLO-18859 review follow-up).
+          if (githubReviewReason !== null) {
+            recordGithubReviewRequestSuppressed({
+              reason: githubReviewReason,
+              cause: suppression.durableSkipReason ?? GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED,
+            });
+          }
           continue;
         }
 

@@ -44,6 +44,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import {
   GITHUB_REVIEW_REQUEST_DELIVERY_METRIC,
+  GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC,
   __resetMetricsForTest,
   getMetricsRegistry,
 } from "../services/metrics.js";
@@ -60,6 +61,21 @@ async function deliveryCount(state: string): Promise<number> {
   };
   return data.values
     .filter((entry) => entry.labels.state === state)
+    .reduce((sum, entry) => sum + entry.value, 0);
+}
+
+/**
+ * Sum {@link GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC} for one suppression
+ * cause, or across all causes when omitted (BLO-18859 review follow-up).
+ */
+async function suppressionCount(cause?: string): Promise<number> {
+  const metric = getMetricsRegistry().getSingleMetric(GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC);
+  if (!metric) throw new Error(`${GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC} is not registered`);
+  const data = (await metric.get()) as {
+    values: Array<{ labels: Record<string, string>; value: number }>;
+  };
+  return data.values
+    .filter((entry) => cause === undefined || entry.labels.cause === cause)
     .reduce((sum, entry) => sum + entry.value, 0);
 }
 
@@ -1359,6 +1375,12 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(await deliveryCount("suppressed")).toBe(1);
     expect(await deliveryCount("retried")).toBe(0);
     expect(await deliveryCount("dead_lettered")).toBe(0);
+    // End-to-end through the real route: the cause comes from the gate inside
+    // enqueueWakeup, which the route cannot see — so this also pins that the
+    // route no longer emits its own causeless `suppressed` increment (that would
+    // read as 2 here and desync the two counters).
+    expect(await suppressionCount("company.inactive")).toBe(1);
+    expect(await suppressionCount()).toBe(1);
 
     // Ground the counter against the durable record: a skipped row, no run.
     const wakeRows = await db

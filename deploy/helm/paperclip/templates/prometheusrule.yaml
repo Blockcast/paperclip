@@ -118,6 +118,30 @@ spec:
           annotations:
             summary: "Paperclip GitHub review-request delivery dead-lettered (an @ally review will never run)"
             description: "At least one GitHub review-request reviewer wake was dead-lettered in the last {{ .Values.prometheusRule.githubDeliveryDeadLetterWindow }} (BLO-18859). Dead-lettered is TERMINAL — the reconciler never re-arms it, so the affected PR has a posted review trigger and will never get a review until someone re-triggers it. Two paths reach this state: a durable agent_wakeup_requests row exhausted DISPATCH_RETRY_MAX_ATTEMPTS (query `select id, agent_id, reason, error from agent_wakeup_requests where status = 'dispatch_failed_exhausted' order by updated_at desc`), or wakeupWithDispatchRetry could not persist its safety-net row at all — the latter leaves NO row and is visible only in the logs ('dropping without a durable record' / 'failed to persist durable wake-dispatch-failed record'). Break down by the `reason` label to see which event type is failing. Read alongside the received/queued/retried states of the same counter: a rising `retried` with no dead-letters is dispatch flakiness absorbed by the retry chain, not loss."
+        - alert: PaperclipGithubReviewRequestSuppressionOutage
+          # BLO-18859 review follow-up: dead_lettered is not the only terminal
+          # state. `suppressed` is also terminal (no reconciler pass re-arms a
+          # skipped or superseded row) but it is NOT uniformly a fault, so it
+          # cannot be alerted on as a whole: an inactive company, a cooldown, a
+          # blocked budget and wake-on-demand-off are the fleet correctly
+          # declining, and paging on those would force the rule off entirely --
+          # leaving a stuck global scheduling-suppression flag free to eat every
+          # @ally review while the dead-letter alert above stays green.
+          #
+          # So this keys on the cause breakdown counter and selects only the
+          # outage-like causes. `other` is in the default set on purpose: it is
+          # the bucket for a skip reason not yet in the server's allow-list, and
+          # an untriaged cause has not been shown to be an expected decline.
+          # Widen/narrow via githubDeliverySuppressionOutageCauses rather than
+          # editing this expr, and remember Prometheus fully anchors =~ (so the
+          # unescaped dots here can only over-match within a listed name).
+          expr: sum(increase(paperclip_github_review_request_suppression_total{cause=~{{ .Values.prometheusRule.githubDeliverySuppressionOutageCauses | quote }}}[{{ .Values.prometheusRule.githubDeliverySuppressionWindow }}])) > 0
+          for: {{ .Values.prometheusRule.githubDeliverySuppressionFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip GitHub review-request wakes suppressed by an outage-like cause (reviews are being dropped)"
+            description: "At least one GitHub review-request reviewer wake was terminally suppressed in the last {{ .Values.prometheusRule.githubDeliverySuppressionWindow }} with an outage-like cause ({{ .Values.prometheusRule.githubDeliverySuppressionOutageCauses }}) (BLO-18859). Suppressed means the wake was declined rather than dispatched: no run exists and nothing will re-arm it, so the PR has a posted trigger and no review — the same user-visible outcome as a dead-letter. Check the `cause` label first. `heartbeat.scheduling_suppressed` means the fleet-wide scheduling-suppression flag is on: if that is not a deliberate maintenance window, clear it (this is the mode that silently strands every review). `dispatch_rejected` means the dispatch path threw a business-rule HttpError with no durable skipped row — an unresolvable agent or responsible user; waiting will not fix it. `other` means the server emitted a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES in services/metrics.ts: find it with `select reason, count(*) from agent_wakeup_requests where status = 'skipped' and created_at > now() - interval '1 hour' group by 1 order by 2 desc`, then either add it to the allow-list as an expected decline or fix the cause. Expected declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded from this selector by default and are visible on the same counter for context."
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

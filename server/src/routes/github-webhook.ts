@@ -1714,7 +1714,12 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             recordGithubReviewRequestDelivery({ state: "queued", reason: context.wakeReason });
             return true;
           }
-          recordGithubReviewRequestDelivery({ state: "suppressed", reason: context.wakeReason });
+          // The terminal `suppressed` increment is NOT emitted here: the wake
+          // path owns it, because only `enqueueWakeup` knows which gate
+          // declined and the suppression metric's `cause` label needs that. The
+          // same applies to an HttpError refusal, which never reaches this line
+          // at all — it propagates to the catch below, and counting it here
+          // would have been impossible (BLO-18859 review follow-up).
           logger.warn(
             {
               agentId: reviewerAgentId,
