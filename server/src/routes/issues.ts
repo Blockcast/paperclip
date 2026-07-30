@@ -3622,6 +3622,61 @@ export function issueRoutes(
     return decision !== true && decision.reason === "allow_issue_mention_grant";
   }
 
+  // A recovery-handoff grant (BLO-18906) is comment-only by construction: it
+  // exists so the agent a recovery transfer took the issue from can still write
+  // its diagnosis down. It must never carry a state transition, so the comment
+  // route strips reopen/resume for it on EVERY status — unlike the mention-grant
+  // neutering below, which only covers closed issues. Recovery leaves the issue
+  // `blocked`, and on a blocked issue `reopen: true` would move it to `todo`.
+  function isRecoveryHandoffGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    return decision !== true && decision.reason === "allow_recovery_handoff_grant";
+  }
+
+  // The decision reason alone is not a sufficient test for "this caller is a
+  // recovery-transferred previous owner". assertAgentIssueCommentAllowed short-
+  // circuits with a bare `true` when isCurrentIssueExecutionRun matches (the
+  // BLO-18152 parity bypass), which discards the reason — so any caller that
+  // reached the route through a run lock rather than through decideIssueAccess
+  // would read as "not a handoff grant" and keep the transitions the grant is
+  // supposed to withhold. Resolve it from the recovery row instead, so the
+  // comment-only contract holds no matter which allow-path let the caller in.
+  //
+  // Mirrors the authorization-service predicate: active action, actor is
+  // `previousOwnerAgentId`, ownership moved to someone else, and that someone
+  // is still the assignee.
+  async function isRecoveryHandoffPreviousOwner(
+    req: Request,
+    issue: { id: string; companyId: string; assigneeAgentId: string | null },
+  ) {
+    if (req.actor.type !== "agent") return false;
+    const actorAgentId = req.actor.agentId;
+    if (!actorAgentId) return false;
+    if (req.actor.companyId !== issue.companyId) return false;
+    // The assignee is never a handoff caller, so the common path never pays for
+    // the lookup — and a lookup failure can never affect an ordinary assignee.
+    if (issue.assigneeAgentId === actorAgentId) return false;
+    let action: Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>>;
+    try {
+      action = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+    } catch (err) {
+      // Fail closed: if we cannot tell whether this non-assignee is a handoff
+      // caller, withhold the state transitions rather than granting them. The
+      // comment itself still lands — only reopen/resume and comment-triggered
+      // auto-approval are refused, which is the conservative direction for an
+      // authorization boundary.
+      logger.warn({
+        err,
+        issueId: issue.id,
+        companyId: issue.companyId,
+        actorAgentId,
+      }, "recovery handoff lookup failed; treating comment as comment-only");
+      return true;
+    }
+    if (!action || action.previousOwnerAgentId !== actorAgentId) return false;
+    if (!action.ownerAgentId || action.ownerAgentId === actorAgentId) return false;
+    return action.ownerAgentId === issue.assigneeAgentId;
+  }
+
   async function filterIssuesForActor<T extends Parameters<typeof decideIssueAccess>[1]>(req: Request, rows: T[]) {
     const decisions = await Promise.all(rows.map((issue) => decideIssueAccess(req, issue, "issue:read")));
     return rows.filter((_, index) => decisions[index]?.allowed);
@@ -10182,8 +10237,40 @@ export function issueRoutes(
       !reopenRequested &&
       !resumeRequested &&
       isIssueMentionGrantDecision(commentAccessDecision);
-    const effectiveReopenRequested = mentionGrantedPeerAgentCommentOnly ? false : reopenRequested;
-    const effectiveResumeRequested = mentionGrantedPeerAgentCommentOnly ? false : resumeRequested;
+    // Comment-only on every status, not just closed ones: recovery leaves the
+    // issue `blocked`, where an un-neutered `reopen` would transition it to
+    // `todo` — a status change the handoff grant must not confer (BLO-18906).
+    // Refuse explicitly rather than silently dropping the flag, and refuse here
+    // rather than deferring to assertAgentIssueMutationAllowed: that helper's
+    // isCurrentIssueExecutionRun bypass still matches the previous owner's stale
+    // execution lock, which would hand back the very transition recovery removed.
+    //
+    // Detect the handoff caller from the recovery row as well as from the
+    // decision reason. The reason is absent whenever assertAgentIssueComment-
+    // Allowed took its own current-execution-run short-circuit and returned a
+    // bare `true`, so a reason-only test would let exactly the stale-lock case
+    // this guard exists for slip past it.
+    const recoveryHandoffGrantedCommentOnly =
+      req.actor.type === "agent" &&
+      (isRecoveryHandoffGrantDecision(commentAccessDecision) ||
+        await isRecoveryHandoffPreviousOwner(req, issue));
+    if (recoveryHandoffGrantedCommentOnly && (reopenRequested || resumeRequested)) {
+      res.status(403).json({
+        error: "Recovery handoff grant is comment-only",
+        details: {
+          issueId: issue.id,
+          assigneeAgentId: issue.assigneeAgentId,
+          actorAgentId: req.actor.agentId,
+          reason: "allow_recovery_handoff_grant",
+          hint: "Post the handoff evidence as a plain comment; the recovery owner controls status.",
+        },
+      });
+      return;
+    }
+    const commentOnlyGrantedPeerAgent =
+      mentionGrantedPeerAgentCommentOnly || recoveryHandoffGrantedCommentOnly;
+    const effectiveReopenRequested = commentOnlyGrantedPeerAgent ? false : reopenRequested;
+    const effectiveResumeRequested = commentOnlyGrantedPeerAgent ? false : resumeRequested;
     if (
       isClosed &&
       req.actor.type === "agent" &&
@@ -10395,6 +10482,16 @@ export function issueRoutes(
       const shouldAutoApproveReviewComment =
         currentIssue.status === "in_review" &&
         currentExecutionState?.status === "pending" &&
+        // A recovery-handoff caller is comment-only, so its comment must never
+        // be read as a review decision (BLO-18906). Without this, an approval-
+        // shaped comment from a previous owner who happens to still be named as
+        // the pending stage participant would transition the issue to `done` and
+        // insert an execution decision — a state mutation the grant does not
+        // confer, reached without ever passing an `issue:mutate` check.
+        // Deliberately NOT extended to `mentionGrantedPeerAgentCommentOnly`: a
+        // mentioned non-assignee reviewer approving its own stage is the
+        // established path this branch exists to serve.
+        !recoveryHandoffGrantedCommentOnly &&
         actorMatchesExecutionParticipant(actor, currentExecutionState.currentParticipant ?? null) &&
         isApprovalReviewComment(req.body.body);
 

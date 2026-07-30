@@ -472,6 +472,103 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     expect(todoRun?.status).not.toBe("queued");
   });
 
+  it("suppresses a queued same-issue retry even when the running row is stale", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `D${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "StaleSameIssueCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "StaleSameIssueAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 2 } },
+      permissions: {},
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Issue with quiet owner",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      startedAt: new Date(),
+    });
+
+    const staleOutputAt = new Date(Date.now() - 20 * 60 * 1000);
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "heartbeat",
+      triggerDetail: "timer",
+      status: "running",
+      contextSnapshot: { issueId, wakeReason: "heartbeat_timer" },
+      startedAt: staleOutputAt,
+      lastOutputAt: staleOutputAt,
+      createdAt: staleOutputAt,
+      updatedAt: staleOutputAt,
+    });
+
+    const queuedWakeupId = randomUUID();
+    const queuedRunId = randomUUID();
+    const queuedTime = new Date();
+    await db.insert(agentWakeupRequests).values({
+      id: queuedWakeupId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      status: "queued",
+      runId: queuedRunId,
+      requestedAt: queuedTime,
+      updatedAt: queuedTime,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: queuedWakeupId,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      createdAt: queuedTime,
+      updatedAt: queuedTime,
+    });
+
+    mockAdapterExecute.mockClear();
+    await heartbeat.resumeQueuedRuns();
+
+    const queuedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(queuedRun).toMatchObject({
+      status: "cancelled",
+      errorCode: "duplicate_dispatch_suppressed",
+    });
+    expect(mockAdapterExecute.mock.calls.some(([ctx]) => ctx.runId === queuedRunId)).toBe(false);
+  });
+
   it("dispatches a long-starved low-priority todo run ahead of a fresh in_progress run (BLO-16253)", async () => {
     // Regression for BLO-16253: dispatchRank had no time component, so a
     // `todo` queued run could be starved forever behind a busy agent's
