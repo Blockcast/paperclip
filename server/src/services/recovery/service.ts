@@ -41,6 +41,7 @@ import { issueTreeControlService } from "../issue-tree-control.js";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
+  derivePersistedMonitorState,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../issue-execution-policy.js";
@@ -4021,7 +4022,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   function hasActiveMonitorPath(issue: typeof issues.$inferSelect) {
-    return Boolean(issue.monitorNextCheckAt && issue.monitorNextCheckAt.getTime() > Date.now());
+    if (issue.monitorNextCheckAt && issue.monitorNextCheckAt.getTime() > Date.now()) return true;
+
+    // BLO-18643: a monitor that has already fired (`status: "triggered"`) but has not
+    // yet been rescheduled or cleared is still an active watch, not an absent one --
+    // the assignee's next continuation run (or the monitor's own scheduler) owns
+    // re-arming `monitorNextCheckAt`. Reading "fired, not yet rescheduled" as "no
+    // monitor" let the stranded-assigned sweep race the park gate and re-escalate a
+    // deliberate review wait to `blocked` (BLO-16146 recurrence).
+    const monitor = derivePersistedMonitorState({
+      issue,
+      state: parseIssueExecutionState(issue.executionState),
+      policy: null,
+    });
+    return monitor?.status === "triggered";
   }
 
   async function parkReviewWaitingContinuationIssue(input: {
@@ -4078,11 +4092,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     });
   }
 
+  type ReviewWaitingParkOutcome = "parked" | "already_parked" | "failed";
+
   async function parkNoDependencyReviewWaitingIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: "in_progress";
     latestRun: LatestIssueRun;
-  }) {
+  }): Promise<ReviewWaitingParkOutcome> {
     // BLO-16146: a continuation that deliberately parked for review/approval, with no
     // dependency to convert into a `blocked` wait (resolveContinuationWaitingOnReview
     // returned null) and no active monitor path (the monitor-path park earlier in the
@@ -4103,7 +4119,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .from(issues)
         .where(eq(issues.id, input.issue.id))
         .limit(1);
-      if (!fresh || fresh.status !== "in_progress") return null;
+      if (!fresh) return "failed";
+      if (fresh.status === "in_review") return "already_parked";
+      if (fresh.status !== "in_progress") return "failed";
 
       // The in_review transition runs an evidence gate (issues.ts) that throws
       // `unprocessable` when the issue has no reviewable evidence yet (analysis-only
@@ -4119,9 +4137,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           { err, issueId: fresh.id, identifier: fresh.identifier },
           "parkNoDependencyReviewWaitingIssue: in_review park rejected; escalating instead",
         );
-        return null;
+        return "failed";
       }
-      if (!updated) return null;
+      if (!updated) return "failed";
 
       const activeRecoveryAction = await recoveryActionsSvc.resolveActiveForIssue({
         companyId: fresh.companyId,
@@ -4165,7 +4183,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         },
       });
 
-      return updated;
+      return "parked";
     });
   }
 
@@ -4445,6 +4463,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .where(eq(issues.id, input.issue.id))
         .limit(1);
       if (!fresh) return null;
+      // BLO-18643: mirror the park paths' own re-check (parkReviewWaitingContinuationIssue /
+      // parkNoDependencyReviewWaitingIssue both bail if `fresh.status` has moved past the
+      // status the candidate was read at). Without this, a park that committed first --
+      // under the same per-issue advisory lock, whether from a concurrent transaction or an
+      // earlier sweep pass -- gets silently clobbered back to `blocked` here. Whichever side
+      // reaches its expected-status re-check second is now a no-op.
+      //
+      // `blocked` is explicitly allowed through in addition to `previousStatus`: it's this
+      // function's own steady-state output, and repeated/concurrent escalation attempts on an
+      // already-`blocked` issue are expected to keep updating the same active recovery action
+      // (attempt-count bookkeeping, wake suppression) rather than no-op. Only a status this
+      // function did NOT produce -- e.g. `in_review` from a park that raced it -- is a signal
+      // that some other terminal action already claimed this issue for this cause.
+      if (fresh.status !== input.previousStatus && fresh.status !== "blocked") return null;
 
       const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
       const { action, hasNewActivitySinceLastAttempt } = await ensureSourceScopedStrandedRecoveryAction({
@@ -5708,16 +5740,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           // issue_continuation_needed) so a `failed`/`timed_out` run that merely carries
           // this error code is NOT treated as a deliberate wait.
           if (isWaitingOnReviewContinuationRun(latestRun)) {
-            const parked = await parkNoDependencyReviewWaitingIssue({
+            const parkOutcome = await parkNoDependencyReviewWaitingIssue({
               issue,
               previousStatus: "in_progress",
               latestRun,
             });
-            if (parked) {
+            if (parkOutcome === "parked") {
               result.reviewWaitingParked += 1;
               result.issueIds.push(issue.id);
               continue;
             }
+            if (parkOutcome === "already_parked") {
+              // BLO-18643: the common case on a re-run -- the issue was already parked
+              // `in_review` by an earlier pass (parkNoDependencyReviewWaitingIssue's own
+              // guard requires `status === "in_progress"`). Never a stranded escalation:
+              // falling through here previously let the second sweep pass clobber a
+              // just-parked issue back to `blocked` 21s later.
+              result.skipped += 1;
+              continue;
+            }
+            // `failed` is a genuine park failure (evidence-gate rejection
+            // because there's nothing reviewable yet, or a transient update
+            // failure). Fall through to the normal blocked recovery path.
           }
         }
 
@@ -6511,6 +6555,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         },
         "skipping cycle-forming liveness escalation blocker relation",
       );
+      if (blockerIds.length === 0) {
+        // No pre-existing blocker to fall back to. Forcing `blocked` here
+        // would strand the issue with an empty blockedByIssueIds set --
+        // blocked, but with no dependency edge to ever unblock it. Leave
+        // the issue's current status untouched so its existing continuation
+        // path (e.g. the same liveness finding re-triggering next sweep)
+        // keeps working, and persist nothing that didn't actually happen.
+        return input.issue;
+      }
       persistedBlockerIds = blockerIds;
       updated = isAlreadyBlocked
         ? input.issue
