@@ -206,6 +206,7 @@ import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
 } from "./issue-tree-control.js";
+import { RUN_STALE_SILENCE_MS } from "./issue-run-holding.js";
 import {
   continuationSummaryParksExecutor,
   getIssueContinuationSummaryDocument,
@@ -926,7 +927,10 @@ const EXTERNAL_LIFECYCLE_ADAPTERS = new Set([
 // Jobs immediately; this threshold only applies when that probe returns
 // null. Kept generous so a slow probe + a healthy long-running Claude
 // session don't collide.
-const EXTERNAL_LIFECYCLE_STALE_MS = 15 * 60 * 1000;
+// Shared with issue-run-holding.ts for one named 15-minute slot-accounting
+// threshold. Issue/worktree ownership stays more conservative: a running row
+// holds its issue until it reaches a terminal/missing lifecycle state.
+const EXTERNAL_LIFECYCLE_STALE_MS = RUN_STALE_SILENCE_MS;
 // External-lifecycle adapters create a DB run before the adapter.invoke event
 // is appended. Startup and periodic reapers can overlap that setup window;
 // give slow pre-run hooks and kube Job creation time to reach adapter.invoke.
@@ -6268,7 +6272,9 @@ async function coalesceQueuedGithubStateWake(input: {
     })
     .where(and(eq(heartbeatRuns.id, existingRun.id), eq(heartbeatRuns.status, "queued")))
     .returning()
-    .then((rows) => rows[0] ?? existingRun);
+    .then((rows) => rows[0] ?? null);
+
+  if (!mergedRun) return null;
 
   let coalescedEventCount: number | null = null;
   if (mergedRun.wakeupRequestId) {
@@ -6378,7 +6384,9 @@ async function coalescePendingTaskScopeWake(input: {
       ),
     )
     .returning()
-    .then((rows) => rows[0] ?? existingRun);
+    .then((rows) => rows[0] ?? null);
+
+  if (!mergedRun) return null;
 
   if (mergedRun.wakeupRequestId) {
     await input.tx
@@ -6793,6 +6801,67 @@ export function evaluatePrReviewCompletionEvidence(
     errorMessage:
       "PR reviewer run exited successfully but did not leave durable evidence of a posted review or intentional skip",
   };
+}
+
+// Reviewer wake reasons that must refresh review work for the current head:
+// an @ally comment / requested_reviewer, the draft->ready toggle, and a PR
+// synchronize push. Contrast with github_pr_opened/reopened, where a wake
+// already in flight genuinely covers the event.
+const EXPLICIT_PR_REVIEW_REQUEST_WAKE_REASONS = new Set([
+  "github_pr_review_requested",
+  "github_pr_ready_for_review",
+  "github_pr_synchronized",
+]);
+
+// BLO-18953: an explicit review request must never be absorbed into a review
+// run that is already RUNNING for the same PR. The reviewer task key is
+// PR-scoped and carries no head sha (deliberately: it also scopes the reviewer
+// affinity lookup, the withPrReviewerTaskLock serialization, and the
+// cancel-on-close sweep), so same-scope coalescing cannot tell "the run about
+// to start will read this head" from "the run already reviewing an older head
+// will never re-read head". Coalescing into a `queued` run is benign — that run
+// reads head when it starts. Coalescing into a `running` one silently drops the
+// request: observed on Blockcast/pim-multicast-gateway#1888 (human @ally
+// comment), Blockcast/paperclip#822 (ready_for_review), and synchronize pushes
+// that arrived while a previous-head review was already running.
+//
+// Head-sha comparison is NOT a workable discriminator here: the issue_comment
+// branch of resolveEventContext never populates headSha (GitHub's issue_comment
+// payload has no PR head), so the most common request path would compare
+// null-to-null and coalesce anyway.
+function isExplicitPrReviewRequestWake(contextSnapshot: Record<string, unknown> | null | undefined) {
+  const review = derivePaperclipPrReview(contextSnapshot);
+  if (!review || review.prRole !== "reviewer") return false;
+  return EXPLICIT_PR_REVIEW_REQUEST_WAKE_REASONS.has(review.wakeReason);
+}
+
+/**
+ * Decides whether a wake that finds a same-task-scope run already RUNNING must
+ * get its own queued follow-up run instead of being absorbed into that run.
+ *
+ * Extracted from enqueueWakeup so the property can be asserted directly: the
+ * in-situ path applies zombie filtering afterwards, which makes a DB-only
+ * `running` row (no live process) fall through for unrelated reasons and would
+ * render an end-to-end assertion vacuous.
+ *
+ * Returns false when a same-scope QUEUED run exists — that run has not started
+ * and will read the current head when it does, so absorbing into it is both
+ * correct and the desired rapid-event coalescing.
+ */
+export function shouldQueueFollowupInsteadOfAbsorbingIntoRunningRun(input: {
+  hasRunningSameScopeRun: boolean;
+  hasQueuedSameScopeRun: boolean;
+  contextSnapshot: Record<string, unknown> | null | undefined;
+  wakeCommentId: string | null;
+}): boolean {
+  if (!input.hasRunningSameScopeRun || input.hasQueuedSameScopeRun) return false;
+  return (
+    isExplicitPrReviewRequestWake(input.contextSnapshot) ||
+    shouldQueueFollowupForRunningIssueWake({
+      contextSnapshot: input.contextSnapshot,
+      wakeCommentId: input.wakeCommentId,
+    })
+  );
 }
 
 function isCrossPrReviewWakeForActiveRun(input: {
@@ -16771,13 +16840,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Per-issue dedupe: if a queued run targets an issue that already has a
       // running sibling (this iteration's claim OR a prior tick's still-running
       // run), suppress it instead of letting two dispatches race for the same
-      // k8s Job slot. Cross-agent and null-issueId (autonomous) runs are
-      // unaffected — withAgentStartLock already scopes this to one agent and
-      // the gate only fires when issueId is present. Stale runs are excluded
-      // (consistent with Fix #1 above) so a queued retry for a stale issue
-      // can proceed once the stale run's job is gone.
+      // k8s Job slot/worktree. Cross-agent and null-issueId (autonomous) runs
+      // are unaffected — withAgentStartLock already scopes this to one agent
+      // and the gate only fires when issueId is present. Unlike the slot gate
+      // above, issue ownership is not released merely because a running row has
+      // been silent for 15 minutes; an external Job can be quiet and still edit
+      // its shared worktree. Reaper/lifecycle checks must move the old run out
+      // of "running" before a queued same-issue retry can proceed.
       const inFlightIssueIds = new Set<string>();
-      for (const row of nonStaleRunningRuns) {
+      for (const row of runningRunRows) {
         const id = readNonEmptyString(parseObject(row.contextSnapshot).issueId);
         if (id) inFlightIssueIds.add(id);
       }
@@ -22552,10 +22623,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const sameScopeRunningRun = activeRuns.find(
       (candidate) => candidate.status === "running" && isSameTaskScope(runTaskKey(candidate), effectiveTaskKey),
     );
-    const shouldQueueFollowupForRunningWake =
-      Boolean(sameScopeRunningRun) &&
-      !sameScopeQueuedRun &&
-      shouldQueueFollowupForRunningIssueWake({ contextSnapshot: enrichedContextSnapshot, wakeCommentId });
+    // BLO-18953: an explicit review request is never satisfied by a review
+    // already in flight against an older head, so it must not be absorbed into
+    // a running same-scope run. Queued/scheduled_retry coalescing is preserved:
+    // those runs read head when they start.
+    const explicitPrReviewRequestWake = isExplicitPrReviewRequestWake(enrichedContextSnapshot);
+    const shouldQueueFollowupForRunningWake = shouldQueueFollowupInsteadOfAbsorbingIntoRunningRun({
+      hasRunningSameScopeRun: Boolean(sameScopeRunningRun),
+      hasQueuedSameScopeRun: Boolean(sameScopeQueuedRun),
+      contextSnapshot: enrichedContextSnapshot,
+      wakeCommentId,
+    });
     const rawCoalescedTarget =
       sameScopeQueuedRun ??
       sameScopeScheduledRetryRun ??
@@ -22571,32 +22649,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         coalescedTargetRun.contextSnapshot,
         enrichedContextSnapshot,
       );
+      const observedStatus = coalescedTargetRun.status;
       const mergedRun = await db
         .update(heartbeatRuns)
         .set({
           contextSnapshot: mergedContextSnapshot,
           updatedAt: new Date(),
         })
-        .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
+        .where(and(eq(heartbeatRuns.id, coalescedTargetRun.id), eq(heartbeatRuns.status, observedStatus)))
         .returning()
-        .then((rows) => rows[0] ?? coalescedTargetRun);
+        .then((rows) => rows[0] ?? null);
 
-      await db.insert(agentWakeupRequests).values({
-        companyId: agent.companyId,
-        agentId,
-        source,
-        triggerDetail,
-        reason,
-        payload,
-        status: "coalesced",
-        coalescedCount: 1,
-        requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
-        runId: mergedRun.id,
-        finishedAt: new Date(),
-      });
-      return mergedRun;
+      if (mergedRun) {
+        await db.insert(agentWakeupRequests).values({
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          reason,
+          payload,
+          status: "coalesced",
+          coalescedCount: 1,
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          runId: mergedRun.id,
+          finishedAt: new Date(),
+        });
+        return mergedRun;
+      }
     }
 
     const queueOutcome = await db.transaction(async (tx) => {
@@ -22625,8 +22706,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // found after taking the agent lock was created while this enqueue was
         // waiting. It is therefore a live concurrency race, not a pre-existing
         // zombie. Merge into it unless this wake intentionally needs a new run
-        // boundary (for example, an issue-comment follow-up).
-        includeRunning: !sameScopeRunningRun && !shouldQueueFollowupForRunningWake,
+        // boundary (for example, an issue-comment follow-up, or an explicit PR
+        // review request that a run already reviewing this PR cannot satisfy —
+        // BLO-18953).
+        includeRunning:
+          !sameScopeRunningRun &&
+          !shouldQueueFollowupForRunningWake &&
+          !explicitPrReviewRequestWake,
       });
       if (coalescedTaskScopeRun) {
         return { kind: "coalesced" as const, run: coalescedTaskScopeRun };

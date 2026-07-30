@@ -91,30 +91,35 @@ You have two GitHub identities available, and which one you use decides whether
 the review bot can formally review your PR:
 
 - **Default App-installation token** — identity `app/allyblockcast[bot]`. Works
-  for commits, PR creation, comments, status, and reads. This is also the
-  identity the **review bot** posts as.
+  for commits, PR creation, comments, status, and reads. The review bot posts its
+  **comment-mode** reviews under this identity.
 - **User-seat token** — mounted at `/paperclip/.secrets/github-merge-token/token`
   when provisioned. This is the **`allyblockcast` user** account, a *distinct*
-  GitHub identity from the `app/allyblockcast[bot]` App.
+  GitHub identity from the `app/allyblockcast[bot]` App. The review bot posts its
+  **formal approvals** under this same seat, and it is the identity used for the
+  final merge.
 
 GitHub forbids an identity from submitting a **formal review** (`APPROVE` /
-`REQUEST_CHANGES`) on a PR it authored. So when a PR is authored by the App, the
-review bot (also the App) can only leave a *comment* — never a formal review.
-Authoring under the **user seat** makes author ≠ reviewer, so the bot can post a
-real `gh pr review`.
+`REQUEST_CHANGES`) on a PR it authored, so the author and the reviewer must be
+different identities.
 
-**When the user-seat token is mounted, author your PR under it** — push the
-branch and create the PR with it — and use it for the final merge too:
+Holding the user-seat token does **not** make you a reviewer. In this workflow it
+is a *push / create / merge* credential and nothing more — the review bot's own
+approvals come from that very same login, which is exactly why you must never
+submit a review under it (see
+[Why the user seat must never post a review](#why-the-user-seat-must-never-post-a-review)).
+
+**Even when the user-seat token is mounted, author your PR under the default
+App-installation token** — push the branch and create the PR without
+`PAPERCLIP_GITHUB_TOKEN_FILE`. Reserve the user-seat token for the final merge
+after the review checklist is satisfied:
 
 ```sh
 USER_TOKEN_FILE=/paperclip/.secrets/github-merge-token/token
 
-# push the branch + open the PR as the allyblockcast USER (formally reviewable)
-PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE" \
-  git -c http.https://github.com/.extraheader= \
-  push -u origin "$(git branch --show-current)"
-PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE" \
-  gh pr create --repo <org>/<repo> --title ... --body ...
+# push the branch + open the PR as app/allyblockcast[bot]
+git push -u origin "$(git branch --show-current)"
+gh pr create --repo <org>/<repo> --title ... --body ...
 
 # ... later, after the review checklist is satisfied:
 PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE" \
@@ -123,15 +128,19 @@ PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE" \
 
 The agent image wraps `gh` and deliberately replaces `GH_TOKEN` with the token
 read from `PAPERCLIP_GITHUB_TOKEN_FILE` on every invocation. Setting `GH_TOKEN`
-does not switch identities in these pods; select the user-seat token file as
-shown above. The same environment override reaches the `gh` credential helper
-used by `git push`.
+does not switch identities in these pods; select the user-seat token file only
+for the merge command shown above.
 
 Rules:
-- Use the **user-seat token** for the branch push, `gh pr create`, and
-  `gh pr merge`/auto-merge. Use the **default App token** for everything else
-  (comments, replies, status, reads) so the Paperclip↔GitHub integration keeps
-  working.
+- Use the **default App token** for the branch push, `gh pr create`, comments,
+  replies, status, and reads. Use the **user-seat token** only for
+  `gh pr merge`/auto-merge after checks are green and reviewer comments are
+  resolved.
+- **Never submit a formal review under the user-seat token.** No `gh pr review`
+  with it — not `--approve`, not `--request-changes`, not `--comment`. Never post
+  an `ally-verdict:` marker or a `Reviewed head: <sha>` line under it, on a review
+  or in a comment. This holds even when the review is honest and even when the
+  change is yours: the prohibition is on the *credential*, not on your intent.
 - If the file does **not** exist, the user-seat lane is not provisioned for this
   repo — do not improvise a token. Author and merge under the default token as
   before; the review bot will fall back to comment-mode review, and a maintainer
@@ -139,9 +148,31 @@ Rules:
 - Only merge when the merge checklist above is satisfied (checks green, comments
   resolved).
 
+### Why the user seat must never post a review
+
+The user-seat token authenticates as the `allyblockcast` **user** — the same
+identity the review bot's own formal approvals come from. GitHub records only
+that shared identity, so a review you post under it is **indistinguishable from
+the reviewer's own**, to a human reader and to CI alike.
+
+The `review/ally-complete` merge gate keys off exactly that: an `APPROVED` review
+from an `allyblockcast` login. An approval posted under the seat therefore clears
+the gate for a change no reviewer ever looked at, and nothing in the audit trail
+can afterwards tell the two apart. Only the reviewer's own pipeline may produce a
+review that clears that gate.
+
+So when you are looking at a red `review/ally-complete` on your own PR, the
+sanctioned move is to **get a review** — re-request one (see the repo's review
+handoff convention) and wait. Posting the approval yourself is not a shortcut
+past a slow reviewer; it is a forged review, and it has already shipped a
+data-loss bug to master that the real review had caught.
+
 ## Anti-patterns
 
 - PR description that says "see commits". Reviewers should not need to read the log.
 - Mixing refactor and behavior change in the same PR with no separation in the body.
 - "Address feedback" commits that bundle unrelated edits. One commit per round of feedback is fine; one commit for everything in flight is not.
 - Force-pushing during active review without telling the reviewer.
+- Approving your own PR under the user-seat merge token to turn the review gate
+  green. That is a forged review, not a merge unblock — see the credential rules
+  above.

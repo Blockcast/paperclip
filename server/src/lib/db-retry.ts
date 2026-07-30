@@ -42,8 +42,16 @@ export const TRANSIENT_DB_SQLSTATES = new Set([
 
 /** True when `error` carries a transient PostgreSQL SQLSTATE `code`. */
 export function isTransientDbError(error: unknown): boolean {
-  const code = (error as { code?: unknown } | null | undefined)?.code;
-  return typeof code === "string" && TRANSIENT_DB_SQLSTATES.has(code);
+  let current: unknown = error;
+  for (let depth = 0; depth < 6; depth += 1) {
+    if (!current || typeof current !== "object") return false;
+    const record = current as { code?: unknown; cause?: unknown };
+    if (typeof record.code === "string" && TRANSIENT_DB_SQLSTATES.has(record.code)) {
+      return true;
+    }
+    current = record.cause;
+  }
+  return false;
 }
 
 export interface TransientDbRetryOptions {

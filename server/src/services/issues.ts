@@ -716,6 +716,10 @@ type IssueActiveRunRow = {
   startedAt: Date | null;
   finishedAt: Date | null;
   createdAt: Date;
+  // BLO-19001: liveness signals, so a consumer can tell a run that is actually
+  // holding this issue from one that has been silent long enough to be stale.
+  lastOutputAt: Date | null;
+  lastUsefulActionAt: Date | null;
 };
 type IssueScheduledRetryRow = {
   runId: string;
@@ -1882,6 +1886,44 @@ async function withIssueLabels(dbOrTx: any, rows: IssueRow[]): Promise<IssueWith
  * operator overrides, and any work_products. Caller supplies the description
  * (already on the existing row in the PATCH handler, no need to re-select).
  */
+/**
+ * Shapes that record a DURABLE fact ("a PR/commit was attached to this issue"),
+ * as opposed to a fact about the current comment window.
+ */
+const DURABLE_LANDING_SHAPES = ["pr-link", "landing-artifact"] as const;
+
+/**
+ * Carry forward durable landing evidence when re-evaluating an already-in_review
+ * issue.
+ *
+ * The evaluator only scans the 10 most recent agent comments, so once ten
+ * comments accumulate after the one bearing the PR link, a fresh evaluation
+ * reports `allDetected: []`. On the in_review TRANSITION that is the honest
+ * answer and it is what gets stored. But `done-gate.ts` reads the STORED
+ * verdict's `allDetected` as the standing record that a PR was ever attached
+ * (`hasPrLinkEvidence`), so letting a re-evaluation overwrite it would make an
+ * issue that legitimately shipped a PR fail its later `done` transition with
+ * `no_execution_run_and_no_pr_evidence` purely because the comment thread grew.
+ * Before BLO-19047 the re-evaluation was a no-op, so the transition-time verdict
+ * was durable by accident; this keeps it durable on purpose.
+ *
+ * Only `allDetected` is merged — `verdict`, `missing` and `requiredFound` stay
+ * exactly as freshly computed, which is the whole point of re-evaluating.
+ */
+function preserveDurableLandingEvidence<T extends { allDetected?: unknown }>(
+  fresh: T,
+  stored: unknown,
+): T {
+  const storedDetected = (stored as { allDetected?: unknown } | null)?.allDetected;
+  if (!Array.isArray(storedDetected)) return fresh;
+  const freshDetected = Array.isArray(fresh.allDetected) ? fresh.allDetected : [];
+  const carried = DURABLE_LANDING_SHAPES.filter(
+    (shape) => storedDetected.includes(shape) && !freshDetected.includes(shape),
+  );
+  if (carried.length === 0) return fresh;
+  return { ...fresh, allDetected: [...freshDetected, ...carried] };
+}
+
 async function fetchEvidenceForIssue(
   dbOrTx: any,
   issueId: string,
@@ -2109,6 +2151,8 @@ async function activeRunMapForIssues(
         startedAt: heartbeatRuns.startedAt,
         finishedAt: heartbeatRuns.finishedAt,
         createdAt: heartbeatRuns.createdAt,
+        lastOutputAt: heartbeatRuns.lastOutputAt,
+        lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
       })
       .from(heartbeatRuns)
       .where(
@@ -8168,10 +8212,21 @@ export function issueService(db: Db) {
 
       // Evaluation failures remain fail-open, but a computed block verdict
       // rejects every new transition to in_review.
-      if (
-        issueData.status === "in_review" &&
-        existing.status !== "in_review"
-      ) {
+      //
+      // The gate re-evaluates on EVERY patch that carries `status: "in_review"`,
+      // including in_review → in_review. It used to be transition-only, which
+      // silently froze `lastEvidenceVerdict` at its first evaluation: an agent
+      // following the documented remediation loop ("add the missing evidence,
+      // comment again, re-send in_review") got a 200 with an unchanged stale
+      // verdict and no way to tell "gate ran and still fails" from "gate never
+      // ran" — the same silent-no-op class as BLO-18790. (BLO-19047)
+      //
+      // Only a real transition INTO in_review can throw. A re-evaluation on an
+      // already-in_review issue refreshes the recorded verdict but never
+      // rejects the patch, so unrelated edits (labels, description, assignee)
+      // to an in_review issue cannot start failing with a 422.
+      if (issueData.status === "in_review") {
+        const isInReviewTransition = existing.status !== "in_review";
         let inReviewVerdict: Awaited<ReturnType<typeof runEvidenceGate>> | null = null;
         try {
           const verdict = await runEvidenceGate(
@@ -8185,7 +8240,9 @@ export function issueService(db: Db) {
             id,
           );
           inReviewVerdict = verdict;
-          patch.lastEvidenceVerdict = verdict;
+          patch.lastEvidenceVerdict = isInReviewTransition
+            ? verdict
+            : preserveDurableLandingEvidence(verdict, existing.lastEvidenceVerdict);
           patch.lastEvidenceVerdictEvaluatedAt = new Date(verdict.evaluatedAt);
           logger.info(
             {
@@ -8198,8 +8255,11 @@ export function issueService(db: Db) {
               diagnostics: verdict.diagnostics,
               overridden: verdict.overridden,
               overrideReason: verdict.overrideReason,
+              inReviewTransition: isInReviewTransition,
             },
-            `evidence-gate: ${verdict.verdict} on in_review transition`,
+            `evidence-gate: ${verdict.verdict} on ${
+              isInReviewTransition ? "in_review transition" : "in_review re-evaluation"
+            }`,
           );
         } catch (err) {
           logger.warn(
@@ -8211,7 +8271,7 @@ export function issueService(db: Db) {
           );
         }
 
-        if (inReviewVerdict?.verdict === "block") {
+        if (isInReviewTransition && inReviewVerdict?.verdict === "block") {
           throw unprocessable("missing-evidence", {
             code: "missing-evidence",
             missing: inReviewVerdict.missing,
