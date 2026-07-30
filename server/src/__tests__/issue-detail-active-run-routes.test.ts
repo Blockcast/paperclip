@@ -210,6 +210,32 @@ describeEmbeddedPostgres("GET /api/issues/:id — active run holder", () => {
     ).toBe(true);
   });
 
+  it("returns a queued activeRun without treating it as a worktree holder", async () => {
+    const { companyId, agentId, prefix } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "queued" });
+    const issueId = await seedIssue({
+      companyId,
+      prefix,
+      issueNumber: 3,
+      agentId,
+      executionRunId: runId,
+    });
+
+    const res = await request(createApp(companyId)).get(`/api/issues/${issueId}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.executionRunId).toBe(runId);
+    expect(res.body.activeRun?.id).toBe(runId);
+    expect(res.body.activeRun?.status).toBe("queued");
+    expect(
+      isIssueHeldByForeignRun({
+        activeRun: res.body.activeRun,
+        callerRunId: randomUUID(),
+        nowMs: Date.now(),
+      }),
+    ).toBe(false);
+  });
+
   it("returns activeRun null when the recorded run has terminalized", async () => {
     // `executionRunId` outlives the run, so a stale pointer must not read as held.
     for (const [index, status] of ["completed", "failed", "cancelled"].entries()) {
@@ -242,6 +268,30 @@ describeEmbeddedPostgres("GET /api/issues/:id — active run holder", () => {
         `status=${status}`,
       ).toBe(false);
     }
+  });
+
+  it("returns activeRun null when executionRunId points at another company", async () => {
+    const owner = await seedCompanyAndAgent();
+    const foreign = await seedCompanyAndAgent();
+    const foreignRunId = await seedRun({
+      companyId: foreign.companyId,
+      agentId: foreign.agentId,
+      status: "running",
+    });
+    const issueId = await seedIssue({
+      companyId: owner.companyId,
+      prefix: owner.prefix,
+      issueNumber: 19,
+      agentId: owner.agentId,
+      executionRunId: foreignRunId,
+    });
+
+    const res = await request(createApp(owner.companyId)).get(`/api/issues/${issueId}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.executionRunId).toBe(foreignRunId);
+    expect(res.body.activeRun).toBeNull();
+    expect(JSON.stringify(res.body)).not.toContain(foreign.agentId);
   });
 
   it("returns activeRun null when no run is recorded", async () => {

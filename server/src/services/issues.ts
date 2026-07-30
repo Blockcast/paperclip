@@ -2092,20 +2092,26 @@ type IssueBlockerAttentionAgentRow = {
   status: string;
 };
 
+function activeRunMapKey(companyId: string, runId: string) {
+  return `${companyId}:${runId}`;
+}
+
 async function activeRunMapForIssues(
   dbOrTx: any,
-  issueRows: Array<Pick<IssueRow, "executionRunId">>,
+  issueRows: Array<Pick<IssueRow, "companyId" | "executionRunId">>,
 ): Promise<Map<string, IssueActiveRunRow>> {
   const map = new Map<string, IssueActiveRunRow>();
   const runIds = issueRows
     .map((row) => row.executionRunId)
     .filter((id): id is string => id != null);
   if (runIds.length === 0) return map;
+  const companyIds = [...new Set(issueRows.map((row) => row.companyId))];
 
   for (const runIdChunk of chunkList([...new Set(runIds)], ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
     const rows = await dbOrTx
       .select({
         id: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
         status: heartbeatRuns.status,
         agentId: heartbeatRuns.agentId,
         invocationSource: heartbeatRuns.invocationSource,
@@ -2120,12 +2126,14 @@ async function activeRunMapForIssues(
       .where(
         and(
           inArray(heartbeatRuns.id, runIdChunk),
+          inArray(heartbeatRuns.companyId, companyIds),
           inArray(heartbeatRuns.status, ACTIVE_RUN_STATUSES),
         ),
       );
 
     for (const row of rows) {
-      map.set(row.id, row);
+      const { companyId, ...activeRun } = row;
+      map.set(activeRunMapKey(companyId, row.id), activeRun);
     }
   }
   return map;
@@ -2992,7 +3000,7 @@ function withActiveRuns(
 ): IssueWithLabelsAndRun[] {
   return issueRows.map((row) => ({
     ...row,
-    activeRun: row.executionRunId ? (runMap.get(row.executionRunId) ?? null) : null,
+    activeRun: row.executionRunId ? (runMap.get(activeRunMapKey(row.companyId, row.executionRunId)) ?? null) : null,
   }));
 }
 
@@ -5943,24 +5951,27 @@ export function issueService(db: Db) {
     },
 
     /**
-     * The run currently holding this issue, or null.
+     * The queued-or-running run recorded for this issue, or null.
      *
      * BLO-19001: single-issue counterpart to the `activeRun` the list paths
      * attach via `withActiveRuns`. `getById` deliberately stays lean, so the
      * issue-detail route composes this in alongside its other enrichments.
      *
-     * Null covers both "no run recorded" and "the recorded run has already
+     * Null covers "no run recorded", "the recorded run belongs to another
+     * company", and "the recorded run has already
      * terminalized" — `activeRunMapForIssues` only returns rows whose status is
      * in ACTIVE_RUN_STATUSES. That is the distinction a caller needs: a stale
      * `executionRunId` left behind by a finished run reads as not-held, while a
-     * live sibling run reads as held.
+     * live sibling run reads as present. A queued run is present but does not
+     * yet hold a worktree; callers should use `isRunHoldingIssue` for that
+     * stricter cede decision.
      */
     getActiveRun: async (
-      issue: Pick<IssueRow, "executionRunId">,
+      issue: Pick<IssueRow, "companyId" | "executionRunId">,
     ): Promise<IssueActiveRunRow | null> => {
       if (!issue.executionRunId) return null;
       const map = await activeRunMapForIssues(db, [issue]);
-      return map.get(issue.executionRunId) ?? null;
+      return map.get(activeRunMapKey(issue.companyId, issue.executionRunId)) ?? null;
     },
 
     /**
