@@ -265,6 +265,12 @@ afterEach(async () => {
       leasedRunIds.delete(runId);
     }),
   );
+  // Backstop for the tests that set this locally. Those restore it in their own
+  // `finally`, but a test that is itself killed by the suite timeout can run
+  // that block late -- after a later test has already read the override -- so a
+  // process-global left dirty here would leak a 1ms git budget into unrelated
+  // cases. Clearing unconditionally is idempotent.
+  setSubmoduleInspectSettingsForTests(null);
   delete process.env.PAPERCLIP_CONFIG;
   delete process.env.PAPERCLIP_HOME;
   delete process.env.PAPERCLIP_INSTANCE_ID;
@@ -2764,6 +2770,100 @@ describe("realizeExecutionWorkspace", () => {
       expect(allText).not.toContain("vendor/trunc");
       expect(allText).not.toContain("vendor/head-fragment");
       expect(allText).not.toContain("vendor/healthy-dep");
+    } finally {
+      setSubmoduleInspectSettingsForTests(null);
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await fs.rm(shimDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("reports both the repair and the degradation when the post-repair re-check stalls", async () => {
+    // The other timeout tests all stall the *initial* probe. This covers the
+    // second inspection site, which has a different obligation: the repair
+    // commands really did succeed, so the run must report that alongside the
+    // inconclusive verification rather than discarding either -- and the
+    // degradation operation has to be attributed to `post_repair`, otherwise an
+    // operator reading it goes looking for a stall that never happened at the
+    // start of the run.
+    const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: true });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+    const counterPath = path.join(shimDir, "status-calls");
+    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+    const shimPath = path.join(shimDir, "git");
+    // Call 1 (initial probe) reports the submodule uninitialized so the repair
+    // path runs for real; call 2 (the post-repair verification) hangs. `exec`
+    // replaces the shell so the SIGTERM lands on the stalling process directly.
+    await fs.writeFile(
+      shimPath,
+      [
+        "#!/bin/sh",
+        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+        `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
+        "  calls=$((calls + 1))",
+        `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
+        '  if [ "$calls" = "1" ]; then',
+        `    echo '-1111111111111111111111111111111111111111 ${submodulePath}'`,
+        "    exit 0",
+        "  fi",
+        "  exec sleep 30",
+        "fi",
+        `exec ${JSON.stringify(realGit)} "$@"`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(shimPath, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+    setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 2, retryDelayMs: 1 });
+
+    try {
+      const realized = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-post-repair-timeout",
+          workspaceId: "workspace-submodule-post-repair-timeout",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-post-repair-timeout",
+          identifier: "PAP-SUBMODULE-POST-REPAIR-TIMEOUT",
+          title: "Survive a stalled post-repair verification",
+        },
+        agent: {
+          id: "agent-submodule-post-repair-timeout",
+          name: "Codex Coder",
+          companyId: "company-submodule-post-repair-timeout",
+        },
+        recorder,
+      });
+
+      // The run survives, and neither half of the story is dropped.
+      expect(realized.strategy).toBe("project_primary");
+      expect(realized.warnings).toHaveLength(2);
+      expect(realized.warnings[0]).toBe(
+        `Initialized git submodules before starting: ${submodulePath}`,
+      );
+      expect(realized.warnings[1]).toContain("Continuing without the submodule readiness check");
+      expect(realized.warnings[1]).toContain("2 attempt(s)");
+
+      // The repair actually ran, and the verification stalled after it.
+      expect(
+        operations.some(
+          (operation) => operation.metadata?.action === "repair_uninitialized_submodules",
+        ),
+      ).toBe(true);
+      const degraded = operations.filter(
+        (operation) => operation.metadata?.action === "submodule_inspection_degraded",
+      );
+      expect(degraded).toHaveLength(1);
+      expect(degraded[0]?.metadata?.stage).toBe("post_repair");
+      expect(degraded[0]?.metadata?.attempts).toBe(2);
     } finally {
       setSubmoduleInspectSettingsForTests(null);
       if (previousPath === undefined) delete process.env.PATH;
