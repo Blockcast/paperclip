@@ -79,7 +79,7 @@ Before you PATCH any issue from `in_review` to `done`, **re-run the evidence aga
 
 ### The procedure
 
-1. **Read `## Done when` from the issue description** and the agent's most recent claim comment. Identify the artifact and the evidence shape required (consult the registry table inside the `paperclip-evidence-before-in-review` skill — same one the agent used).
+1. **Read the acceptance criteria from the issue description** — the section headed `## Done when`, `## Acceptance criteria`, `## Success criteria`, or `## Exit criteria` — and the agent's most recent claim comment. Identify the artifact and the evidence shape required (consult the registry table inside the `paperclip-evidence-before-in-review` skill — same one the agent used).
 
 2. **Re-run the shape against the live artifact, fresh:**
 
@@ -108,7 +108,7 @@ A `frontend` issue agent claims `pass` with two viewport screenshots + a checkli
 3. Open the production URL at 390x844.
 4. Take another fresh screenshot.
 5. Visually compare to the agent's: did the orange-bordered lede actually render? Is the listing grid actually 1-col on mobile? Did the filter chip actually become active when you clicked it?
-6. Walk through the `## Done when` bullets, marking each pass/fail against what *you* see.
+6. Walk through the acceptance-criteria bullets, marking each pass/fail against what *you* see.
 7. If everything matches: comment with your fresh screenshots + a per-criterion checklist, then `done`. If anything differs: reject to `in_progress` with the diff.
 
 ### Anti-patterns
