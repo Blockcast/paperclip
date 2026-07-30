@@ -35,10 +35,12 @@ REAL_GH="${GH_TOKEN_WRAPPER_REAL_GH:-/usr/bin/gh.real}"
 # (BLO-13241), so GH_TOKEN cannot double as an input without reopening that bug.
 if [ -n "${PAPERCLIP_GITHUB_TOKEN_VALUE:-}" ]; then
   TOKEN="$(printf '%s' "${PAPERCLIP_GITHUB_TOKEN_VALUE}" | tr -d '\r\n')"
-  if [ -n "${TOKEN}" ]; then
-    export GH_TOKEN="${TOKEN}"
-    export GITHUB_TOKEN="${TOKEN}"
+  if [ -z "${TOKEN}" ]; then
+    echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_VALUE is set but empty after trimming line terminators; refusing to run with ambient auth" >&2
+    exit 64
   fi
+  export GH_TOKEN="${TOKEN}"
+  export GITHUB_TOKEN="${TOKEN}"
   exec "${REAL_GH}" "$@"
 fi
 

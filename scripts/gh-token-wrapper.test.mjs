@@ -210,16 +210,29 @@ test("an empty token value falls through to the token file", () => {
   });
 });
 
-test("a whitespace-only token value neither authenticates nor falls through to the file", () => {
+test("a line-terminator-only token value fails before ambient auth can be used", () => {
   // Guards the tr-strip: a value that is only CR/LF is a malformed binding, not
-  // a request to use the App token. Failing closed makes it visible.
+  // a request to use the App token or inherited caller credentials.
   withTempDir((dir) => {
-    const result = runWrapper(dir, {
-      tokenFileContent: "ghs_apptoken\n",
-      tokenValue: "\r\n",
-    });
-    assert.equal(result.GH_TOKEN, "");
-    assert.equal(result.GITHUB_TOKEN, "");
+    const stubGhPath = path.join(dir, "gh.real");
+    writeFileSync(stubGhPath, STUB_GH_SOURCE);
+    chmodSync(stubGhPath, 0o755);
+    const tokenFilePath = path.join(dir, "token");
+    writeFileSync(tokenFilePath, "ghs_apptoken\n");
+
+    const env = {
+      ...process.env,
+      GH_TOKEN_WRAPPER_REAL_GH: stubGhPath,
+      PAPERCLIP_GITHUB_TOKEN_FILE: tokenFilePath,
+      PAPERCLIP_GITHUB_TOKEN_VALUE: "\r\n",
+      GH_TOKEN: "user_supplied_override",
+      GITHUB_TOKEN: "user_supplied_override",
+    };
+
+    const proc = spawnSync("sh", [WRAPPER, "api", "user"], { env, encoding: "utf8" });
+    assert.equal(proc.status, 64);
+    assert.match(proc.stderr, /PAPERCLIP_GITHUB_TOKEN_VALUE is set but empty/);
+    assert.equal(proc.stdout, "");
   });
 });
 
