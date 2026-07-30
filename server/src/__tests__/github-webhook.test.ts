@@ -31,6 +31,9 @@ import {
   __test_isReviewerSelfEchoReview,
   __test_isSelfReviewedPr,
   __test_hasPrReviewerRequestMention,
+  __test_hasPrReviewerAgentRequestMarker,
+  __test_hasAllyConsolidatedReviewHeading,
+  __test_hasAllyConsolidatedReviewHeader,
   __test_resolveDependabotAlertContext,
   __test_resolveEventContext,
   __test_shouldFirePrReviewerWake,
@@ -418,6 +421,240 @@ describe("github-webhook pure helpers", () => {
       repository: { full_name: "Blockcast/paperclip" },
     });
     expect(fromHuman).toMatchObject({ wakeReason: "github_pr_review_requested" });
+  });
+
+  it("treats a marker-prefixed reviewer-bot comment as an AGENT review request (BLO-18865)", () => {
+    // Agents post PR comments through the Paperclip GitHub App, so the author
+    // login is allyblockcast[bot] -- Ally's own identity. Before BLO-18865 the
+    // author-scoped guard dropped every agent-issued @ally request, leaving
+    // agents with no comment-based and no push-based way to get a re-review
+    // (Blockcast/paperclip#814: two pushes + two @ally comments, nothing in
+    // 2h19m). The explicit start-of-body marker restores that path.
+    const agentRequest = __test_resolveEventContext("issue_comment", {
+      action: "created",
+      issue: {
+        number: 814,
+        title: "BLO-18797 creator + manager-chain issue authz",
+        html_url: "https://github.com/Blockcast/paperclip/pull/814",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/814" },
+      },
+      comment: {
+        id: 4900000001,
+        body: "<!-- paperclip:review-request -->\n@ally please re-review at head 2e6a1b71 — the active-run guard is restored.",
+        html_url: "https://github.com/Blockcast/paperclip/pull/814#issuecomment-4900000001",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+    expect(agentRequest).toMatchObject({
+      wakeReason: "github_pr_review_requested",
+      prNumber: 814,
+      commentAuthorLogin: "allyblockcast[bot]",
+    });
+    if (!__test_shouldFirePrReviewerWake(agentRequest)) {
+      throw new Error("expected a marker-prefixed agent request to fire a reviewer wake");
+    }
+    // Comment-scoped idempotency: each distinct request comment gets its own
+    // wake, so a later re-review request at a newer head is not swallowed.
+    expect(__test_buildPrReviewerWakeIdempotencyKey(agentRequest, "delivery-agent-req")).toBe(
+      "pr_review:Blockcast/paperclip:814:github_pr_review_requested:comment:4900000001",
+    );
+
+    // Marker may carry provenance attributes. It must still start at byte 0.
+    const withAttributes = __test_resolveEventContext("issue_comment", {
+      action: "created",
+      issue: {
+        number: 814,
+        title: "BLO-18797 creator + manager-chain issue authz",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/814" },
+      },
+      comment: {
+        id: 4900000002,
+        body: "<!--  paperclip:review-request agent=cto issue=BLO-18865  -->\nRe-review please, @ally.",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+    expect(withAttributes).toMatchObject({ wakeReason: "github_pr_review_requested" });
+  });
+
+  it("classifies agent and human review requests identically once the marker is present (BLO-18865)", () => {
+    const request = (login: string, body: string) =>
+      __test_resolveEventContext("issue_comment", {
+        action: "created",
+        issue: {
+          number: 820,
+          title: "BLO-18865 agent review requests",
+          pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/820" },
+        },
+        comment: { id: 77, body, user: { login } },
+        repository: { full_name: "Blockcast/paperclip" },
+      });
+
+    // The marker is an authorization to *fire the reviewer wake* -- nothing
+    // more. It rides the shared Paperclip GitHub App identity, so it proves
+    // no requester identity and the resolved context carries no
+    // agent-vs-human discriminator for downstream code to branch on. An agent
+    // request is therefore shaped exactly like a human one; in particular the
+    // author wake is preserved for both (see suppressAuthorWake).
+    const fromAgent = request(
+      "allyblockcast[bot]",
+      "<!-- paperclip:review-request -->\n@ally re-review please",
+    );
+    const fromHumanRequest = request("kkroo", "@ally re-review please");
+    expect(fromAgent).toMatchObject({ wakeReason: "github_pr_review_requested" });
+    expect(fromHumanRequest).toMatchObject({ wakeReason: "github_pr_review_requested" });
+    expect(fromAgent).not.toHaveProperty("agentReviewRequest");
+    expect(fromHumanRequest).not.toHaveProperty("agentReviewRequest");
+  });
+
+  it("keeps the #583 self-refire loop closed: a quoted or reviewer-output marker is not a request (BLO-18865)", () => {
+    const botComment = (id: number, body: string) =>
+      __test_resolveEventContext("issue_comment", {
+        action: "created",
+        issue: {
+          number: 583,
+          title: "BLO-13247 precheck idempotency key",
+          pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/583" },
+        },
+        comment: { id, body, user: { login: "allyblockcast[bot]" } },
+        repository: { full_name: "Blockcast/paperclip" },
+      });
+
+    // The #583 loop was driven by bot-authored bodies mentioning the alias
+    // SOMEWHERE. The marker is anchored to offset 0, so Ally quoting the
+    // marker back while explaining the request it is answering cannot re-arm
+    // the trigger -- this is the case that would relight the loop.
+    expect(
+      botComment(
+        10,
+        "Thanks — for future runs, prefix the comment with `<!-- paperclip:review-request -->` and mention @ally.",
+      ),
+    ).toBeNull();
+
+    // A fenced/indented marker is likewise mid-body, not a request.
+    expect(botComment(11, "Example:\n\n    <!-- paperclip:review-request -->\n    @ally review\n")).toBeNull();
+
+    // ...and the same example with NOTHING before it. Four leading spaces is a
+    // Markdown indented code block -- the canonical way a reviewer renders
+    // "here is the marker to use" -- so this is a quoted example too, but it
+    // is the one an offset-0-modulo-whitespace anchor would misread as a real
+    // request. Each such comment would mint a fresh comment-scoped
+    // idempotency key, so nothing downstream would dedup the refire. This is
+    // the #583 loop; the anchor is at literal byte 0 to keep it closed.
+    expect(botComment(14, "    <!-- paperclip:review-request -->\n    @ally review\n")).toBeNull();
+    expect(botComment(15, "\n<!-- paperclip:review-request -->\n@ally review\n")).toBeNull();
+    expect(botComment(16, "> <!-- paperclip:review-request -->\n> @ally review\n")).toBeNull();
+
+    // Even at offset 0, Ally's own review output is never a request: the
+    // consolidated-review header disqualifies it regardless of the marker.
+    expect(
+      botComment(
+        12,
+        "<!-- paperclip:review-request -->\n## Ally — Consolidated PR Review\n\nSee findings below; @ally ran 3 lenses.",
+      ),
+    ).toBeNull();
+
+    // And the original #583 bodies stay suppressed (no marker at all).
+    expect(botComment(13, "Hey @allyblockcast[bot]! Before this PR can be reviewed...")).toBeNull();
+
+    // ...but a real request that merely REFERS to a past review in prose is
+    // still a request. The exclusion keys on Ally's own output shape (the
+    // header on its own line), not on the phrase appearing anywhere, so
+    // citing the review as context does not silently drop the ask.
+    expect(
+      botComment(
+        17,
+        "<!-- paperclip:review-request -->\n@ally re-review at head abc123 — your earlier Ally — Consolidated PR Review flagged the vault probe; that is fixed now.",
+      ),
+    ).not.toBeNull();
+
+    // A quoted copy of the header is likewise context, not Ally's output.
+    expect(
+      botComment(
+        18,
+        "<!-- paperclip:review-request -->\n@ally re-review at head abc123. For context:\n\n> ## Ally — Consolidated PR Review\n> Fix I1 before merge.\n",
+      ),
+    ).not.toBeNull();
+  });
+
+  it("scopes the consolidated-review exclusion to Ally's own output shape (BLO-18865)", () => {
+    // Ally's actual review opens with the header as a Markdown heading.
+    expect(__test_hasAllyConsolidatedReviewHeading("## Ally — Consolidated PR Review\n\nFindings...")).toBe(true);
+    expect(__test_hasAllyConsolidatedReviewHeading("# Ally - Consolidated PR Review")).toBe(true);
+    expect(__test_hasAllyConsolidatedReviewHeading("###### Ally: Consolidated PR Review")).toBe(true);
+    // Bold and bare-line variants stay excluded so a format change on Ally's
+    // side cannot silently lapse this layer.
+    expect(__test_hasAllyConsolidatedReviewHeading("**Ally — Consolidated PR Review**")).toBe(true);
+    expect(__test_hasAllyConsolidatedReviewHeading("Ally — Consolidated PR Review\n\nFindings...")).toBe(true);
+    // Still catches Ally echoing the marker at byte 0 -- the #583 layer.
+    expect(
+      __test_hasAllyConsolidatedReviewHeading(
+        "<!-- paperclip:review-request -->\n## Ally — Consolidated PR Review\n\n@ally ran 3 lenses.",
+      ),
+    ).toBe(true);
+
+    // A mid-line prose reference is a citation, not Ally's output.
+    expect(
+      __test_hasAllyConsolidatedReviewHeading("@ally re-review — your Ally — Consolidated PR Review flagged X"),
+    ).toBe(false);
+    // A blockquoted or indented copy is a quote, not Ally's output.
+    expect(__test_hasAllyConsolidatedReviewHeading("> ## Ally — Consolidated PR Review")).toBe(false);
+    expect(__test_hasAllyConsolidatedReviewHeading("    ## Ally — Consolidated PR Review")).toBe(false);
+    expect(__test_hasAllyConsolidatedReviewHeading(null)).toBe(false);
+    expect(__test_hasAllyConsolidatedReviewHeading(undefined)).toBe(false);
+
+    // The WHOLE-body helper keeps its broader behaviour: it gates a different
+    // call site (isActionablePrReviewComment), where a relayed review body must
+    // still count as review feedback whoever forwarded it.
+    expect(
+      __test_hasAllyConsolidatedReviewHeader("@ally re-review — your Ally — Consolidated PR Review flagged X"),
+    ).toBe(true);
+    expect(__test_hasAllyConsolidatedReviewHeader("> ## Ally — Consolidated PR Review")).toBe(true);
+  });
+
+  it("anchors the agent review-request marker to literal byte 0 of the body (BLO-18865)", () => {
+    expect(__test_hasPrReviewerAgentRequestMarker("<!-- paperclip:review-request -->\n@ally")).toBe(true);
+    expect(__test_hasPrReviewerAgentRequestMarker("<!--paperclip:review-request-->")).toBe(true);
+    expect(__test_hasPrReviewerAgentRequestMarker("<!-- PAPERCLIP:REVIEW-REQUEST agent=cto -->")).toBe(true);
+    expect(__test_hasPrReviewerAgentRequestMarker("<!--\tpaperclip:review-request\t-->")).toBe(true);
+
+    // NOT anchored at byte 0 -> not a marker. Leading whitespace is rejected
+    // on purpose: 4 spaces makes the line a Markdown indented code block, so
+    // an indented marker at body start is a rendered EXAMPLE, and accepting it
+    // would let a reviewer-authored example re-arm the #583 refire loop.
+    expect(__test_hasPrReviewerAgentRequestMarker("    <!-- paperclip:review-request -->")).toBe(false);
+    expect(__test_hasPrReviewerAgentRequestMarker("\n<!-- paperclip:review-request -->")).toBe(false);
+    expect(__test_hasPrReviewerAgentRequestMarker(" <!-- paperclip:review-request -->")).toBe(false);
+    expect(__test_hasPrReviewerAgentRequestMarker("> <!-- paperclip:review-request -->")).toBe(false);
+    expect(__test_hasPrReviewerAgentRequestMarker("please use <!-- paperclip:review-request -->")).toBe(false);
+
+    // The token must end at whitespace or the closing `-->`, so a longer
+    // lookalike token is not a match.
+    expect(__test_hasPrReviewerAgentRequestMarker("<!-- paperclip:review-request-evil -->")).toBe(false);
+    expect(__test_hasPrReviewerAgentRequestMarker("<!-- paperclip:review-requested -->")).toBe(false);
+    expect(__test_hasPrReviewerAgentRequestMarker("<!-- paperclip:review -->")).toBe(false);
+    expect(__test_hasPrReviewerAgentRequestMarker("@ally please review")).toBe(false);
+    expect(__test_hasPrReviewerAgentRequestMarker(null)).toBe(false);
+    expect(__test_hasPrReviewerAgentRequestMarker(undefined)).toBe(false);
+  });
+
+  it("suppresses only AUTOMATIC reviewer wakes on a draft PR, not explicit requests (BLO-18865)", () => {
+    const draftCtx = (wakeReason: string) => ({ wakeReason, prNumber: 900, prDraft: true }) as never;
+    // Automatic reasons stay suppressed while the PR is a draft: a push to a
+    // draft must not spend a review pass per commit, so draft PRs are never
+    // reviewed until marked ready.
+    expect(__test_shouldFirePrReviewerWake(draftCtx("github_pr_opened"))).toBe(false);
+    expect(__test_shouldFirePrReviewerWake(draftCtx("github_pr_synchronized"))).toBe(false);
+    expect(__test_shouldFirePrReviewerWake(draftCtx("github_pr_reopened"))).toBe(false);
+    expect(__test_shouldFirePrReviewerWake(draftCtx("github_pr_review_submitted"))).toBe(false);
+    // An explicit ask is not churn and is honoured even on a draft. This
+    // exemption is belt-and-braces today (resolveEventContext's issue_comment
+    // branch does not populate prDraft, so the check is not reached that way);
+    // it is asserted directly so populating prDraft later cannot silently
+    // re-strand agents.
+    expect(__test_shouldFirePrReviewerWake(draftCtx("github_pr_review_requested"))).toBe(true);
+    expect(__test_shouldFirePrReviewerWake(draftCtx("github_pr_ready_for_review"))).toBe(true);
   });
 
   it("ignores issue comments that are not PR @ally review requests", () => {
@@ -2322,6 +2559,125 @@ describeEmbeddedPostgres("github-webhook route", () => {
       idempotencyKey: expect.stringContaining(
         ":Blockcast/paperclip:582:github_pr_review_requested:comment:4871387911",
       ),
+    });
+  });
+
+  it("drives the reviewer wake AND preserves the author wake for a marker-prefixed agent review request (BLO-18865)", async () => {
+    // Route-level coverage for the marker path: the pure-helper tests stop at
+    // context classification, so dispatch wiring could regress while they stay
+    // green. Asserts the two counts that matter -- exactly one reviewer wake,
+    // and the author wake still fires.
+    //
+    // The author wake is the regression guard. The marker rides the shared
+    // Paperclip GitHub App identity, so the route cannot tell "the PR author
+    // is asking for a re-review of its own work" from "a manager or peer agent
+    // is asking for a review of someone else's PR". Suppressing the author
+    // wake on the marker alone silently drops the notification in the second
+    // case. Here the PR is authored by `codex` and the request arrives under
+    // the app identity -- a third-party request -- and BLO-18865's assignee
+    // must still be woken.
+    const { companyId, agentId: authorAgentId } = await seedIssueWithIdentifier("BLO-18865");
+    const reviewerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const app = buildApp({
+      prReviewerAgentId: reviewerAgentId,
+      prReviewerBotLogin: "allyblockcast[bot]",
+    });
+
+    const commentPayload = (commentId: number, body: string) => ({
+      action: "created",
+      issue: {
+        number: 822,
+        title: "fix(github-webhook): let agents request an Ally re-review (BLO-18865)",
+        body: null,
+        html_url: "https://github.com/Blockcast/paperclip/pull/822",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/822" },
+        user: { login: "codex" },
+      },
+      comment: {
+        id: commentId,
+        body,
+        html_url: `https://github.com/Blockcast/paperclip/pull/822#issuecomment-${commentId}`,
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+    const send = async (payload: Record<string, unknown>, deliveryId: string) => {
+      const { body, signature } = signedRequest(payload);
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "issue_comment")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", deliveryId)
+        .set("content-type", "application/json")
+        .send(body);
+    };
+
+    const marked = await send(
+      commentPayload(4900000010, "<!-- paperclip:review-request -->\n@ally please re-review at head ea8697d1."),
+      "delivery-agent-marker",
+    );
+    expect(marked.status).toBe(200);
+    // NB: the response only carries `reviewerWakeFired` on the
+    // no_paperclip_identifier early-return. This PR's title matches BLO-18865,
+    // so the reviewer wake is asserted against the DB below instead.
+    expect(marked.body.wakes).toEqual([{ issueIdentifier: "BLO-18865", agentId: authorAgentId }]);
+
+    // The same body INDENTED at byte 0 is a Markdown code block -- a rendered
+    // example, not a request -- and must not re-arm the #583 refire loop. This
+    // is the offset-zero anchor asserted through the route, not just the
+    // helper: a fresh comment id means nothing downstream would dedup it.
+    const indentedExample = await send(
+      commentPayload(4900000011, "    <!-- paperclip:review-request -->\n    @ally review\n"),
+      "delivery-indented-example",
+    );
+    expect(indentedExample.status).toBe(200);
+    // Not a request and not review feedback, so resolveEventContext returns
+    // null and the route short-circuits before any identifier matching --
+    // which is why `reviewerWakeFired` is observable on this one.
+    expect(indentedExample.body).toMatchObject({ reviewerWakeFired: false });
+    expect(indentedExample.body.wakes ?? []).toEqual([]);
+
+    // Exactly one reviewer wake, from the marked request only.
+    const reviewerWakes = await db
+      .select({ reason: agentWakeupRequests.reason, idempotencyKey: agentWakeupRequests.idempotencyKey })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, reviewerAgentId));
+    expect(reviewerWakes).toHaveLength(1);
+    expect(reviewerWakes[0]).toMatchObject({
+      reason: "github_pr_review_requested",
+      idempotencyKey:
+        "pr_review:Blockcast/paperclip:822:github_pr_review_requested:comment:4900000010",
+    });
+
+    // ...and exactly one author wake, carrying the author role.
+    const authorWakes = await db
+      .select({ reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, authorAgentId));
+    expect(authorWakes).toHaveLength(1);
+    expect(authorWakes[0]).toMatchObject({ reason: "github_pr_review_requested" });
+
+    const authorRuns = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, authorAgentId));
+    expect(authorRuns).toHaveLength(1);
+    expect(authorRuns[0]).toMatchObject({
+      contextSnapshot: expect.objectContaining({
+        wakeReason: "github_pr_review_requested",
+        prRole: "author",
+      }),
     });
   });
 
