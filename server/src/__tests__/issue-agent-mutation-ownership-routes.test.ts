@@ -1965,6 +1965,125 @@ describe("agent issue mutation checkout ownership", () => {
         expect(mockIssueService.remove).not.toHaveBeenCalled();
       });
     }
+
+    // BLO-18797 review follow-up #1 (Ally, PR #814). POST /issues/:id/comments
+    // accepts `reopen` / `resume` control fields, and the follow-up gate behind
+    // them (assertExplicitResumeIntentAllowed) independently admits this same
+    // reporting chain via hasActiveCheckoutManagementOverride. That gate was
+    // unreachable for these actors while the comment boundary denied them
+    // outright; admitting them via allow_manager_chain / allow_issue_creator
+    // made it reachable, so a manager could reopen a terminal issue through
+    // what this change documents and tests as a comment grant. The comment
+    // grant must stay comment-only: the sole status change these reasons buy
+    // is the blocked -> todo PATCH asserted above.
+    for (const reason of ["allow_manager_chain", "allow_issue_creator"] as const) {
+      for (const controlField of ["reopen", "resume"] as const) {
+        it(`does not let a ${reason} actor ${controlField} another agent's issue through a comment`, async () => {
+          decideAllowingOnly(reason);
+          mockIssueService.getById.mockResolvedValue(
+            makeIssue({
+              status: "done",
+              assigneeAgentId: ownerAgentId,
+              createdByAgentId: peerAgentId,
+            }),
+          );
+
+          const res = await request(await createApp(peerActor()))
+            .post(`/api/issues/${issueId}/comments`)
+            .send({ body: "Reopen this please", [controlField]: true });
+
+          expect(res.status, JSON.stringify(res.body)).toBe(403);
+          expect(res.body?.error).toContain("outside delegate recovery");
+          // The status change is what matters — assert it never happened, not
+          // merely that the response was a 403.
+          expect(mockIssueService.update).not.toHaveBeenCalled();
+          expect(mockIssueService.addComment).not.toHaveBeenCalled();
+        });
+      }
+    }
+
+    // BLO-18797 review follow-up #2 (Ally, PR #814). The delegate-recovery
+    // authorization reads a snapshot loaded by the route, then issueService
+    // .update re-reads and writes by id. Under READ COMMITTED a concurrent
+    // assignee checkout can commit in between, so the recovery would clear
+    // blockers and write `todo` over a live run — defeating the active-run
+    // protection the narrow patch shape exists to preserve. The route now
+    // pins the precondition through to the write.
+    for (const reason of ["allow_manager_chain", "allow_issue_creator"] as const) {
+      it(`pins status=blocked through to the write for a ${reason} delegate recovery`, async () => {
+        decideAllowingOnly(reason);
+        const stored = makeIssue({
+          status: "blocked",
+          assigneeAgentId: ownerAgentId,
+          createdByAgentId: peerAgentId,
+        });
+        mockIssueService.getById.mockResolvedValue(stored);
+        mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+          ...stored,
+          ...patch,
+        }));
+
+        const res = await request(await createApp(peerActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send({ status: "todo", blockedByIssueIds: [] });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
+        expect(patch.expectedCurrentStatus).toBe("blocked");
+      });
+    }
+
+    it("surfaces 409 when the issue stops being blocked before the recovery write lands", async () => {
+      decideAllowingOnly("allow_manager_chain");
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          status: "blocked",
+          assigneeAgentId: ownerAgentId,
+          createdByAgentId: peerAgentId,
+        }),
+      );
+      // Stands in for the real service guard: the assignee checked the issue
+      // out between the route's snapshot read and the UPDATE, so the
+      // status-equality predicate in the WHERE clause matches zero rows.
+      const { conflict } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      mockIssueService.update.mockRejectedValue(
+        conflict("Issue status changed before the update could be applied", {
+          issueId,
+          expectedStatus: "blocked",
+          currentStatus: "in_progress",
+        }),
+      );
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", blockedByIssueIds: [] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body?.error).toContain("status changed");
+    });
+
+    it("does not pin expectedCurrentStatus on an ordinary assignee patch", async () => {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: true,
+        action: input.action,
+        reason: "allow_self",
+        explanation: "Assignee.",
+      }));
+      const stored = makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId });
+      mockIssueService.getById.mockResolvedValue(stored);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...stored,
+        ...patch,
+      }));
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", blockedByIssueIds: [] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
+      expect(patch.expectedCurrentStatus).toBeUndefined();
+    });
   });
 
   it.each([

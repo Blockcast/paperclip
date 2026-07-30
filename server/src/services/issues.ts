@@ -7845,6 +7845,19 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        /**
+         * BLO-18797: optimistic-concurrency guard. When set, the row must still
+         * carry this status at write time or the update is rejected with 409.
+         * Callers that authorized a mutation *because of* the row's current
+         * status must pass it — the authorization check reads a snapshot loaded
+         * by the route, and READ COMMITTED lets a concurrent writer (an
+         * assignee checkout, say) land between that read and this write. The
+         * status equality is repeated in the UPDATE's WHERE clause, not just
+         * asserted against `existing`, because only the WHERE is re-evaluated
+         * against the latest row version when the statement blocks on a
+         * concurrent transaction.
+         */
+        expectedCurrentStatus?: string;
       },
       dbOrTx: any = db,
     ) => {
@@ -7860,8 +7873,17 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        expectedCurrentStatus,
         ...issueData
       } = data;
+
+      if (expectedCurrentStatus !== undefined && existing.status !== expectedCurrentStatus) {
+        throw conflict("Issue status changed before the update could be applied", {
+          issueId: id,
+          expectedStatus: expectedCurrentStatus,
+          currentStatus: existing.status,
+        });
+      }
       const experimental = await instanceSettings.getExperimental();
       const isolatedWorkspacesEnabled = experimental.enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
@@ -8124,10 +8146,26 @@ export function issueService(db: Db) {
         const updated = await tx
           .update(issues)
           .set(patch)
-          .where(eq(issues.id, id))
+          .where(
+            expectedCurrentStatus === undefined
+              ? eq(issues.id, id)
+              : and(eq(issues.id, id), eq(issues.status, expectedCurrentStatus)),
+          )
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
-        if (!updated) return null;
+        if (!updated) {
+          // With expectedCurrentStatus set, zero matched rows means a concurrent
+          // writer changed the status after the snapshot check above — the
+          // precondition genuinely failed, so surface 409 rather than the 404
+          // that a bare `return null` would produce.
+          if (expectedCurrentStatus !== undefined) {
+            throw conflict("Issue status changed before the update could be applied", {
+              issueId: id,
+              expectedStatus: expectedCurrentStatus,
+            });
+          }
+          return null;
+        }
         if (
           (updated.status === "done" || updated.status === "cancelled") &&
           existing.status !== updated.status

@@ -3625,6 +3625,26 @@ export function issueRoutes(
     return decision !== true && decision.reason === "allow_issue_mention_grant";
   }
 
+  // BLO-18797: the creator / manager-chain allow-paths are a *comment* grant.
+  // They exist so a manager or the delegating creator can deliver a handoff
+  // onto a delegate's issue; the only status change they buy is the narrow
+  // blocked -> todo PATCH gated by isCreatorOrManagerChainRecoveryPatch.
+  // POST /issues/:id/comments also accepts `reopen` / `resume`, and the
+  // follow-up gate below it (assertExplicitResumeIntentAllowed) independently
+  // admits the same reporting chain via hasActiveCheckoutManagementOverride —
+  // a path that was unreachable while the comment boundary denied these actors
+  // outright. Left alone, admitting them here would hand a manager a reopen of
+  // any terminal issue through what this PR documents and tests as a
+  // comment-only grant. The comment route re-runs the mutation gate for these
+  // actors when a control field is present, so the request fails closed with an
+  // explicit 403 rather than silently dropping the caller's stated intent.
+  function isCreatorOrManagerChainDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    return (
+      decision !== true &&
+      (decision.reason === "allow_issue_creator" || decision.reason === "allow_manager_chain")
+    );
+  }
+
   async function filterIssuesForActor<T extends Parameters<typeof decideIssueAccess>[1]>(req: Request, rows: T[]) {
     const decisions = await Promise.all(rows.map((issue) => decideIssueAccess(req, issue, "issue:read")));
     return rows.filter((_, index) => decisions[index]?.allowed);
@@ -8084,6 +8104,21 @@ export function issueRoutes(
         allowCreatorOrManagerChainOwnership: true,
       },
     ))) return;
+    // BLO-18797: the delegate-recovery bypass authorized this patch *because*
+    // the snapshot said `blocked` — an issue nobody is actively running. That
+    // read happened before any of the work below, so a concurrent assignee
+    // checkout can land in between and leave us clearing blockers and writing
+    // `todo` over a live run, which is exactly the active-run protection the
+    // narrow patch shape exists to preserve. Re-assert the status at write time
+    // (see `expectedCurrentStatus` in issues service `update`) and 409 instead.
+    // Deliberately keyed off the patch shape rather than the decision reason:
+    // the checkout-management override and recovery-action-owner paths reach
+    // this same mutation on someone else's issue and want the same guard.
+    const delegateRecoveryPatchInFlight =
+      req.actor.type === "agent" &&
+      !!existing.assigneeAgentId &&
+      existing.assigneeAgentId !== req.actor.agentId &&
+      isCreatorOrManagerChainRecoveryPatch(existing, req.body as Record<string, unknown>);
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);
@@ -8438,6 +8473,7 @@ export function issueRoutes(
               ...updateFields,
               actorAgentId: actor.agentId ?? null,
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
+              ...(delegateRecoveryPatchInFlight ? { expectedCurrentStatus: "blocked" } : {}),
             },
             tx,
           );
@@ -8463,6 +8499,7 @@ export function issueRoutes(
           ...updateFields,
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
+          ...(delegateRecoveryPatchInFlight ? { expectedCurrentStatus: "blocked" } : {}),
         });
       }
     } catch (err) {
@@ -10255,6 +10292,21 @@ export function issueRoutes(
       isIssueMentionGrantDecision(commentAccessDecision);
     const effectiveReopenRequested = mentionGrantedPeerAgentCommentOnly ? false : reopenRequested;
     const effectiveResumeRequested = mentionGrantedPeerAgentCommentOnly ? false : resumeRequested;
+    // BLO-18797: a creator / manager-chain comment grant carries no status
+    // authority. Escalate rather than silently dropping the field, mirroring
+    // the mention-grant branch below: re-run the mutation gate WITHOUT
+    // allowCreatorOrManagerChainOwnership, which lands on the explicit
+    // "outside delegate recovery" 403. The only status change these actors get
+    // is the blocked -> todo PATCH.
+    if (
+      req.actor.type === "agent" &&
+      issue.assigneeAgentId !== null &&
+      issue.assigneeAgentId !== req.actor.agentId &&
+      isCreatorOrManagerChainDecision(commentAccessDecision) &&
+      (reopenRequested || resumeRequested)
+    ) {
+      if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    }
     if (
       isClosed &&
       req.actor.type === "agent" &&
