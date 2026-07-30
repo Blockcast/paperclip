@@ -15085,6 +15085,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // its slot until it actually terminates.
             and(
               inArray(externalRuntimeReservations.state, ["reserved", "launching", "launched"]),
+              or(
+                isNotNull(externalRuntimeReservations.jobName),
+                isNotNull(externalRuntimeReservations.jobUid),
+              ),
               inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
             ),
           ),

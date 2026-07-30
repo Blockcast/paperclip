@@ -1,14 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   createDb,
   heartbeatRuns,
   issueComments,
   issueRelations,
+  issueTreeHolds,
   issues,
 } from "@paperclipai/db";
 import {
@@ -45,8 +47,10 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(activityLog);
+    await db.delete(issueTreeHolds);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -352,5 +356,304 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(row).toEqual({ checkoutRunId: runningRunId, executionRunId: queuedRunId });
+  });
+
+  it("does not clear a stale pre-claim lock if a claim refreshes executionLockedAt after scan", async () => {
+    const { companyId, agentId, queuedRunId } = await seed();
+    const issueId = randomUUID();
+    const staleLockedAt = new Date(Date.now() - 7 * 60 * 60 * 1000);
+    const refreshedLockedAt = new Date();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Pre-claim lock claimed during sweep",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: queuedRunId,
+      executionLockedAt: staleLockedAt,
+    });
+
+    const heartbeat = heartbeatService(db);
+    let sweepPromise: ReturnType<typeof heartbeat.sweepStaleIssueLocks> | null = null;
+
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select id from issues where id = ${issueId} for update`);
+      sweepPromise = heartbeat.sweepStaleIssueLocks();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await tx
+        .update(issues)
+        .set({ executionLockedAt: refreshedLockedAt, updatedAt: refreshedLockedAt })
+        .where(eq(issues.id, issueId));
+    });
+
+    expect(sweepPromise).not.toBeNull();
+    const result = await sweepPromise!;
+
+    expect(result.cleared).toBe(0);
+    const row = await db
+      .select({
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.executionRunId).toBe(queuedRunId);
+    expect(row?.executionLockedAt?.getTime()).toBe(refreshedLockedAt.getTime());
+  });
+
+  it("promotes the oldest eligible deferred issue wake after clearing an expired pre-claim lock", async () => {
+    const { companyId, agentId, queuedRunId } = await seed();
+    const issueId = randomUUID();
+    const deferredWakeId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Expired holder with deferred follow-up",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      checkoutRunId: null,
+      executionRunId: queuedRunId,
+      executionLockedAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId,
+        commentId: "comment-1",
+        _paperclipWakeContext: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_comment_followup",
+        },
+      },
+      status: "deferred_issue_execution",
+      requestedByActorType: "system",
+      requestedByActorId: null,
+      requestedAt: new Date(Date.now() - 5 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const wake = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        runId: agentWakeupRequests.runId,
+        error: agentWakeupRequests.error,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeId))
+      .then((rows) => rows[0]);
+    expect(wake).toMatchObject({
+      status: "queued",
+      reason: "issue_execution_promoted",
+      error: null,
+    });
+    expect(wake?.runId).toBeTruthy();
+    expect(wake?.runId).not.toBe(queuedRunId);
+
+    const promotedRun = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        wakeupRequestId: heartbeatRuns.wakeupRequestId,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        responsibleUserId: heartbeatRuns.responsibleUserId,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, wake!.runId!))
+      .then((rows) => rows[0]);
+    expect(promotedRun).toMatchObject({
+      id: wake?.runId,
+      status: "queued",
+      wakeupRequestId: deferredWakeId,
+      responsibleUserId: "responsible-user",
+    });
+    expect(promotedRun?.contextSnapshot).toMatchObject({
+      issueId,
+      taskId: issueId,
+      wakeReason: "issue_comment_followup",
+      wakeSource: "automation",
+      wakeTriggerDetail: "system",
+      commentId: "comment-1",
+    });
+
+    const issue = await db
+      .select({
+        executionRunId: issues.executionRunId,
+        executionAgentNameKey: issues.executionAgentNameKey,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(issue?.executionRunId).toBe(wake?.runId);
+    expect(issue?.executionAgentNameKey).toBe("coder");
+    expect(issue?.executionLockedAt).not.toBeNull();
+
+    const originalRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRunId))
+      .then((rows) => rows[0]);
+    expect(originalRun?.status).toBe("queued");
+  });
+
+  it("fails non-invokable deferred wakes and promotes the next eligible wake", async () => {
+    const { companyId, agentId, queuedRunId } = await seed();
+    const pausedAgentId = randomUUID();
+    const issueId = randomUUID();
+    const pausedWakeId = randomUUID();
+    const activeWakeId = randomUUID();
+    await db.insert(agents).values({
+      id: pausedAgentId,
+      companyId,
+      name: "Paused Coder",
+      role: "engineer",
+      status: "paused",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Expired holder with mixed deferred wakes",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: queuedRunId,
+      executionLockedAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: pausedWakeId,
+        companyId,
+        agentId: pausedAgentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_execution_deferred",
+        payload: { issueId, _paperclipWakeContext: { issueId, taskId: issueId } },
+        status: "deferred_issue_execution",
+        requestedAt: new Date(Date.now() - 10 * 60 * 1000),
+      },
+      {
+        id: activeWakeId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_execution_deferred",
+        payload: { issueId, _paperclipWakeContext: { issueId, taskId: issueId } },
+        status: "deferred_issue_execution",
+        requestedAt: new Date(Date.now() - 5 * 60 * 1000),
+      },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    const wakes = await db
+      .select({
+        id: agentWakeupRequests.id,
+        status: agentWakeupRequests.status,
+        runId: agentWakeupRequests.runId,
+        error: agentWakeupRequests.error,
+      })
+      .from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.id} in (${pausedWakeId}, ${activeWakeId})`);
+    const byId = new Map(wakes.map((wake) => [wake.id, wake]));
+    expect(byId.get(pausedWakeId)).toMatchObject({
+      status: "failed",
+      runId: null,
+      error: "Deferred wake could not be promoted: agent is not invokable",
+    });
+    expect(byId.get(activeWakeId)?.status).toBe("queued");
+    expect(byId.get(activeWakeId)?.runId).toBeTruthy();
+  });
+
+  it("cancels deferred wake promotion when a subtree pause hold is active", async () => {
+    const { companyId, agentId, queuedRunId } = await seed();
+    const issueId = randomUUID();
+    const deferredWakeId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Expired holder under pause hold",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: queuedRunId,
+      executionLockedAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+    await db.insert(issueTreeHolds).values({
+      companyId,
+      rootIssueId: issueId,
+      mode: "pause",
+      status: "active",
+      reason: "manual pause",
+      releasePolicy: { strategy: "manual" },
+      createdByActorType: "user",
+      createdByUserId: "board-user",
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: { issueId, _paperclipWakeContext: { issueId, taskId: issueId } },
+      status: "deferred_issue_execution",
+      requestedByActorType: "system",
+      requestedByActorId: null,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    const wake = await db
+      .select({
+        status: agentWakeupRequests.status,
+        runId: agentWakeupRequests.runId,
+        error: agentWakeupRequests.error,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeId))
+      .then((rows) => rows[0]);
+    expect(wake).toMatchObject({
+      status: "cancelled",
+      runId: null,
+      error: "Deferred wake suppressed by active subtree pause hold",
+    });
+
+    const issue = await db
+      .select({
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(issue).toEqual({ executionRunId: null, executionLockedAt: null });
   });
 });
