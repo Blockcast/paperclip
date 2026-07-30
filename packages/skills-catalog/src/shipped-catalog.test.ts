@@ -94,6 +94,13 @@ case "$1 $2" in
   "pr view")
     if [ "$3" = "7" ]; then
       [ "$GH_SCENARIO" = "view-fails" ] && { echo "gh: HTTP 500" >&2; exit 1; }
+      if [[ "$*" == *"--json state"* ]]; then
+        case "$GH_SCENARIO" in
+          close-applied-error|create-applied-error|signal-after-close) echo "CLOSED" ;;
+          *) echo "OPEN" ;;
+        esac
+        exit 0
+      fi
       case "$GH_SCENARIO" in
         null-sha|blank-both) echo '{"headRefName":"feat","baseRefName":"main","headRefOid":null,"title":"T","body":"B"}'; exit 0 ;;
       esac
@@ -110,10 +117,24 @@ case "$1 $2" in
     [ "$GH_SCENARIO" = "blank-both" ] && { echo ""; exit 0; }
     [ "$GH_SCENARIO" = "moved" ] && { echo "$MOVED"; exit 0; }
     echo "$ORIG" ;;
+  "pr close")
+    if [ "$3" = "7" ] && [ "$GH_SCENARIO" = "close-applied-error" ]; then
+      echo "gh: connection reset after close" >&2
+      exit 1
+    fi
+    if [ "$3" = "7" ] && [ "$GH_SCENARIO" = "signal-after-close" ]; then
+      kill -TERM "$PPID"
+      sleep 0.1
+    fi
+    exit 0 ;;
   "pr create")
     [ "$GH_SCENARIO" = "create-fails" ] && { echo "gh: no commits between branches" >&2; exit 1; }
+    [ "$GH_SCENARIO" = "create-applied-error" ] && { echo "gh: connection reset after create" >&2; exit 1; }
     [ "$GH_SCENARIO" = "blank-url" ] && { echo ""; exit 0; }
     echo "https://github.com/acme/widgets/pull/8" ;;
+  "pr list")
+    [ "$GH_SCENARIO" = "create-applied-error" ] && { echo "8"; exit 0; }
+    echo "" ;;
   *) exit 0 ;;
 esac
 `;
@@ -429,7 +450,9 @@ describe("shipped skills catalog", () => {
       // `set -e` is what makes an unanticipated failure reach the rollback trap
       // rather than falling through to the next destructive line.
       expect(recipe).toMatch(/set\s+-euo\s+pipefail/);
-      expect(recipe).toMatch(/trap\s+\w+\s+EXIT\s+INT\s+TERM/);
+      expect(recipe).toMatch(/trap\s+rollback\s+EXIT/);
+      expect(recipe).toMatch(/trap\s+'handle_signal INT'\s+INT/);
+      expect(recipe).toMatch(/trap\s+'handle_signal TERM'\s+TERM/);
     });
 
     // Every pre-close failure must abort with the review artifact still open.
@@ -458,6 +481,25 @@ describe("shipped skills catalog", () => {
       ["wrong-base", true],
       ["moved-head", true],
     ])("rolls the original back open after %s", (scenario, expectReplacement) => {
+      const { status, ghCalls } = runRecovery(scenario);
+      expect(status, "recipe must exit non-zero").not.toBe(0);
+      expect(closedOriginal(ghCalls), "scenario should have reached the close").toBe(true);
+      expect(reopenedOriginal(ghCalls), "must reopen the original").toBe(true);
+      expect(closedReplacement(ghCalls), "must not leave a bad replacement open").toBe(expectReplacement);
+    });
+
+    it("rolls the original back open when interrupted after close", () => {
+      const { status, stderr, ghCalls } = runRecovery("signal-after-close");
+      expect(status, "recipe must exit non-zero").not.toBe(0);
+      expect(stderr).toContain("interrupted by TERM");
+      expect(closedOriginal(ghCalls), "scenario should have reached the close").toBe(true);
+      expect(reopenedOriginal(ghCalls), "must reopen the original").toBe(true);
+    });
+
+    it.each([
+      ["close-applied-error", false],
+      ["create-applied-error", true],
+    ])("reconciles applied remote mutation after %s", (scenario, expectReplacement) => {
       const { status, ghCalls } = runRecovery(scenario);
       expect(status, "recipe must exit non-zero").not.toBe(0);
       expect(closedOriginal(ghCalls), "scenario should have reached the close").toBe(true);

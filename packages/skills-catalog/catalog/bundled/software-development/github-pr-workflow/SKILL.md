@@ -183,15 +183,32 @@ printf '%s' "$REMOTE_SHA" | grep -Eq '^[0-9a-f]{40}$' ||
 [ "$REMOTE_SHA" = "$ORIG_SHA" ] ||
   { echo "abort: origin/$HEAD_REF is $REMOTE_SHA, expected $ORIG_SHA" >&2; exit 1; }
 
-# Arm rollback BEFORE closing anything, and arm it for every unsuccessful exit —
-# not just the two failures spelled out below. An interrupt or an unanticipated
-# error between here and the final check would otherwise strand the branch with
-# its review artifact closed. A rollback that itself fails says so loudly.
+# Arm rollback BEFORE closing anything, and arm it for every unsuccessful exit.
+# Re-query GitHub inside rollback because a close/create can apply remotely and
+# still return a client error or be interrupted before this script records it.
 CLOSED=0
 NEW_NUM=""
-rollback() {
-  status=$?
+reconcile_original_state() {
+  state="$(gh pr view "$NUM" --repo "$REPO" --json state --jq '.state // empty' 2>/dev/null || true)"
+  if [ "$state" = "CLOSED" ]; then CLOSED=1; fi
+}
+reconcile_replacement_state() {
+  if printf '%s' "$NEW_NUM" | grep -Eq '^[0-9]+$'; then return 0; fi
+  NEW_NUM="$(gh pr list --repo "$REPO" \
+    --head "$HEAD_REF" \
+    --base "$BASE_REF" \
+    --state open \
+    --json number,headRefOid,baseRefName \
+    --jq ".[] | select(.number != $NUM and .headRefOid == \"$ORIG_SHA\" and .baseRefName == \"$BASE_REF\") | .number" \
+    2>/dev/null | head -n 1 || true)"
+  printf '%s' "$NEW_NUM" | grep -Eq '^[0-9]+$' || NEW_NUM=""
+}
+rollback_status() {
+  status="$1"
   if [ "$status" -eq 0 ]; then return 0; fi
+  trap - EXIT INT TERM
+  reconcile_original_state
+  reconcile_replacement_state
   echo "recovery failed (exit $status); restoring #$NUM" >&2
   if [ -n "$NEW_NUM" ]; then
     gh pr close "$NEW_NUM" --repo "$REPO" ||
@@ -202,23 +219,38 @@ rollback() {
       echo "ROLLBACK FAILED: reopen #$NUM by hand" >&2
   fi
 }
-trap rollback EXIT INT TERM
+rollback() { rollback_status "$?"; }
+handle_signal() {
+  signal="$1"
+  echo "interrupted by $signal" >&2
+  rollback_status 130
+  exit 130
+}
+trap rollback EXIT
+trap 'handle_signal INT' INT
+trap 'handle_signal TERM' TERM
 
-gh pr close "$NUM" --repo "$REPO"
+if ! gh pr close "$NUM" --repo "$REPO"; then
+  reconcile_original_state
+  exit 1
+fi
 CLOSED=1
 
-NEW_URL="$(gh pr create --repo "$REPO" \
-  --head  "$HEAD_REF" \
-  --base  "$BASE_REF" \
-  --title "$(jq -r .title "/tmp/pr-$NUM.json")" \
-  --body  "$(jq -r .body  "/tmp/pr-$NUM.json")")"
+if ! NEW_URL="$(gh pr create --repo "$REPO" \
+    --head  "$HEAD_REF" \
+    --base  "$BASE_REF" \
+    --title "$(jq -r .title "/tmp/pr-$NUM.json")" \
+    --body  "$(jq -r .body  "/tmp/pr-$NUM.json")")"; then
+  reconcile_replacement_state
+  exit 1
+fi
 NEW_NUM="${NEW_URL##*/}"
 
 # Validate the number too: an empty or non-numeric NEW_URL would otherwise send
 # the checks below to `gh pr view ""`, and an unvalidated blank is exactly the
 # fail-open the capture step above guards against.
 printf '%s' "$NEW_NUM" | grep -Eq '^[0-9]+$' ||
-  { echo "abort: gh pr create returned '$NEW_URL'" >&2; exit 1; }
+  { echo "abort: gh pr create returned '$NEW_URL'" >&2; reconcile_replacement_state; exit 1; }
 
 # Verification is part of the recovery, not a follow-up step: a replacement on a
 # different head or base is not a recovery, and leaving it open while the
