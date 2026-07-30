@@ -4002,13 +4002,39 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   // to wait for" -- whose correct handling is to fall through to `blocked`
   // escalation. Everything else (a programming error, a DB failure, an unrelated
   // service fault) is NOT that, and swallowing it would report a fault as a business
-  // decision and route the issue to `blocked` on a lie. Those propagate to the
-  // per-issue boundary in reconcileStrandedAssignedIssues, which records the fault
-  // and moves to the next issue without touching this one's status.
+  // decision and route the issue to `blocked` on a lie. Those propagate to
+  // runParkAttempt, the per-park boundary in reconcileStrandedAssignedIssues, which
+  // records the fault and moves to the next issue without touching this one's status.
   function isEvidenceGateRejection(err: unknown) {
     return err instanceof HttpError &&
       err.status === 422 &&
       (err.details as { code?: string } | undefined)?.code === "missing-evidence";
+  }
+
+  // BLO-18829: the park paths above rethrow every fault that is NOT the evidence gate
+  // instead of relabelling it "nothing to review". That is only safe if one candidate's
+  // fault cannot abort the whole sweep, so every park call goes through this boundary.
+  // It is deliberately the *narrowest* thing that restores sweep survival: record the
+  // fault and leave the issue's status exactly as it was found.
+  //
+  // Note what it specifically does NOT do -- fall through to `blocked` escalation. That
+  // is the behaviour the rethrow exists to remove: escalating on an unrelated fault
+  // reports a bug as the business state "this issue is stranded and unreviewable", which
+  // is how BLO-18829 got here. A faulted candidate is left alone for the next sweep pass,
+  // which is the honest disposition when we no longer know why the park failed.
+  async function runParkAttempt<T extends string>(
+    input: { issue: typeof issues.$inferSelect; label: string },
+    attempt: () => Promise<T>,
+  ): Promise<T | "faulted"> {
+    try {
+      return await attempt();
+    } catch (err) {
+      logger.warn(
+        { err, issueId: input.issue.id, identifier: input.issue.identifier },
+        `${input.label}: park attempt faulted; leaving status untouched and continuing the sweep`,
+      );
+      return "faulted";
+    }
   }
 
   type ParkReviewWaitingContinuationOutcome = "parked" | "skipped" | "failed";
@@ -4044,9 +4070,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // statement leaves this transaction aborted, so the COMMIT at the end of
       // db.transaction throws anyway and the sweep dies regardless -- while a genuine
       // bug got silently relabelled as "nothing to review" and the issue was escalated
-      // to `blocked` for the wrong reason. Sweep survival is now the per-issue
-      // boundary's job in reconcileStrandedAssignedIssues, which is the only place
-      // that can actually deliver it.
+      // to `blocked` for the wrong reason. Sweep survival is now runParkAttempt's job,
+      // the per-park boundary in reconcileStrandedAssignedIssues, which is the only
+      // place that can actually deliver it.
       let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
       try {
         updated = await issuesSvc.update(fresh.id, { status: "in_review" }, tx);
@@ -4972,6 +4998,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       providerQuotaMonitored: 0,
       recentProgressExempted: 0,
       skipped: 0,
+      // BLO-18829: park attempts that threw a non-evidence-gate fault and were skipped
+      // by runParkAttempt. Counted separately from `skipped` because a fault is not a
+      // decision -- it is the signal that something needs looking at.
+      parkFaulted: 0,
       issueIds: [] as string[],
     };
 
@@ -5503,11 +5533,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
       if (isWaitingOnReviewContinuationRun(latestRun) && hasActiveMonitorPath(issue)) {
-        const parkOutcome = await parkReviewWaitingContinuationIssue({
-          issue,
-          previousStatus: "in_progress",
-          latestRun,
-        });
+        const parkOutcome = await runParkAttempt(
+          { issue, label: "parkReviewWaitingContinuationIssue" },
+          () => parkReviewWaitingContinuationIssue({
+            issue,
+            previousStatus: "in_progress",
+            latestRun,
+          }),
+        );
+        if (parkOutcome === "faulted") {
+          result.parkFaulted += 1;
+          continue;
+        }
         if (parkOutcome === "parked") {
           result.reviewWaitingParked += 1;
           result.issueIds.push(issue.id);
@@ -5701,11 +5738,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           // issue_continuation_needed) so a `failed`/`timed_out` run that merely carries
           // this error code is NOT treated as a deliberate wait.
           if (isWaitingOnReviewContinuationRun(latestRun)) {
-            const parkOutcome = await parkNoDependencyReviewWaitingIssue({
-              issue,
-              previousStatus: "in_progress",
-              latestRun,
-            });
+            const parkOutcome = await runParkAttempt(
+              { issue, label: "parkNoDependencyReviewWaitingIssue" },
+              () => parkNoDependencyReviewWaitingIssue({
+                issue,
+                previousStatus: "in_progress",
+                latestRun,
+              }),
+            );
+            if (parkOutcome === "faulted") {
+              result.parkFaulted += 1;
+              continue;
+            }
             if (parkOutcome === "parked") {
               result.reviewWaitingParked += 1;
               result.issueIds.push(issue.id);
