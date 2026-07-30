@@ -355,7 +355,33 @@ function assertExplicitPinnedWorktreeIssueRunnable(input: {
   }
 }
 
+// Two deliberately different questions about the same three fields. Collapsing
+// them into one `!= null` predicate regressed recovery escalation once already
+// (PR #811), so they stay separate and each call site picks explicitly.
+//
+// Did the caller *mention* any workspace field? An explicit `null` counts.
+// Passing all three as null is how a caller opts OUT of inheriting a parent's
+// execution workspace — recovery/service.ts does exactly that for a liveness
+// escalation it parents to the recovery issue, to stop the escalation adopting
+// the blocker's checkout. The inheritance-suppression sites must therefore read
+// null as a real override, or that opt-out silently stops working.
 function hasExplicitExecutionWorkspaceOverride(input: {
+  executionWorkspaceId?: string | null;
+  executionWorkspacePreference?: string | null;
+  executionWorkspaceSettings?: unknown;
+}) {
+  return (
+    input.executionWorkspaceId !== undefined ||
+    input.executionWorkspacePreference !== undefined ||
+    input.executionWorkspaceSettings !== undefined
+  );
+}
+
+// Did the caller supply an actual workspace *value*? Explicit nulls do not
+// count. Sole-led-project inference keys off this one, because the board/UI
+// intake path serializes explicit nulls and must still get inference — that
+// intake case is the whole point of BLO-18760.
+function hasExecutionWorkspaceIntent(input: {
   executionWorkspaceId?: string | null;
   executionWorkspacePreference?: string | null;
   executionWorkspaceSettings?: unknown;
@@ -7568,6 +7594,7 @@ export function issueService(db: Db) {
           ? null
           : inheritExecutionWorkspaceFromIssueId ?? issueData.parentId ?? null;
         const hasExplicitWorkspaceOverride = hasExplicitExecutionWorkspaceOverride(issueData);
+        const hasWorkspaceIntent = hasExecutionWorkspaceIntent(issueData);
         if (workspaceInheritanceIssueId) {
           const workspaceSource = await getWorkspaceInheritanceIssue(tx, companyId, workspaceInheritanceIssueId);
           if (issueData.projectId == null && workspaceSource.projectId) {
@@ -7681,7 +7708,13 @@ export function issueService(db: Db) {
         //    something about where this runs; honour it and let the validation speak.
         //    Nullable API payloads are not workspace intent: explicit null workspace
         //    fields mean "no workspace override" and follow the same inference path as
-        //    omitted fields, matching `projectId: null` above.
+        //    omitted fields, matching `projectId: null` above. That null-tolerance is
+        //    scoped to THIS guard — hence `hasExecutionWorkspaceIntent` here versus
+        //    `hasExplicitExecutionWorkspaceOverride` at the two inheritance sites above.
+        //    Do not re-merge them: for inheritance, explicit nulls are a deliberate
+        //    opt-out ("do not adopt the parent's workspace") and must keep suppressing
+        //    it. Collapsing both onto `!= null` regressed exactly that and let a
+        //    liveness escalation adopt its blocker's checkout.
         //    Intake sends none of these fields, so the fix still fires where it matters.
         //    Inert when `enableIsolatedWorkspaces` is off, and correctly so: create()
         //    deletes all three fields in that mode, so the flag is already false — and
@@ -7692,7 +7725,7 @@ export function issueService(db: Db) {
           issueData.assigneeAgentId &&
           issueData.parentId == null &&
           workspaceInheritanceIssueId == null &&
-          !hasExplicitWorkspaceOverride
+          !hasWorkspaceIntent
         ) {
           const ledProjects = await tx
             .select({ id: projects.id })

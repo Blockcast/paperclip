@@ -3044,6 +3044,83 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(issue.projectId).toBe(projectId);
   });
 
+  // Ally review (PR #811) asked for explicit-null workspace fields to stop suppressing
+  // sole-led-project inference. Applying that to the SHARED override predicate also
+  // changed the two workspace-*inheritance* guards, which read the same three fields for
+  // the opposite purpose: recovery/service.ts creates a liveness escalation parented to
+  // the recovery issue and passes all three as null precisely so the escalation does NOT
+  // adopt the blocker's checkout. Under the merged predicate the nulls stopped counting,
+  // inheritance fired, and the escalation came out pinned to the parent's workspace with
+  // preference "reuse_existing" (caught by heartbeat-issue-liveness-escalation.test.ts).
+  // The two questions are now separate predicates; this pins the inheritance half so
+  // they cannot be re-merged silently.
+  it("BLO-18760: explicit null workspace fields still opt out of inheriting the parent's workspace", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const parentIssueId = randomUUID();
+
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace project",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "operator_branch",
+      strategyType: "git_worktree",
+      name: "Operator branch",
+      status: "active",
+      providerType: "git_worktree",
+    });
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Recovery issue holding a workspace",
+      status: "todo",
+      priority: "medium",
+      executionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: { mode: "operator_branch" },
+    });
+
+    // Same field set the recovery escalation sends on its no-reuse branch.
+    const escalation = await svc.create(companyId, {
+      title: "Unblock liveness incident",
+      status: "todo",
+      priority: "high",
+      parentId: parentIssueId,
+      projectId,
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+      executionWorkspaceSettings: null,
+    });
+
+    expect(escalation.parentId).toBe(parentIssueId);
+    expect(escalation.executionWorkspaceId).toBeNull();
+    expect(escalation.executionWorkspacePreference).toBeNull();
+  });
+
   // Ally review (PR #811): archival is the only exclusion, so an archived led project
   // must not be inferred even though it is the agent's sole lead.
   it("BLO-18760: excludes archived led projects from inference", async () => {
