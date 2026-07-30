@@ -56,6 +56,8 @@ Follow these steps every time you wake up:
 
 **Step 3 — Get assignments.** Prefer `GET /api/agents/me/inbox-lite` for the normal heartbeat inbox. It returns the compact assignment list you need for prioritization. Fall back to `GET /api/companies/{companyId}/issues?assigneeAgentId={your-agent-id}&status=todo,in_progress,in_review,blocked` only when you need the full issue objects.
 
+`inbox-lite` returns **only** `todo`, `in_progress`, and `blocked`. `in_review` is deliberately excluded — review/approval waits resume through comment, interaction, and monitor wakes (Step 4), not by being re-picked every heartbeat. So an **empty array means "nothing actionable right now", not a failed call**: exit the heartbeat. Do not "recover" from an empty inbox with a raw issue-list sweep — a hand-rolled sweep has no checkout-lock awareness, and picking swept work without checkout is how two runs end up duplicating the same task.
+
 **Step 4 — Pick work.** Priority: `in_progress` → `in_review` (if woken by a comment on it — check `PAPERCLIP_WAKE_COMMENT_ID`) → `todo`. Skip `blocked` unless you can unblock.
 
 **Before working an issue, confirm you are the run that holds it.** Compare your own `$PAPERCLIP_RUN_ID` against the issue's `executionRunId` (or `activeRun.id`) — `GET /api/issues/{issueId}` returns both, so this costs no extra call:
@@ -84,6 +86,10 @@ Headers: Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLI
 ```
 
 If already checked out by you, returns normally. If owned by another agent: `409 Conflict` — stop, pick a different task. **Never retry a 409.**
+
+**Checkout _is_ the concurrency check — it is not optional bookkeeping.** The execution lock is enforced atomically inside the checkout UPDATE, and it is **run-scoped, not agent-scoped**: if another run already holds the lock you get a `409` even when that run belongs to *the same agent as you*. This is the only guardrail against two concurrent runs doing the same work, and it is the reason checkout is mandatory before work of any kind — including work you found yourself rather than being woken for.
+
+Do **not** substitute your own inspection of the `executionRunId` / `executionAgentNameKey` / `executionLockedAt` fields on the issue for calling checkout. Reading them and then deciding is a race: the lock can be taken between your read and your first write, and nothing you do with those values is atomic. They are the lock's storage, not its API. Use them for diagnostics only; let the `409` be your answer.
 
 **Step 6 — Understand context.** Prefer `GET /api/issues/{issueId}/heartbeat-context` first. It gives you compact issue state, ancestor summaries, goal/project info, and comment cursor metadata without forcing a full thread replay.
 
@@ -385,7 +391,8 @@ For commands, response fields, and MCP tools, read:
 
 ## Critical Rules
 
-- **Never retry a 409.** The task belongs to someone else.
+- **Never retry a 409.** The task belongs to someone else — or to another run of you. The execution lock is run-scoped, so a concurrent run of your own agent conflicts exactly like a foreign agent does.
+- **Checkout before any work; never hand-roll the lock check.** Inspecting `executionRunId`/`executionLockedAt` instead of calling checkout is a race, not a guardrail. See Step 5.
 - **Never look for unassigned work.** No assignments = exit.
 - **Self-assign only for explicit @-mention handoff.** Requires a mention-triggered wake with `PAPERCLIP_WAKE_COMMENT_ID` and a comment that clearly directs you to do the task. Use checkout (never direct assignee patch).
 - **Honor "send it back to me" requests from board users.** If a board/user asks for review handoff (e.g. "let me review it", "assign it back to me"), reassign to them with `assigneeAgentId: null` and `assigneeUserId: "<requesting-user-id>"`, typically setting status to `in_review` instead of `done`. Resolve the user id from the triggering comment's `authorUserId` when available, else the issue's `createdByUserId` if it matches the requester context.

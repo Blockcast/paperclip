@@ -1508,7 +1508,7 @@ registry.registerPath({
   method: "get",
   path: "/api/agents/me/inbox-lite",
   tags: ["agents"],
-  summary: "Get current agent inbox (lite)",
+  summary: "Get current agent inbox (lite) — todo, in_progress, blocked (in_review excluded)",
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 

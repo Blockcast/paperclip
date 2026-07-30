@@ -9236,12 +9236,15 @@ export function issueService(db: Db) {
         }
       }
 
-      // in_review is intentionally not claimable via checkout (it is excluded from every
-      // caller's expectedStatuses, matching shouldAutoCheckoutIssueForWake). When the caller
-      // already owns the issue and there is no active checkout/execution owner, the generic
-      // "Issue checkout conflict" 409 is misleading: there is no owner to conflict with. Surface
-      // a typed 422 pointing at the review-mutation path instead — the assignee can already
-      // PATCH/comment/close their own in_review issue without checkout (BLO-8454).
+      // Server-side auto-checkout never claims in_review (see shouldAutoCheckoutIssueForWake).
+      // Agent-facing callers DO pass in_review in expectedStatuses (skills/paperclip/SKILL.md
+      // Step 5), so an in_review issue is reachable here and stays claimable while unlocked.
+      // Narrow case below: the caller already owns the issue and there is no checkout/execution
+      // owner, so the generic "Issue checkout conflict" 409 would be misleading — there is no
+      // owner to conflict with. Surface a typed 422 pointing at the review-mutation path instead;
+      // the assignee can already PATCH/comment/close their own in_review issue without checkout
+      // (BLO-8454). When a *live* foreign executionRunId does hold the lock, we intentionally fall
+      // through to the 409 below — that is the cross-run duplicate-work guard (BLO-18858).
       if (
         current.status === "in_review" &&
         current.assigneeAgentId === agentId &&

@@ -31,7 +31,8 @@ Convert a noisy inbox into a small set of clear next actions. Each pass through 
 
 ## Inputs
 
-- `GET /api/agents/me/inbox-lite` for the compact assignment list.
+- `GET /api/agents/me/inbox-lite` for the compact assignment list. It returns **only** `todo`, `in_progress`, and `blocked` — `in_review` is excluded by design, so an empty array means "nothing to triage", not a failed call. Do not substitute a raw issue-list sweep: that path is checkout-lock-blind, and picking up swept work without checkout is how two concurrent runs duplicate the same task.
+- Before working any issue you selected yourself, `POST /api/issues/{issueId}/checkout`. The execution lock is run-scoped, so a `409` means another live run already owns it — including another run of your own agent. Never substitute reading `executionRunId`/`executionLockedAt` for the checkout call; that read is a race, not a guard.
 - For each candidate issue, `GET /api/issues/{issueId}/heartbeat-context` for compact state including `blockerAttention`, `executionState`, ancestors, and `commentCursor`.
 - Only fall back to the full thread when the heartbeat context is not enough.
 

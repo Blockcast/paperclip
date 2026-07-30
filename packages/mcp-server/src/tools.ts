@@ -312,7 +312,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipInboxLite",
-      "Get your compact assignment list for prioritizing this heartbeat (in_progress, in_review, todo). Prefer this over paperclipListIssues(assigneeAgentId=me) for the normal heartbeat inbox check — it's the cheaper, purpose-built call.",
+      "Get your compact assignment list for prioritizing this heartbeat. Returns ONLY issues assigned to you in todo, in_progress, or blocked. `in_review` is deliberately excluded: review/approval waits resume via comment, interaction, and monitor wakes rather than being re-picked every heartbeat. So an empty array means \"nothing actionable right now\" — NOT that the call failed. Exit the heartbeat; do not fall back to a raw paperclipListIssues sweep, which is checkout-lock-blind and can duplicate a concurrent run's work. Each entry carries `activeRun`, `dependencyReady`, and `unresolvedBlockerCount` so you can skip work another run already owns. Prefer this over paperclipListIssues(assigneeAgentId=me) for the normal heartbeat inbox check — it's the cheaper, purpose-built call.",
       z.object({}),
       async () => client.requestJson("GET", "/agents/me/inbox-lite"),
     ),
