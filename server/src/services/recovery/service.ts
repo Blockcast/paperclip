@@ -4043,11 +4043,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     });
   }
 
+  type ReviewWaitingParkOutcome = "parked" | "already_parked" | "failed";
+
   async function parkNoDependencyReviewWaitingIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: "in_progress";
     latestRun: LatestIssueRun;
-  }) {
+  }): Promise<ReviewWaitingParkOutcome> {
     // BLO-16146: a continuation that deliberately parked for review/approval, with no
     // dependency to convert into a `blocked` wait (resolveContinuationWaitingOnReview
     // returned null) and no active monitor path (the monitor-path park earlier in the
@@ -4068,7 +4070,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .from(issues)
         .where(eq(issues.id, input.issue.id))
         .limit(1);
-      if (!fresh || fresh.status !== "in_progress") return null;
+      if (!fresh) return "failed";
+      if (fresh.status === "in_review") return "already_parked";
+      if (fresh.status !== "in_progress") return "failed";
 
       // The in_review transition runs an evidence gate (issues.ts) that throws
       // `unprocessable` when the issue has no reviewable evidence yet (analysis-only
@@ -4084,9 +4088,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           { err, issueId: fresh.id, identifier: fresh.identifier },
           "parkNoDependencyReviewWaitingIssue: in_review park rejected; escalating instead",
         );
-        return null;
+        return "failed";
       }
-      if (!updated) return null;
+      if (!updated) return "failed";
 
       const activeRecoveryAction = await recoveryActionsSvc.resolveActiveForIssue({
         companyId: fresh.companyId,
@@ -4130,7 +4134,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         },
       });
 
-      return updated;
+      return "parked";
     });
   }
 
@@ -5515,24 +5519,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           // issue_continuation_needed) so a `failed`/`timed_out` run that merely carries
           // this error code is NOT treated as a deliberate wait.
           if (isWaitingOnReviewContinuationRun(latestRun)) {
-            const parked = await parkNoDependencyReviewWaitingIssue({
+            const parkOutcome = await parkNoDependencyReviewWaitingIssue({
               issue,
               previousStatus: "in_progress",
               latestRun,
             });
-            if (parked) {
+            if (parkOutcome === "parked") {
               result.reviewWaitingParked += 1;
               result.issueIds.push(issue.id);
-            } else {
-              // BLO-18643: `parked` is null both on a genuine failure and -- the common
-              // case on a re-run -- because the issue was already parked `in_review` by
-              // an earlier pass (parkNoDependencyReviewWaitingIssue's own guard requires
-              // `status === "in_progress"`). Either way, this cause is never a stranded
-              // escalation: falling through here previously let the second sweep pass
-              // clobber a just-parked issue back to `blocked` 21s later.
-              result.skipped += 1;
+              continue;
             }
-            continue;
+            if (parkOutcome === "already_parked") {
+              // BLO-18643: the common case on a re-run -- the issue was already parked
+              // `in_review` by an earlier pass (parkNoDependencyReviewWaitingIssue's own
+              // guard requires `status === "in_progress"`). Never a stranded escalation:
+              // falling through here previously let the second sweep pass clobber a
+              // just-parked issue back to `blocked` 21s later.
+              result.skipped += 1;
+              continue;
+            }
+            // `failed` is a genuine park failure (evidence-gate rejection
+            // because there's nothing reviewable yet, or a transient update
+            // failure). Fall through to the normal blocked recovery path.
           }
         }
 
