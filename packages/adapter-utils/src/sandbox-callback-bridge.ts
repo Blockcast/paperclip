@@ -515,9 +515,14 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
     writeTextFile: async (remotePath, body) => {
       const remoteDir = path.posix.dirname(remotePath);
       const tempPath = `${remotePath}.paperclip-upload.b64`;
+      const decodedTempPath = `${remotePath}.paperclip-upload.tmp`;
       await runChecked(
         `prepare upload ${remotePath}`,
-        `mkdir -p ${shellQuote(remoteDir)} && rm -f ${shellQuote(tempPath)} && : > ${shellQuote(tempPath)}`,
+        [
+          `mkdir -p ${shellQuote(remoteDir)}`,
+          `rm -f ${shellQuote(tempPath)} ${shellQuote(decodedTempPath)}`,
+          `: > ${shellQuote(tempPath)}`,
+        ].join(" && "),
       );
       const base64Body = toBuffer(Buffer.from(body, "utf8")).toString("base64");
       for (const chunk of base64Chunks(base64Body)) {
@@ -528,7 +533,11 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       }
       await runChecked(
         `finalize upload ${remotePath}`,
-        `base64 -d < ${shellQuote(tempPath)} > ${shellQuote(remotePath)} && rm -f ${shellQuote(tempPath)}`,
+        [
+          `base64 -d < ${shellQuote(tempPath)} > ${shellQuote(decodedTempPath)}`,
+          `mv -f ${shellQuote(decodedTempPath)} ${shellQuote(remotePath)}`,
+          `rm -f ${shellQuote(tempPath)}`,
+        ].join(" && "),
       );
     },
     writeResponseFile: async (responsePath, body, options = {}) => {
