@@ -5,6 +5,12 @@ import {
   selectAgedPrReviewRunForFairDispatch,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
+import {
+  __test_buildPrReviewerTaskKey,
+  __test_buildPrReviewerWakeIdempotencyKey,
+  __test_resolveEventContext,
+  __test_shouldFirePrReviewerWake,
+} from "../routes/github-webhook.js";
 
 // BLO-17518: integration/replay test for the full BLO-17456 incident chain —
 // GitHub webhook events -> Paperclip heartbeat wake dispatch -> Ally posting a
@@ -37,6 +43,11 @@ import {
 // coverage for the real script; if the source diverges, update this fixture
 // to match.
 const ALLY_LOGIN = "allyblockcast";
+const REPO = "Blockcast/pim-multicast-gateway";
+const PR_NUMBER = 1656;
+// Real head SHAs from the BLO-17456 incident this test replays.
+const OLD_HEAD = "a24708eac27007d4de3280e37b2a887467025146";
+const NEW_HEAD = "0cbd6523c2d308e581295b4bf217d8c0b77d5679";
 const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/;
 const REVIEWED_HEAD_PATTERN =
   /^\s*(?:[_*]+)?\s*Reviewed head:\s*`?([0-9a-f]{40})`?\s*(?:[_*]+)?\s*$/gm;
@@ -64,7 +75,7 @@ type FixtureReview = {
 };
 
 function reviewAttestsToHead(review: FixtureReview | null, headSha: string) {
-  return review?.commit_id === headSha && bodyAttestsToHead(review?.body, headSha);
+  return bodyAttestsToHead(review?.body, headSha);
 }
 
 function latestAllyReview(reviews: FixtureReview[]) {
@@ -91,10 +102,16 @@ function reviewSignalForHead(reviews: FixtureReview[], headSha: string) {
   return { state: "success" as const, description: `Ally formally approved exact head ${headSha.slice(0, 7)}.` };
 }
 
-function allyReview(opts: { id: number; headSha: string; submittedAt: string; state?: FixtureReview["state"] }): FixtureReview {
+function allyReview(opts: {
+  id: number;
+  headSha: string;
+  submittedAt: string;
+  commitId?: string;
+  state?: FixtureReview["state"];
+}): FixtureReview {
   return {
     id: opts.id,
-    commit_id: opts.headSha,
+    commit_id: opts.commitId ?? opts.headSha,
     body: `Reviewed head: \`${opts.headSha}\`\n\nLGTM, no findings.`,
     state: opts.state ?? "APPROVED",
     submitted_at: opts.submittedAt,
@@ -102,13 +119,48 @@ function allyReview(opts: { id: number; headSha: string; submittedAt: string; st
   };
 }
 
-describe("BLO-17518: Ally exact-head re-review replay (old head -> fix push -> re-request -> new head -> gate success)", () => {
-  const REPO = "Blockcast/pim-multicast-gateway";
-  const PR_NUMBER = 1656;
-  // Real head SHAs from the BLO-17456 incident this test replays.
-  const OLD_HEAD = "a24708eac27007d4de3280e37b2a887467025146";
-  const NEW_HEAD = "0cbd6523c2d308e581295b4bf217d8c0b77d5679";
+function freshHeadWebhookContext() {
+  const context = __test_resolveEventContext("pull_request", {
+    action: "synchronize",
+    pull_request: {
+      number: PR_NUMBER,
+      title: "fix(review-gate): retry exact-head Ally review (BLO-17456)",
+      body: "Closes BLO-17456",
+      html_url: `https://github.com/${REPO}/pull/${PR_NUMBER}`,
+      head: { ref: "fix/BLO-17456-exact-head-review", sha: NEW_HEAD },
+      user: { login: "contributor" },
+    },
+    repository: { full_name: REPO },
+  });
+  if (!__test_shouldFirePrReviewerWake(context)) {
+    throw new Error("expected fresh-head pull_request.synchronize to drive reviewer wake");
+  }
+  const taskKey = __test_buildPrReviewerTaskKey(context);
+  return {
+    routeContext: context,
+    taskKey,
+    contextSnapshot: {
+      taskKey,
+      wakeReason: context.wakeReason,
+      wakeSource: "automation",
+      wakeTriggerDetail: "system",
+      githubEvent: "pull_request",
+      githubDeliveryId: "delivery-fresh-head",
+      githubPrNumber: context.prNumber,
+      githubRepoFullName: context.repoFullName,
+      githubPrTitle: context.prTitle,
+      githubPrUrl: context.prUrl,
+      githubEventUrl: context.eventUrl,
+      githubHeadSha: context.headSha,
+      githubPrAuthorLogin: context.prAuthorLogin,
+      githubPaperclipIdentifiers: context.identifiers,
+      reviewKind: "pr_review" as const,
+      prRole: "reviewer" as const,
+    },
+  };
+}
 
+describe("BLO-17518: Ally exact-head re-review replay (old head -> fix push -> re-request -> new head -> gate success)", () => {
   const baseContext = {
     reviewKind: "pr_review" as const,
     prRole: "reviewer" as const,
@@ -133,8 +185,30 @@ describe("BLO-17518: Ally exact-head re-review replay (old head -> fix push -> r
     expect(reviewSignalForHead([oldReview], NEW_HEAD)).toMatchObject({ state: "pending" });
   });
 
+  it("step 3b: GitHub webhook normalization preserves the fresh head and PR-scoped reviewer queue keys", () => {
+    const { routeContext, taskKey, contextSnapshot } = freshHeadWebhookContext();
+    expect(routeContext).toMatchObject({
+      identifiers: ["BLO-17456"],
+      wakeReason: "github_pr_synchronized",
+      prNumber: PR_NUMBER,
+      repoFullName: REPO,
+      headSha: NEW_HEAD,
+    });
+    expect(taskKey).toBe(`pr_review:${REPO}:${PR_NUMBER}`);
+    expect(__test_buildPrReviewerWakeIdempotencyKey(routeContext, "delivery-fresh-head")).toBe(
+      `pr_review:${REPO}:${PR_NUMBER}:github_pr_synchronized`,
+    );
+    expect(contextSnapshot).toMatchObject({
+      taskKey: `pr_review:${REPO}:${PR_NUMBER}`,
+      wakeReason: "github_pr_synchronized",
+      githubHeadSha: NEW_HEAD,
+      reviewKind: "pr_review",
+      prRole: "reviewer",
+    });
+  });
+
   it("step 4: a run against the fresh new-head review-request that leaves no durable evidence is retry-eligible, not stranded (BLO-17456 AC2 / PR #767)", () => {
-    const freshHeadContext = { ...baseContext, githubHeadSha: NEW_HEAD };
+    const { contextSnapshot: freshHeadContext } = freshHeadWebhookContext();
     const missingEvidence = evaluatePrReviewCompletionEvidence(freshHeadContext, {
       summary: `Fetching PR metadata and diff for head ${NEW_HEAD.slice(0, 7)}; investigating findings.`,
     });
@@ -155,7 +229,7 @@ describe("BLO-17518: Ally exact-head re-review replay (old head -> fix push -> r
       shouldScheduleAutomaticRunRetry({
         errorCode: "pr_review_output_missing",
         resultJson: {},
-        contextSnapshot: { taskKey: `pr_review:${REPO}:${PR_NUMBER}` },
+        contextSnapshot: { taskKey: freshHeadContext.taskKey },
       }),
     ).toBe(true);
   });
@@ -207,15 +281,24 @@ describe("BLO-17518: Ally exact-head re-review replay (old head -> fix push -> r
 
     const oldReview = allyReview({ id: 1, headSha: OLD_HEAD, submittedAt: "2026-07-21T08:14:00.000Z" });
     const newReview = allyReview({ id: 2, headSha: NEW_HEAD, submittedAt: "2026-07-21T09:06:25.000Z" });
+    const rewrittenCommitIdReview = allyReview({
+      id: 3,
+      headSha: NEW_HEAD,
+      commitId: OLD_HEAD,
+      submittedAt: "2026-07-21T09:07:00.000Z",
+    });
 
     // Full review history (old + new) evaluated against the current head:
     // the latest, exact-head review resolves the gate success.
     expect(reviewSignalForHead([oldReview, newReview], NEW_HEAD)).toMatchObject({ state: "success" });
+    // GitHub may rewrite REST `review.commit_id` after an Update branch action;
+    // the immutable explicit body attestation is what the gate should trust.
+    expect(reviewSignalForHead([rewrittenCommitIdReview], NEW_HEAD)).toMatchObject({ state: "success" });
 
     // The gate is exact-head, not "any approval ever": re-checking the OLD
     // head against the same history must not also read as success (there is
     // no live PR at the old head anymore, but the invariant — approval is
     // scoped to one head — must hold for whichever head is asked about).
-    expect(reviewSignalForHead([oldReview], NEW_HEAD)).toMatchObject({ state: "pending" });
+    expect(reviewSignalForHead([oldReview, newReview], OLD_HEAD)).toMatchObject({ state: "pending" });
   });
 });
