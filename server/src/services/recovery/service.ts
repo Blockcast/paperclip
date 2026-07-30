@@ -28,7 +28,7 @@ import {
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
-import { forbidden, notFound } from "../../errors.js";
+import { forbidden, HttpError, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
@@ -41,6 +41,7 @@ import { issueTreeControlService } from "../issue-tree-control.js";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
+  derivePersistedMonitorState,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../issue-execution-policy.js";
@@ -3972,14 +3973,51 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   function hasActiveMonitorPath(issue: typeof issues.$inferSelect) {
-    return Boolean(issue.monitorNextCheckAt && issue.monitorNextCheckAt.getTime() > Date.now());
+    if (issue.monitorNextCheckAt && issue.monitorNextCheckAt.getTime() > Date.now()) return true;
+
+    // BLO-18643: a monitor that has already fired (`status: "triggered"`) but has not
+    // yet been rescheduled or cleared is still an active watch, not an absent one --
+    // the assignee's next continuation run (or the monitor's own scheduler) owns
+    // re-arming `monitorNextCheckAt`. Reading "fired, not yet rescheduled" as "no
+    // monitor" let the stranded-assigned sweep race the park gate and re-escalate a
+    // deliberate review wait to `blocked` (BLO-16146 recurrence).
+    const monitor = derivePersistedMonitorState({
+      issue,
+      state: parseIssueExecutionState(issue.executionState),
+      policy: null,
+    });
+    return monitor?.status === "triggered";
   }
+
+  // BLO-18760: a discriminated outcome, for the same reason
+  // ParkNoDependencyReviewWaitingOutcome has one. "skipped" is every pre-existing
+  // no-op (row gone, status already moved on, monitor cleared under the lock) and
+  // keeps its old behaviour exactly; "failed" is new and means the park attempt
+  // itself was rejected, which must fall through to escalation rather than be
+  // silently counted as a skip.
+  // BLO-18829: the evidence gate is the ONE failure the park paths are allowed to
+  // absorb. `issues.ts` rejects an `in_review` transition with
+  // `unprocessable("missing-evidence", { code: "missing-evidence" })` when the issue
+  // has nothing reviewable yet, and that is a business state -- "there is no review
+  // to wait for" -- whose correct handling is to fall through to `blocked`
+  // escalation. Everything else (a programming error, a DB failure, an unrelated
+  // service fault) is NOT that, and swallowing it would report a fault as a business
+  // decision and route the issue to `blocked` on a lie. Those propagate to the
+  // per-issue boundary in reconcileStrandedAssignedIssues, which records the fault
+  // and moves to the next issue without touching this one's status.
+  function isEvidenceGateRejection(err: unknown) {
+    return err instanceof HttpError &&
+      err.status === 422 &&
+      (err.details as { code?: string } | undefined)?.code === "missing-evidence";
+  }
+
+  type ParkReviewWaitingContinuationOutcome = "parked" | "skipped" | "failed";
 
   async function parkReviewWaitingContinuationIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: "in_progress";
     latestRun: LatestIssueRun;
-  }) {
+  }): Promise<ParkReviewWaitingContinuationOutcome> {
     return await db.transaction(async (tx) => {
       await tx.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${input.issue.companyId} || ':' || ${input.issue.id}, 0))`,
@@ -3990,10 +4028,37 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .from(issues)
         .where(eq(issues.id, input.issue.id))
         .limit(1);
-      if (!fresh || fresh.status !== "in_progress" || !hasActiveMonitorPath(fresh)) return null;
+      if (!fresh || fresh.status !== "in_progress" || !hasActiveMonitorPath(fresh)) return "skipped";
 
-      const updated = await issuesSvc.update(fresh.id, { status: "in_review" }, tx);
-      if (!updated) return null;
+      // The in_review transition runs an evidence gate (issues.ts) that throws
+      // `unprocessable("missing-evidence")` when the issue has no reviewable evidence
+      // yet (a `pr`-labelled issue with no PR link, analysis-only work with no branch
+      // or commits). Absorb exactly that and fall through to escalation, for the same
+      // reason parkNoDependencyReviewWaitingIssue does. BLO-18760: this path got
+      // materially wider when hasActiveMonitorPath started counting a
+      // fired-but-unrescheduled (`triggered`) monitor as active, so issues that
+      // previously reached the guarded no-dependency park now reach this one first.
+      //
+      // BLO-18829: anything that is NOT the evidence gate is rethrown. The previous
+      // blanket catch claimed to keep the sweep alive, but it could not: a failed
+      // statement leaves this transaction aborted, so the COMMIT at the end of
+      // db.transaction throws anyway and the sweep dies regardless -- while a genuine
+      // bug got silently relabelled as "nothing to review" and the issue was escalated
+      // to `blocked` for the wrong reason. Sweep survival is now the per-issue
+      // boundary's job in reconcileStrandedAssignedIssues, which is the only place
+      // that can actually deliver it.
+      let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
+      try {
+        updated = await issuesSvc.update(fresh.id, { status: "in_review" }, tx);
+      } catch (err) {
+        if (!isEvidenceGateRejection(err)) throw err;
+        logger.warn(
+          { err, issueId: fresh.id, identifier: fresh.identifier },
+          "parkReviewWaitingContinuationIssue: in_review park rejected by evidence gate; escalating instead",
+        );
+        return "failed";
+      }
+      if (!updated) return "failed";
 
       const activeRecoveryAction = await recoveryActionsSvc.resolveActiveForIssue({
         companyId: fresh.companyId,
@@ -4025,15 +4090,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         },
       });
 
-      return updated;
+      return "parked";
     });
   }
+
+  // BLO-18643 follow-up: a discriminated outcome so the caller can tell "somebody
+  // already parked this in_review" (a genuine no-op) apart from "the park attempt
+  // itself failed" (an evidence-gate rejection or a transient update failure --
+  // still a genuine stranded-issue case that must fall through to `blocked`
+  // escalation, same as before BLO-18643).
+  type ParkNoDependencyReviewWaitingOutcome = "parked" | "already_parked" | "failed";
 
   async function parkNoDependencyReviewWaitingIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: "in_progress";
     latestRun: LatestIssueRun;
-  }) {
+  }): Promise<ParkNoDependencyReviewWaitingOutcome> {
     // BLO-16146: a continuation that deliberately parked for review/approval, with no
     // dependency to convert into a `blocked` wait (resolveContinuationWaitingOnReview
     // returned null) and no active monitor path (the monitor-path park earlier in the
@@ -4054,25 +4126,31 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .from(issues)
         .where(eq(issues.id, input.issue.id))
         .limit(1);
-      if (!fresh || fresh.status !== "in_progress") return null;
+      if (!fresh) return "failed";
+      // Already moved off `in_progress` -- almost always an earlier pass's successful
+      // park to `in_review`, but any other status is equally "someone else already
+      // decided this issue's fate", never a signal to escalate it as stranded.
+      if (fresh.status !== "in_progress") return "already_parked";
 
       // The in_review transition runs an evidence gate (issues.ts) that throws
-      // `unprocessable` when the issue has no reviewable evidence yet (analysis-only
-      // work: no PR, branch, or commits). Catch it so a single un-reviewable issue
-      // cannot abort the whole recovery sweep — bail and let the caller fall through to
-      // `blocked` escalation, the correct disposition when there is nothing to review.
-      // Any other transient failure degrades the same safe way.
+      // `unprocessable("missing-evidence")` when the issue has no reviewable evidence
+      // yet (analysis-only work: no PR, branch, or commits). Absorb exactly that and
+      // let the caller fall through to `blocked` escalation, the correct disposition
+      // when there is nothing to review. BLO-18829: any other failure is rethrown
+      // rather than degraded, so a real fault is not reported as a business state --
+      // see isEvidenceGateRejection.
       let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
       try {
         updated = await issuesSvc.update(fresh.id, { status: "in_review" }, tx);
       } catch (err) {
+        if (!isEvidenceGateRejection(err)) throw err;
         logger.warn(
           { err, issueId: fresh.id, identifier: fresh.identifier },
-          "parkNoDependencyReviewWaitingIssue: in_review park rejected; escalating instead",
+          "parkNoDependencyReviewWaitingIssue: in_review park rejected by evidence gate; escalating instead",
         );
-        return null;
+        return "failed";
       }
-      if (!updated) return null;
+      if (!updated) return "failed";
 
       const activeRecoveryAction = await recoveryActionsSvc.resolveActiveForIssue({
         companyId: fresh.companyId,
@@ -4116,7 +4194,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         },
       });
 
-      return updated;
+      return "parked";
     });
   }
 
@@ -4396,6 +4474,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .where(eq(issues.id, input.issue.id))
         .limit(1);
       if (!fresh) return null;
+      // BLO-18643: mirror the park paths' own re-check (parkReviewWaitingContinuationIssue /
+      // parkNoDependencyReviewWaitingIssue both bail if `fresh.status` has moved past the
+      // status the candidate was read at). Without this, a park that committed first --
+      // under the same per-issue advisory lock, whether from a concurrent transaction or an
+      // earlier sweep pass -- gets silently clobbered back to `blocked` here. Whichever side
+      // reaches its expected-status re-check second is now a no-op.
+      //
+      // `blocked` is explicitly allowed through in addition to `previousStatus`: it's this
+      // function's own steady-state output, and repeated/concurrent escalation attempts on an
+      // already-`blocked` issue are expected to keep updating the same active recovery action
+      // (attempt-count bookkeeping, wake suppression) rather than no-op. Only a status this
+      // function did NOT produce -- e.g. `in_review` from a park that raced it -- is a signal
+      // that some other terminal action already claimed this issue for this cause.
+      if (fresh.status !== input.previousStatus && fresh.status !== "blocked") return null;
 
       const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
       const { action, hasNewActivitySinceLastAttempt } = await ensureSourceScopedStrandedRecoveryAction({
@@ -4429,11 +4521,31 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         hasNewActivitySinceLastAttempt,
       });
 
-      const updated = await issuesSvc.update(input.issue.id, {
-        status: "blocked",
-        blockedByIssueIds: blockerIds,
-        assigneeAgentId: action.ownerAgentId ?? fresh.assigneeAgentId,
-      });
+      const updated = await issuesSvc.update(
+        input.issue.id,
+        {
+          status: "blocked",
+          blockedByIssueIds: blockerIds,
+          assigneeAgentId: action.ownerAgentId ?? fresh.assigneeAgentId,
+        },
+        db,
+        // BLO-18643 follow-up: the advisory lock above only serializes this function
+        // against itself (concurrent sweeps / re-entrant calls) -- it does nothing
+        // against a writer that never takes it, e.g. a human reviewer's PATCH landing
+        // between the `fresh.status` re-check above and this write. Fold the
+        // expected status into the UPDATE itself so that race can't silently clobber
+        // a legitimate concurrent transition.
+        //
+        // BLO-18829: this is `[fresh.status]` -- the single status observed under the
+        // lock -- and deliberately NOT `[input.previousStatus, "blocked"]`. Accepting
+        // both let an `in_progress` reread still match an issue a human moved to
+        // `blocked` afterwards, so recovery overwrote that human's blocker set and
+        // assignee with its own: exactly the stale write the CAS exists to reject.
+        // Pinning to `fresh.status` keeps the steady-state retry working (a reread
+        // that already found `blocked` expects `blocked`) while rejecting a
+        // transition into `blocked` that lands after the reread.
+        { expectedStatus: [fresh.status] },
+      );
       if (!updated) return null;
       if (isProviderQuotaWait) return updated;
 
@@ -5391,18 +5503,26 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
       if (isWaitingOnReviewContinuationRun(latestRun) && hasActiveMonitorPath(issue)) {
-        const updated = await parkReviewWaitingContinuationIssue({
+        const parkOutcome = await parkReviewWaitingContinuationIssue({
           issue,
           previousStatus: "in_progress",
           latestRun,
         });
-        if (updated) {
+        if (parkOutcome === "parked") {
           result.reviewWaitingParked += 1;
           result.issueIds.push(issue.id);
-        } else {
-          result.skipped += 1;
+          continue;
         }
-        continue;
+        if (parkOutcome === "skipped") {
+          result.skipped += 1;
+          continue;
+        }
+        // BLO-18760: `parkOutcome === "failed"` -- the in_review park was rejected
+        // (evidence gate: nothing reviewable yet) or the update did not land. Fall
+        // through (no `continue`) to the normal classification below, which reaches
+        // parkNoDependencyReviewWaitingIssue and then `blocked` escalation, so the
+        // issue gets a live recovery path instead of sitting `in_progress` counted as
+        // a skip. Before this the same rejection threw out of the whole sweep.
       }
       if (isSuccessfulInProgressContinuationRun(latestRun)) {
         const successfulRun = latestRun;
@@ -5581,16 +5701,31 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           // issue_continuation_needed) so a `failed`/`timed_out` run that merely carries
           // this error code is NOT treated as a deliberate wait.
           if (isWaitingOnReviewContinuationRun(latestRun)) {
-            const parked = await parkNoDependencyReviewWaitingIssue({
+            const parkOutcome = await parkNoDependencyReviewWaitingIssue({
               issue,
               previousStatus: "in_progress",
               latestRun,
             });
-            if (parked) {
+            if (parkOutcome === "parked") {
               result.reviewWaitingParked += 1;
               result.issueIds.push(issue.id);
               continue;
             }
+            if (parkOutcome === "already_parked") {
+              // BLO-18643: the common case on a re-run -- the issue was already parked
+              // `in_review` by an earlier pass (parkNoDependencyReviewWaitingIssue's own
+              // guard requires `status === "in_progress"`). Never a stranded escalation:
+              // falling through here previously let the second sweep pass clobber a
+              // just-parked issue back to `blocked` 21s later.
+              result.skipped += 1;
+              continue;
+            }
+            // BLO-18614/BLO-18643: `parkOutcome === "failed"` is a genuine park failure
+            // (evidence-gate rejection because there's nothing reviewable yet, or a
+            // transient update failure) -- not a race with an earlier successful park.
+            // Fall through (no `continue`) to the normal stranded-issue classification
+            // and escalation below, same as before BLO-18643, so it isn't silently stuck
+            // `in_progress` with no live recovery path.
           }
         }
 

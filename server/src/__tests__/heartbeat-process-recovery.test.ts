@@ -36,6 +36,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueDocuments,
+  issueLabels,
   issuePlanDecompositions,
   issueRecoveryActions,
   issueRelations,
@@ -44,6 +45,7 @@ import {
   issueTreeHolds,
   issueWorkProducts,
   issues,
+  labels,
   projects,
   projectWorkspaces,
   workspaceOperations,
@@ -263,6 +265,7 @@ import {
   writeHotRestartIntent,
 } from "../services/hot-restart.ts";
 import { secretService } from "../services/secrets.ts";
+import { issueService } from "../services/issues.js";
 import {
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
@@ -4468,6 +4471,283 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       ),
     ).toBe(true);
   });
+
+  it(
+    "BLO-18643: does not re-escalate a review-waiting park to blocked when its monitor already " +
+      "fired and was never rescheduled",
+    async () => {
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "issue_continuation_waiting_on_review",
+        runError: "Continuation parked: issue is waiting on review/approval",
+      });
+
+      // Replay BLO-18614's exact monitor shape: the monitor already fired
+      // (`status: "triggered"`) and was never rescheduled (`monitorNextCheckAt: null`).
+      await db
+        .update(issues)
+        .set({
+          monitorNextCheckAt: null,
+          monitorLastTriggeredAt: new Date("2026-07-29T03:52:37.000Z"),
+          monitorAttemptCount: 1,
+          monitorScheduledBy: "assignee",
+          monitorNotes: "PR #806 (Blockcast/paperclip): watching for CI green + Ally review decision before merge.",
+        })
+        .where(eq(issues.id, issueId));
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const firstResult = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(firstResult.reviewWaitingParked).toBe(1);
+      expect(firstResult.escalated).toBe(0);
+      expect(firstResult.issueIds).toEqual([issueId]);
+
+      const parked = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(parked?.status).toBe("in_review");
+      expect(parked?.assigneeAgentId).toBe(agentId);
+
+      // Simulate the next sweep tick (BLO-18614 recurred 21s later) finding the same
+      // now-`in_review` issue with the same cancelled/waiting-on-review latest run: it
+      // must be a no-op, not a second, clobbering escalation to `blocked`.
+      const secondResult = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(secondResult.escalated).toBe(0);
+      expect(secondResult.reviewWaitingParked).toBe(0);
+      expect(secondResult.issueIds).not.toContain(issueId);
+
+      const stillParked = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(stillParked?.status).toBe("in_review");
+      await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+
+      // No recovery action or recovery issue was ever created for this deliberate wait.
+      const recoveryActions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+      expect(recoveryActions).toHaveLength(0);
+
+      const recoveryIssues = await db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+      expect(recoveryIssues).toHaveLength(0);
+
+      // The monitor is now recognized as an active watch, so the park goes through the
+      // monitor-path branch (which relies on the monitor's own visible notes rather than
+      // posting a redundant comment) -- not the no-monitor fallback. Either way, no
+      // escalation comment ever lands on the thread.
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      for (const comment of comments) {
+        expect(comment.body).not.toContain("Moving it to `blocked`");
+      }
+
+      const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+      expect(
+        activity.some(
+          (event) =>
+            event.action === "issue.updated" &&
+            (event.details as { source?: string } | null)?.source ===
+              "recovery.reconcile_review_waiting_continuation",
+        ),
+      ).toBe(true);
+      expect(
+        activity.some((event) => (event.details as { status?: string } | null)?.status === "blocked"),
+      ).toBe(false);
+    },
+  );
+
+  it(
+    "BLO-18614/BLO-18643: a genuine review-park failure (evidence gate rejects in_review) still " +
+      "escalates to blocked instead of being silently skipped",
+    async () => {
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "issue_continuation_waiting_on_review",
+        runError: "Continuation parked: issue is waiting on review/approval",
+      });
+
+      // Label the issue "pr" (DEFAULT_EVIDENCE_REGISTRY requires "pr-link" for that
+      // label) and leave it with no PR-link evidence, so the in_review transition's
+      // evidence gate returns verdict "block" (unlabeledFallback is false because the
+      // label matched a registry entry) and issuesSvc.update throws `unprocessable`
+      // inside parkNoDependencyReviewWaitingIssue. This is a genuine park failure, not
+      // a race with an earlier successful park -- distinct from the BLO-18643 case
+      // above where `fresh.status !== "in_progress"` because someone already parked it.
+      const labelId = randomUUID();
+      await db.insert(labels).values({ id: labelId, companyId, name: "pr", color: "#000000" });
+      await db.insert(issueLabels).values({ issueId, labelId, companyId });
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.reviewWaitingParked).toBe(0);
+      expect(result.escalated).toBe(1);
+      expect(result.issueIds).toEqual([issueId]);
+
+      const escalated = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(escalated?.status).toBe("blocked");
+
+      const recoveryActions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+      expect(recoveryActions).toHaveLength(1);
+    },
+  );
+
+  it(
+    "BLO-18760: a triggered-monitor park rejected by the evidence gate escalates that issue and " +
+      "lets the rest of the sweep finish",
+    async () => {
+      // The combination the two tests above miss. BLO-18643 taught hasActiveMonitorPath
+      // to treat a fired-but-unrescheduled monitor as active, which routes issues into
+      // parkReviewWaitingContinuationIssue -- and that park's in_review update was not
+      // guarded against evidence-gate rejection the way the no-dependency park is. So a
+      // `pr`-labelled issue with no PR link threw `unprocessable` straight out of
+      // db.transaction and out of the per-issue loop, aborting the entire sweep: this
+      // issue never escalated AND every issue behind it went unreconciled.
+      const failing = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "issue_continuation_waiting_on_review",
+        runError: "Continuation parked: issue is waiting on review/approval",
+      });
+
+      // Fired, never rescheduled -> hasActiveMonitorPath returns true.
+      await db
+        .update(issues)
+        .set({
+          monitorNextCheckAt: null,
+          monitorLastTriggeredAt: new Date("2026-07-29T03:52:37.000Z"),
+          monitorAttemptCount: 1,
+          monitorScheduledBy: "assignee",
+          monitorNotes: "PR #811: watching for CI green + review decision.",
+        })
+        .where(eq(issues.id, failing.issueId));
+
+      // ...and no reviewable evidence, so the in_review transition is rejected.
+      const labelId = randomUUID();
+      await db.insert(labels).values({
+        id: labelId,
+        companyId: failing.companyId,
+        name: "pr",
+        color: "#000000",
+      });
+      await db.insert(issueLabels).values({
+        issueId: failing.issueId,
+        labelId,
+        companyId: failing.companyId,
+      });
+
+      // A second, independent stranded issue (own company) that parks cleanly. It is the
+      // canary for "the sweep kept going": the sweep is global and its per-issue order is
+      // not fixed, but an uncaught throw kills the whole call either way, so asserting
+      // BOTH issues reached their correct terminal state is order-independent.
+      const healthy = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "issue_continuation_waiting_on_review",
+        runError: "Continuation parked: issue is waiting on review/approval",
+      });
+      await db
+        .update(issues)
+        .set({
+          monitorNextCheckAt: null,
+          monitorLastTriggeredAt: new Date("2026-07-29T03:52:37.000Z"),
+          monitorAttemptCount: 1,
+          monitorScheduledBy: "assignee",
+          monitorNotes: "PR #812: watching for CI green + review decision.",
+        })
+        .where(eq(issues.id, healthy.issueId));
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      // The un-reviewable issue degraded to `blocked` instead of being counted a skip.
+      expect(result.escalated).toBe(1);
+      const escalated = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, failing.issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(escalated?.status).toBe("blocked");
+      const failingActions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(
+          eq(issueRecoveryActions.companyId, failing.companyId),
+          eq(issueRecoveryActions.sourceIssueId, failing.issueId),
+        ));
+      expect(failingActions).toHaveLength(1);
+
+      // The canary was still reconciled in the same pass.
+      expect(result.reviewWaitingParked).toBe(1);
+      const parked = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, healthy.issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(parked?.status).toBe("in_review");
+      expect(result.issueIds).toEqual(expect.arrayContaining([failing.issueId, healthy.issueId]));
+    },
+  );
+
+  it(
+    "BLO-18829: the expectedStatus CAS rejects the write when the row has moved off the " +
+      "observed status, leaving a concurrent writer's blockers and assignee intact",
+    async () => {
+      // The primitive escalateStrandedAssignedIssue's `{ expectedStatus: [fresh.status] }`
+      // pin depends on. Recovery rereads the row under an advisory lock, sees
+      // `in_progress`, and then writes `blocked` -- but a writer that never takes that
+      // lock (a human reviewer's PATCH) can land in between. The CAS has to make that
+      // write a no-op rather than overwrite what the row now says.
+      //
+      // This covers the WHERE-clause semantics deterministically. The call-site
+      // interleaving test Ally asked for lands with the atomicity refactor in this same
+      // PR: escalateStrandedAssignedIssue currently has no seam to suspend between its
+      // reread and its write, and threading `tx` through the action/monitor/wake path is
+      // what creates one.
+      const { companyId, issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "failed",
+      });
+      const issuesSvc = issueService(db);
+
+      // A concurrent writer moves the issue to `blocked` after recovery's reread saw
+      // `in_progress`.
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+
+      // Recovery's write, pinned to the status it actually observed, must not land.
+      const clobbered = await issuesSvc.update(
+        issueId,
+        { status: "blocked", blockedByIssueIds: [] },
+        db,
+        { expectedStatus: ["in_progress"] },
+      );
+      expect(clobbered).toBeNull();
+
+      // Positive control: the steady-state retry, where the reread itself found
+      // `blocked`, still goes through -- the pin must not break attempt bookkeeping.
+      const steadyState = await issuesSvc.update(
+        issueId,
+        { status: "blocked", blockedByIssueIds: [] },
+        db,
+        { expectedStatus: ["blocked"] },
+      );
+      expect(steadyState?.status).toBe("blocked");
+      expect(steadyState?.companyId).toBe(companyId);
+    },
+  );
 
   // BLO-16182: process_lost is reclassified as transient_infra (3 attempts +
   // 60s backoff). These two guard the COMBINED attempt cap end-to-end through
