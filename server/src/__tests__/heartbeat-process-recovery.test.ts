@@ -266,6 +266,7 @@ import {
 } from "../services/hot-restart.ts";
 import { secretService } from "../services/secrets.ts";
 import {
+  recoveryService,
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
@@ -4492,6 +4493,103 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(recoveryActions).toHaveLength(1);
     },
   );
+
+  it(
+    "BLO-18643: a triggered-monitor review-park rejection degrades to blocked recovery",
+    async () => {
+      const { companyId, issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "issue_continuation_waiting_on_review",
+        runError: "Continuation parked: issue is waiting on review/approval",
+      });
+
+      // Label the issue "pr" but leave it without PR-link evidence so the
+      // monitor-path `in_review` transition is rejected by the evidence gate.
+      const labelId = randomUUID();
+      await db.insert(labels).values({ id: labelId, companyId, name: "pr", color: "#000000" });
+      await db.insert(issueLabels).values({ issueId, labelId, companyId });
+      await db
+        .update(issues)
+        .set({
+          monitorNextCheckAt: null,
+          monitorLastTriggeredAt: new Date("2026-07-29T03:52:37.000Z"),
+          monitorAttemptCount: 1,
+          monitorScheduledBy: "assignee",
+          monitorNotes: "PR #807 (Blockcast/paperclip): waiting on review/CI.",
+        })
+        .where(eq(issues.id, issueId));
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.reviewWaitingParked).toBe(0);
+      expect(result.escalated).toBe(1);
+      expect(result.issueIds).toEqual([issueId]);
+
+      const escalated = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(escalated?.status).toBe("blocked");
+
+      const recoveryActions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+      expect(recoveryActions).toHaveLength(1);
+    },
+  );
+
+  it("BLO-18643: a failed recovery claim leaves no action, wake, or escalation comment", async () => {
+    const { companyId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "adapter_failed",
+      runError: "adapter died",
+    });
+    const staleIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    const latestRun = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]);
+
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() } as never));
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    let recoveryResult: ReturnType<typeof recovery.escalateStrandedAssignedIssue> | null = null;
+    await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${companyId} || ':' || ${issueId}, 0))`,
+      );
+      recoveryResult = recovery.escalateStrandedAssignedIssue({
+        issue: staleIssue!,
+        previousStatus: "in_progress",
+        latestRun: latestRun!,
+        comment: "Recovery should not emit side effects when the source issue was not claimed.",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, issueId));
+    });
+
+    expect(recoveryResult).not.toBeNull();
+    await expect(recoveryResult!).resolves.toBeNull();
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    await expect(
+      db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId))),
+    ).resolves.toHaveLength(0);
+    await expect(
+      db
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.reason, "source_scoped_recovery_action"))),
+    ).resolves.toHaveLength(0);
+    await expect(
+      db
+        .select()
+        .from(issueComments)
+        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId))),
+    ).resolves.toHaveLength(0);
+  });
 
   // BLO-16182: process_lost is reclassified as transient_infra (3 attempts +
   // 60s backoff). These two guard the COMBINED attempt cap end-to-end through

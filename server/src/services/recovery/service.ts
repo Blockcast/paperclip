@@ -3989,11 +3989,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return monitor?.status === "triggered";
   }
 
+  type ReviewWaitingParkOutcome = "parked" | "already_parked" | "failed";
+
   async function parkReviewWaitingContinuationIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: "in_progress";
     latestRun: LatestIssueRun;
-  }) {
+  }): Promise<ReviewWaitingParkOutcome> {
     return await db.transaction(async (tx) => {
       await tx.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${input.issue.companyId} || ':' || ${input.issue.id}, 0))`,
@@ -4004,10 +4006,21 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .from(issues)
         .where(eq(issues.id, input.issue.id))
         .limit(1);
-      if (!fresh || fresh.status !== "in_progress" || !hasActiveMonitorPath(fresh)) return null;
+      if (!fresh) return "failed";
+      if (fresh.status !== "in_progress") return "already_parked";
+      if (!hasActiveMonitorPath(fresh)) return "failed";
 
-      const updated = await issuesSvc.update(fresh.id, { status: "in_review" }, tx);
-      if (!updated) return null;
+      let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
+      try {
+        updated = await issuesSvc.update(fresh.id, { status: "in_review" }, tx);
+      } catch (err) {
+        logger.warn(
+          { err, issueId: fresh.id, identifier: fresh.identifier },
+          "parkReviewWaitingContinuationIssue: in_review park rejected; escalating instead",
+        );
+        return "failed";
+      }
+      if (!updated) return "failed";
 
       const activeRecoveryAction = await recoveryActionsSvc.resolveActiveForIssue({
         companyId: fresh.companyId,
@@ -4039,7 +4052,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         },
       });
 
-      return updated;
+      return "parked";
     });
   }
 
@@ -4048,13 +4061,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   // itself failed" (an evidence-gate rejection or a transient update failure --
   // still a genuine stranded-issue case that must fall through to `blocked`
   // escalation, same as before BLO-18643).
-  type ParkNoDependencyReviewWaitingOutcome = "parked" | "already_parked" | "failed";
-
   async function parkNoDependencyReviewWaitingIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: "in_progress";
     latestRun: LatestIssueRun;
-  }): Promise<ParkNoDependencyReviewWaitingOutcome> {
+  }): Promise<ReviewWaitingParkOutcome> {
     // BLO-16146: a continuation that deliberately parked for review/approval, with no
     // dependency to convert into a `blocked` wait (resolveContinuationWaitingOnReview
     // returned null) and no active monitor path (the monitor-path park earlier in the
@@ -4342,13 +4353,44 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // that some other terminal action already claimed this issue for this cause.
       if (fresh.status !== input.previousStatus && fresh.status !== "blocked") return null;
 
+      const claimed = await issuesSvc.update(
+        input.issue.id,
+        { status: "blocked" },
+        tx,
+        {
+          expectedStatus: [input.previousStatus, "blocked"],
+        },
+      );
+      if (!claimed) return null;
+
       const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
+      const routing = await resolveStrandedRecoveryRouting({
+        issue: fresh,
+        latestRun: input.latestRun,
+        recoveryCause,
+        preferredOwnerAgentId: input.recoveryOwnerAgentId,
+      });
+      const {
+        blockerIssueIds: blockerIds,
+        needsHumanDecision,
+      } = await unresolvedBlockerHumanDecisionEscalationState(fresh.companyId, fresh.id);
+
+      const updated = await issuesSvc.update(
+        input.issue.id,
+        {
+          blockedByIssueIds: blockerIds,
+          assigneeAgentId: routing.ownerAgentId ?? fresh.assigneeAgentId,
+        },
+        tx,
+        { expectedStatus: ["blocked"] },
+      ) ?? claimed;
+
       const { action, hasNewActivitySinceLastAttempt } = await ensureSourceScopedStrandedRecoveryAction({
         issue: fresh,
         previousStatus: input.previousStatus,
         latestRun: input.latestRun,
         recoveryCause,
-        recoveryOwnerAgentId: input.recoveryOwnerAgentId,
+        recoveryOwnerAgentId: routing.ownerAgentId,
         successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
       });
       const isProviderQuotaWait = recoveryCause === "provider_quota" &&
@@ -4361,10 +4403,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           agentId: action.returnOwnerAgentId,
         });
       }
-      const {
-        blockerIssueIds: blockerIds,
-        needsHumanDecision,
-      } = await unresolvedBlockerHumanDecisionEscalationState(fresh.companyId, fresh.id);
 
       await enqueueSourceScopedStrandedRecoveryWake({
         action,
@@ -4373,24 +4411,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         recoveryCause,
         hasNewActivitySinceLastAttempt,
       });
-
-      const updated = await issuesSvc.update(
-        input.issue.id,
-        {
-          status: "blocked",
-          blockedByIssueIds: blockerIds,
-          assigneeAgentId: action.ownerAgentId ?? fresh.assigneeAgentId,
-        },
-        db,
-        // BLO-18643 follow-up: the advisory lock above only serializes this function
-        // against itself (concurrent sweeps / re-entrant calls) -- it does nothing
-        // against a writer that never takes it, e.g. a human reviewer's PATCH landing
-        // between the `fresh.status` re-check above and this write. Fold the same
-        // expected-status set into the UPDATE itself so that race can't silently
-        // clobber a legitimate concurrent transition back to `blocked`.
-        { expectedStatus: [input.previousStatus, "blocked"] },
-      );
-      if (!updated) return null;
       if (isProviderQuotaWait) return updated;
 
       const prefix = await getCompanyIssuePrefix(fresh.companyId);
@@ -5347,18 +5367,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
       if (isWaitingOnReviewContinuationRun(latestRun) && hasActiveMonitorPath(issue)) {
-        const updated = await parkReviewWaitingContinuationIssue({
+        const parkOutcome = await parkReviewWaitingContinuationIssue({
           issue,
           previousStatus: "in_progress",
           latestRun,
         });
-        if (updated) {
+        if (parkOutcome === "parked") {
           result.reviewWaitingParked += 1;
           result.issueIds.push(issue.id);
-        } else {
-          result.skipped += 1;
+          continue;
         }
-        continue;
+        if (parkOutcome === "already_parked") {
+          result.skipped += 1;
+          continue;
+        }
+        // `failed` means the monitor-path `in_review` park was rejected or
+        // otherwise could not claim the issue. Fall through to the normal
+        // stranded continuation handling so the issue gets the blocked
+        // recovery path instead of aborting the sweep.
       }
       if (isSuccessfulInProgressContinuationRun(latestRun)) {
         const successfulRun = latestRun;
