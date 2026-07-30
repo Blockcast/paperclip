@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -2668,6 +2668,7 @@ export function issueRoutes(
     wakeups: Map<string, { agentId: string; wakeup: IssueWakeupRequest }>,
     genericFailureMessage: string = "failed to wake agent on issue update",
   ) {
+    const dispatched: Array<Promise<unknown>> = [];
     for (const { agentId, wakeup } of wakeups.values()) {
       const isBlockerResolvedWake = wakeup.reason === "issue_blockers_resolved";
       const dependentIssueId =
@@ -2680,7 +2681,7 @@ export function issueRoutes(
           : null;
       const promise = heartbeat.wakeup(agentId, wakeup);
       if (isBlockerResolvedWake) {
-        promise
+        dispatched.push(promise
           .then((result) => {
             const outcome = result ? "sent" : "skipped";
             incrementBlockerResolvedWakeMetric(outcome === "sent" ? "fast_path_sent" : "fast_path_skipped");
@@ -2695,11 +2696,12 @@ export function issueRoutes(
               { err, issueId, dependentIssueId, resolvedBlockerIssueId, agentId, outcome: "failed" },
               "blocker-resolved dependent wake failed",
             );
-          });
+          }));
       } else {
-        promise.catch((err) => logger.warn({ err, issueId, agentId }, genericFailureMessage));
+        dispatched.push(promise.catch((err) => logger.warn({ err, issueId, agentId }, genericFailureMessage)));
       }
     }
+    return Promise.all(dispatched).then(() => undefined);
   }
   const enqueueRecoveryActionWakeup = opts.recoveryActionEnqueueWakeup ?? heartbeat.wakeup;
   const feedback = feedbackService(db);
@@ -2781,6 +2783,26 @@ export function issueRoutes(
       .catch((err) => {
         logger.warn({ err, issueId: issue.id }, "task watchdog evaluation hook failed");
       });
+  }
+
+  async function hasIssueCommentAddedActivity(input: { issueId: string; commentId: string }) {
+    if (typeof (db as { select?: unknown }).select !== "function") return false;
+    try {
+      const [existing] = await db
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.action, "issue.comment_added"),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, input.issueId),
+          sql`${activityLog.details}->>'commentId' = ${input.commentId}`,
+        ))
+        .limit(1);
+      return Boolean(existing);
+    } catch (err) {
+      logger.warn({ err, issueId: input.issueId, commentId: input.commentId }, "failed to check issue comment activity");
+      return false;
+    }
   }
 
   async function sourceTrustForActorWrite(
@@ -10217,13 +10239,32 @@ export function issueRoutes(
       presentation: req.body.presentation,
       metadata: req.body.metadata,
     })) return;
-    const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
-    if (closedExecutionWorkspace) {
-      respondClosedIssueExecutionWorkspace(res, closedExecutionWorkspace);
-      return;
-    }
 
     const actor = getActorInfo(req);
+    let comment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
+    let idempotentReplay = false;
+    if (req.body.idempotencyKey) {
+      const existingComment = await svc.getCommentByIdempotencyKey(id, req.body.idempotencyKey, {
+        agentId: actor.agentId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      });
+      if (existingComment) {
+        idempotentReplay = true;
+        if (existingComment.idempotencyProcessedAt) {
+          res.status(200).json({ ...existingComment, deduplicated: true });
+          return;
+        }
+        comment = { ...existingComment, deduplicated: true };
+      }
+    }
+    if (!idempotentReplay) {
+      const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
+      if (closedExecutionWorkspace) {
+        respondClosedIssueExecutionWorkspace(res, closedExecutionWorkspace);
+        return;
+      }
+    }
+
     const reopenRequested = req.body.reopen === true;
     const resumeRequested = req.body.resume === true;
     const interruptRequested = req.body.interrupt === true;
@@ -10287,7 +10328,7 @@ export function issueRoutes(
     }
     const explicitMoveToTodoRequested = effectiveReopenRequested || effectiveResumeRequested === true;
     const scheduledRetryForHumanComment =
-      shouldHumanCommentResumeInProgressScheduledRetry({
+      !idempotentReplay && shouldHumanCommentResumeInProgressScheduledRetry({
         hasComment: true,
         issueStatus: issue.status,
         assigneeAgentId: issue.assigneeAgentId,
@@ -10307,6 +10348,7 @@ export function issueRoutes(
       actorId: actor.actorId,
     });
     const effectiveMoveToTodoRequested =
+      !idempotentReplay &&
       !assigneeSelfCommentOnTerminal &&
       (explicitMoveToTodoRequested ||
         shouldImplicitlyMoveCommentedIssueToTodo({
@@ -10320,12 +10362,18 @@ export function issueRoutes(
         }) ||
         shouldResumeInProgressScheduledRetry);
     const hasUnresolvedFirstClassBlockers =
-      isBlocked && effectiveMoveToTodoRequested
+      !idempotentReplay && isBlocked && effectiveMoveToTodoRequested
         ? (await svc.getDependencyReadiness(issue.id)).unresolvedBlockerCount > 0
         : false;
     if (resumeRequested === true && isBlocked && hasUnresolvedFirstClassBlockers) {
       res.status(409).json({ error: "Issue follow-up blocked by unresolved blockers" });
       return;
+    }
+    if (req.body.idempotencyKey && !idempotentReplay) {
+      if (effectiveMoveToTodoRequested) {
+        res.status(400).json({ error: "Idempotent comments cannot change issue state" });
+        return;
+      }
     }
     let reopened = false;
     let reopenFromStatus: string | null = null;
@@ -10334,7 +10382,6 @@ export function issueRoutes(
     let issueBeforeCommentDecision = issue;
     let commentDecisionStageWakeup: ReturnType<typeof buildExecutionStageWakeup> | null = null;
     const commentReferenceSummaryBefore = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-    let comment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
     let commentReferenceDiff: ReturnType<typeof issueReferencesSvc.diffIssueReferenceSummary> | null = null;
     const persistUserReplyBeforeBlockedReopen =
       actor.actorType === "user" &&
@@ -10495,6 +10542,11 @@ export function issueRoutes(
         actorMatchesExecutionParticipant(actor, currentExecutionState.currentParticipant ?? null) &&
         isApprovalReviewComment(req.body.body);
 
+      if (req.body.idempotencyKey && shouldAutoApproveReviewComment) {
+        res.status(400).json({ error: "Idempotent comments cannot approve review stages" });
+        return;
+      }
+
       // Persist the comment and the auto-approval state transition atomically when both apply.
       // Without a single transaction, a later status-update error would leave an orphan comment.
       if (shouldAutoApproveReviewComment) {
@@ -10618,6 +10670,7 @@ export function issueRoutes(
           authorType: req.body.authorType ?? (actor.actorType === "agent" ? "agent" : "user"),
           presentation: req.body.presentation ?? null,
           metadata: req.body.metadata ?? null,
+          idempotencyKey: req.body.idempotencyKey ?? null,
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
         });
       }
@@ -10625,6 +10678,14 @@ export function issueRoutes(
 
     if (!comment) {
       throw new Error("Issue comment was not persisted");
+    }
+
+    if ("deduplicated" in comment && comment.deduplicated) {
+      idempotentReplay = true;
+      if (comment.idempotencyProcessedAt) {
+        res.status(200).json(comment);
+        return;
+      }
     }
 
     if (commentReferenceDiff === null) {
@@ -10641,47 +10702,52 @@ export function issueRoutes(
         logger.warn({ err, runId: actor.runId }, "failed to clear detached run warning after issue comment"));
     }
 
-    await logActivity(db, {
-      companyId: currentIssue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      agentApiKeyId: actor.agentApiKeyId,
-      action: "issue.comment_added",
-      entityType: "issue",
-      entityId: currentIssue.id,
-      details: {
-        commentId: comment.id,
-        bodySnippet: comment.body.slice(0, 120),
-        identifier: currentIssue.identifier,
-        issueTitle: currentIssue.title,
-        ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
-        ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
-        ...(scheduledRetrySupersededByComment
-          ? {
-              scheduledRetrySupersededByComment: true,
-              scheduledRetryRunId: scheduledRetryForHumanComment?.runId ?? null,
-              ...(cancelledScheduledRetryRunId ? { cancelledScheduledRetryRunId } : {}),
-            }
-          : {}),
-        ...(interruptedRunId ? { interruptedRunId } : {}),
-        ...summarizeIssueReferenceActivityDetails({
-          addedReferencedIssues: (commentReferenceDiff?.addedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
-          removedReferencedIssues: (commentReferenceDiff?.removedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
-          currentReferencedIssues: (commentReferenceDiff?.currentReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
-        }),
-      },
-      // Full body + author ride on the emitted issue.comment.created plugin
-      // event only (not the persisted activity_log row, which keeps the
-      // bodySnippet) so the Linear comment bridge can mirror Paperclip
-      // comments. The bridge handler reads payload.body / payload.authorName.
-      pluginEventPayloadExtra: {
-        issueId: currentIssue.id,
-        body: comment.body,
-        authorName: await resolveCommentAuthorName(actor),
-      },
-    });
+    const commentAddedActivityAlreadyLogged = idempotentReplay
+      ? await hasIssueCommentAddedActivity({ issueId: currentIssue.id, commentId: comment.id })
+      : false;
+    if (!commentAddedActivityAlreadyLogged) {
+      await logActivity(db, {
+        companyId: currentIssue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: currentIssue.id,
+        details: {
+          commentId: comment.id,
+          bodySnippet: comment.body.slice(0, 120),
+          identifier: currentIssue.identifier,
+          issueTitle: currentIssue.title,
+          ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+          ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
+          ...(scheduledRetrySupersededByComment
+            ? {
+                scheduledRetrySupersededByComment: true,
+                scheduledRetryRunId: scheduledRetryForHumanComment?.runId ?? null,
+                ...(cancelledScheduledRetryRunId ? { cancelledScheduledRetryRunId } : {}),
+              }
+            : {}),
+          ...(interruptedRunId ? { interruptedRunId } : {}),
+          ...summarizeIssueReferenceActivityDetails({
+            addedReferencedIssues: (commentReferenceDiff?.addedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+            removedReferencedIssues: (commentReferenceDiff?.removedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+            currentReferencedIssues: (commentReferenceDiff?.currentReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+          }),
+        },
+        // Full body + author ride on the emitted issue.comment.created plugin
+        // event only (not the persisted activity_log row, which keeps the
+        // bodySnippet) so the Linear comment bridge can mirror Paperclip
+        // comments. The bridge handler reads payload.body / payload.authorName.
+        pluginEventPayloadExtra: {
+          issueId: currentIssue.id,
+          body: comment.body,
+          authorName: await resolveCommentAuthorName(actor),
+        },
+      });
+    }
 
     const expiredInteractions = await issueThreadInteractionService(db).expireRequestConfirmationsSupersededByComment(
       currentIssue,
@@ -10709,7 +10775,7 @@ export function issueRoutes(
     });
 
     // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.
-    void (async () => {
+    await (async () => {
       type WakeupRequest = NonNullable<Parameters<typeof heartbeat.wakeup>[1]>;
       const wakeups = new Map<string, { agentId: string; wakeup: WakeupRequest }>();
       const addWakeup = (agentId: string, wakeup: WakeupRequest) => {
@@ -10794,6 +10860,7 @@ export function issueRoutes(
             },
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
+            idempotencyKey: `issue_comment:${comment.id}:reopen:${assigneeId}`,
             contextSnapshot: {
               issueId: currentIssue.id,
               taskId: currentIssue.id,
@@ -10820,6 +10887,7 @@ export function issueRoutes(
             },
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
+            idempotencyKey: `issue_comment:${comment.id}:assignee:${assigneeId}`,
             contextSnapshot: {
               issueId: currentIssue.id,
               taskId: currentIssue.id,
@@ -10836,7 +10904,7 @@ export function issueRoutes(
 
       let mentionedIds: string[] = [];
       try {
-        mentionedIds = await svc.findMentionedAgents(issue.companyId, req.body.body);
+        mentionedIds = await svc.findMentionedAgents(issue.companyId, comment.body);
       } catch (err) {
         logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
       }
@@ -10850,6 +10918,7 @@ export function issueRoutes(
           payload: { issueId: id, commentId: comment.id },
           requestedByActorType: actor.actorType,
           requestedByActorId: actor.actorId,
+          idempotencyKey: `issue_comment:${comment.id}:mention:${mentionedId}`,
           contextSnapshot: {
             issueId: id,
             taskId: id,
@@ -10896,6 +10965,7 @@ export function issueRoutes(
             },
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
+            idempotencyKey: `issue_comment:${comment.id}:children_completed:${parent.id}`,
             contextSnapshot: {
               issueId: parent.id,
               taskId: parent.id,
@@ -10910,11 +10980,14 @@ export function issueRoutes(
         }
       }
 
-      dispatchIssueWakeups(currentIssue.id, wakeups, "failed to wake agent on issue comment");
+      await dispatchIssueWakeups(currentIssue.id, wakeups, "failed to wake agent on issue comment");
     })();
 
     await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
-    res.status(201).json(comment);
+    if (req.body.idempotencyKey) {
+      await svc.markCommentIdempotencyProcessed(comment.id);
+    }
+    res.status(idempotentReplay ? 200 : 201).json(comment);
   });
 
   router.post("/issues/:id/feedback-votes", validate(upsertIssueFeedbackVoteSchema), async (req, res) => {
