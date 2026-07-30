@@ -286,7 +286,7 @@ const NEGATION_LOOKBACK_WORDS = 8;
 // blockquote, bullet/ordered-list, or emphasis (`**`) decoration. See the call
 // site in hasActionablePrReviewFeedback for why the anchor is load-bearing.
 const UNCOUNTED_FINDINGS_HEADING_REGEX =
-  /^[ \t]*(?:[#>]+[ \t]*)?(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(?:Critical|Important)[ \t]+Issues\b(?![ \t]*\()/im;
+  /^[ \t]*(?:[#>]+[ \t]*)?(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(?:Critical|Important)[ \t]+Issues\b(?![*_]*[ \t]*\()/im;
 
 // Returns true if `pattern` matches `text` at least once outside a negated context
 // (see NEGATION_CUE_REGEX). Used for bare-phrase heuristics ("changes requested")
@@ -321,7 +321,7 @@ function hasActionablePrReviewFeedback(body: string | null | undefined, state?: 
   // before a non-zero one doesn't mask it. NOTE: keep this list in sync with
   // the reviewer's severity taxonomy — a review that flags "Critical Issues"
   // must not slip through as non-actionable (the BLO-12541/#973 stall).
-  for (const bucket of text.matchAll(/\b(?:Critical|Important)\s+Issues\s*\((\d+)\)/gi)) {
+  for (const bucket of text.matchAll(/\b(?:Critical|Important)\s+Issues\b[*_]*\s*\((\d+)\)/gi)) {
     if (Number(bucket[1]) > 0) return true;
   }
   // Same headings without an explicit count still signal findings. Match the

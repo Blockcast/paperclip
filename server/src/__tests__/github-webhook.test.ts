@@ -3560,6 +3560,38 @@ describe("hasActionablePrReviewFeedback — reviewer taxonomy", () => {
     expect(__test_hasActionablePrReviewFeedback(body)).toBe(false);
   });
 
+  it("is not actionable when emphasized severity headings only carry zero counts", () => {
+    const body = [
+      "## Ally — Consolidated PR Review",
+      "",
+      "### **Critical Issues** (0)",
+      "None.",
+      "",
+      "### **Important Issues** (0)",
+      "None.",
+      "",
+      "### Recommended Action",
+      "Merge when required CI passes.",
+    ].join("\n");
+    expect(__test_hasActionablePrReviewFeedback(body, "approved")).toBe(false);
+  });
+
+  it("still treats emphasized non-zero severity buckets as actionable", () => {
+    const body = [
+      "## Ally — Consolidated PR Review",
+      "",
+      "### **Critical Issues** (0)",
+      "None.",
+      "",
+      "### **Important Issues** (1)",
+      "- The retry remains stranded.",
+      "",
+      "### Recommended Action",
+      "Fix before merge.",
+    ].join("\n");
+    expect(__test_hasActionablePrReviewFeedback(body, "commented")).toBe(true);
+  });
+
   it("still short-circuits on a formal changes_requested review state", () => {
     expect(__test_hasActionablePrReviewFeedback("looks fine overall", "changes_requested")).toBe(true);
   });
