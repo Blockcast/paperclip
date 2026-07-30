@@ -339,7 +339,7 @@ jobs:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
     name: verify
     if: ${{ always() }}
-    needs: [typecheck_release_registry, general_tests, build]
+    needs: [typecheck_release_registry, general_tests, worktree_install, build]
     runs-on: arc-light
     timeout-minutes: 5
 
@@ -348,10 +348,12 @@ jobs:
         env:
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
+          WORKTREE_INSTALL_RESULT: ${{ needs.worktree_install.result }}
           BUILD_RESULT: ${{ needs.build.result }}
         run: |
           test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"
           test "$GENERAL_TESTS_RESULT" = "success"
+          test "$WORKTREE_INSTALL_RESULT" = "success"
           test "$BUILD_RESULT" = "success"
 
   build:

@@ -10,6 +10,15 @@ function readRepoFile(relativePath) {
   return readFileSync(path.join(repoRoot, relativePath), "utf8");
 }
 
+function workflowJobBody(workflow, jobName) {
+  const jobStart = workflow.indexOf(`  ${jobName}:`);
+  assert.notEqual(jobStart, -1, `pr.yml must define a ${jobName} job.`);
+
+  const rest = workflow.slice(jobStart + 1);
+  const nextJob = rest.search(/\n {2}[A-Za-z0-9_-]+:\n/);
+  return nextJob === -1 ? workflow.slice(jobStart) : workflow.slice(jobStart, jobStart + 1 + nextJob);
+}
+
 /**
  * Parse .npmrc into key/value pairs, ignoring comments and blank lines, so a
  * setting that only appears inside an explanatory comment cannot satisfy these
@@ -58,14 +67,14 @@ test("pr.yml guards the install against an ambient NODE_ENV=production", () => {
     "pr.yml must define a worktree_install job that exercises a from-scratch install.",
   );
 
+  const jobBody = workflowJobBody(prWorkflow, "worktree_install");
+
   // The job is only a regression guard if it reproduces the broken environment.
   assert.match(
-    prWorkflow,
-    /worktree_install:[\s\S]*?env:\n\s+NODE_ENV: production/,
+    jobBody,
+    /env:\n\s+NODE_ENV: production/,
     "worktree_install must pin NODE_ENV: production so removing the .npmrc setting fails CI.",
   );
-
-  const jobBody = prWorkflow.slice(prWorkflow.indexOf("  worktree_install:"));
 
   assert.match(jobBody, /git worktree add --detach/);
   assert.match(jobBody, /pnpm install --frozen-lockfile/);
@@ -83,4 +92,13 @@ test("pr.yml guards the install against an ambient NODE_ENV=production", () => {
 
   assert.match(jobBody, /node_modules\/\.bin\/vitest/);
   assert.match(jobBody, /pnpm exec vitest --version/);
+
+  const verifyBody = workflowJobBody(prWorkflow, "verify");
+  assert.match(
+    verifyBody,
+    /needs:\s*\[[^\]]*\bworktree_install\b[^\]]*\]/,
+    "The legacy required verify job must depend on worktree_install so the guard gates merges.",
+  );
+  assert.match(verifyBody, /WORKTREE_INSTALL_RESULT:\s*\${{\s*needs\.worktree_install\.result\s*}}/);
+  assert.match(verifyBody, /test "\$WORKTREE_INSTALL_RESULT" = "success"/);
 });
