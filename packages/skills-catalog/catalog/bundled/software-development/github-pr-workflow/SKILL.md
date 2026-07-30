@@ -128,15 +128,30 @@ default credential (GitHub permits only one open PR per head/base, so the close
 must come first). No force-push and no CI re-plumbing is needed.
 
 Closing is the destructive step, so everything the replacement needs must be
-captured and re-validated *before* it, and any failure after it must put the
-original PR back. Two ways this goes wrong if you improvise it: the branch moves
-between capture and re-create, so the "same SHA" promise silently breaks; or
-`gh pr create` fails and leaves the branch with the review artifact closed and
-no replacement open.
+captured and re-validated *before* it, and every unsuccessful exit after it must
+put the original PR back. Four ways this goes wrong if you improvise it: a read
+fails and the captured fields come back empty, so an empty SHA compares equal to
+an empty remote SHA and the check "passes" on two blanks; the branch moves
+between capture and re-create, so the "same SHA" promise silently breaks;
+`gh pr create` fails — or the script is interrupted — and the branch is left with
+its review artifact closed and no replacement open; or the replacement is created
+under the seat as well, reproducing the exact defect while reporting success.
 
 ```sh
+set -euo pipefail
+
 REPO=<org>/<repo>
 NUM=<number>
+
+# Preflight: the point of this recovery is an App-authored replacement, so prove
+# the active identity IS the App before touching anything. Recreating under the
+# seat reproduces the defect being recovered from and reports success doing it.
+# Assert the App's signature rather than the seat's absence: any other outcome —
+# a seat login, a network failure, a broken `gh` — must abort, not proceed.
+case "$(gh api user 2>&1 || true)" in
+  *"Resource not accessible by integration"*) ;;  # 403 == App installation
+  *) echo "abort: not authenticated as the App installation" >&2; exit 1 ;;
+esac
 
 # Capture head, base, title, body AND the exact head SHA BEFORE closing.
 # Never assume `master`: stacked PRs and repos with another default branch
@@ -145,50 +160,97 @@ NUM=<number>
 gh pr view "$NUM" --repo "$REPO" \
   --json headRefName,baseRefName,headRefOid,title,body > "/tmp/pr-$NUM.json"
 
-HEAD_REF="$(jq -r .headRefName "/tmp/pr-$NUM.json")"
-ORIG_SHA="$(jq -r .headRefOid  "/tmp/pr-$NUM.json")"
-BASE_REF="$(jq -r .baseRefName "/tmp/pr-$NUM.json")"
+HEAD_REF="$(jq -r '.headRefName // empty' "/tmp/pr-$NUM.json")"
+ORIG_SHA="$(jq -r '.headRefOid  // empty' "/tmp/pr-$NUM.json")"
+BASE_REF="$(jq -r '.baseRefName // empty' "/tmp/pr-$NUM.json")"
+
+# Validate every captured field before the destructive step. `jq` prints an empty
+# string for a missing or null key, and "" = "" compares equal — so an
+# unvalidated capture and a failed remote read agree with each other and close
+# the PR for nothing. Require a full 40-hex SHA, not merely "non-empty".
+[ -n "$HEAD_REF" ] || { echo "abort: #$NUM has no headRefName" >&2; exit 1; }
+[ -n "$BASE_REF" ] || { echo "abort: #$NUM has no baseRefName" >&2; exit 1; }
+printf '%s' "$ORIG_SHA" | grep -Eq '^[0-9a-f]{40}$' ||
+  { echo "abort: headRefOid '$ORIG_SHA' is not a full SHA" >&2; exit 1; }
 
 # Re-validate the SHA against the remote immediately before closing, and abort
 # instead of closing on a mismatch: if the branch has moved, the replacement PR
 # would open on a head nobody reviewed. Ask GitHub, not the local checkout —
 # a stale local ref would confirm the wrong thing.
-REMOTE_SHA="$(gh api "repos/$REPO/git/ref/heads/$HEAD_REF" --jq .object.sha)"
-if [ "$REMOTE_SHA" != "$ORIG_SHA" ]; then
-  echo "abort: origin/$HEAD_REF is $REMOTE_SHA, expected $ORIG_SHA" >&2
-  exit 1
-fi
+REMOTE_SHA="$(gh api "repos/$REPO/git/ref/heads/$HEAD_REF" --jq '.object.sha // empty')"
+printf '%s' "$REMOTE_SHA" | grep -Eq '^[0-9a-f]{40}$' ||
+  { echo "abort: could not read origin/$HEAD_REF" >&2; exit 1; }
+[ "$REMOTE_SHA" = "$ORIG_SHA" ] ||
+  { echo "abort: origin/$HEAD_REF is $REMOTE_SHA, expected $ORIG_SHA" >&2; exit 1; }
+
+# Arm rollback BEFORE closing anything, and arm it for every unsuccessful exit —
+# not just the two failures spelled out below. An interrupt or an unanticipated
+# error between here and the final check would otherwise strand the branch with
+# its review artifact closed. A rollback that itself fails says so loudly.
+CLOSED=0
+NEW_NUM=""
+rollback() {
+  status=$?
+  if [ "$status" -eq 0 ]; then return 0; fi
+  echo "recovery failed (exit $status); restoring #$NUM" >&2
+  if [ -n "$NEW_NUM" ]; then
+    gh pr close "$NEW_NUM" --repo "$REPO" ||
+      echo "ROLLBACK INCOMPLETE: close #$NEW_NUM by hand" >&2
+  fi
+  if [ "$CLOSED" -eq 1 ]; then
+    gh pr reopen "$NUM" --repo "$REPO" ||
+      echo "ROLLBACK FAILED: reopen #$NUM by hand" >&2
+  fi
+}
+trap rollback EXIT INT TERM
 
 gh pr close "$NUM" --repo "$REPO"
+CLOSED=1
 
-# From here the original is closed, so every failure path reopens it.
 NEW_URL="$(gh pr create --repo "$REPO" \
   --head  "$HEAD_REF" \
   --base  "$BASE_REF" \
   --title "$(jq -r .title "/tmp/pr-$NUM.json")" \
-  --body  "$(jq -r .body  "/tmp/pr-$NUM.json")")" || {
-  echo "create failed; reopening $NUM" >&2
-  gh pr reopen "$NUM" --repo "$REPO"
-  exit 1
-}
+  --body  "$(jq -r .body  "/tmp/pr-$NUM.json")")"
+NEW_NUM="${NEW_URL##*/}"
+
+# Validate the number too: an empty or non-numeric NEW_URL would otherwise send
+# the checks below to `gh pr view ""`, and an unvalidated blank is exactly the
+# fail-open the capture step above guards against.
+printf '%s' "$NEW_NUM" | grep -Eq '^[0-9]+$' ||
+  { echo "abort: gh pr create returned '$NEW_URL'" >&2; exit 1; }
 
 # Verification is part of the recovery, not a follow-up step: a replacement on a
 # different head or base is not a recovery, and leaving it open while the
-# original stays closed is worse than not having tried.
-NEW_NUM="${NEW_URL##*/}"
-if [ "$(gh pr view "$NEW_NUM" --repo "$REPO" --json headRefOid --jq .headRefOid)" != "$ORIG_SHA" ] ||
-   [ "$(gh pr view "$NEW_NUM" --repo "$REPO" --json baseRefName --jq .baseRefName)" != "$BASE_REF" ]; then
-  echo "abort: #$NEW_NUM does not match $ORIG_SHA onto $BASE_REF; reopening $NUM" >&2
-  gh pr close "$NEW_NUM" --repo "$REPO"
-  gh pr reopen "$NUM" --repo "$REPO"
-  exit 1
-fi
+# original stays closed is worse than not having tried. Verify the author too —
+# the preflight can pass and the create still land under another identity, and a
+# seat-authored replacement is exactly the defect being recovered from.
+NEW_JSON="$(gh pr view "$NEW_NUM" --repo "$REPO" --json headRefOid,baseRefName,author)"
+[ "$(printf '%s' "$NEW_JSON" | jq -r '.headRefOid  // empty')" = "$ORIG_SHA" ] ||
+  { echo "abort: #$NEW_NUM is not at $ORIG_SHA" >&2; exit 1; }
+[ "$(printf '%s' "$NEW_JSON" | jq -r '.baseRefName // empty')" = "$BASE_REF" ] ||
+  { echo "abort: #$NEW_NUM is not onto $BASE_REF" >&2; exit 1; }
+NEW_AUTHOR="$(printf '%s' "$NEW_JSON" | jq -r '.author.login // empty')"
+case "$NEW_AUTHOR" in
+  app/*) ;;
+  *) echo "abort: #$NEW_NUM is authored by '$NEW_AUTHOR', not the App" >&2; exit 1 ;;
+esac
 
-echo "recovered $NUM -> $NEW_NUM at $ORIG_SHA onto $BASE_REF"
+trap - EXIT INT TERM
+echo "recovered $NUM -> $NEW_NUM at $ORIG_SHA onto $BASE_REF as $NEW_AUTHOR"
 ```
 
-The recovery is done only when that final check passes. If it aborted, you are
-back on the original PR with nothing lost — diagnose before retrying.
+The recovery is done only when that final check passes. If it aborted, the
+rollback has put you back on the original PR with nothing lost — diagnose before
+retrying. If it printed `ROLLBACK FAILED` or `ROLLBACK INCOMPLETE`, the restore
+itself did not complete: fix that by hand first, before anything else.
+
+The replacement carries the original head, base, title, and body — and nothing
+else. Labels, assignees, requested reviewers, milestone, linked issues, and the
+original's draft state are **not** restored; in particular a draft original comes
+back ready-for-review, which is usually what you want (a draft PR gets no
+reviewer wake at all) but is a change you should expect rather than discover.
+Re-apply anything you need on the replacement.
 
 Pushing under the seat is also unsafe where branch protection sets
 `require_last_push_approval` — the most recent pusher cannot approve, so a

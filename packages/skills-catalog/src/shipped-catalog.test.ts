@@ -1,5 +1,7 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -50,7 +52,11 @@ const EXECUTABLE_FENCE_INFO = new Set(["sh", "bash", "shell", "zsh", "console", 
  * publish, or formally review a PR.
  */
 const AUTHORING_COMMAND_PATTERNS = [
-  { name: "git push", pattern: /\bgit\s+push\b/ },
+  // `git` accepts global options before the subcommand, and the historical
+  // seat-authoring recipe used exactly that form
+  // (`git -c http.https://github.com/.extraheader=… push`). Matching a bare
+  // `git push` would let that spelling slip a credential past the scan below.
+  { name: "git push", pattern: /\bgit\s+(?:-[cC]\s+\S+\s+|--\S+\s+)*push\b/ },
   { name: "gh pr create", pattern: /\bgh\s+pr\s+create\b/ },
   { name: "gh pr merge", pattern: /\bgh\s+pr\s+merge\b/ },
   { name: "gh pr review", pattern: /\bgh\s+pr\s+review\b/ },
@@ -72,8 +78,47 @@ const CREDENTIAL_SELECTOR_PATTERNS = [
   { name: "gh auth login/switch", pattern: /\bgh\s+auth\s+(?:login|switch)\b/ },
 ];
 
-/** Fenced blocks in a Markdown document, with info string and 1-based opening line. */
-function fencedBlocks(markdown: string): { info: string; body: string; line: number }[] {
+/**
+ * Stub `gh` for the recovery-recipe failure-path tests. Logs every argv to
+ * $GH_LOG and scripts one failure per $GH_SCENARIO, so a test can assert what
+ * the recipe did — above all whether it closed the original PR before it had
+ * validated everything the replacement needs.
+ */
+const GH_STUB = `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$GH_LOG"
+case "$1 $2" in
+  "api user")
+    if [ "$GH_SCENARIO" = "seat-identity" ]; then echo '{"login":"allyblockcast"}'; exit 0; fi
+    if [ "$GH_SCENARIO" = "gh-broken" ]; then echo "dial tcp: lookup api.github.com" >&2; exit 1; fi
+    echo '{"message":"Resource not accessible by integration","status":"403"}' >&2; exit 1 ;;
+  "pr view")
+    if [ "$3" = "7" ]; then
+      [ "$GH_SCENARIO" = "view-fails" ] && { echo "gh: HTTP 500" >&2; exit 1; }
+      case "$GH_SCENARIO" in
+        null-sha|blank-both) echo '{"headRefName":"feat","baseRefName":"main","headRefOid":null,"title":"T","body":"B"}'; exit 0 ;;
+      esac
+      echo '{"headRefName":"feat","baseRefName":"main","headRefOid":"'"$ORIG"'","title":"T","body":"B"}'; exit 0
+    fi
+    case "$GH_SCENARIO" in
+      seat-author) echo '{"headRefOid":"'"$ORIG"'","baseRefName":"main","author":{"login":"allyblockcast"}}' ;;
+      wrong-base)  echo '{"headRefOid":"'"$ORIG"'","baseRefName":"release","author":{"login":"app/allyblockcast"}}' ;;
+      moved-head)  echo '{"headRefOid":"'"$MOVED"'","baseRefName":"main","author":{"login":"app/allyblockcast"}}' ;;
+      *) echo '{"headRefOid":"'"$ORIG"'","baseRefName":"main","author":{"login":"app/allyblockcast"}}' ;;
+    esac ;;
+  "api repos"*)
+    [ "$GH_SCENARIO" = "ref-fails" ] && { echo "gh: HTTP 404" >&2; exit 1; }
+    [ "$GH_SCENARIO" = "blank-both" ] && { echo ""; exit 0; }
+    [ "$GH_SCENARIO" = "moved" ] && { echo "$MOVED"; exit 0; }
+    echo "$ORIG" ;;
+  "pr create")
+    [ "$GH_SCENARIO" = "create-fails" ] && { echo "gh: no commits between branches" >&2; exit 1; }
+    [ "$GH_SCENARIO" = "blank-url" ] && { echo ""; exit 0; }
+    echo "https://github.com/acme/widgets/pull/8" ;;
+  *) exit 0 ;;
+esac
+`;
+
+/** Fenced blocks in a Markdown document, with info string and 1-based opening line. */function fencedBlocks(markdown: string): { info: string; body: string; line: number }[] {
   const blocks: { info: string; body: string; line: number }[] = [];
   let open: { info: string; line: number; body: string[] } | null = null;
 
@@ -92,6 +137,88 @@ function fencedBlocks(markdown: string): { info: string; body: string; line: num
   }
   return blocks;
 }
+
+/**
+ * Shell fences that run an authoring/review command, paired with any credential
+ * selector appearing beside it. Takes markdown rather than reading the skill so
+ * the detector itself can be tested against known-bad fixtures — a scan that
+ * only ever sees a passing file cannot show it would catch a regression.
+ */
+function credentialViolations(markdown: string): { authoringBlocks: number; violations: string[] } {
+  const authoringBlocks = fencedBlocks(markdown)
+    .filter((block) => EXECUTABLE_FENCE_INFO.has(block.info))
+    .filter((block) => AUTHORING_COMMAND_PATTERNS.some(({ pattern }) => pattern.test(block.body)));
+
+  const violations = authoringBlocks.flatMap((block) => {
+    const commands = AUTHORING_COMMAND_PATTERNS.filter(({ pattern }) => pattern.test(block.body))
+      .map(({ name }) => name)
+      .join(", ");
+    return CREDENTIAL_SELECTOR_PATTERNS.filter(({ pattern }) => pattern.test(block.body)).map(
+      ({ name }) => `fence at line ${block.line} (${commands}): ${name}`,
+    );
+  });
+
+  return { authoringBlocks: authoringBlocks.length, violations };
+}
+
+/** The destructive seat-authored-PR recovery, ready to run against a stub `gh`. */
+function extractRecoveryRecipe(markdown: string): string | null {
+  const recovery = fencedBlocks(markdown)
+    .filter((block) => EXECUTABLE_FENCE_INFO.has(block.info))
+    .find((block) => /\bgh\s+pr\s+close\b/.test(block.body));
+  if (!recovery) return null;
+  return recovery.body.replace("REPO=<org>/<repo>", "REPO=acme/widgets").replace("NUM=<number>", "NUM=7");
+}
+
+const ORIG_SHA = "a".repeat(40);
+const MOVED_SHA = "b".repeat(40);
+
+/**
+ * Runs the shipped recovery recipe against a stub `gh` so its failure paths are
+ * exercised, not merely pattern-matched. Returns the exit code and the exact
+ * `gh` argv sequence the recipe issued, which is what makes "did it close the PR
+ * before validating?" and "did it roll back?" answerable.
+ */
+function runRecovery(scenario: string): { status: number; stderr: string; ghCalls: string[] } {
+  const dir = mkdtempSync(path.join(tmpdir(), "pr-recovery-"));
+  try {
+    const logPath = path.join(dir, "gh.log");
+    const binDir = path.join(dir, "bin");
+    mkdirSync(binDir);
+    writeFileSync(path.join(binDir, "gh"), GH_STUB, { mode: 0o755 });
+
+    const recipe = extractRecoveryRecipe(readFileSync(fileURLToPath(GITHUB_PR_WORKFLOW_SKILL), "utf8"));
+    if (!recipe) throw new Error("no recovery recipe found in the skill");
+    const recipePath = path.join(dir, "recipe.sh");
+    writeFileSync(recipePath, recipe);
+
+    const result = spawnSync("bash", [recipePath], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        // The pods export this by default pointing at the App token, so the
+        // recipe must not key off its mere presence.
+        PAPERCLIP_GITHUB_TOKEN_FILE: "/paperclip/.secrets/github-token/token",
+        PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        GH_LOG: logPath,
+        GH_SCENARIO: scenario,
+        ORIG: ORIG_SHA,
+        MOVED: MOVED_SHA,
+      },
+    });
+
+    const ghCalls = existsSync(logPath)
+      ? readFileSync(logPath, "utf8").split("\n").filter(Boolean)
+      : [];
+    return { status: result.status ?? -1, stderr: result.stderr ?? "", ghCalls };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const closedOriginal = (calls: string[]) => calls.some((call) => /^pr close 7\b/.test(call));
+const reopenedOriginal = (calls: string[]) => calls.some((call) => /^pr reopen 7\b/.test(call));
+const closedReplacement = (calls: string[]) => calls.some((call) => /^pr close 8\b/.test(call));
 
 function listSkillFiles(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
@@ -265,56 +392,86 @@ describe("shipped skills catalog", () => {
 
   it("never selects a non-default credential in an authoring or review recipe", async () => {
     const content = await readFile(GITHUB_PR_WORKFLOW_SKILL, "utf8");
-
-    const authoringBlocks = fencedBlocks(content)
-      .filter((block) => EXECUTABLE_FENCE_INFO.has(block.info))
-      .filter((block) => AUTHORING_COMMAND_PATTERNS.some(({ pattern }) => pattern.test(block.body)));
+    const { authoringBlocks, violations } = credentialViolations(content);
 
     // Anti-vacuity guard: if the fence extractor or the fence languages drift, the
     // scan below would "pass" having inspected nothing. Pin that it found recipes.
-    expect(
-      authoringBlocks.length,
-      "expected >=1 shell fence running git push / gh pr create|merge|review",
-    ).toBeGreaterThan(0);
-
-    // Structural, not string-matched: any spelling of credential selection next to
-    // an authoring command fails, so seat authoring cannot return under a renamed
-    // variable or a literal token path.
-    const violations = authoringBlocks.flatMap((block) => {
-      const commands = AUTHORING_COMMAND_PATTERNS.filter(({ pattern }) => pattern.test(block.body))
-        .map(({ name }) => name)
-        .join(", ");
-      return CREDENTIAL_SELECTOR_PATTERNS.filter(({ pattern }) => pattern.test(block.body)).map(
-        ({ name }) => `fence at line ${block.line} (${commands}): ${name}`,
-      );
-    });
+    expect(authoringBlocks, "expected >=1 shell fence running git push / gh pr create|merge|review").toBeGreaterThan(0);
 
     expect(violations).toEqual([]);
   });
 
-  it("keeps the seat-authored PR recovery SHA-preserving and failure-safe", async () => {
-    const content = await readFile(GITHUB_PR_WORKFLOW_SKILL, "utf8");
+  it("rejects the historical seat-authoring recipes it is meant to keep out", () => {
+    // A green scan proves nothing unless the scanner would fail on the bad input.
+    // These are the two forms that actually shipped before BLO-18997: a token-file
+    // selector beside `gh pr create`, and the `git -c …extraheader= push` spelling
+    // that a bare /\bgit\s+push\b/ detector walks straight past.
+    const seatCreate = ["```sh", 'PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE" \\', "  gh pr create --fill", "```"].join("\n");
+    const seatGitPush = [
+      "```sh",
+      "git -c http.https://github.com/.extraheader= push -u origin HEAD",
+      'GH_TOKEN="$(cat /paperclip/.secrets/github-merge-token/token)"',
+      "```",
+    ].join("\n");
 
-    const recovery = fencedBlocks(content)
-      .filter((block) => EXECUTABLE_FENCE_INFO.has(block.info))
-      .find((block) => /\bgh\s+pr\s+close\b/.test(block.body));
-    expect(recovery, "expected a shell fence recovering a seat-authored PR").toBeDefined();
-    if (!recovery) return;
+    expect(credentialViolations(seatCreate).violations).not.toEqual([]);
 
-    const closeIndex = recovery.body.search(/\bgh\s+pr\s+close\b/);
-    const beforeClose = recovery.body.slice(0, closeIndex);
-    const afterClose = recovery.body.slice(closeIndex);
+    const gitPushResult = credentialViolations(seatGitPush);
+    expect(gitPushResult.authoringBlocks, "git -c … push must register as an authoring command").toBe(1);
+    expect(gitPushResult.violations).not.toEqual([]);
+  });
 
-    // Closing is destructive, so the head SHA must be captured AND re-validated
-    // against the remote before it — otherwise a branch that moved between
-    // capture and re-create silently reopens on a head nobody reviewed.
-    expect(beforeClose).toMatch(/--json[^\n]*headRefOid/);
-    expect(beforeClose).toMatch(/git\/ref\/heads/);
-    expect(beforeClose).toMatch(/\bexit\s+1\b/);
+  describe("seat-authored PR recovery", () => {
+    it("is present, SHA-preserving, and fails closed on its own reads", async () => {
+      const content = await readFile(GITHUB_PR_WORKFLOW_SKILL, "utf8");
+      const recipe = extractRecoveryRecipe(content);
+      expect(recipe, "expected a shell fence recovering a seat-authored PR").toBeTruthy();
+      // `set -e` is what makes an unanticipated failure reach the rollback trap
+      // rather than falling through to the next destructive line.
+      expect(recipe).toMatch(/set\s+-euo\s+pipefail/);
+      expect(recipe).toMatch(/trap\s+\w+\s+EXIT\s+INT\s+TERM/);
+    });
 
-    // Every failure path after the close must put the original PR back, so a
-    // failed create never leaves the branch with no open review artifact.
-    expect(afterClose).toMatch(/\bgh\s+pr\s+reopen\b/);
-    expect(afterClose).toMatch(/\bgh\s+pr\s+create\b/);
+    // Every pre-close failure must abort with the review artifact still open.
+    // These are the fail-open cases: a read that errors, or one that returns a
+    // null field, leaves an empty SHA that compares equal to an empty remote SHA.
+    it.each([
+      ["seat-identity", "a user-seat login instead of the App"],
+      ["gh-broken", "an identity probe that cannot reach GitHub"],
+      ["view-fails", "a failed metadata read"],
+      ["null-sha", "a null headRefOid"],
+      ["blank-both", "a null headRefOid AND an empty remote read, which compare equal"],
+      ["ref-fails", "a failed remote-ref read"],
+      ["moved", "a branch that moved since capture"],
+    ])("never closes the original on %s (%s)", (scenario) => {
+      const { status, ghCalls } = runRecovery(scenario);
+      expect(status, "recipe must exit non-zero").not.toBe(0);
+      expect(closedOriginal(ghCalls), "must not reach `gh pr close` on the original").toBe(false);
+    });
+
+    // Past the close, every unsuccessful exit must put the original back — and
+    // take any replacement it managed to open back down with it.
+    it.each([
+      ["create-fails", false],
+      ["blank-url", false],
+      ["seat-author", true],
+      ["wrong-base", true],
+      ["moved-head", true],
+    ])("rolls the original back open after %s", (scenario, expectReplacement) => {
+      const { status, ghCalls } = runRecovery(scenario);
+      expect(status, "recipe must exit non-zero").not.toBe(0);
+      expect(closedOriginal(ghCalls), "scenario should have reached the close").toBe(true);
+      expect(reopenedOriginal(ghCalls), "must reopen the original").toBe(true);
+      expect(closedReplacement(ghCalls), "must not leave a bad replacement open").toBe(expectReplacement);
+    });
+
+    it("recovers onto the captured head and base when everything holds", () => {
+      const { status, ghCalls } = runRecovery("happy");
+      expect(status).toBe(0);
+      expect(closedOriginal(ghCalls)).toBe(true);
+      expect(reopenedOriginal(ghCalls), "a successful run must not roll back").toBe(false);
+      // The captured base, never a hardcoded `master`.
+      expect(ghCalls.some((call) => /^pr create .*--head feat .*--base main\b/.test(call))).toBe(true);
+    });
   });
 });
