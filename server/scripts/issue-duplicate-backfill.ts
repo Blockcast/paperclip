@@ -38,6 +38,32 @@ import {
  * disabled the evidence floor, reports numbers that look real and are not
  * reproducible from the command line that produced them.
  */
+const DUPLICATE_BACKFILL_FLAGS = new Set([
+  "--company",
+  "--project",
+  "--days",
+  "--origin",
+  "--score",
+  "--distinctive",
+  "--show",
+  "--dump-corpus",
+]);
+
+export function validateDuplicateBackfillFlags(args: readonly string[]): void {
+  const startIndex = args[0]?.startsWith("--") ? 0 : 2;
+  for (let index = startIndex; index < args.length; index += 1) {
+    const arg = args[index];
+    if (!arg?.startsWith("--")) continue;
+    if (!DUPLICATE_BACKFILL_FLAGS.has(arg)) {
+      throw new Error(`Unknown flag ${arg}`);
+    }
+    const value = args[index + 1];
+    if (value !== undefined && !value.startsWith("--")) {
+      index += 1;
+    }
+  }
+}
+
 export function parseDuplicateBackfillFlag(args: readonly string[], name: string): string | null {
   const index = args.indexOf(name);
   if (index < 0) return null;
@@ -87,6 +113,7 @@ function parseNumberFlag(name: string, fallback: number, range: NumberFlagRange 
 }
 
 async function main() {
+  validateDuplicateBackfillFlags(process.argv);
   const config = loadConfig();
   const dbUrl =
     process.env.DATABASE_URL?.trim()

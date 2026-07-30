@@ -153,7 +153,7 @@ const MIN_TERM_LENGTH = 4;
 
 const ISSUE_REFERENCE_RE = /\b[A-Z][A-Z0-9]{1,9}-\d{1,7}\b/g;
 const NUMERIC_REFERENCE_RE = /(?:^|[\s([])#(\d{1,7})\b/g;
-const FENCED_CODE_BLOCK_RE = /^[ \t]*`{3,}[^\n`]*(?:\r?\n[\s\S]*?\r?\n[ \t]*`{3,}[ \t]*(?=\r?\n|$))/gm;
+const FENCED_CODE_BLOCK_RE = /^[ \t]*(`{3,})[^\n`]*(?:\r?\n[\s\S]*?\r?\n[ \t]*\1`*[ \t]*(?=\r?\n|$))/gm;
 const FENCED_CODE_BLOCK_OPEN_RE = /^[ \t]*`{3,}[^\n`]*\r?\n/;
 const FENCED_CODE_BLOCK_CLOSE_RE = /\r?\n[ \t]*`{3,}[ \t]*$/;
 const INLINE_CODE_SPAN_RE = /(`+)([^\n]*?)(?<!`)\1(?!`)/g;

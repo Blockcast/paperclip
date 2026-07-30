@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   parseDuplicateBackfillFlag,
   parseDuplicateBackfillNumberFlag,
+  validateDuplicateBackfillFlags,
 } from "../../scripts/issue-duplicate-backfill.js";
 
 describe("issue duplicate backfill flags", () => {
@@ -26,5 +27,14 @@ describe("issue duplicate backfill flags", () => {
         integer: true,
       }),
     ).toThrow("--distinctive requires a non-empty value");
+  });
+
+  it("rejects misspelled option-like arguments before a scope can widen", () => {
+    expect(() => validateDuplicateBackfillFlags(argv("--comapny", "company-1"))).toThrow(
+      "Unknown flag --comapny",
+    );
+    expect(() => validateDuplicateBackfillFlags(["--comapny", "company-1"])).toThrow(
+      "Unknown flag --comapny",
+    );
   });
 });

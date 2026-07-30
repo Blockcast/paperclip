@@ -177,6 +177,23 @@ describe("extractIssueDuplicateFeatures", () => {
     expect(features.get("ts")).not.toBe("symbol");
     expect(features.get("handler.ts")).not.toBe("symbol");
   });
+
+  it("does not close a longer fenced block on a shorter backtick line", () => {
+    const features = extractIssueDuplicateFeatures({
+      title: "Nested fence marker remains code",
+      description: [
+        "````ts",
+        "const beforeShortFence = true;",
+        "```",
+        "const afterShortFence = true;",
+        "````",
+      ].join("\n"),
+    });
+
+    expect(features.get("beforeshortfence")).toBe("symbol");
+    expect(features.get("aftershortfence")).toBe("symbol");
+    expect(features.get("ts")).not.toBe("symbol");
+  });
 });
 
 describe("findIssueDuplicateCandidates — the four real monitor filings", () => {
