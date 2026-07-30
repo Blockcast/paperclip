@@ -1,0 +1,244 @@
+import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import {
+  activityLog,
+  agentWakeupRequests,
+  agents,
+  companies,
+  costEvents,
+  createDb,
+  heartbeatRuns,
+} from "@paperclipai/db";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
+import { buildHostServices } from "../services/plugin-host-services.js";
+import { heartbeatService } from "../services/heartbeat.js";
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+function createEventBusStub() {
+  return {
+    forPlugin() {
+      return {
+        emit: async () => {},
+        subscribe: () => {},
+      };
+    },
+  } as any;
+}
+
+function issuePrefix(id: string) {
+  return `T${id.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+}
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping embedded Postgres plugin invoke fan-out tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+  );
+}
+
+/**
+ * Regression coverage for BLO-18847 / BLO-18848.
+ *
+ * `agents.invoke` used to send `payload: { prompt }` and nothing else, so
+ * `deriveTaskKey` returned null for every plugin-originated wake. Because
+ * `isSameTaskScope(null, null)` is true, a review request that arrived while the
+ * target agent already had a run in flight was folded into that unrelated run and
+ * recorded as `status: "coalesced"` — the webhook still returned 200, so the loss
+ * was invisible. Nine `@ally` review requests went unanswered for 3-12h that way.
+ */
+describeEmbeddedPostgres("plugin agents.invoke wake fan-out", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-invoke-fanout-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(activityLog);
+    await db.delete(costEvents);
+    await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedBusyAgent() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: issuePrefix(companyId),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      // Single-slot concurrency keeps the seeded run occupying the only slot,
+      // which is exactly the burst condition that triggered the original loss.
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    // An in-flight plugin-originated run with no task key — the coalesce target.
+    const activeRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: activeRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "automation",
+      contextSnapshot: {},
+    });
+
+    return { companyId, agentId, activeRunId };
+  }
+
+  function hostServices(db: ReturnType<typeof createDb>) {
+    return buildHostServices(db, "github-plugin-record-id", "paperclip.github", createEventBusStub());
+  }
+
+  it("gives ten concurrent review requests ten distinct durable runs while the agent is busy", async () => {
+    const { companyId, agentId, activeRunId } = await seedBusyAgent();
+    const services = hostServices(db);
+
+    const taskKeys = Array.from(
+      { length: 10 },
+      (_, i) => `pr_review:Blockcast/pim-multicast-gateway:${1800 + i}`,
+    );
+
+    const results = await Promise.all(
+      taskKeys.map((taskKey) =>
+        services.agents.invoke({
+          agentId,
+          companyId,
+          prompt: `Review ${taskKey}`,
+          reason: "pr_review_requested",
+          taskKey,
+        }),
+      ),
+    );
+
+    // Every request got its own run, and none reused the busy run.
+    const runIds = new Set(results.map((r) => r.runId));
+    expect(runIds.size).toBe(10);
+    expect(runIds.has(activeRunId)).toBe(false);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(11); // 10 new + the pre-existing active run
+
+    const persistedTaskKeys = runs
+      .map((run) => (run.contextSnapshot as Record<string, unknown> | null)?.taskKey)
+      .filter((key): key is string => typeof key === "string");
+    expect(new Set(persistedTaskKeys)).toEqual(new Set(taskKeys));
+
+    // Nothing was silently folded into another PR's run.
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups).toHaveLength(10);
+    expect(wakeups.filter((w) => w.status === "coalesced")).toHaveLength(0);
+    expect(wakeups.every((w) => w.runId !== null)).toBe(true);
+  }, 60_000);
+
+  it("does not coalesce concurrent invokes that omit a task key", async () => {
+    const { companyId, agentId } = await seedBusyAgent();
+    const services = hostServices(db);
+
+    // An un-updated plugin that cannot supply a task key must still not lose
+    // deliveries — keyless invokes default to distinct scopes, not to "same".
+    const results = await Promise.all(
+      Array.from({ length: 10 }, (_, i) =>
+        services.agents.invoke({
+          agentId,
+          companyId,
+          prompt: `Keyless request ${i}`,
+          reason: "pr_review_requested",
+        }),
+      ),
+    );
+
+    expect(new Set(results.map((r) => r.runId)).size).toBe(10);
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups.filter((w) => w.status === "coalesced")).toHaveLength(0);
+  }, 60_000);
+
+  it("replays a redelivered webhook onto the original run instead of queueing a second", async () => {
+    const { companyId, agentId } = await seedBusyAgent();
+    const services = hostServices(db);
+    const deliveryId = "gh-delivery-7f3c9a10-0000-4000-8000-000000000001";
+
+    const first = await services.agents.invoke({
+      agentId,
+      companyId,
+      prompt: "Review penstock-llm-proxy-core#880",
+      reason: "pr_review_requested",
+      taskKey: "pr_review:Blockcast/penstock-llm-proxy-core:880",
+      idempotencyKey: deliveryId,
+    });
+
+    const replay = await services.agents.invoke({
+      agentId,
+      companyId,
+      prompt: "Review penstock-llm-proxy-core#880",
+      reason: "pr_review_requested",
+      taskKey: "pr_review:Blockcast/penstock-llm-proxy-core:880",
+      idempotencyKey: deliveryId,
+    });
+
+    expect(replay.runId).toBe(first.runId);
+    expect(replay.deduplicated).toBe(true);
+
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]!.idempotencyKey).toBe(deliveryId);
+  }, 60_000);
+
+  it("characterizes the original loss: keyless wakes coalesce into an unrelated active run", async () => {
+    const { companyId, agentId, activeRunId } = await seedBusyAgent();
+
+    // The pre-fix payload shape, sent straight at the heartbeat service. This
+    // pins the mechanism the fix routes around; if coalescing semantics change,
+    // this test should be revisited alongside the invoke path.
+    const run = await heartbeatService(db).wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "pr_review_requested",
+      payload: { prompt: "Review some PR" },
+      requestedByActorType: "system",
+      requestedByActorId: "github-plugin-record-id",
+    });
+
+    expect(run?.id).toBe(activeRunId);
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]!.status).toBe("coalesced");
+    expect(companyId).toBeTruthy();
+  }, 60_000);
+});
