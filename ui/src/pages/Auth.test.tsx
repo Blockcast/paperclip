@@ -11,12 +11,16 @@ import { AuthPage } from "./Auth";
 const getSessionMock = vi.hoisted(() => vi.fn());
 const signInEmailMock = vi.hoisted(() => vi.fn());
 const signUpEmailMock = vi.hoisted(() => vi.fn());
+const signInSocialMock = vi.hoisted(() => vi.fn());
+const signInOAuth2Mock = vi.hoisted(() => vi.fn());
 
 vi.mock("../api/auth", () => ({
   authApi: {
     getSession: () => getSessionMock(),
     signInEmail: (input: unknown) => signInEmailMock(input),
     signUpEmail: (input: unknown) => signUpEmailMock(input),
+    signInSocial: (input: unknown) => signInSocialMock(input),
+    signInOAuth2: (input: unknown) => signInOAuth2Mock(input),
   },
 }));
 
@@ -87,6 +91,8 @@ describe("AuthPage", () => {
     getSessionMock.mockResolvedValue(null);
     signInEmailMock.mockResolvedValue(undefined);
     signUpEmailMock.mockResolvedValue(undefined);
+    signInSocialMock.mockResolvedValue({ url: "https://login.microsoft.example.test" });
+    signInOAuth2Mock.mockResolvedValue({ url: "https://dex.example.test" });
   });
 
   afterEach(() => {
@@ -247,6 +253,23 @@ describe("AuthPage", () => {
       password: "supersecret",
     });
     expect(queryClient.getQueryState(queryKeys.health)?.isInvalidated).toBe(true);
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("offers Google/Dex sign-in before the Microsoft fallback", async () => {
+    const { root } = await mount();
+
+    const buttons = Array.from(container.querySelectorAll("button")).map((button) =>
+      button.textContent?.trim(),
+    );
+
+    expect(buttons).toContain("Sign In");
+    expect(buttons.indexOf("Sign in with Google")).toBeLessThan(
+      buttons.indexOf("Sign in with Microsoft"),
+    );
 
     await act(async () => {
       root.unmount();

@@ -30,8 +30,8 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(runtimeDockerfile).not.toMatch(/npm install[^\n]*\sopencode-ai(?:\s|\\)/);
   });
 
-  it("vendors the claude_k8s adapter commit with runtime isolation, Penstock retry hints, and Opus 5", () => {
-    expect(serverDockerfile).toContain("ARG CLAUDE_K8S_REF=c4f92ffcafbd6b286b291d0ad2e49557401d884d");
+  it("vendors the claude_k8s adapter commit with runtime isolation, Penstock retry hints, Opus 5, and run-cwd diagnostics", () => {
+    expect(serverDockerfile).toContain("ARG CLAUDE_K8S_REF=c9b3b2c1c979d2db121f0c1129a06a38356678e7");
     expect(serverDockerfile).toContain("model-only commit based on the previous");
     expect(serverDockerfile).toContain("without bundling later retry-semantics changes");
     expect(serverDockerfile).toContain("bound the pre-Job live-Job list to 15 seconds");
@@ -65,6 +65,10 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(serverDockerfile).toContain("fail closed on live Jobs with unknown isolation metadata");
     expect(serverDockerfile).toContain("keep telemetry non-fatal");
     expect(serverDockerfile).toContain("map legacy `isolated` labels");
+    expect(serverDockerfile).toContain("stable run root before deleting/recloning");
+    expect(serverDockerfile).toContain("getcwd() /");
+    expect(serverDockerfile).toContain("redacted failed-pod container log tail");
+    expect(serverDockerfile).toContain("execute/job-manifest suite 230/230");
   });
 
   it("vendors the opencode_k8s adapter commit with runtime isolation, the env-dump deny, and Opus 5", () => {

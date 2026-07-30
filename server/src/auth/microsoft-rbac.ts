@@ -1,4 +1,4 @@
-// Microsoft Entra → paperclip RBAC reconciliation (BLO-6295 piece D).
+// OIDC group-claim → paperclip RBAC reconciliation (BLO-6295 piece D).
 //
 // Behavior contract (signed off 2026-05-21):
 //
@@ -20,7 +20,8 @@
 // or the Microsoft Graph client; the periodic reconciler in
 // services/microsoft-group-reconciler.ts and the better-auth hook in
 // auth/better-auth.ts both call `reconcileMicrosoftUser` with whatever
-// group list they have on hand.
+// group list they have on hand. Dex/Google sign-in uses the same underlying
+// reconciler with Workspace group email addresses from the Dex `groups` claim.
 
 import type { Db } from "@paperclipai/db";
 import {
@@ -42,6 +43,18 @@ export interface MicrosoftRbacConfig {
   adminAgentsGroupId: string;
 }
 
+export interface GroupClaimRbacConfig {
+  blockcastCompanyId: string;
+  operatorGroupId: string | null;
+  adminGroupId: string | null;
+  adminApprovalType: string;
+  payloadSource: string;
+}
+
+export interface DexRbacConfig extends GroupClaimRbacConfig {
+  providerId: string;
+}
+
 export function loadMicrosoftRbacConfig(): MicrosoftRbacConfig {
   return {
     blockcastCompanyId:
@@ -50,6 +63,20 @@ export function loadMicrosoftRbacConfig(): MicrosoftRbacConfig {
       process.env.MICROSOFT_SSH_USERS_GROUP_ID?.trim() || DEFAULT_SSH_USERS_GROUP_ID,
     adminAgentsGroupId:
       process.env.MICROSOFT_ADMIN_AGENTS_GROUP_ID?.trim() || DEFAULT_ADMIN_AGENTS_GROUP_ID,
+  };
+}
+
+export function loadDexRbacConfig(): DexRbacConfig {
+  const providerId = process.env.PAPERCLIP_DEX_OIDC_PROVIDER_ID?.trim() || "dex";
+  return {
+    providerId,
+    blockcastCompanyId:
+      process.env.PAPERCLIP_DEX_BLOCKCAST_COMPANY_ID?.trim() || DEFAULT_BLOCKCAST_COMPANY_ID,
+    operatorGroupId: process.env.PAPERCLIP_DEX_OPERATOR_GROUP?.trim() || null,
+    adminGroupId: process.env.PAPERCLIP_DEX_ADMIN_GROUP?.trim() || null,
+    adminApprovalType:
+      process.env.PAPERCLIP_DEX_ADMIN_APPROVAL_TYPE?.trim() || "dex_admin_elevation",
+    payloadSource: "dex_groups_claim",
   };
 }
 
@@ -87,8 +114,13 @@ export interface ReconcileResult {
   observedGroups: string[];
 }
 
+function normalizeGroup(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed.toLowerCase() : null;
+}
+
 /**
- * Apply Entra group membership to paperclip state. Idempotent: safe to
+ * Apply OIDC group membership to paperclip state. Idempotent: safe to
  * call on every signin and from the periodic reconciler — no duplicate
  * memberships, no duplicate approval rows.
  *
@@ -102,18 +134,20 @@ export interface ReconcileResult {
  * be too aggressive a default — a transient Entra outage that returns
  * empty groups would mass-remove the whole team.
  */
-export async function reconcileMicrosoftUser(
+export async function reconcileGroupClaimUser(
   db: Db,
   userId: string,
   groups: string[],
-  config: MicrosoftRbacConfig = loadMicrosoftRbacConfig(),
+  config: GroupClaimRbacConfig,
 ): Promise<ReconcileResult> {
-  const groupSet = new Set(groups);
+  const groupSet = new Set(groups.map(normalizeGroup).filter((g): g is string => Boolean(g)));
+  const operatorGroupId = normalizeGroup(config.operatorGroupId);
+  const adminGroupId = normalizeGroup(config.adminGroupId);
   let addedMembership = false;
   let pendingAdminElevation = false;
 
   // ── ssh-users → Blockcast operator ──────────────────────────────────
-  if (groupSet.has(config.sshUsersGroupId)) {
+  if (operatorGroupId && groupSet.has(operatorGroupId)) {
     const existing = await db
       .select({ id: companyMemberships.id, status: companyMemberships.status })
       .from(companyMemberships)
@@ -148,13 +182,13 @@ export async function reconcileMicrosoftUser(
   }
 
   // ── AdminAgents → pending elevation approval ────────────────────────
-  if (groupSet.has(config.adminAgentsGroupId)) {
+  if (adminGroupId && groupSet.has(adminGroupId)) {
     const existing = await db
       .select({ id: approvals.id })
       .from(approvals)
       .where(
         and(
-          eq(approvals.type, "microsoft_admin_elevation"),
+          eq(approvals.type, config.adminApprovalType),
           eq(approvals.requestedByUserId, userId),
           eq(approvals.status, "pending"),
         ),
@@ -164,14 +198,14 @@ export async function reconcileMicrosoftUser(
     if (existing.length === 0) {
       await db.insert(approvals).values({
         companyId: config.blockcastCompanyId,
-        type: "microsoft_admin_elevation",
+        type: config.adminApprovalType,
         requestedByUserId: userId,
         status: "pending",
         payload: {
           userId,
           detectedAt: new Date().toISOString(),
-          source: "microsoft_groups_claim",
-          adminGroupId: config.adminAgentsGroupId,
+          source: config.payloadSource,
+          adminGroupId: config.adminGroupId,
         },
       });
       pendingAdminElevation = true;
@@ -179,4 +213,28 @@ export async function reconcileMicrosoftUser(
   }
 
   return { addedMembership, pendingAdminElevation, observedGroups: groups };
+}
+
+export async function reconcileMicrosoftUser(
+  db: Db,
+  userId: string,
+  groups: string[],
+  config: MicrosoftRbacConfig = loadMicrosoftRbacConfig(),
+): Promise<ReconcileResult> {
+  return reconcileGroupClaimUser(db, userId, groups, {
+    blockcastCompanyId: config.blockcastCompanyId,
+    operatorGroupId: config.sshUsersGroupId,
+    adminGroupId: config.adminAgentsGroupId,
+    adminApprovalType: "microsoft_admin_elevation",
+    payloadSource: "microsoft_groups_claim",
+  });
+}
+
+export async function reconcileDexUser(
+  db: Db,
+  userId: string,
+  groups: string[],
+  config: DexRbacConfig = loadDexRbacConfig(),
+): Promise<ReconcileResult> {
+  return reconcileGroupClaimUser(db, userId, groups, config);
 }

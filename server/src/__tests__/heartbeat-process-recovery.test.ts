@@ -4235,6 +4235,114 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).toBe(true);
   });
 
+  it("parks a review-waiting continuation when an open child blocker would create a cycle", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const openChildId = randomUUID();
+
+    await db.insert(issues).values({
+      id: openChildId,
+      companyId,
+      parentId: issueId,
+      title: "Child already blocked by parent",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 10,
+      identifier: `${issuePrefix}-10`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId,
+      relatedIssueId: openChildId,
+      type: "blocks",
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.waitingOnReviewResolved).toBe(0);
+    expect(result.reviewWaitingParked).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const parked = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(parked?.status).toBe("in_review");
+    expect(parked?.assigneeAgentId).toBe(agentId);
+
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+    await expect(sourceBlockerIssueIds(companyId, openChildId)).resolves.toEqual([issueId]);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.authorType).toBe("system");
+    expect(comments[0]?.body).toContain("review/approval");
+    expect(comments[0]?.body).not.toContain(`${issuePrefix}-10`);
+    expect(comments[0]?.body).not.toContain("issue_continuation_waiting_on_review");
+  });
+
+  it("parks a review-waiting continuation in_review when the blocker write races a concurrent cycle-forming relation", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const openChildId = randomUUID();
+
+    await db.insert(issues).values({
+      id: openChildId,
+      companyId,
+      parentId: issueId,
+      title: "Child not yet blocked by parent",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 10,
+      identifier: `${issuePrefix}-10`,
+    });
+    // No reverse `blocks` relation is seeded, so the recovery reachability check
+    // (findCycleFormingBlockerIssueIds) will not flag openChildId as cycle-forming - it
+    // only sees a cycle at write time, simulating a relation update that lands between
+    // the check and the write. The real write-time check (assertNoBlockingCycles) runs
+    // inside issuesSvc.update's db.transaction(), so the fault is injected on the first
+    // transaction the reconcile pass opens rather than on db.update directly (that
+    // transaction's tx.update/tx.select calls are a separate client, invisible to a
+    // db.update spy).
+    const transactionSpy = vi.spyOn(db, "transaction");
+    let cycleErrorThrown = false;
+    transactionSpy.mockImplementationOnce(async () => {
+      cycleErrorThrown = true;
+      throw new Error("Blocking relations cannot contain cycles");
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    let result: Awaited<ReturnType<typeof heartbeat.reconcileStrandedAssignedIssues>>;
+    try {
+      result = await heartbeat.reconcileStrandedAssignedIssues();
+    } finally {
+      transactionSpy.mockRestore();
+    }
+
+    expect(cycleErrorThrown).toBe(true);
+    expect(result.waitingOnReviewResolved).toBe(0);
+    expect(result.reviewWaitingParked).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const parked = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(parked?.status).toBe("in_review");
+    expect(parked?.assigneeAgentId).toBe(agentId);
+
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+  });
+
   it("converts a continuation parked for review into a dependency wait on its existing blockers", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
