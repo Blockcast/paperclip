@@ -12293,6 +12293,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(heartbeatRuns)
         .set({
           status: "queued",
+          error: null,
+          errorCode: null,
           updatedAt: now,
         })
         .where(
@@ -13619,6 +13621,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .update(heartbeatRuns)
           .set({
             status: "running",
+            error: null,
+            errorCode: null,
             responsibleUserId,
             startedAt: run.startedAt ?? claimedAt,
             updatedAt: claimedAt,

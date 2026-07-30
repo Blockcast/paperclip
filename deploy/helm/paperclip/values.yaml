@@ -255,6 +255,44 @@ probes:
     periodSeconds: 10
     failureThreshold: 30
 
+# -- Worker StatefulSet probe configuration. The worker role does not bind the
+# HTTP port reliably during startup, but it does run the same Node entrypoint;
+# use a process check for the single StatefulSet pod and keep the API tier on
+# `probes.*` HTTP checks.
+workerProbes:
+  # -- Worker liveness probe.
+  liveness:
+    exec:
+      command:
+        - /bin/sh
+        - -c
+        - "grep -qa 'server/dist/index.js' /proc/[0-9]*/cmdline"
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 2
+    failureThreshold: 3
+  # -- Worker readiness probe.
+  readiness:
+    exec:
+      command:
+        - /bin/sh
+        - -c
+        - "grep -qa 'server/dist/index.js' /proc/[0-9]*/cmdline"
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  # -- Worker startup probe.
+  startup:
+    exec:
+      command:
+        - /bin/sh
+        - -c
+        - "grep -qa 'server/dist/index.js' /proc/[0-9]*/cmdline"
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 30
+
 # -- Node selector.
 nodeSelector: {}
 # -- Tolerations.

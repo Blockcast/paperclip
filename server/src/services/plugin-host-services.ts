@@ -2,6 +2,7 @@ import type { Db } from "@paperclipai/db";
 import {
   activityLog,
   agentTaskSessions as agentTaskSessionsTable,
+  agentWakeupRequests,
   agents as agentsTable,
   approvals as approvalsTable,
   authUsers,
@@ -607,6 +608,12 @@ export function buildHostServices(
   const ensureCompanyId = (companyId?: string) => {
     if (!companyId) throw new Error("companyId is required for this operation");
     return companyId;
+  };
+
+  /** Normalizes an optional string param to a trimmed value or null. */
+  const readNonEmptyParam = (value?: string | null) => {
+    const trimmed = typeof value === "string" ? value.trim() : "";
+    return trimmed.length > 0 ? trimmed : null;
   };
 
   const parseWindowValue = (value: unknown): number | null => {
@@ -2484,11 +2491,53 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
+
+        const taskKey = readNonEmptyParam(params.taskKey);
+        // Namespaced so one plugin's delivery ids can never resolve to another's run.
+        const idempotencyKey = readNonEmptyParam(params.idempotencyKey)
+          ? `plugin:${pluginId}:${readNonEmptyParam(params.idempotencyKey)}`
+          : null;
+
+        // Delivery-level replay guard: a redelivered webhook (same GitHub
+        // delivery id) must resolve to the original run, not a second one.
+        if (idempotencyKey) {
+          const [existing] = await db
+            .select({ runId: agentWakeupRequests.runId })
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.agentId, params.agentId),
+                eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+              ),
+            )
+            .limit(1);
+          if (existing?.runId) return { runId: existing.runId, deduplicated: true };
+        }
+
+        // Wakes that carry no task key all derive `taskKey === null`, and
+        // `isSameTaskScope(null, null)` is true — so before this, every plugin
+        // invoke that landed while the agent already had a run in flight was
+        // coalesced into that run and silently dropped (BLO-18847: nine `@ally`
+        // review requests, no runs). Distinct work must get a distinct scope,
+        // so keyless invokes are made unique rather than defaulting to "same".
+        //
+        // Plugin-supplied keys are namespaced by plugin. Coalescing merges the
+        // incoming snapshot over the target run's, so an un-namespaced key could
+        // be pointed at a live issue-execution run (whose task key is the issue
+        // id) and overwrite its context. Namespacing keeps a plugin's invokes
+        // able to coalesce only with its own.
+        const scopeKey = taskKey
+          ? `plugin:${pluginId}:${taskKey}`
+          : `plugin:${pluginId}:${randomUUID()}`;
+
         const run = await heartbeat.wakeup(params.agentId, {
           source: "automation",
           triggerDetail: "system",
           reason: params.reason ?? null,
-          payload: { prompt: params.prompt },
+          // `enrichWakeContextSnapshot` promotes `payload.taskKey` onto the run's
+          // contextSnapshot, which is what later scope comparisons read back.
+          payload: { prompt: params.prompt, taskKey: scopeKey },
+          idempotencyKey,
           requestedByActorType: "system",
           requestedByActorId: pluginId,
         });
