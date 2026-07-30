@@ -87,66 +87,91 @@ Skip the `Risk and rollback` section only for clearly trivial PRs (typos, docs).
 
 ## Which credential to use (authoring, reviewing, merging)
 
-You have two GitHub identities available, and which one you use decides whether
-the review bot can formally review your PR:
+You have two GitHub identities available, and which one **authors** your PR
+decides whether the PR can receive a formal review at all:
 
-- **Default App-installation token** — identity `app/allyblockcast[bot]`. Works
-  for commits, PR creation, comments, status, and reads. The review bot posts its
-  **comment-mode** reviews under this identity.
+- **Default App-installation token** — identity `app/allyblockcast[bot]`. This is
+  the **authoring identity**: commits, branch push, `gh pr create`, comments,
+  replies, status, reads, and merges. The review bot posts its **comment-mode**
+  reviews under this identity.
 - **User-seat token** — mounted at `/paperclip/.secrets/github-merge-token/token`
   when provisioned. This is the **`allyblockcast` user** account, a *distinct*
   GitHub identity from the `app/allyblockcast[bot]` App. The review bot posts its
-  **formal approvals** under this same seat, and it is the identity used for the
-  final merge.
+  **formal approvals** under this seat. It is *not* an authoring credential.
 
 GitHub forbids an identity from submitting a **formal review** (`APPROVE` /
 `REQUEST_CHANGES`) on a PR it authored, so the author and the reviewer must be
 different identities.
 
-Holding the user-seat token does **not** make you a reviewer. In this workflow it
-is a *push / create / merge* credential and nothing more — the review bot's own
-approvals come from that very same login, which is exactly why you must never
-submit a review under it (see
+Holding the user-seat token does **not** make you a reviewer, and it is not your
+push/create credential either — the review bot's own approvals come from that very
+same login, which is both why authoring under it blocks review and why you must
+never submit a review under it (see
 [Why the user seat must never post a review](#why-the-user-seat-must-never-post-a-review)).
 
-**When the user-seat token is mounted, author your PR under it** — push the
-branch and create the PR with it — and use it for the final merge too:
+**Author and push under the default App token. Never author or push a PR under
+the user-seat token.** No token selection is needed — the default `gh` and `git`
+credentials already are the App token.
+
+### Why seat-authoring breaks review
+
+A PR authored under the seat makes author == approver, so GitHub refuses the
+approval, the review bot silently degrades to a comment-mode review, and the
+`review/ally-complete` gate maps a clean comment-mode review to `pending`, never
+`success`. The PR cannot go green, and no amount of re-requesting review will
+change that.
+
+A PR's author is **fixed at creation**, so there is no in-place fix. If you find
+yourself on a seat-authored PR, the sanctioned recovery is to re-open it under the
+App: close the PR, then re-create it from the *same branch and SHA* with the
+default credential (GitHub permits only one open PR per head/base, so the close
+must come first). No force-push and no CI re-plumbing is needed.
 
 ```sh
-USER_TOKEN_FILE=/paperclip/.secrets/github-merge-token/token
+gh pr close <number> --repo <org>/<repo>
+gh pr create --repo <org>/<repo> --head <same-branch> --base master \
+  --title ... --body-file <file>
+```
 
-# push the branch + open the PR as the allyblockcast USER (formally reviewable)
-PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE" \
-  git -c http.https://github.com/.extraheader= \
-  push -u origin "$(git branch --show-current)"
-PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE" \
-  gh pr create --repo <org>/<repo> --title ... --body ...
+Pushing under the seat is also unsafe where branch protection sets
+`require_last_push_approval` — the most recent pusher cannot approve, so a
+seat-push disqualifies the only identity that can approve and leaves the PR with
+no eligible approver at all. The seat PAT additionally lacks `workflow` scope and
+cannot push `.github/workflows/**`.
 
-# ... later, after the review checklist is satisfied:
-PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE" \
-  gh pr merge <number> --repo <org>/<repo> --squash
+### Confirming which identity you are on
+
+```sh
+gh api user   # 403 "Resource not accessible by integration" == the App token (correct)
+              # 200 with a login == you are on the user seat (wrong for authoring)
 ```
 
 The agent image wraps `gh` and deliberately replaces `GH_TOKEN` with the token
 read from `PAPERCLIP_GITHUB_TOKEN_FILE` on every invocation. Setting `GH_TOKEN`
-does not switch identities in these pods; select the user-seat token file as
-shown above. The same environment override reaches the `gh` credential helper
-used by `git push`.
+does not switch identities in these pods; a token file is the only selector, and
+the same override reaches the `gh` credential helper used by `git push`.
+
+### Merging
+
+Merge under the **default App token** — it holds merge rights on this fleet's
+main repos, and no token selection is needed:
+
+```sh
+gh pr merge <number> --repo <org>/<repo> --squash
+```
 
 Rules:
-- Use the **user-seat token** for the branch push, `gh pr create`, and
-  `gh pr merge`/auto-merge. Use the **default App token** for everything else
-  (comments, replies, status, reads) so the Paperclip↔GitHub integration keeps
-  working.
+- Use the **default App token** for authoring, pushing, commenting, and merging.
 - **Never submit a formal review under the user-seat token.** No `gh pr review`
   with it — not `--approve`, not `--request-changes`, not `--comment`. Never post
   an `ally-verdict:` marker or a `Reviewed head: <sha>` line under it, on a review
   or in a comment. This holds even when the review is honest and even when the
   change is yours: the prohibition is on the *credential*, not on your intent.
-- If the file does **not** exist, the user-seat lane is not provisioned for this
-  repo — do not improvise a token. Author and merge under the default token as
-  before; the review bot will fall back to comment-mode review, and a maintainer
-  lands the merge. Note it on the issue.
+- If merge is refused because branch protection requires an identity the App
+  lacks, that is a **permission gate, not a credential puzzle** — do not reach for
+  the seat to work around it. Note the exact refusal on the issue and escalate;
+  where a repo's required-reviewer rule can only be satisfied by a human or by an
+  org-admin change, no agent-held token can clear it.
 - Only merge when the merge checklist above is satisfied (checks green, comments
   resolved).
 
@@ -165,9 +190,12 @@ review that clears that gate.
 
 So when you are looking at a red `review/ally-complete` on your own PR, the
 sanctioned move is to **get a review** — re-request one (see the repo's review
-handoff convention) and wait. Posting the approval yourself is not a shortcut
-past a slow reviewer; it is a forged review, and it has already shipped a
-data-loss bug to master that the real review had caught.
+handoff convention) and wait. If the PR turns out to be seat-authored, no review
+can clear it and re-requesting is futile; re-open it under the App first, per
+[Why seat-authoring breaks review](#why-seat-authoring-breaks-review). Posting the
+approval yourself is not a shortcut past a slow reviewer; it is a forged review,
+and it has already shipped a data-loss bug to master that the real review had
+caught.
 
 ## Anti-patterns
 
