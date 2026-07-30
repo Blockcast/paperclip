@@ -87,9 +87,10 @@ describe("explicit PR review requests are not absorbed by an in-flight review (B
     ).toBe(false);
   });
 
-  it("leaves push (synchronize) wakes coalescing into a running run as before", () => {
-    // github_pr_synchronized is deduped upstream by a stable repo+pr+reason
-    // idempotency key; forcing a follow-up here would fan out one run per push.
+  it("queues push (synchronize) wakes behind a running same-PR review run", () => {
+    // A running reviewer already snapshotted the old head, so the first push
+    // that lands while it runs needs a queued follow-up for the new head.
+    // Rapid push bursts still coalesce into that queued follow-up.
     expect(
       shouldQueueFollowupInsteadOfAbsorbingIntoRunningRun({
         hasRunningSameScopeRun: true,
@@ -97,7 +98,7 @@ describe("explicit PR review requests are not absorbed by an in-flight review (B
         contextSnapshot: reviewerSnapshot({ wakeReason: "github_pr_synchronized" }),
         wakeCommentId: null,
       }),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("does not apply to the PR author's wake, only the reviewer's", () => {
