@@ -6,8 +6,7 @@ import {
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
 import {
-  __test_buildPrReviewerTaskKey,
-  __test_buildPrReviewerWakeIdempotencyKey,
+  __test_buildPrReviewerWakeupOptions,
   __test_resolveEventContext,
   __test_shouldFirePrReviewerWake,
 } from "../routes/github-webhook.js";
@@ -119,7 +118,7 @@ function allyReview(opts: {
   };
 }
 
-function freshHeadWebhookContext() {
+function freshHeadReviewerWakeup() {
   const context = __test_resolveEventContext("pull_request", {
     action: "synchronize",
     pull_request: {
@@ -135,28 +134,16 @@ function freshHeadWebhookContext() {
   if (!__test_shouldFirePrReviewerWake(context)) {
     throw new Error("expected fresh-head pull_request.synchronize to drive reviewer wake");
   }
-  const taskKey = __test_buildPrReviewerTaskKey(context);
+  const wakeupOptions = __test_buildPrReviewerWakeupOptions(context, "pull_request", "delivery-fresh-head");
+  if (!wakeupOptions.contextSnapshot) {
+    throw new Error("expected reviewer wake enqueue boundary to build a context snapshot");
+  }
+  const taskKey = String(wakeupOptions.contextSnapshot.taskKey ?? "");
   return {
     routeContext: context,
+    wakeupOptions,
     taskKey,
-    contextSnapshot: {
-      taskKey,
-      wakeReason: context.wakeReason,
-      wakeSource: "automation",
-      wakeTriggerDetail: "system",
-      githubEvent: "pull_request",
-      githubDeliveryId: "delivery-fresh-head",
-      githubPrNumber: context.prNumber,
-      githubRepoFullName: context.repoFullName,
-      githubPrTitle: context.prTitle,
-      githubPrUrl: context.prUrl,
-      githubEventUrl: context.eventUrl,
-      githubHeadSha: context.headSha,
-      githubPrAuthorLogin: context.prAuthorLogin,
-      githubPaperclipIdentifiers: context.identifiers,
-      reviewKind: "pr_review" as const,
-      prRole: "reviewer" as const,
-    },
+    contextSnapshot: wakeupOptions.contextSnapshot,
   };
 }
 
@@ -185,8 +172,8 @@ describe("BLO-17518: Ally exact-head re-review replay (old head -> fix push -> r
     expect(reviewSignalForHead([oldReview], NEW_HEAD)).toMatchObject({ state: "pending" });
   });
 
-  it("step 3b: GitHub webhook normalization preserves the fresh head and PR-scoped reviewer queue keys", () => {
-    const { routeContext, taskKey, contextSnapshot } = freshHeadWebhookContext();
+  it("step 3b: GitHub webhook normalization produces a fresh-head reviewer wake at the enqueue boundary", () => {
+    const { routeContext, wakeupOptions, taskKey, contextSnapshot } = freshHeadReviewerWakeup();
     expect(routeContext).toMatchObject({
       identifiers: ["BLO-17456"],
       wakeReason: "github_pr_synchronized",
@@ -195,9 +182,28 @@ describe("BLO-17518: Ally exact-head re-review replay (old head -> fix push -> r
       headSha: NEW_HEAD,
     });
     expect(taskKey).toBe(`pr_review:${REPO}:${PR_NUMBER}`);
-    expect(__test_buildPrReviewerWakeIdempotencyKey(routeContext, "delivery-fresh-head")).toBe(
-      `pr_review:${REPO}:${PR_NUMBER}:github_pr_synchronized`,
-    );
+    expect(wakeupOptions).toMatchObject({
+      source: "automation",
+      triggerDetail: "system",
+      reason: "github_pr_synchronized",
+      idempotencyKey: `pr_review:${REPO}:${PR_NUMBER}:github_pr_synchronized`,
+    });
+    expect(wakeupOptions.payload).toMatchObject({
+      taskKey: `pr_review:${REPO}:${PR_NUMBER}`,
+      source: "github",
+      event: "pull_request",
+      deliveryId: "delivery-fresh-head",
+      prNumber: PR_NUMBER,
+      repoFullName: REPO,
+      headSha: NEW_HEAD,
+      paperclipIdentifiers: ["BLO-17456"],
+      reviewKind: "pr_review",
+    });
+    const producedReviewerRun = {
+      id: "fresh-head-review-run",
+      createdAt: new Date("2026-07-21T08:27:55.000Z"),
+      contextSnapshot,
+    };
     expect(contextSnapshot).toMatchObject({
       taskKey: `pr_review:${REPO}:${PR_NUMBER}`,
       wakeReason: "github_pr_synchronized",
@@ -205,10 +211,14 @@ describe("BLO-17518: Ally exact-head re-review replay (old head -> fix push -> r
       reviewKind: "pr_review",
       prRole: "reviewer",
     });
+    expect(producedReviewerRun.contextSnapshot).toMatchObject({
+      taskKey: `pr_review:${REPO}:${PR_NUMBER}`,
+      githubHeadSha: NEW_HEAD,
+    });
   });
 
   it("step 4: a run against the fresh new-head review-request that leaves no durable evidence is retry-eligible, not stranded (BLO-17456 AC2 / PR #767)", () => {
-    const { contextSnapshot: freshHeadContext } = freshHeadWebhookContext();
+    const { contextSnapshot: freshHeadContext } = freshHeadReviewerWakeup();
     const missingEvidence = evaluatePrReviewCompletionEvidence(freshHeadContext, {
       summary: `Fetching PR metadata and diff for head ${NEW_HEAD.slice(0, 7)}; investigating findings.`,
     });
@@ -235,41 +245,56 @@ describe("BLO-17518: Ally exact-head re-review replay (old head -> fix push -> r
   });
 
   it("step 4b: the retry does not get starved behind a backlog of unrelated review wakes (dispatch-fairness)", () => {
+    const { contextSnapshot: freshHeadContext } = freshHeadReviewerWakeup();
     const now = new Date("2026-07-21T08:40:00.000Z");
-    const agedBeyondCutoff = PR_REVIEW_QUEUE_FAIRNESS_MAX_WAIT_MS + 60_000;
+    const targetAge = PR_REVIEW_QUEUE_FAIRNESS_MAX_WAIT_MS + 60_000;
 
     const freshRetryRun = {
       id: "retry-of-fresh-head-review",
       // Queued at the fresh review-request event (08:27:55Z in the incident);
       // by 08:40:00Z it has aged past the fairness cutoff.
-      createdAt: new Date(now.getTime() - agedBeyondCutoff),
-      contextSnapshot: { taskKey: `pr_review:${REPO}:${PR_NUMBER}`, githubHeadSha: NEW_HEAD },
+      createdAt: new Date(now.getTime() - targetAge),
+      contextSnapshot: freshHeadContext,
     };
-    // A burst of unrelated pr_review wakes across other repos, queued ahead of
-    // (i.e. older than, ordered by createdAt) the fresh, merge-blocking one is
-    // not required for FIFO to explain the incident — the incident was that
-    // Ally's concurrency cap is 1, so *any* queued unrelated review, regardless
-    // of relative age, blocks the fresh one until fairness promotes it.
-    const unrelatedBacklog = [
-      { id: "unrelated-review-1", createdAt: new Date(now.getTime() - 5 * 60_000), contextSnapshot: { taskKey: "pr_review:Blockcast/onprem-k8s:42" } },
-      { id: "unrelated-review-2", createdAt: new Date(now.getTime() - 2 * 60_000), contextSnapshot: { taskKey: "pr_review:Blockcast/hindsight:7" } },
+    // Older unrelated PR-review wakes are genuinely ahead of the fresh,
+    // merge-blocking retry in createdAt/FIFO order. Under sustained mixed load,
+    // fairness must eventually promote the target once older aged reviews have
+    // had their turns and issue work has broken the no-two-reviews-in-a-row
+    // guard.
+    const olderUnrelatedBacklog = [
+      {
+        id: "older-unrelated-review-1",
+        createdAt: new Date(now.getTime() - (PR_REVIEW_QUEUE_FAIRNESS_MAX_WAIT_MS + 8 * 60_000)),
+        contextSnapshot: { taskKey: "pr_review:Blockcast/onprem-k8s:42" },
+      },
+      {
+        id: "older-unrelated-review-2",
+        createdAt: new Date(now.getTime() - (PR_REVIEW_QUEUE_FAIRNESS_MAX_WAIT_MS + 4 * 60_000)),
+        contextSnapshot: { taskKey: "pr_review:Blockcast/hindsight:7" },
+      },
     ];
-    const queue = [freshRetryRun, ...unrelatedBacklog];
+    const afterIssueWork = { contextSnapshot: { issueId: "unrelated-issue-work" } };
+    const afterReviewWork = { contextSnapshot: { reviewKind: "pr_review" } };
+    const queue = [...olderUnrelatedBacklog, freshRetryRun];
+
+    expect(selectAgedPrReviewRunForFairDispatch(queue, afterIssueWork, now)).toBe("older-unrelated-review-1");
 
     // While the last-started run was itself a pr_review, fairness must not
     // promote a second one consecutively (the exact-head fix landing does not
     // get to monopolize the reviewer ahead of ordinary priority).
     expect(
-      selectAgedPrReviewRunForFairDispatch(queue, { contextSnapshot: { reviewKind: "pr_review" } }, now),
+      selectAgedPrReviewRunForFairDispatch(queue.slice(1), afterReviewWork, now),
     ).toBeNull();
 
-    // Once the last-started run was issue work (not a review), the fairness
-    // fix promotes the OLDEST aged review — the fresh, merge-blocking one —
-    // ahead of the fresher unrelated backlog entries, instead of leaving it to
-    // rot behind FIFO/priority ordering indefinitely.
-    expect(
-      selectAgedPrReviewRunForFairDispatch(queue, { contextSnapshot: { issueId: "unrelated-issue-work" } }, now),
-    ).toBe(freshRetryRun.id);
+    const afterFirstOlderReview = queue.slice(1);
+    expect(selectAgedPrReviewRunForFairDispatch(afterFirstOlderReview, afterIssueWork, now)).toBe(
+      "older-unrelated-review-2",
+    );
+
+    const afterOlderReviewsClear = [freshRetryRun];
+    expect(selectAgedPrReviewRunForFairDispatch(afterOlderReviewsClear, afterIssueWork, now)).toBe(
+      freshRetryRun.id,
+    );
   });
 
   it("step 5-6: the exact new-head review lands and flips review/ally-complete to success", () => {

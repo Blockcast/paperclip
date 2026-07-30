@@ -973,6 +973,65 @@ function buildPrReviewerTaskKey(context: ResolvedEventContext & { prNumber: numb
   return `pr_review:${repo}:${context.prNumber}`;
 }
 
+type PrReviewerWakeupOptions = NonNullable<Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1]> & {
+  payload: Record<string, unknown> & { taskKey: string };
+  contextSnapshot: Record<string, unknown> & { taskKey: string };
+  idempotencyKey: string;
+};
+
+function buildPrReviewerWakeupOptions(
+  context: ResolvedEventContext & { prNumber: number },
+  eventName: string,
+  deliveryId: string | null,
+): PrReviewerWakeupOptions {
+  const reviewerTaskKey = buildPrReviewerTaskKey(context);
+  const idempotencyKey = buildPrReviewerWakeIdempotencyKey(context, deliveryId);
+
+  return {
+    source: "automation",
+    triggerDetail: "system",
+    reason: context.wakeReason,
+    payload: {
+      taskKey: reviewerTaskKey,
+      source: "github",
+      event: eventName,
+      deliveryId,
+      prNumber: context.prNumber,
+      repoFullName: context.repoFullName,
+      prUrl: context.prUrl,
+      eventUrl: context.eventUrl,
+      headSha: context.headSha,
+      paperclipIdentifiers: context.identifiers,
+      commentId: context.commentId,
+      commentAuthorLogin: context.commentAuthorLogin,
+      reviewKind: "pr_review",
+    },
+    contextSnapshot: {
+      taskKey: reviewerTaskKey,
+      wakeReason: context.wakeReason,
+      wakeSource: "automation",
+      wakeTriggerDetail: "system",
+      commentSource: "github",
+      githubEvent: eventName,
+      githubDeliveryId: deliveryId,
+      githubPrNumber: context.prNumber,
+      githubRepoFullName: context.repoFullName,
+      ...githubContextMetadata(context),
+      ...(context.commentId ? { githubCommentId: context.commentId } : {}),
+      ...(context.commentAuthorLogin
+        ? { githubPrReviewRequestAuthorLogin: context.commentAuthorLogin }
+        : {}),
+      ...(context.commentBody ? { githubPrReviewRequestBody: context.commentBody } : {}),
+      reviewKind: "pr_review",
+      prRole: "reviewer",
+    },
+    // Open/ready/review-submitted events stay one wake per PR+reason.
+    // @ally comment requests are scoped to the GitHub comment id so a
+    // later explicit re-review comment can wake Ally again.
+    idempotencyKey,
+  };
+}
+
 function configuredPrReviewerAgentIds(config: GithubWebhookConfig): string[] {
   return [
     ...new Set(
@@ -1479,10 +1538,11 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           pluginWorkerManager: config.pluginWorkerManager,
           ...config.heartbeatOptions,
         });
-        const reviewerTaskKey = buildPrReviewerTaskKey(context);
+        const reviewerWakeupOptions = buildPrReviewerWakeupOptions(context, eventName, deliveryId);
+        const reviewerTaskKey = String(reviewerWakeupOptions.payload?.taskKey ?? "");
+        const idempotencyKey = reviewerWakeupOptions.idempotencyKey;
         // taskKey scopes active-run coalescing; idempotencyKey scopes duplicate
         // request rows for the same PR+reason before enqueueing.
-        const idempotencyKey = buildPrReviewerWakeIdempotencyKey(context, deliveryId);
         return await withPrReviewerTaskLock(db, reviewerTaskKey, async (tx) => {
           // The wake insert commits through heartbeat's own transaction. Keep
           // this transaction-scoped lock held until that commit is visible so
@@ -1533,49 +1593,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             return false;
           }
 
-          await heartbeat.wakeup(reviewerAgentId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: context.wakeReason,
-            payload: {
-              taskKey: reviewerTaskKey,
-              source: "github",
-              event: eventName,
-              deliveryId,
-              prNumber: context.prNumber,
-              repoFullName: context.repoFullName,
-              prUrl: context.prUrl,
-              eventUrl: context.eventUrl,
-              headSha: context.headSha,
-              paperclipIdentifiers: context.identifiers,
-              commentId: context.commentId,
-              commentAuthorLogin: context.commentAuthorLogin,
-              reviewKind: "pr_review",
-            },
-            contextSnapshot: {
-              taskKey: reviewerTaskKey,
-              wakeReason: context.wakeReason,
-              wakeSource: "automation",
-              wakeTriggerDetail: "system",
-              commentSource: "github",
-              githubEvent: eventName,
-              githubDeliveryId: deliveryId,
-              githubPrNumber: context.prNumber,
-              githubRepoFullName: context.repoFullName,
-              ...githubContextMetadata(context),
-              ...(context.commentId ? { githubCommentId: context.commentId } : {}),
-              ...(context.commentAuthorLogin
-                ? { githubPrReviewRequestAuthorLogin: context.commentAuthorLogin }
-                : {}),
-              ...(context.commentBody ? { githubPrReviewRequestBody: context.commentBody } : {}),
-              reviewKind: "pr_review",
-              prRole: "reviewer",
-            },
-            // Open/ready/review-submitted events stay one wake per PR+reason.
-            // @ally comment requests are scoped to the GitHub comment id so a
-            // later explicit re-review comment can wake Ally again.
-            idempotencyKey,
-          });
+          await heartbeat.wakeup(reviewerAgentId, reviewerWakeupOptions);
           return true;
         });
       } catch (err) {
@@ -2161,6 +2179,7 @@ export const __test_shouldFirePrReviewerWake = shouldFirePrReviewerWake;
 export const __test_isReviewerSelfEchoReview = isReviewerSelfEchoReview;
 export const __test_buildPrReviewerWakeIdempotencyKey = buildPrReviewerWakeIdempotencyKey;
 export const __test_buildPrReviewerTaskKey = buildPrReviewerTaskKey;
+export const __test_buildPrReviewerWakeupOptions = buildPrReviewerWakeupOptions;
 export const __test_resolveDependabotAlertContext = resolveDependabotAlertContext;
 export const __test_hasActionablePrReviewFeedback = hasActionablePrReviewFeedback;
 export const __test_buildIssueBackLinkBody = buildIssueBackLinkBody;
