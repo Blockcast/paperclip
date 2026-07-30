@@ -4353,6 +4353,16 @@ export function issueService(db: Db) {
     }
   }
 
+  function issueCommentIdempotencyAuthorScope(actor: { agentId?: string | null; userId?: string | null }) {
+    if (actor.agentId) {
+      return and(eq(issueComments.authorAgentId, actor.agentId), isNull(issueComments.authorUserId));
+    }
+    if (actor.userId) {
+      return and(eq(issueComments.authorUserId, actor.userId), isNull(issueComments.authorAgentId));
+    }
+    return and(isNull(issueComments.authorAgentId), isNull(issueComments.authorUserId));
+  }
+
   function redactIssueComment<T extends {
     body: string;
     authorType?: string | null;
@@ -9238,13 +9248,19 @@ export function issueService(db: Db) {
       });
     },
 
-    getCommentByIdempotencyKey: async (issueId: string, idempotencyKey: string, dbOrTx: any = db) => {
+    getCommentByIdempotencyKey: async (
+      issueId: string,
+      idempotencyKey: string,
+      actor: { agentId?: string | null; userId?: string | null },
+      dbOrTx: any = db,
+    ) => {
       const comment = await dbOrTx
         .select()
         .from(issueComments)
         .where(and(
           eq(issueComments.issueId, issueId),
           eq(issueComments.idempotencyKey, idempotencyKey),
+          issueCommentIdempotencyAuthorScope(actor),
           isNull(issueComments.deletedAt),
         ))
         .then((rows: Array<typeof issueComments.$inferSelect>) => rows[0] ?? null);
@@ -9254,6 +9270,18 @@ export function issueService(db: Db) {
         enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
       };
       return redactIssueComment(comment, currentUserRedactionOptions.enabled);
+    },
+
+    markCommentIdempotencyProcessed: async (commentId: string, dbOrTx: any = db) => {
+      await dbOrTx
+        .update(issueComments)
+        .set({ idempotencyProcessedAt: new Date() })
+        .where(and(
+          eq(issueComments.id, commentId),
+          isNotNull(issueComments.idempotencyKey),
+          isNull(issueComments.idempotencyProcessedAt),
+          isNull(issueComments.deletedAt),
+        ));
     },
 
     addComment: async (
@@ -9315,6 +9343,7 @@ export function issueService(db: Db) {
             .where(and(
               eq(issueComments.issueId, issueId),
               eq(issueComments.idempotencyKey, options.idempotencyKey),
+              issueCommentIdempotencyAuthorScope(actor),
               isNull(issueComments.deletedAt),
             ))
             .then((rows: Array<typeof issueComments.$inferSelect>) => rows[0] ?? null)

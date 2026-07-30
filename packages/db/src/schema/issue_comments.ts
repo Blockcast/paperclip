@@ -30,6 +30,7 @@ export const issueComments = pgTable(
     derivedCreatedByRunId: uuid("derived_created_by_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     derivedAuthorSource: text("derived_author_source").$type<IssueCommentDerivedAuthorSource>(),
     idempotencyKey: text("idempotency_key"),
+    idempotencyProcessedAt: timestamp("idempotency_processed_at", { withTimezone: true }),
     body: text("body").notNull(),
     presentation: jsonb("presentation").$type<IssueCommentPresentation | null>(),
     metadata: jsonb("metadata").$type<IssueCommentMetadata | null>(),
@@ -45,9 +46,15 @@ export const issueComments = pgTable(
   (table) => ({
     issueIdx: index("issue_comments_issue_idx").on(table.issueId),
     companyIdx: index("issue_comments_company_idx").on(table.companyId),
-    issueIdempotencyIdx: uniqueIndex("issue_comments_issue_idempotency_idx")
+    issueAgentIdempotencyIdx: uniqueIndex("issue_comments_issue_agent_idempotency_idx")
+      .on(table.issueId, table.authorAgentId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} IS NOT NULL AND ${table.authorAgentId} IS NOT NULL AND ${table.deletedAt} IS NULL`),
+    issueUserIdempotencyIdx: uniqueIndex("issue_comments_issue_user_idempotency_idx")
+      .on(table.issueId, table.authorUserId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} IS NOT NULL AND ${table.authorUserId} IS NOT NULL AND ${table.deletedAt} IS NULL`),
+    issueSystemIdempotencyIdx: uniqueIndex("issue_comments_issue_system_idempotency_idx")
       .on(table.issueId, table.idempotencyKey)
-      .where(sql`${table.idempotencyKey} IS NOT NULL AND ${table.deletedAt} IS NULL`),
+      .where(sql`${table.idempotencyKey} IS NOT NULL AND ${table.authorAgentId} IS NULL AND ${table.authorUserId} IS NULL AND ${table.deletedAt} IS NULL`),
     companyIssueCreatedAtIdx: index("issue_comments_company_issue_created_at_idx").on(
       table.companyId,
       table.issueId,

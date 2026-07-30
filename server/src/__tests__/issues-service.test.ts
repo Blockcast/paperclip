@@ -418,6 +418,34 @@ describeEmbeddedPostgres("issueService.addComment idempotency", () => {
     expect(comments).toHaveLength(1);
   });
 
+  it("scopes comment idempotency keys to the authenticated author", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "BLO",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Agent health and stalled-issue alerts",
+      status: "done",
+      priority: "medium",
+    });
+
+    const key = "agent-health:2026-07-30T12:00:00.000Z:shared-fingerprint";
+    const first = await svc.addComment(issueId, "Alice alert", { userId: "alice" }, { idempotencyKey: key });
+    const second = await svc.addComment(issueId, "Bob alert", { userId: "bob" }, { idempotencyKey: key });
+    const replay = await svc.addComment(issueId, "Alice alert replay", { userId: "alice" }, { idempotencyKey: key });
+
+    expect(second.id).not.toBe(first.id);
+    expect(replay).toMatchObject({ id: first.id, body: first.body, deduplicated: true });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(2);
+  });
+
   it("keeps different fingerprints in the same window distinct", async () => {
     const companyId = randomUUID();
     const issueId = randomUUID();
