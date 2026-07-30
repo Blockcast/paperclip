@@ -341,6 +341,28 @@ function isNonRetryableTerminalRun(latestRun: LatestIssueRun) {
   return Boolean(errorCode && NON_RETRYABLE_RUN_ERROR_CODES.has(errorCode));
 }
 
+// BLO-18860: `issue_checkout_adopted` is a HANDOVER marker, not a failure.
+// `adoptStaleCheckoutRun`/`adoptUnownedCheckoutRun` (services/issues.ts) cancel
+// an issue's older context runs when a *live* run of the same assignee writes to
+// that issue, and deliberately keep the adopting run alive (`keepRunId`). The
+// cancellation is bookkeeping about the run that lost the checkout; it says
+// nothing about the issue's health, so it must never be the evidence that
+// escalates the issue away from the agent whose write produced it. Observed live
+// on BLO-18237 (2026-07-30): CTO — the assignee — PATCHed a stale issue at
+// 02:40:42Z (200 OK, adoption), and 25s later the resulting cancellation was
+// classified as a stranded-work failure and the issue was reassigned CTO → CEO
+// and flipped to `blocked`, taking CTO's write access with it.
+const CHECKOUT_ADOPTED_RUN_ERROR_CODE = "issue_checkout_adopted";
+
+function isCheckoutAdoptionCancelledRun(
+  latestRun: LatestIssueRun,
+): latestRun is NonNullable<LatestIssueRun> {
+  return (
+    latestRun?.status === "cancelled" &&
+    readNonEmptyString(latestRun.errorCode) === CHECKOUT_ADOPTED_RUN_ERROR_CODE
+  );
+}
+
 function buildNonRetryableEscalationComment(input: {
   status: "todo" | "in_progress";
   latestRun: LatestIssueRun;
@@ -952,20 +974,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return (await evaluateAgentInvokabilityFromDb(db, agent)).invokable;
   }
 
+  // Column set behind `LatestIssueRun`. Shared by every helper that produces
+  // run evidence for the recovery classifiers so the shapes cannot drift apart.
+  const LATEST_ISSUE_RUN_COLUMNS = {
+    id: heartbeatRuns.id,
+    agentId: heartbeatRuns.agentId,
+    status: heartbeatRuns.status,
+    error: heartbeatRuns.error,
+    errorCode: heartbeatRuns.errorCode,
+    contextSnapshot: heartbeatRuns.contextSnapshot,
+    livenessState: heartbeatRuns.livenessState,
+    resultJson: heartbeatRuns.resultJson,
+    usageJson: heartbeatRuns.usageJson,
+    createdAt: heartbeatRuns.createdAt,
+  } as const;
+
   async function getLatestIssueRun(companyId: string, issueId: string): Promise<LatestIssueRun> {
     return db
-      .select({
-        id: heartbeatRuns.id,
-        agentId: heartbeatRuns.agentId,
-        status: heartbeatRuns.status,
-        error: heartbeatRuns.error,
-        errorCode: heartbeatRuns.errorCode,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
-        livenessState: heartbeatRuns.livenessState,
-        resultJson: heartbeatRuns.resultJson,
-        usageJson: heartbeatRuns.usageJson,
-        createdAt: heartbeatRuns.createdAt,
-      })
+      .select(LATEST_ISSUE_RUN_COLUMNS)
       .from(heartbeatRuns)
       .where(
         and(
@@ -974,6 +1000,29 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         ),
       )
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  // BLO-18860: the run that took over `adoptedRun`'s checkout — i.e. the run the
+  // issue's execution lock now points at. `getLatestIssueRun` cannot find it:
+  // that query matches on `contextSnapshot ->> 'issueId'`, and the hazardous
+  // adoption is precisely an agent touching a *stale other* issue from a run
+  // scoped to a different issue, so the adopting run carries someone else's
+  // issueId (or none). Returns null when the lock no longer names a different
+  // run, in which case there is no successor evidence to judge the issue on.
+  async function getCheckoutAdoptingRun(
+    issue: Pick<typeof issues.$inferSelect, "companyId" | "executionRunId" | "checkoutRunId">,
+    adoptedRun: NonNullable<LatestIssueRun>,
+  ): Promise<LatestIssueRun> {
+    const adoptingRunId = issue.executionRunId ?? issue.checkoutRunId;
+    if (!adoptingRunId || adoptingRunId === adoptedRun.id) return null;
+    return db
+      .select(LATEST_ISSUE_RUN_COLUMNS)
+      .from(heartbeatRuns)
+      .where(
+        and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, adoptingRunId)),
+      )
       .limit(1)
       .then((rows) => rows[0] ?? null);
   }
@@ -4457,26 +4506,53 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           missingDisposition: input.successfulRunHandoffEvidence.missingDisposition,
         });
       }
+      // BLO-18860: a recovery escalation that moves the issue to a NEW owner is
+      // a transfer of write access away from the previous assignee — after it,
+      // that agent's `allow_self` grant is gone and its next PATCH/comment on
+      // the issue 403s. Make the transfer legible in the issue history (naming
+      // the recovery action AND the cause) instead of only in
+      // `activeRecoveryAction`, so the previous owner and any reader can see
+      // who owns it now and why. `fresh` was read before the status/assignee
+      // update below, so its `assigneeAgentId` is the pre-transfer owner.
+      const reassignsAssignee = Boolean(
+        action.ownerAgentId && action.ownerAgentId !== fresh.assigneeAgentId,
+      );
+      // Stable dedup key for the transfer announcement: one comment per
+      // (recovery action, new owner), so a repeated escalation to the SAME
+      // owner stays silent while a transfer to a new owner is always announced.
+      const reassignmentMarker = `Reassigned by recovery action \`${action.id}\` to owner \`${action.ownerAgentId}\``;
       const recoveryLine = action.ownerAgentId
         ? [
           "",
-          `- Recovery action: \`${action.id}\``,
+          `- Recovery action: \`${action.id}\` (cause \`${recoveryCause}\`, attempt ${action.attemptCount})`,
           `- Recovery owner: ${agentUiLink(recoveryOwner, prefix)}`,
+          ...(reassignsAssignee
+            ? [
+              `- ${reassignmentMarker}: taken over from ${agentUiLink(sourceAssignee, prefix)}, which can no longer PATCH or comment on this issue as its assignee.`,
+            ]
+            : []),
           "- Next action: the recovery owner should restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
         ].join("\n")
         : [
           "",
-          `- Recovery action: \`${action.id}\``,
+          `- Recovery action: \`${action.id}\` (cause \`${recoveryCause}\`, attempt ${action.attemptCount})`,
           "- Recovery owner: board escalation, because Paperclip could not find an invokable manager, creator, or executive owner with budget available.",
           "- Next action: a board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
         ].join("\n");
 
+      // A later attempt normally stays silent (one comment per action), but a
+      // reassignment on that attempt must still be announced. The notice path
+      // keeps its own metadata-based dedup, so leave it on the original gate.
+      const announcesReassignment = reassignsAssignee && !notice;
       const shouldPostEscalationComment =
         action.attemptCount === 1 ||
         recoveryCause === "workspace_validation_failed" ||
-        recoveryCause === "configuration_incomplete";
+        recoveryCause === "configuration_incomplete" ||
+        announcesReassignment;
       if (shouldPostEscalationComment) {
-        const escalationCommentMarker = `Recovery action: \`${action.id}\``;
+        const escalationCommentMarker = announcesReassignment
+          ? reassignmentMarker
+          : `Recovery action: \`${action.id}\``;
         const hasEscalationComment = await db
           .select({ id: issueComments.id, body: issueComments.body, metadata: issueComments.metadata })
           .from(issueComments)
@@ -4909,6 +4985,34 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      // BLO-18860: never judge an issue on a checkout-adoption cancellation.
+      // The adopting run is by construction the assignee's own *live* run, so
+      // this issue has continuity, not a lost execution path — but the
+      // `hasActiveExecutionPath` check above cannot see that run (it matches on
+      // `contextSnapshot ->> 'issueId'`, and the adopting run is scoped to
+      // whichever issue its own dispatch was for). Left unhandled, the handover
+      // marker is the newest run row for this issue, reads as
+      // terminal-unsuccessful, and escalates the issue away from the agent that
+      // had just written to it. Resolve the evidence to the adopting run
+      // instead: live same-assignee run → continuity, otherwise judge the issue
+      // on that run's real outcome so no escalation ever cites
+      // `issue_checkout_adopted` as its cause.
+      if (isCheckoutAdoptionCancelledRun(latestRun)) {
+        const adoptingRun = await getCheckoutAdoptingRun(issue, latestRun);
+        // Compare against the assignee, not `agentId`: adoption is only ever
+        // performed by the assignee's own run (`adoptStaleCheckoutRun` requires
+        // `assigneeAgentId = actor`), and on an `in_review` issue `agentId` is
+        // the review participant instead.
+        if (
+          adoptingRun &&
+          adoptingRun.agentId === issue.assigneeAgentId &&
+          !isTerminalIssueRun(adoptingRun)
+        ) {
+          result.skipped += 1;
+          continue;
+        }
+        latestRun = adoptingRun;
+      }
       if (latestRun?.status === "succeeded" && await hasPersistedDurableWaitPath(issue)) {
         result.skipped += 1;
         continue;
