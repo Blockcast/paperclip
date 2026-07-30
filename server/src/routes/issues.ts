@@ -10240,6 +10240,17 @@ export function issueRoutes(
       res.status(409).json({ error: "Issue follow-up blocked by unresolved blockers" });
       return;
     }
+    if (req.body.idempotencyKey) {
+      const existingComment = await svc.getCommentByIdempotencyKey(id, req.body.idempotencyKey);
+      if (existingComment) {
+        res.status(200).json({ ...existingComment, deduplicated: true });
+        return;
+      }
+      if (effectiveMoveToTodoRequested) {
+        res.status(400).json({ error: "Idempotent comments cannot change issue state" });
+        return;
+      }
+    }
     let reopened = false;
     let reopenFromStatus: string | null = null;
     let interruptedRunId: string | null = null;
@@ -10398,6 +10409,11 @@ export function issueRoutes(
         actorMatchesExecutionParticipant(actor, currentExecutionState.currentParticipant ?? null) &&
         isApprovalReviewComment(req.body.body);
 
+      if (req.body.idempotencyKey && shouldAutoApproveReviewComment) {
+        res.status(400).json({ error: "Idempotent comments cannot approve review stages" });
+        return;
+      }
+
       // Persist the comment and the auto-approval state transition atomically when both apply.
       // Without a single transaction, a later status-update error would leave an orphan comment.
       if (shouldAutoApproveReviewComment) {
@@ -10521,6 +10537,7 @@ export function issueRoutes(
           authorType: req.body.authorType ?? (actor.actorType === "agent" ? "agent" : "user"),
           presentation: req.body.presentation ?? null,
           metadata: req.body.metadata ?? null,
+          idempotencyKey: req.body.idempotencyKey ?? null,
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
         });
       }
@@ -10528,6 +10545,11 @@ export function issueRoutes(
 
     if (!comment) {
       throw new Error("Issue comment was not persisted");
+    }
+
+    if ("deduplicated" in comment && comment.deduplicated) {
+      res.status(200).json(comment);
+      return;
     }
 
     if (commentReferenceDiff === null) {

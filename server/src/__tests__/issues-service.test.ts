@@ -370,6 +370,112 @@ describe("deriveIssueCommentRunLogAttribution", () => {
   });
 });
 
+describeEmbeddedPostgres("issueService.addComment idempotency", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-comment-idempotency-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issues);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("suppresses a same-window unchanged fingerprint even when the renderer changes", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "BLO",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Agent health and stalled-issue alerts",
+      status: "done",
+      priority: "medium",
+    });
+
+    const idempotencyKey = "agent-health:2026-07-30T12:00:00.000Z:7bedaee78643280797da9151a9d5a08572aaa17d7e345c884069924f040fdc0c";
+    const first = await svc.addComment(issueId, "13:38 renderer payload\n", {}, { idempotencyKey });
+    const second = await svc.addComment(issueId, "13:39 renderer payload in a new format", {}, { idempotencyKey });
+
+    expect(second).toMatchObject({ id: first.id, body: first.body, deduplicated: true });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+  });
+
+  it("keeps different fingerprints in the same window distinct", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "BLO",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Agent health and stalled-issue alerts",
+      status: "done",
+      priority: "medium",
+    });
+
+    await svc.addComment(issueId, "First alert set", {}, {
+      idempotencyKey: "agent-health:2026-07-30T12:00:00.000Z:fingerprint-a",
+    });
+    await svc.addComment(issueId, "Meaningfully changed alert set", {}, {
+      idempotencyKey: "agent-health:2026-07-30T12:00:00.000Z:fingerprint-b",
+    });
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(2);
+  });
+
+  it("serializes concurrent emits for the same window and fingerprint", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "BLO",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Agent health and stalled-issue alerts",
+      status: "done",
+      priority: "medium",
+    });
+
+    const key = "agent-health:2026-07-30T12:00:00.000Z:7bedaee78643280797da9151a9d5a08572aaa17d7e345c884069924f040fdc0c";
+    const [first, second] = await Promise.all([
+      issueService(db).addComment(issueId, "13:38 payload", {}, { idempotencyKey: key }),
+      issueService(db).addComment(issueId, "13:39 payload", {}, { idempotencyKey: key }),
+    ]);
+
+    expect(first.id).toBe(second.id);
+    expect(["deduplicated" in first, "deduplicated" in second]).toContain(true);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+  });
+});
+
 async function ensureIssueRelationsTable(db: ReturnType<typeof createDb>) {
   await db.execute(sql.raw(`
     CREATE TABLE IF NOT EXISTS "issue_relations" (
