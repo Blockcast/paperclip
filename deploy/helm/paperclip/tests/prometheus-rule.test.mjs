@@ -139,6 +139,16 @@ test("PaperclipGithubReviewRequestDeadLettered fires on any dead-lettered delive
     /state="dead_lettered"\}\[[^\]]+\]\)\) > 0/,
     "dead-letter alert must fire only on a strictly positive increase",
   );
+  // BLO-18859 review follow-up: the durable-gauge arm. Without it a dead letter
+  // recorded before the first scrape (no baseline for increase()) or one whose
+  // pod is replaced before `for` elapses (series retires out of the range) is
+  // silently un-alertable — a terminal loss that pages nobody. The gauge is
+  // re-derived from committed rows every reconcile pass, so it survives both.
+  assert.match(
+    rendered,
+    /or \(sum\(paperclip_github_review_request_dead_letter_unresolved\) > 0\)/,
+    "dead-letter alert must also key on the restart-safe durable gauge",
+  );
 });
 
 test("PaperclipGithubReviewRequestSuppressionOutage pages on outage-like causes only (BLO-18859)", () => {

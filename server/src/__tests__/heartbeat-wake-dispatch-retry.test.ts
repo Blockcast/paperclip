@@ -20,6 +20,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import { heartbeatService } from "../services/heartbeat.js";
 import {
+  GITHUB_REVIEW_REQUEST_DEAD_LETTER_UNRESOLVED_METRIC,
   GITHUB_REVIEW_REQUEST_DELIVERY_METRIC,
   GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC,
   __resetMetricsForTest,
@@ -792,6 +793,168 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         expect(await deliveryCount("deferred")).toBe(0);
         expect(await deliveryCount("suppressed")).toBe(0);
         expect(await suppressionCount()).toBe(0);
+      });
+
+      it("settles a deferred delivery as `queued` when its scheduled retry is promoted", async () => {
+        const { agentId } = await seedCompanyAndAgent();
+
+        expect(
+          await heartbeatWithCapacityDenied().wakeup(agentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "github_pr_review_submitted",
+            payload: GITHUB_REVIEW_PAYLOAD,
+          }),
+        ).toBeNull();
+        expect(await deliveryCount("deferred")).toBe(1);
+        // The gap this test exists for: before the promotion path counted the
+        // settle, a successfully-delayed review sat here permanently, reading
+        // `deferred=1, queued=0` — arithmetically identical to a lost delivery.
+        expect(await deliveryCount("queued")).toBe(0);
+
+        // Make the parked retry due. The gate returned resumeAt=null, so it was
+        // scheduled a full backoff into the future.
+        await db
+          .update(heartbeatRuns)
+          .set({ scheduledRetryAt: new Date(Date.now() - 60_000) })
+          .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "scheduled_retry")));
+
+        // A pass with capacity available (the default gate allows) promotes it.
+        await heartbeatService(db, { skipQueuedRunDispatch: true }).promoteDueScheduledRetries(new Date());
+
+        const runs = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, agentId));
+        expect(runs.map((row) => row.status)).toContain("queued");
+
+        // Funnel closed, and closed exactly once — no terminal-loss state was
+        // reached on the way.
+        expect(await deliveryCount("queued")).toBe(1);
+        expect(await deliveryCount("suppressed")).toBe(0);
+        expect(await deliveryCount("dead_lettered")).toBe(0);
+      });
+
+      it("settles a deferred delivery as `suppressed` on a non-alerting cause when promotion is gated", async () => {
+        const { agentId } = await seedCompanyAndAgent();
+
+        expect(
+          await heartbeatWithCapacityDenied().wakeup(agentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "github_pr_review_submitted",
+            payload: GITHUB_REVIEW_PAYLOAD,
+          }),
+        ).toBeNull();
+        expect(await deliveryCount("deferred")).toBe(1);
+
+        await db
+          .update(heartbeatRuns)
+          .set({ scheduledRetryAt: new Date(Date.now() - 60_000) })
+          .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "scheduled_retry")));
+        // Pause the agent out from under the parked retry: the promotion gate
+        // cancels the run rather than promoting it, which is the other way a
+        // deferral ends.
+        await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+
+        await heartbeatService(db, { skipQueuedRunDispatch: true }).promoteDueScheduledRetries(new Date());
+
+        expect(await deliveryCount("queued")).toBe(0);
+        expect(await deliveryCount("suppressed")).toBe(1);
+        // A gate decline is policy, not an outage, so it must land on a cause
+        // the suppression-outage alert does not select — otherwise every
+        // routine reassign/cancel would page and the rule would get silenced.
+        expect(await suppressionCount("scheduled_retry_gate_declined")).toBe(1);
+        expect(await suppressionCount("other")).toBe(0);
+        expect(await suppressionCount("dispatch_rejected")).toBe(0);
+      });
+    });
+    describe("dead-letter gauge survives restart and first scrape", () => {
+      /**
+       * The gauge exists because the `dead_lettered` counter cannot be alerted
+       * on reliably at the process boundaries: `increase()` needs a
+       * pre-increment sample, and a replaced pod retires its series. So these
+       * assert the property that fixes that — the value is *re-derived from
+       * committed rows* on each reconcile pass, not accumulated in memory.
+       */
+      async function deadLetterGauge(): Promise<number> {
+        const metric = getMetricsRegistry().getSingleMetric(
+          GITHUB_REVIEW_REQUEST_DEAD_LETTER_UNRESOLVED_METRIC,
+        );
+        expect(
+          metric,
+          `${GITHUB_REVIEW_REQUEST_DEAD_LETTER_UNRESOLVED_METRIC} must be registered`,
+        ).toBeTruthy();
+        const data = (await metric!.get()) as {
+          values: Array<{ labels: Record<string, string>; value: number }>;
+        };
+        return data.values.reduce((sum, entry) => sum + entry.value, 0);
+      }
+
+      it("republishes an existing dead letter on a pass that recorded no new one", async () => {
+        const { agentId, companyId } = await seedCompanyAndAgent();
+        const now = new Date();
+        // A committed terminal row written by some *earlier* process — exactly
+        // what a restarted pod inherits, and exactly what the in-memory counter
+        // can no longer tell you about.
+        await db.insert(agentWakeupRequests).values({
+          id: randomUUID(),
+          companyId,
+          agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: "github_pr_review_submitted",
+          payload: {
+            dispatchRetry: {
+              attempts: 5,
+              originalOpts: {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "github_pr_review_submitted",
+                payload: GITHUB_REVIEW_PAYLOAD,
+              },
+            },
+          },
+          status: "dispatch_failed_exhausted",
+          finishedAt: now,
+        });
+
+        // This pass has nothing due, so it increments the counter zero times.
+        const result = await heartbeat.reconcileFailedWakeDispatches(now);
+        expect(result.exhausted).toBe(0);
+        expect(await deliveryCount("dead_lettered")).toBe(0);
+        // ...and yet the loss is still visible. That difference is the whole
+        // point of the gauge.
+        expect(await deadLetterGauge()).toBe(1);
+      });
+
+      it("stays at zero for a non-GitHub wake that dead-lettered", async () => {
+        const { agentId, companyId } = await seedCompanyAndAgent();
+        const now = new Date();
+        await db.insert(agentWakeupRequests).values({
+          id: randomUUID(),
+          companyId,
+          agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: {
+            dispatchRetry: {
+              attempts: 5,
+              originalOpts: {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "issue_assigned",
+                payload: { taskKey: "issue:BLO-1" },
+              },
+            },
+          },
+          status: "dispatch_failed_exhausted",
+          finishedAt: now,
+        });
+
+        await heartbeat.reconcileFailedWakeDispatches(now);
+        expect(await deadLetterGauge()).toBe(0);
       });
     });
   });
