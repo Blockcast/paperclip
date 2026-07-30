@@ -57,6 +57,7 @@ vi.mock("../services/k8s-job-liveness.ts", () => ({
   readAgentJobRunStatusByName: vi.fn(async () => null),
   deleteAgentJobsForRun: vi.fn(async () => 1),
   hasActiveJobForAgent: vi.fn(async () => false),
+  captureAgentJobFailureDiagnostics: vi.fn(async () => null),
 }));
 
 vi.mock("../telemetry.ts", () => ({

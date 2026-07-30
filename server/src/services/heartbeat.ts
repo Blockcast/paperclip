@@ -85,6 +85,7 @@ import { publishLiveEvent } from "./live-events.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
+  captureAgentJobFailureDiagnostics,
   deleteAgentJobExact,
   deleteAgentJobsForRun,
   deleteAgentPodExact,
@@ -14686,6 +14687,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ? await hasAdapterInvocationEvent(input.run.id)
       : null;
 
+    // BLO-18145: capture the pod's own container exit codes and log tails while
+    // the pod still exists. The Job's `Failed` condition only says "Job has
+    // reached the specified backoff limit" — it names no container and carries
+    // no exit code, so without this the opaque `claude` exit 128 was lost to pod
+    // GC on every recurrence. Read before the Job delete below (staleKill) and
+    // before the Job's TTL reaps its pods. Best-effort by construction: a null
+    // here must never change how the run is finalized.
+    const containerDiagnostics = terminalOutcome.status === "failed"
+      ? await captureAgentJobFailureDiagnostics(input.run.id)
+      : null;
+    if (containerDiagnostics) {
+      logger.warn(
+        {
+          runId: input.run.id,
+          adapterType: input.adapterType,
+          errorCode: terminalOutcome.errorCode,
+          podName: containerDiagnostics.podName,
+          nodeName: containerDiagnostics.nodeName,
+          terminations: containerDiagnostics.terminations.map((termination) => ({
+            container: termination.container,
+            kind: termination.kind,
+            exitCode: termination.exitCode,
+            reason: termination.reason,
+          })),
+          capturedLogContainers: containerDiagnostics.logs.map((log) => log.container),
+        },
+        "external-lifecycle run failed: captured container exit codes before pod GC",
+      );
+    }
+
     const resultJson = mergeRunStopMetadataForAgent(
       { adapterType: input.adapterType, adapterConfig: parseObject(input.adapterConfig) },
       terminalOutcome.status,
@@ -14698,6 +14729,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             jobReason: terminalOutcome.jobReason,
             jobMessage: terminalOutcome.jobMessage,
             ...(adapterInvocationStarted !== null ? { adapterInvocationStarted } : {}),
+            ...(containerDiagnostics ? { containerDiagnostics } : {}),
           },
         },
         errorCode: terminalOutcome.errorCode,

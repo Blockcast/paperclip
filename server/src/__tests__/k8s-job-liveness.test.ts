@@ -1,4 +1,4 @@
-import type { V1Job, V1Pod } from "@kubernetes/client-node";
+import type { V1ContainerStatus, V1Job, V1Pod } from "@kubernetes/client-node";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -8,6 +8,8 @@ import {
   indexUniqueAgentJobRunStatuses,
   isActiveOrTerminatingAgentPod,
   matchExactAgentJob,
+  readContainerTermination,
+  scoreFailedPodCandidate,
   type ManagedAgentJob,
 } from "../services/k8s-job-liveness.js";
 
@@ -184,5 +186,91 @@ describe("classifyManagedAgentPod", () => {
 
   it("exposes the adapter-type label constant", () => {
     expect(ADAPTER_TYPE_LABEL).toBe("paperclip.io/adapter-type");
+  });
+});
+
+// BLO-18145: the Job-level `Failed` condition only ever says "Job has reached
+// the specified backoff limit" — it names no container and carries no exit code.
+// These cover the container-level read that makes an opaque exit 128 diagnosable.
+describe("readContainerTermination", () => {
+  it("reads exit code, reason and redacted message from a terminated container", () => {
+    const result = readContainerTermination(
+      {
+        name: "claude",
+        restartCount: 0,
+        state: {
+          terminated: {
+            exitCode: 128,
+            reason: "Error",
+            message: "ANTHROPIC_API_KEY=sk-ant-leaked-value",
+            startedAt: new Date("2026-07-30T14:29:46.000Z"),
+            finishedAt: new Date("2026-07-30T14:29:46.000Z"),
+          },
+        },
+      } as unknown as V1ContainerStatus,
+      "app",
+    );
+
+    expect(result).toMatchObject({
+      container: "claude",
+      kind: "app",
+      exitCode: 128,
+      reason: "Error",
+      restartCount: 0,
+      fromLastState: false,
+    });
+    expect(result!.startedAt).toBe("2026-07-30T14:29:46.000Z");
+    // The captured text is persisted and surfaced, so secrets must not survive it.
+    expect(result!.message).not.toContain("sk-ant-leaked-value");
+  });
+
+  it("falls back to lastState so a restarted container still reports its exit", () => {
+    const result = readContainerTermination(
+      {
+        name: "claude",
+        restartCount: 2,
+        state: { running: { startedAt: new Date("2026-07-30T14:30:00.000Z") } },
+        lastState: { terminated: { exitCode: 128, reason: "Error" } },
+      } as unknown as V1ContainerStatus,
+      "app",
+    );
+
+    expect(result).toMatchObject({ exitCode: 128, fromLastState: true, restartCount: 2 });
+  });
+
+  it("returns null for a container that never terminated", () => {
+    expect(
+      readContainerTermination(
+        { name: "claude", state: { waiting: { reason: "PodInitializing" } } } as unknown as V1ContainerStatus,
+        "app",
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("scoreFailedPodCandidate", () => {
+  function podWithExit(exitCode: number | null, phase = "Failed") {
+    return {
+      status: {
+        phase,
+        containerStatuses: exitCode === null
+          ? []
+          : [{ name: "claude", state: { terminated: { exitCode } } }],
+      },
+    } as unknown as V1Pod;
+  }
+
+  it("ranks a non-zero exit above a merely Failed pod, and Failed above the rest", () => {
+    const nonZeroExit = scoreFailedPodCandidate(podWithExit(128));
+    const failedNoExit = scoreFailedPodCandidate(podWithExit(null, "Failed"));
+    const running = scoreFailedPodCandidate(podWithExit(null, "Running"));
+
+    expect(nonZeroExit).toBeGreaterThan(failedNoExit);
+    expect(failedNoExit).toBeGreaterThan(running);
+  });
+
+  it("does not treat a clean exit 0 as the failing pod", () => {
+    expect(scoreFailedPodCandidate(podWithExit(0, "Running")))
+      .toBe(scoreFailedPodCandidate(podWithExit(null, "Running")));
   });
 });

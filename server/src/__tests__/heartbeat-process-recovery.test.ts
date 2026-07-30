@@ -182,6 +182,9 @@ vi.mock("../services/k8s-job-liveness.ts", () => ({
   listManagedAgentJobs: mockListManagedAgentJobs,
   listManagedAgentPods: mockListManagedAgentPods,
   deleteAgentPodExact: mockDeleteAgentPodExact,
+  // BLO-18145: best-effort container diagnostics capture. Null here keeps these
+  // tests on the "no pod detail available" branch they already assert against.
+  captureAgentJobFailureDiagnostics: vi.fn(async () => null),
   indexUniqueAgentJobRunStatuses: (jobs: Array<{
     runId: string | null;
     name: string;

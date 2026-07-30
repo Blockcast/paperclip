@@ -1,6 +1,7 @@
 import * as k8s from "@kubernetes/client-node";
 
 import { logger } from "../middleware/logger.js";
+import { redactSensitiveText } from "../redaction.js";
 
 // Namespace where the claude_k8s / opencode_k8s adapters create their agent
 // Job pods. Matches the chart's deploy namespace; an explicit env override
@@ -17,6 +18,21 @@ const K8S_JOB_LIVENESS_TIMEOUT_SECONDS = Math.max(
   1,
   Math.ceil(K8S_JOB_LIVENESS_TIMEOUT_MS / 1000),
 );
+
+// BLO-18145: reading a pod's own container log is materially slower than a
+// Job/Pod metadata GET (the apiserver proxies to the kubelet), so the 2s
+// liveness budget is too tight for it. This capture runs at most once per
+// terminal failed run, off the hot liveness path, so a larger ceiling is safe.
+const K8S_POD_LOG_CAPTURE_TIMEOUT_MS = Number(
+  process.env.PAPERCLIP_K8S_POD_LOG_CAPTURE_TIMEOUT_MS ??
+    (IS_TEST_ENVIRONMENT ? "100" : "8000"),
+);
+// Bounds on what we persist. The captured text lands in heartbeat_runs.result_json
+// and is surfaced in the UI, so it must stay small and bounded regardless of how
+// chatty the container was before dying.
+const POD_LOG_CAPTURE_TAIL_LINES = 200;
+const POD_LOG_CAPTURE_LIMIT_BYTES = 16 * 1024;
+const POD_LOG_CAPTURE_MAX_CONTAINERS = 4;
 
 // Agent Job manifests carry app.kubernetes.io/managed-by=paperclip and a
 // paperclip.io/run-id label that maps directly to heartbeat_runs.id. The
@@ -76,6 +92,48 @@ export type ExactAgentJobIdentity = {
   uid: string;
 };
 
+/**
+ * One container's own termination record, as reported by the kubelet.
+ *
+ * BLO-18145: this is the signal the reaper was missing. A failed Job's
+ * `Failed` condition only ever says "Job has reached the specified backoff
+ * limit", which names no container and carries no exit code — so a pod whose
+ * `claude` container exited 128 four seconds after start was indistinguishable
+ * from any other failure, and the pod was GC'd before anyone could look.
+ */
+export type AgentPodContainerTermination = {
+  container: string;
+  kind: "init" | "app";
+  exitCode: number | null;
+  signal: number | null;
+  reason: string | null;
+  message: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  restartCount: number | null;
+  /** True when read from lastState (the container already restarted past it). */
+  fromLastState: boolean;
+};
+
+export type AgentPodLogCapture = {
+  container: string;
+  /** True when read with previous=true (the current instance had no log). */
+  previous: boolean;
+  truncated: boolean;
+  text: string;
+};
+
+export type AgentJobFailureDiagnostics = {
+  podName: string;
+  podPhase: string | null;
+  podReason: string | null;
+  podMessage: string | null;
+  nodeName: string | null;
+  terminations: AgentPodContainerTermination[];
+  logs: AgentPodLogCapture[];
+  capturedAt: string;
+};
+
 type ClientState =
   | { kind: "uninitialized" }
   | { kind: "unavailable"; reason: string }
@@ -83,13 +141,13 @@ type ClientState =
 
 let clientState: ClientState = { kind: "uninitialized" };
 
-function requestOptionsWithTimeout() {
+function requestOptionsWithTimeout(timeoutMs: number = K8S_JOB_LIVENESS_TIMEOUT_MS) {
   return {
     middlewareMergeStrategy: "append" as const,
     promiseMiddleware: [
       {
         async pre(context: { setSignal(signal: AbortSignal): void }) {
-          context.setSignal(AbortSignal.timeout(K8S_JOB_LIVENESS_TIMEOUT_MS));
+          context.setSignal(AbortSignal.timeout(timeoutMs));
           return context;
         },
         async post<T>(context: T) {
@@ -599,4 +657,196 @@ export async function hasActiveJobForAgent(agentId: string): Promise<boolean> {
 /** Test-only hook to force re-init (e.g. after env changes). */
 export function __resetK8sJobLivenessClient() {
   clientState = { kind: "uninitialized" };
+}
+
+function toIsoOrNull(value: unknown): string | null {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(String(value));
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+/**
+ * Reads one container's termination record, preferring the live `terminated`
+ * state and falling back to `lastState.terminated` so a container that already
+ * restarted past its fatal exit still reports the exit code we need.
+ * Exported for unit tests (pure).
+ */
+export function readContainerTermination(
+  status: k8s.V1ContainerStatus,
+  kind: "init" | "app",
+): AgentPodContainerTermination | null {
+  const terminated = status.state?.terminated ?? status.lastState?.terminated ?? null;
+  if (!terminated) return null;
+  const rawMessage = terminated.message?.trim();
+  return {
+    container: status.name,
+    kind,
+    exitCode: typeof terminated.exitCode === "number" ? terminated.exitCode : null,
+    signal: typeof terminated.signal === "number" ? terminated.signal : null,
+    reason: terminated.reason?.trim() || null,
+    message: rawMessage ? redactSensitiveText(rawMessage) : null,
+    startedAt: toIsoOrNull(terminated.startedAt),
+    finishedAt: toIsoOrNull(terminated.finishedAt),
+    restartCount: typeof status.restartCount === "number" ? status.restartCount : null,
+    fromLastState: !status.state?.terminated && Boolean(status.lastState?.terminated),
+  };
+}
+
+/**
+ * Scores a pod by how likely it is to be the one that actually failed. A Job
+ * that exhausted its backoff limit leaves several pods behind; the interesting
+ * one is whichever has a non-zero container exit. Exported for unit tests (pure).
+ */
+export function scoreFailedPodCandidate(pod: k8s.V1Pod): number {
+  const statuses = [
+    ...(pod.status?.initContainerStatuses ?? []),
+    ...(pod.status?.containerStatuses ?? []),
+  ];
+  const hasNonZeroExit = statuses.some((status) => {
+    const terminated = status.state?.terminated ?? status.lastState?.terminated;
+    return typeof terminated?.exitCode === "number" && terminated.exitCode !== 0;
+  });
+  if (hasNonZeroExit) return 3;
+  if (pod.status?.phase === "Failed") return 2;
+  return 1;
+}
+
+async function capturePodContainerLog(
+  coreApi: k8s.CoreV1Api,
+  podName: string,
+  container: string,
+): Promise<AgentPodLogCapture | null> {
+  for (const previous of [false, true]) {
+    try {
+      const raw = await coreApi.readNamespacedPodLog(
+        {
+          name: podName,
+          namespace: PAPERCLIP_K8S_NAMESPACE,
+          container,
+          previous,
+          tailLines: POD_LOG_CAPTURE_TAIL_LINES,
+          limitBytes: POD_LOG_CAPTURE_LIMIT_BYTES,
+          timestamps: true,
+        },
+        requestOptionsWithTimeout(K8S_POD_LOG_CAPTURE_TIMEOUT_MS),
+      );
+      const text = typeof raw === "string" ? raw.trim() : "";
+      if (!text) continue;
+      return {
+        container,
+        previous,
+        // limitBytes truncates from the *front*, so hitting the cap means the
+        // earliest captured lines are missing, not the fatal trailing ones.
+        truncated: Buffer.byteLength(text, "utf8") >= POD_LOG_CAPTURE_LIMIT_BYTES,
+        text: redactSensitiveText(text),
+      };
+    } catch (error) {
+      // A 400 here is routine, not exceptional: "previous terminated container
+      // not found" when previous=false already had the log, and vice versa.
+      logger.debug(
+        {
+          podName,
+          container,
+          previous,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        "k8s pod log capture attempt failed",
+      );
+    }
+  }
+  return null;
+}
+
+/**
+ * Captures a failed run's own container exit codes and log tails *before* the
+ * pod is garbage-collected, so the failure is diagnosable after the fact.
+ *
+ * BLO-18145: `claude_k8s` pods were dying ~4s after start with an opaque
+ * `exit 128` and nothing but `BackoffLimitExceeded` recorded against the run.
+ * The container's own stderr — the one artifact that names the cause — was lost
+ * with the pod every time, which made every recurrence unfalsifiable. This
+ * reads it while the pod still exists and hands it back for persistence.
+ *
+ * Returns null when the kube API is unavailable or no pod for the run remains.
+ * Never throws: a diagnostics failure must not change how a run is finalized.
+ * Requires only `pods: get,list` + `pods/log: get`, both already granted to the
+ * server's Role — this adds no new permission.
+ */
+export async function captureAgentJobFailureDiagnostics(
+  runId: string,
+): Promise<AgentJobFailureDiagnostics | null> {
+  const trimmedRunId = runId?.trim();
+  if (!trimmedRunId) return null;
+  const state = initClient();
+  if (state.kind !== "ready") return null;
+  try {
+    const list = await state.coreApi.listNamespacedPod(
+      {
+        namespace: PAPERCLIP_K8S_NAMESPACE,
+        labelSelector: `${AGENT_JOB_LABEL_SELECTOR},${RUN_ID_LABEL_FILTER_PREFIX}${trimmedRunId}`,
+        timeoutSeconds: K8S_JOB_LIVENESS_TIMEOUT_SECONDS,
+      },
+      requestOptionsWithTimeout(),
+    );
+    const pods = list.items ?? [];
+    if (pods.length === 0) return null;
+    const pod = [...pods].sort((a, b) => {
+      const byScore = scoreFailedPodCandidate(b) - scoreFailedPodCandidate(a);
+      if (byScore !== 0) return byScore;
+      const aCreated = new Date(a.metadata?.creationTimestamp ?? 0).getTime();
+      const bCreated = new Date(b.metadata?.creationTimestamp ?? 0).getTime();
+      return bCreated - aCreated;
+    })[0];
+    const podName = pod.metadata?.name?.trim();
+    if (!podName) return null;
+
+    const terminations: AgentPodContainerTermination[] = [];
+    for (const status of pod.status?.initContainerStatuses ?? []) {
+      const termination = readContainerTermination(status, "init");
+      if (termination) terminations.push(termination);
+    }
+    for (const status of pod.status?.containerStatuses ?? []) {
+      const termination = readContainerTermination(status, "app");
+      if (termination) terminations.push(termination);
+    }
+
+    // Log the containers that actually failed. When nothing reports a non-zero
+    // exit (e.g. a pod stuck in PodInitializing that never terminated), fall
+    // back to the declared containers so we still capture *something*.
+    const failedContainers = terminations
+      .filter((termination) => termination.exitCode !== null && termination.exitCode !== 0)
+      .map((termination) => termination.container);
+    const fallbackContainers = [
+      ...(pod.spec?.initContainers ?? []),
+      ...(pod.spec?.containers ?? []),
+    ].map((container) => container.name);
+    const targets = Array.from(
+      new Set(failedContainers.length > 0 ? failedContainers : fallbackContainers),
+    ).slice(0, POD_LOG_CAPTURE_MAX_CONTAINERS);
+
+    const logs: AgentPodLogCapture[] = [];
+    for (const container of targets) {
+      const captured = await capturePodContainerLog(state.coreApi, podName, container);
+      if (captured) logs.push(captured);
+    }
+
+    return {
+      podName,
+      podPhase: pod.status?.phase ?? null,
+      podReason: pod.status?.reason?.trim() || null,
+      podMessage: pod.status?.message?.trim()
+        ? redactSensitiveText(pod.status.message.trim())
+        : null,
+      nodeName: pod.spec?.nodeName?.trim() || null,
+      terminations,
+      logs,
+      capturedAt: new Date().toISOString(),
+    };
+  } catch (error) {
+    logger.warn(
+      { runId: trimmedRunId, error: error instanceof Error ? error.message : String(error) },
+      "k8s failed-run diagnostics capture failed; run will finalize without container detail",
+    );
+    return null;
+  }
 }

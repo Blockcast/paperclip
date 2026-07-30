@@ -285,6 +285,41 @@ function summarizeAgentCapabilities(agent: typeof agents.$inferSelect | null | u
 // requested." runs because CTO doesn't have the Webflow MCP the issue
 // actually needs.
 //
+function readContainerExitCode(entry: Record<string, unknown>): number | null {
+  const value = entry.exitCode;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+// BLO-18145: name the container that actually died. `BackoffLimitExceeded` says
+// only "Job has reached the specified backoff limit", which is why an opaque
+// `claude` exit 128 went undiagnosed for so long — the recovery comment repeated
+// the Job-level condition and never the container's own exit code. The capture
+// in k8s-job-liveness.ts persists that detail; this surfaces it where a reader
+// will actually see it. Container messages were already redacted at capture.
+function summarizeContainerDiagnosticsForIssueComment(run: LatestIssueRun) {
+  if (!run) return null;
+  const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
+  const diagnostics = parseObject(recovery.containerDiagnostics);
+  const terminations = Array.isArray(diagnostics.terminations) ? diagnostics.terminations : [];
+  const fatal = terminations
+    .map((entry) => parseObject(entry))
+    .filter((entry) => {
+      const exitCode = readContainerExitCode(entry);
+      return exitCode !== null && exitCode !== 0;
+    });
+  if (fatal.length === 0) return null;
+  const rendered = fatal
+    .slice(0, 3)
+    .map((entry) => {
+      const container = readNonEmptyString(entry.container) ?? "unknown";
+      const reason = readNonEmptyString(entry.reason);
+      return `\`${container}\` exited ${readContainerExitCode(entry)}${reason ? ` (${reason})` : ""}`;
+    })
+    .join("; ");
+  const podName = readNonEmptyString(diagnostics.podName);
+  return ` Container detail: ${rendered}${podName ? ` in pod \`${podName}\`` : ""}.`;
+}
+
 // Restore a structured summary (errorCode + first line of the error
 // message, capped) but pass it through `redactSensitiveText` first so any
 // secrets in the raw error blob get scrubbed. errorCode is a stable
@@ -310,11 +345,14 @@ function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
       ? `${summarySource.slice(0, 237)}...`
       : summarySource;
   const summary = truncated ? redactSensitiveText(truncated) : null;
+  const containerDetail = summarizeContainerDiagnosticsForIssueComment(run) ?? "";
 
-  if (errorCode && summary) return ` Latest retry failure: \`${errorCode}\` — ${summary}.`;
-  if (errorCode) return ` Latest retry failure: \`${errorCode}\`.`;
-  if (summary) return ` Latest retry failure: ${summary}.`;
-  return null;
+  if (errorCode && summary) {
+    return ` Latest retry failure: \`${errorCode}\` — ${summary}.${containerDetail}`;
+  }
+  if (errorCode) return ` Latest retry failure: \`${errorCode}\`.${containerDetail}`;
+  if (summary) return ` Latest retry failure: ${summary}.${containerDetail}`;
+  return containerDetail || null;
 }
 
 // Run failures that the recovery sweep must NOT retry. These are environment
