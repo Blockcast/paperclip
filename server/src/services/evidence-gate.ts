@@ -238,29 +238,93 @@ function detectChecklistDoneWhen(
  * Headings that introduce a per-criterion acceptance list. `Done when` was
  * the only recognized spelling until BLO-19047, which made the shape
  * unsatisfiable for every issue written to the company issue-creation policy
- * (that policy mandates `## Acceptance criteria`). Synonyms are matched
- * case-insensitively; the trailing `\b` keeps `## Acceptance criteria` from
- * also matching a prose line that merely starts with the same words.
+ * (that policy mandates `## Acceptance criteria`).
+ *
+ * Matched case-insensitively at any heading depth including `#`. The trailing
+ * `\b` keeps a prose line that merely starts with the same words from matching,
+ * and `[ \t]*` (rather than `\s*`) keeps the gap from spanning a newline.
  */
-const DONE_WHEN_HEADING_RE =
-  /^##+\s*(?:Done when|Acceptance criteria|Success criteria|Exit criteria)\b/im;
+const DONE_WHEN_HEADING_SOURCE =
+  "^(#{1,6})[ \\t]*(?:Done when|Acceptance criteria|Success criteria|Exit criteria)\\b";
+
+/** Any line terminator JS regex `^`/`$` recognize, including a bare CR. */
+const LINE_BREAK_RE = /\r?\n|\r/;
+
+/**
+ * Blank out fenced-code-block CONTENT, preserving line structure.
+ *
+ * Without this, a heading inside a pasted template or example fence counts as
+ * the issue's own criteria section. That is not hypothetical: the company
+ * issue-creation policy ships a fenced `## Acceptance criteria` template, so a
+ * description that quotes the template would have its criteria count taken from
+ * the template's placeholder bullets. (BLO-19047)
+ */
+function stripFencedCodeBlocks(markdown: string): string {
+  let fence: string | null = null;
+  return markdown
+    .split(LINE_BREAK_RE)
+    .map((line) => {
+      const opener = /^\s*(`{3,}|~{3,})/.exec(line);
+      if (fence !== null) {
+        // A closing fence must use the same char and be at least as long.
+        if (opener && opener[1][0] === fence[0] && opener[1].length >= fence.length) {
+          fence = null;
+        }
+        return "";
+      }
+      if (opener) {
+        fence = opener[1];
+        return "";
+      }
+      return line;
+    })
+    .join("\n");
+}
+
+/**
+ * Bodies of every recognized criteria section, outermost-first.
+ *
+ * A section runs to the next heading of the SAME depth or shallower, so
+ * `### Functional` sub-groups under `## Acceptance criteria` stay inside the
+ * section instead of truncating it.
+ */
+function doneWhenSectionBodies(description: string): string[] {
+  const scrubbed = stripFencedCodeBlocks(description);
+  const headingRe = new RegExp(DONE_WHEN_HEADING_SOURCE, "gim");
+  const bodies: string[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = headingRe.exec(scrubbed)) !== null) {
+    const depth = match[1].length;
+    const rest = scrubbed.slice(match.index);
+    const headingLineEnd = rest.search(LINE_BREAK_RE);
+    // A heading on the final line with nothing after it has an empty body.
+    const body = headingLineEnd === -1 ? "" : rest.slice(headingLineEnd + 1);
+    const nextSiblingHeading = body.search(new RegExp(`^#{1,${depth}}[ \\t]`, "m"));
+    bodies.push(nextSiblingHeading === -1 ? body : body.slice(0, nextSiblingHeading));
+    // Zero-length matches are impossible here (the pattern requires a `#`), but
+    // guard anyway so a future edit cannot spin this loop forever.
+    if (headingRe.lastIndex <= match.index) headingRe.lastIndex = match.index + 1;
+  }
+  return bodies;
+}
+
+/** True when the description carries a criteria heading the gate recognizes. */
+export function hasDoneWhenHeading(description: string): boolean {
+  return doneWhenSectionBodies(description).length > 0;
+}
 
 export function countDoneWhenBullets(description: string): number {
-  const doneWhenIdx = description.search(DONE_WHEN_HEADING_RE);
-  if (doneWhenIdx === -1) return 0;
-  const rest = description.slice(doneWhenIdx);
-  // Consume the heading LINE, then stop at the next heading. Skipping a fixed
-  // two characters instead (the old `rest.slice(2)`) silently broke any heading
-  // deeper than `###`: for `#### Acceptance criteria` the two leftover `#`s
-  // matched `^##+\s` at offset 0, so the section was cut to "##" and every
-  // bullet under it was lost. (BLO-19047)
-  const headingLineEnd = rest.indexOf("\n");
-  if (headingLineEnd === -1) return 0;
-  const body = rest.slice(headingLineEnd + 1);
-  const nextHeading = body.search(/^##+\s/m);
-  const section = nextHeading === -1 ? body : body.slice(0, nextHeading);
-  const bullets = section.match(/^[-*]\s+/gm);
-  return bullets ? bullets.length : 0;
+  // First section that actually carries bullets wins. Taking the FIRST heading
+  // unconditionally (a plain `search()`) broke descriptions where an
+  // `## Acceptance criteria` section only points at the real list — it counted
+  // zero and made the shape unsatisfiable, and on an issue that previously had
+  // bullets it also tripped `doneWhenBulletsRemoved`, reporting a policy-aligned
+  // description edit as deliberate gate-dodging. (BLO-19047)
+  for (const body of doneWhenSectionBodies(description)) {
+    const bullets = body.match(/^[-*]\s+/gm);
+    if (bullets && bullets.length > 0) return bullets.length;
+  }
+  return 0;
 }
 
 function detectTestOutput(text: string): boolean {
@@ -469,12 +533,15 @@ export function evaluateEvidence(
     !!input.issue.description && countDoneWhenBullets(input.issue.description) > 0;
   if (!doneWhenApplicable && required.includes("checklist:done-when")) {
     diagnostics.push(input.issue.description ? "missing-done-when-bullets" : "missing-description");
-    // Name the remedy. `missing: ["checklist:done-when"]` on its own reads as
-    // "attach more evidence", but no comment can ever satisfy this shape — the
-    // fix is in the DESCRIPTION: add criteria bullets under a heading the gate
-    // recognizes. Agents burned whole runs re-posting evidence tables against
-    // an `## Acceptance criteria` heading the matcher didn't accept (BLO-19047).
-    if (input.issue.description) diagnostics.push("no-done-when-heading");
+    // Name the remedy, but only when it is actually the remedy. `missing:
+    // ["checklist:done-when"]` on its own reads as "attach more evidence", and
+    // no comment can ever satisfy this shape — the fix is in the DESCRIPTION.
+    // Emit this ONLY when no recognized heading exists, so we never tell an
+    // agent to rename a heading that is already correct but whose bullets the
+    // counter didn't find. (BLO-19047)
+    if (input.issue.description && !hasDoneWhenHeading(input.issue.description)) {
+      diagnostics.push("no-done-when-heading");
+    }
   }
   const requiredDoneWhenBulletsRemoved =
     input.doneWhenBulletsRemoved && required.includes("checklist:done-when");

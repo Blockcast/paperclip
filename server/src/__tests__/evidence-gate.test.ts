@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   countDoneWhenBullets,
   evaluateEvidence,
+  hasDoneWhenHeading,
   resolveRequiredShapes,
   type EvidenceCommentLite,
   type EvidenceWorkProductLite,
@@ -1079,5 +1080,163 @@ describe("evaluateEvidence — no-done-when-heading diagnostic (BLO-19047)", () 
     });
     expect(result.verdict).toBe("block");
     expect(result.missing).toEqual(["checklist:done-when"]);
+  });
+});
+
+// Regressions found by adversarial review of the BLO-19047 fix. Each of these
+// failed on the first cut of the synonym change.
+describe("countDoneWhenBullets — review regressions (BLO-19047)", () => {
+  it("uses the first section that HAS bullets, not merely the first heading", () => {
+    // A pointer section preceding the real list: anchoring on the first
+    // heading counted 0 and made the shape unsatisfiable.
+    const description = [
+      "## Summary",
+      "fix the thing",
+      "",
+      "## Acceptance criteria",
+      "",
+      "See the Done when list below.",
+      "",
+      "## Done when",
+      "- a",
+      "- b",
+    ].join("\n");
+    expect(countDoneWhenBullets(description)).toBe(2);
+  });
+
+  it("does not report a pointer-section edit as removed bullets", () => {
+    // The `doneWhenBulletsRemoved` tamper signal compares prior vs current
+    // counts; a policy-aligned edit must not read as gate-dodging.
+    const before = "## Done when\n- a\n- b";
+    const after = "## Acceptance criteria\n\nSee below.\n\n## Done when\n- a\n- b";
+    expect(countDoneWhenBullets(before)).toBe(2);
+    expect(countDoneWhenBullets(after)).toBe(2);
+  });
+
+  it("ignores criteria headings inside fenced code blocks", () => {
+    const description = [
+      "## Context",
+      "Template we follow:",
+      "",
+      "```markdown",
+      "## Acceptance criteria",
+      "- [ ] one",
+      "- [ ] two",
+      "- [ ] three",
+      "- [ ] four",
+      "- [ ] five",
+      "```",
+      "",
+      "## Done when",
+      "- real one",
+      "- real two",
+    ].join("\n");
+    expect(countDoneWhenBullets(description)).toBe(2);
+  });
+
+  it("ignores a tilde-fenced block too", () => {
+    const description = "~~~\n## Acceptance criteria\n- fake\n~~~\n\n## Done when\n- real";
+    expect(countDoneWhenBullets(description)).toBe(1);
+  });
+
+  it("keeps sub-grouped criteria inside the section", () => {
+    const description = [
+      "## Acceptance criteria",
+      "",
+      "### Functional",
+      "- a",
+      "- b",
+      "",
+      "### Non-functional",
+      "- c",
+      "",
+      "## Verifying signal",
+      "- ci job",
+    ].join("\n");
+    expect(countDoneWhenBullets(description)).toBe(3);
+  });
+
+  it("stops at a shallower heading", () => {
+    const description = "## Acceptance criteria\n- a\n- b\n\n# Appendix\n- not a criterion";
+    expect(countDoneWhenBullets(description)).toBe(2);
+  });
+
+  it("accepts a single-hash H1 heading", () => {
+    expect(countDoneWhenBullets("# Acceptance criteria\n- a\n- b")).toBe(2);
+  });
+
+  it("handles CRLF line endings", () => {
+    expect(countDoneWhenBullets("## Acceptance criteria\r\n- a\r\n- b\r\n")).toBe(2);
+  });
+
+  it("handles bare-CR line endings", () => {
+    expect(countDoneWhenBullets("## Done when\r- a\r- b\r")).toBe(2);
+  });
+
+  it("tolerates trailing punctuation and parentheticals in the heading", () => {
+    expect(countDoneWhenBullets("## Acceptance criteria:\n- a")).toBe(1);
+    expect(countDoneWhenBullets("## Acceptance criteria (v2)\n- a\n- b")).toBe(2);
+  });
+
+  it("returns 0 for a criteria heading on the final line with no body", () => {
+    expect(countDoneWhenBullets("## Goal\nx\n\n## Acceptance criteria")).toBe(0);
+  });
+
+  it("does not let the heading gap span a newline", () => {
+    expect(
+      countDoneWhenBullets("##\n\nAcceptance criteria are tracked elsewhere:\n- doc1\n- doc2"),
+    ).toBe(0);
+  });
+});
+
+describe("hasDoneWhenHeading (BLO-19047)", () => {
+  it("is true for each recognized synonym", () => {
+    for (const heading of ["Done when", "Acceptance criteria", "Success criteria", "Exit criteria"]) {
+      expect(hasDoneWhenHeading(`## ${heading}\n- a`)).toBe(true);
+    }
+  });
+
+  it("is false for an unrecognized heading", () => {
+    expect(hasDoneWhenHeading("## Definition of done\n- a")).toBe(false);
+  });
+
+  it("is false when the only match is inside a fence", () => {
+    expect(hasDoneWhenHeading("```\n## Acceptance criteria\n- a\n```")).toBe(false);
+  });
+
+  it("is true even when the section carries no bullets", () => {
+    expect(hasDoneWhenHeading("## Acceptance criteria\n\nprose only")).toBe(true);
+  });
+});
+
+describe("evaluateEvidence — no-done-when-heading accuracy (BLO-19047)", () => {
+  it("does NOT claim a missing heading when the heading exists but bullets were not found", () => {
+    // Criteria expressed as a table under a recognized heading: the counter
+    // finds no bullets, but telling the agent to rename the heading is wrong.
+    const description = [
+      "## Acceptance criteria",
+      "",
+      "| Criterion | Notes |",
+      "|---|---|",
+      "| a | x |",
+    ].join("\n");
+    const result = evaluateEvidence({
+      issue: { description, labels: [] },
+      comments: [agentComment("done")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.diagnostics).toContain("missing-done-when-bullets");
+    expect(result.diagnostics).not.toContain("no-done-when-heading");
+  });
+
+  it("still claims a missing heading when none is recognized", () => {
+    const result = evaluateEvidence({
+      issue: { description: "## Definition of done\n- a", labels: [] },
+      comments: [agentComment("done")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.diagnostics).toContain("no-done-when-heading");
   });
 });

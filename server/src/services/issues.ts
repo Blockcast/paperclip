@@ -1844,6 +1844,44 @@ async function withIssueLabels(dbOrTx: any, rows: IssueRow[]): Promise<IssueWith
  * operator overrides, and any work_products. Caller supplies the description
  * (already on the existing row in the PATCH handler, no need to re-select).
  */
+/**
+ * Shapes that record a DURABLE fact ("a PR/commit was attached to this issue"),
+ * as opposed to a fact about the current comment window.
+ */
+const DURABLE_LANDING_SHAPES = ["pr-link", "landing-artifact"] as const;
+
+/**
+ * Carry forward durable landing evidence when re-evaluating an already-in_review
+ * issue.
+ *
+ * The evaluator only scans the 10 most recent agent comments, so once ten
+ * comments accumulate after the one bearing the PR link, a fresh evaluation
+ * reports `allDetected: []`. On the in_review TRANSITION that is the honest
+ * answer and it is what gets stored. But `done-gate.ts` reads the STORED
+ * verdict's `allDetected` as the standing record that a PR was ever attached
+ * (`hasPrLinkEvidence`), so letting a re-evaluation overwrite it would make an
+ * issue that legitimately shipped a PR fail its later `done` transition with
+ * `no_execution_run_and_no_pr_evidence` purely because the comment thread grew.
+ * Before BLO-19047 the re-evaluation was a no-op, so the transition-time verdict
+ * was durable by accident; this keeps it durable on purpose.
+ *
+ * Only `allDetected` is merged — `verdict`, `missing` and `requiredFound` stay
+ * exactly as freshly computed, which is the whole point of re-evaluating.
+ */
+function preserveDurableLandingEvidence<T extends { allDetected?: unknown }>(
+  fresh: T,
+  stored: unknown,
+): T {
+  const storedDetected = (stored as { allDetected?: unknown } | null)?.allDetected;
+  if (!Array.isArray(storedDetected)) return fresh;
+  const freshDetected = Array.isArray(fresh.allDetected) ? fresh.allDetected : [];
+  const carried = DURABLE_LANDING_SHAPES.filter(
+    (shape) => storedDetected.includes(shape) && !freshDetected.includes(shape),
+  );
+  if (carried.length === 0) return fresh;
+  return { ...fresh, allDetected: [...freshDetected, ...carried] };
+}
+
 async function fetchEvidenceForIssue(
   dbOrTx: any,
   issueId: string,
@@ -8055,7 +8093,9 @@ export function issueService(db: Db) {
             id,
           );
           inReviewVerdict = verdict;
-          patch.lastEvidenceVerdict = verdict;
+          patch.lastEvidenceVerdict = isInReviewTransition
+            ? verdict
+            : preserveDurableLandingEvidence(verdict, existing.lastEvidenceVerdict);
           patch.lastEvidenceVerdictEvaluatedAt = new Date(verdict.evaluatedAt);
           logger.info(
             {

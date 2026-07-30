@@ -251,5 +251,48 @@ describeEmbeddedPostgres("PATCH /issues/:id evidence gate", () => {
         title: "Still under review",
       });
     });
+
+    it("keeps durable landing evidence that has aged out of the comment window", async () => {
+      // done-gate.ts reads the STORED verdict's allDetected as the standing
+      // record that a PR was attached. The evaluator only scans the 10 newest
+      // agent comments, so a re-evaluation must not erase that record just
+      // because the thread grew — that would fail a later `done` transition
+      // with no_execution_run_and_no_pr_evidence on an issue that did ship.
+      const { companyId, issueId, agentId } = await seedFrontendIssue("in_review");
+      await db
+        .update(issues)
+        .set({
+          lastEvidenceVerdict: {
+            verdict: "pass",
+            missing: [],
+            allDetected: ["pr-link", "landing-artifact", "checklist:done-when"],
+          } as any,
+          lastEvidenceVerdictEvaluatedAt: new Date("2026-07-30T11:48:19.000Z"),
+        })
+        .where(eq(issues.id, issueId));
+      // 12 newer comments with no PR link push the original out of the window.
+      for (let i = 0; i < 12; i += 1) {
+        await db.insert(issueComments).values({
+          companyId,
+          issueId,
+          body: `review note ${i}`,
+          authorAgentId: agentId,
+          authorUserId: null,
+          createdAt: new Date(Date.parse("2026-07-30T12:00:00.000Z") + i * 1000),
+        });
+      }
+
+      const response = await request(createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review" });
+
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      // Freshly computed fields reflect the current window...
+      expect(response.body.lastEvidenceVerdict).toMatchObject({ verdict: "block" });
+      // ...but the durable landing fact survives.
+      expect(response.body.lastEvidenceVerdict.allDetected).toEqual(
+        expect.arrayContaining(["pr-link", "landing-artifact"]),
+      );
+    });
   });
 });
