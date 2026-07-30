@@ -8392,6 +8392,16 @@ export function issueService(db: Db) {
         expectedCurrentAssigneeAgentId?: string | null;
       },
       dbOrTx: any = db,
+      // BLO-18643 follow-up: an optional compare-and-swap guard on the write itself.
+      // A caller that read the row earlier (e.g. under an advisory lock, in a separate
+      // statement or transaction) and validated its status before deciding to mutate
+      // has no guarantee that status is still current by the time this runs -- any
+      // non-lock-holding writer (a human reviewer's PATCH, a different code path) can
+      // land in between. `expectedStatus` folds that check into the UPDATE's WHERE
+      // clause so the write is atomic: if the row's status has moved on, zero rows
+      // match, the update is a no-op, and this returns null exactly like "row missing"
+      // does today -- instead of unconditionally overwriting whatever the row now says.
+      options?: { expectedStatus?: string[] },
     ) => {
       const existing = await dbOrTx
         .select()
@@ -8754,7 +8764,7 @@ export function issueService(db: Db) {
             );
           }
         }
-        const writePreconditions = [
+        const conflictPreconditions = [
           ...(expectedCurrentStatus === undefined ? [] : [eq(issues.status, expectedCurrentStatus)]),
           ...(expectedCurrentAssigneeAgentId === undefined
             ? []
@@ -8764,6 +8774,10 @@ export function issueService(db: Db) {
                   : eq(issues.assigneeAgentId, expectedCurrentAssigneeAgentId),
               ]),
         ];
+        const casPreconditions = options?.expectedStatus?.length
+          ? [inArray(issues.status, options.expectedStatus)]
+          : [];
+        const writePreconditions = [...conflictPreconditions, ...casPreconditions];
         const updated = await tx
           .update(issues)
           .set(patch)
@@ -8779,7 +8793,7 @@ export function issueService(db: Db) {
           // changed an authorization-relevant field after the snapshot check
           // above — the precondition genuinely failed, so surface 409 rather
           // than the 404 that a bare `return null` would produce.
-          if (writePreconditions.length > 0) {
+          if (conflictPreconditions.length > 0) {
             throw conflict("Issue changed before the update could be applied", {
               issueId: id,
               ...(expectedCurrentStatus === undefined ? {} : { expectedStatus: expectedCurrentStatus }),
