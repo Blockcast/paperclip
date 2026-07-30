@@ -119,7 +119,7 @@ const checkoutIssueToolSchema = z.object({
 
 const addCommentToolSchema = z.object({
   issueId: issueIdSchema,
-}).merge(addIssueCommentSchema);
+}).merge(addIssueCommentSchema.innerType());
 
 const createSuggestTasksToolSchema = z.object({
   issueId: issueIdSchema,
