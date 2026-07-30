@@ -128,10 +128,25 @@ default credential (GitHub permits only one open PR per head/base, so the close
 must come first). No force-push and no CI re-plumbing is needed.
 
 ```sh
+# Capture head, base, title and body BEFORE closing — a closed PR is still
+# readable, but reconstructing these by hand is how a re-opened PR silently
+# acquires a different base (and so a different diff and a different check set).
+# Never assume `master`: stacked PRs and repos with another default branch
+# target something else.
+gh pr view <number> --repo <org>/<repo> \
+  --json headRefName,baseRefName,title,body > /tmp/pr-<number>.json
+
 gh pr close <number> --repo <org>/<repo>
-gh pr create --repo <org>/<repo> --head <same-branch> --base master \
-  --title ... --body-file <file>
+
+gh pr create --repo <org>/<repo> \
+  --head  "$(jq -r .headRefName /tmp/pr-<number>.json)" \
+  --base  "$(jq -r .baseRefName /tmp/pr-<number>.json)" \
+  --title "$(jq -r .title       /tmp/pr-<number>.json)" \
+  --body  "$(jq -r .body        /tmp/pr-<number>.json)"
 ```
+
+Confirm the new PR reports the same `baseRefName` and `headRefOid` as the old one
+before you treat the recovery as done.
 
 Pushing under the seat is also unsafe where branch protection sets
 `require_last_push_approval` — the most recent pusher cannot approve, so a

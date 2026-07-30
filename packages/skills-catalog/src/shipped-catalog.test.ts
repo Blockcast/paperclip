@@ -195,13 +195,22 @@ describe("shipped skills catalog", () => {
     expect(remoteExecPattern.test(rampSkill)).toBe(false);
   });
 
-  it("selects user-seat GitHub auth through the agent token-file wrapper", async () => {
+  it("authors PRs under the App token and never under the user seat", async () => {
     const content = await readFile(
       new URL("../catalog/bundled/software-development/github-pr-workflow/SKILL.md", import.meta.url),
       "utf8",
     );
 
-    expect(content).toContain('PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE"');
+    // The review bot's formal APPROVE comes from the `allyblockcast` user seat, so a
+    // seat-authored PR makes author == approver and can never clear `review/ally-complete`.
+    expect(content).toContain("Author and push under the default App token.");
+    expect(content).not.toContain("author your PR under it");
+    expect(content).not.toContain('PAPERCLIP_GITHUB_TOKEN_FILE="$USER_TOKEN_FILE"');
+
+    // The seat is not a reviewing credential either.
+    expect(content).toContain("Never submit a formal review under the user-seat token.");
+
+    // The wrapped `gh` overrides GH_TOKEN from a token file, so setting it selects nothing.
     expect(content).not.toContain('GH_TOKEN="$AUTHOR_TOKEN"');
   });
 });
