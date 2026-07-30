@@ -40,6 +40,18 @@ pnpm install
 pnpm dev
 ```
 
+> **`NODE_ENV=production` and `pnpm install`.** pnpm treats `NODE_ENV=production`
+> as an implicit `--prod` and skips every devDependency **while still exiting 0**.
+> The agent toolchain image inherits `NODE_ENV=production` from the
+> `paperclip-runtime` base, so this bites agents in particular. The repo's
+> `.npmrc` sets `production=false` to neutralize it — do not remove that line
+> (the `prod=false` alias does **not** work; only `production=false` does).
+> If you ever see `devDependencies: skipped because NODE_ENV is set to production`
+> in install output, the resulting tree has no `vitest` / `typescript` / `tsx`,
+> so no test, typecheck or build entrypoint will run. Re-run with
+> `pnpm install --prod=false`. This is not specific to `git worktree`; a plain
+> checkout installs just as incompletely. See BLO-19064.
+
 This starts:
 
 - API: `http://localhost:3100`
