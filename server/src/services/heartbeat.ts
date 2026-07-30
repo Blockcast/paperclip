@@ -206,6 +206,7 @@ import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
 } from "./issue-tree-control.js";
+import { RUN_STALE_SILENCE_MS } from "./issue-run-holding.js";
 import {
   continuationSummaryParksExecutor,
   getIssueContinuationSummaryDocument,
@@ -926,7 +927,9 @@ const EXTERNAL_LIFECYCLE_ADAPTERS = new Set([
 // Jobs immediately; this threshold only applies when that probe returns
 // null. Kept generous so a slow probe + a healthy long-running Claude
 // session don't collide.
-const EXTERNAL_LIFECYCLE_STALE_MS = 15 * 60 * 1000;
+// BLO-19001: canonical definition lives in issue-run-holding.ts so the dispatch
+// gate below and the inbox-lite self-selection guard cannot drift apart.
+const EXTERNAL_LIFECYCLE_STALE_MS = RUN_STALE_SILENCE_MS;
 // External-lifecycle adapters create a DB run before the adapter.invoke event
 // is appended. Startup and periodic reapers can overlap that setup window;
 // give slow pre-run hooks and kube Job creation time to reach adapter.invoke.
