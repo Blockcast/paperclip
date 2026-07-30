@@ -2357,6 +2357,49 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
+  it("BLO-18829: a failed post-commit wake dispatch leaves the outbox row durable for the reconciler", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    // The escalation itself must still succeed -- a wake we could not hand off is not a
+    // reason to abandon a park that already committed.
+    const enqueueWakeup = vi.fn(async () => {
+      throw new Error("dispatch exploded");
+    });
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const escalation = await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      },
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    expect(escalation?.status).toBe("blocked");
+    expect(enqueueWakeup).toHaveBeenCalled();
+
+    // The wake is still owed, and owed in exactly the shape reconcileFailedWakeDispatches
+    // selects on: status `dispatch_failed` with a replayable dispatchRetry envelope. That
+    // is what makes this an under-wake-proof outbox rather than a lost wake.
+    const wakeRows = await db.select().from(agentWakeupRequests);
+    expect(wakeRows).toHaveLength(1);
+    expect(wakeRows[0]?.status).toBe("dispatch_failed");
+    const dispatchRetry = (wakeRows[0]?.payload as { dispatchRetry?: Record<string, unknown> })
+      ?.dispatchRetry;
+    expect(dispatchRetry).toMatchObject({ attempts: 0 });
+    expect(typeof dispatchRetry?.nextAttemptAt).toBe("string");
+    expect(dispatchRetry?.originalOpts).toMatchObject({ reason: "source_scoped_recovery_action" });
+  });
+
   it("does not create nested recovery artifacts when issue-backed fallback work itself fails", async () => {
     const { companyId, managerId, sourceIssueId, prefix } = await seedCompany();
     const recoveryIssueId = randomUUID();
