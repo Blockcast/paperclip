@@ -95,14 +95,13 @@ export async function cleanupHeartbeatTestState(
   await heartbeat.drainInFlightExecutions(drainTimeoutMs);
 
   const truncateList = ['"companies"', ...extraTruncateTables.map((t) => `"${t}"`)].join(", ");
-  await runWithTransientDbRetry(
-    () => db.execute(sql.raw(`TRUNCATE TABLE ${truncateList} CASCADE`)),
-    {
-      maxAttempts: 5,
-      baseDelayMs: 50,
-      jitterMs: 100,
-    },
-  );
+  await runWithTransientDbRetry(async () => {
+    await db.execute(sql.raw(`TRUNCATE TABLE ${truncateList} CASCADE`));
+  }, {
+    maxAttempts: 5,
+    baseDelayMs: 50,
+    jitterMs: 100,
+  });
 }
 
 async function cancelActiveRunsForCleanup(
