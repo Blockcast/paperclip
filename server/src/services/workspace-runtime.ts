@@ -722,10 +722,62 @@ async function executeProcess(input: {
  * from the historical string so existing `gitErrorIncludes` matching still works.
  */
 class GitCommandTimeoutError extends Error {
-  constructor(message: string) {
+  /**
+   * Whatever the command had already written to stdout before it was killed,
+   * raw and untrimmed.
+   *
+   * Kept because a stalled command can still have emitted *conclusive* output:
+   * `git submodule status --recursive` flushes each entry as it walks, so it can
+   * print a definitive `U`/`-` record for one submodule and then stall on a
+   * later one. Discarding this would throw away evidence the probe already
+   * produced and let a known-broken checkout through the degrade path.
+   *
+   * Two properties callers must respect (both measured against a real
+   * multi-submodule checkout, see BLO-18784):
+   * - The captured text can be unreliable at *both* ends: a stream killed
+   *   mid-write ends in a partial line, and a byte-capped stream keeps only the
+   *   last N bytes (so it is chopped at its head and carries a truncation
+   *   banner). `salvageGitSubmoduleFaults` handles both.
+   * - Absence of a fault record here is NOT evidence of health: an early kill
+   *   or buffering can yield zero bytes for a checkout that is in fact broken.
+   *   Presence may be acted on; absence must still degrade.
+   */
+  readonly stdout: string;
+  readonly stdoutEndsWithNewline: boolean;
+
+  constructor(message: string, partial?: { stdout: string }) {
     super(message);
     this.name = "GitCommandTimeoutError";
+    this.stdout = partial?.stdout ?? "";
+    this.stdoutEndsWithNewline = this.stdout.endsWith("\n");
   }
+}
+
+/**
+ * `git submodule status` line shape: a status character, the full object id,
+ * then the path. Anchored deliberately -- it is the guard that makes salvaging a
+ * *partial* stream safe, because neither a head-chopped fragment (which has lost
+ * its status character and part of its object id) nor the capture layer's
+ * `[output truncated ...]` banner can match it. Only `-` (uninitialized) and `U`
+ * (conflicted) are of interest; ` ` and `+` are healthy states.
+ */
+const GIT_SUBMODULE_FAULT_LINE = /^[-U][0-9a-f]{40,64} \S/;
+
+/**
+ * Recover submodule faults a stalled probe had already reported.
+ *
+ * Safe in one direction only: a fault found here is real (git printed it), so it
+ * may be acted on, but finding none is NOT evidence of health -- see
+ * `GitCommandTimeoutError.stdout`.
+ */
+function salvageGitSubmoduleFaults(error: GitCommandTimeoutError): GitSubmoduleReadinessEntry[] {
+  if (!error.stdout) return [];
+  const lines = error.stdout.split("\n");
+  // A stream killed mid-write ends in a partial line. That fragment can still
+  // match the shape above while carrying a *truncated path*, which would name
+  // the wrong submodule, so drop it outright rather than filtering it.
+  if (!error.stdoutEndsWithNewline) lines.pop();
+  return parseGitSubmoduleReadiness(lines.filter((line) => GIT_SUBMODULE_FAULT_LINE.test(line)).join("\n"));
 }
 
 async function runGit(
@@ -743,7 +795,9 @@ async function runGit(
     maxStderrBytes: options.maxStderrBytes,
   });
   if (proc.timedOut) {
-    throw new GitCommandTimeoutError(`git ${args.join(" ")} timed out after ${options.timeoutMs}ms`);
+    throw new GitCommandTimeoutError(`git ${args.join(" ")} timed out after ${options.timeoutMs}ms`, {
+      stdout: proc.stdout,
+    });
   }
   if (proc.code !== 0) {
     throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
@@ -1126,11 +1180,18 @@ function buildNonInteractiveGitEnv(): NodeJS.ProcessEnv {
  * which is NOT evidence that submodules are broken. Callers must not strand a
  * live issue on an inconclusive probe -- see `ensureGitSubmodulesReady`.
  *
+ * `partial: true` accompanies `ok: true` when the entries were recovered from a
+ * *timed-out* probe's partial output. The list is a subset -- the walk did not
+ * finish -- but each entry in it is a fault git actually reported, so callers
+ * treat it exactly like a completed probe: fail closed on conflicted, repair
+ * uninitialized. Only the absence of faults is unknowable from partial output,
+ * and that case degrades instead (`ok: false`).
+ *
  * Deterministic failures never reach this type: they throw. See
  * `inspectGitSubmoduleReadiness`.
  */
 type GitSubmoduleInspection =
-  | { ok: true; entries: GitSubmoduleReadinessEntry[] }
+  | { ok: true; entries: GitSubmoduleReadinessEntry[]; partial?: boolean }
   | { ok: false; reason: string; attempts: number };
 
 /**
@@ -1138,8 +1199,14 @@ type GitSubmoduleInspection =
  *
  * Two failure modes, deliberately handled differently:
  *
- * - **Stall** (`GitCommandTimeoutError`): inconclusive. Retried, then reported as
- *   `ok: false` so the caller can degrade to a warning. This is the BLO-18784 fix.
+ * - **Stall** (`GitCommandTimeoutError`): inconclusive *unless* the partial output
+ *   already names a broken submodule. `git submodule status --recursive` flushes
+ *   entries as it walks, so a stall can arrive with a definitive `U`/`-` record
+ *   for an earlier submodule in hand. When it does, that evidence is returned
+ *   (`partial: true`) and the caller fails closed / repairs as usual -- retrying
+ *   would spend another full budget to reach a conclusion we already have.
+ *   Otherwise the stall is retried, then reported as `ok: false` so the caller
+ *   can degrade to a warning. This is the BLO-18784 fix.
  * - **Any other failure** (non-zero exit, missing git binary, malformed
  *   `.gitmodules`, corrupt checkout, permission error): deterministic evidence
  *   that the checkout is unusable. Throws `WorkspaceGitSubmoduleError`, as it did
@@ -1173,6 +1240,17 @@ async function inspectGitSubmoduleReadiness(
         );
       }
       lastTimeoutReason = error.message;
+
+      // The stall may still have produced conclusive evidence before it hung.
+      const salvaged = salvageGitSubmoduleFaults(error);
+      if (salvaged.length > 0) {
+        // Faults git actually reported. Return them as conclusive so the caller
+        // fails closed / repairs. Note the converse does NOT hold: an empty
+        // `salvaged` is not evidence of health (buffering or an early kill can
+        // yield no output at all), so that case falls through to retry/degrade.
+        return { ok: true, entries: salvaged, partial: true };
+      }
+
       if (attempt < settings.attempts) {
         // Cap the linear backoff as well: the delay is a *product*, so bounding
         // only the configured value would leave the effective delay unbounded
@@ -1270,11 +1348,17 @@ async function ensureGitSubmodulesReady(input: {
   }
 
   const entries = inspection.entries;
+  // When the evidence came from a stalled probe, say so: the fault is real but
+  // the list is a subset, so an operator reading the error should not treat it
+  // as the complete set of broken submodules.
+  const partialSuffix = inspection.partial
+    ? " (detected in the partial output of a probe that then stalled, so there may be more)"
+    : "";
 
   const conflicted = entries.filter((entry) => entry.state === "conflicted");
   if (conflicted.length > 0) {
     throw new WorkspaceGitSubmoduleError(
-      `Execution workspace "${input.cwd}" has conflicted git submodules that need manual resolution before an agent can run: ${conflicted.map((entry) => entry.path).join(", ")}`,
+      `Execution workspace "${input.cwd}" has conflicted git submodules that need manual resolution before an agent can run: ${conflicted.map((entry) => entry.path).join(", ")}${partialSuffix}`,
     );
   }
 
@@ -1356,8 +1440,22 @@ async function ensureGitSubmodulesReady(input: {
     ];
   }
   if (verification.entries.length > 0) {
+    const stillMissing = verification.entries.map((entry) => entry.path);
+    // Only the paths we actually attempted can be described as unfixed by the
+    // repair. A partial initial probe returns a subset, so anything outside
+    // `missingPaths` was never attempted -- calling that "still unavailable
+    // after repair" would send an operator looking for a repair failure that
+    // never happened. The workspace is still unusable either way, so this stays
+    // fatal; only the attribution changes.
+    const unattempted = stillMissing.filter((candidate) => !missingPaths.includes(candidate));
     throw new WorkspaceGitSubmoduleError(
-      `Execution workspace "${input.cwd}" still has unavailable git submodules after repair: ${verification.entries.map((entry) => entry.path).join(", ")}`,
+      `Execution workspace "${input.cwd}" still has unavailable git submodules after repair: ${stillMissing.join(", ")}` +
+        (unattempted.length > 0
+          ? `. Not attempted by this repair (the initial probe stalled before reporting them): ${unattempted.join(", ")}`
+          : "") +
+        (verification.partial
+          ? " (verification itself stalled, so this list may be incomplete)"
+          : ""),
     );
   }
 

@@ -2606,6 +2606,171 @@ describe("realizeExecutionWorkspace", () => {
     }
   }, 30_000);
 
+  it("still fails the run when a stalled probe already reported a conflicted submodule", async () => {
+    // BLO-18784 follow-up: `git submodule status --recursive` flushes each entry
+    // as it walks, so a stall can arrive with a definitive fault already in hand
+    // -- a `U` record for an earlier submodule, then a hang on a later one.
+    // `runGit` used to discard the partial stdout when it threw
+    // GitCommandTimeoutError, so that evidence was lost and the run degraded as
+    // though the probe had produced nothing. Measured against a real
+    // 120-submodule checkout: the `-`/`U` lines land ~130ms into a multi-second
+    // walk, well before the budget expires, so this is reachable in production.
+    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+    const counterPath = path.join(shimDir, "status-calls");
+    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+    const shimPath = path.join(shimDir, "git");
+    // Emit a conflicted record, then hang. `exec sleep` replaces the shell so the
+    // SIGTERM from executeProcess lands on the stalling process directly.
+    await fs.writeFile(
+      shimPath,
+      [
+        "#!/bin/sh",
+        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+        `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
+        "  calls=$((calls + 1))",
+        `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
+        "  echo 'U1111111111111111111111111111111111111111 vendor/conflicted-dep'",
+        "  exec sleep 30",
+        "fi",
+        `exec ${JSON.stringify(realGit)} "$@"`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(shimPath, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+    // attempts: 3 so that acting on the salvaged evidence is observable -- a
+    // correct implementation stops after the first stall because it already has
+    // a conclusive answer, rather than spending two more budgets on it.
+    setSubmoduleInspectSettingsForTests({ timeoutMs: 500, attempts: 3, retryDelayMs: 1 });
+
+    try {
+      await expect(
+        realizeExecutionWorkspace({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-submodule-partial-fault",
+            workspaceId: "workspace-submodule-partial-fault",
+            repoUrl: null,
+            repoRef: "main",
+          },
+          config: {},
+          issue: {
+            id: "issue-submodule-partial-fault",
+            identifier: "PAP-SUBMODULE-PARTIAL-FAULT",
+            title: "Do not discard a fault a stalled probe already found",
+          },
+          agent: {
+            id: "agent-submodule-partial-fault",
+            name: "Codex Coder",
+            companyId: "company-submodule-partial-fault",
+          },
+          recorder,
+        }),
+      ).rejects.toThrow(/vendor\/conflicted-dep/);
+
+      // The fault must be fatal, not degraded away.
+      expect(
+        operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+      ).toBe(false);
+      // Evidence was conclusive on the first stall, so it must not have retried.
+      expect(await fs.readFile(counterPath, "utf8")).toBe("1");
+    } finally {
+      setSubmoduleInspectSettingsForTests(null);
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await fs.rm(shimDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("still degrades when a stalled probe produced no fault record", async () => {
+    // The converse of the test above, and the property that keeps this from
+    // becoming a fail-*closed* regression: an empty or fault-free partial output
+    // is NOT evidence of health (an early kill or stdio buffering can yield zero
+    // bytes for a checkout that is in fact broken), so absence of a fault record
+    // must still degrade rather than being read as "clean" or as a fault.
+    //
+    // The shim also emits the three shapes that must NOT be mistaken for faults,
+    // because the captured stream is unreliable at both ends -- it keeps only the
+    // last N bytes (chopping the head and prepending a banner) and a kill can cut
+    // the tail mid-line:
+    //   1. the capture layer's `[output truncated ...]` banner,
+    //   2. a head-chopped line that lost its status character and sha prefix,
+    //   3. a tail fragment whose path is truncated (would name the wrong module).
+    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+    const shimPath = path.join(shimDir, "git");
+    await fs.writeFile(
+      shimPath,
+      [
+        "#!/bin/sh",
+        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+        "  echo '[output truncated to last 512 bytes; total 9000 bytes]'",
+        "  echo '9cd3ad27f42c565e05964ab4 vendor/head-fragment'",
+        "  echo ' 2222222222222222222222222222222222222222 vendor/healthy-dep (heads/main)'",
+        "  printf -- '-3333333333333333333333333333333333333333 vendor/trunc'",
+        "  exec sleep 30",
+        "fi",
+        `exec ${JSON.stringify(realGit)} "$@"`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(shimPath, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+    setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 2, retryDelayMs: 1 });
+
+    try {
+      const realized = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-partial-clean",
+          workspaceId: "workspace-submodule-partial-clean",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-partial-clean",
+          identifier: "PAP-SUBMODULE-PARTIAL-CLEAN",
+          title: "Degrade when a stall carries no fault record",
+        },
+        agent: {
+          id: "agent-submodule-partial-clean",
+          name: "Codex Coder",
+          companyId: "company-submodule-partial-clean",
+        },
+        recorder,
+      });
+
+      expect(realized.cwd).toBe(repoRoot);
+      expect(
+        realized.warnings.some((warning) => warning.includes("Could not inspect git submodules")),
+      ).toBe(true);
+      expect(
+        operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+      ).toBe(true);
+      // None of the three non-fault shapes may have been read as a broken module.
+      const allText = realized.warnings.join("\n");
+      expect(allText).not.toContain("vendor/trunc");
+      expect(allText).not.toContain("vendor/head-fragment");
+      expect(allText).not.toContain("vendor/healthy-dep");
+    } finally {
+      setSubmoduleInspectSettingsForTests(null);
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await fs.rm(shimDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("ignores a non-integer submodule inspection override instead of truncating it to zero", async () => {
     // `Math.trunc(0.5)` is 0, which does not fall back: 0 attempts skips the
     // retry loop (degrading a healthy workspace) and a 0ms timeout disables
