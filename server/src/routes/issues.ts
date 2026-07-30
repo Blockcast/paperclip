@@ -3735,6 +3735,21 @@ export function issueRoutes(
     );
   }
 
+  function isCreatorOrManagerChainRecoveryPatch(
+    issue: { status: string },
+    body: Record<string, unknown>,
+  ) {
+    if (issue.status !== "blocked") return false;
+    const keys = Object.keys(body);
+    return (
+      keys.length === 2 &&
+      keys.includes("status") &&
+      keys.includes("blockedByIssueIds") &&
+      body.status === "todo" &&
+      Array.isArray(body.blockedByIssueIds)
+    );
+  }
+
   async function assertAgentIssueMutationAllowed(
     req: Request,
     res: Response,
@@ -3802,30 +3817,33 @@ export function issueRoutes(
     // actor it had just admitted — 403 "Agent cannot mutate another agent's
     // issue". Mirrors the isActiveRecoveryActionOwner bypass directly above.
     //
-    // Opt-in per route. This helper guards ~25 routes; only PATCH /issues/:id
-    // passes allowCreatorOrManagerChainOwnership. Every other caller — most
-    // pointedly DELETE /issues/:id — keeps the pre-existing behaviour, so
-    // creating an issue does not become a licence to destroy it after handing
-    // it to someone else.
-    //
-    // Also gated on status !== "in_progress". The
-    // `issue.assigneeAgentId !== actorAgentId` block below carries TWO distinct
-    // guards: the assignee-ownership 403, and the 409 that protects an
-    // assignee's *live run*. Returning early above both would let any issue
-    // creator — who needs no org relationship and no grant, since tasks:assign
-    // resolves company-wide — cancel a peer's running heartbeat with
-    // PATCH { status: "cancelled" }. Managers are not constrained by this: on an
-    // in_progress issue they still pass below via
-    // hasActiveCheckoutManagementOverride, since authorization.ts grants
-    // tasks:manage_active_checkouts through the same isManagerOf predicate. So
-    // the manager-driven recovery case this was written for still works.
+    // Opt-in per route and patch shape. This helper guards ~25 routes; only the
+    // blocked -> todo delegate-recovery PATCH passes the bypass. Every other
+    // caller — most pointedly DELETE /issues/:id — fails closed before the
+    // checkout-management override below can widen the boundary decision.
     if (
       options.allowCreatorOrManagerChainOwnership &&
       (boundaryDecision.reason === "allow_issue_creator" ||
         boundaryDecision.reason === "allow_manager_chain") &&
-      issue.status !== "in_progress"
+      isCreatorOrManagerChainRecoveryPatch(issue, req.body as Record<string, unknown>)
     ) {
       return true;
+    }
+    if (
+      boundaryDecision.reason === "allow_issue_creator" ||
+      boundaryDecision.reason === "allow_manager_chain"
+    ) {
+      res.status(403).json({
+        error: "Agent cannot mutate another agent's issue outside delegate recovery",
+        details: {
+          issueId: issue.id,
+          assigneeAgentId: issue.assigneeAgentId,
+          actorAgentId,
+          status: issue.status,
+          securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+        },
+      });
+      return false;
     }
     if (issue.assigneeAgentId === null) {
       return true;
@@ -8059,9 +8077,9 @@ export function issueRoutes(
       {
         allowBlockedCorrection: true,
         allowScopedRecoveryOwnerSourceMutation,
-        // BLO-18797: the delegate-recovery path. A manager (or the issue's
-        // creator) needs to move a stuck delegate's issue out of `blocked`
-        // and clear a stale blocker edge. Scoped to this route only.
+        // BLO-18797: the delegate-recovery path. The helper additionally
+        // requires a blocked -> todo patch containing only status and
+        // blockedByIssueIds.
         allowCreatorOrManagerChainOwnership: true,
       },
     ))) return;

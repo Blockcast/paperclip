@@ -1804,10 +1804,8 @@ describe("agent issue mutation checkout ownership", () => {
   // tasks:manage_active_checkouts so the only thing that can carry the request
   // is the boundary-reason short-circuit itself.
   //
-  // The short-circuit is gated on status !== "in_progress" on purpose: the same
-  // route block also holds the 409 that protects an assignee's live run. See the
-  // "does not let a creator reach an in_progress issue" cases below — that is a
-  // privilege-escalation regression guard, not an incidental assertion.
+  // The short-circuit is restricted to an explicit blocked -> todo recovery
+  // patch containing only status and blockedByIssueIds.
   describe("creator / manager-chain boundary reasons survive the route ownership gate (BLO-18797)", () => {
     function decideAllowingOnly(issueBoundaryReason: string) {
       mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
@@ -1851,80 +1849,31 @@ describe("agent issue mutation checkout ownership", () => {
       });
     }
 
-    // The escalation this guards against: tasks:assign resolves company-wide, so
-    // ANY agent can create an issue and assign it to an unrelated peer. If the
-    // short-circuit ignored status, that creator could then cancel the peer's
-    // running heartbeat with PATCH { status: "cancelled" } — no org relationship
-    // and no grant required. The 409 must survive for the creator path.
-    it("does not let allow_issue_creator mutate an in_progress issue held by another agent", async () => {
-      decideAllowingOnly("allow_issue_creator");
-      mockIssueService.getById.mockResolvedValue(
-        makeIssue({
-          status: "in_progress",
-          assigneeAgentId: ownerAgentId,
-          createdByAgentId: peerAgentId,
-          checkoutRunId: "abcdef00-0000-4000-8000-000000000001",
-          executionRunId: "abcdef00-0000-4000-8000-000000000001",
-        }),
-      );
+    for (const body of [
+      { title: "Not recovery" },
+      { status: "done", blockedByIssueIds: [] },
+      { status: "cancelled", blockedByIssueIds: [] },
+      { status: "todo", blockedByIssueIds: [], description: "Too broad" },
+    ]) {
+      it(`rejects a manager-chain blocked-issue PATCH outside the recovery shape: ${JSON.stringify(body)}`, async () => {
+        decideAllowingOnly("allow_manager_chain");
+        mockIssueService.getById.mockResolvedValue(
+          makeIssue({
+            status: "blocked",
+            assigneeAgentId: ownerAgentId,
+            createdByAgentId: ownerAgentId,
+          }),
+        );
 
-      const res = await request(await createApp(peerActor()))
-        .patch(`/api/issues/${issueId}`)
-        .send({ status: "cancelled" });
+        const res = await request(await createApp(peerActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send(body);
 
-      expect(res.status, JSON.stringify(res.body)).toBe(409);
-      expect(res.body?.error).toContain("checked out by another agent");
-      expect(mockIssueService.update).not.toHaveBeenCalled();
-      // The whole point: the assignee's live run is not cancelled.
-      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
-    });
-
-    // Counterpart to the above — proves the status gate did not re-break the
-    // original BLO-18797 bug. A manager must still reach an in_progress report's
-    // issue, via the pre-existing tasks:manage_active_checkouts override.
-    it("still lets a manager mutate an in_progress report's issue via the checkout-management override", async () => {
-      mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
-        if (input.action === "issue:mutate" || input.action === "issue:comment") {
-          return {
-            allowed: true,
-            action: input.action,
-            reason: "allow_manager_chain",
-            explanation: "Allowed via allow_manager_chain.",
-          };
-        }
-        if (input.action === "tasks:manage_active_checkouts") {
-          return {
-            allowed: true,
-            action: input.action,
-            reason: "allow_manager_chain",
-            explanation: "Manager of the assignee.",
-          };
-        }
-        return {
-          allowed: false,
-          action: input.action,
-          reason: "deny_missing_grant",
-          explanation: "Missing permission.",
-        };
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(res.body?.error).toContain("outside delegate recovery");
+        expect(mockIssueService.update).not.toHaveBeenCalled();
       });
-      const stored = makeIssue({
-        status: "in_progress",
-        assigneeAgentId: ownerAgentId,
-        createdByAgentId: ownerAgentId,
-      });
-      mockIssueService.getById.mockResolvedValue(stored);
-      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
-        ...stored,
-        ...patch,
-      }));
-
-      const res = await request(await createApp(peerActor()))
-        .patch(`/api/issues/${issueId}`)
-        .send({ status: "todo" });
-
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(mockIssueService.update).toHaveBeenCalled();
-    });
+    }
 
     for (const reason of ["allow_manager_chain", "allow_issue_creator"] as const) {
       it(`lets a ${reason} actor POST a comment on an issue assigned to another agent`, async () => {
@@ -1992,7 +1941,15 @@ describe("agent issue mutation checkout ownership", () => {
     // already run would still satisfy a status-only assertion.
     for (const reason of ["allow_manager_chain", "allow_issue_creator"] as const) {
       it(`does not let a ${reason} actor DELETE another agent's issue`, async () => {
-        decideAllowingOnly(reason);
+        mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+          allowed: input.action === "issue:mutate" || input.action === "tasks:manage_active_checkouts",
+          action: input.action,
+          reason:
+            input.action === "issue:mutate" || input.action === "tasks:manage_active_checkouts"
+              ? reason
+              : "deny_missing_grant",
+          explanation: `Decision for ${input.action}.`,
+        }));
         mockIssueService.getById.mockResolvedValue(
           makeIssue({
             status: "todo",
