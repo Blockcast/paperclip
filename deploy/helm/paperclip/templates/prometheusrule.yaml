@@ -25,6 +25,25 @@
   cluster that does grant the RBAC. When you change a rule here, change it in
   both onprem-k8s files too — see BLO-18859 for the review that caught an alert
   landing here and nowhere else.
+
+  STATUS of the BLO-18859 dead-letter alert, so this head is auditable on its
+  own (a reviewer cannot see the other repo from here):
+
+    - Landed on both authoritative onprem-k8s files by Blockcast/onprem-k8s#1784,
+      merged 2026-07-30T13:01:18Z as 423e32bc76c1bcdfa88c02bfce722a2ee71c22ef.
+      Verify:
+        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
+          --jq '.content' | base64 -d | grep PaperclipGithubReviewRequestDeadLettered
+
+    - NOT YET LIVE as of 2026-07-30T19:40Z. The cluster ConfigMap
+      monitoring/prometheus-config is Argo-tracked
+      (argocd.argoproj.io/tracking-id: monitoring-rules:/ConfigMap:monitoring/prometheus-config)
+      and the `monitoring-rules` app syncs manually, so a merge does not deploy.
+      The live key still carries only the six pre-existing Paperclip alerts.
+      That sync gate is a standing repo-wide hazard — it once sat 8 days and
+      stranded 15 merged alerts — and is tracked on BLO-19095, not here. Merging
+      an alert is not deploying it; confirm the live ConfigMap before treating
+      any rule in this family as production observability.
 */}}
 {{- if .Values.prometheusRule.enabled }}
 apiVersion: monitoring.coreos.com/v1
