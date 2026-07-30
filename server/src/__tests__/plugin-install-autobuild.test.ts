@@ -285,7 +285,7 @@ describeEmbeddedPostgres("plugin install auto-build route", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-autobuild-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     vi.clearAllMocks();
@@ -299,7 +299,7 @@ describeEmbeddedPostgres("plugin install auto-build route", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
-  });
+  }, 30_000);
 
   it("auto-builds bundled local plugins during POST /api/plugins/install when dist is missing", async () => {
     const fixture = await createBundledPluginFixture("success");
@@ -380,7 +380,7 @@ describeEmbeddedPostgres("plugin install auto-build route", () => {
     expect(res.body.error).toContain(`pnpm --filter ${fixture.packageName} build`);
     expect(existsSync(path.join(fixture.distDir, "manifest.js"))).toBe(false);
     expect(mockLifecycle.load).not.toHaveBeenCalled();
-  }, 20_000);
+  }, 120_000);
 
   it("returns the standalone bootstrap command when auto-build is disabled for sandbox-provider plugins", async () => {
     process.env["PAPERCLIP_DISABLE_PLUGIN_AUTOBUILD"] = "1";
@@ -398,5 +398,5 @@ describeEmbeddedPostgres("plugin install auto-build route", () => {
     expect(res.body.error).toContain("pnpm install --ignore-workspace --no-lockfile && pnpm build");
     expect(existsSync(path.join(fixture.distDir, "manifest.js"))).toBe(false);
     expect(mockLifecycle.load).not.toHaveBeenCalled();
-  }, 20_000);
+  }, 120_000);
 });

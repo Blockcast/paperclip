@@ -84,6 +84,7 @@ const baseConfig = (
 const baseInput = (
   overrides: Partial<PluginWebhookInput> = {},
 ): PluginWebhookInput => ({
+  companyId: "company-1",
   endpointKey: "alertmanager",
   headers: { authorization: `Bearer ${TOKEN}` },
   rawBody: JSON.stringify(baseEnvelope()),

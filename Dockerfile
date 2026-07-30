@@ -1,67 +1,9 @@
 # syntax=harbor.blockcast.net/dockerfile/dockerfile:1.20
-# Mirrored from docker.io/library/node:lts-trixie-slim to avoid Docker Hub
-# anonymous rate limits on self-hosted BuildKit runners.
-FROM harbor.blockcast.net/paperclip/node:lts-trixie-slim AS base
-ARG USER_UID=1000
-ARG USER_GID=1000
-# Disable Debian's auto-clean of apt cache so the BuildKit cache mount
-# below actually retains downloaded .deb files between builds. Without
-# this the docker-clean apt hook nukes /var/cache/apt after each install,
-# defeating the cache mount.
-RUN rm -f /etc/apt/apt.conf.d/docker-clean \
-  && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-  apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates gosu curl gh git wget ripgrep python3 \
-  && corepack enable
-
-# Wrap `gh` so it reads the live GitHub App installation token from the
-# kubelet-refreshed secret-volume file (PAPERCLIP_GITHUB_TOKEN_FILE, default
-# /paperclip/.secrets/github-token/token) on every invocation, instead of
-# falling back to ~/.config/gh/hosts.yml (BLO-13241: nothing refreshes that
-# file — it went stale ~10 days after a one-off write and broke `gh api`/
-# `gh auth status` for every agent pod, unnoticed because SSH git kept
-# working). A `/paperclip/.local/bin` wrapper with the same job already
-# exists (statefulset seed script, BLO-10448-adjacent), fed by a PATH
-# override in values.blockcast.yaml — but that override lives only on the
-# long-running server pod's env and does not reliably reach ephemeral agent
-# Job pods, which inherit this base image directly. Wrapping the binary at
-# its canonical PATH location closes that gap for every pod. Falls back to
-# the unmodified binary (existing hosts.yml/env auth) when the token file
-# isn't present, so non-agent uses of this image are unaffected.
-#
-# The wrapper is checked in at scripts/gh-token-wrapper.sh (single source of
-# truth, exercised directly by scripts/gh-token-wrapper.test.mjs) rather than
-# inlined here.
-COPY scripts/gh-token-wrapper.sh /usr/bin/gh-token-wrapper.sh
-RUN mv /usr/bin/gh /usr/bin/gh.real \
-  && ln -s /usr/bin/gh-token-wrapper.sh /usr/bin/gh \
-  && chmod 0755 /usr/bin/gh-token-wrapper.sh
-
-# Chromium runtime libs (BLO-3663) — required so headless Playwright works
-# inside agent Job pods. Job pods inherit this base image (the heavier
-# Dockerfile.agent toolchain isn't deployed for adapter Jobs), so the libs
-# must live here. Without them, `mcp__playwright__browser_navigate` fails
-# with `libglib-2.0.so.0: cannot open shared object file`, which is what
-# blocks UXDesigner's visual STOP gate on BLO-3979 every run.
-# Canonical list from `npx playwright install-deps chromium --dry-run` on
-# trixie; `t64` suffixes are Debian 13's time_t-64 transition packages.
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-  apt-get update \
-  && apt-get install -y --no-install-recommends \
-       libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
-       libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 \
-       libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 \
-       libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 \
-       libxfixes3 libxkbcommon0 libxrandr2 \
-       fonts-liberation fonts-noto-color-emoji
-
-# Modify the existing node user/group to have the specified UID/GID to match host user
-RUN usermod -u $USER_UID --non-unique node \
-  && groupmod -g $USER_GID --non-unique node \
-  && usermod -g $USER_GID -d /paperclip node
+# Build stages use the same stable runtime as production, but explicitly reset
+# NODE_ENV so dependency installers include development/build dependencies.
+ARG RUNTIME_IMAGE=harbor.blockcast.net/paperclip/paperclip-runtime:latest
+FROM ${RUNTIME_IMAGE} AS base
+ENV NODE_ENV=development
 
 FROM base AS deps
 WORKDIR /app
@@ -72,6 +14,8 @@ COPY ui/package.json ui/
 COPY packages/shared/package.json packages/shared/
 COPY packages/db/package.json packages/db/
 COPY packages/adapter-utils/package.json packages/adapter-utils/
+COPY packages/google-sheets-mcp-server/package.json packages/google-sheets-mcp-server/
+COPY packages/kv-demo-mcp-server/package.json packages/kv-demo-mcp-server/
 COPY packages/mcp-server/package.json packages/mcp-server/
 COPY packages/mcp-external/package.json packages/mcp-external/
 COPY packages/mcp-gateway/package.json packages/mcp-gateway/
@@ -183,7 +127,54 @@ WORKDIR /vendor
 # shared paperclip-data CephFS PVC. Manifest suite 141/141, typecheck, and build
 # passed; live concurrent shared-PVC pods reached Ready without
 # VolumePermissionChangeInProgress. PR Blockcast/paperclip#653.
-ARG CLAUDE_K8S_REF=63d00ecf69dc4cdd35259772d7e10152e6145f56
+# Bumped 2026-07-14 to 5f1d027 (BLO-15956): acknowledge the created Job name
+# and UID before polling or cleanup. A missing/rejected acknowledgment deletes
+# the Job and fails closed with k8s_job_identity_unacknowledged. PR
+# kkroo/paperclip-adapter-claude-k8s#17; focused suite 86/86 and typecheck pass.
+# Bumped 2026-07-14 for PEN-1305 PreToolUse env-guard (PR kkroo/paperclip-adapter-claude-k8s#18)
+# Bumped 2026-07-14 to c10a12b (BLO-15957): prefer the server-owned runtime
+# isolation descriptor, clone stateless review worktrees with an independent
+# Git index, persist durable workspace sessions, and keep writable caches on
+# the per-Job runtime-cache emptyDir. PR kkroo/paperclip-adapter-claude-k8s#19;
+# typecheck, 422/422 tests, and build pass after rebasing onto the env guard.
+# Bumped 2026-07-14 to 288f92a: bootstrap run-isolated jobs safely when a
+# stateless review starts from the generic non-Git fallback workspace, and
+# create the isolated pod-log parent before the pipefail/tee pipeline. PR
+# kkroo/paperclip-adapter-claude-k8s#20; typecheck, 422/422 tests, and build pass.
+# Bumped 2026-07-14 to 6b96224: terminate both run-isolation shell branches
+# before their `else`/`fi` control keywords. PR
+# kkroo/paperclip-adapter-claude-k8s#21; generated command parse-check,
+# typecheck, 422/422 tests, and build pass.
+# Bumped 2026-07-15 to d44eb4e: preserve Penstock's structured `resume_at`
+# capacity hint as adapter `retryNotBefore`, avoiding blind 90-second retries.
+# PR kkroo/paperclip-adapter-claude-k8s#22; typecheck and 425/425 tests pass.
+# Bumped 2026-07-15 to ec788a7 (BLO-16219): set TMPDIR/TMP/TEMP to a
+# tmpRoot sibling of homeRoot/sessionRoot/cacheRoot/workspaceRoot for run and
+# workspace isolation modes — previously unset, so concurrent stateless Jobs
+# shared the image's /tmp. Shared mode is unchanged. Pushed directly to
+# kkroo/paperclip-adapter-claude-k8s master (PR creation unavailable to the
+# GitHub App integration on this personal repo); typecheck and 426/426 tests
+# pass.
+# Bumped 2026-07-16 to e2bc983 (BLO-12558): emit isolated-start and
+# concurrent-block decisions with isolation mode/key, task key, and session ID;
+# fail closed on live Jobs with unknown isolation metadata; label server-owned
+# shared descriptors for later guard decisions; keep telemetry non-fatal even
+# if the metrics or log transport is unavailable; map legacy `isolated` labels
+# to the bounded `workspace` mode. PR kkroo/paperclip-adapter-claude-k8s#23;
+# typecheck, build, and 432/432 tests pass.
+# Bumped 2026-07-20 to cd52a58: bound the pre-Job live-Job list to 15 seconds
+# and fail closed when Kubernetes does not answer. PR kkroo/paperclip-adapter-claude-k8s#24.
+# Bumped 2026-07-24 to c4f92ff: model-only commit based on the previous
+# production pin cd52a58. Adds Claude Opus 5, Claude Opus 5 1M, and Bedrock
+# Opus 5 model catalog entries without bundling later retry-semantics changes.
+# Focused models suite and typecheck pass.
+# Bumped 2026-07-29 to c9b3b2c: start run-isolated claude_k8s Jobs from the
+# stable run root before deleting/recloning the per-run workspace. Starting in
+# that workspace invalidated the shell cwd and made Git fail with getcwd() /
+# index-pack errors. Also appends a redacted failed-pod container log tail to
+# partial-run errors. PR kkroo/paperclip-adapter-claude-k8s#28; focused
+# execute/job-manifest suite 230/230 and typecheck pass.
+ARG CLAUDE_K8S_REF=c9b3b2c1c979d2db121f0c1129a06a38356678e7
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
@@ -310,7 +301,41 @@ ARG CLAUDE_K8S_REF=63d00ecf69dc4cdd35259772d7e10152e6145f56
 # shared paperclip-data CephFS PVC. Manifest suite 113/113, typecheck, and build
 # passed; live concurrent shared-PVC pods reached Ready without
 # VolumePermissionChangeInProgress. PR Blockcast/paperclip#653.
-ARG OPENCODE_K8S_REF=010f0e7e6f9058b887ec3e82d91e1ceb34f691ca
+# Bumped 2026-07-14 to 0a84868 (BLO-15956): acknowledge the created Job name
+# and UID before polling or cleanup. A missing/rejected acknowledgment deletes
+# the Job and fails closed with k8s_job_identity_unacknowledged. PR
+# kkroo/paperclip-adapter-opencode-k8s#43; focused suite 114/114 and typecheck pass.
+# Bumped 2026-07-14 for PEN-1305 permission.bash env-dump deny (PR kkroo/paperclip-adapter-opencode-k8s#44)
+# Bumped 2026-07-14 to dfd13f2 (BLO-15957): consume typed run/workspace
+# isolation, separate persistent XDG/session state from ephemeral build caches,
+# force stateless OpenCode DBs onto emptyDir, and key durable DBs by workspace.
+# PR kkroo/paperclip-adapter-opencode-k8s#45; typecheck, 523/523 tests, and
+# build pass after rebasing onto the env-dump deny.
+# Bumped 2026-07-15 to 4aca4ad (BLO-16219): fold in the previously
+# build-time-patched run-isolation working-dir fix (now pushed directly to
+# kkroo/paperclip-adapter-opencode-k8s master — the separate build-time patch
+# file + git-apply step formerly below are retired) and set TMPDIR/TMP/TEMP
+# to a new tmpRoot sibling of homeRoot/sessionRoot/cacheRoot/workspaceRoot
+# for run and workspace isolation modes. Shared mode is unchanged. typecheck
+# and 524/524 tests pass, build clean.
+# Bumped 2026-07-16 to f4ca4a6 (#46): default reattachOrphanedJobs=true so a
+# same-task opencode Job orphaned by a paperclip-0 restart is reattached
+# (stream + await) instead of failing new runs with k8s_concurrent_run_blocked
+# (observed: Players-Engineer run 8d35d883 blocked after a paperclip-0 restart).
+# PR kkroo/paperclip-adapter-opencode-k8s#46; adapter suite 118/118, typecheck clean.
+# Bumped 2026-07-20 to ad549a0 (#47): run isolation now detects the generic
+# non-Git fallback workspace and creates a private empty run workspace instead
+# of exiting before OpenCode starts. Real Git checkouts still use independent
+# shared-object clones. Full adapter suite 526/526, focused manifest suite
+# 119/119, typecheck, and build pass.
+# Bumped 2026-07-20 to 239f2e1 (#48):
+# bound the pre-Job live-Job list to 15 seconds and fail closed when Kubernetes
+# does not answer. Focused suite 13/13, full adapter suite 527/527, typecheck,
+# and build pass.
+# Bumped 2026-07-24 to 3ab75fb (#50): add anthropic/claude-opus-5 to the
+# static model picker and list-price fallback table. Focused pricing/static
+# adapter tests and typecheck pass.
+ARG OPENCODE_K8S_REF=3ab75fb6893d3f2eed26b38a830f1a48bd1f35c0
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
@@ -384,7 +409,8 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     GH="$(cat /run/secrets/gh_token)" \
  && git -c "url.https://x-access-token:${GH}@github.com/.insteadOf=https://github.com/" \
       clone https://github.com/kkroo/paperclip-adapter-opencode-k8s.git opencode-k8s \
-  && cd opencode-k8s && git checkout "${OPENCODE_K8S_REF}" && rm -rf .git \
+  && cd opencode-k8s && git checkout "${OPENCODE_K8S_REF}" \
+  && rm -rf .git \
   && npm ci \
   && npm install --no-save /vendor/adapter-utils.tgz \
   && npm run build \
@@ -402,25 +428,31 @@ FROM base AS build
 WORKDIR /app
 COPY --from=deps /app /app
 COPY . .
-RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/plugin-sdk build
-RUN pnpm --filter @kkroo/paperclip-plugin-gbrain build
-RUN pnpm --filter @kkroo/paperclip-plugin-linear build
-RUN pnpm --filter paperclip-plugin-alertmanager build
-RUN pnpm --filter paperclip-plugin-slack build
-RUN pnpm --filter @paperclipai/mcp-server build
-RUN pnpm --filter @paperclipai/server build
+# The UI is the longest independent build. Run it beside the server/plugin
+# chain while keeping that chain serial to avoid a large memory spike on ARC.
+RUN set -eu; \
+  pnpm --filter @paperclipai/ui build & ui_pid=$!; \
+  pnpm --filter @kkroo/paperclip-plugin-gbrain build; \
+  pnpm --filter @kkroo/paperclip-plugin-linear build; \
+  pnpm --filter paperclip-plugin-alertmanager build; \
+  pnpm --filter paperclip-plugin-slack build; \
+  pnpm --filter @paperclipai/mcp-server build; \
+  pnpm --filter @paperclipai/server build; \
+  wait "$ui_pid"
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
 # The seed-init in the helm chart looks for this file to decide whether
 # to write /paperclip/.mcp.json. Fail the build if it's missing instead
 # of silently shipping an image where the seed quietly skips.
 RUN test -f packages/mcp-server/dist/stdio.js || (echo "ERROR: mcp-server stdio bridge missing" && exit 1)
 
-FROM base AS production
+FROM ${RUNTIME_IMAGE} AS production
+# Preserve the documented local-build defaults. docker-entrypoint.sh compares
+# these values with the inherited passwd entry and remaps node at startup when
+# a caller supplies custom USER_UID/USER_GID build args.
 ARG USER_UID=1000
 ARG USER_GID=1000
 WORKDIR /app
-COPY --chown=node:node --from=build /app /app
 # The kkroo forks of paperclip-adapter-claude-k8s /
 # paperclip-adapter-opencode-k8s are built from source in the `vendor` stage
 # above and installed here.
@@ -441,55 +473,15 @@ COPY --from=vendor /vendor/paperclip-adapter-opencode-k8s.tgz /tmp/paperclip-bun
 # falling back to whatever npm publishes today.
 COPY --from=vendor /vendor/adapter-utils.tgz /tmp/paperclip-bundled-adapters/
 COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-server
-# Pin OpenCode for k8s agent pods (BLO-10651). opencode_k8s runs inside this
-# image, so `opencode-ai@latest` lets unrelated rebuilds pick up parser/runtime
-# changes that can crash every OpenCode-backed agent. Bump only after adapter
-# smoke/regression tests pass.
-# Bumped 2026-06-20 to 1.15.12: opencode 1.4.3 fails OpenAI Responses streams
-# that include reasoning output items before the assistant message, surfacing as
-# UnknownError/exit 1 in opencode_k8s review runs while ccrotate returned 200.
-ARG OPENCODE_AI_VERSION=1.15.12
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
-    --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    npm install --global --omit=dev --cache /root/.npm @anthropic-ai/claude-code@latest @openai/codex@latest "opencode-ai@${OPENCODE_AI_VERSION}" @google/gemini-cli@latest \
-  && test "$(opencode --version)" = "${OPENCODE_AI_VERSION}" \
-  && apt-get update \
-  && apt-get install -y --no-install-recommends openssh-client rsync jq zsh \
-  && mkdir -p /paperclip /paperclip/.local/bin /opt/paperclip-bundled-adapters \
-  && npm install --prefix /opt/paperclip-bundled-adapters --omit=dev --no-save --legacy-peer-deps --cache /root/.npm /tmp/paperclip-bundled-adapters/*.tgz \
+  npm install --prefix /opt/paperclip-bundled-adapters --omit=dev --no-save --legacy-peer-deps --cache /root/.npm /tmp/paperclip-bundled-adapters/*.tgz \
   && rm -rf /tmp/paperclip-bundled-adapters \
-  && ln -sf /usr/local/bin/claude /paperclip/.local/bin/claude \
-  && chown -R node:node /paperclip /opt/paperclip-bundled-adapters
+  && chown -R node:node /opt/paperclip-bundled-adapters
 
-COPY scripts/docker-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+# Keep dependency trees in their own stable layer. Ordinary source edits only
+# replace the much smaller source/compiled payload and do not re-upload pnpm's
+# node_modules tree as part of every per-commit image.
+COPY --chown=node:node --from=deps /app /app
+COPY --chown=node:node --from=build --exclude=node_modules --exclude=**/node_modules /app /app
 
-# Codex 2nd-opinion CLI wrapper for claude_k8s agents (BLO-2413).
-# Lets a claude session shell out to `paperclip-consult-codex "<prompt>"`
-# and get back codex's JSONL — used by the gstack /codex skill for external
-# review. Production no longer installs a local ccrotate CLI, so this wrapper
-# uses whatever Codex auth the pod already has.
-COPY scripts/paperclip-consult-codex.sh /usr/local/bin/paperclip-consult-codex
-RUN chmod +x /usr/local/bin/paperclip-consult-codex
-
-ENV NODE_ENV=production \
-  HOME=/paperclip \
-  HOST=0.0.0.0 \
-  PORT=3100 \
-  SERVE_UI=true \
-  PAPERCLIP_HOME=/paperclip \
-  PAPERCLIP_INSTANCE_ID=default \
-  USER_UID=${USER_UID} \
-  USER_GID=${USER_GID} \
-  PAPERCLIP_CONFIG=/paperclip/instances/default/config.json \
-  PAPERCLIP_DEPLOYMENT_MODE=authenticated \
-  PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
-  OPENCODE_ALLOW_ALL_MODELS=true \
-  GEMINI_SANDBOX=false
-
-VOLUME ["/paperclip"]
-EXPOSE 3100
-
-ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]
+ENV USER_UID=${USER_UID} USER_GID=${USER_GID}

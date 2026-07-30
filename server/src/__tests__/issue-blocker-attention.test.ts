@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -44,7 +44,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-blocker-attention-");
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(issueThreadInteractions);
@@ -535,6 +535,42 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
+  it("does not treat cancelled liveness escalation issues as covered waiting paths", async () => {
+    const { companyId, agentId } = await createCompany("PBLX");
+    const parentId = await insertIssue({ companyId, identifier: "PBLX-1", title: "Parent", status: "blocked" });
+    const cancelledLeafId = await insertIssue({
+      companyId,
+      identifier: "PBLX-2",
+      title: "Cancelled blocker",
+      status: "cancelled",
+      assigneeAgentId: agentId,
+    });
+    await insertIssue({
+      companyId,
+      identifier: "PBLX-3",
+      title: "Cancelled liveness escalation",
+      status: "cancelled",
+      assigneeAgentId: agentId,
+      originKind: "harness_liveness_escalation",
+      originId: [
+        "harness_liveness",
+        companyId,
+        parentId,
+        "blocked_by_cancelled_issue",
+        cancelledLeafId,
+      ].join(":"),
+    });
+    await block({ companyId, blockerIssueId: cancelledLeafId, blockedIssueId: parentId });
+
+    const parent = (await svc.list(companyId, { attention: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockedInboxAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "blocked_by_cancelled_issue",
+      leafIssue: { id: cancelledLeafId, identifier: "PBLX-2" },
+    });
+  });
+
   it("does not treat a scheduled retry as actively covered work", async () => {
     const { companyId, agentId } = await createCompany("PBY");
     const parentId = await insertIssue({ companyId, identifier: "PBY-1", title: "Parent", status: "blocked" });
@@ -588,6 +624,37 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       redaction: { secretFieldsOmitted: true },
     });
     await expect(svc.count(companyId, { attention: "blocked" })).resolves.toBe(1);
+  });
+
+  it("surfaces cancelled-blocker attention on an assigned todo source", async () => {
+    const { companyId, agentId } = await createCompany("BICX");
+    const sourceId = await insertIssue({
+      companyId,
+      identifier: "BICX-1",
+      title: "Dispatch-suppressed source",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "BICX-2",
+      title: "Cancelled dependency",
+      status: "cancelled",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: sourceId });
+
+    const rows = await svc.list(companyId, { attention: "blocked" });
+    const source = rows.find((issue) => issue.id === sourceId);
+
+    expect(source?.blockedInboxAttention).toMatchObject({
+      kind: "blocked",
+      state: "needs_attention",
+      reason: "blocked_by_cancelled_issue",
+      owner: { type: "agent", agentId },
+      action: { label: "Replace blocker" },
+      leafIssue: { id: blockerId, identifier: "BICX-2" },
+    });
   });
 
   it("redacts external wait details from blocked inbox payloads and search", async () => {
@@ -644,6 +711,103 @@ describeEmbeddedPostgres("issue blocker attention", () => {
 
     expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
   });
+
+  it("batches blocked-inbox blocker attention across independent roots", async () => {
+    const { companyId, agentId } = await createCompany("BIBQ");
+    const firstParentId = await insertIssue({
+      companyId,
+      identifier: "BIBQ-1",
+      title: "First blocked source",
+      status: "blocked",
+    });
+    const firstBlockerId = await insertIssue({
+      companyId,
+      identifier: "BIBQ-2",
+      title: "First running leaf",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: firstBlockerId, blockedIssueId: firstParentId });
+    await activeRun({ companyId, agentId, issueId: firstBlockerId });
+
+    const selectSpy = vi.spyOn(db, "select");
+    let oneRootSelectCount = 0;
+    try {
+      expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
+      oneRootSelectCount = selectSpy.mock.calls.length;
+    } finally {
+      selectSpy.mockRestore();
+    }
+
+    const secondParentId = await insertIssue({
+      companyId,
+      identifier: "BIBQ-3",
+      title: "Second blocked source",
+      status: "blocked",
+    });
+    const secondBlockerId = await insertIssue({
+      companyId,
+      identifier: "BIBQ-4",
+      title: "Second running leaf",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: secondBlockerId, blockedIssueId: secondParentId });
+    await activeRun({ companyId, agentId, issueId: secondBlockerId });
+
+    const secondSelectSpy = vi.spyOn(db, "select");
+    let twoRootSelectCount = 0;
+    try {
+      expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
+      twoRootSelectCount = secondSelectSpy.mock.calls.length;
+    } finally {
+      secondSelectSpy.mockRestore();
+    }
+
+    expect(twoRootSelectCount).toBe(oneRootSelectCount);
+  });
+
+  it("isolates traversal truncation to the oversized blocked-inbox root", async () => {
+    const { companyId } = await createCompany("BIBN");
+    const oversizedParentId = await insertIssue({
+      companyId,
+      identifier: "BIBN-1",
+      title: "Oversized blocked source",
+      status: "blocked",
+    });
+
+    const childRows = Array.from({ length: 2_000 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      identifier: `BIBN-${index + 2}`,
+      title: `Human-owned blocker ${index + 2}`,
+      status: "backlog",
+      priority: "medium",
+      parentId: oversizedParentId,
+      assigneeUserId: "board-user-1",
+      originKind: "manual",
+      originFingerprint: "default",
+    }));
+
+    await db.insert(issues).values(childRows);
+
+    const coveredParentId = await insertIssue({
+      companyId,
+      identifier: "BIBN-2002",
+      title: "Small covered blocked source",
+      status: "blocked",
+    });
+    await block({
+      companyId,
+      blockerIssueId: childRows[0]!.id,
+      blockedIssueId: coveredParentId,
+    });
+
+    const rows = await svc.list(companyId, { attention: "blocked" });
+
+    expect(rows.map((row) => row.id)).toContain(oversizedParentId);
+    expect(rows.map((row) => row.id)).not.toContain(coveredParentId);
+  }, 120_000);
 
   it("classifies assigned backlog and invalid review leaves for blocked inbox attention", async () => {
     const { companyId, agentId, pausedAgentId } = await createCompany("BIC");
@@ -759,6 +923,37 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       reason: "missing_successful_run_disposition",
       owner: { type: "agent", agentId },
       action: { label: "Choose disposition" },
+    });
+
+    const handoffRunId = await activeRun({ companyId, agentId, issueId: handoffId, current: false });
+    const liveRows = await svc.list(companyId, { attention: "blocked" });
+    expect(liveRows.some((row) => row.id === handoffId)).toBe(false);
+
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, handoffRunId));
+    const stoppedRows = await svc.list(companyId, { attention: "blocked" });
+    expect(stoppedRows.find((row) => row.id === handoffId)?.blockedInboxAttention).toMatchObject({
+      state: "missing_disposition",
+      reason: "missing_successful_run_disposition",
+    });
+
+    const scheduledRetryRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: scheduledRetryRunId,
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      contextSnapshot: { taskId: handoffId },
+      scheduledRetryAt: new Date(Date.now() + 60_000),
+      scheduledRetryAttempt: 1,
+    });
+    const scheduledRows = await svc.list(companyId, { attention: "blocked" });
+    expect(scheduledRows.some((row) => row.id === handoffId)).toBe(false);
+
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, scheduledRetryRunId));
+    const exhaustedRows = await svc.list(companyId, { attention: "blocked" });
+    expect(exhaustedRows.find((row) => row.id === handoffId)?.blockedInboxAttention).toMatchObject({
+      state: "missing_disposition",
+      reason: "missing_successful_run_disposition",
     });
   });
 

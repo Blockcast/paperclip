@@ -22,6 +22,19 @@ import {
   recordHeartbeatRunFailed,
   recordIsolatedRunStarted,
   renderMetrics,
+  EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC,
+  KNOWN_PROCESS_LOSS_CLASSIFICATIONS,
+  PROCESS_LOST_LIVENESS_NULL_METRIC,
+  PROCESS_LOST_TOTAL_METRIC,
+  UNKNOWN_EXTERNAL_ADAPTER,
+  UNKNOWN_PROCESS_LOSS_CLASSIFICATION,
+  UNKNOWN_PROCESS_LOST_BUCKET,
+  normalizeExternalAdapter,
+  normalizeProcessLossClassification,
+  normalizeProcessLostBucket,
+  recordProcessLost,
+  recordProcessLostLivenessNull,
+  setExternalLifecycleRunningRuns,
 } from "../services/metrics.js";
 import {
   getDepBlockedMetric,
@@ -222,56 +235,111 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
 
   it("emits normalized labels for a known invocation source", async () => {
     const labels = recordHeartbeatRunFailed({
+      agentId: "agent-a",
+      issueId: "issue-a",
       adapter: "claude_k8s",
-      errorCode: "adapter_failed",
+      errorCode: "k8s_pod_schedule_failed",
       invocationSource: "github_pr_review_submitted",
+      isolationMode: "run",
     });
     expect(labels).toEqual({
+      agent_id: "agent-a",
+      issue_id: "issue-a",
       adapter: "claude_k8s",
-      error_code: "adapter_failed",
+      error_code: "k8s_pod_schedule_failed",
       invocation_source: "github_pr_review_submitted",
+      isolation_mode: "run",
     });
 
     const { body } = await renderMetrics();
     expect(body).toContain(
-      `${HEARTBEAT_RUN_FAILED_METRIC}{adapter="claude_k8s",error_code="adapter_failed",invocation_source="github_pr_review_submitted"} 1`,
+      `${HEARTBEAT_RUN_FAILED_METRIC}{agent_id="agent-a",issue_id="issue-a",adapter="claude_k8s",error_code="k8s_pod_schedule_failed",invocation_source="github_pr_review_submitted",isolation_mode="run"} 1`,
     );
   });
 
+  it.each([
+    ["workspace", "workspace"],
+    ["shared", "shared"],
+    ["not-a-mode", UNKNOWN_ISOLATION_MODE],
+  ])(
+    "collapses source identifiers for %s pod-schedule failures",
+    async (isolationMode, expectedIsolationMode) => {
+      const labels = recordHeartbeatRunFailed({
+        agentId: "agent-a",
+        issueId: "issue-a",
+        adapter: "claude_k8s",
+        errorCode: "k8s_pod_schedule_failed",
+        invocationSource: "github_pr_review_submitted",
+        isolationMode,
+      });
+
+      expect(labels).toEqual({
+        agent_id: UNKNOWN_AGENT_ID,
+        issue_id: "none",
+        adapter: "claude_k8s",
+        error_code: "k8s_pod_schedule_failed",
+        invocation_source: "github_pr_review_submitted",
+        isolation_mode: expectedIsolationMode,
+      });
+
+      const { body } = await renderMetrics();
+      expect(body).toContain(
+        `${HEARTBEAT_RUN_FAILED_METRIC}{agent_id="${UNKNOWN_AGENT_ID}",issue_id="none",adapter="claude_k8s",error_code="k8s_pod_schedule_failed",invocation_source="github_pr_review_submitted",isolation_mode="${expectedIsolationMode}"} 1`,
+      );
+    },
+  );
+
   it("collapses unknown invocation source to the bounded fallback (cardinality guardrail)", async () => {
     const labels = recordHeartbeatRunFailed({
+      agentId: "agent-a",
+      issueId: "issue-a",
       adapter: "claude_k8s",
       errorCode: "process_lost",
       invocationSource: "some_unlisted_source",
+      isolationMode: "workspace",
     });
     expect(labels.invocation_source).toBe(UNKNOWN_INVOCATION_SOURCE);
 
     const { body } = await renderMetrics();
     expect(body).toContain(
-      `${HEARTBEAT_RUN_FAILED_METRIC}{adapter="claude_k8s",error_code="process_lost",invocation_source="${UNKNOWN_INVOCATION_SOURCE}"} 1`,
+      `${HEARTBEAT_RUN_FAILED_METRIC}{agent_id="${UNKNOWN_AGENT_ID}",issue_id="none",adapter="claude_k8s",error_code="process_lost",invocation_source="${UNKNOWN_INVOCATION_SOURCE}",isolation_mode="workspace"} 1`,
     );
   });
 
   it("falls back adapter/error_code to 'unknown' when null or empty", async () => {
     const labels = recordHeartbeatRunFailed({
+      agentId: null,
+      issueId: null,
       adapter: null,
       errorCode: "",
       invocationSource: "capacity_blocked_retry",
+      isolationMode: "invalid",
     });
     expect(labels).toEqual({
+      agent_id: UNKNOWN_AGENT_ID,
+      issue_id: "none",
       adapter: "unknown",
       error_code: "unknown",
       invocation_source: "capacity_blocked_retry",
+      isolation_mode: UNKNOWN_ISOLATION_MODE,
     });
   });
 
   it("accumulates repeated failures into the same bounded series", async () => {
-    recordHeartbeatRunFailed({ adapter: "claude_k8s", errorCode: "k8s_concurrent_run_blocked", invocationSource: "transient_failure_retry" });
-    recordHeartbeatRunFailed({ adapter: "claude_k8s", errorCode: "k8s_concurrent_run_blocked", invocationSource: "transient_failure_retry" });
+    const input = {
+      agentId: "agent-a",
+      issueId: "issue-a",
+      adapter: "claude_k8s",
+      errorCode: "k8s_pod_schedule_failed",
+      invocationSource: "transient_failure_retry",
+      isolationMode: "run",
+    };
+    recordHeartbeatRunFailed(input);
+    recordHeartbeatRunFailed(input);
 
     const { body } = await renderMetrics();
     expect(body).toContain(
-      `${HEARTBEAT_RUN_FAILED_METRIC}{adapter="claude_k8s",error_code="k8s_concurrent_run_blocked",invocation_source="transient_failure_retry"} 2`,
+      `${HEARTBEAT_RUN_FAILED_METRIC}{agent_id="agent-a",issue_id="issue-a",adapter="claude_k8s",error_code="k8s_pod_schedule_failed",invocation_source="transient_failure_retry",isolation_mode="run"} 2`,
     );
   });
 });
@@ -368,5 +436,130 @@ describe("dep-blocked metrics counters", () => {
     for (const value of Object.values(snap)) {
       expect(value).toBe(0);
     }
+  });
+});
+
+describe("process_lost monitor normalizers (BLO-16184)", () => {
+  it("bounds the external adapter label to the allow-list", () => {
+    expect(normalizeExternalAdapter("claude_k8s")).toBe("claude_k8s");
+    expect(normalizeExternalAdapter("opencode_k8s")).toBe("opencode_k8s");
+    for (const bad of ["codex_local", "", null, undefined, "claude_k8s_evil"]) {
+      expect(normalizeExternalAdapter(bad as string)).toBe(UNKNOWN_EXTERNAL_ADAPTER);
+    }
+  });
+
+  it("maps the four canonical reaper failure strings to fixed buckets", () => {
+    expect(
+      normalizeProcessLostBucket(
+        "Process lost before external adapter invocation -- k8s job terminated or server restarted",
+      ),
+    ).toBe("pre_adapter");
+    expect(normalizeProcessLostBucket("Process lost -- child pid 4213 is no longer running")).toBe("child_pid");
+    expect(normalizeProcessLostBucket("Process lost -- process group 4213 is no longer running")).toBe(
+      "process_group",
+    );
+    expect(normalizeProcessLostBucket("Process lost -- server may have restarted")).toBe("server_restart");
+  });
+
+  it("still buckets the pre-adapter string when the retry suffix is appended", () => {
+    expect(
+      normalizeProcessLostBucket(
+        "Process lost before external adapter invocation -- k8s job terminated or server restarted; retrying once",
+      ),
+    ).toBe("pre_adapter");
+  });
+
+  it("collapses an unknown/empty error string to the bounded fallback", () => {
+    for (const bad of ["something new", "", null, undefined]) {
+      expect(normalizeProcessLostBucket(bad as string)).toBe(UNKNOWN_PROCESS_LOST_BUCKET);
+    }
+  });
+
+  it("keeps every known classification and collapses the rest to unknown", () => {
+    for (const c of KNOWN_PROCESS_LOSS_CLASSIFICATIONS) {
+      expect(normalizeProcessLossClassification(c)).toBe(c);
+    }
+    for (const bad of ["started_job_missing", "", null, undefined, "legacy"]) {
+      expect(normalizeProcessLossClassification(bad as string)).toBe(UNKNOWN_PROCESS_LOSS_CLASSIFICATION);
+    }
+  });
+});
+
+describe("recordProcessLost + renderMetrics (BLO-16184 numerator)", () => {
+  it("registers the counter so /metrics carries its TYPE line before any event", async () => {
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${PROCESS_LOST_TOTAL_METRIC} counter`);
+  });
+
+  it("emits the bounded label set and returns it", async () => {
+    const labels = recordProcessLost({
+      adapter: "opencode_k8s",
+      errorString: "Process lost before external adapter invocation -- k8s job terminated or server restarted",
+      classification: "pre_adapter_job_unstamped",
+    });
+    expect(labels).toEqual({
+      adapter: "opencode_k8s",
+      error_bucket: "pre_adapter",
+      classification: "pre_adapter_job_unstamped",
+    });
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${PROCESS_LOST_TOTAL_METRIC}{adapter="opencode_k8s",error_bucket="pre_adapter",classification="pre_adapter_job_unstamped"} 1`,
+    );
+  });
+
+  it("collapses an off-list adapter, string, and classification to bounded fallbacks", async () => {
+    recordProcessLost({ adapter: "codex_local", errorString: "totally new msg", classification: "bogus" });
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${PROCESS_LOST_TOTAL_METRIC}{adapter="other",error_bucket="other",classification="unknown"} 1`,
+    );
+  });
+
+  it("accumulates repeated events into the same bounded series", async () => {
+    for (let i = 0; i < 3; i++) {
+      recordProcessLost({
+        adapter: "claude_k8s",
+        errorString: "Process lost -- server may have restarted",
+        classification: "started_job_absent",
+      });
+    }
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${PROCESS_LOST_TOTAL_METRIC}{adapter="claude_k8s",error_bucket="server_restart",classification="started_job_absent"} 3`,
+    );
+  });
+});
+
+describe("setExternalLifecycleRunningRuns (BLO-16184 denominator #1)", () => {
+  it("writes an explicit 0 for a known adapter with no running runs (drop-to-0 observable)", async () => {
+    setExternalLifecycleRunningRuns({ claude_k8s: 5, opencode_k8s: 2 });
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(`${EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC}{adapter="claude_k8s"} 5`);
+    expect(body).toContain(`${EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC}{adapter="opencode_k8s"} 2`);
+
+    // Next cycle: claude drops to 0. reset-then-set must write 0, not leave 5.
+    setExternalLifecycleRunningRuns({ opencode_k8s: 1 });
+    body = (await renderMetrics()).body;
+    expect(body).toContain(`${EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC}{adapter="claude_k8s"} 0`);
+    expect(body).toContain(`${EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC}{adapter="opencode_k8s"} 1`);
+    expect(body).not.toContain(`${EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC}{adapter="claude_k8s"} 5`);
+  });
+
+  it("folds unknown external adapters into the 'other' series", async () => {
+    setExternalLifecycleRunningRuns({ claude_k8s: 1, some_future_k8s: 3, another: 4 });
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC}{adapter="other"} 7`);
+  });
+});
+
+describe("recordProcessLostLivenessNull (BLO-16184 denominator #2)", () => {
+  it("registers the counter TYPE line and increments per blind cycle", async () => {
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(`# TYPE ${PROCESS_LOST_LIVENESS_NULL_METRIC} counter`);
+    recordProcessLostLivenessNull();
+    recordProcessLostLivenessNull();
+    body = (await renderMetrics()).body;
+    expect(body).toContain(`${PROCESS_LOST_LIVENESS_NULL_METRIC} 2`);
   });
 });

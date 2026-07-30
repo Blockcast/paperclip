@@ -23,10 +23,12 @@ import {
 import { resolveGbrainUrlForAgent } from "./client-routing.js";
 import {
   buildCacheEntry,
+  packCacheEntry,
+  unpackCacheEntry,
   prefetchRunContext,
   RECALL_STATE_KEY,
   DEFAULT_RECALL_DEPTH,
-  type CachedRecall,
+  type StoredRecall,
 } from "./recall.js";
 
 const DEFAULT_HINDSIGHT_API_URL = "http://hindsight-api.hindsight.svc.cluster.local:8888";
@@ -134,11 +136,12 @@ const plugin = definePlugin({
         parametersSchema: { type: "object", properties: {}, additionalProperties: false },
       },
       async (_params, runCtx) => {
-        const cached = (await ctx.state.get({
+        const stored = (await ctx.state.get({
           scopeKind: "run",
           scopeId: runCtx.runId,
           stateKey: RECALL_STATE_KEY,
-        })) as CachedRecall | null;
+        })) as StoredRecall | null;
+        const cached = stored ? unpackCacheEntry(stored) : null;
         if (!cached) {
           return {
             data: {
@@ -207,9 +210,20 @@ const plugin = definePlugin({
         enrichmentFallback: config.recallEnrichmentFallback !== false,
       });
       const entry = buildCacheEntry({ result, depth });
+      const storedEntry = packCacheEntry(entry);
+      // packCacheEntry fails safe by storing the graph inline if compression
+      // throws. That's silent by design (pure fn, no logger), so surface it
+      // here: recurring fallbacks would quietly reintroduce the plugin_state
+      // bloat this path exists to prevent (BLO-17449).
+      if (entry.graph != null && storedEntry.graphZ === undefined) {
+        ctx.logger.warn(
+          "gbrain prefetch: graph compression fell back to inline storage (BLO-17449 bloat risk if recurring)",
+          { runId, status: entry.status },
+        );
+      }
       await ctx.state.set(
         { scopeKind: "run", scopeId: runId, stateKey: RECALL_STATE_KEY },
-        entry,
+        storedEntry,
       );
 
       ctx.logger.info("gbrain prefetch complete", {

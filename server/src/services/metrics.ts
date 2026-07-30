@@ -66,6 +66,45 @@ export const ISOLATED_RUN_STARTED_METRIC = "paperclip_k8s_isolated_run_started_t
  */
 export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_deferred_total";
 export const AGENT_NO_USAGE_STREAK_METRIC = "paperclip_agent_zero_token_completed_run_streak";
+export const EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC = "paperclip_external_runtime_reservation_events_total";
+export const EXTERNAL_RUNTIME_RESERVATIONS_ACTIVE_METRIC = "paperclip_external_runtime_reservations_active";
+export const EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC = "paperclip_external_runtime_reservation_oldest_age_seconds";
+/**
+ * process_lost reap counter (BLO-16184, parent BLO-12292). Incremented once at
+ * the reaper's `process_lost` mint, labeled by bounded `adapter`
+ * (claude_k8s/opencode_k8s/other), `error_bucket` (the fixed reaper failure
+ * string collapsed to a category), and `classification` (the durable
+ * resultJson.processLoss bucket added in BLO-16181). This is the NUMERATOR of
+ * the trigger monitor: warn >20/day, page >40/day sustained 2h. Worst-case
+ * series = 3 adapters x 5 buckets x 6 classifications = 90, roster-independent.
+ */
+export const PROCESS_LOST_TOTAL_METRIC = "paperclip_process_lost_total";
+/**
+ * External-lifecycle running-run volume gauge (BLO-16184 DENOMINATOR #1). Set
+ * every reap cycle from the live `activeRuns` snapshot, reset-then-set so a
+ * genuine drop to 0 is written explicitly rather than going stale. A
+ * `process_lost`-count of 0 is only trustworthy as "healthy" when this gauge is
+ * above a floor — otherwise the 0 just means there were no external runs to lose.
+ */
+export const EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC = "paperclip_external_lifecycle_running_runs";
+/**
+ * Kube-liveness-null counter (BLO-16184 DENOMINATOR #2). Incremented once per
+ * reap cycle when the reaper had external-lifecycle candidates but
+ * `listAgentJobRunStatuses()` returned null (kube API unavailable) — the exact
+ * degradation the data-plane review flagged as previously unobservable (only a
+ * `logger.warn` existed). A rising rate means the reaper is flying blind, so any
+ * concurrent low `process_lost` count is UNRELIABLE, not healthy.
+ */
+export const PROCESS_LOST_LIVENESS_NULL_METRIC = "paperclip_process_lost_liveness_null_total";
+/**
+ * Orphaned-managed-pod reap counter (BLO-16850). Incremented once per pod
+ * force-deleted by the orphaned-managed-pod sweep in reapOrphanedRuns — a
+ * still-Running external-lifecycle agent pod whose heartbeat run has finalized
+ * (terminal/absent) with no live Job. Labeled by bounded `adapter`
+ * (claude_k8s/opencode_k8s/other). A sustained rate means runs are finalizing
+ * while their pods keep running (the wedged-container leak this reaper closes).
+ */
+export const ORPHANED_MANAGED_POD_REAPED_METRIC = "paperclip_orphaned_managed_pod_reaped_total";
 
 /**
  * Bounded `reason` allow-list (mirrors the adapter-lane reasons defined in
@@ -79,6 +118,17 @@ export const AGENT_NO_USAGE_STREAK_METRIC = "paperclip_agent_zero_token_complete
  *   visible after isolated concurrency lands.
  * - `unknown_isolation_blocked`: a live Job carried missing or malformed
  *   isolation metadata, so the guard fail-closed and refused an isolated start.
+ *
+ * BLO-15959 adds three bounded-external-lifecycle-concurrency admission
+ * reasons, emitted from the server-side dispatch gate in heartbeat.ts (as
+ * opposed to the adapter-lane reasons above):
+ * - `concurrency_disabled`: the agent is at its (fallback) one-run cap
+ *   because `heartbeat.concurrencyEnabled` is false/absent.
+ * - `max_concurrent_runs`: concurrency is enabled but the agent is at its
+ *   configured `maxConcurrentRuns` ceiling.
+ * - `external_slot_capacity`: concurrency is enabled but the agent is at the
+ *   operational `EXTERNAL_LIFECYCLE_SLOT_CAPACITY` ceiling (independent of,
+ *   and possibly lower than, its configured `maxConcurrentRuns`).
  */
 export const KNOWN_BLOCKED_REASONS = [
   "live_job_for_active_run",
@@ -86,6 +136,9 @@ export const KNOWN_BLOCKED_REASONS = [
   "live_job_for_terminated_run",
   "shared_mode_serialized",
   "unknown_isolation_blocked",
+  "concurrency_disabled",
+  "max_concurrent_runs",
+  "external_slot_capacity",
 ] as const;
 
 /**
@@ -100,7 +153,7 @@ export const KNOWN_BLOCKED_REASONS = [
  * group by those identifiers but degrade gracefully to an empty label when the
  * control plane omits them.
  */
-export const KNOWN_ISOLATION_MODES = ["shared", "workspace"] as const;
+export const KNOWN_ISOLATION_MODES = ["shared", "run", "workspace"] as const;
 
 export const UNKNOWN_ISOLATION_MODE = "unknown";
 
@@ -153,20 +206,106 @@ export function normalizeAgentId(
   return UNKNOWN_AGENT_ID;
 }
 
+/**
+ * External-lifecycle adapter allow-list for the process_lost monitor (BLO-16184).
+ * Anything else (local adapters, future types) collapses to "other" so the
+ * `adapter` label can never be inflated by an unexpected value.
+ */
+export const KNOWN_EXTERNAL_LIFECYCLE_ADAPTERS = ["claude_k8s", "opencode_k8s"] as const;
+export const UNKNOWN_EXTERNAL_ADAPTER = "other";
+const knownExternalLifecycleAdapterSet: ReadonlySet<string> = new Set(KNOWN_EXTERNAL_LIFECYCLE_ADAPTERS);
+
+/**
+ * process_lost error-string buckets. Derived from the FIXED failure strings the
+ * reaper stamps (heartbeat.ts buildProcessLossMessage + the pre-adapter mint) so
+ * the raw (pid-bearing, unbounded) message never becomes a label. Unmatched
+ * strings collapse to "other".
+ */
+export const KNOWN_PROCESS_LOST_BUCKETS = [
+  "pre_adapter",
+  "child_pid",
+  "process_group",
+  "server_restart",
+] as const;
+export const UNKNOWN_PROCESS_LOST_BUCKET = "other";
+
+/**
+ * The 5 durable ProcessLossClassification values (process-loss-classification.ts,
+ * BLO-16181). Anything else collapses to "unknown" — notably historical rows
+ * minted before BLO-16181 have no classification and land here.
+ */
+export const KNOWN_PROCESS_LOSS_CLASSIFICATIONS = [
+  "pre_adapter_job_unstamped",
+  "pre_adapter_job_stamped",
+  "pre_adapter_kube_unknown",
+  "started_job_absent",
+  "local",
+] as const;
+export const UNKNOWN_PROCESS_LOSS_CLASSIFICATION = "unknown";
+const knownProcessLossClassificationSet: ReadonlySet<string> = new Set(KNOWN_PROCESS_LOSS_CLASSIFICATIONS);
+
+export function normalizeExternalAdapter(adapter: string | null | undefined): string {
+  return typeof adapter === "string" && knownExternalLifecycleAdapterSet.has(adapter)
+    ? adapter
+    : UNKNOWN_EXTERNAL_ADAPTER;
+}
+
+/**
+ * Map a raw process_lost failure message to a bounded bucket by matching the
+ * fixed substrings the reaper stamps. Order matters only in that each substring
+ * is unique to one bucket. Never returns the raw string (unbounded cardinality).
+ */
+export function normalizeProcessLostBucket(errorString: string | null | undefined): string {
+  const s = typeof errorString === "string" ? errorString : "";
+  if (s.includes("before external adapter invocation")) return "pre_adapter";
+  if (s.includes("child pid")) return "child_pid";
+  if (s.includes("process group")) return "process_group";
+  if (s.includes("server may have restarted")) return "server_restart";
+  return UNKNOWN_PROCESS_LOST_BUCKET;
+}
+
+export function normalizeProcessLossClassification(classification: string | null | undefined): string {
+  return typeof classification === "string" && knownProcessLossClassificationSet.has(classification)
+    ? classification
+    : UNKNOWN_PROCESS_LOSS_CLASSIFICATION;
+}
+
 let registry: Registry | null = null;
 let concurrentRunBlocked: Counter<"agent_id" | "reason" | "isolation_mode"> | null = null;
 let isolatedRunStarted: Counter<"agent_id" | "isolation_mode"> | null = null;
-let heartbeatRunFailed: Counter<"adapter" | "error_code" | "invocation_source"> | null = null;
+type HeartbeatRunFailedLabel =
+  | "agent_id"
+  | "issue_id"
+  | "adapter"
+  | "error_code"
+  | "invocation_source"
+  | "isolation_mode";
+
+let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
 let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = null;
+let externalRuntimeReservationEvents: Counter<"event"> | null = null;
+let externalRuntimeReservationsActive: Gauge | null = null;
+let externalRuntimeReservationOldestAge: Gauge | null = null;
+let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
+let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
+let processLostLivenessNull: Counter | null = null;
+let orphanedManagedPodReaped: Counter<"adapter"> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
   counter: Counter<"agent_id" | "reason" | "isolation_mode">;
   isolatedStartedCounter: Counter<"agent_id" | "isolation_mode">;
-  failedCounter: Counter<"adapter" | "error_code" | "invocation_source">;
+  failedCounter: Counter<HeartbeatRunFailedLabel>;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
   zeroTokenCompletedRunStreakGauge: Gauge<"agent_id" | "adapter">;
+  externalRuntimeReservationEventsCounter: Counter<"event">;
+  externalRuntimeReservationsActiveGauge: Gauge;
+  externalRuntimeReservationOldestAgeGauge: Gauge;
+  processLostTotalCounter: Counter<"adapter" | "error_bucket" | "classification">;
+  externalLifecycleRunningRunsGauge: Gauge<"adapter">;
+  processLostLivenessNullCounter: Counter;
+  orphanedManagedPodReapedCounter: Counter<"adapter">;
 } {
   if (
     !registry
@@ -175,6 +314,13 @@ function ensureRegistry(): {
     || !heartbeatRunFailed
     || !ccrotateCapacityDeferred
     || !agentZeroTokenCompletedRunStreak
+    || !externalRuntimeReservationEvents
+    || !externalRuntimeReservationsActive
+    || !externalRuntimeReservationOldestAge
+    || !processLostTotal
+    || !externalLifecycleRunningRuns
+    || !processLostLivenessNull
+    || !orphanedManagedPodReaped
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -200,10 +346,13 @@ function ensureRegistry(): {
     heartbeatRunFailed = new Counter({
       name: HEARTBEAT_RUN_FAILED_METRIC,
       help:
-        "Count of heartbeat runs that reached terminal status 'failed', labeled by adapter type, "
-        + "error_code, and invocation_source (wake reason). Used to compute webhook-driven "
-        + "PR-review failure rate (BLO-7457 / BLO-9147). Cardinality bounded by allow-lists.",
-      labelNames: ["adapter", "error_code", "invocation_source"],
+        "Count of heartbeat runs that reached terminal status 'failed', labeled by agent, source issue, "
+        + "adapter, error_code, invocation_source (wake reason), and bounded isolation_mode. Used to "
+        + "compute webhook-driven PR-review failure rate and detect repeated run-isolated execution-pod "
+        + "failures for one issue (BLO-7457 / BLO-9147 / BLO-17953). Agent and issue identifiers are "
+        + "retained only for run-isolated k8s_pod_schedule_failed; other failures collapse them to "
+        + "bounded fallbacks.",
+      labelNames: ["agent_id", "issue_id", "adapter", "error_code", "invocation_source", "isolation_mode"],
       registers: [registry],
     });
     ccrotateCapacityDeferred = new Counter({
@@ -224,6 +373,64 @@ function ensureRegistry(): {
       labelNames: ["agent_id", "adapter"],
       registers: [registry],
     });
+    externalRuntimeReservationEvents = new Counter({
+      name: EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC,
+      help: "Count of durable external-runtime reservation lifecycle transitions.",
+      labelNames: ["event"],
+      registers: [registry],
+    });
+    externalRuntimeReservationsActive = new Gauge({
+      name: EXTERNAL_RUNTIME_RESERVATIONS_ACTIVE_METRIC,
+      help: "Current count of unreleased durable external-runtime slot reservations.",
+      registers: [registry],
+    });
+    externalRuntimeReservationOldestAge = new Gauge({
+      name: EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC,
+      help: "Age in seconds of the oldest unreleased external-runtime slot reservation.",
+      registers: [registry],
+    });
+    processLostTotal = new Counter({
+      name: PROCESS_LOST_TOTAL_METRIC,
+      help:
+        "Count of heartbeat runs reaped as process_lost (BLO-16184/BLO-12292), labeled by "
+        + "bounded adapter (claude_k8s/opencode_k8s/other), error_bucket (fixed reaper failure "
+        + "string collapsed to a category), and classification (the durable resultJson.processLoss "
+        + "bucket from BLO-16181). NUMERATOR of the trigger monitor; read against "
+        + EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC + " and " + PROCESS_LOST_LIVENESS_NULL_METRIC
+        + " so a 0 count is only trusted at real volume with kube liveness intact.",
+      labelNames: ["adapter", "error_bucket", "classification"],
+      registers: [registry],
+    });
+    externalLifecycleRunningRuns = new Gauge({
+      name: EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC,
+      help:
+        "Current count of running external-lifecycle heartbeat runs by adapter, snapshotted "
+        + "each reap cycle (reset-then-set so a true drop to 0 is written explicitly, not stale). "
+        + "DENOMINATOR for " + PROCESS_LOST_TOTAL_METRIC + ": a 0 process_lost count is only "
+        + "'healthy' when this is above a floor — otherwise there were simply no runs to lose.",
+      labelNames: ["adapter"],
+      registers: [registry],
+    });
+    processLostLivenessNull = new Counter({
+      name: PROCESS_LOST_LIVENESS_NULL_METRIC,
+      help:
+        "Count of reap cycles that had external-lifecycle candidates but got a null kube "
+        + "Job-status list (kube API unavailable), i.e. the reaper fell back to the staleness "
+        + "heuristic while blind. DENOMINATOR guard: a rising rate makes any concurrent low "
+        + PROCESS_LOST_TOTAL_METRIC + " reading unreliable rather than healthy (BLO-16184).",
+      registers: [registry],
+    });
+    orphanedManagedPodReaped = new Counter({
+      name: ORPHANED_MANAGED_POD_REAPED_METRIC,
+      help:
+        "Count of orphaned external-lifecycle agent pods force-deleted by the "
+        + "reapOrphanedRuns managed-pod sweep (BLO-16850): a still-Running pod whose "
+        + "heartbeat run finalized (terminal/absent) with no live Job. Labeled by bounded "
+        + "adapter (claude_k8s/opencode_k8s/other). A sustained rate means runs are "
+        + "finalizing while their pods keep running.",
+      labelNames: ["adapter"],
+      registers: [registry],
+    });
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -235,6 +442,13 @@ function ensureRegistry(): {
     failedCounter: heartbeatRunFailed,
     capacityDeferredCounter: ccrotateCapacityDeferred,
     zeroTokenCompletedRunStreakGauge: agentZeroTokenCompletedRunStreak,
+    externalRuntimeReservationEventsCounter: externalRuntimeReservationEvents,
+    externalRuntimeReservationsActiveGauge: externalRuntimeReservationsActive,
+    externalRuntimeReservationOldestAgeGauge: externalRuntimeReservationOldestAge,
+    processLostTotalCounter: processLostTotal,
+    externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
+    processLostLivenessNullCounter: processLostLivenessNull,
+    orphanedManagedPodReapedCounter: orphanedManagedPodReaped,
   };
 }
 
@@ -296,6 +510,10 @@ export function recordIsolatedRunStarted(
 }
 
 export interface RecordHeartbeatRunFailedInput {
+  /** Agent that owned the finalized run. */
+  agentId: string | null | undefined;
+  /** Source issue for issue-scoped execution, or null for non-issue work. */
+  issueId: string | null | undefined;
   /** Agent adapter type (e.g. "claude_k8s", "claude_local"). */
   adapter: string | null | undefined;
   /** Finalized error code on the heartbeat_runs row. */
@@ -305,6 +523,8 @@ export interface RecordHeartbeatRunFailedInput {
    * Maps to `invocation_source` label.
    */
   invocationSource: string | null | undefined;
+  /** K8s workspace isolation mode; non-K8s and malformed values become unknown. */
+  isolationMode: string | null | undefined;
 }
 
 /**
@@ -314,11 +534,23 @@ export interface RecordHeartbeatRunFailedInput {
  */
 export function recordHeartbeatRunFailed(
   input: RecordHeartbeatRunFailedInput,
-): { adapter: string; error_code: string; invocation_source: string } {
+): Record<HeartbeatRunFailedLabel, string> {
+  // Per-issue labels are intentionally limited to the retry-loop failure this
+  // monitor needs. Keeping them on every terminal failure would retain one
+  // Prometheus counter series per historical issue for the process lifetime.
+  const isolationMode = normalizeIsolationMode(input.isolationMode);
+  const retainSourceIds = input.errorCode === "k8s_pod_schedule_failed" && isolationMode === "run";
   const labels = {
+    agent_id: retainSourceIds && typeof input.agentId === "string" && input.agentId.length > 0
+      ? input.agentId
+      : UNKNOWN_AGENT_ID,
+    issue_id: retainSourceIds && typeof input.issueId === "string" && input.issueId.length > 0
+      ? input.issueId
+      : "none",
     adapter: typeof input.adapter === "string" && input.adapter.length > 0 ? input.adapter : "unknown",
     error_code: typeof input.errorCode === "string" && input.errorCode.length > 0 ? input.errorCode : "unknown",
     invocation_source: normalizeInvocationSource(input.invocationSource),
+    isolation_mode: isolationMode,
   };
   ensureRegistry().failedCounter.inc(labels);
   return labels;
@@ -372,6 +604,85 @@ export function recordAgentZeroTokenCompletedRunStreak(
   return { ...labels, streak };
 }
 
+const EXTERNAL_RUNTIME_RESERVATION_EVENTS = new Set(["reserved", "contended", "launching", "launched", "released"]);
+
+export function recordExternalRuntimeReservationEvent(event: string): string {
+  const normalized = EXTERNAL_RUNTIME_RESERVATION_EVENTS.has(event) ? event : "other";
+  ensureRegistry().externalRuntimeReservationEventsCounter.inc({ event: normalized });
+  return normalized;
+}
+
+export function setExternalRuntimeReservationMetrics(input: {
+  active: number;
+  oldestAgeSeconds: number;
+}): void {
+  const metrics = ensureRegistry();
+  metrics.externalRuntimeReservationsActiveGauge.set(Math.max(0, input.active));
+  metrics.externalRuntimeReservationOldestAgeGauge.set(Math.max(0, input.oldestAgeSeconds));
+}
+
+/**
+ * Record one process_lost reap (BLO-16184 numerator). All three labels are
+ * normalized to bounded allow-lists before touching the registry. Returns the
+ * resolved label set (useful for assertions / structured logs).
+ */
+export function recordProcessLost(input: {
+  adapter: string | null | undefined;
+  errorString: string | null | undefined;
+  classification: string | null | undefined;
+}): { adapter: string; error_bucket: string; classification: string } {
+  const labels = {
+    adapter: normalizeExternalAdapter(input.adapter),
+    error_bucket: normalizeProcessLostBucket(input.errorString),
+    classification: normalizeProcessLossClassification(input.classification),
+  };
+  ensureRegistry().processLostTotalCounter.inc(labels);
+  return labels;
+}
+
+/**
+ * Snapshot the external-lifecycle running-run volume (BLO-16184 denominator #1).
+ * Reset-then-set so a true drop to 0 for an adapter is written explicitly rather
+ * than leaving a stale non-zero series (the classic stale-gauge masking trap).
+ * Unknown/future external adapters collapse into the "other" series.
+ */
+export function setExternalLifecycleRunningRuns(byAdapter: Record<string, number>): void {
+  const gauge = ensureRegistry().externalLifecycleRunningRunsGauge;
+  gauge.reset();
+  let other = 0;
+  for (const [adapter, count] of Object.entries(byAdapter)) {
+    const value = Math.max(0, count);
+    if (knownExternalLifecycleAdapterSet.has(adapter)) {
+      gauge.set({ adapter }, value);
+    } else {
+      other += value;
+    }
+  }
+  // Always write an explicit 0 for each known adapter that had no running runs,
+  // so a drop to 0 is observable rather than an absent series.
+  for (const adapter of KNOWN_EXTERNAL_LIFECYCLE_ADAPTERS) {
+    if (!(adapter in byAdapter)) gauge.set({ adapter }, 0);
+  }
+  if (other > 0) gauge.set({ adapter: UNKNOWN_EXTERNAL_ADAPTER }, other);
+}
+
+/** Record one reap cycle that was blind to kube (BLO-16184 denominator #2). */
+export function recordProcessLostLivenessNull(): void {
+  ensureRegistry().processLostLivenessNullCounter.inc();
+}
+
+/**
+ * Record one orphaned external-lifecycle managed-pod reap (BLO-16850). The
+ * adapter label is normalized to the bounded external-adapter allow-list before
+ * touching the registry (claude_k8s/opencode_k8s/other), mirroring
+ * {@link recordProcessLost}'s cardinality guard.
+ */
+export function recordOrphanedManagedPodReaped(labels?: { adapterType?: string }): void {
+  ensureRegistry().orphanedManagedPodReapedCounter.inc({
+    adapter: normalizeExternalAdapter(labels?.adapterType),
+  });
+}
+
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
   const reg = getMetricsRegistry();
   const depBlockedSnapshot = snapshotDepBlockedMetrics();
@@ -404,6 +715,13 @@ export function __resetMetricsForTest(): void {
   heartbeatRunFailed = null;
   ccrotateCapacityDeferred = null;
   agentZeroTokenCompletedRunStreak = null;
+  externalRuntimeReservationEvents = null;
+  externalRuntimeReservationsActive = null;
+  externalRuntimeReservationOldestAge = null;
+  processLostTotal = null;
+  externalLifecycleRunningRuns = null;
+  processLostLivenessNull = null;
+  orphanedManagedPodReaped = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
 }

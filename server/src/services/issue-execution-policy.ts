@@ -51,6 +51,16 @@ type TransitionInput = {
   commentBody?: string | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   monitorExplicitlyUpdated?: boolean;
+  /**
+   * BLO-15942: an operator/adjudicator override (`tasks:override_execution_stage`,
+   * checked by the caller before this is set — never derived here) that lets an
+   * actor above the stage's mandate-bound participant force-complete or
+   * request-changes on a review/approval stage the participant cannot or will
+   * not act on. Without this, a stage pinned to a participant whose mandate
+   * excludes stage decisions (e.g. a PR-webhook-only reviewer bot) deadlocks:
+   * only the participant can advance, and no role-based actor can unstick it.
+   */
+  overrideAuthorized?: boolean;
 };
 
 type TransitionResult = {
@@ -705,7 +715,12 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       };
     }
 
-    if (principalsEqual(currentParticipant, actor)) {
+    // BLO-15942: an authorized override acts with the same stage authority as
+    // the pinned participant (the route only sets this after an explicit
+    // tasks:override_execution_stage authorization check), so a stage cannot
+    // permanently deadlock on a participant whose mandate excludes stage
+    // decisions.
+    if (principalsEqual(currentParticipant, actor) || input.overrideAuthorized) {
       if (requestedStatus === "done") {
         if (!input.commentBody?.trim()) {
           throw unprocessable("Approving a review or approval stage requires a comment");
@@ -1075,4 +1090,8 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
   const monitorPatch = applyMonitorTransition(input, stageResult.patch);
   Object.assign(stageResult.patch, monitorPatch);
   return stageResult;
+}
+
+export function applyIssueMonitorPolicyTransition(input: TransitionInput): TransitionResult {
+  return { patch: applyMonitorTransition(input, {}) };
 }

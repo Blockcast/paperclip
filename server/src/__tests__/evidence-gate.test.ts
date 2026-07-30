@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  countDoneWhenBullets,
   evaluateEvidence,
+  hasDoneWhenHeading,
   resolveRequiredShapes,
   type EvidenceCommentLite,
   type EvidenceWorkProductLite,
@@ -16,6 +18,7 @@ function operatorComment(body: string, createdAt = "2026-05-11T20:00:00.000Z"): 
 }
 
 const FRONTEND_DONE_WHEN = `## Goal\nShip the blog.\n\n## Done when\n- entry page renders\n- listing page renders\n- footer at bottom\n`;
+const LANDING_ARTIFACT = "https://github.com/Blockcast/paperclip/pull/775";
 
 describe("resolveRequiredShapes", () => {
   it("unions required shapes across multiple matching labels", () => {
@@ -29,6 +32,7 @@ describe("resolveRequiredShapes", () => {
         "screenshot:1440x900",
         "screenshot:390x844",
         "checklist:done-when",
+        "landing-artifact",
         "pr-link",
       ]),
     );
@@ -100,6 +104,7 @@ describe("evaluateEvidence — frontend label", () => {
       "",
       "![blog entry desktop 1440x900](./blog_entry_desktop_1440.png)",
       "![blog entry mobile 390x844](./blog_entry_mobile_390.png)",
+      LANDING_ARTIFACT,
       "",
       "| Criterion | Status | Evidence |",
       "|---|---|---|",
@@ -137,6 +142,7 @@ describe("evaluateEvidence — frontend label", () => {
         agentComment(
           [
             "Shipped. Per-bug:",
+            LANDING_ARTIFACT,
             "| # | Status |",
             "|---|---|",
             "| entry | ✅ |",
@@ -155,7 +161,7 @@ describe("evaluateEvidence — frontend label", () => {
   });
 
   it("blocks when only one viewport is present", () => {
-    const body = `![desktop](./shot_1440x900.png)\n| Item | Status |\n|---|---|\n| entry | ✅ |\n| listing | ✅ |\n| footer | ✅ |`;
+    const body = `![desktop](./shot_1440x900.png)\n${LANDING_ARTIFACT}\n| Item | Status |\n|---|---|\n| entry | ✅ |\n| listing | ✅ |\n| footer | ✅ |`;
     const result = evaluateEvidence({
       issue: {
         description: FRONTEND_DONE_WHEN,
@@ -202,6 +208,7 @@ describe("evaluateEvidence — backend label", () => {
       " Test Files  1 passed (1)",
       "      Tests  35 passed (35)",
       "```",
+      LANDING_ARTIFACT,
       "",
       "- [x] adds USABLE_TIERS entry",
       "- [x] adds asymmetric test for claude",
@@ -295,7 +302,7 @@ describe("evaluateEvidence — unlabeled issue", () => {
   it("blocks labeled issues when required Done-when criteria are absent", () => {
     const result = evaluateEvidence({
       issue: { description: "## Goal\nfix the thing", labels: [{ name: "backend" }] },
-      comments: [agentComment("Test Files  3 passed (3)")],
+      comments: [agentComment(`Test Files  3 passed (3)\n${LANDING_ARTIFACT}`)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
     });
@@ -454,6 +461,7 @@ describe("evaluateEvidence — comment recency window", () => {
       [
         "![desktop](./shot_1440x900.png)",
         "![mobile](./shot_390x844.png)",
+        LANDING_ARTIFACT,
         "| C | S | E |",
         "|---|---|---|",
         "| entry | ✅ | x |",
@@ -629,6 +637,7 @@ describe("evaluateEvidence — additional shape coverage (review-driven)", () =>
       [
         "![desktop](./shot_1440x900.png)",
         "![mobile](./shot_390x844.png)",
+        LANDING_ARTIFACT,
         "| C | S |",
         "|---|---|",
         "| entry | ✅ |",
@@ -726,6 +735,7 @@ describe("evaluateEvidence — shapeDetections shape", () => {
         "e2e-run",
         "e2e-script",
         "kubectl-state",
+        "landing-artifact",
         "migration-output",
         "pr-link",
         "probe-output",
@@ -753,6 +763,7 @@ describe("evaluateEvidence — db-migration label", () => {
       "Planning Time: 0.123 ms",
       "Execution Time: 0.045 ms",
       "```",
+      LANDING_ARTIFACT,
     ].join("\n");
     const result = evaluateEvidence({
       issue: {
@@ -769,7 +780,7 @@ describe("evaluateEvidence — db-migration label", () => {
   });
 
   it("passes for the 'migration' label alias", () => {
-    const body = "Applied 1 migration successfully.\n\n(5 rows)\n";
+    const body = `Applied 1 migration successfully.\n\n(5 rows)\n${LANDING_ARTIFACT}`;
     const result = evaluateEvidence({
       issue: {
         description: "## Done when\n- migration applied",
@@ -789,6 +800,7 @@ describe("evaluateEvidence — db-migration label", () => {
       "drizzle-kit: push completed",
       "✓ done",
       "```",
+      LANDING_ARTIFACT,
     ].join("\n");
     const result = evaluateEvidence({
       issue: {
@@ -814,6 +826,7 @@ describe("evaluateEvidence — db-migration label", () => {
       " 98432",
       "(1 row)",
       "```",
+      LANDING_ARTIFACT,
     ].join("\n");
     const result = evaluateEvidence({
       issue: {
@@ -834,7 +847,9 @@ describe("evaluateEvidence — db-migration label", () => {
         labels: [{ name: "db-migration" }],
       },
       comments: [
-        agentComment("Verified table exists.\n\nSELECT COUNT(*) FROM foo;\n(7 rows)"),
+        agentComment(
+          `Verified table exists.\n\nSELECT COUNT(*) FROM foo;\n(7 rows)\n${LANDING_ARTIFACT}`,
+        ),
       ],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
@@ -850,6 +865,7 @@ describe("evaluateEvidence — db-migration label", () => {
       "ALTER TABLE issues ADD COLUMN last_evidence_verdict jsonb;",
       "CREATE INDEX issue_events_issue_id_idx ON issue_events(issue_id);",
       "```",
+      LANDING_ARTIFACT,
     ].join("\n");
     const result = evaluateEvidence({
       issue: {
@@ -870,7 +886,7 @@ describe("evaluateEvidence — db-migration label", () => {
         description: "## Done when\n- migration applied",
         labels: [{ name: "db-migration" }],
       },
-      comments: [agentComment("Migration ran successfully — trust me.")],
+      comments: [agentComment(`Migration ran successfully — trust me.\n${LANDING_ARTIFACT}`)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
     });
@@ -892,12 +908,335 @@ describe("evaluateEvidence — db-migration label", () => {
     expect(result.verdict).toBe("block");
   });
 
-  it("resolveRequiredShapes: db-migration label returns migration-output required", () => {
+  it("resolveRequiredShapes: db-migration label returns migration and artifact requirements", () => {
     const { required, unlabeledFallback } = resolveRequiredShapes(
       { labels: [{ name: "db-migration" }] },
       DEFAULT_EVIDENCE_REGISTRY,
     );
     expect(unlabeledFallback).toBe(false);
-    expect(required).toEqual(["migration-output"]);
+    expect(required).toEqual(["migration-output", "landing-artifact"]);
+  });
+});
+
+describe("countDoneWhenBullets — criteria heading synonyms (BLO-19047)", () => {
+  it("counts bullets under the historical `## Done when` heading", () => {
+    expect(countDoneWhenBullets("## Done when\n- a\n- b")).toBe(2);
+  });
+
+  it.each([
+    "Acceptance criteria",
+    "acceptance criteria",
+    "ACCEPTANCE CRITERIA",
+    "Success criteria",
+    "Exit criteria",
+  ])("counts bullets under `## %s`", (heading) => {
+    expect(countDoneWhenBullets(`## ${heading}\n- a\n- b\n- c`)).toBe(3);
+  });
+
+  it("matches at any heading depth", () => {
+    expect(countDoneWhenBullets("#### Acceptance criteria\n- a")).toBe(1);
+  });
+
+  it("stops at the next heading so later bullets are not counted", () => {
+    const description =
+      "## Acceptance criteria\n- a\n- b\n\n## Verifying signal\n- ci job\n- dashboard";
+    expect(countDoneWhenBullets(description)).toBe(2);
+  });
+
+  it("does not match an unrecognized heading", () => {
+    expect(countDoneWhenBullets("## Definition of done\n- a\n- b")).toBe(0);
+    expect(countDoneWhenBullets("## AC\n- a\n- b")).toBe(0);
+  });
+
+  it("does not match a bolded pseudo-heading", () => {
+    expect(countDoneWhenBullets("**Acceptance criteria**\n- a\n- b")).toBe(0);
+  });
+
+  it("does not match the phrase in prose", () => {
+    expect(countDoneWhenBullets("We agreed on acceptance criteria below.\n- a")).toBe(0);
+  });
+});
+
+describe("evaluateEvidence — criteria heading synonyms (BLO-19047)", () => {
+  // Regression for the exact BLO-18833 shape: a description written to the
+  // company issue-creation policy (which mandates `## Acceptance criteria`)
+  // plus a matching marker table. Before the synonym fix this was a permanent
+  // `warn` on an unlabeled issue and a permanent 422 `block` on a labeled one,
+  // satisfiable by no comment the agent could post.
+  const ACCEPTANCE_CRITERIA = [
+    "## Acceptance criteria",
+    "- cards drop the h-100 dead space",
+    "- the lone odd card no longer overlaps page decoration",
+    "- grid reflows at 390px",
+    "- no visual regression at 1440px",
+  ].join("\n");
+
+  const MARKER_TABLE = [
+    "| Criterion | Status | Evidence |",
+    "|---|---|---|",
+    "| h-100 dead space gone | ✅ | screenshot |",
+    "| odd card no overlap | ✅ | screenshot |",
+    "| reflows at 390px | ✅ | screenshot |",
+    "| no 1440px regression | ✅ | screenshot |",
+  ].join("\n");
+
+  it("passes an unlabeled issue whose criteria use `## Acceptance criteria`", () => {
+    const result = evaluateEvidence({
+      issue: { description: ACCEPTANCE_CRITERIA, labels: [] },
+      comments: [agentComment(MARKER_TABLE)],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    // `checklist:done-when` is the whole unlabeled required set, so detecting
+    // it clears the verdict outright. This is the BLO-18833 case: previously a
+    // permanent `warn` that no comment could clear.
+    expect(result.verdict).toBe("pass");
+    expect(result.missing).toEqual([]);
+    expect(result.evidenceFound).toContain("checklist:done-when");
+    expect(result.diagnostics).not.toContain("no-done-when-heading");
+  });
+
+  it("satisfies checklist:done-when for a labeled issue using `## Acceptance criteria`", () => {
+    const result = evaluateEvidence({
+      issue: {
+        description: ACCEPTANCE_CRITERIA,
+        labels: [{ name: "backend" }],
+      },
+      comments: [
+        agentComment(`Test Files  3 passed (3)\n${LANDING_ARTIFACT}\n\n${MARKER_TABLE}`),
+      ],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.verdict).toBe("pass");
+    expect(result.missing).toEqual([]);
+    expect(result.evidenceFound).toContain("checklist:done-when");
+  });
+
+  it("still requires one marker row per criterion under a synonym heading", () => {
+    const shortTable = [
+      "| Criterion | Status |",
+      "|---|---|",
+      "| h-100 dead space gone | ✅ |",
+    ].join("\n");
+    const result = evaluateEvidence({
+      issue: { description: ACCEPTANCE_CRITERIA, labels: [] },
+      comments: [agentComment(shortTable)],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.missing).toEqual(["checklist:done-when"]);
+  });
+});
+
+describe("evaluateEvidence — no-done-when-heading diagnostic (BLO-19047)", () => {
+  it("names the description as the remedy when the heading is unrecognized", () => {
+    const result = evaluateEvidence({
+      issue: { description: "## Definition of done\n- a\n- b", labels: [] },
+      comments: [agentComment("done")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.missing).toEqual(["checklist:done-when"]);
+    expect(result.diagnostics).toContain("no-done-when-heading");
+    expect(result.diagnostics).toContain("missing-done-when-bullets");
+  });
+
+  it("emits missing-description (not no-done-when-heading) when there is no description", () => {
+    const result = evaluateEvidence({
+      issue: { description: null, labels: [] },
+      comments: [agentComment("done")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.diagnostics).toContain("missing-description");
+    expect(result.diagnostics).not.toContain("no-done-when-heading");
+  });
+
+  it("omits the diagnostic once a recognized heading is present", () => {
+    const result = evaluateEvidence({
+      issue: { description: "## Success criteria\n- a", labels: [] },
+      comments: [agentComment("| x | ✅ |")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.diagnostics).not.toContain("no-done-when-heading");
+    expect(result.diagnostics).not.toContain("missing-done-when-bullets");
+  });
+
+  it("does not turn an unrecognized heading into a bypass for a labeled issue", () => {
+    // The shape stays REQUIRED when it cannot be evaluated — renaming a
+    // heading to something the gate ignores must not weaken the gate.
+    const result = evaluateEvidence({
+      issue: {
+        description: "## Definition of done\n- a",
+        labels: [{ name: "backend" }],
+      },
+      comments: [
+        agentComment(`Test Files  3 passed (3)\n${LANDING_ARTIFACT}\n| x | ✅ |`),
+      ],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.verdict).toBe("block");
+    expect(result.missing).toEqual(["checklist:done-when"]);
+  });
+});
+
+// Regressions found by adversarial review of the BLO-19047 fix. Each of these
+// failed on the first cut of the synonym change.
+describe("countDoneWhenBullets — review regressions (BLO-19047)", () => {
+  it("uses the first section that HAS bullets, not merely the first heading", () => {
+    // A pointer section preceding the real list: anchoring on the first
+    // heading counted 0 and made the shape unsatisfiable.
+    const description = [
+      "## Summary",
+      "fix the thing",
+      "",
+      "## Acceptance criteria",
+      "",
+      "See the Done when list below.",
+      "",
+      "## Done when",
+      "- a",
+      "- b",
+    ].join("\n");
+    expect(countDoneWhenBullets(description)).toBe(2);
+  });
+
+  it("does not report a pointer-section edit as removed bullets", () => {
+    // The `doneWhenBulletsRemoved` tamper signal compares prior vs current
+    // counts; a policy-aligned edit must not read as gate-dodging.
+    const before = "## Done when\n- a\n- b";
+    const after = "## Acceptance criteria\n\nSee below.\n\n## Done when\n- a\n- b";
+    expect(countDoneWhenBullets(before)).toBe(2);
+    expect(countDoneWhenBullets(after)).toBe(2);
+  });
+
+  it("ignores criteria headings inside fenced code blocks", () => {
+    const description = [
+      "## Context",
+      "Template we follow:",
+      "",
+      "```markdown",
+      "## Acceptance criteria",
+      "- [ ] one",
+      "- [ ] two",
+      "- [ ] three",
+      "- [ ] four",
+      "- [ ] five",
+      "```",
+      "",
+      "## Done when",
+      "- real one",
+      "- real two",
+    ].join("\n");
+    expect(countDoneWhenBullets(description)).toBe(2);
+  });
+
+  it("ignores a tilde-fenced block too", () => {
+    const description = "~~~\n## Acceptance criteria\n- fake\n~~~\n\n## Done when\n- real";
+    expect(countDoneWhenBullets(description)).toBe(1);
+  });
+
+  it("keeps sub-grouped criteria inside the section", () => {
+    const description = [
+      "## Acceptance criteria",
+      "",
+      "### Functional",
+      "- a",
+      "- b",
+      "",
+      "### Non-functional",
+      "- c",
+      "",
+      "## Verifying signal",
+      "- ci job",
+    ].join("\n");
+    expect(countDoneWhenBullets(description)).toBe(3);
+  });
+
+  it("stops at a shallower heading", () => {
+    const description = "## Acceptance criteria\n- a\n- b\n\n# Appendix\n- not a criterion";
+    expect(countDoneWhenBullets(description)).toBe(2);
+  });
+
+  it("accepts a single-hash H1 heading", () => {
+    expect(countDoneWhenBullets("# Acceptance criteria\n- a\n- b")).toBe(2);
+  });
+
+  it("handles CRLF line endings", () => {
+    expect(countDoneWhenBullets("## Acceptance criteria\r\n- a\r\n- b\r\n")).toBe(2);
+  });
+
+  it("handles bare-CR line endings", () => {
+    expect(countDoneWhenBullets("## Done when\r- a\r- b\r")).toBe(2);
+  });
+
+  it("tolerates trailing punctuation and parentheticals in the heading", () => {
+    expect(countDoneWhenBullets("## Acceptance criteria:\n- a")).toBe(1);
+    expect(countDoneWhenBullets("## Acceptance criteria (v2)\n- a\n- b")).toBe(2);
+  });
+
+  it("returns 0 for a criteria heading on the final line with no body", () => {
+    expect(countDoneWhenBullets("## Goal\nx\n\n## Acceptance criteria")).toBe(0);
+  });
+
+  it("does not let the heading gap span a newline", () => {
+    expect(
+      countDoneWhenBullets("##\n\nAcceptance criteria are tracked elsewhere:\n- doc1\n- doc2"),
+    ).toBe(0);
+  });
+});
+
+describe("hasDoneWhenHeading (BLO-19047)", () => {
+  it("is true for each recognized synonym", () => {
+    for (const heading of ["Done when", "Acceptance criteria", "Success criteria", "Exit criteria"]) {
+      expect(hasDoneWhenHeading(`## ${heading}\n- a`)).toBe(true);
+    }
+  });
+
+  it("is false for an unrecognized heading", () => {
+    expect(hasDoneWhenHeading("## Definition of done\n- a")).toBe(false);
+  });
+
+  it("is false when the only match is inside a fence", () => {
+    expect(hasDoneWhenHeading("```\n## Acceptance criteria\n- a\n```")).toBe(false);
+  });
+
+  it("is true even when the section carries no bullets", () => {
+    expect(hasDoneWhenHeading("## Acceptance criteria\n\nprose only")).toBe(true);
+  });
+});
+
+describe("evaluateEvidence — no-done-when-heading accuracy (BLO-19047)", () => {
+  it("does NOT claim a missing heading when the heading exists but bullets were not found", () => {
+    // Criteria expressed as a table under a recognized heading: the counter
+    // finds no bullets, but telling the agent to rename the heading is wrong.
+    const description = [
+      "## Acceptance criteria",
+      "",
+      "| Criterion | Notes |",
+      "|---|---|",
+      "| a | x |",
+    ].join("\n");
+    const result = evaluateEvidence({
+      issue: { description, labels: [] },
+      comments: [agentComment("done")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.diagnostics).toContain("missing-done-when-bullets");
+    expect(result.diagnostics).not.toContain("no-done-when-heading");
+  });
+
+  it("still claims a missing heading when none is recognized", () => {
+    const result = evaluateEvidence({
+      issue: { description: "## Definition of done\n- a", labels: [] },
+      comments: [agentComment("done")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.diagnostics).toContain("no-done-when-heading");
   });
 });

@@ -1,11 +1,12 @@
 import * as React from "react";
-import * as RouterDom from "react-router-dom";
-import type { NavigateOptions, To } from "react-router-dom";
+import * as RouterDom from "react-router";
+import type { NavigateOptions, To } from "react-router";
 import type { Issue } from "@paperclipai/shared";
 import { useCompany } from "@/context/CompanyContext";
 import { IssueLinkQuicklook } from "@/components/IssueLinkQuicklook";
 import {
   applyCompanyPrefix,
+  caseHref,
   extractCompanyPrefixFromPath,
   normalizeCompanyPrefix,
 } from "@/lib/company-routes";
@@ -26,7 +27,7 @@ function resolveTo(to: To, companyPrefix: string | null): To {
   return to;
 }
 
-function useActiveCompanyPrefix(): string | null {
+export function useActiveCompanyPrefix(): string | null {
   const { selectedCompany } = useCompany();
   const params = RouterDom.useParams<{ companyPrefix?: string }>();
   const location = RouterDom.useLocation();
@@ -41,7 +42,20 @@ function useActiveCompanyPrefix(): string | null {
   return selectedCompany ? normalizeCompanyPrefix(selectedCompany.issuePrefix) : null;
 }
 
-export * from "react-router-dom";
+/**
+ * Returns a builder for company-prefixed Cases hrefs bound to the active company
+ * (e.g. `/PAP/cases/PAP-C5`). Use for all case-to-case links so they emit
+ * prefixed paths directly instead of leaning on the PAP-13002 redirect.
+ */
+export function useCaseHref(): (...segments: string[]) => string {
+  const companyPrefix = useActiveCompanyPrefix();
+  return React.useCallback(
+    (...segments: string[]) => caseHref(companyPrefix, ...segments),
+    [companyPrefix],
+  );
+}
+
+export * from "react-router";
 
 type CompanyLinkProps = React.ComponentProps<typeof RouterDom.Link> & {
   disableIssueQuicklook?: boolean;

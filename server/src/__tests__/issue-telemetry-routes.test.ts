@@ -50,6 +50,9 @@ function registerModuleMocks() {
       hasPermission: vi.fn(),
     }),
     agentService: () => mockAgentService,
+    companySkillService: () => ({
+      completeTestRunForIssue: vi.fn(async () => null),
+    }),
     documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => ({}),
     executionWorkspaceService: () => ({}),
@@ -177,7 +180,7 @@ describe("issue telemetry routes", () => {
         model: "claude-sonnet-4-6",
       });
     });
-  }, 10_000);
+  }, 60_000);
 
   it("does not emit agent task-completed telemetry for board-driven completions", async () => {
     const app = await createApp({

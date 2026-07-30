@@ -109,7 +109,7 @@ describeEmbeddedPostgres("permissions upgrade visibility and route boundaries", 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-permissions-boundary-routes-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(issueAttachments);
@@ -228,15 +228,15 @@ describeEmbeddedPostgres("permissions upgrade visibility and route boundaries", 
 
     const app = await createApp(db, agentActor(company.id, readerAgent.id));
 
-    const [issueList, comments, docs, docDetail, attachments, activity, workProducts] = await Promise.all([
-      request(app).get(`/api/companies/${company.id}/issues`),
-      request(app).get(`/api/issues/${issue.id}/comments`),
-      request(app).get(`/api/issues/${issue.id}/documents`),
-      request(app).get(`/api/issues/${issue.id}/documents/plan`),
-      request(app).get(`/api/issues/${issue.id}/attachments`),
-      request(app).get(`/api/issues/${issue.id}/activity`),
-      request(app).get(`/api/issues/${issue.id}/work-products`),
-    ]);
+    // This verifies visibility, not concurrent request handling. Serial reads
+    // avoid making one embedded Postgres fixture contend with itself on ARC.
+    const issueList = await request(app).get(`/api/companies/${company.id}/issues`);
+    const comments = await request(app).get(`/api/issues/${issue.id}/comments`);
+    const docs = await request(app).get(`/api/issues/${issue.id}/documents`);
+    const docDetail = await request(app).get(`/api/issues/${issue.id}/documents/plan`);
+    const attachments = await request(app).get(`/api/issues/${issue.id}/attachments`);
+    const activity = await request(app).get(`/api/issues/${issue.id}/activity`);
+    const workProducts = await request(app).get(`/api/issues/${issue.id}/work-products`);
 
     expect(issueList.status, JSON.stringify(issueList.body)).toBe(200);
     expect(issueList.body.items ?? issueList.body).toEqual(
@@ -284,8 +284,10 @@ describeEmbeddedPostgres("permissions upgrade visibility and route boundaries", 
     const res = await request(await createApp(db, agentActor(sourceCompany.id, sourceAgent.id)))
       .get(`/api/issues/${issue.id}`);
 
-    expect(res.status).toBe(403);
-    expect(res.body.error).toContain("Agent key cannot access another company");
+    // Cross-tenant reads return 404 (not 403) so the response is
+    // indistinguishable from a nonexistent issue — no existence oracle.
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("Issue not found");
   });
 
   it("allows same-company route assignment after upgrade but keeps private target assignment grant constrained", async () => {

@@ -514,6 +514,14 @@ describe("sandbox callback bridge", () => {
     const directories = sandboxCallbackBridgeDirectories(queueDir);
     const bridgeToken = createSandboxCallbackBridgeToken();
     const seenRequestIds: string[] = [];
+    let markRequestObserved!: (requestId: string) => void;
+    const requestObserved = new Promise<string>((resolve) => {
+      markRequestObserved = resolve;
+    });
+    let releaseHandler!: () => void;
+    const handlerRelease = new Promise<void>((resolve) => {
+      releaseHandler = resolve;
+    });
 
     const worker = await startSandboxCallbackBridgeWorker({
       client: createCommandManagedSandboxCallbackBridgeQueueClient({
@@ -525,7 +533,8 @@ describe("sandbox callback bridge", () => {
       authorizeRequest: async () => null,
       handleRequest: async (request) => {
         seenRequestIds.push(request.id);
-        await new Promise((resolve) => setTimeout(resolve, 250));
+        markRequestObserved(request.id);
+        await handlerRelease;
         return {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -555,11 +564,8 @@ describe("sandbox callback bridge", () => {
       },
     });
 
-    for (let attempt = 0; attempt < 50 && seenRequestIds.length === 0; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-
-    expect(seenRequestIds).toHaveLength(1);
+    const observedRequestId = await requestObserved;
+    expect(seenRequestIds).toEqual([observedRequestId]);
     await worker.stop({ drainTimeoutMs: 10 });
 
     const response = await responsePromise;
@@ -568,7 +574,8 @@ describe("sandbox callback bridge", () => {
       error: "Bridge worker stopped before request could be handled.",
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    releaseHandler();
+    await worker.stop({ drainTimeoutMs: 1_000 });
 
     await expect(readdir(directories.responsesDir)).resolves.toEqual([]);
     await expect(
@@ -771,7 +778,7 @@ describe("sandbox callback bridge", () => {
     await expect(response.json()).resolves.toMatchObject({
       error: expect.stringMatching(/JSON|Unexpected|Unterminated/i),
     });
-  });
+  }, 30_000);
 
   it("reuses an already-uploaded bridge entrypoint when the remote file hash matches", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-sync-"));
@@ -913,6 +920,9 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/issues/issue-1/release" },
       { method: "PATCH", path: "/api/issues/issue-1" },
       { method: "GET", path: "/api/issues/issue-1/approvals" },
+      { method: "GET", path: "/api/issues/issue-1/work-products" },
+      { method: "POST", path: "/api/issues/issue-1/work-products" },
+      { method: "PATCH", path: "/api/work-products/wp-1" },
       { method: "GET", path: "/api/issues/issue-1/interactions" },
       { method: "GET", path: "/api/issues/issue-1/interactions/inter-1" },
       { method: "POST", path: "/api/issues/issue-1/interactions" },
@@ -966,6 +976,7 @@ describe("sandbox callback bridge", () => {
       { method: "GET", path: "/api/heartbeat-runs/run-1/artifacts" },
       { method: "DELETE", path: "/api/issues/issue-1/documents/plan" },
       { method: "DELETE", path: "/api/issues/issue-1/approvals/ap-1" },
+      { method: "DELETE", path: "/api/work-products/wp-1" },
       { method: "POST", path: "/api/approvals/ap-1/approve" },
       { method: "POST", path: "/api/approvals/ap-1/reject" },
       { method: "POST", path: "/api/companies/co-1/logo" },
@@ -1005,5 +1016,41 @@ describe("sandbox callback bridge", () => {
         PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge",
       },
     }));
+  });
+
+  it("publishes command-managed JSON writes only after staging them outside the visible queue", async () => {
+    const runner = {
+      execute: vi.fn(async (_input: {
+        command: string;
+        args?: string[];
+        cwd?: string;
+        env?: Record<string, string>;
+        stdin?: string;
+        timeoutMs?: number;
+      }): Promise<RunProcessResult> => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+        pid: null,
+        startedAt: new Date().toISOString(),
+      })),
+    };
+
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({
+      runner,
+      remoteCwd: "/workspace",
+      timeoutMs: 30_000,
+    });
+
+    await client.writeTextFile("/workspace/queue/000000000001.json", "{\"ok\":true}\n");
+
+    const scripts = runner.execute.mock.calls
+      .map(([input]) => input.args?.join("\n") ?? "")
+      .join("\n---\n");
+    expect(scripts).toContain("/workspace/queue/000000000001.json.paperclip-upload.tmp");
+    expect(scripts).toContain("mv -f '/workspace/queue/000000000001.json.paperclip-upload.tmp' '/workspace/queue/000000000001.json'");
+    expect(scripts).not.toContain("> '/workspace/queue/000000000001.json'");
   });
 });

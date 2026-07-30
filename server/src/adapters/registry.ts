@@ -31,6 +31,7 @@ import {
   testEnvironment as claudeTestEnvironment,
   sessionCodec as claudeSessionCodec,
   getQuotaWindows as claudeGetQuotaWindows,
+  getConfigSchema as getClaudeConfigSchema,
 } from "@paperclipai/adapter-claude-local/server";
 import {
   agentConfigurationDoc as claudeAgentConfigurationDoc,
@@ -44,6 +45,7 @@ import {
   testEnvironment as codexTestEnvironment,
   sessionCodec as codexSessionCodec,
   getQuotaWindows as codexGetQuotaWindows,
+  getConfigSchema as getCodexConfigSchema,
 } from "@paperclipai/adapter-codex-local/server";
 import {
   agentConfigurationDoc as codexAgentConfigurationDoc,
@@ -75,6 +77,7 @@ import {
   syncGeminiSkills,
   testEnvironment as geminiTestEnvironment,
   sessionCodec as geminiSessionCodec,
+  getConfigSchema as getGeminiConfigSchema,
 } from "@paperclipai/adapter-gemini-local/server";
 import {
   agentConfigurationDoc as geminiAgentConfigurationDoc,
@@ -187,64 +190,50 @@ function buildCursorRuntimeCommandSpec(config: Record<string, unknown>): Adapter
 }
 
 function normalizeHermesConfig<T extends { config?: unknown; agent?: unknown }>(ctx: T): T {
-  const config =
-    ctx && typeof ctx === "object" && "config" in ctx && ctx.config && typeof ctx.config === "object"
-      ? (ctx.config as Record<string, unknown>)
-      : null;
-  const agent =
-    ctx && typeof ctx === "object" && "agent" in ctx && ctx.agent && typeof ctx.agent === "object"
-      ? (ctx.agent as Record<string, unknown>)
-      : null;
-  const agentAdapterConfig =
-    agent?.adapterConfig && typeof agent.adapterConfig === "object"
-      ? (agent.adapterConfig as Record<string, unknown>)
-      : null;
-
-  const configCommand =
-    typeof config?.command === "string" && config.command.length > 0 ? config.command : undefined;
-  const agentCommand =
-    typeof agentAdapterConfig?.command === "string" && agentAdapterConfig.command.length > 0
-      ? agentAdapterConfig.command
-      : undefined;
-
-  if (config && !config.hermesCommand && configCommand) {
-    config.hermesCommand = configCommand;
-  }
+  const config = ctx.config && typeof ctx.config === "object"
+    ? (ctx.config as Record<string, unknown>)
+    : null;
+  const agent = ctx.agent && typeof ctx.agent === "object"
+    ? (ctx.agent as Record<string, unknown>)
+    : null;
+  const agentAdapterConfig = agent?.adapterConfig && typeof agent.adapterConfig === "object"
+    ? (agent.adapterConfig as Record<string, unknown>)
+    : null;
+  const configCommand = typeof config?.command === "string" && config.command.length > 0
+    ? config.command
+    : undefined;
+  const agentCommand = typeof agentAdapterConfig?.command === "string" && agentAdapterConfig.command.length > 0
+    ? agentAdapterConfig.command
+    : undefined;
+  if (config && !config.hermesCommand && configCommand) config.hermesCommand = configCommand;
   if (agentAdapterConfig && !agentAdapterConfig.hermesCommand && agentCommand) {
     agentAdapterConfig.hermesCommand = agentCommand;
   }
-
   return ctx;
 }
 
 function passHermesCustomProviderThroughExtraArgs(config: Record<string, unknown>): Record<string, unknown> {
   const provider = typeof config.provider === "string" ? config.provider.trim() : "";
   if (!provider.startsWith("custom:")) return config;
-
   const existingExtraArgs = Array.isArray(config.extraArgs)
     ? config.extraArgs.filter((arg): arg is string => typeof arg === "string")
     : [];
   const alreadyHasProviderArg = existingExtraArgs.some((arg) =>
     arg === "--provider" || arg.startsWith("--provider=")
   );
-  if (alreadyHasProviderArg) return config;
-
-  return {
-    ...config,
-    extraArgs: [...existingExtraArgs, "--provider", provider],
-  };
+  return alreadyHasProviderArg
+    ? config
+    : { ...config, extraArgs: [...existingExtraArgs, "--provider", provider] };
 }
 
 function dedupeAdapterModels(models: AdapterModel[]): AdapterModel[] {
   const seen = new Set<string>();
-  const result: AdapterModel[] = [];
-  for (const model of models) {
+  return models.flatMap((model) => {
     const id = model.id.trim();
-    if (!id || seen.has(id)) continue;
+    if (!id || seen.has(id)) return [];
     seen.add(id);
-    result.push({ ...model, id });
-  }
-  return result;
+    return [{ ...model, id }];
+  });
 }
 
 function prefixAdapterModelLabels(models: AdapterModel[], provider: "Claude" | "Codex"): AdapterModel[] {
@@ -271,6 +260,14 @@ const claudeLocalAdapter: ServerAdapterModule = {
   type: "claude_local",
   execute: stampClaudeAgentIdHeader(claudeExecute),
   testEnvironment: claudeTestEnvironment,
+  acp: {
+    agentId: "claude",
+    skillsMode: "ephemeral",
+    prerequisites: {
+      nodeRange: ">=22.12.0",
+      packages: ["@agentclientprotocol/claude-agent-acp"],
+    },
+  },
   listSkills: listClaudeSkills,
   syncSkills: syncClaudeSkills,
   sessionCodec: claudeSessionCodec,
@@ -286,6 +283,7 @@ const claudeLocalAdapter: ServerAdapterModule = {
   getRuntimeCommandSpec: (config) =>
     buildNpmRuntimeCommandSpec(config, "claude", "@anthropic-ai/claude-code"),
   agentConfigurationDoc: claudeAgentConfigurationDoc,
+  getConfigSchema: getClaudeConfigSchema,
   getQuotaWindows: claudeGetQuotaWindows,
 };
 
@@ -314,6 +312,14 @@ const codexLocalAdapter: ServerAdapterModule = {
   type: "codex_local",
   execute: codexExecute,
   testEnvironment: codexTestEnvironment,
+  acp: {
+    agentId: "codex",
+    skillsMode: "ephemeral",
+    prerequisites: {
+      nodeRange: ">=22.13.0",
+      packages: ["@agentclientprotocol/codex-acp"],
+    },
+  },
   listSkills: listCodexSkills,
   syncSkills: syncCodexSkills,
   sessionCodec: codexSessionCodec,
@@ -328,6 +334,7 @@ const codexLocalAdapter: ServerAdapterModule = {
   requiresMaterializedRuntimeSkills: false,
   getRuntimeCommandSpec: (config) => buildNpmRuntimeCommandSpec(config, "codex", "@openai/codex"),
   agentConfigurationDoc: codexAgentConfigurationDoc,
+  getConfigSchema: getCodexConfigSchema,
   getQuotaWindows: codexGetQuotaWindows,
 };
 
@@ -369,6 +376,14 @@ const geminiLocalAdapter: ServerAdapterModule = {
   type: "gemini_local",
   execute: geminiExecute,
   testEnvironment: geminiTestEnvironment,
+  acp: {
+    agentId: "gemini",
+    skillsMode: "ephemeral",
+    prerequisites: {
+      nodeRange: ">=20.0.0",
+      packages: ["@google/gemini-cli"],
+    },
+  },
   listSkills: listGeminiSkills,
   syncSkills: syncGeminiSkills,
   sessionCodec: geminiSessionCodec,
@@ -382,6 +397,7 @@ const geminiLocalAdapter: ServerAdapterModule = {
   getRuntimeCommandSpec: (config) =>
     buildNpmRuntimeCommandSpec(config, "gemini", "@google/gemini-cli"),
   agentConfigurationDoc: geminiAgentConfigurationDoc,
+  getConfigSchema: getGeminiConfigSchema,
 };
 
 const grokLocalAdapter: ServerAdapterModule = {
@@ -403,6 +419,55 @@ const grokLocalAdapter: ServerAdapterModule = {
     installCommand: null,
   }),
   agentConfigurationDoc: grokAgentConfigurationDoc,
+};
+
+const executeHermesLocal = hermesExecute as unknown as ServerAdapterModule["execute"];
+const listHermesSkills = hermesListSkills as unknown as ServerAdapterModule["listSkills"];
+const syncHermesSkills = hermesSyncSkills as unknown as ServerAdapterModule["syncSkills"];
+
+const hermesLocalAdapter: ServerAdapterModule = {
+  type: "hermes_local",
+  execute: async (ctx) => {
+    const normalizedCtx = normalizeHermesConfig(ctx);
+    if (!normalizedCtx.authToken) return executeHermesLocal(normalizedCtx);
+    const existingConfig = (normalizedCtx.agent.adapterConfig ?? {}) as Record<string, unknown>;
+    const existingEnv = existingConfig.env && typeof existingConfig.env === "object" && !Array.isArray(existingConfig.env)
+      ? (existingConfig.env as Record<string, string>)
+      : {};
+    const explicitApiKey = typeof existingEnv.PAPERCLIP_API_KEY === "string" && existingEnv.PAPERCLIP_API_KEY.trim().length > 0;
+    const promptTemplate = typeof existingConfig.promptTemplate === "string" && existingConfig.promptTemplate.trim().length > 0
+      ? existingConfig.promptTemplate
+      : "";
+    const authGuardPrompt = [
+      "Paperclip API safety rule:",
+      "Use Authorization: Bearer $PAPERCLIP_API_KEY on every Paperclip API request.",
+      "Use X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID on every Paperclip API request that writes or mutates data, including comments and issue updates.",
+      "Never use a board, browser, or local-board session for Paperclip API writes.",
+    ].join("\n");
+    const patchedConfig = passHermesCustomProviderThroughExtraArgs({
+      ...existingConfig,
+      env: {
+        ...existingEnv,
+        ...(!explicitApiKey ? { PAPERCLIP_API_KEY: normalizedCtx.authToken } : {}),
+        PAPERCLIP_RUN_ID: normalizedCtx.runId,
+      },
+    });
+    if (promptTemplate) patchedConfig.promptTemplate = `${authGuardPrompt}\n\n${promptTemplate}`;
+    return executeHermesLocal({
+      ...normalizedCtx,
+      agent: { ...normalizedCtx.agent, adapterConfig: patchedConfig },
+    });
+  },
+  testEnvironment: (ctx) => hermesTestEnvironment(normalizeHermesConfig(ctx) as never),
+  sessionCodec: hermesSessionCodec,
+  listSkills: listHermesSkills,
+  syncSkills: syncHermesSkills,
+  models: hermesModels,
+  supportsLocalAgentJwt: true,
+  supportsInstructionsBundle: false,
+  requiresMaterializedRuntimeSkills: false,
+  agentConfigurationDoc: hermesAgentConfigurationDoc,
+  detectModel: () => detectModelFromHermes(),
 };
 
 const openclawGatewayAdapter: ServerAdapterModule = {
@@ -455,77 +520,6 @@ const piLocalAdapter: ServerAdapterModule = {
   agentConfigurationDoc: piAgentConfigurationDoc,
 };
 
-// hermes-paperclip-adapter v0.2.0 predates the authToken field; cast is
-// intentional until hermes ships a matching AdapterExecutionContext type.
-const executeHermesLocal = hermesExecute as unknown as ServerAdapterModule["execute"];
-// hermes-paperclip-adapter v0.2.0 still depends on the published @paperclipai/adapter-utils
-// that ships the "paperclip_required" origin; casts bridge until hermes upgrades.
-const listHermesSkills = hermesListSkills as unknown as ServerAdapterModule["listSkills"];
-const syncHermesSkills = hermesSyncSkills as unknown as ServerAdapterModule["syncSkills"];
-
-const hermesLocalAdapter: ServerAdapterModule = {
-  type: "hermes_local",
-  execute: async (ctx) => {
-    const normalizedCtx = normalizeHermesConfig(ctx);
-    if (!normalizedCtx.authToken) return executeHermesLocal(normalizedCtx);
-
-    const existingConfig = (normalizedCtx.agent.adapterConfig ?? {}) as Record<string, unknown>;
-    const existingEnv =
-      typeof existingConfig.env === "object" && existingConfig.env !== null && !Array.isArray(existingConfig.env)
-        ? (existingConfig.env as Record<string, string>)
-        : {};
-    const explicitApiKey =
-      typeof existingEnv.PAPERCLIP_API_KEY === "string" && existingEnv.PAPERCLIP_API_KEY.trim().length > 0;
-    const promptTemplate =
-      typeof existingConfig.promptTemplate === "string" && existingConfig.promptTemplate.trim().length > 0
-        ? existingConfig.promptTemplate
-        : "";
-    const authGuardPrompt = [
-      "Paperclip API safety rule:",
-      "Use Authorization: Bearer $PAPERCLIP_API_KEY on every Paperclip API request.",
-      "Use X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID on every Paperclip API request that writes or mutates data, including comments and issue updates.",
-      "Never use a board, browser, or local-board session for Paperclip API writes.",
-    ].join("\n");
-
-    const patchedConfig: Record<string, unknown> = {
-      ...existingConfig,
-      env: {
-        ...existingEnv,
-        ...(!explicitApiKey ? { PAPERCLIP_API_KEY: normalizedCtx.authToken } : {}),
-        PAPERCLIP_RUN_ID: normalizedCtx.runId,
-      },
-    };
-    const effectivePatchedConfig = passHermesCustomProviderThroughExtraArgs(patchedConfig);
-
-    // Only inject the auth guard into promptTemplate when a custom template already exists.
-    // When no custom template is set, Hermes uses its built-in default heartbeat/task prompt —
-    // overwriting it with only the auth guard text would strip the assigned issue/workflow instructions.
-    if (promptTemplate) {
-      effectivePatchedConfig.promptTemplate = `${authGuardPrompt}\n\n${promptTemplate}`;
-    }
-
-    const patchedCtx = {
-      ...normalizedCtx,
-      agent: {
-        ...normalizedCtx.agent,
-        adapterConfig: effectivePatchedConfig,
-      },
-    };
-
-    return executeHermesLocal(patchedCtx);
-  },
-  testEnvironment: (ctx) => hermesTestEnvironment(normalizeHermesConfig(ctx) as never),
-  sessionCodec: hermesSessionCodec,
-  listSkills: listHermesSkills,
-  syncSkills: syncHermesSkills,
-  models: hermesModels,
-  supportsLocalAgentJwt: true,
-  supportsInstructionsBundle: false,
-  requiresMaterializedRuntimeSkills: false,
-  agentConfigurationDoc: hermesAgentConfigurationDoc,
-  detectModel: () => detectModelFromHermes(),
-};
-
 const adaptersByType = new Map<string, ServerAdapterModule>();
 
 // For builtin types that are overridden by an external adapter, we keep the
@@ -548,9 +542,9 @@ function registerBuiltInAdapters() {
     cursorLocalAdapter,
     geminiLocalAdapter,
     grokLocalAdapter,
-    openclawGatewayAdapter,
     hermesLocalAdapter,
     openrouterAdapter,
+    openclawGatewayAdapter,
     processAdapter,
     httpAdapter,
   ]) {

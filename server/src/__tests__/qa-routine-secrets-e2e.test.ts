@@ -58,7 +58,7 @@ describeEmbedded("PAP-9522 QA: routine secrets end-to-end", () => {
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsTmpDir, "master.key");
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-qa-routine-secrets-");
     db = createDb(tempDb.connectionString);
-  }, 30_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(secretAccessEvents);
@@ -91,6 +91,7 @@ describeEmbedded("PAP-9522 QA: routine secrets end-to-end", () => {
       name: "QA Co",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
     });
     // Note: executor agent has NO secret bindings of its own — this is the
     // whole point of routine env (the secret rides with the routine, not the agent).

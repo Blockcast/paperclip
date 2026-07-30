@@ -41,6 +41,7 @@ Production routing is identity-synced from penstock state:
 ```sh
 PAPERCLIP_MCP_UPSTREAMS_STATE_URL=https://api.penstock.run/v1/mcp/upstreams \
 PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN="$STATE_TOKEN" \
+PAPERCLIP_MCP_TENANT_RELAY_ORIGIN=https://api.penstock.run \
 PAPERCLIP_MCP_UPSTREAMS_CACHE_FILE=/cache/upstreams-lkg.json \
 PAPERCLIP_MCP_SESSION_STORE_FILE=/cache/sessions.json \
   node dist/server.js
@@ -61,22 +62,59 @@ The state response may be either a legacy `prefix -> URL` object or metadata:
 }
 ```
 
+Credential-bearing tenant routes use the same schema with an explicit execution
+class. Their URL is the MCP worker route exposed through the existing PEN-629
+tenant-node channel, not a second tunnel:
+
+```json
+{
+  "upstreams": [
+    {
+      "prefix": "github",
+      "execution": "tenant_node",
+      "routeId": "github",
+      "authorizationEnv": "GITHUB_TOKEN"
+    }
+  ]
+}
+```
+
+For `tenant_node` entries, the registry cannot provide a URL. `routeId` must
+equal the entry prefix, and the gateway derives the only valid target as
+`$PAPERCLIP_MCP_TENANT_RELAY_ORIGIN/v1/mcp/apps/<routeId>/mcp`. The relay origin
+must be a public HTTPS origin on the default port; IP literals, local/internal
+names, userinfo, alternate ports, path components, and an origin different from
+the authenticated state service fail startup. Relay calls
+authenticate with the same state-token principal that scoped the registry
+response, never caller-supplied identity headers, and redirects are not followed.
+Credential key names remain visible registry metadata, but the central gateway
+never reads or injects their values. The tenant-node worker resolves those names
+from its local environment before calling the real MCP server. House servers
+omit `execution` (or set it to `house`) and retain the existing central
+Kubernetes Secret injection path. This package routes approved HTTP MCP servers
+only; it does not host customer-supplied server code.
+
 Credential values are not valid state. State may only name the gateway env var
 that holds a credential. Kubernetes Secrets remain the source of truth for those
 values; the gateway injects them as upstream headers at request time. A state
 payload containing fields such as `token`, `secret`, `password`, or `apiKey` is
 rejected before serving.
 
-When state fetch succeeds, the raw metadata is persisted to
-`PAPERCLIP_MCP_UPSTREAMS_CACHE_FILE`. If the control plane is unavailable on a
-later startup, the gateway serves the last-known-good cache instead of losing all
-routes.
+When state fetch succeeds, the metadata is persisted to
+`PAPERCLIP_MCP_UPSTREAMS_CACHE_FILE` in an envelope bound to the state URL and a
+SHA-256 fingerprint of the authenticated state-token principal. If the control
+plane is unavailable on a later startup, the gateway serves that last-known-good
+cache only when both bindings still match. Token rotation or a different tenant
+therefore fails closed instead of reusing stale routes.
 
 Set `PAPERCLIP_MCP_SESSION_STORE_FILE` to externalize client-to-upstream session
 mappings. The file contains only session ids, cached initialize payloads, and
 timestamps; it must live on storage shared by all gateway replicas if the
 Deployment runs with more than one pod. Without this setting, sessions remain
-process-local and a replica restart requires clients to initialize again.
+process-local and a replica restart requires clients to initialize again. The
+persisted snapshot is also bound to the state-token principal and each resolved
+upstream route plus registry revision; principal rotation, registry changes, or
+a route change invalidate stale sessions.
 
 For local development and bootstrap, routing table JSON is still supported:
 
@@ -130,10 +168,29 @@ exclusive lease acquisition during ordinary session traffic and is invalidated
 when the upstream Figma server returns `401`. Cache keys hash caller authorization
 values instead of storing raw caller bearer tokens.
 
+### OAuth discovery
+
+Set both variables to publish discovery for the tenant's logical MCP URL:
+
+```sh
+PAPERCLIP_MCP_PUBLIC_URL=https://tenant.example \
+PAPERCLIP_MCP_AUTHORIZATION_SERVER=https://auth.example \
+  node dist/server.js
+```
+
+The gateway serves RFC 9728 protected-resource metadata at both
+`/.well-known/oauth-protected-resource` and
+`/.well-known/oauth-protected-resource/mcp`. It redirects the authorization
+server and OpenID discovery probes to the configured issuer. Discovery is
+disabled unless both variables are present; partial configuration fails startup.
+
 ## Endpoints
 
 - `GET /healthz` — health check; returns `{ ok: true, upstreams, upstreamCallCounts, breakers, sessions }`.
 - `GET /` — same as `/healthz`.
+- `GET /.well-known/oauth-protected-resource[/mcp]` — tenant MCP OAuth protected-resource metadata when configured.
+- `GET /.well-known/oauth-authorization-server` — redirect to the configured authorization server's discovery document.
+- `GET /.well-known/openid-configuration` — redirect to the configured OpenID issuer discovery document.
 - `<METHOD> /mcp` — aggregate MCP endpoint; exposes one stable tool list with `<prefix>__<toolName>` names.
 - `<METHOD> /<prefix>/mcp` — proxied to the upstream URL for `<prefix>`.
 - `<METHOD> /<prefix>/mcp/<rest...>` — preserves the trailing path.

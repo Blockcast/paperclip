@@ -2,7 +2,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildCredentialHeaders, loadUpstreams, matchUpstream, parseUpstreamMap } from "./upstreams.js";
+import {
+  buildCredentialHeaders,
+  loadUpstreams,
+  matchUpstream,
+  parseUpstreamMap,
+  upstreamsPrincipalHash,
+} from "./upstreams.js";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -52,6 +58,56 @@ describe("parseUpstreamMap", () => {
         "test",
       ),
     ).toThrow(/credential value/);
+  });
+
+  it("retains tenant-node credential key names as non-custodial metadata", () => {
+    const map = parseUpstreamMap(
+      JSON.stringify({
+        upstreams: [{
+          prefix: "github",
+          execution: "tenant_node",
+          routeId: "github",
+          authorizationEnv: "GITHUB_TOKEN",
+        }],
+      }),
+      "test",
+      { origin: "https://relay.example", authorization: "Bearer tenant-a" },
+    );
+
+    expect(map.github).toEqual({
+      url: "https://relay.example/v1/mcp/apps/github/mcp",
+      execution: "tenant_node",
+      routeId: "github",
+      relayAuthorization: "Bearer tenant-a",
+      credentialHeaders: [{ header: "authorization", env: "GITHUB_TOKEN", scheme: "Bearer" }],
+    });
+  });
+
+  it("derives tenant targets from the authenticated relay and ignores registry URLs", () => {
+    const map = parseUpstreamMap(
+      JSON.stringify({
+        upstreams: [{
+          prefix: "github",
+          execution: "tenant_node",
+          routeId: "github",
+          url: "http://169.254.169.254/latest/meta-data",
+        }],
+      }),
+      "test",
+      { origin: "https://relay.example", authorization: "Bearer tenant-a" },
+    );
+
+    expect(map.github.url).toBe("https://relay.example/v1/mcp/apps/github/mcp");
+  });
+
+  it("rejects tenant route swaps and unauthenticated relay configuration", () => {
+    const payload = JSON.stringify({
+      upstreams: [{ prefix: "github", execution: "tenant_node", routeId: "linear" }],
+    });
+    expect(() => parseUpstreamMap(payload, "test")).toThrow(/authenticated relay/);
+    expect(() =>
+      parseUpstreamMap(payload, "test", { origin: "https://relay.example", authorization: "Bearer tenant-a" }),
+    ).toThrow(/routeId must equal/);
   });
 
   it("rejects non-object roots", () => {
@@ -125,6 +181,19 @@ describe("buildCredentialHeaders", () => {
     expect(headers).toEqual({ authorization: "Bearer serve-token", "x-api-key": "api-key" });
   });
 
+  it("never reads or injects credential values for a tenant-node route", () => {
+    const headers = buildCredentialHeaders(
+      {
+        url: "https://tenant-channel.example/mcp/github",
+        execution: "tenant_node",
+        credentialHeaders: [{ header: "authorization", env: "GITHUB_TOKEN", scheme: "Bearer" }],
+      },
+      { GITHUB_TOKEN: "must-stay-on-node" },
+    );
+
+    expect(headers).toEqual({});
+  });
+
   it("rejects credential env names that are not allowlisted", () => {
     expect(() =>
       buildCredentialHeaders(
@@ -154,16 +223,27 @@ describe("loadUpstreams", () => {
     });
 
     expect(map.figma.url).toBe("http://figma:8000/mcp");
-    expect(fs.readFileSync(cacheFile, "utf8")).toBe('{"figma":"http://figma:8000/mcp"}');
+    expect(JSON.parse(fs.readFileSync(cacheFile, "utf8"))).toEqual({
+      version: 1,
+      principalHash: upstreamsPrincipalHash({ PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN: "state-token" }),
+      stateUrl: "https://penstock.example/mcp-upstreams",
+      payload: '{"figma":"http://figma:8000/mcp"}',
+    });
     expect(fetch).toHaveBeenCalledWith("https://penstock.example/mcp-upstreams", {
       headers: { accept: "application/json", authorization: "Bearer state-token" },
+      redirect: "error",
     });
   });
 
   it("falls back to last-known-good cache when penstock state is unavailable", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-upstreams-"));
     const cacheFile = path.join(dir, "lkg.json");
-    fs.writeFileSync(cacheFile, '{"figma":"http://cached-figma:8000/mcp"}');
+    fs.writeFileSync(cacheFile, JSON.stringify({
+      version: 1,
+      principalHash: upstreamsPrincipalHash({}),
+      stateUrl: "https://penstock.example/mcp-upstreams",
+      payload: '{"figma":"http://cached-figma:8000/mcp"}',
+    }));
     vi.stubGlobal("fetch", vi.fn(async () => new Response("unavailable", { status: 503 })));
 
     const map = await loadUpstreams({
@@ -172,6 +252,43 @@ describe("loadUpstreams", () => {
     });
 
     expect(map.figma.url).toBe("http://cached-figma:8000/mcp");
+  });
+
+  it("rejects a last-known-good cache from a stale tenant principal", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-upstreams-"));
+    const cacheFile = path.join(dir, "lkg.json");
+    fs.writeFileSync(cacheFile, JSON.stringify({
+      version: 1,
+      principalHash: upstreamsPrincipalHash({ PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN: "tenant-a-token" }),
+      stateUrl: "https://penstock.example/mcp-upstreams",
+      payload: '{"figma":"http://cached-figma:8000/mcp"}',
+    }));
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("unavailable", { status: 503 })));
+
+    await expect(loadUpstreams({
+      PAPERCLIP_MCP_UPSTREAMS_STATE_URL: "https://penstock.example/mcp-upstreams",
+      PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN: "tenant-b-token",
+      PAPERCLIP_MCP_UPSTREAMS_CACHE_FILE: cacheFile,
+    })).rejects.toThrow(/no last-known-good cache/);
+  });
+
+  it.each([
+    "http://relay.example",
+    "https://127.0.0.1",
+    "https://[::1]",
+    "https://relay.example:8443",
+    "https://user:pass@relay.example",
+    "https://relay.internal",
+    "https://relay.example/nested",
+  ])("rejects unsafe tenant relay origin %s before state fetch", async (origin) => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(loadUpstreams({
+      PAPERCLIP_MCP_UPSTREAMS_STATE_URL: "https://penstock.example/mcp-upstreams",
+      PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN: "tenant-token",
+      PAPERCLIP_MCP_TENANT_RELAY_ORIGIN: origin,
+    })).rejects.toThrow(/public HTTPS origin/);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("does not fall back to last-known-good cache when reachable state is invalid", async () => {
@@ -226,5 +343,29 @@ describe("loadUpstreams", () => {
       }),
     ).rejects.toThrow(/not listed in PAPERCLIP_MCP_UPSTREAM_CREDENTIAL_ENVS/);
     expect(fs.existsSync(cacheFile)).toBe(false);
+  });
+
+  it("does not require control-plane env allowlisting for tenant-node credential keys", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-upstreams-"));
+    const cacheFile = path.join(dir, "lkg.json");
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      upstreams: [{
+        prefix: "github",
+        execution: "tenant_node",
+        routeId: "github",
+        authorizationEnv: "GITHUB_TOKEN",
+      }],
+    }), { status: 200 })));
+
+    const map = await loadUpstreams({
+      PAPERCLIP_MCP_UPSTREAMS_STATE_URL: "https://penstock.example/mcp-upstreams",
+      PAPERCLIP_MCP_UPSTREAMS_STATE_TOKEN: "tenant-token",
+      PAPERCLIP_MCP_TENANT_RELAY_ORIGIN: "https://penstock.example",
+      PAPERCLIP_MCP_UPSTREAMS_CACHE_FILE: cacheFile,
+    });
+
+    expect(map.github.execution).toBe("tenant_node");
+    expect(map.github.url).toBe("https://penstock.example/v1/mcp/apps/github/mcp");
+    expect(map.github.relayAuthorization).toBe("Bearer tenant-token");
   });
 });

@@ -40,9 +40,16 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
 })));
 const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
-const mockDb = vi.hoisted(() => ({
-  select: mockDbSelect,
-}));
+const mockDbInsertValues = vi.hoisted(() => vi.fn(async () => undefined));
+const mockDbInsert = vi.hoisted(() => vi.fn(() => ({ values: mockDbInsertValues })));
+const mockDb = vi.hoisted(() => {
+  const db: any = {
+    select: mockDbSelect,
+    insert: mockDbInsert,
+    transaction: async (cb: (tx: unknown) => unknown) => cb(db),
+  };
+  return db;
+});
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
@@ -74,6 +81,9 @@ function registerModuleMocks() {
           orgChainHealth: { status: "healthy" },
         },
       })),
+    }),
+    companySkillService: () => ({
+      completeTestRunForIssue: vi.fn(async () => null),
     }),
     documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => ({}),
@@ -749,6 +759,277 @@ describe("issue execution policy routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  // BLO-18790 / BLO-18782 / BLO-18783 / BLO-18168 (same defect, filed four times).
+  // The monitor on BLO-12852 sat dead for ~4h across three runs because writes shaped as
+  // top-level `monitor` / `monitorNextCheckAt` were stripped by the non-strict body schema:
+  // HTTP 200, `updatedAt` bumped, nothing persisted. A `triggered` monitor was never the cause.
+  describe("monitor re-arm on a triggered monitor (BLO-18790)", () => {
+    // Mirrors BLO-12852's observed row exactly: triggered, no nextCheckAt, 18 attempts burned,
+    // maxAttempts null, and executionPolicy null (the monitor lives only in the columns + state).
+    const wedgedIssue = () => ({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      checkoutRunId: "run-1",
+      executionRunId: "run-1",
+      createdByUserId: "local-board",
+      identifier: "PAP-12852",
+      title: "Wedged triggered monitor",
+      executionPolicy: null,
+      executionState: {
+        status: "idle",
+        monitor: {
+          status: "triggered",
+          nextCheckAt: null,
+          lastTriggeredAt: "2026-07-29T18:51:23.137Z",
+          attemptCount: 18,
+          maxAttempts: null,
+          notes: "stale signature written at 18:51Z",
+          scheduledBy: "assignee",
+          clearedAt: null,
+          clearReason: null,
+        },
+      },
+      monitorAttemptCount: 18,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date("2026-07-29T18:51:23.137Z"),
+      monitorNotes: "stale signature written at 18:51Z",
+      monitorScheduledBy: "assignee",
+    });
+
+    // Same row, but carrying policy fields that a monitor write must not take down with it.
+    // `reviewPreset`/`authorizationPolicy` ride along with `stages` so the assertions below cover
+    // every field an `executionPolicy` replacement can drop, not just the one that is easiest to see.
+    const REVIEWER_AGENT_ID = "44444444-4444-4444-8444-444444444444";
+    const stagedIssue = () => ({
+      ...wedgedIssue(),
+      executionPolicy: normalizeIssueExecutionPolicy({
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          { type: "review", participants: [{ type: "agent", agentId: REVIEWER_AGENT_ID }] },
+        ],
+        reviewPreset: { id: "low_trust_review", version: 1, rawOutputDisposition: "quarantine" },
+        // The security-sensitive one: a trust boundary that confines the issue's agents and tools.
+        // Losing this to a monitor write silently widens what the assignee is allowed to do, so it
+        // gets the same drop/preserve assertions as `stages` and `reviewPreset` below.
+        authorizationPolicy: {
+          trustPreset: "low_trust_review",
+          trustBoundary: {
+            mode: "low_trust_review",
+            allowedAgentIds: [REVIEWER_AGENT_ID],
+            allowedToolClasses: ["read"],
+          },
+        },
+        monitor: {
+          nextCheckAt: "2099-11-01T13:00:00.000Z",
+          notes: "armed",
+          scheduledBy: "assignee",
+        },
+      }),
+    });
+
+    const patchIssue = async (body: unknown) => {
+      const app = await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      });
+      return request(app).patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").send(body);
+    };
+
+    it("persists a re-arm through executionPolicy.monitor despite triggered state and 18 burned attempts", async () => {
+      const issue = wedgedIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({
+          executionPolicy: {
+            monitor: {
+              nextCheckAt: "2099-12-01T13:00:00.000Z",
+              notes: "signature=unchanged; next=2099-12-01T13:00:00.000Z",
+              scheduledBy: "assignee",
+            },
+          },
+        });
+
+      expect(res.status).toBe(200);
+      // The exact bug was 200-with-unchanged-row, so assert the row actually moved rather than
+      // just that the request succeeded.
+      const patch = mockIssueService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+      expect(patch.monitorNextCheckAt).toEqual(new Date("2099-12-01T13:00:00.000Z"));
+      expect(patch.monitorNotes).toBe("signature=unchanged; next=2099-12-01T13:00:00.000Z");
+      expect(patch.monitorNextCheckAt).not.toBeNull();
+      expect(patch.monitorNotes).not.toBe(issue.monitorNotes);
+      expect((patch.executionState as { monitor: { status: string } }).monitor.status).toBe("scheduled");
+    });
+
+    it.each([
+      ["monitor", { nextCheckAt: "2099-12-01T13:00:00.000Z", notes: "sig", scheduledBy: "assignee" }],
+      ["monitorNextCheckAt", "2099-12-01T13:00:00.000Z"],
+      ["monitorNotes", "sig"],
+    ])("rejects a misplaced top-level `%s` instead of accepting and ignoring it", async (key, value) => {
+      const issue = wedgedIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ [key]: value });
+
+      // A 200 here is the regression: it means the key was silently dropped again. Constrain the
+      // upper end too — a 500 from a schema or middleware exception is not "rejected the key".
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(res.status).toBeLessThan(500);
+      expect(JSON.stringify(res.body)).toContain("executionPolicy.monitor");
+      // Nothing may be written when the body is rejected.
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+
+    // Why the schema guidance tells callers to re-send the COMPLETE policy with only `monitor`
+    // omitted, rather than the shorter-looking `{"executionPolicy":{}}`: the update replaces the
+    // whole policy, so the terse form silently drops the review stages too.
+    it("drops unrelated policy fields when a monitor clear sends a bare executionPolicy", async () => {
+      const issue = stagedIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      expect(issue.executionPolicy?.stages).toHaveLength(1);
+
+      const res = await patchIssue({ executionPolicy: {} });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+      // The monitor clear lands...
+      expect(patch.monitorNextCheckAt).toBeNull();
+      // ...but it takes the whole policy with it: normalizeIssueExecutionPolicy collapses a
+      // stage-less, monitor-less policy to null, so the review stage asserted above is gone.
+      // This is why the schema guidance says to re-send the COMPLETE policy minus `monitor`.
+      expect("executionPolicy" in patch).toBe(true);
+      expect(patch.executionPolicy).toBeNull();
+    });
+
+    // The same replacement rule bites arming/re-arming, not just clearing — a monitor-only body
+    // is a policy that happens to have no stages, so it erases them. This is the destructive case
+    // the guidance has to steer callers away from, so pin it: if the server ever starts merging
+    // monitor-only writes, this test fails and the guidance must be rewritten to match.
+    it("drops unrelated policy fields when a re-arm sends a monitor-only executionPolicy", async () => {
+      const issue = stagedIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      expect(issue.executionPolicy?.stages).toHaveLength(1);
+      expect(issue.executionPolicy?.reviewPreset).toBeTruthy();
+      expect(issue.executionPolicy?.authorizationPolicy).toBeTruthy();
+
+      const res = await patchIssue({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2099-12-01T13:00:00.000Z",
+            notes: "signature=unchanged",
+            scheduledBy: "assignee",
+          },
+        },
+      });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+      const nextPolicy = patch.executionPolicy as {
+        stages?: unknown[];
+        reviewPreset?: unknown;
+        authorizationPolicy?: unknown;
+      } | null;
+      // The monitor is armed as asked...
+      expect(patch.monitorNextCheckAt).toEqual(new Date("2099-12-01T13:00:00.000Z"));
+      // ...and the review stage, preset and trust boundary the caller never mentioned are gone
+      // with it. The `authorizationPolicy` loss is the one with teeth: it silently un-confines the
+      // issue rather than just skipping a review.
+      expect(nextPolicy?.stages ?? []).toHaveLength(0);
+      expect(nextPolicy?.reviewPreset ?? null).toBeNull();
+      expect(nextPolicy?.authorizationPolicy ?? null).toBeNull();
+    });
+
+    // ...and the pattern the guidance actually prescribes: read the current policy, re-send it
+    // complete with `monitor` swapped in. Same arm, no collateral damage.
+    it("preserves unrelated policy fields when a re-arm re-sends the complete policy", async () => {
+      const issue = stagedIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await patchIssue({
+        executionPolicy: {
+          ...issue.executionPolicy,
+          monitor: {
+            nextCheckAt: "2099-12-01T13:00:00.000Z",
+            notes: "signature=unchanged",
+            scheduledBy: "assignee",
+          },
+        },
+      });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+      const nextPolicy = patch.executionPolicy as {
+        stages: Array<{ type: string; participants: Array<{ agentId: string | null }> }>;
+        reviewPreset?: { id: string } | null;
+        authorizationPolicy?: {
+          trustPreset?: string;
+          trustBoundary?: { mode?: string; allowedAgentIds?: string[]; allowedToolClasses?: string[] };
+        } | null;
+      };
+      expect(patch.monitorNextCheckAt).toEqual(new Date("2099-12-01T13:00:00.000Z"));
+      expect(patch.monitorNotes).toBe("signature=unchanged");
+      expect(nextPolicy.stages).toHaveLength(1);
+      expect(nextPolicy.stages[0]?.participants[0]?.agentId).toBe(REVIEWER_AGENT_ID);
+      expect(nextPolicy.reviewPreset?.id).toBe("low_trust_review");
+      // The trust boundary survives intact, nested fields included — a re-arm must not quietly
+      // relax it, so assert the contents rather than mere presence.
+      expect(nextPolicy.authorizationPolicy?.trustPreset).toBe("low_trust_review");
+      expect(nextPolicy.authorizationPolicy?.trustBoundary).toEqual({
+        mode: "low_trust_review",
+        allowedAgentIds: [REVIEWER_AGENT_ID],
+        allowedToolClasses: ["read"],
+      });
+    });
+  });
+
+
   it("triggers a scheduled monitor immediately from the dedicated route", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -1044,6 +1325,186 @@ describe("issue execution policy routes", () => {
 
       expect(res.status).toBe(403);
       expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("execution-stage deadlock override (BLO-15942)", () => {
+    const reviewStageId = "77777777-7777-4777-8777-777777777777";
+    // Stands in for a mandate-bound reviewer (e.g. Ally) whose mandate excludes
+    // advancing issue stages — only tasks:override_execution_stage lets another
+    // actor unstick the stage.
+    const mandateBoundParticipantAgentId = "88888888-8888-4888-8888-888888888888";
+    const implementerAgentId = "33333333-3333-4333-8333-333333333333";
+    const unrelatedAgentId = "99999999-9999-4999-8999-999999999999";
+
+    function makeStuckReviewIssue() {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [
+          {
+            id: reviewStageId,
+            type: "review",
+            participants: [{ type: "agent", agentId: mandateBoundParticipantAgentId }],
+          },
+        ],
+      })!;
+      return {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        companyId: "company-1",
+        status: "in_review",
+        assigneeAgentId: mandateBoundParticipantAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-15942",
+        title: "Deadlocked review stage",
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: mandateBoundParticipantAgentId },
+          returnAssignee: { type: "agent", agentId: implementerAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      };
+    }
+
+    it("an authorized operator override force-completes a stage the mandate-bound participant cannot act on", async () => {
+      const issue = makeStuckReviewIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      // Board/local_implicit is always allowed by the real authorization
+      // service (allow_local_board) and is mirrored here by the mock.
+      const res = await request(await createApp({
+        type: "board",
+        userId: "local-board",
+        companyIds: ["company-1"],
+        source: "local_implicit",
+        isInstanceAdmin: false,
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({
+          status: "done",
+          comment: "Overriding: reviewer's mandate excludes stage decisions; verified independently.",
+        });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        expect.objectContaining({
+          status: "done",
+          executionState: expect.objectContaining({
+            status: "completed",
+            completedStageIds: [reviewStageId],
+            lastDecisionOutcome: "approved",
+            lastDecisionId: expect.any(String),
+          }),
+        }),
+        expect.anything(),
+      );
+    });
+
+    it("still rejects an unrelated, unauthorized agent (regression: override does not open the stage to anyone)", async () => {
+      const issue = makeStuckReviewIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: unrelatedAgentId,
+        companyId: "company-1",
+        runId: "run-blo-15942",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ status: "done", comment: "Trying to bypass review" });
+
+      // Rejected at the assignee-ownership boundary (403) before the
+      // execution-stage transition is even evaluated — an unrelated agent
+      // with no tasks:manage_active_checkouts / tasks:override_execution_stage
+      // grant never gets far enough to hit the stage's own "only the active
+      // reviewer or approver can advance" 422.
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("resolves the override grant against the stage's currentParticipant, not a diverged issue assignee", async () => {
+      // Regression for the Ally review finding on this PR: the issue's
+      // assigneeAgentId and the stage's currentParticipant can diverge (e.g. a
+      // prior reassignment that didn't walk through the execution-policy
+      // transition). The override must authorize against the participant a
+      // manager is trying to unstick, not whoever the issue happens to be
+      // assigned to.
+      const divergedAssigneeAgentId = "44444444-4444-4444-8444-444444444444";
+      const managerOfParticipantAgentId = "55555555-5555-4555-8555-555555555555";
+      const issue = {
+        ...makeStuckReviewIssue(),
+        assigneeAgentId: divergedAssigneeAgentId,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const decideCalls: Array<{ action?: string; resource?: { assigneeAgentId?: string | null } }> = [];
+      mockAccessService.decide.mockImplementation(async (input: {
+        actor?: { type?: string; agentId?: string; source?: string };
+        action?: string;
+        resource?: { assigneeAgentId?: string | null };
+      }) => {
+        decideCalls.push({ action: input.action, resource: input.resource });
+        const isTestActor = input.actor?.type === "agent" && input.actor.agentId === managerOfParticipantAgentId;
+        // Mirror the suite-wide default mock's blanket allow for the general
+        // read/mutate actions every PATCH exercises, so only the two override
+        // grants below are actually under test.
+        const isGenerallyAllowedAction =
+          isTestActor &&
+          ["company_scope:read", "issue:read", "issue:mutate", "runtime:manage"].includes(input.action ?? "");
+        // Grant the pre-existing tasks:manage_active_checkouts boundary check
+        // broadly (unrelated to this fix) so the request reaches the
+        // execution-stage override decision below. Only a manager of the
+        // *participant* (not the diverged assignee) is granted
+        // tasks:override_execution_stage — proving the resource passed to
+        // access.decide for that action targets the participant, not the
+        // issue's assignee.
+        const allowed =
+          isGenerallyAllowedAction ||
+          (input.action === "tasks:manage_active_checkouts" && isTestActor) ||
+          (input.action === "tasks:override_execution_stage" &&
+            isTestActor &&
+            input.resource?.assigneeAgentId === mandateBoundParticipantAgentId);
+        return {
+          allowed,
+          action: input.action,
+          reason: allowed ? "allow_manager_chain" : "deny_missing_grant",
+          explanation: allowed ? "Allowed by test grant." : `Missing permission: ${input.action ?? "action"}`,
+        };
+      });
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: managerOfParticipantAgentId,
+        companyId: "company-1",
+        runId: "run-blo-15942-divergence",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({
+          status: "done",
+          comment: "Overriding as manager of the mandate-bound participant.",
+        });
+
+      expect(res.status).toBe(200);
+      const overrideCall = decideCalls.find((call) => call.action === "tasks:override_execution_stage");
+      expect(overrideCall?.resource?.assigneeAgentId).toBe(mandateBoundParticipantAgentId);
+      expect(overrideCall?.resource?.assigneeAgentId).not.toBe(divergedAssigneeAgentId);
     });
   });
 });

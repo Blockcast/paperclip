@@ -3,7 +3,7 @@
 import { act } from "react";
 import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IssueChatThread } from "./IssueChatThread";
 import type { IssueChatComment } from "../lib/issue-chat-messages";
@@ -286,6 +286,11 @@ describe("IssueChatThread system notice routing", () => {
 
   it("shows copy-link feedback on the link button only", async () => {
     const writeText = vi.fn(async () => undefined);
+    const originalSecureContext = Object.getOwnPropertyDescriptor(window, "isSecureContext");
+    Object.defineProperty(window, "isSecureContext", {
+      configurable: true,
+      value: true,
+    });
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
       value: { writeText },
@@ -320,6 +325,12 @@ describe("IssueChatThread system notice routing", () => {
     expect(writeText).toHaveBeenCalledWith(expect.stringContaining("#comment-comment-copy-link"));
     expect(copyLink.querySelector(".lucide-check")).not.toBeNull();
     expect(copyText.querySelector(".lucide-check")).toBeNull();
+    if (originalSecureContext) {
+      Object.defineProperty(window, "isSecureContext", originalSecureContext);
+    } else {
+      // @ts-expect-error test cleanup for optional browser API
+      delete window.isSecureContext;
+    }
   });
 
   it("labels system notice source as Paperclip when no run agent can be resolved", () => {
@@ -443,6 +454,7 @@ describe("IssueChatThread system notice routing", () => {
       successfulRunHandoff: {
         state: "resolved",
         required: false,
+        hasLiveContinuation: false,
         sourceRunId: "run-stale",
         correctiveRunId: "run-corrective",
         assigneeAgentId: "agent-codex",

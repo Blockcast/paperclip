@@ -30,7 +30,14 @@ import {
   type CredentialCustodyState,
   type CredentialCustodyToken,
 } from "./credential-custody.js";
-import { buildCredentialHeaders, loadUpstreams, matchUpstream, type UpstreamConfig, type UpstreamMap } from "./upstreams.js";
+import {
+  buildCredentialHeaders,
+  loadUpstreams,
+  matchUpstream,
+  upstreamsPrincipalHash,
+  type UpstreamConfig,
+  type UpstreamMap,
+} from "./upstreams.js";
 import { CircuitBreaker, type CircuitBreakerConfig } from "./circuit-breaker.js";
 import {
   MCP_SESSION_HEADER,
@@ -59,6 +66,12 @@ export interface GatewayConfig {
   upstreamTimeoutMs: number;
   breaker: CircuitBreakerConfig;
   sessionPersistenceFile: string | null;
+  oauthDiscovery: OAuthDiscoveryConfig | null;
+}
+
+export interface OAuthDiscoveryConfig {
+  resource: string;
+  authorizationServer: string;
 }
 
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
@@ -68,6 +81,11 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
 }
 
 export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig {
+  const publicUrl = env.PAPERCLIP_MCP_PUBLIC_URL?.trim().replace(/\/+$/, "");
+  const authorizationServer = env.PAPERCLIP_MCP_AUTHORIZATION_SERVER?.trim().replace(/\/+$/, "");
+  if ((publicUrl && !authorizationServer) || (!publicUrl && authorizationServer)) {
+    throw new Error("PAPERCLIP_MCP_PUBLIC_URL and PAPERCLIP_MCP_AUTHORIZATION_SERVER must be configured together");
+  }
   return {
     upstreamTimeoutMs: parsePositiveInt(env.PAPERCLIP_MCP_UPSTREAM_TIMEOUT_MS, DEFAULT_UPSTREAM_TIMEOUT_MS),
     breaker: {
@@ -85,6 +103,9 @@ export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): Gateway
       ),
     },
     sessionPersistenceFile: env.PAPERCLIP_MCP_SESSION_STORE_FILE?.trim() || null,
+    oauthDiscovery: publicUrl && authorizationServer
+      ? { resource: `${publicUrl}/mcp`, authorizationServer }
+      : null,
   };
 }
 
@@ -95,13 +116,17 @@ export interface GatewayState {
   breaker: CircuitBreaker;
   upstreamTimeoutMs: number;
   credentialCustody?: CredentialCustodyState;
+  oauthDiscovery?: OAuthDiscoveryConfig | null;
   sessionPersistenceFile?: string | null;
   sessionPersistenceLoaded?: boolean;
   sessionPersistenceWrite?: Promise<void>;
+  routingPrincipalHash?: string;
 }
 
 interface PersistedSessionSnapshot {
-  version: 1;
+  version: 2;
+  principalHash: string;
+  routeBindings: Record<string, string>;
   prefixes: Record<string, PersistedSessionRecord[]>;
 }
 
@@ -156,9 +181,19 @@ async function loadPersistedSessions(state: GatewayState): Promise<void> {
   } catch {
     return;
   }
-  if (!parsed || parsed.version !== 1 || !parsed.prefixes || typeof parsed.prefixes !== "object") return;
+  if (
+    !parsed ||
+    parsed.version !== 2 ||
+    parsed.principalHash !== (state.routingPrincipalHash ?? "") ||
+    !parsed.routeBindings ||
+    typeof parsed.routeBindings !== "object" ||
+    !parsed.prefixes ||
+    typeof parsed.prefixes !== "object"
+  ) return;
   for (const [prefix, records] of Object.entries(parsed.prefixes)) {
     if (!Array.isArray(records)) continue;
+    const upstream = state.upstreams[prefix];
+    if (!upstream || parsed.routeBindings[prefix] !== routeBinding(upstream)) continue;
     getOrCreateStore(state, prefix).restore(records);
   }
 }
@@ -184,7 +219,11 @@ async function persistSessionsNow(state: GatewayState): Promise<void> {
   // the upstream session on the next aggregate call.
   await loadPersistedSessions(state);
   const snapshot: PersistedSessionSnapshot = {
-    version: 1,
+    version: 2,
+    principalHash: state.routingPrincipalHash ?? "",
+    routeBindings: Object.fromEntries(
+      Object.entries(state.upstreams).map(([prefix, upstream]) => [prefix, routeBinding(upstream)]),
+    ),
     prefixes: Object.fromEntries(Array.from(state.sessions.entries()).map(([prefix, store]) => [prefix, store.snapshot()])),
   };
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
@@ -201,6 +240,10 @@ async function persistSessionsNow(state: GatewayState): Promise<void> {
     // eslint-disable-next-line no-console
     console.warn(`[mcp-gateway] failed to persist session store: ${(e as Error).message}`);
   }
+}
+
+function routeBinding(upstream: UpstreamConfig): string {
+  return `${upstream.execution ?? "house"}\0${upstream.routeId ?? ""}\0${upstream.url}\0${upstream.registryRevision ?? ""}`;
 }
 
 async function readBody(req: http.IncomingMessage): Promise<Buffer> {
@@ -297,7 +340,15 @@ async function createUpstreamSession(
   const initializeBody = initializeResult.body.toString("utf8");
   const upstreamSessionId = extractUpstreamSessionId(initializeResult.headers, initializeBody);
   if (!isSuccess(initializeResult.status) || !upstreamSessionId) return null;
-  await notifyUpstreamInitialized(upstreamUrl, inboundHeaders, upstreamSessionId, timeoutMs, credentialToken, upstreamConfig);
+  const initialized = await notifyUpstreamInitialized(
+    upstreamUrl,
+    inboundHeaders,
+    upstreamSessionId,
+    timeoutMs,
+    credentialToken,
+    upstreamConfig,
+  );
+  if (!initialized) return null;
   return upstreamSessionId;
 }
 
@@ -313,21 +364,25 @@ async function ensureUpstreamSession(
   const store = getOrCreateStore(state, prefix);
   const existing = store.get(clientSessionId);
   if (existing) return existing.upstreamSessionId;
-  const credentialToken = await resolveMatchedCustodyToken(custodyConfig, inboundHeaders, clientSessionId);
-  const upstreamSessionId = await createUpstreamSession(
-    upstream.url,
-    inboundHeaders,
-    initializePayload,
-    state.upstreamTimeoutMs,
-    credentialToken,
-    upstream,
-    custodyConfig,
-    clientSessionId,
-  );
-  if (!upstreamSessionId) return null;
-  store.createInitialized({ clientSessionId, upstreamSessionId, initializePayload });
-  await persistSessions(state);
-  return upstreamSessionId;
+  return store.runLifecycleExclusive(async () => {
+    const current = store.get(clientSessionId);
+    if (current) return current.upstreamSessionId;
+    const credentialToken = await resolveMatchedCustodyToken(custodyConfig, inboundHeaders, clientSessionId);
+    const upstreamSessionId = await createUpstreamSession(
+      upstream.url,
+      inboundHeaders,
+      initializePayload,
+      state.upstreamTimeoutMs,
+      credentialToken,
+      upstream,
+      custodyConfig,
+      clientSessionId,
+    );
+    if (!upstreamSessionId) return null;
+    store.createInitialized({ clientSessionId, upstreamSessionId, initializePayload });
+    await persistSessions(state);
+    return upstreamSessionId;
+  });
 }
 
 async function forwardAggregateWithSessionRecovery(
@@ -358,23 +413,39 @@ async function forwardAggregateWithSessionRecovery(
   const text = result.body.toString("utf8");
   if (!isSessionNotFoundResponse(result.status, text)) return result;
 
-  const retryCredentialToken = await resolveMatchedCustodyToken(custodyConfig, inboundHeaders, clientSessionId);
-  const newUpstreamSessionId = await createUpstreamSession(
-    upstream.url,
-    inboundHeaders,
-    initializePayload,
-    state.upstreamTimeoutMs,
-    retryCredentialToken,
-    upstream,
-    custodyConfig,
-    clientSessionId,
-  );
-  if (!newUpstreamSessionId) return null;
-  store.rotateUpstream(clientSessionId, newUpstreamSessionId);
-  result = await forward(upstream.url, method, inboundHeaders, body, newUpstreamSessionId, state.upstreamTimeoutMs, retryCredentialToken, upstream);
-  invalidateMatchedCustodyTokenIfUnauthorized(result, custodyConfig, inboundHeaders, clientSessionId);
-  await persistSessions(state);
-  return result;
+  return store.runLifecycleExclusive(async () => {
+    const current = store.get(clientSessionId);
+    let retryUpstreamSessionId = current?.upstreamSessionId;
+    const retryCredentialToken = await resolveMatchedCustodyToken(custodyConfig, inboundHeaders, clientSessionId);
+    if (!retryUpstreamSessionId || retryUpstreamSessionId === upstreamSessionId) {
+      retryUpstreamSessionId = await createUpstreamSession(
+        upstream.url,
+        inboundHeaders,
+        initializePayload,
+        state.upstreamTimeoutMs,
+        retryCredentialToken,
+        upstream,
+        custodyConfig,
+        clientSessionId,
+      ) ?? undefined;
+      if (!retryUpstreamSessionId) return null;
+      if (current) store.rotateUpstream(clientSessionId, retryUpstreamSessionId);
+      else store.createInitialized({ clientSessionId, upstreamSessionId: retryUpstreamSessionId, initializePayload });
+      await persistSessions(state);
+    }
+    result = await forward(
+      upstream.url,
+      method,
+      inboundHeaders,
+      body,
+      retryUpstreamSessionId,
+      state.upstreamTimeoutMs,
+      retryCredentialToken,
+      upstream,
+    );
+    invalidateMatchedCustodyTokenIfUnauthorized(result, custodyConfig, inboundHeaders, clientSessionId);
+    return result;
+  });
 }
 
 async function forward(
@@ -397,6 +468,7 @@ async function forward(
   const init: RequestInit = {
     method,
     headers,
+    redirect: upstreamConfig?.execution === "tenant_node" ? "manual" : "follow",
     // Bound the call: abort a hung upstream instead of holding the connection
     // and buffered body until undici's ~300s default timeouts fire. A fired
     // timeout rejects with a TimeoutError, surfaced as 504 by safeOnError.
@@ -419,6 +491,17 @@ function buildForwardHeaders(
   upstreamConfig?: UpstreamConfig,
 ): Record<string, string> {
   const headers: Record<string, string> = {};
+  if (upstreamConfig?.execution === "tenant_node") {
+    copyHeader(headers, inboundHeaders, "accept");
+    copyHeader(headers, inboundHeaders, "content-type");
+    copyHeader(headers, inboundHeaders, "last-event-id");
+    copyHeader(headers, inboundHeaders, "mcp-protocol-version");
+    if (!upstreamConfig.relayAuthorization) {
+      throw new Error("tenant-node route is missing authenticated relay authorization");
+    }
+    headers.authorization = upstreamConfig.relayAuthorization;
+    return headers;
+  }
   if (credentialToken) {
     copyHeader(headers, inboundHeaders, "accept");
     copyHeader(headers, inboundHeaders, "content-type");
@@ -481,9 +564,12 @@ async function handleRequest(
   state: GatewayState,
 ): Promise<void> {
   const url = req.url ?? "/";
+  const pathName = url.split("?", 1)[0] ?? "/";
+
+  if (serveOAuthDiscovery(pathName, res, state.oauthDiscovery)) return;
 
   // Health endpoint.
-  if (url === "/" || url === "/healthz") {
+  if (pathName === "/" || pathName === "/healthz") {
     res.statusCode = 200;
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify({
@@ -498,24 +584,24 @@ async function handleRequest(
     return;
   }
 
-  if (url === "/mcp" || url.startsWith("/mcp/")) {
+  if (pathName === "/mcp" || pathName.startsWith("/mcp/")) {
     await handleAggregateRequest(req, res, state);
     return;
   }
 
-  const matched = matchUpstream(url, state.upstreams);
+  const matched = matchUpstream(pathName, state.upstreams);
   if (!matched) {
     res.statusCode = 404;
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify({
       error: "no upstream matched",
-      path: url,
+      path: pathName,
       knownPrefixes: Object.keys(state.upstreams),
     }));
     return;
   }
   const prefix = (() => {
-    const trimmed = url.startsWith("/") ? url.slice(1) : url;
+    const trimmed = pathName.startsWith("/") ? pathName.slice(1) : pathName;
     const slashIdx = trimmed.indexOf("/");
     return slashIdx === -1 ? trimmed : trimmed.slice(0, slashIdx);
   })();
@@ -554,7 +640,7 @@ async function handleRequest(
       bodyText,
       clientSessionId,
       state.upstreamTimeoutMs,
-      matchedCustodyConfig(state.credentialCustody, prefix),
+      matchedCustodyConfig(state.credentialCustody, prefix, matched.config),
       () => persistSessions(state),
     );
     if (status >= 500) state.breaker.recordFailure(prefix);
@@ -602,7 +688,7 @@ async function handleAggregateRequest(
           req.headers,
           clientSessionId,
           initializePayload,
-          matchedCustodyConfig(state.credentialCustody, prefix),
+          matchedCustodyConfig(state.credentialCustody, prefix, upstream),
         );
         if (upstreamSessionId) state.breaker.recordSuccess(prefix);
         else state.breaker.recordFailure(prefix);
@@ -645,7 +731,7 @@ async function handleAggregateRequest(
           body,
           clientSessionId,
           initializePayload,
-          matchedCustodyConfig(state.credentialCustody, prefix),
+          matchedCustodyConfig(state.credentialCustody, prefix, upstream),
         );
         if (!result) {
           state.breaker.recordFailure(prefix);
@@ -708,7 +794,7 @@ async function handleAggregateRequest(
       rewritten,
       clientSessionId,
       initializePayload,
-      matchedCustodyConfig(state.credentialCustody, prefix),
+      matchedCustodyConfig(state.credentialCustody, prefix, upstream),
     );
     if (!result) {
       state.breaker.recordFailure(prefix);
@@ -751,6 +837,7 @@ async function serveMatched(
   if (clientSessionId) {
     const record = store.get(clientSessionId);
     if (record) {
+      const attemptedUpstreamSessionId = record.upstreamSessionId;
       const credentialToken = custodyConfig
         ? await resolveCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, record.clientSessionId)
         : undefined;
@@ -759,7 +846,7 @@ async function serveMatched(
         req.method ?? "POST",
         req.headers,
         body,
-        record.upstreamSessionId,
+        attemptedUpstreamSessionId,
         timeoutMs,
         credentialToken,
         matched.config,
@@ -775,34 +862,40 @@ async function serveMatched(
           writeResponse(res, result, clientSessionId);
           return result.status;
         }
-        const replayInitResult = await forward(
-          matched.upstreamUrl,
-          "POST",
-          buildInitializeReplayHeaders(req.headers),
-          record.initializePayload,
-          null,
-          timeoutMs,
-          credentialToken,
-          matched.config,
-        );
-        const replayBody = replayInitResult.body.toString("utf8");
-        const newUpstreamId = extractUpstreamSessionId(replayInitResult.headers, replayBody);
-        if (isSuccess(replayInitResult.status) && newUpstreamId) {
-          await notifyUpstreamInitialized(matched.upstreamUrl, req.headers, newUpstreamId, timeoutMs, credentialToken, matched.config);
-          store.rotateUpstream(clientSessionId, newUpstreamId);
-          // Retry the original call with the new upstream id.
-          const retryResult = await forward(
+        const retryResult = await store.runLifecycleExclusive(async () => {
+          const current = store.get(clientSessionId);
+          let retryUpstreamId = current?.upstreamSessionId;
+          if (!retryUpstreamId || retryUpstreamId === attemptedUpstreamSessionId) {
+            retryUpstreamId = await createUpstreamSession(
+              matched.upstreamUrl,
+              req.headers,
+              record.initializePayload!,
+              timeoutMs,
+              credentialToken,
+              matched.config,
+            ) ?? undefined;
+            if (!retryUpstreamId) return null;
+            if (current) store.rotateUpstream(clientSessionId, retryUpstreamId);
+            else store.createInitialized({
+              clientSessionId,
+              upstreamSessionId: retryUpstreamId,
+              initializePayload: record.initializePayload!,
+            });
+            await persistSessionStore?.();
+          }
+          return forward(
             matched.upstreamUrl,
             req.method ?? "POST",
             req.headers,
             body,
-            newUpstreamId,
+            retryUpstreamId,
             timeoutMs,
             credentialToken,
             matched.config,
           );
+        });
+        if (retryResult) {
           writeResponse(res, retryResult, clientSessionId);
-          await persistSessionStore?.();
           return retryResult.status;
         }
         // Re-init failed; pass the original 404 through so the client can recover its own way.
@@ -823,22 +916,38 @@ async function serveMatched(
     : undefined;
 
   if (!isInitializeRequest && requestMethod !== "GET" && requestMethod !== "HEAD" && body.length > 0) {
-    const initializePayload = buildDefaultInitializePayload();
-    const upstreamSessionId = await createUpstreamSession(
-      matched.upstreamUrl,
-      req.headers,
-      initializePayload,
-      timeoutMs,
-      credentialToken,
-      matched.config,
-    );
-    if (upstreamSessionId) {
+    const bootstrapResult = await store.runLifecycleExclusive(async () => {
+      const current = store.get(nextClientSessionId);
+      if (current) {
+        const result = await forward(
+          matched.upstreamUrl,
+          requestMethod,
+          req.headers,
+          body,
+          current.upstreamSessionId,
+          timeoutMs,
+          credentialToken,
+          matched.config,
+        );
+        return { result, clientSessionId: current.clientSessionId };
+      }
+      const initializePayload = buildDefaultInitializePayload();
+      const upstreamSessionId = await createUpstreamSession(
+        matched.upstreamUrl,
+        req.headers,
+        initializePayload,
+        timeoutMs,
+        credentialToken,
+        matched.config,
+      );
+      if (!upstreamSessionId) return null;
       const record = store.createInitialized({
         clientSessionId: nextClientSessionId,
         upstreamSessionId,
         initializePayload,
       });
-      const retryResult = await forward(
+      await persistSessionStore?.();
+      const result = await forward(
         matched.upstreamUrl,
         requestMethod,
         req.headers,
@@ -848,12 +957,14 @@ async function serveMatched(
         credentialToken,
         matched.config,
       );
-      writeResponse(res, retryResult, record.clientSessionId);
-      await persistSessionStore?.();
-      if (retryResult.status === 401 && custodyConfig) {
-        invalidateCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, record.clientSessionId);
+      return { result, clientSessionId: record.clientSessionId };
+    });
+    if (bootstrapResult) {
+      writeResponse(res, bootstrapResult.result, bootstrapResult.clientSessionId);
+      if (bootstrapResult.result.status === 401 && custodyConfig) {
+        invalidateCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, bootstrapResult.clientSessionId);
       }
-      return retryResult.status;
+      return bootstrapResult.result.status;
     }
   }
 
@@ -895,9 +1006,36 @@ interface MatchedCustodyConfig {
 function matchedCustodyConfig(
   state: CredentialCustodyState | undefined,
   prefix: string,
+  upstream: UpstreamConfig,
 ): MatchedCustodyConfig | undefined {
+  if (upstream.execution === "tenant_node") return undefined;
   const config = configForPrefix(state, prefix);
   return state && config ? { state, config } : undefined;
+}
+
+function serveOAuthDiscovery(
+  pathName: string,
+  res: http.ServerResponse,
+  config: OAuthDiscoveryConfig | null | undefined,
+): boolean {
+  if (!config) return false;
+  if (pathName === "/.well-known/oauth-protected-resource" || pathName === "/.well-known/oauth-protected-resource/mcp") {
+    res.statusCode = 200;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({
+      resource: config.resource,
+      authorization_servers: [config.authorizationServer],
+      bearer_methods_supported: ["header"],
+    }));
+    return true;
+  }
+  if (pathName === "/.well-known/oauth-authorization-server" || pathName === "/.well-known/openid-configuration") {
+    res.statusCode = 307;
+    res.setHeader("location", `${config.authorizationServer}${pathName}`);
+    res.end();
+    return true;
+  }
+  return false;
 }
 
 async function resolveMatchedCustodyToken(
@@ -965,7 +1103,9 @@ async function main(): Promise<void> {
     breaker: new CircuitBreaker(config.breaker),
     upstreamTimeoutMs: config.upstreamTimeoutMs,
     credentialCustody: loadCredentialCustodyState(),
+    oauthDiscovery: config.oauthDiscovery,
     sessionPersistenceFile: config.sessionPersistenceFile,
+    routingPrincipalHash: upstreamsPrincipalHash(),
   };
   await loadPersistedSessions(state);
   state.sessionPersistenceLoaded = true;

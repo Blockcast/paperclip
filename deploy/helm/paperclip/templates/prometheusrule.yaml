@@ -31,6 +31,47 @@ spec:
           annotations:
             summary: "Paperclip agent Kubernetes Jobs are hitting BackoffLimitExceeded"
             description: "One or more ac-* Paperclip agent Jobs in namespace {{`{{ $labels.namespace }}`}} are failing with BackoffLimitExceeded, or this cluster's kube-state-metrics omits Job failure reason labels and an ac-* Job failed. Check the matching Job/Pod logs and the zero-token streak alert for poisoned-session loops."
+        - alert: PaperclipAgentPodUnschedulable
+          # BLO-16224: keys on kube_pod_status_scheduled{condition="false"} (PodScheduled=False
+          # -- the scheduler has not placed the pod) rather than kube_pod_status_unschedulable,
+          # which many kube-state-metrics builds/allowlists do NOT expose (confirmed absent on
+          # the Blockcast cluster's KSM, 2026-07-15). scheduled{condition="false"} is a core,
+          # always-emitted KSM series; with the `for` window it captures sustained node-pool
+          # starvation while ignoring pods still mid-scheduling. Post-scheduling waits
+          # (image pull, PVC bind) keep PodScheduled=True, so they do not false-fire this.
+          expr: count(kube_pod_status_scheduled{condition="false",pod=~{{ .Values.prometheusRule.agentJobNameRegex | quote }}} == 1) > {{ .Values.prometheusRule.unschedulablePodThreshold }}
+          for: {{ .Values.prometheusRule.unschedulableFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip agent pods stuck Unschedulable (node-pool scheduling starvation)"
+            description: "More than {{ .Values.prometheusRule.unschedulablePodThreshold }} ac-* agent pod(s) have had PodScheduled=false (unschedulable) for {{ .Values.prometheusRule.unschedulableFor }} (BLO-16224). Agent-Job pods request 1 CPU each and affinity-pin to the shared arc-runner-host pool, which bin-packs on requests, so sustained unschedulable means the pool is requests-saturated (not usage-saturated). Remediate by adding pool capacity or right-sizing the agent-Job CPU request (observed usage runs well under the 1-core request). Transient blips self-resolve; this fires only on sustained starvation. Requires kube-state-metrics (kube_pod_status_scheduled)."
+    - name: paperclip-process-lost
+      rules:
+        - alert: PaperclipProcessLostElevated
+          expr: sum(increase(paperclip_process_lost_total[1d])) > {{ .Values.prometheusRule.processLostWarnPerDay }}
+          for: {{ .Values.prometheusRule.processLostElevatedFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip process_lost reaps elevated (>{{ .Values.prometheusRule.processLostWarnPerDay }}/day)"
+            description: "More than {{ .Values.prometheusRule.processLostWarnPerDay }} heartbeat runs were reaped as process_lost over the last 24h (BLO-12292 fleet instability). Break the numerator down by (adapter, error_bucket, classification) on paperclip_process_lost_total. Before trusting a low/zero reading, cross-check the two denominators: paperclip_external_lifecycle_running_runs (run volume) and the PaperclipProcessLostSignalBlind alert (kube-null blindness)."
+        - alert: PaperclipProcessLostSustained
+          expr: sum(increase(paperclip_process_lost_total[1d])) > {{ .Values.prometheusRule.processLostPagePerDay }}
+          for: {{ .Values.prometheusRule.processLostPageFor }}
+          labels:
+            severity: critical
+          annotations:
+            summary: "Paperclip process_lost reaps sustained-high (>{{ .Values.prometheusRule.processLostPagePerDay }}/day for {{ .Values.prometheusRule.processLostPageFor }})"
+            description: "process_lost reaps exceeded {{ .Values.prometheusRule.processLostPagePerDay }}/day sustained for {{ .Values.prometheusRule.processLostPageFor }} (BLO-12292). If PaperclipProcessLostSignalBlind is also firing, the spike may be kube-API-outage-driven staleness reaping rather than genuine loss — check kube API / paperclip-0 health and recent deploys/restarts."
+        - alert: PaperclipProcessLostSignalBlind
+          expr: sum(increase(paperclip_process_lost_liveness_null_total[15m])) > {{ .Values.prometheusRule.processLostLivenessNullWindowCount }}
+          for: {{ .Values.prometheusRule.processLostSignalBlindFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip reaper is blind to kube Job liveness"
+            description: "The reaper hit more than {{ .Values.prometheusRule.processLostLivenessNullWindowCount }} null kube Job-status lists in 15m, so it is falling back to the staleness heuristic while blind (BLO-16184 denominator guard). Any concurrent LOW process_lost count is UNRELIABLE — a 0 means 'could not see', not 'healthy'; a spike may be kube-outage-driven. Check the K8s API and the paperclip ServiceAccount RBAC."
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

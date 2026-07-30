@@ -4,10 +4,17 @@ import { readConfigFromEnv, type PaperclipExternalConfig } from "./config.js";
 import { createToolDefinitions } from "./tools.js";
 import { registerHeartbeatRunResources } from "./heartbeat-resources.js";
 
-export function createMcpServer(config: PaperclipExternalConfig = readConfigFromEnv()) {
+export function createMcpServer(
+  config: PaperclipExternalConfig = readConfigFromEnv(),
+  options: { stateless?: boolean } = {},
+) {
   const server = new McpServer({ name: "paperclip", version: "0.1.0" });
   const client = new PaperclipApiClient(config);
-  registerHeartbeatRunResources(server, client);
+  // Resource push-subscriptions require a standing per-session SSE stream to
+  // deliver `notifications/resources/updated`. A stateless server has no
+  // session (and no standing stream), so advertise + wire subscriptions only
+  // when stateful. resources/read and resources/list work either way.
+  registerHeartbeatRunResources(server, client, { enableSubscriptions: !options.stateless });
   const tools = createToolDefinitions(client);
   for (const tool of tools) {
     // ToolDefinition uses loose arg types to stay transport-agnostic; the SDK's

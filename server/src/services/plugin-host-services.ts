@@ -2,6 +2,7 @@ import type { Db } from "@paperclipai/db";
 import {
   activityLog,
   agentTaskSessions as agentTaskSessionsTable,
+  agentWakeupRequests,
   agents as agentsTable,
   approvals as approvalsTable,
   authUsers,
@@ -41,7 +42,7 @@ import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
 import { createMilestonesService } from "./milestones.js";
 import { documentService } from "./documents.js";
-import { heartbeatService } from "./heartbeat.js";
+import { heartbeatService, type HeartbeatServiceOptions } from "./heartbeat.js";
 import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
@@ -547,7 +548,11 @@ export function buildHostServices(
   eventBus: PluginEventBus,
   notifyWorker?: (method: string, params: unknown) => void,
   lifecycleManager?: PluginLifecycleManager,
-  options: { pluginWorkerManager?: PluginWorkerManager; manifest?: import("@paperclipai/shared").PaperclipPluginManifestV1 } = {},
+  options: {
+    pluginWorkerManager?: PluginWorkerManager;
+    manifest?: import("@paperclipai/shared").PaperclipPluginManifestV1;
+    heartbeatOptions?: HeartbeatServiceOptions;
+  } = {},
 ): HostServices & { dispose(): void } {
   const registry = pluginRegistryService(db);
   const stateStore = pluginStateStore(db);
@@ -586,7 +591,8 @@ export function buildHostServices(
     manifest: options.manifest,
   });
   const heartbeat = heartbeatService(db, {
-    pluginWorkerManager: options.pluginWorkerManager,
+    ...options.heartbeatOptions,
+    pluginWorkerManager: options.pluginWorkerManager ?? options.heartbeatOptions?.pluginWorkerManager,
   });
   const projects = projectService(db);
   const executionWorkspaces = executionWorkspaceService(db);
@@ -607,6 +613,12 @@ export function buildHostServices(
   const ensureCompanyId = (companyId?: string) => {
     if (!companyId) throw new Error("companyId is required for this operation");
     return companyId;
+  };
+
+  /** Normalizes an optional string param to a trimmed value or null. */
+  const readNonEmptyParam = (value?: string | null) => {
+    const trimmed = typeof value === "string" ? value.trim() : "";
+    return trimmed.length > 0 ? trimmed : null;
   };
 
   const parseWindowValue = (value: unknown): number | null => {
@@ -950,19 +962,16 @@ export function buildHostServices(
   };
 
   const INVITE_TOKEN_PREFIX = "pcp_invite_";
-  const INVITE_TOKEN_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
-  const INVITE_TOKEN_SUFFIX_LENGTH = 8;
+  // 256 bits of entropy, base64url-encoded. Keep in sync with createInviteToken
+  // in routes/access.ts. The token is public, so it must not be brute-forceable.
+  const INVITE_TOKEN_ENTROPY_BYTES = 32;
   const INVITE_TOKEN_MAX_RETRIES = 5;
   const COMPANY_INVITE_TTL_MS = 72 * 60 * 60 * 1000;
 
   const hashToken = (token: string) => createHash("sha256").update(token).digest("hex");
 
   const createInviteToken = () => {
-    const bytes = randomBytes(INVITE_TOKEN_SUFFIX_LENGTH);
-    let suffix = "";
-    for (let idx = 0; idx < INVITE_TOKEN_SUFFIX_LENGTH; idx += 1) {
-      suffix += INVITE_TOKEN_ALPHABET[bytes[idx]! % INVITE_TOKEN_ALPHABET.length];
-    }
+    const suffix = randomBytes(INVITE_TOKEN_ENTROPY_BYTES).toString("base64url");
     return `${INVITE_TOKEN_PREFIX}${suffix}`;
   };
 
@@ -1147,8 +1156,10 @@ export function buildHostServices(
 
   return {
     config: {
-      async get() {
-        const configRow = await registry.getConfig(pluginId);
+      async get(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const configRow = await registry.getConfig(pluginId, companyId);
         return configRow?.configJson ?? {};
       },
     },
@@ -1379,7 +1390,9 @@ export function buildHostServices(
 
     secrets: {
       async resolve(params) {
-        return secretsHandler.resolve(params);
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        return secretsHandler.resolve({ ...params, companyId });
       },
       async list(params) {
         const svc = secretService(db);
@@ -1473,7 +1486,7 @@ export function buildHostServices(
         }
         const telemetryClient = getTelemetryClient();
         if (!telemetryClient) return;
-        telemetryClient.track(`plugin.${pluginKey}.${eventName}`, params.dimensions);
+        telemetryClient.trackDynamic(`plugin.${pluginKey}.${eventName}`, params.dimensions);
       },
     },
 
@@ -1810,6 +1823,8 @@ export function buildHostServices(
           originRunId: params.originRunId ?? actorRunId ?? null,
           createdByAgentId: actorAgentId ?? null,
           createdByUserId: actorUserId ?? null,
+          actorResponsibleUserId: actorUserId ?? null,
+          trustExplicitResponsibleUserId: true,
         })) as Issue;
         await logPluginActivity({
           companyId,
@@ -2481,11 +2496,53 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
+
+        const taskKey = readNonEmptyParam(params.taskKey);
+        // Namespaced so one plugin's delivery ids can never resolve to another's run.
+        const idempotencyKey = readNonEmptyParam(params.idempotencyKey)
+          ? `plugin:${pluginId}:${readNonEmptyParam(params.idempotencyKey)}`
+          : null;
+
+        // Delivery-level replay guard: a redelivered webhook (same GitHub
+        // delivery id) must resolve to the original run, not a second one.
+        if (idempotencyKey) {
+          const [existing] = await db
+            .select({ runId: agentWakeupRequests.runId })
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.agentId, params.agentId),
+                eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+              ),
+            )
+            .limit(1);
+          if (existing?.runId) return { runId: existing.runId, deduplicated: true };
+        }
+
+        // Wakes that carry no task key all derive `taskKey === null`, and
+        // `isSameTaskScope(null, null)` is true — so before this, every plugin
+        // invoke that landed while the agent already had a run in flight was
+        // coalesced into that run and silently dropped (BLO-18847: nine `@ally`
+        // review requests, no runs). Distinct work must get a distinct scope,
+        // so keyless invokes are made unique rather than defaulting to "same".
+        //
+        // Plugin-supplied keys are namespaced by plugin. Coalescing merges the
+        // incoming snapshot over the target run's, so an un-namespaced key could
+        // be pointed at a live issue-execution run (whose task key is the issue
+        // id) and overwrite its context. Namespacing keeps a plugin's invokes
+        // able to coalesce only with its own.
+        const scopeKey = taskKey
+          ? `plugin:${pluginId}:${taskKey}`
+          : `plugin:${pluginId}:${randomUUID()}`;
+
         const run = await heartbeat.wakeup(params.agentId, {
           source: "automation",
           triggerDetail: "system",
           reason: params.reason ?? null,
-          payload: { prompt: params.prompt },
+          // `enrichWakeContextSnapshot` promotes `payload.taskKey` onto the run's
+          // contextSnapshot, which is what later scope comparisons read back.
+          payload: { prompt: params.prompt, taskKey: scopeKey },
+          idempotencyKey,
           requestedByActorType: "system",
           requestedByActorId: pluginId,
         });
@@ -3078,7 +3135,7 @@ export function buildHostServices(
         // Track the subscription so it can be cleaned up on dispose() if the run
         // never reaches a terminal status (hang, crash, network partition).
         if (notifyWorker) {
-          const TERMINAL_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+          const TERMINAL_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
 
           const cleanup = () => {
             unsubscribe();

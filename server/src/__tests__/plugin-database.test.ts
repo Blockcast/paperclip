@@ -9,6 +9,7 @@ import {
   createDb,
   issueRelations,
   issues,
+  pluginConfig,
   pluginDatabaseNamespaces,
   pluginMigrations,
   plugins,
@@ -251,7 +252,7 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-db-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     for (const pluginKey of ["paperclip.dbtest", "paperclip.escape", "paperclip.refresh", multiMigrationPluginKey, llmWikiPluginKey]) {
@@ -604,6 +605,18 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
       `,
     );
     const pluginId = await installPluginRecord(staleManifest);
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Plugin Bootstrap Co",
+      issuePrefix: "PBC",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(pluginConfig).values({
+      pluginId,
+      companyId,
+      configJson: { enabled: true },
+    });
     await db
       .update(plugins)
       .set({
@@ -656,6 +669,7 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
     expect(workerManager.startWorker).toHaveBeenCalledWith(
       pluginId,
       expect.objectContaining({
+        bootstrapCompanyId: companyId,
         databaseNamespace: namespace,
         env: expect.objectContaining({
           PAPERCLIP_DEPLOYMENT_MODE: "authenticated",

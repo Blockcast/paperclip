@@ -1,0 +1,97 @@
+# syntax=harbor.blockcast.net/dockerfile/dockerfile:1.20
+# Stable Paperclip runtime. CI publishes this image under a content-derived
+# tag and rebuilds it only when this file, a copied script, or the resolved
+# upstream base image changes.
+# Per-commit server images add vendored adapters and /app on top.
+
+# Mirrored from docker.io/library/node:lts-trixie-slim to avoid Docker Hub
+# anonymous rate limits on self-hosted BuildKit runners. CI resolves this tag
+# to a digest before deriving the runtime tag so Node/Debian security updates
+# produce a new immutable runtime automatically.
+ARG RUNTIME_BASE_IMAGE=harbor.blockcast.net/paperclip/node:lts-trixie-slim
+FROM ${RUNTIME_BASE_IMAGE}
+
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+# Disable Debian's auto-clean of apt cache so BuildKit cache mounts retain
+# downloaded packages while this image is rebuilt deliberately.
+RUN rm -f /etc/apt/apt.conf.d/docker-clean \
+  && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+  apt-get update \
+  && apt-get install -y --no-install-recommends \
+       ca-certificates gosu curl gh git wget ripgrep python3 \
+       openssh-client rsync jq zsh \
+       libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
+       libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 \
+       libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 \
+       libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 \
+       libxfixes3 libxkbcommon0 libxrandr2 \
+       fonts-liberation fonts-noto-color-emoji \
+  && corepack enable
+
+# Wrap gh so agent Jobs read the kubelet-refreshed GitHub App token on every
+# invocation instead of using stale hosts.yml state (BLO-13241).
+COPY scripts/gh-token-wrapper.sh /usr/bin/gh-token-wrapper.sh
+RUN mv /usr/bin/gh /usr/bin/gh.real \
+  && ln -s /usr/bin/gh-token-wrapper.sh /usr/bin/gh \
+  && chmod 0755 /usr/bin/gh-token-wrapper.sh
+
+# Match the host/PVC ownership expected by the production Helm deployment.
+RUN usermod -u "$USER_UID" --non-unique node \
+  && groupmod -g "$USER_GID" --non-unique node \
+  && usermod -g "$USER_GID" -d /paperclip node
+
+# Keep unrelated runtime rebuilds reproducible. Bump these versions
+# deliberately after adapter smoke/regression testing.
+#
+# OpenCode 1.4.3 failed OpenAI Responses streams that include reasoning output items
+# before the assistant message, surfacing as UnknownError/exit 1
+# in opencode_k8s review runs while the upstream provider returned 200.
+ARG CLAUDE_CODE_VERSION=2.1.210
+ARG CODEX_CLI_VERSION=0.144.4
+ARG OPENCODE_AI_VERSION=1.15.12
+ARG GEMINI_CLI_VERSION=0.50.0
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+  npm install --global --omit=dev --cache /root/.npm \
+    "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    "@openai/codex@${CODEX_CLI_VERSION}" \
+    "opencode-ai@${OPENCODE_AI_VERSION}" \
+    "@google/gemini-cli@${GEMINI_CLI_VERSION}" \
+  && claude --version | grep -Fq "${CLAUDE_CODE_VERSION}" \
+  && codex --version | grep -Fq "${CODEX_CLI_VERSION}" \
+  && test "$(opencode --version)" = "${OPENCODE_AI_VERSION}" \
+  && test "$(gemini --version)" = "${GEMINI_CLI_VERSION}"
+
+RUN mkdir -p /paperclip /paperclip/.local/bin /opt/paperclip-bundled-adapters \
+  && ln -sf /usr/local/bin/claude /paperclip/.local/bin/claude \
+  && chown -R node:node /paperclip /opt/paperclip-bundled-adapters
+
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY scripts/paperclip-consult-codex.sh /usr/local/bin/paperclip-consult-codex
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh /usr/local/bin/paperclip-consult-codex
+
+WORKDIR /app
+ENV NODE_ENV=production \
+  HOME=/paperclip \
+  HOST=0.0.0.0 \
+  PORT=3100 \
+  SERVE_UI=true \
+  PAPERCLIP_HOME=/paperclip \
+  PAPERCLIP_INSTANCE_ID=default \
+  USER_UID=${USER_UID} \
+  USER_GID=${USER_GID} \
+  PAPERCLIP_CONFIG=/paperclip/instances/default/config.json \
+  PAPERCLIP_DEPLOYMENT_MODE=authenticated \
+  PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
+  OPENCODE_ALLOW_ALL_MODELS=true \
+  GEMINI_SANDBOX=false
+
+VOLUME ["/paperclip"]
+EXPOSE 3100
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]

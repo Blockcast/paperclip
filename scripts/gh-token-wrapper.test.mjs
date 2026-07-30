@@ -25,7 +25,7 @@ function withTempDir(fn) {
   }
 }
 
-function runWrapper(dir, { tokenFileContent, args = ["api", "user"] } = {}) {
+function runWrapper(dir, { tokenFileContent, tokenValue, args = ["api", "user"] } = {}) {
   const stubGhPath = path.join(dir, "gh.real");
   writeFileSync(stubGhPath, STUB_GH_SOURCE);
   chmodSync(stubGhPath, 0o755);
@@ -33,6 +33,11 @@ function runWrapper(dir, { tokenFileContent, args = ["api", "user"] } = {}) {
   const env = { ...process.env, GH_TOKEN_WRAPPER_REAL_GH: stubGhPath };
   delete env.GH_TOKEN;
   delete env.GITHUB_TOKEN;
+  delete env.PAPERCLIP_GITHUB_TOKEN_VALUE;
+
+  if (tokenValue !== undefined) {
+    env.PAPERCLIP_GITHUB_TOKEN_VALUE = tokenValue;
+  }
 
   if (tokenFileContent !== undefined) {
     const tokenFilePath = path.join(dir, "token");
@@ -158,5 +163,137 @@ test("logs a diagnostic to stderr and falls back when the token file exists but 
     );
     assert.equal(result.GH_TOKEN, "");
     assert.equal(result.GITHUB_TOKEN, "");
+  });
+});
+
+// PAPERCLIP_GITHUB_TOKEN_VALUE — credentials delivered by the scoped
+// secret-binding path rather than a mounted secret volume (BLO-18927).
+
+test("exports a token supplied by value when no token file exists", () => {
+  withTempDir((dir) => {
+    const result = runWrapper(dir, { tokenValue: "ghu_fromenvbinding" });
+    assert.equal(result.GH_TOKEN, "ghu_fromenvbinding");
+    assert.equal(result.GITHUB_TOKEN, "ghu_fromenvbinding");
+    assert.equal(result.ARGS, "api user");
+  });
+});
+
+test("a token supplied by value wins over the token file", () => {
+  // Both are explicit per-invocation identity selections; the more specific one
+  // wins so a caller can pick the user seat for a single `gh` call while the
+  // default App-token file stays mounted for everything else.
+  withTempDir((dir) => {
+    const result = runWrapper(dir, {
+      tokenFileContent: "ghs_apptoken\n",
+      tokenValue: "ghu_userseat",
+    });
+    assert.equal(result.GH_TOKEN, "ghu_userseat");
+    assert.equal(result.GITHUB_TOKEN, "ghu_userseat");
+  });
+});
+
+test("strips trailing newline/CR from a token supplied by value", () => {
+  withTempDir((dir) => {
+    const result = runWrapper(dir, { tokenValue: "ghu_windows_style\r\n" });
+    assert.equal(result.GH_TOKEN, "ghu_windows_style");
+  });
+});
+
+// Every rejection below is asserted with BOTH a readable token file and
+// ambient GH_TOKEN/GITHUB_TOKEN present, because those are the two things a
+// fall-through would silently authenticate as. Asserting only the exit code
+// against a bare env would pass even if the wrapper had fallen through.
+function runMalformedValue(dir, tokenValue) {
+  const stubGhPath = path.join(dir, "gh.real");
+  writeFileSync(stubGhPath, STUB_GH_SOURCE);
+  chmodSync(stubGhPath, 0o755);
+  const tokenFilePath = path.join(dir, "token");
+  writeFileSync(tokenFilePath, "ghs_apptoken\n");
+
+  return spawnSync("sh", [WRAPPER, "api", "user"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GH_TOKEN_WRAPPER_REAL_GH: stubGhPath,
+      PAPERCLIP_GITHUB_TOKEN_FILE: tokenFilePath,
+      PAPERCLIP_GITHUB_TOKEN_VALUE: tokenValue,
+      GH_TOKEN: "user_supplied_override",
+      GITHUB_TOKEN: "user_supplied_override",
+    },
+  });
+}
+
+for (const [label, tokenValue] of [
+  ["empty", ""],
+  ["CRLF only", "\r\n"],
+  ["spaces only", "   "],
+  ["tabs only", "\t\t"],
+  ["mixed whitespace only", " \t\r\n "],
+]) {
+  test(`a whitespace-only token value (${label}) fails before ambient auth can be used`, () => {
+    // A binding that resolved to nothing is a misconfiguration, not a request
+    // to fall back to the App token file or to inherited caller credentials.
+    withTempDir((dir) => {
+      const proc = runMalformedValue(dir, tokenValue);
+      assert.equal(proc.status, 64);
+      assert.match(proc.stderr, /PAPERCLIP_GITHUB_TOKEN_VALUE is set but holds only whitespace/);
+      assert.equal(proc.stdout, "");
+    });
+  });
+}
+
+for (const [label, tokenValue] of [
+  ["embedded LF", "ghu_aaa\nbbb"],
+  ["embedded CRLF", "ghu_aaa\r\nbbb"],
+  ["embedded space", "ghu_aaa bbb"],
+  ["embedded tab", "ghu_aaa\tbbb"],
+]) {
+  test(`a token value with interior whitespace (${label}) is rejected, not spliced`, () => {
+    // The pre-hardening `tr -d` would have joined these into "ghu_aaabbb" and
+    // authenticated as a token nobody issued. Refusing is the point.
+    withTempDir((dir) => {
+      const proc = runMalformedValue(dir, tokenValue);
+      assert.equal(proc.status, 64);
+      assert.match(proc.stderr, /contains embedded whitespace/);
+      assert.equal(proc.stdout, "");
+      // The malformed value must not be echoed into logs.
+      assert.doesNotMatch(proc.stderr, /ghu_aaa/);
+    });
+  });
+}
+
+test("trims surrounding whitespace, not just line terminators, from a token value", () => {
+  withTempDir((dir) => {
+    const result = runWrapper(dir, { tokenValue: " \tghu_padded \r\n" });
+    assert.equal(result.GH_TOKEN, "ghu_padded");
+    assert.equal(result.GITHUB_TOKEN, "ghu_padded");
+  });
+});
+
+test("a token supplied by value overrides a pre-existing GH_TOKEN in the caller's env", () => {
+  withTempDir((dir) => {
+    const stubGhPath = path.join(dir, "gh.real");
+    writeFileSync(stubGhPath, STUB_GH_SOURCE);
+    chmodSync(stubGhPath, 0o755);
+
+    const env = {
+      ...process.env,
+      GH_TOKEN_WRAPPER_REAL_GH: stubGhPath,
+      PAPERCLIP_GITHUB_TOKEN_VALUE: "ghu_userseat",
+      GH_TOKEN: "user_supplied_override",
+      GITHUB_TOKEN: "user_supplied_override",
+    };
+    const out = execFileSync("sh", [WRAPPER, "api", "user"], { env, encoding: "utf8" });
+    const result = Object.fromEntries(
+      out
+        .trim()
+        .split("\n")
+        .map((line) => {
+          const idx = line.indexOf("=");
+          return [line.slice(0, idx), line.slice(idx + 1)];
+        }),
+    );
+    assert.equal(result.GH_TOKEN, "ghu_userseat");
+    assert.equal(result.GITHUB_TOKEN, "ghu_userseat");
   });
 });

@@ -8,9 +8,15 @@ on:
         type: boolean
         default: true
 
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+  CC: "sccache gcc"
+  CXX: "sccache g++"
+
 jobs:
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: default
     timeout-minutes: 30
     env:
       PAPERCLIP_E2E_SKIP_LLM: ${{ inputs.skip_llm && 'true' || 'false' }}
@@ -20,20 +26,40 @@ jobs:
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 9.15.4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
+
+      - name: Set up GHA-backed sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
-      - run: google-chrome --version
+
+      - name: Resolve Playwright version
+        id: playwright_version
+        run: |
+          version="$(node -p "require('@playwright/test/package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browser
+        id: playwright_cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright_version.outputs.version }}
+
+      - name: Install Playwright system dependencies
+        run: pnpm exec playwright install-deps chromium
+
+      - name: Install Playwright browser
+        if: steps.playwright_cache.outputs.cache-hit != 'true'
+        run: pnpm exec playwright install chromium
 
       - name: Run e2e tests
-        env:
-          PAPERCLIP_PLAYWRIGHT_CHANNEL: "chrome"
         run: pnpm run test:e2e
 
       - uses: actions/upload-artifact@v4

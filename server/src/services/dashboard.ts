@@ -22,6 +22,7 @@ const DASHBOARD_SCORECARD_MAX_WINDOW_DAYS = 365;
 // Agent statuses excluded from the staffing scorecard roster (no longer
 // staffable / not yet hired).
 const SCORECARD_EXCLUDED_AGENT_STATUSES = ["terminated", "pending_approval"];
+import { visibleIssueCondition } from "./issue-visibility.js";
 
 const DASHBOARD_RUN_ACTIVITY_DAYS = 14;
 const DASHBOARD_ISSUE_ACTIVITY_DAYS = 14;
@@ -57,11 +58,10 @@ function emptyStatusBuckets(): Record<IssueStatus, number> {
 export function dashboardService(db: Db) {
   const budgets = budgetService(db);
 
-  // Cheap aggregates the sidebar-badges polling path needs (agent status,
-  // task counts, costs, pending approvals, run activity). Split out so
-  // sidebar-badges (polled ~every 15 s on every page) doesn't pay for the
-  // GROUP BY-on-issues queries that summary() adds.
-  async function core(companyId: string) {
+  // Common dashboard aggregates. Sidebar polling disables run activity below:
+  // it only needs agent/cost alerts and must not run the recursive retry-chain
+  // chart query every ~15 seconds on every page.
+  async function core(companyId: string, options?: { includeRunActivity?: boolean }) {
     const company = await db
       .select()
       .from(companies)
@@ -79,7 +79,7 @@ export function dashboardService(db: Db) {
     const taskRows = await db
       .select({ status: issues.status, count: sql<number>`count(*)` })
       .from(issues)
-      .where(eq(issues.companyId, companyId))
+      .where(and(eq(issues.companyId, companyId), visibleIssueCondition()))
       .groupBy(issues.status);
 
     const pendingApprovals = await db
@@ -132,38 +132,84 @@ export function dashboardService(db: Db) {
       );
 
     const monthSpendCents = Number(monthSpend);
-    const runActivityDayExpr = sql<string>`to_char(${heartbeatRuns.createdAt} at time zone 'UTC', 'YYYY-MM-DD')`;
-    const runActivityRows = await db
-      .select({
-        date: runActivityDayExpr,
-        status: heartbeatRuns.status,
-        count: sql<number>`count(*)::double precision`,
-      })
-      .from(heartbeatRuns)
-      .where(
-        and(
-          eq(heartbeatRuns.companyId, companyId),
-          gte(heartbeatRuns.createdAt, runActivityStart),
-        ),
-      )
-      .groupBy(runActivityDayExpr, heartbeatRuns.status);
+    // A failed ancestor whose retry chain later succeeds is reported as
+    // recovered instead of inflating the headline failure count. Retry links
+    // are FK-backed, so the CTE can emit retryOfRunId directly without joining
+    // the parent row. Its seed and traversal stay inside the chart window: a
+    // retry that recovers a recent run cannot have been created before it.
+    const runActivityRows = options?.includeRunActivity === false
+      ? []
+      : (await db.execute(sql`
+        WITH RECURSIVE recovered_runs(id) AS (
+          SELECT child.retry_of_run_id
+          FROM ${heartbeatRuns} AS child
+          WHERE child.company_id = ${companyId}
+            AND child.status = 'succeeded'
+            AND child.created_at >= ${runActivityStart.toISOString()}::timestamptz
+            AND child.retry_of_run_id IS NOT NULL
+          UNION
+          SELECT child.retry_of_run_id
+          FROM recovered_runs rr
+          JOIN ${heartbeatRuns} AS child ON child.id = rr.id
+          WHERE child.retry_of_run_id IS NOT NULL
+            AND child.created_at >= ${runActivityStart.toISOString()}::timestamptz
+        )
+        SELECT
+          to_char(run.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS date,
+          run.status AS status,
+          run.error_code AS error_code,
+          (run.id IN (SELECT id FROM recovered_runs)) AS recovered,
+          count(*)::double precision AS count
+        FROM ${heartbeatRuns} AS run
+        WHERE run.company_id = ${companyId}
+          AND run.created_at >= ${runActivityStart.toISOString()}::timestamptz
+        GROUP BY date, run.status, run.error_code, recovered
+      `)) as unknown as Iterable<{
+      date: string;
+      status: string;
+      error_code: string | null;
+      recovered: boolean | string;
+      count: number | string;
+      }>;
 
     const runActivity = new Map(
       runActivityDays.map((date) => [
         date,
-        { date, succeeded: 0, failed: 0, other: 0, total: 0 },
+        {
+          date,
+          succeeded: 0,
+          failed: 0,
+          recovered: 0,
+          other: 0,
+          total: 0,
+          failedByErrorCode: {} as Record<string, number>,
+        },
       ]),
     );
     for (const row of runActivityRows) {
-      const bucket = runActivity.get(row.date);
+      const bucket = runActivity.get(String(row.date));
       if (!bucket) {
         logger.warn({ companyId, unmappedDate: row.date }, "dashboard runActivity received row outside the precomputed day window");
         continue;
       }
       const count = Number(row.count);
-      if (row.status === "succeeded") bucket.succeeded += count;
-      else if (row.status === "failed" || row.status === "timed_out") bucket.failed += count;
-      else bucket.other += count;
+      const status = String(row.status);
+      const recovered = row.recovered === true || row.recovered === "t" || row.recovered === "true";
+      if (status === "succeeded") {
+        bucket.succeeded += count;
+      } else if (status === "failed" || status === "timed_out") {
+        if (recovered) {
+          bucket.recovered += count;
+        } else {
+          bucket.failed += count;
+          const code = typeof row.error_code === "string" && row.error_code.length > 0
+            ? row.error_code
+            : "unknown";
+          bucket.failedByErrorCode[code] = (bucket.failedByErrorCode[code] ?? 0) + count;
+        }
+      } else {
+        bucket.other += count;
+      }
       bucket.total += count;
     }
 

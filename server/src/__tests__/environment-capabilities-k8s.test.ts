@@ -30,6 +30,7 @@ const mockEnvironmentService = vi.hoisted(() => ({
   listLeases: vi.fn(),
   getLeaseById: vi.fn(),
 }));
+const mockEnvironmentCustomImageService = vi.hoisted(() => ({}));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockProbeEnvironment = vi.hoisted(() => vi.fn());
@@ -50,6 +51,7 @@ vi.mock("../services/index.js", () => ({
   agentService: () => mockAgentService,
   issueService: () => mockIssueService,
   environmentService: () => mockEnvironmentService,
+  environmentCustomImageService: () => mockEnvironmentCustomImageService,
   instanceSettingsService: () => mockInstanceSettingsService,
   logActivity: mockLogActivity,
   projectService: () => mockProjectService,

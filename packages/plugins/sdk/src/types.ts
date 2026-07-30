@@ -49,6 +49,7 @@ import type {
   PermissionKey,
   PrincipalPermissionGrant,
   PrincipalType,
+  EnvSecretRefBinding,
 } from "@paperclipai/shared";
 import type { PluginPerformActionContext } from "./protocol.js";
 
@@ -62,6 +63,7 @@ export type {
   PluginWebhookDeclaration,
   PluginToolDeclaration,
   PluginEnvironmentDriverDeclaration,
+  PluginEnvironmentTemplateConfigBinding,
   PluginManagedAgentDeclaration,
   PluginManagedAgentResolution,
   PluginManagedProjectDeclaration,
@@ -142,6 +144,7 @@ export type {
   PermissionKey,
   PrincipalPermissionGrant,
   PrincipalType,
+  EnvSecretRefBinding,
 } from "@paperclipai/shared";
 
 // ---------------------------------------------------------------------------
@@ -463,11 +466,11 @@ export interface PluginExecutionWorkspaceMetadata {
  */
 export interface PluginConfigClient {
   /**
-   * Returns the resolved operator configuration for this plugin instance.
-   * Values are validated against the plugin's `instanceConfigSchema` by the
-   * host before being passed to the worker.
+   * Returns the resolved operator configuration for this plugin in a company.
+   * When called during a host-scoped invocation, the host may derive the
+   * companyId; otherwise callers must pass it explicitly.
    */
-  get(): Promise<Record<string, unknown>>;
+  get(companyId?: string): Promise<Record<string, unknown>>;
 }
 
 export interface PluginLocalFolderProblem {
@@ -679,9 +682,9 @@ export interface PluginHttpClient {
  *
  * Requires `secrets.read-ref` capability.
  *
- * Plugins store secret *references* in their config (e.g. a secret name).
- * This client resolves the reference through the Paperclip secret provider
- * system and returns the resolved value at execution time.
+ * Plugins store shared `{ type: "secret_ref", secretId, version? }` bindings in
+ * company-scoped config. This client resolves a bound ref through the
+ * Paperclip secret provider system at execution time.
  *
  * @see PLUGIN_SPEC.md §22 — Secrets
  */
@@ -689,16 +692,19 @@ export interface PluginSecretsClient {
   /**
    * Resolve a secret reference to its current value.
    *
-   * The reference is a string identifier pointing to a secret configured
-   * in the Paperclip secret provider (e.g. `"MY_API_KEY"`).
+   * The reference must be the shared `secret_ref` object shape from plugin
+   * config. Legacy string UUID references fail closed.
    *
    * Secret values are resolved at call time and must never be cached or
    * written to logs, config, or other persistent storage.
    *
-   * @param secretRef - The secret reference string from plugin config
+   * @param secretRef - The secret reference object from plugin config
    * @returns The resolved secret value
    */
-  resolve(secretRef: string): Promise<string>;
+  resolve(
+    secretRef: string | EnvSecretRefBinding,
+    options?: { companyId?: string; configPath?: string },
+  ): Promise<string>;
 
   /** List all secrets for a company. Requires `secrets.list`. */
   list(companyId: string): Promise<CompanySecret[]>;
@@ -1448,6 +1454,8 @@ export interface PluginIssuesClient {
     originKind?: PluginIssueOriginKind;
     originKindPrefix?: string;
     originId?: string;
+    /** Filter by the secondary origin dedup key — see `create`'s `originFingerprint`. */
+    originFingerprint?: string;
     status?: Issue["status"];
     includePluginOperations?: boolean;
     limit?: number;
@@ -1494,6 +1502,16 @@ export interface PluginIssuesClient {
     originKind?: PluginIssueOriginKind;
     originId?: string | null;
     originRunId?: string | null;
+    /**
+     * Secondary dedup key, orthogonal to `originId`. Some origin kinds carry
+     * a partial unique DB index on `(companyId, originKind,
+     * originFingerprint)`; a `create()` call that collides with an existing
+     * open row for that slot rejects with a 409 conflict (message includes
+     * "conflict") instead of silently racing a duplicate into existence.
+     * Omit to use the `'default'` column value, which every such index
+     * excludes.
+     */
+    originFingerprint?: string | null;
     blockedByIssueIds?: string[];
     labelIds?: string[];
     executionWorkspaceId?: string | null;
@@ -1627,8 +1645,19 @@ export interface PluginAgentsClient {
   pause(agentId: string, companyId: string): Promise<Agent>;
   /** Resume a paused agent (sets status to idle). Throws if terminated, pending_approval, or not found. Requires `agents.resume`. */
   resume(agentId: string, companyId: string): Promise<Agent>;
-  /** Invoke (wake up) an agent with a prompt payload. Throws if paused, terminated, pending_approval, or not found. Requires `agents.invoke`. */
-  invoke(agentId: string, companyId: string, opts: { prompt: string; reason?: string }): Promise<{ runId: string }>;
+  /**
+   * Invoke (wake up) an agent with a prompt payload. Throws if paused, terminated, pending_approval, or not found. Requires `agents.invoke`.
+   *
+   * Pass `taskKey` whenever concurrent invokes represent *different* units of
+   * work (e.g. `pr_review:<repo>:<number>`). Invokes that omit it are treated
+   * as independent and are never coalesced with each other. Pass
+   * `idempotencyKey` (e.g. a webhook delivery id) to make redelivery safe.
+   */
+  invoke(
+    agentId: string,
+    companyId: string,
+    opts: { prompt: string; reason?: string; taskKey?: string; idempotencyKey?: string },
+  ): Promise<{ runId: string; deduplicated?: boolean }>;
   /**
    * Set or clear a company agent's adapter override. The override is overlaid on
    * the agent's base adapter config (e.g. to repoint traffic at a different

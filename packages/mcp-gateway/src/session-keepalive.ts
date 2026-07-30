@@ -59,6 +59,7 @@ export class SessionStore {
   private readonly idleTtlMs: number;
   private readonly maxSessions: number;
   private readonly records = new Map<string, SessionRecord>();
+  private lifecycleOperation: Promise<void> = Promise.resolve();
 
   constructor(opts: SessionStoreOpts = {}) {
     this.idleTtlMs = opts.idleTtlMs ?? 60 * 60 * 1000;
@@ -111,6 +112,22 @@ export class SessionStore {
     return this.records.size;
   }
 
+  /** Serialize connection-scoped upstream lifecycle changes across clients. */
+  async runLifecycleExclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const prior = this.lifecycleOperation;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.lifecycleOperation = prior.catch(() => undefined).then(() => gate);
+    await prior.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
   /** Visible-for-testing iterator. */
   *all(): IterableIterator<SessionRecord> {
     for (const r of this.records.values()) yield r;
@@ -161,18 +178,52 @@ export class SessionStore {
 }
 
 /**
- * Detect "Session not found" from upstream. The MCP spec (2025-03-26)
+ * Detect responses that mean the upstream session must be reinitialized.
+ * The MCP spec (2025-03-26)
  * specifies status 404 with a JSON body whose `error` is the string
  * `Session not found` (case sensitive in the SDK reference, but we
  * match case-insensitively for resilience).
  *
  * Some servers return 410 Gone with the same body when they explicitly
- * GC'd the session — we treat that as session-not-found too.
+ * GC'd the session. Older kubernetes-mcp-server releases instead return a
+ * JSON-RPC error with HTTP 200 after their connection-scoped lifecycle state
+ * expires, either as bare JSON or in MCP SSE `data:` frames, so recover those
+ * responses too.
  */
 export function isSessionNotFoundResponse(statusCode: number, bodyText: string): boolean {
-  if (statusCode !== 404 && statusCode !== 410) return false;
   const lower = bodyText.toLowerCase();
-  return lower.includes("session not found") || lower.includes("session expired");
+  if (statusCode === 404 || statusCode === 410) {
+    return lower.includes("session not found") || lower.includes("session expired");
+  }
+  if (statusCode < 200 || statusCode >= 300) return false;
+
+  const payloads = [bodyText];
+  let eventData: string[] = [];
+  const flushEventData = () => {
+    if (eventData.length > 0) payloads.push(eventData.join("\n"));
+    eventData = [];
+  };
+  for (const line of bodyText.split(/\r?\n/)) {
+    if (line === "") {
+      flushEventData();
+    } else if (line.startsWith("data:")) {
+      eventData.push(line.slice(5).replace(/^ /, ""));
+    }
+  }
+  flushEventData();
+
+  for (const payload of payloads) {
+    try {
+      const response = JSON.parse(payload) as { error?: { message?: unknown } };
+      if (typeof response.error?.message === "string" &&
+        response.error.message.toLowerCase().includes("invalid during session initialization")) {
+        return true;
+      }
+    } catch {
+      // Ignore non-JSON SSE events and continue checking remaining data payloads.
+    }
+  }
+  return false;
 }
 
 export const MCP_SESSION_HEADER = "mcp-session-id";

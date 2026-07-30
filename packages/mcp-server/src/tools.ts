@@ -78,6 +78,7 @@ const listIssuesSchema = z.object({
   originKind: z.string().optional(),
   originId: z.string().optional(),
   includeRoutineExecutions: z.boolean().optional(),
+  includeLiveDescendantSummary: z.boolean().optional(),
   q: z.string().optional(),
 });
 
@@ -329,7 +330,10 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       "Get a single issue by UUID or identifier. Cross-company identifiers (e.g. PEN-307) are routed by prefix; the optional company override takes precedence. Dependency edges appear under `blockedBy` (issues blocking this one) and `blocks` (issues this one blocks); the write-only `blockedByIssueIds` field is null here. Use `blockedBy`/`blocks` to read the dependency graph.",
       z.object({ issueId: issueIdSchema, company: companyIdOptional }),
       async ({ issueId, company }) => {
-        const companyId = await client.resolveCompany({ override: company, issueId });
+        if (!company?.trim()) {
+          return client.requestJson("GET", `/issues/${encodeURIComponent(issueId)}`);
+        }
+        const companyId = await client.resolveCompany({ override: company });
         return client.requestJson("GET", `/issues/${encodeURIComponent(issueId)}`, { companyId });
       },
     ),

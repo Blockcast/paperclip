@@ -36,6 +36,7 @@ export const issues = pgTable(
     description: text("description"),
     status: text("status").notNull().default("backlog"),
     workMode: text("work_mode").notNull().default("standard"),
+    harnessKind: text("harness_kind"),
     priority: text("priority").notNull().default("medium"),
     estimate: integer("estimate"),
     assigneeAgentId: uuid("assignee_agent_id").references(() => agents.id),
@@ -46,6 +47,7 @@ export const issues = pgTable(
     executionLockedAt: timestamp("execution_locked_at", { withTimezone: true }),
     createdByAgentId: uuid("created_by_agent_id").references(() => agents.id),
     createdByUserId: text("created_by_user_id"),
+    responsibleUserId: text("responsible_user_id"),
     issueNumber: integer("issue_number"),
     identifier: text("identifier"),
     // Stash of the identifier as it existed before a Phase-3 BLO→PCL
@@ -95,6 +97,8 @@ export const issues = pgTable(
       missing: string[];
       evidenceFound: string[];
       unlabeledFallback: boolean;
+      overridden?: boolean;
+      overrideReason?: string;
       evaluatedAt: string;
     }>(),
     // Materialized from lastEvidenceVerdict.evaluatedAt when the evidence gate
@@ -108,6 +112,7 @@ export const issues = pgTable(
       table.companyId,
       table.lastActivityAt,
     ),
+    companyHarnessKindIdx: index("issues_company_harness_kind_idx").on(table.companyId, table.harnessKind),
     assigneeStatusIdx: index("issues_company_assignee_status_idx").on(
       table.companyId,
       table.assigneeAgentId,
@@ -118,6 +123,7 @@ export const issues = pgTable(
       table.assigneeUserId,
       table.status,
     ),
+    responsibleUserIdx: index("issues_company_responsible_user_idx").on(table.companyId, table.responsibleUserId),
     parentIdx: index("issues_company_parent_idx").on(table.companyId, table.parentId),
     projectIdx: index("issues_company_project_idx").on(table.companyId, table.projectId),
     milestoneIdx: index("issues_company_milestone_idx").on(table.companyId, table.milestoneId).where(sql`milestone_id IS NOT NULL`),
@@ -133,6 +139,17 @@ export const issues = pgTable(
     evidenceVerdictEvaluatedIdx: index("issues_company_evidence_verdict_evaluated_idx")
       .on(table.companyId, table.lastEvidenceVerdictEvaluatedAt)
       .where(sql`${table.lastEvidenceVerdict} is not null`),
+    companyUpdatedIdx: index("issues_company_updated_idx").on(table.companyId, table.updatedAt),
+    companyCreatedIdx: index("issues_company_created_idx").on(table.companyId, table.createdAt),
+    openNormalizedTitleCreatedIdx: index("issues_open_normalized_title_created_idx")
+      .on(
+        table.companyId,
+        table.parentId,
+        sql`lower(regexp_replace(btrim(${table.title}), '\\s+', ' ', 'g'))`,
+        table.createdAt,
+      )
+      .where(sql`${table.hiddenAt} is null and ${table.status} not in ('done', 'cancelled')`),
+    companyPriorityIdx: index("issues_company_priority_idx").on(table.companyId, table.priority),
     identifierIdx: uniqueIndex("issues_identifier_idx").on(table.identifier),
     titleSearchIdx: index("issues_title_search_idx").using("gin", table.title.op("gin_trgm_ops")),
     identifierSearchIdx: index("issues_identifier_search_idx").using("gin", table.identifier.op("gin_trgm_ops")),
@@ -198,6 +215,34 @@ export const issues = pgTable(
       .on(table.companyId, table.originKind, table.originId)
       .where(
         sql`${table.originKind} = 'stranded_issue_recovery'
+          and ${table.originId} is not null
+          and ${table.hiddenAt} is null
+          and ${table.status} not in ('done', 'cancelled')`,
+      ),
+    // BLO-15982: cross-issue dedup for alertmanager board covers. originId
+    // stays the specific triggering alert issue's id (so resolve-time cover
+    // cleanup can look covers up by originId=<source alert issue id>);
+    // originFingerprint carries the alertname+dedup-window key so concurrent
+    // same-alertname ladders racing to the cover rung hit this constraint
+    // instead of a read-then-create gap — the loser catches 23505 and
+    // attaches itself to the winner's cover instead of duplicating it.
+    activeAlertEscalationCoverIdx: uniqueIndex("issues_active_alert_escalation_cover_uq")
+      .on(table.companyId, table.originKind, table.originFingerprint)
+      .where(
+        sql`${table.originKind} = 'plugin:paperclip-plugin-alertmanager:escalation'
+          and ${table.originFingerprint} <> 'default'
+          and ${table.hiddenAt} is null
+          and ${table.status} not in ('done', 'cancelled')`,
+      ),
+    // BLO-16319: one open issue per Dependabot alert. originId is the stable
+    // `github-dependabot:<repoFullName>#<alertNumber>` key (the same key the
+    // webhook route already uses for the wake idempotency key), so a
+    // `reintroduced`/`reopened` redelivery for an alert with an already-open
+    // issue reuses it instead of spawning a duplicate remediation run.
+    activeDependabotAlertIdx: uniqueIndex("issues_active_dependabot_alert_uq")
+      .on(table.companyId, table.originKind, table.originId)
+      .where(
+        sql`${table.originKind} = 'github_dependabot_alert'
           and ${table.originId} is not null
           and ${table.hiddenAt} is null
           and ${table.status} not in ('done', 'cancelled')`,

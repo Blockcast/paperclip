@@ -19,7 +19,10 @@ describe("codex inactivity monitor (integration: real subprocess)", () => {
     "kills a codex child that goes silent after one event and surfaces a monitor failure",
     async () => {
       const runId = `monitor-integration-${Date.now()}`;
-      const timeoutMs = 250;
+      // Leave enough headroom for the real child to be scheduled on a loaded
+      // ARC runner before its first stdout write. The assertion still covers
+      // the same one-event-then-silent monitor path.
+      const timeoutMs = 2_000;
       const logs: Array<{ stream: string; chunk: string }> = [];
       let killTarget: { pid: number | null; processGroupId: number | null } | null = null;
       let monitorFired = false;
@@ -72,9 +75,7 @@ describe("codex inactivity monitor (integration: real subprocess)", () => {
           },
           onLog: async (stream, chunk) => {
             logs.push({ stream, chunk });
-            if (stream === "stdout") {
-              monitor.noteStdoutChunk(chunk);
-            }
+            monitor.noteOutputChunk(stream, chunk);
           },
         });
 

@@ -135,6 +135,7 @@ const mockExternalObjectService = vi.hoisted(() => ({
   syncDocumentSafely: vi.fn(async () => undefined),
   syncIssueSafely: vi.fn(async () => undefined),
 }));
+const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 
 function registerRouteMocks() {
   vi.doMock("@paperclipai/shared/telemetry", () => ({
@@ -172,7 +173,7 @@ function registerRouteMocks() {
   }));
 
   vi.doMock("../services/activity-log.js", () => ({
-    logActivity: vi.fn(async () => undefined),
+    logActivity: mockLogActivity,
   }));
 
   vi.doMock("../services/index.js", () => ({
@@ -182,6 +183,9 @@ function registerRouteMocks() {
     companySearchService: () => ({}),
     agentService: () => mockAgentService,
     clampIssueListLimit: (value: number) => Math.min(Math.max(value, 1), 500),
+    companySkillService: () => ({
+      completeTestRunForIssue: vi.fn(async () => null),
+    }),
     companyService: () => mockCompanyService,
     documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => mockDocumentService,
@@ -220,7 +224,7 @@ function registerRouteMocks() {
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     taskWatchdogService: () => mockTaskWatchdogService,
-    logActivity: vi.fn(async () => undefined),
+    logActivity: mockLogActivity,
     projectService: () => ({}),
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
@@ -395,6 +399,19 @@ function boardActor() {
   };
 }
 
+function allowStandardAgentRootIssueCreation() {
+  mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+    allowed:
+      input.action === "tasks:assign" ||
+      input.action === "issue:read" ||
+      input.action === "issue:mutate" ||
+      input.action === "company_scope:read",
+    action: input.action,
+    reason: "allow_test_default",
+    explanation: "Allowed by test default.",
+  }));
+}
+
 describe("agent issue mutation checkout ownership", () => {
   beforeEach(() => {
     vi.resetModules();
@@ -521,6 +538,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.removeAttachment.mockReset();
     mockIssueService.update.mockReset();
     mockIssueService.findMentionedAgents.mockReset();
+    mockLogActivity.mockClear();
     mockDocumentService.upsertIssueDocument.mockReset();
     mockWorkProductService.createForIssue.mockReset();
     mockExternalObjectService.getIssueSummaries.mockClear();
@@ -554,8 +572,13 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockIssueService.getByIdentifier.mockResolvedValue(null);
     mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId,
+      blockerIssueIds: [],
       unresolvedBlockerCount: 0,
       unresolvedBlockerIssueIds: [],
+      pendingFinalizeBlockerIssueIds: [],
+      allBlockersDone: true,
+      isDependencyReady: true,
     });
     mockIssueService.getComment.mockResolvedValue({
       id: "comment-1",
@@ -697,6 +720,22 @@ describe("agent issue mutation checkout ownership", () => {
       contentLength: 6,
     });
     mockStorageService.deleteObject.mockResolvedValue(undefined);
+  });
+
+  it("denies company-wide issue list routes for task bridge keys", async () => {
+    const app = await createApp(peerActor({
+      keyId: "99999999-9999-4999-8999-999999999999",
+      keyScope: {
+        kind: "task_bridge",
+        parentIssueId: issueId,
+      },
+    }));
+
+    const res = await request(app).get(`/api/companies/${companyId}/issues`);
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("Task bridge keys cannot use company-wide issue list APIs");
+    expect(mockIssueService.list).not.toHaveBeenCalled();
   });
 
   it("uses the company-scope fast path on the issue list route", async () => {
@@ -906,6 +945,209 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  // BLO-18906: recovery escalation reassigns the issue away from the previous
+  // owner, which costs it allow_self mid-run. The handoff grant restores exactly
+  // one capability — posting a comment — and nothing that changes issue state.
+  const recoveryHandoffDecide = async (input: { action: string }) => ({
+    allowed: input.action === "issue:comment",
+    action: input.action,
+    reason: input.action === "issue:comment" ? "allow_recovery_handoff_grant" : "deny_missing_grant",
+    explanation:
+      input.action === "issue:comment"
+        ? "Allowed by a recovery-handoff issue comment grant for the reassigned previous owner."
+        : "Missing permission.",
+  });
+
+  it("lets a recovery-transferred previous owner post its handoff comment", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+
+    const res = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Handoff: root cause is X, next step is Y." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "Handoff: root cause is X, next step is Y.",
+      expect.any(Object),
+      expect.any(Object),
+    );
+    // The comment must not drag the blocked issue back to todo.
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses reopen/resume from a recovery handoff grant instead of transitioning a blocked issue", async () => {
+    for (const transition of [{ reopen: true }, { resume: true }]) {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+      mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+
+      const res = await request(await createApp(ownerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Handoff plus a status grab.", ...transition });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Recovery handoff grant is comment-only");
+      expect(res.body.details).toMatchObject({ reason: "allow_recovery_handoff_grant" });
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    }
+  });
+
+  it("keeps mutation and deletion denied for a recovery handoff grant holder", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+
+    const patchRes = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo" });
+    expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(403);
+    expect(patchRes.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+
+    const deleteRes = await request(await createApp(ownerActor()))
+      .delete(`/api/issues/${issueId}`);
+    expect(deleteRes.status, JSON.stringify(deleteRes.body)).toBe(403);
+    expect(mockIssueService.remove).not.toHaveBeenCalled();
+  });
+
+  // The comment route's current-execution-run short-circuit returns a bare
+  // `true`, discarding the decision reason. A previous owner whose stale
+  // execution lock still matches therefore reaches the route WITHOUT an
+  // allow_recovery_handoff_grant decision to key off, so the comment-only
+  // contract has to be resolved from the recovery row instead.
+  it("keeps the handoff comment-only when a stale execution lock bypasses the boundary decision", async () => {
+    const staleLockIssue = () => makeIssue({
+      status: "blocked",
+      assigneeAgentId: peerAgentId,
+      // Recovery moved the assignee to peerAgentId, but this run id is the
+      // previous owner's — the shape the current-run bypass matches on.
+      executionRunId: ownerRunId,
+      checkoutRunId: ownerRunId,
+    });
+    // Deny every boundary action: the ONLY way through is the current-run bypass.
+    const denyEverything = async (input: { action: string }) => ({
+      allowed: false,
+      action: input.action,
+      reason: "deny_missing_grant",
+      explanation: "Missing permission.",
+    });
+
+    mockIssueService.getById.mockResolvedValue(staleLockIssue());
+    mockAccessService.decide.mockImplementation(denyEverything);
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction() as never);
+
+    const commentRes = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Handoff evidence from the run that just lost the issue." });
+    expect(commentRes.status, JSON.stringify(commentRes.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    for (const transition of [{ reopen: true }, { resume: true }]) {
+      mockIssueService.addComment.mockClear();
+      mockIssueService.update.mockClear();
+      mockIssueService.getById.mockResolvedValue(staleLockIssue());
+      mockAccessService.decide.mockImplementation(denyEverything);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction() as never);
+
+      const res = await request(await createApp(ownerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Handoff plus a status grab.", ...transition });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Recovery handoff grant is comment-only");
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    }
+  });
+
+  // A comment-only grant must not become a review decision by another route:
+  // the in_review auto-approval branch transitions the issue to `done` and
+  // records an execution decision without ever consulting issue:mutate.
+  it("does not let a recovery handoff comment auto-approve an in_review issue", async () => {
+    const { normalizeIssueExecutionPolicy } = await import("../services/issue-execution-policy.js");
+    // The stage still names the previous owner as its reviewer, so the actor
+    // matches currentParticipant even though recovery moved the assignee away.
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          type: "review",
+          participants: [{ type: "agent", agentId: ownerAgentId }],
+        },
+      ],
+    })!;
+    const inReviewIssue = makeIssue({
+      status: "in_review",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: policy.stages[0].id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: ownerAgentId },
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+    const reviewBody = "## Review: APPROVED";
+    mockIssueService.getById.mockResolvedValue(inReviewIssue);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-recovery-handoff-approval",
+      issueId,
+      companyId,
+      body: reviewBody,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      authorAgentId: ownerAgentId,
+      authorUserId: null,
+    });
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction() as never);
+
+    const res = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: reviewBody });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+    // The comment lands; the state transition does not.
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // A transient lookup failure must not become a way to keep the transition:
+  // the comment still lands, the state change does not.
+  it("fails closed on a recovery-action lookup error, keeping the comment but refusing reopen", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+    mockIssueRecoveryActionService.getActiveForIssue.mockRejectedValue(new Error("database timeout"));
+
+    const commentRes = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Handoff evidence." });
+    expect(commentRes.status, JSON.stringify(commentRes.body)).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    mockIssueService.addComment.mockClear();
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+    mockIssueRecoveryActionService.getActiveForIssue.mockRejectedValue(new Error("database timeout"));
+
+    const reopenRes = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Handoff plus a status grab.", reopen: true });
+    expect(reopenRes.status, JSON.stringify(reopenRes.body)).toBe(403);
+    expect(reopenRes.body.error).toBe("Recovery handoff grant is comment-only");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("rejects non-mentioned peer agents from posting comments", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: input.action === "issue:read",
@@ -919,7 +1161,8 @@ describe("agent issue mutation checkout ownership", () => {
       .send({ body: "I was not mentioned." });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (grant)");
+    expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
@@ -935,7 +1178,7 @@ describe("agent issue mutation checkout ownership", () => {
       .get(`/api/issues/${issueId}/comments`);
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (trust-boundary)");
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:read" }));
   });
 
@@ -951,7 +1194,7 @@ describe("agent issue mutation checkout ownership", () => {
       .get(`/api/issues/${issueId}/interactions`);
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (trust-boundary)");
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:read" }));
     expect(mockIssueThreadInteractionService.listForIssue).not.toHaveBeenCalled();
   });
@@ -997,7 +1240,7 @@ describe("agent issue mutation checkout ownership", () => {
       .get(`/api/issues/${issueId}/comments/comment-1`);
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (trust-boundary)");
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:read" }));
     expect(mockIssueService.getComment).not.toHaveBeenCalled();
   });
@@ -1118,7 +1361,10 @@ describe("agent issue mutation checkout ownership", () => {
       .post(`/api/issues/${issueId}/comments`)
       .send({ body: "Wrong company." });
 
-    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    // Cross-tenant requests return 404 (not 403) so the response is
+    // indistinguishable from a nonexistent issue — no existence oracle.
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(res.body.error).toBe("Issue not found");
     expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({ action: "issue:comment" }));
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
@@ -1430,6 +1676,223 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.create).not.toHaveBeenCalled();
     expect(mockIssueService.createChild).not.toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("defaults agent-created root follow-up issues to inherit the current run workspace", async () => {
+    allowStandardAgentRootIssueCreation();
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        issueId,
+        executionWorkspaceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      }),
+    );
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Follow-up in same worktree",
+        projectId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      companyId,
+      expect.objectContaining({
+        title: "Follow-up in same worktree",
+        inheritExecutionWorkspaceFromIssueId: issueId,
+      }),
+    );
+  });
+
+  it("preserves explicit workspace choices on agent-created root issues", async () => {
+    allowStandardAgentRootIssueCreation();
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        issueId,
+        executionWorkspaceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      }),
+    );
+
+    const explicitExecutionWorkspaceId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Explicit different workspace",
+        executionWorkspaceId: explicitExecutionWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      companyId,
+      expect.objectContaining({
+        title: "Explicit different workspace",
+        executionWorkspaceId: explicitExecutionWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+      }),
+    );
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      companyId,
+      expect.not.objectContaining({
+        inheritExecutionWorkspaceFromIssueId: issueId,
+      }),
+    );
+  });
+
+  it("rejects agent-created issues that supply responsibleUserId", async () => {
+    const app = await createApp(ownerActor());
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Spoof responsible user",
+        responsibleUserId: "spoofed-user",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("responsibleUserId");
+    expect(mockIssueService.create).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId,
+        actorType: "agent",
+        actorId: ownerAgentId,
+        action: "issue.attribution_spoof_rejected",
+        entityType: "company",
+        details: expect.objectContaining({
+          surface: "issues.create",
+          field: "responsibleUserId",
+          requestedValue: "spoofed-user",
+        }),
+      }),
+    );
+  });
+
+  it("strips agent-supplied createdByUserId and derives attribution from the authenticated actor", async () => {
+    allowStandardAgentRootIssueCreation();
+    const app = await createApp(ownerActor());
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Spoof creator",
+        createdByUserId: "spoofed-user",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      companyId,
+      expect.objectContaining({
+        title: "Spoof creator",
+        createdByAgentId: ownerAgentId,
+        createdByUserId: null,
+        actorRunId: ownerRunId,
+      }),
+    );
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      companyId,
+      expect.not.objectContaining({
+        createdByUserId: "spoofed-user",
+      }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId,
+        actorType: "agent",
+        actorId: ownerAgentId,
+        action: "issue.attribution_spoof_stripped",
+        details: expect.objectContaining({
+          surface: "issues.create",
+          field: "createdByUserId",
+          requestedValue: "spoofed-user",
+        }),
+      }),
+    );
+  });
+
+  it("allows board-created issues to pass explicit responsibleUserId as trusted attribution", async () => {
+    const app = await createApp(boardActor());
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Board-owned work",
+        responsibleUserId: "responsible-board-user",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      companyId,
+      expect.objectContaining({
+        title: "Board-owned work",
+        responsibleUserId: "responsible-board-user",
+        createdByUserId: "board-user",
+        trustExplicitResponsibleUserId: true,
+      }),
+    );
+  });
+
+  it("rejects agent-created child issues that supply responsibleUserId", async () => {
+    const app = await createApp(ownerActor());
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/children`)
+      .send({
+        title: "Spoof child responsible user",
+        responsibleUserId: "spoofed-user",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(mockIssueService.createChild).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId,
+        action: "issue.attribution_spoof_rejected",
+        entityType: "issue",
+        entityId: issueId,
+        details: expect.objectContaining({
+          surface: "issues.children.create",
+          field: "responsibleUserId",
+        }),
+      }),
+    );
+  });
+
+  it("rejects accepted-plan child creation when an agent child body supplies responsibleUserId", async () => {
+    const app = await createApp(ownerActor());
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/accepted-plan-decompositions`)
+      .send({
+        acceptedPlanRevisionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        children: [
+          {
+            title: "Spoof plan child responsible user",
+            responsibleUserId: "spoofed-user",
+          },
+        ],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(mockIssueService.decomposeAcceptedPlan).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId,
+        action: "issue.attribution_spoof_rejected",
+        entityType: "issue",
+        entityId: issueId,
+        details: expect.objectContaining({
+          surface: "issues.accepted_plan_decomposition",
+          field: "responsibleUserId",
+        }),
+      }),
+    );
   });
 
   it("allows board users to set explicit cheap issue assignee profile overrides", async () => {
@@ -2056,20 +2519,27 @@ describe("agent issue mutation checkout ownership", () => {
       }));
     }
 
-    it("lets a watchdog run comment on a watched issue assigned to a different agent", async () => {
+    it("allows both POST comments and PATCH {comment} for a valid watchdog-scoped current run", async () => {
       denyBaseBoundary();
-      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
+      const watchedIssue = makeIssue({
+        assigneeAgentId: ownerAgentId,
+        executionRunId: watchdogRunId,
+      });
+      mockIssueService.getById.mockResolvedValue(watchedIssue);
+      mockIssueService.update.mockResolvedValue(watchedIssue);
 
       const app = await createApp(watchdogActor(), createWatchdogDb());
-      const res = await request(app).post(`/api/issues/${issueId}/comments`).send({ body: "Watchdog finding" });
+      const postRes = await request(app).post(`/api/issues/${issueId}/comments`).send({ body: "Watchdog finding" });
+      expect(postRes.status, JSON.stringify(postRes.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
 
-      expect(res.status, JSON.stringify(res.body)).toBe(201);
-      expect(mockIssueService.addComment).toHaveBeenCalledWith(
-        issueId,
-        "Watchdog finding",
-        expect.any(Object),
-        expect.any(Object),
-      );
+      mockIssueService.addComment.mockClear();
+      mockIssueService.update.mockClear();
+
+      const patchRes = await request(app).patch(`/api/issues/${issueId}`).send({ comment: "Watchdog finding" });
+      expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(200);
+      expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+      expect(mockIssueService.update).toHaveBeenCalledTimes(1);
     });
 
     it.each([
@@ -2315,18 +2785,25 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
-    it("denies an invalid watchdog run context even when the base boundary would allow it", async () => {
+    it("denies both POST comments and PATCH {comment} for an invalid watchdog-scoped current run", async () => {
       // Run context claims a watched issue, but no active persisted watchdog backs it.
       const app = await createApp(
         watchdogActor(),
         createWatchdogDb({ watchdogRows: [] }),
       );
-      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: peerAgentId }));
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        assigneeAgentId: peerAgentId,
+        executionRunId: watchdogRunId,
+      }));
 
-      const res = await request(app).patch(`/api/issues/${issueId}`).send({ status: "blocked" });
+      const postRes = await request(app).post(`/api/issues/${issueId}/comments`).send({ body: "Invalid watchdog" });
+      const patchRes = await request(app).patch(`/api/issues/${issueId}`).send({ comment: "Invalid watchdog" });
 
-      expect(res.status, JSON.stringify(res.body)).toBe(403);
-      expect(res.body.error).toBe("Task-watchdog run context is not backed by an active persisted watchdog.");
+      expect(postRes.status, JSON.stringify(postRes.body)).toBe(403);
+      expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(403);
+      expect(postRes.body.error).toBe("Task-watchdog run context is not backed by an active persisted watchdog.");
+      expect(patchRes.body.error).toBe("Task-watchdog run context is not backed by an active persisted watchdog.");
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
   });

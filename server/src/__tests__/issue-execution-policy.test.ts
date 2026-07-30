@@ -598,6 +598,87 @@ describe("issue execution policy transitions", () => {
       // No error — just no patch modifications
       expect(result.patch).toEqual({});
     });
+
+    // BLO-15942: a review/approval stage pinned to a participant whose mandate
+    // excludes stage decisions (e.g. a PR-webhook-only reviewer bot) otherwise
+    // deadlocks forever — only the participant can advance, and the "Only the
+    // active reviewer or approver can advance" throw above fires for every
+    // other actor, including an operator/adjudicator above the participant.
+    // `overrideAuthorized` (set by the route only after a real
+    // tasks:override_execution_stage authorization check — never derived here)
+    // lets that actor force-complete or request-changes without the
+    // mandate-bound participant ever acting.
+    it("an authorized override force-completes a stage the participant cannot act on", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: ctoAgentId },
+        commentBody: "Overriding: reviewer's mandate excludes stage decisions; verified independently.",
+        overrideAuthorized: true,
+      });
+
+      // Advances past the review stage into the approval stage (two-stage
+      // policy) — the override acts with the participant's stage authority,
+      // it does not skip the workflow.
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageType: "approval",
+        completedStageIds: [reviewStageId],
+      });
+      expect(result.decision).toMatchObject({
+        stageId: reviewStageId,
+        stageType: "review",
+        outcome: "approved",
+      });
+    });
+
+    it("overrideAuthorized alone does not bypass the comment requirement", () => {
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: qaAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: {
+              status: "pending",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "agent", agentId: qaAgentId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+            },
+          },
+          policy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: ctoAgentId },
+          commentBody: "",
+          overrideAuthorized: true,
+        }),
+      ).toThrow("Approving a review or approval stage requires a comment");
+    });
   });
 
   describe("comment requirements", () => {

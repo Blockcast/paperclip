@@ -93,6 +93,11 @@ import type {
   PluginEnvironmentResumeLeaseParams,
   PluginEnvironmentValidateConfigParams,
   PluginEnvironmentProbeParams,
+  PluginEnvironmentStartInteractiveSetupParams,
+  PluginEnvironmentGetInteractiveSetupParams,
+  PluginEnvironmentCaptureTemplateParams,
+  PluginEnvironmentCancelInteractiveSetupParams,
+  PluginEnvironmentDeleteTemplateParams,
   PluginInvocationContext,
   WorkerToHostMethodName,
   WorkerToHostMethods,
@@ -424,8 +429,16 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       },
 
       config: {
-        async get() {
-          return callHost("config.get", {} as Record<string, never>);
+        async get(companyId?: string) {
+          const invocationCompanyId = invocationContextStorage.getStore()?.scope.companyId;
+          // Company-scoped hosts intentionally send an empty bootstrap config.
+          // Legacy plugins may still read config during setup before any company
+          // config exists. Let those workers initialize in a disabled/default
+          // state; all post-initialize reads still require a host-issued scope.
+          if (!initialized && !companyId && !invocationCompanyId) {
+            return currentConfig;
+          }
+          return callHost("config.get", companyId ? { companyId } : {});
         },
       },
 
@@ -592,8 +605,12 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       },
 
       secrets: {
-        async resolve(secretRef: string): Promise<string> {
-          return callHost("secrets.resolve", { secretRef });
+        async resolve(secretRef, options = {}): Promise<string> {
+          return callHost("secrets.resolve", {
+            secretRef,
+            companyId: options.companyId,
+            configPath: options.configPath,
+          });
         },
         async list(companyId: string) {
           return callHost("secrets.list" as any, { companyId });
@@ -830,6 +847,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             originKind: input.originKind,
             originKindPrefix: input.originKindPrefix,
             originId: input.originId,
+            originFingerprint: input.originFingerprint,
             status: input.status,
             includePluginOperations: input.includePluginOperations,
             limit: input.limit,
@@ -869,6 +887,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             originKind: input.originKind,
             originId: input.originId,
             originRunId: input.originRunId,
+            originFingerprint: input.originFingerprint,
             blockedByIssueIds: input.blockedByIssueIds,
             labelIds: input.labelIds,
             executionWorkspaceId: input.executionWorkspaceId,
@@ -1135,8 +1154,19 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           return callHost("agents.resume", { agentId, companyId });
         },
 
-        async invoke(agentId: string, companyId: string, opts: { prompt: string; reason?: string }) {
-          return callHost("agents.invoke", { agentId, companyId, prompt: opts.prompt, reason: opts.reason });
+        async invoke(
+          agentId: string,
+          companyId: string,
+          opts: { prompt: string; reason?: string; taskKey?: string; idempotencyKey?: string },
+        ) {
+          return callHost("agents.invoke", {
+            agentId,
+            companyId,
+            prompt: opts.prompt,
+            reason: opts.reason,
+            taskKey: opts.taskKey,
+            idempotencyKey: opts.idempotencyKey,
+          });
         },
 
         async updateAdapterOverrides(
@@ -1539,6 +1569,21 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       case "environmentExecute":
         return handleEnvironmentExecute(params as PluginEnvironmentExecuteParams);
 
+      case "environmentStartInteractiveSetup":
+        return handleEnvironmentStartInteractiveSetup(params as PluginEnvironmentStartInteractiveSetupParams);
+
+      case "environmentGetInteractiveSetup":
+        return handleEnvironmentGetInteractiveSetup(params as PluginEnvironmentGetInteractiveSetupParams);
+
+      case "environmentCaptureTemplate":
+        return handleEnvironmentCaptureTemplate(params as PluginEnvironmentCaptureTemplateParams);
+
+      case "environmentCancelInteractiveSetup":
+        return handleEnvironmentCancelInteractiveSetup(params as PluginEnvironmentCancelInteractiveSetupParams);
+
+      case "environmentDeleteTemplate":
+        return handleEnvironmentDeleteTemplate(params as PluginEnvironmentDeleteTemplateParams);
+
       default:
         throw Object.assign(
           new Error(`Unknown method: ${method}`),
@@ -1583,6 +1628,11 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     if (plugin.definition.onEnvironmentDestroyLease) supportedMethods.push("environmentDestroyLease");
     if (plugin.definition.onEnvironmentRealizeWorkspace) supportedMethods.push("environmentRealizeWorkspace");
     if (plugin.definition.onEnvironmentExecute) supportedMethods.push("environmentExecute");
+    if (plugin.definition.onEnvironmentStartInteractiveSetup) supportedMethods.push("environmentStartInteractiveSetup");
+    if (plugin.definition.onEnvironmentGetInteractiveSetup) supportedMethods.push("environmentGetInteractiveSetup");
+    if (plugin.definition.onEnvironmentCaptureTemplate) supportedMethods.push("environmentCaptureTemplate");
+    if (plugin.definition.onEnvironmentCancelInteractiveSetup) supportedMethods.push("environmentCancelInteractiveSetup");
+    if (plugin.definition.onEnvironmentDeleteTemplate) supportedMethods.push("environmentDeleteTemplate");
 
     return { ok: true, supportedMethods };
   }
@@ -1838,6 +1888,41 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       throw methodNotImplemented("environmentExecute");
     }
     return plugin.definition.onEnvironmentExecute(params);
+  }
+
+  async function handleEnvironmentStartInteractiveSetup(params: PluginEnvironmentStartInteractiveSetupParams) {
+    if (!plugin.definition.onEnvironmentStartInteractiveSetup) {
+      throw methodNotImplemented("environmentStartInteractiveSetup");
+    }
+    return plugin.definition.onEnvironmentStartInteractiveSetup(params);
+  }
+
+  async function handleEnvironmentGetInteractiveSetup(params: PluginEnvironmentGetInteractiveSetupParams) {
+    if (!plugin.definition.onEnvironmentGetInteractiveSetup) {
+      throw methodNotImplemented("environmentGetInteractiveSetup");
+    }
+    return plugin.definition.onEnvironmentGetInteractiveSetup(params);
+  }
+
+  async function handleEnvironmentCaptureTemplate(params: PluginEnvironmentCaptureTemplateParams) {
+    if (!plugin.definition.onEnvironmentCaptureTemplate) {
+      throw methodNotImplemented("environmentCaptureTemplate");
+    }
+    return plugin.definition.onEnvironmentCaptureTemplate(params);
+  }
+
+  async function handleEnvironmentCancelInteractiveSetup(params: PluginEnvironmentCancelInteractiveSetupParams) {
+    if (!plugin.definition.onEnvironmentCancelInteractiveSetup) {
+      throw methodNotImplemented("environmentCancelInteractiveSetup");
+    }
+    return plugin.definition.onEnvironmentCancelInteractiveSetup(params);
+  }
+
+  async function handleEnvironmentDeleteTemplate(params: PluginEnvironmentDeleteTemplateParams) {
+    if (!plugin.definition.onEnvironmentDeleteTemplate) {
+      throw methodNotImplemented("environmentDeleteTemplate");
+    }
+    return plugin.definition.onEnvironmentDeleteTemplate(params);
   }
 
   // -----------------------------------------------------------------------

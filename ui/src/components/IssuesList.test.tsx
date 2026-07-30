@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
 import { createRoot } from "react-dom/client";
+import { flushSync } from "react-dom";
 import type { AnchorHTMLAttributes, ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Issue, Project } from "@paperclipai/shared";
@@ -56,6 +56,7 @@ vi.mock("../context/DialogContext", () => ({
 }));
 
 vi.mock("@/lib/router", () => ({
+  useNavigate: () => vi.fn(),
   Link: ({
     children,
     to,
@@ -72,7 +73,10 @@ vi.mock("@/lib/router", () => ({
 }));
 
 vi.mock("../api/issues", () => ({
-  issuesApi: mockIssuesApi,
+  issuesApi: {
+    ...mockIssuesApi,
+    listCompact: mockIssuesApi.list,
+  },
 }));
 
 vi.mock("../api/auth", () => ({
@@ -80,6 +84,10 @@ vi.mock("../api/auth", () => ({
 }));
 
 vi.mock("../api/access", () => ({
+  accessApi: mockAccessApi,
+}));
+
+vi.mock("@/api/access", () => ({
   accessApi: mockAccessApi,
 }));
 
@@ -94,6 +102,17 @@ vi.mock("../api/instanceSettings", () => ({
 vi.mock("../api/externalObjects", () => ({
   externalObjectsApi: mockExternalObjectsApi,
 }));
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+async function act(callback: () => void | Promise<void>) {
+  let result: void | Promise<void> = undefined;
+  flushSync(() => {
+    result = callback();
+  });
+  await result;
+}
 
 vi.mock("./IssueRow", () => ({
   IssueRow: ({
@@ -176,6 +195,7 @@ function createIssue(overrides: Partial<Issue> = {}): Issue {
     priority: "medium",
     assigneeAgentId: null,
     assigneeUserId: null,
+    responsibleUserId: null,
     createdByAgentId: null,
     createdByUserId: null,
     issueNumber: 1,
@@ -211,6 +231,13 @@ function createIssue(overrides: Partial<Issue> = {}): Issue {
 async function flush() {
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+}
+
+async function flushAnimationFrame() {
+  await act(async () => {
+    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+    await Promise.resolve();
   });
 }
 
@@ -470,7 +497,7 @@ describe("IssuesList", () => {
         q: "server",
         projectId: undefined,
         limit: 200,
-      });
+      }, { signal: expect.any(AbortSignal) });
       expect(container.textContent).toContain("Server result");
       expect(container.textContent).not.toContain("Local issue");
     });
@@ -505,7 +532,7 @@ describe("IssuesList", () => {
         projectId: undefined,
         parentId: "parent-1",
         limit: 200,
-      });
+      }, { signal: expect.any(AbortSignal) });
       expect(container.textContent).toContain("Server result");
       expect(container.textContent).not.toContain("Local issue");
     });
@@ -1089,7 +1116,7 @@ describe("IssuesList", () => {
       container,
     );
 
-    await waitForMicrotaskAssertion(() => {
+    await waitForAssertion(() => {
       expect(container.textContent).toContain("Showing up to 200 matches. Refine the search to narrow further.");
     });
 
@@ -1143,12 +1170,12 @@ describe("IssuesList", () => {
         status: "backlog",
         limit: 200,
         includeRoutineExecutions: true,
-      }));
+      }), { signal: expect.any(AbortSignal) });
       expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", expect.objectContaining({
         status: "done",
         limit: 200,
         includeRoutineExecutions: true,
-      }));
+      }), { signal: expect.any(AbortSignal) });
       expect(mockKanbanBoard).toHaveBeenLastCalledWith(expect.objectContaining({
         issues: expect.arrayContaining([
           expect.objectContaining({ id: "issue-backlog" }),
@@ -1363,10 +1390,13 @@ describe("IssuesList", () => {
       expect(container.querySelectorAll('[data-testid="issue-row"]')).toHaveLength(100);
     });
 
+    await flush();
+
     act(() => {
       setDocumentScrollMetrics({ innerHeight: 600, scrollY: 1500, scrollHeight: 2000 });
       window.dispatchEvent(new Event("scroll"));
     });
+    await flushAnimationFrame();
 
     await waitForAssertion(() => {
       expect(container.querySelectorAll('[data-testid="issue-row"]')).toHaveLength(250);
@@ -1419,6 +1449,7 @@ describe("IssuesList", () => {
       main.scrollTop = 1500;
       main.dispatchEvent(new Event("scroll"));
     });
+    await flushAnimationFrame();
 
     await waitForAssertion(() => {
       expect(container.querySelectorAll('[data-testid="issue-row"]').length).toBeGreaterThan(100);
@@ -1456,8 +1487,9 @@ describe("IssuesList", () => {
     await waitForAssertion(() => {
       expect(container.querySelectorAll('[data-testid="issue-row"]')).toHaveLength(100);
     });
-    await flush();
-    expect(onLoadMoreIssues).toHaveBeenCalledTimes(1);
+    await waitForAssertion(() => {
+      expect(onLoadMoreIssues).toHaveBeenCalledTimes(1);
+    });
     await flush();
     expect(onLoadMoreIssues).toHaveBeenCalledTimes(1);
 
@@ -1465,6 +1497,7 @@ describe("IssuesList", () => {
       setDocumentScrollMetrics({ innerHeight: 600, scrollY: 1500, scrollHeight: 2000 });
       window.dispatchEvent(new Event("scroll"));
     });
+    await flushAnimationFrame();
 
     await waitForAssertion(() => {
       expect(onLoadMoreIssues).toHaveBeenCalledTimes(2);
@@ -1888,6 +1921,39 @@ describe("IssuesList", () => {
     await waitForAssertion(() => {
       expect(mockExecutionWorkspacesApi.listSummaries).toHaveBeenCalledWith("company-1");
       expect(mockExecutionWorkspacesApi.list).not.toHaveBeenCalled();
+    });
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  // Run 3 review (Jul 8) reversed PAP-243's lg enlargement: task rows in the
+  // list and inbox standardize on md (16px). The live list always supplies its
+  // own `statusSlot` (the PAP-246 slot-override gotcha), so assert the real
+  // slot size here.
+  it("renders the desktop row status glyph at md (16px)", async () => {
+    const { root } = renderWithQueryClient(
+      <IssuesList
+        issues={[createIssue({ status: "in_progress" })]}
+        agents={[]}
+        projects={[]}
+        viewStateKey="paperclip:test-issues"
+        onUpdateIssue={() => undefined}
+      />,
+      container,
+    );
+
+    await waitForAssertion(() => {
+      const glyphs = Array.from(container.querySelectorAll("svg")).filter(
+        (svg) => svg.getAttribute("width") === "16" && svg.getAttribute("height") === "16",
+      );
+      expect(glyphs.length).toBeGreaterThan(0);
+      // No 20px (lg) status glyph should leak through from the list's slot.
+      const lgGlyphs = Array.from(container.querySelectorAll("svg")).filter(
+        (svg) => svg.getAttribute("width") === "20" && svg.getAttribute("height") === "20",
+      );
+      expect(lgGlyphs.length).toBe(0);
     });
 
     act(() => {

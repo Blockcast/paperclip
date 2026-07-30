@@ -8,6 +8,8 @@ image:
   repository: ghcr.io/paperclipai/paperclip
   # -- Image tag. Override to a specific stable release (e.g. `v2026.416.0`) or pin to a `sha-<commit>` tag.
   tag: "latest"
+  # -- Image manifest digest. When set, this takes precedence over `tag` and pins the deployed artifact immutably.
+  digest: ""
   # -- Image pull policy.
   pullPolicy: IfNotPresent
 
@@ -253,6 +255,44 @@ probes:
     periodSeconds: 10
     failureThreshold: 30
 
+# -- Worker StatefulSet probe configuration. The worker role does not bind the
+# HTTP port reliably during startup, but it does run the same Node entrypoint;
+# use a process check for the single StatefulSet pod and keep the API tier on
+# `probes.*` HTTP checks.
+workerProbes:
+  # -- Worker liveness probe.
+  liveness:
+    exec:
+      command:
+        - /bin/sh
+        - -c
+        - "grep -qa 'server/dist/index.js' /proc/[0-9]*/cmdline"
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 2
+    failureThreshold: 3
+  # -- Worker readiness probe.
+  readiness:
+    exec:
+      command:
+        - /bin/sh
+        - -c
+        - "grep -qa 'server/dist/index.js' /proc/[0-9]*/cmdline"
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  # -- Worker startup probe.
+  startup:
+    exec:
+      command:
+        - /bin/sh
+        - -c
+        - "grep -qa 'server/dist/index.js' /proc/[0-9]*/cmdline"
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 30
+
 # -- Node selector.
 nodeSelector: {}
 # -- Tolerations.
@@ -327,6 +367,22 @@ prometheusRule:
   backoffLimitExceededWindow: 5m
   # -- How long the BackoffLimitExceeded rate condition must persist before firing.
   backoffLimitExceededFor: 2m
+  # -- Warn when process_lost reaps exceed this many per rolling 24h (BLO-16184 numerator).
+  processLostWarnPerDay: 20
+  # -- How long the elevated process_lost daily count must persist before warning.
+  processLostElevatedFor: 10m
+  # -- Page when process_lost reaps exceed this many per rolling 24h.
+  processLostPagePerDay: 40
+  # -- How long the high process_lost daily count must be sustained before paging.
+  processLostPageFor: 2h
+  # -- Warn when the reaper gets more than this many null kube Job-status lists in 15m (blind-to-kube denominator guard: a low process_lost count is untrustworthy while this fires).
+  processLostLivenessNullWindowCount: 5
+  # -- How long the reaper-blind-to-kube condition must persist before warning.
+  processLostSignalBlindFor: 15m
+  # -- Warn when more than this many ac-* agent pods are Unschedulable for unschedulableFor (node-pool scheduling starvation, BLO-16224). Reuses agentJobNameRegex to match agent pods.
+  unschedulablePodThreshold: 0
+  # -- How long agent pods must stay Unschedulable before warning (transient blips self-resolve; this catches sustained starvation).
+  unschedulableFor: 15m
   # -- Additional PrometheusRule groups appended verbatim.
   additionalGroups: []
 

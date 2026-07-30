@@ -74,6 +74,11 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "PATCH", path: /^\/api\/issues\/[^/]+$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/approvals$/ },
 
+  // Work products: publish branch/commit/artifact metadata for completed work.
+  { method: "GET", path: /^\/api\/issues\/[^/]+\/work-products$/ },
+  { method: "POST", path: /^\/api\/issues\/[^/]+\/work-products$/ },
+  { method: "PATCH", path: /^\/api\/work-products\/[^/]+$/ },
+
   // Issue-thread interactions (suggest tasks, ask questions, request confirmation)
   { method: "GET", path: /^\/api\/issues\/[^/]+\/interactions(?:\/[^/]+)?$/ },
   { method: "POST", path: /^\/api\/issues\/[^/]+\/interactions$/ },
@@ -379,8 +384,14 @@ export function createFileSystemSandboxCallbackBridgeQueueClient(): SandboxCallb
     },
     readTextFile: async (remotePath) => await fs.readFile(remotePath, "utf8"),
     writeTextFile: async (remotePath, body) => {
+      const tempPath = `${remotePath}.tmp`;
       await fs.mkdir(path.posix.dirname(remotePath), { recursive: true });
-      await fs.writeFile(remotePath, body, "utf8");
+      try {
+        await fs.writeFile(tempPath, body, "utf8");
+        await fs.rename(tempPath, remotePath);
+      } finally {
+        await fs.rm(tempPath, { force: true }).catch(() => undefined);
+      }
     },
     writeResponseFile: async (responsePath, body, options = {}) => {
       const responseDir = path.posix.dirname(responsePath);
@@ -509,21 +520,31 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
     },
     writeTextFile: async (remotePath, body) => {
       const remoteDir = path.posix.dirname(remotePath);
-      const tempPath = `${remotePath}.paperclip-upload.b64`;
+      const uploadPath = `${remotePath}.paperclip-upload.b64`;
+      const decodedPath = `${remotePath}.paperclip-upload.tmp`;
       await runChecked(
         `prepare upload ${remotePath}`,
-        `mkdir -p ${shellQuote(remoteDir)} && rm -f ${shellQuote(tempPath)} && : > ${shellQuote(tempPath)}`,
+        `mkdir -p ${shellQuote(remoteDir)} && rm -f ${shellQuote(uploadPath)} ${shellQuote(decodedPath)} && : > ${shellQuote(uploadPath)}`,
       );
       const base64Body = toBuffer(Buffer.from(body, "utf8")).toString("base64");
       for (const chunk of base64Chunks(base64Body)) {
         await runChecked(
           `append upload chunk ${remotePath}`,
-          `printf '%s' ${shellQuote(chunk)} >> ${shellQuote(tempPath)}`,
+          `printf '%s' ${shellQuote(chunk)} >> ${shellQuote(uploadPath)}`,
         );
       }
       await runChecked(
         `finalize upload ${remotePath}`,
-        `base64 -d < ${shellQuote(tempPath)} > ${shellQuote(remotePath)} && rm -f ${shellQuote(tempPath)}`,
+        [
+          `base64 -d < ${shellQuote(uploadPath)} > ${shellQuote(decodedPath)}`,
+          "status=$?",
+          'if [ "$status" -eq 0 ]; then',
+          `  mv -f ${shellQuote(decodedPath)} ${shellQuote(remotePath)}`,
+          "  status=$?",
+          "fi",
+          `rm -f ${shellQuote(uploadPath)} ${shellQuote(decodedPath)}`,
+          'exit "$status"',
+        ].join("\n"),
       );
     },
     writeResponseFile: async (responsePath, body, options = {}) => {
@@ -930,8 +951,7 @@ export async function startSandboxCallbackBridgeServer(input: {
       [
         `mkdir -p ${shellQuote(directories.requestsDir)} ${shellQuote(directories.responsesDir)} ${shellQuote(directories.logsDir)}`,
         `rm -f ${shellQuote(directories.readyFile)} ${shellQuote(directories.pidFile)}`,
-        `nohup env ${Object.entries(env).map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")} ` +
-          `${shellQuote(nodeCommand)} ${shellQuote(remoteEntrypoint)} ` +
+        `nohup ${shellQuote(nodeCommand)} ${shellQuote(remoteEntrypoint)} ` +
           `>> ${shellQuote(directories.logFile)} 2>&1 < /dev/null &`,
         "pid=$!",
         `printf '%s\\n' \"$pid\" > ${shellQuote(directories.pidFile)}`,
@@ -941,6 +961,7 @@ export async function startSandboxCallbackBridgeServer(input: {
     cwd: input.remoteCwd,
     env: {
       [SANDBOX_EXEC_CHANNEL_ENV]: SANDBOX_EXEC_CHANNEL_BRIDGE,
+      ...env,
     },
     timeoutMs,
   });

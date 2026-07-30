@@ -14,8 +14,9 @@ Each fork is pinned by commit SHA in the Dockerfile's `ARG *_REF` lines.
 - Fork: <https://github.com/kkroo/paperclip-adapter-claude-k8s>
 - Upstream: <https://github.com/farhoodlabs/paperclip-adapter-claude-k8s>
 - What's vendored over upstream:
-  1. `job-manifest.js` — `write-prompt` init container mounts the `data`
-     PVC so it can `mkdir -p /paperclip/instances/.../run-logs/...`.
+  1. `job-manifest.js` — run-isolated jobs clone sources with a valid Git
+     `HEAD`, bootstrap a clean private workspace for generic non-repository
+     fallbacks, and create the isolated pod-log parent before `tee` starts.
   2. `execute.js` `tailPodLogFile` — stable-size drain loop + trailing
      `pendingLine` flush so cephfs propagation lag does not surface a
      successful run as `adapter_failed: "Failed to parse Claude JSON output"`.

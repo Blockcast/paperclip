@@ -7,15 +7,48 @@ import {
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
 
-const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?claude\s+login`?|login\s+required|requires\s+login|failed\s+to\s+authenticate|invalid\s+authentication\s+credentials|invalid_auth|invalid_credential)/i;
+const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|failed\s+to\s+authenticate|invalid\s+authentication\s+credentials|invalid_auth|invalid_credential|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
 const CLAUDE_GENERIC_AUTH_RE = /(?:unauthorized|authentication\s+(?:required|failed))/i;
 const CLAUDE_GENERIC_AUTH_CONTEXT_RE = /(?:claude|anthropic|oauth|api\s+error)/i;
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
 
 const CLAUDE_TRANSIENT_UPSTREAM_RE =
-  /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached)/i;
+  /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|capacity_retry_exhausted|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached)/i;
+const CLAUDE_PROVIDER_QUOTA_RE =
+  /(?:you(?:'|’)ve\s+hit\s+your\s+session\s+limit|session\s+limit\s+(?:reached|exceeded)|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached|servicequotaexceededexception)/i;
+const CLAUDE_MODEL_NOT_FOUND_RE =
+  /(?:\b404\b[\s\S]{0,120})?(?:model[\s_-]*(?:not[\s_-]*found|does not exist|unknown|invalid)|unknown[\s_-]*model)/i;
 const CLAUDE_EXTRA_USAGE_RESET_RE =
-  /(?:out\s+of\s+extra\s+usage|extra\s+usage|usage\s+limit\s+reached|usage\s+cap\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|claude\s+usage\s+limit\s+reached)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
+  /(?:you(?:'|’)ve\s+hit\s+your\s+session\s+limit|session\s+limit\s+(?:reached|exceeded)|out\s+of\s+extra\s+usage|extra\s+usage|usage\s+limit\s+reached|usage\s+cap\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|claude\s+usage\s+limit\s+reached)[\s\S]{0,120}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
+const CLAUDE_ABSOLUTE_RETRY_RE =
+  /(?:\b(?:resume_at|retry_not_before|retryNotBefore)\b[\\'"\s]*[:=][\\'"\s]*|\bcapacity\s+may\s+reset\s+at\s+)(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))/i;
+const CLAUDE_RELATIVE_RETRY_RE =
+  /\b(?:retry|try\s+again)(?:ing)?\s+in\s+(\d+(?:\.\d+)?)\s*(milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)\b/i;
+
+/**
+ * Sum the per-model usage ledger from a Claude CLI result event. The result
+ * event's top-level `usage` reflects only the main-loop message chain, so it
+ * undercounts output tokens whenever subagents or sidechains ran; `modelUsage`
+ * is the CLI's authoritative per-model accounting (it is what backs /cost).
+ * Cache-creation tokens are billed prompt tokens, so they count as input.
+ */
+export function claudeModelUsageTotals(modelUsage: unknown): UsageSummary | null {
+  const byModel = parseObject(modelUsage);
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cachedInputTokens = 0;
+  let sawEntry = false;
+  for (const value of Object.values(byModel)) {
+    const entry = parseObject(value);
+    if (Object.keys(entry).length === 0) continue;
+    sawEntry = true;
+    inputTokens += asNumber(entry.inputTokens, 0) + asNumber(entry.cacheCreationInputTokens, 0);
+    outputTokens += asNumber(entry.outputTokens, 0);
+    cachedInputTokens += asNumber(entry.cacheReadInputTokens, 0);
+  }
+  if (!sawEntry) return null;
+  return { inputTokens, outputTokens, cachedInputTokens };
+}
 
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
@@ -63,13 +96,15 @@ export function parseClaudeStreamJson(stdout: string) {
       model,
       costUsd: null as number | null,
       usage: null as UsageSummary | null,
+      usageBasis: null as "per_run" | null,
       summary: assistantTexts.join("\n\n").trim(),
       resultJson: null as Record<string, unknown> | null,
     };
   }
 
+  const modelUsageTotals = claudeModelUsageTotals(finalResult.modelUsage);
   const usageObj = parseObject(finalResult.usage);
-  const usage: UsageSummary = {
+  const usage: UsageSummary = modelUsageTotals ?? {
     inputTokens: asNumber(usageObj.input_tokens, 0),
     cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
     outputTokens: asNumber(usageObj.output_tokens, 0),
@@ -83,6 +118,9 @@ export function parseClaudeStreamJson(stdout: string) {
     model,
     costUsd,
     usage,
+    // modelUsage covers exactly this CLI invocation, so mark it per-run to
+    // keep the server from applying its session-cumulative delta heuristic.
+    usageBasis: "per_run" as const,
     summary,
     resultJson: finalResult,
   };
@@ -177,6 +215,23 @@ export function describeClaudeFailure(parsed: Record<string, unknown>): string |
   }
   if (detail) parts.push(detail);
   return parts.length > 1 ? parts.join(": ") : null;
+}
+
+export function isClaudeModelNotFoundError(input: {
+  parsed?: Record<string, unknown> | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): boolean {
+  const parsed = input.parsed ?? null;
+  const messages = [
+    input.errorMessage ?? "",
+    input.stdout ?? "",
+    input.stderr ?? "",
+    parsed ? asString(parsed.result, "") : "",
+    ...(parsed ? extractClaudeErrorMessages(parsed) : []),
+  ];
+  return messages.some((message) => CLAUDE_MODEL_NOT_FOUND_RE.test(message));
 }
 
 export function isClaudeMaxTurnsResult(parsed: Record<string, unknown> | null | undefined): boolean {
@@ -480,6 +535,33 @@ function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: 
   return retryAt;
 }
 
+function parseClaudeRetryTimestamp(value: unknown): Date | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const parsed = new Date(value.trim());
+  return Number.isFinite(parsed.getTime()) ? parsed : null;
+}
+
+function parseClaudeRelativeRetry(haystack: string, now: Date): Date | null {
+  const match = haystack.match(CLAUDE_RELATIVE_RETRY_RE);
+  if (!match) return null;
+
+  const amount = Number.parseFloat(match[1] ?? "");
+  const unit = (match[2] ?? "").toLowerCase();
+  if (!Number.isFinite(amount) || amount < 0) return null;
+
+  const multiplier = unit.startsWith("ms") || unit.startsWith("millisecond")
+    ? 1
+    : unit === "s" || unit.startsWith("sec")
+    ? 1_000
+    : unit === "m" || unit.startsWith("min")
+    ? 60_000
+    : unit === "h" || unit.startsWith("hr") || unit.startsWith("hour")
+    ? 3_600_000
+    : 86_400_000;
+  const retryAt = new Date(now.getTime() + amount * multiplier);
+  return Number.isFinite(retryAt.getTime()) ? retryAt : null;
+}
+
 export function extractClaudeRetryNotBefore(
   input: {
     parsed?: Record<string, unknown> | null;
@@ -489,10 +571,26 @@ export function extractClaudeRetryNotBefore(
   },
   now = new Date(),
 ): Date | null {
+  const parsed = input.parsed ?? null;
+  const structuredRetryAt = parsed
+    ? [parsed.retryNotBefore, parsed.retry_not_before, parsed.resumeAt, parsed.resume_at]
+        .map(parseClaudeRetryTimestamp)
+        .find((candidate): candidate is Date => candidate !== null) ?? null
+    : null;
+  if (structuredRetryAt) return structuredRetryAt;
+
   const haystack = buildClaudeTransientHaystack(input);
-  const match = haystack.match(CLAUDE_EXTRA_USAGE_RESET_RE);
-  if (!match) return null;
-  return parseClaudeResetClockTime(match[1] ?? "", now, match[2]);
+  const absoluteMatch = haystack.match(CLAUDE_ABSOLUTE_RETRY_RE);
+  const absoluteRetryAt = parseClaudeRetryTimestamp(absoluteMatch?.[1]);
+  if (absoluteRetryAt) return absoluteRetryAt;
+
+  const clockMatch = haystack.match(CLAUDE_EXTRA_USAGE_RESET_RE);
+  const clockRetryAt = clockMatch
+    ? parseClaudeResetClockTime(clockMatch[1] ?? "", now, clockMatch[2])
+    : null;
+  if (clockRetryAt) return clockRetryAt;
+
+  return parseClaudeRelativeRetry(haystack, now);
 }
 
 export function isClaudeTransientUpstreamError(input: {
@@ -515,5 +613,28 @@ export function isClaudeTransientUpstreamError(input: {
 
   const haystack = buildClaudeTransientHaystack(input);
   if (!haystack) return false;
+  if (isClaudeProviderQuotaError(input)) return false;
   return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
+}
+
+export function isClaudeProviderQuotaError(input: {
+  parsed?: Record<string, unknown> | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): boolean {
+  const parsed = input.parsed ?? null;
+  if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed) || isClaudePoisonedPreviousMessageIdError(parsed) || isClaudeImageProcessingError(parsed))) {
+    return false;
+  }
+  const loginMeta = detectClaudeLoginRequired({
+    parsed,
+    stdout: input.stdout ?? "",
+    stderr: input.stderr ?? "",
+  });
+  if (loginMeta.requiresLogin) return false;
+
+  const haystack = buildClaudeTransientHaystack(input);
+  if (!haystack) return false;
+  return CLAUDE_PROVIDER_QUOTA_RE.test(haystack);
 }

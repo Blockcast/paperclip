@@ -77,6 +77,7 @@ export function noticeMetadataReferencesRecoveryAction(
 export type SuccessfulRunHandoffDecision =
   | {
       kind: "enqueue";
+      targetAgentId: string;
       idempotencyKey: string;
       payload: Record<string, unknown>;
       contextSnapshot: Record<string, unknown>;
@@ -86,6 +87,25 @@ export type SuccessfulRunHandoffDecision =
       kind: "skip";
       reason: string;
     };
+
+const SUCCESSFUL_RUN_HANDOFF_VALID_PATH_SKIP_REASONS = new Set([
+  "issue has execution policy state",
+  "active routine continuation owns the next action",
+  "issue already has an active execution path",
+  "issue already has a queued or deferred wake",
+  "pending interaction or approval owns the next action",
+  "persisted issue monitor owns the next action",
+  "explicit blocker path owns the next action",
+  "open recovery issue owns the ambiguity",
+  "issue is under an active pause hold",
+  "corrective handoff wake already exists for this source run",
+]);
+
+export function isSuccessfulRunHandoffValidPathSkip(
+  decision: SuccessfulRunHandoffDecision,
+): decision is Extract<SuccessfulRunHandoffDecision, { kind: "skip" }> {
+  return decision.kind === "skip" && SUCCESSFUL_RUN_HANDOFF_VALID_PATH_SKIP_REASONS.has(decision.reason);
+}
 
 function metadataText(value: unknown, fallback = "unknown") {
   const text = typeof value === "string" ? value.trim() : value == null ? "" : String(value).trim();
@@ -301,6 +321,17 @@ function isGithubPrReviewRun(run: HeartbeatRunRow) {
   return reviewKind === "pr_review";
 }
 
+function hasPreservedMissingJobOutcome(run: HeartbeatRunRow) {
+  if (!run.resultJson || typeof run.resultJson !== "object" || Array.isArray(run.resultJson)) return false;
+  const recovery = (run.resultJson as Record<string, unknown>).externalLifecycleRecovery;
+  return Boolean(
+    recovery &&
+    typeof recovery === "object" &&
+    !Array.isArray(recovery) &&
+    (recovery as Record<string, unknown>).reason === "job_missing_recorded_outcome_preserved",
+  );
+}
+
 function isCommentDrivenWake(run: HeartbeatRunRow) {
   const context = readRecord(run.contextSnapshot);
   const wakeReason = readString(context.wakeReason);
@@ -324,6 +355,8 @@ export function buildSuccessfulRunHandoffInstruction(input: {
   const issueLabel = input.issueIdentifier ?? "this issue";
   return [
     `Your previous run on ${issueLabel} succeeded, but the issue is still in \`in_progress\` and Paperclip cannot identify a valid issue disposition.`,
+    "",
+    "This is a status-only retry to the original agent. Record a disposition; do not start new work.",
     "",
     "Resolve the missing disposition before creating or revising any new artifacts. Choose **exactly one** outcome and perform the matching Paperclip action:",
     "",
@@ -353,6 +386,7 @@ export function decideSuccessfulRunHandoff(input: {
   hasActiveExecutionPath: boolean;
   hasQueuedWake: boolean;
   hasPendingInteractionOrApproval: boolean;
+  hasPersistedMonitor: boolean;
   hasExplicitBlockerPath: boolean;
   hasOpenRecoveryIssue: boolean;
   hasPauseHold: boolean;
@@ -366,7 +400,7 @@ export function decideSuccessfulRunHandoff(input: {
   if (run.status !== "succeeded") return { kind: "skip", reason: "source run did not succeed" };
   if (isCorrectiveHandoffRun(run)) return { kind: "skip", reason: "source run is already a corrective handoff run" };
   if (isIssueMonitorMaintenanceRun(run)) return { kind: "skip", reason: "issue monitor run owns its own recovery path" };
-  if (isGithubPrReviewRun(run)) {
+  if (isGithubPrReviewRun(run) && !hasPreservedMissingJobOutcome(run)) {
     return { kind: "skip", reason: "successful PR review run already may have emitted an external side effect" };
   }
   if (isCommentDrivenWake(run)) return { kind: "skip", reason: "comment-driven wake already owns the next action" };
@@ -399,6 +433,7 @@ export function decideSuccessfulRunHandoff(input: {
   if (input.hasPendingInteractionOrApproval) {
     return { kind: "skip", reason: "pending interaction or approval owns the next action" };
   }
+  if (input.hasPersistedMonitor) return { kind: "skip", reason: "persisted issue monitor owns the next action" };
   if (input.hasExplicitBlockerPath) return { kind: "skip", reason: "explicit blocker path owns the next action" };
   if (input.hasOpenRecoveryIssue) return { kind: "skip", reason: "open recovery issue owns the ambiguity" };
   if (input.hasPauseHold) return { kind: "skip", reason: "issue is under an active pause hold" };
@@ -432,6 +467,7 @@ export function decideSuccessfulRunHandoff(input: {
 
   return {
     kind: "enqueue",
+    targetAgentId: run.agentId,
     idempotencyKey: buildFinishSuccessfulRunHandoffIdempotencyKey({
       issueId: issue.id,
       sourceRunId: run.id,

@@ -53,6 +53,7 @@ export function AuthPage() {
     onSuccess: async () => {
       setError(null);
       await queryClient.invalidateQueries({ queryKey: queryKeys.auth.session });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.health });
       await queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
       navigate(nextPath, { replace: true });
     },
@@ -76,10 +77,26 @@ export function AuthPage() {
     },
   });
 
+  const googleMutation = useMutation({
+    mutationFn: async () => authApi.signInOAuth2({ providerId: "dex", callbackURL: nextPath }),
+    onSuccess: ({ url }) => {
+      setError(null);
+      window.location.assign(url);
+    },
+    onError: (err) => {
+      setError(
+        err instanceof Error
+          ? `Google sign-in unavailable: ${err.message}`
+          : "Google sign-in unavailable.",
+      );
+    },
+  });
+
   const canSubmit =
     email.trim().length > 0 &&
     password.trim().length > 0 &&
     (mode === "sign_in" || (name.trim().length > 0 && password.trim().length >= 8));
+  const ssoPending = googleMutation.isPending || microsoftMutation.isPending;
 
   if (isSessionLoading) {
     return (
@@ -107,7 +124,7 @@ export function AuthPage() {
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
             {mode === "sign_in"
-              ? "Use your email and password to access this instance."
+              ? "Use team SSO or email and password to access this instance."
               : "Create an account for this instance. Email confirmation is not required in v1."}
           </p>
 
@@ -202,18 +219,32 @@ export function AuthPage() {
                 <span className="text-xs text-muted-foreground">or</span>
                 <div className="h-px flex-1 bg-border" />
               </div>
-              <Button
-                type="button"
-                variant="outline"
-                className="w-full"
-                disabled={microsoftMutation.isPending}
-                onClick={() => {
-                  setError(null);
-                  microsoftMutation.mutate();
-                }}
-              >
-                {microsoftMutation.isPending ? "Redirecting…" : "Sign in with Microsoft"}
-              </Button>
+              <div className="space-y-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full"
+                  disabled={ssoPending}
+                  onClick={() => {
+                    setError(null);
+                    googleMutation.mutate();
+                  }}
+                >
+                  {googleMutation.isPending ? "Redirecting…" : "Sign in with Google"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full"
+                  disabled={ssoPending}
+                  onClick={() => {
+                    setError(null);
+                    microsoftMutation.mutate();
+                  }}
+                >
+                  {microsoftMutation.isPending ? "Redirecting…" : "Sign in with Microsoft"}
+                </Button>
+              </div>
             </>
           )}
 

@@ -46,6 +46,7 @@ import type {
   ExternalObjectLivenessState,
   ExternalObjectMentionConfidence,
   ExternalObjectMentionSourceKind,
+  EnvSecretRefBinding,
 } from "@paperclipai/shared";
 export type { PluginLauncherRenderContextSnapshot } from "@paperclipai/shared";
 
@@ -303,8 +304,14 @@ export interface WorkerHostCallContext {
 export interface InitializeParams {
   /** Full plugin manifest snapshot. */
   manifest: PaperclipPluginManifestV1;
-  /** Resolved operator configuration (validated against `instanceConfigSchema`). */
+  /** Bootstrap configuration. Company-scoped config is read via `ctx.config.get(companyId)`. */
   config: Record<string, unknown>;
+  /**
+   * Sole configured company, when the host can prove this worker has exactly
+   * one company-scoped config. This scopes legacy setup-time host calls
+   * without exposing another company's configuration.
+   */
+  companyId?: string | null;
   /** Instance-level metadata. */
   instanceInfo: {
     /** UUID of this Paperclip instance. */
@@ -334,8 +341,10 @@ export interface InitializeResult {
  * @see PLUGIN_SPEC.md §13.4 — `configChanged`
  */
 export interface ConfigChangedParams {
-  /** The newly resolved configuration. */
+  /** The newly resolved company-scoped configuration. */
   config: Record<string, unknown>;
+  /** Company whose plugin config changed. */
+  companyId?: string | null;
 }
 
 /**
@@ -648,6 +657,107 @@ export interface PluginEnvironmentExecuteResult {
   metadata?: Record<string, unknown>;
 }
 
+export type PluginEnvironmentInteractiveSetupStatus =
+  | "starting"
+  | "waiting_for_user"
+  | "capturing"
+  | "promoted"
+  | "cancelled"
+  | "timed_out"
+  | "failed"
+  | "missing";
+
+export type PluginEnvironmentInteractiveSetupConnectionType =
+  | "ssh"
+  | (string & {});
+
+export type PluginEnvironmentTemplateRefKind =
+  | "snapshot"
+  | "image"
+  | "provider_template"
+  | "unknown"
+  | (string & {});
+
+export interface PluginEnvironmentInteractiveSetupConnectionSummary {
+  type: PluginEnvironmentInteractiveSetupConnectionType;
+  username?: string | null;
+  hostRedacted: boolean;
+  portRedacted: boolean;
+  commandRedacted?: boolean;
+  expiresAt?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PluginEnvironmentInteractiveSetupConnectionPayload {
+  type: PluginEnvironmentInteractiveSetupConnectionType;
+  command?: string | null;
+  token?: string | null;
+  expiresAt?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PluginEnvironmentInteractiveSetupSession {
+  providerLeaseId: string | null;
+  status: PluginEnvironmentInteractiveSetupStatus;
+  connectionSummary: PluginEnvironmentInteractiveSetupConnectionSummary | null;
+  connectionPayload?: PluginEnvironmentInteractiveSetupConnectionPayload | null;
+  expiresAt?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PluginEnvironmentStartInteractiveSetupParams extends PluginEnvironmentDriverBaseParams {
+  sessionId: string;
+  sourceTemplateRef?: string | null;
+  sourceTemplateKind?: PluginEnvironmentTemplateRefKind | null;
+  connectionExpiresInMinutes?: number | null;
+  expiresAt?: string | null;
+}
+
+export interface PluginEnvironmentGetInteractiveSetupParams extends PluginEnvironmentDriverBaseParams {
+  providerLeaseId: string | null;
+  setupMetadata?: Record<string, unknown>;
+  includeConnectionPayload?: boolean;
+  connectionExpiresInMinutes?: number | null;
+}
+
+export interface PluginEnvironmentCaptureTemplateParams extends PluginEnvironmentDriverBaseParams {
+  providerLeaseId: string | null;
+  setupMetadata?: Record<string, unknown>;
+  sourceTemplateRef?: string | null;
+  previousTemplateRef?: string | null;
+  templateLabel?: string | null;
+  timeoutMs?: number | null;
+}
+
+export interface PluginEnvironmentCaptureTemplateResult {
+  templateRef: string;
+  templateKind: PluginEnvironmentTemplateRefKind;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PluginEnvironmentCancelInteractiveSetupParams extends PluginEnvironmentDriverBaseParams {
+  providerLeaseId: string | null;
+  setupMetadata?: Record<string, unknown>;
+  reason?: string | null;
+}
+
+export interface PluginEnvironmentCancelInteractiveSetupResult {
+  status: Extract<PluginEnvironmentInteractiveSetupStatus, "cancelled" | "timed_out" | "failed" | "missing">;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PluginEnvironmentDeleteTemplateParams extends PluginEnvironmentDriverBaseParams {
+  templateRef: string;
+  templateKind?: PluginEnvironmentTemplateRefKind;
+  metadata?: Record<string, unknown>;
+  reason?: string | null;
+}
+
+export interface PluginEnvironmentDeleteTemplateResult {
+  deleted: boolean;
+  metadata?: Record<string, unknown>;
+}
+
 // ---------------------------------------------------------------------------
 // UI launcher / modal host interaction payloads
 // ---------------------------------------------------------------------------
@@ -761,6 +871,26 @@ export interface HostToWorkerMethods {
     params: PluginEnvironmentExecuteParams,
     result: PluginEnvironmentExecuteResult,
   ];
+  environmentStartInteractiveSetup: [
+    params: PluginEnvironmentStartInteractiveSetupParams,
+    result: PluginEnvironmentInteractiveSetupSession,
+  ];
+  environmentGetInteractiveSetup: [
+    params: PluginEnvironmentGetInteractiveSetupParams,
+    result: PluginEnvironmentInteractiveSetupSession,
+  ];
+  environmentCaptureTemplate: [
+    params: PluginEnvironmentCaptureTemplateParams,
+    result: PluginEnvironmentCaptureTemplateResult,
+  ];
+  environmentCancelInteractiveSetup: [
+    params: PluginEnvironmentCancelInteractiveSetupParams,
+    result: PluginEnvironmentCancelInteractiveSetupResult,
+  ];
+  environmentDeleteTemplate: [
+    params: PluginEnvironmentDeleteTemplateParams,
+    result: PluginEnvironmentDeleteTemplateResult,
+  ];
 }
 
 /** Union of all host→worker method names. */
@@ -795,6 +925,11 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] 
   "environmentDestroyLease",
   "environmentRealizeWorkspace",
   "environmentExecute",
+  "environmentStartInteractiveSetup",
+  "environmentGetInteractiveSetup",
+  "environmentCaptureTemplate",
+  "environmentCancelInteractiveSetup",
+  "environmentDeleteTemplate",
 ] as const;
 
 // ---------------------------------------------------------------------------
@@ -809,7 +944,7 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] 
  */
 export interface WorkerToHostMethods {
   // Config
-  "config.get": [params: Record<string, never>, result: Record<string, unknown>];
+  "config.get": [params: { companyId?: string }, result: Record<string, unknown>];
 
   // Trusted local folders
   "localFolders.declarations": [
@@ -985,7 +1120,7 @@ export interface WorkerToHostMethods {
 
   // Secrets
   "secrets.resolve": [
-    params: { secretRef: string },
+    params: { secretRef: string | EnvSecretRefBinding; companyId?: string; configPath?: string },
     result: string,
   ];
   "secrets.list": [
@@ -1200,6 +1335,12 @@ export interface WorkerToHostMethods {
       originKind?: string;
       originKindPrefix?: string;
       originId?: string;
+      /**
+       * Filter by the secondary origin dedup key (see `issues.create`'s
+       * `originFingerprint`). Used to look up a cover/incident by its
+       * dedup slot rather than by the specific instance that created it.
+       */
+      originFingerprint?: string;
       status?: string;
       includePluginOperations?: boolean;
       limit?: number;
@@ -1255,6 +1396,16 @@ export interface WorkerToHostMethods {
       originKind?: string | null;
       originId?: string | null;
       originRunId?: string | null;
+      /**
+       * Secondary dedup key, orthogonal to `originId`. A partial unique
+       * index scoped to a specific `originKind` on
+       * `(companyId, originKind, originFingerprint)` lets a plugin claim a
+       * dedup slot atomically: the losing concurrent `create()` call
+       * rejects with a 23505 conflict instead of both callers reading "no
+       * existing row" and creating duplicates. Leave unset for the default
+       * `'default'` column value (excluded from every such partial index).
+       */
+      originFingerprint?: string | null;
       blockedByIssueIds?: string[];
       labelIds?: string[];
       executionWorkspaceId?: string | null;
@@ -1491,8 +1642,26 @@ export interface WorkerToHostMethods {
     result: Agent,
   ];
   "agents.invoke": [
-    params: { agentId: string; companyId: string; prompt: string; reason?: string },
-    result: { runId: string },
+    params: {
+      agentId: string;
+      companyId: string;
+      prompt: string;
+      reason?: string;
+      /**
+       * Stable identifier for the unit of work this invoke represents, e.g.
+       * `pr_review:<repo>:<number>`. Wakes carrying different task keys are
+       * never coalesced into one another's runs; wakes sharing a task key are.
+       * Omit only when every invoke is genuinely independent work.
+       */
+      taskKey?: string;
+      /**
+       * Delivery-level dedup key, e.g. a GitHub `x-github-delivery` GUID.
+       * A repeat invoke with the same key returns the original run instead of
+       * queueing a second one.
+       */
+      idempotencyKey?: string;
+    },
+    result: { runId: string; deduplicated?: boolean },
   ];
   "agents.updateAdapterOverrides": [
     params: { agentId: string; companyId: string; overrides: Record<string, unknown> | null },

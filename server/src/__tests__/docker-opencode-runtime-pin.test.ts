@@ -4,7 +4,8 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
-const dockerfile = readFileSync(path.join(repoRoot, "Dockerfile"), "utf8");
+const serverDockerfile = readFileSync(path.join(repoRoot, "Dockerfile"), "utf8");
+const runtimeDockerfile = readFileSync(path.join(repoRoot, "Dockerfile.runtime"), "utf8");
 const dockerWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/docker.yml"), "utf8");
 const dockerAgentWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/docker-agent.yml"), "utf8");
 const dockerDesignerWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/docker-designer.yml"), "utf8");
@@ -12,80 +13,118 @@ const agentRuntimeImagesWorkflow = readFileSync(
   path.join(repoRoot, ".github/workflows/agent-runtime-images.yml"),
   "utf8",
 );
+const agentRuntimeBake = readFileSync(
+  path.join(repoRoot, "docker/agent-runtime/buildx-bake.hcl"),
+  "utf8",
+);
 const designerDockerfile = readFileSync(path.join(repoRoot, "packages/services/designer/Dockerfile"), "utf8");
 const designerPackageLock = readFileSync(path.join(repoRoot, "packages/services/designer/package-lock.json"), "utf8");
 
 describe("production Dockerfile k8s adapter runtime pins", () => {
   it("pins opencode-ai and asserts the installed version", () => {
-    expect(dockerfile).toContain("ARG OPENCODE_AI_VERSION=1.15.12");
-    expect(dockerfile).toContain("reasoning output items");
-    expect(dockerfile).toContain("UnknownError/exit 1");
-    expect(dockerfile).toContain('"opencode-ai@${OPENCODE_AI_VERSION}"');
-    expect(dockerfile).toContain('test "$(opencode --version)" = "${OPENCODE_AI_VERSION}"');
-    expect(dockerfile).not.toMatch(/npm install[^\n]*\sopencode-ai(?:\s|\\)/);
+    expect(runtimeDockerfile).toContain("ARG OPENCODE_AI_VERSION=1.15.12");
+    expect(runtimeDockerfile).toContain("reasoning output items");
+    expect(runtimeDockerfile).toContain("UnknownError/exit 1");
+    expect(runtimeDockerfile).toContain('"opencode-ai@${OPENCODE_AI_VERSION}"');
+    expect(runtimeDockerfile).toContain('test "$(opencode --version)" = "${OPENCODE_AI_VERSION}"');
+    expect(runtimeDockerfile).not.toMatch(/npm install[^\n]*\sopencode-ai(?:\s|\\)/);
   });
 
-  it("vendors the claude_k8s adapter commit with shared MCP baseline injection and resume guard", () => {
-    expect(dockerfile).toContain("ARG CLAUDE_K8S_REF=63d00ecf69dc4cdd35259772d7e10152e6145f56");
-    expect(dockerfile).toContain("always materialize the shared MCP baseline");
-    expect(dockerfile).toContain("Fixes BackendEngineerGo/Ally missing paperclip/hindsight/gbrain/linear/etc.");
-    expect(dockerfile).toContain("only pass --resume to Claude when the");
-    expect(dockerfile).toContain("No conversation found with session ID");
-    expect(dockerfile).toContain("split pod scheduling and startup waits");
-    expect(dockerfile).toContain("k8s_pod_schedule_failed");
-    expect(dockerfile).toContain("add 1M model IDs");
-    expect(dockerfile).toContain("stale non-1M sessions");
-    expect(dockerfile).toContain("add Claude Sonnet 5 model IDs");
-    expect(dockerfile).toContain("pack-verifies");
-    expect(dockerfile).toContain("per-agent Penstock session identity");
-    expect(dockerfile).toContain("ANTHROPIC_CUSTOM_HEADERS");
-    expect(dockerfile).toContain("maxConsecutiveFailedResumes");
-    expect(dockerfile).toContain("K8S_AGENT_SESSION_POLICY");
-    expect(dockerfile).toContain("omit pod-level fsGroup from");
-    expect(dockerfile).toContain("Manifest suite 141/141");
+  it("vendors the claude_k8s adapter commit with runtime isolation, Penstock retry hints, Opus 5, and run-cwd diagnostics", () => {
+    expect(serverDockerfile).toContain("ARG CLAUDE_K8S_REF=c9b3b2c1c979d2db121f0c1129a06a38356678e7");
+    expect(serverDockerfile).toContain("model-only commit based on the previous");
+    expect(serverDockerfile).toContain("without bundling later retry-semantics changes");
+    expect(serverDockerfile).toContain("bound the pre-Job live-Job list to 15 seconds");
+    expect(serverDockerfile).toContain("PEN-1305 PreToolUse env-guard");
+    expect(serverDockerfile).toContain("always materialize the shared MCP baseline");
+    expect(serverDockerfile).toContain("Fixes BackendEngineerGo/Ally missing paperclip/hindsight/gbrain/linear/etc.");
+    expect(serverDockerfile).toContain("only pass --resume to Claude when the");
+    expect(serverDockerfile).toContain("No conversation found with session ID");
+    expect(serverDockerfile).toContain("split pod scheduling and startup waits");
+    expect(serverDockerfile).toContain("k8s_pod_schedule_failed");
+    expect(serverDockerfile).toContain("add 1M model IDs");
+    expect(serverDockerfile).toContain("stale non-1M sessions");
+    expect(serverDockerfile).toContain("add Claude Sonnet 5 model IDs");
+    expect(serverDockerfile).toContain("pack-verifies");
+    expect(serverDockerfile).toContain("per-agent Penstock session identity");
+    expect(serverDockerfile).toContain("ANTHROPIC_CUSTOM_HEADERS");
+    expect(serverDockerfile).toContain("maxConsecutiveFailedResumes");
+    expect(serverDockerfile).toContain("K8S_AGENT_SESSION_POLICY");
+    expect(serverDockerfile).toContain("omit pod-level fsGroup from");
+    expect(serverDockerfile).toContain("Manifest suite 141/141");
+    expect(serverDockerfile).toContain("acknowledge the created Job name");
+    expect(serverDockerfile).toContain("k8s_job_identity_unacknowledged");
+    expect(serverDockerfile).toContain("server-owned runtime");
+    expect(serverDockerfile).toContain("independent");
+    expect(serverDockerfile).toContain("generic non-Git fallback workspace");
+    expect(serverDockerfile).toContain("isolated pod-log parent");
+    expect(serverDockerfile).toContain("preserve Penstock's structured `resume_at`");
+    expect(serverDockerfile).toContain("BLO-16219");
+    expect(serverDockerfile).toContain("tmpRoot sibling of homeRoot/sessionRoot/cacheRoot/workspaceRoot");
+    expect(serverDockerfile).toContain("emit isolated-start and");
+    expect(serverDockerfile).toContain("fail closed on live Jobs with unknown isolation metadata");
+    expect(serverDockerfile).toContain("keep telemetry non-fatal");
+    expect(serverDockerfile).toContain("map legacy `isolated` labels");
+    expect(serverDockerfile).toContain("stable run root before deleting/recloning");
+    expect(serverDockerfile).toContain("getcwd() /");
+    expect(serverDockerfile).toContain("redacted failed-pod container log tail");
+    expect(serverDockerfile).toContain("execute/job-manifest suite 230/230");
   });
 
-  it("vendors the opencode_k8s adapter commit with crash, runtime-cache, MCP header, pod-stderr, startup-wait, opencode-db, chunkTimeout, budget-cap, compact-threshold, and turn-zero-snapshot fixes", () => {
-    expect(dockerfile).toContain("ARG OPENCODE_K8S_REF=010f0e7e6f9058b887ec3e82d91e1ceb34f691ca");
-    expect(dockerfile).toContain("disable opencode's turn-zero workspace");
-    expect(dockerfile).toContain("snapshot: false");
-    expect(dockerfile).toContain("opencode config/auth writers respect XDG_*");
-    expect(dockerfile).toContain("reserve opencode XDG config/data/state onto the");
-    expect(dockerfile).toContain("type-crash");
-    expect(dockerfile).toContain("5-strike adapter crashloop circuit-breaker");
-    expect(dockerfile).toContain("writable home (/paperclip/.runtime-cache)");
-    expect(dockerfile).toContain("EACCES mkdir '/runtime-cache'");
-    expect(dockerfile).toContain("preserve headers when translating Claude-style");
-    expect(dockerfile).toContain("Bearer-protected gbrain connects");
-    expect(dockerfile).toContain("recover the failed");
-    expect(dockerfile).toContain("pod's container stderr");
-    expect(dockerfile).toContain("PEN-389");
-    expect(dockerfile).toContain("mount a per-agent");
-    expect(dockerfile).toContain("/runtime-cache emptyDir in opencode_k8s Jobs");
-    expect(dockerfile).toContain("Chrome BrowserMetrics");
-    expect(dockerfile).toContain("reserve the runtime-cache env keys");
-    expect(dockerfile).toContain("stale /paperclip/.runtime-cache overrides");
-    expect(dockerfile).toContain("split the opencode pod schedule wait");
-    expect(dockerfile).toContain("bounded 10m startup window");
-    expect(dockerfile).toContain("reset the per-agent opencode.db");
-    expect(dockerfile).toContain("session_message.seq");
-    expect(dockerfile).toContain("no-task workspace_subpath runs");
-    expect(dockerfile).toContain("shared _no_task_ DB");
-    expect(dockerfile).toContain("size exceeds 500 MiB");
-    expect(dockerfile).toContain("chunkTimeout=240s");
-    expect(dockerfile).toContain("Stream idle timeout - partial response");
-    expect(dockerfile).toContain("errorCode=budget_exceeded");
-    expect(dockerfile).toContain("model-aware proactive compact thresholds");
-    expect(dockerfile).toContain("adapterConfig.compactThreshold");
-    expect(dockerfile).toContain("opencode_k8s session management");
-    expect(dockerfile).toContain("x-penstock-session: agent:<name>");
-    expect(dockerfile).toContain("omit pod-level fsGroup from");
-    expect(dockerfile).toContain("Manifest suite 113/113");
+  it("vendors the opencode_k8s adapter commit with runtime isolation, the env-dump deny, and Opus 5", () => {
+    expect(serverDockerfile).toContain("ARG OPENCODE_K8S_REF=3ab75fb6893d3f2eed26b38a830f1a48bd1f35c0");
+    expect(serverDockerfile).toContain("add anthropic/claude-opus-5 to the");
+    expect(serverDockerfile).toContain("bound the pre-Job live-Job list to 15 seconds");
+    expect(serverDockerfile).toContain("PEN-1305 permission.bash env-dump deny");
+    expect(serverDockerfile).toContain("disable opencode's turn-zero workspace");
+    expect(serverDockerfile).toContain("snapshot: false");
+    expect(serverDockerfile).toContain("opencode config/auth writers respect XDG_*");
+    expect(serverDockerfile).toContain("reserve opencode XDG config/data/state onto the");
+    expect(serverDockerfile).toContain("type-crash");
+    expect(serverDockerfile).toContain("5-strike adapter crashloop circuit-breaker");
+    expect(serverDockerfile).toContain("writable home (/paperclip/.runtime-cache)");
+    expect(serverDockerfile).toContain("EACCES mkdir '/runtime-cache'");
+    expect(serverDockerfile).toContain("preserve headers when translating Claude-style");
+    expect(serverDockerfile).toContain("Bearer-protected gbrain connects");
+    expect(serverDockerfile).toContain("recover the failed");
+    expect(serverDockerfile).toContain("pod's container stderr");
+    expect(serverDockerfile).toContain("PEN-389");
+    expect(serverDockerfile).toContain("mount a per-agent");
+    expect(serverDockerfile).toContain("/runtime-cache emptyDir in opencode_k8s Jobs");
+    expect(serverDockerfile).toContain("Chrome BrowserMetrics");
+    expect(serverDockerfile).toContain("reserve the runtime-cache env keys");
+    expect(serverDockerfile).toContain("stale /paperclip/.runtime-cache overrides");
+    expect(serverDockerfile).toContain("split the opencode pod schedule wait");
+    expect(serverDockerfile).toContain("bounded 10m startup window");
+    expect(serverDockerfile).toContain("reset the per-agent opencode.db");
+    expect(serverDockerfile).toContain("session_message.seq");
+    expect(serverDockerfile).toContain("no-task workspace_subpath runs");
+    expect(serverDockerfile).toContain("shared _no_task_ DB");
+    expect(serverDockerfile).toContain("size exceeds 500 MiB");
+    expect(serverDockerfile).toContain("chunkTimeout=240s");
+    expect(serverDockerfile).toContain("Stream idle timeout - partial response");
+    expect(serverDockerfile).toContain("errorCode=budget_exceeded");
+    expect(serverDockerfile).toContain("model-aware proactive compact thresholds");
+    expect(serverDockerfile).toContain("adapterConfig.compactThreshold");
+    expect(serverDockerfile).toContain("opencode_k8s session management");
+    expect(serverDockerfile).toContain("x-penstock-session: agent:<name>");
+    expect(serverDockerfile).toContain("omit pod-level fsGroup from");
+    expect(serverDockerfile).toContain("Manifest suite 113/113");
+    expect(serverDockerfile).toContain("typed run/workspace");
+    expect(serverDockerfile).toContain("key durable DBs by workspace");
+    expect(serverDockerfile).toContain("BLO-16219");
+    expect(serverDockerfile).toContain("run-isolation working-dir fix");
+    expect(serverDockerfile).toContain("private empty run workspace");
+    expect(serverDockerfile).not.toContain("opencode-k8s-run-isolation-working-dir.patch");
+    expect(serverDockerfile).not.toContain("git apply /vendor/opencode-k8s-run-isolation-working-dir.patch");
   });
 
   it("routes Paperclip Docker image builds through the DIND runner pool", () => {
     expect(dockerWorkflow.match(/runs-on: arc-dind/g)).toHaveLength(1);
     expect(dockerWorkflow.match(/runs-on: arc-deploy/g)).toHaveLength(1);
+    expect(dockerWorkflow).toContain(
+      "if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}",
+    );
     expect(dockerAgentWorkflow.match(/runs-on: arc-dind/g)).toHaveLength(1);
     expect(dockerAgentWorkflow).not.toContain("runs-on: arc-deploy");
     expect(dockerWorkflow).not.toContain("runs-on: self-hosted");
@@ -96,10 +135,24 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerAgentWorkflow).toContain("timeout-minutes: 90");
   });
 
-  it("publishes agent runtime images to a GHCR owner this repo token can write", () => {
-    expect(agentRuntimeImagesWorkflow).toContain("REGISTRY: ${{ vars.AGENT_RUNTIME_REGISTRY || 'ghcr.io/blockcast' }}");
-    expect(agentRuntimeImagesWorkflow).toContain("password: ${{ secrets.GITHUB_TOKEN }}");
+  it("includes resolved upstream image digests in stable image identities", () => {
+    expect(dockerWorkflow).toContain('RUNTIME_BASE_IMAGE=${{ steps.runtime.outputs.base_image }}');
+    expect(dockerAgentWorkflow).toContain(
+      'RUNTIME_BASE_IMAGE=${{ steps.bases.outputs.runtime_base_image }}',
+    );
+    expect(dockerAgentWorkflow).toContain('FFMPEG_IMAGE=${{ steps.bases.outputs.ffmpeg_image }}');
+  });
+
+  it("publishes agent runtime images to Harbor with a secondary GHA cache", () => {
+    expect(agentRuntimeImagesWorkflow).toContain(
+      "REGISTRY: ${{ vars.AGENT_RUNTIME_REGISTRY || 'harbor.blockcast.net/paperclip-agent' }}",
+    );
+    expect(agentRuntimeImagesWorkflow).toContain("password: ${{ secrets.HARBOR_PASSWORD }}");
     expect(agentRuntimeImagesWorkflow).not.toContain("REGISTRY: ghcr.io/paperclipai");
+    expect(agentRuntimeBake).toContain(
+      "type=registry,ref=${REGISTRY}/agent-runtime-base:buildcache-v1",
+    );
+    expect(agentRuntimeBake).toContain("type=gha,scope=agent-runtime-base");
   });
 
   it("keeps the designer Docker build context aligned with npm ci inputs", () => {

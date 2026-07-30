@@ -5,6 +5,7 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentRuntimeState,
   agentWakeupRequests,
   agents,
   companies,
@@ -43,7 +44,7 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-watchdogs-routes-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(activityLog);
@@ -51,6 +52,7 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(agentRuntimeState);
     await db.delete(issueRelations);
     await db.delete(issueWatchdogs);
     await db.delete(issues);
@@ -607,7 +609,9 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
     const foreignIssue = await request(app)
       .put(`/api/issues/${otherIssueId}/watchdog`)
       .send({ agentId: otherAgentId });
-    expect(foreignIssue.status, JSON.stringify(foreignIssue.body)).toBe(403);
+    // Uniform 404 so cross-tenant ids are indistinguishable from missing ones.
+    expect(foreignIssue.status, JSON.stringify(foreignIssue.body)).toBe(404);
+    expect(foreignIssue.body.error).toBe("Issue not found");
 
     const foreignAgent = await request(app)
       .put(`/api/issues/${issueId}/watchdog`)

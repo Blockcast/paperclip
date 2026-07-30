@@ -3,12 +3,26 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 const workflow = readFileSync(new URL("../.github/workflows/docker.yml", import.meta.url), "utf8");
+const imageHelper = readFileSync(
+  new URL("../deploy/helm/paperclip/templates/_helpers.tpl", import.meta.url),
+  "utf8",
+);
 
 function getDeployJobBlock() {
   const marker = "\n  deploy:\n";
   const start = workflow.indexOf(marker);
   assert.notEqual(start, -1, "docker.yml must define a deploy job");
   return workflow.slice(start + marker.length);
+}
+
+function getBuildJobBlock() {
+  const startMarker = "\n  build-and-push:\n";
+  const endMarker = "\n  deploy:\n";
+  const start = workflow.indexOf(startMarker);
+  const end = workflow.indexOf(endMarker, start + startMarker.length);
+  assert.notEqual(start, -1, "docker.yml must define a build-and-push job");
+  assert.notEqual(end, -1, "docker.yml must define a deploy job after build-and-push");
+  return workflow.slice(start + startMarker.length, end);
 }
 
 test("Docker deploy job timeout exceeds Helm wait timeout", () => {
@@ -26,4 +40,60 @@ test("Docker deploy job timeout exceeds Helm wait timeout", () => {
     jobTimeoutMinutes >= helmTimeoutMinutes + 5,
     `job timeout (${jobTimeoutMinutes}m) must leave cleanup margin after Helm timeout (${helmTimeoutMinutes}m)`,
   );
+});
+
+test("manual Docker deploys carry one full immutable SHA between jobs", () => {
+  const buildJob = getBuildJobBlock();
+  const deployJob = getDeployJobBlock();
+
+  assert.match(buildJob, /\^\[0-9a-fA-F\]\{40\}\$/);
+  assert.match(buildJob, /target_sha: \$\{\{ steps\.target\.outputs\.full \}\}/);
+  assert.match(buildJob, /ref: \$\{\{ steps\.target\.outputs\.full \}\}/);
+  assert.match(deployJob, /needs\.build-and-push\.outputs\.target_sha/);
+  assert.match(deployJob, /\[ "\$\{full\}" != "\$\{expected\}" \]/);
+});
+
+test("Docker deploy job provisions Buildx before inspecting the artifact", () => {
+  const deployJob = getDeployJobBlock();
+  const setup = deployJob.indexOf("uses: docker/setup-buildx-action@v4");
+  const inspect = deployJob.indexOf("docker buildx imagetools inspect");
+
+  assert.notEqual(setup, -1, "deploy job must provision Buildx");
+  assert.notEqual(inspect, -1, "deploy job must inspect the deploy artifact");
+  assert.ok(setup < inspect, "deploy job must provision Buildx before artifact inspection");
+});
+
+test("scheduled deploy gate recognizes a recent digest-pinned tip", () => {
+  const deployJob = getDeployJobBlock();
+  const gateStart = deployJob.indexOf("- name: Deploy gate (6h debounce on push)");
+  const gateEnd = deployJob.indexOf("\n      - name:", gateStart + 1);
+  assert.notEqual(gateStart, -1, "deploy job must define the debounce gate");
+  assert.notEqual(gateEnd, -1, "debounce gate must be followed by another step");
+  const gate = deployJob.slice(gateStart, gateEnd);
+
+  assert.match(gate, /docker buildx imagetools inspect "\$\{image\}"/);
+  assert.match(gate, /EXPECTED_IMG="harbor\.blockcast\.net\/paperclip\/paperclip@\$\{digest\}"/);
+  assert.match(gate, /\[ "\$RUNNING_IMG" = "\$EXPECTED_IMG" \]/);
+  assert.doesNotMatch(gate, /grep -qF "sha-\$\{TIP_SHORT\}"/);
+});
+
+test("Docker deploy binds Helm to the digest built for the approved SHA", () => {
+  const buildJob = getBuildJobBlock();
+  const deployJob = getDeployJobBlock();
+
+  assert.match(buildJob, /image_digest: \$\{\{ steps\.build\.outputs\.digest \}\}/);
+  assert.match(deployJob, /BUILD_RESULT: \$\{\{ needs\.build-and-push\.result \}\}/);
+  assert.match(deployJob, /EXPECTED_DIGEST: \$\{\{ needs\.build-and-push\.outputs\.image_digest \}\}/);
+  assert.match(deployJob, /success\)[\s\S]*EXPECTED_DIGEST[\s\S]*\^sha256:/);
+  assert.match(deployJob, /skipped\)[\s\S]*github\.event_name[\s\S]*schedule/);
+  assert.match(deployJob, /\[ "\$\{digest\}" != "\$\{EXPECTED_DIGEST\}" \]/);
+  assert.match(deployJob, /DIGEST: \$\{\{ steps\.artifact\.outputs\.digest \}\}/);
+  const render = deployJob.indexOf('rendered=$(helm template');
+  const upgrade = deployJob.indexOf('helm upgrade "${RELEASE}"');
+  assert.notEqual(render, -1, "deploy job must render the selected chart before upgrade");
+  assert.ok(render < upgrade, "deploy job must validate rendered images before upgrade");
+  assert.match(deployJob, /grep -Fvx "\$\{expected_image\}"/);
+  assert.match(deployJob, /--set-string image\.digest="\$\{DIGEST\}"/);
+  assert.match(imageHelper, /if \.Values\.image\.digest/);
+  assert.match(imageHelper, /printf "%s@%s" \.Values\.image\.repository \.Values\.image\.digest/);
 });

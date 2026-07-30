@@ -11,7 +11,7 @@ import type {
 import { SchemaConfigFields } from "@/adapters/schema-config-fields";
 import type { TranscriptEntry } from "@/adapters";
 import { RunTranscriptView } from "@/components/transcript/RunTranscriptView";
-import { AgentSkillsTab } from "@/pages/AgentDetail";
+import { AgentSkillsTab } from "@/pages/agent-skills/AgentSkillsTab";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { queryKeys } from "@/lib/queryKeys";

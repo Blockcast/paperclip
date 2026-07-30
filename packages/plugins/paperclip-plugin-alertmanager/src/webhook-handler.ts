@@ -19,7 +19,7 @@ import {
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { resolveAssigneeUserId } from "./owner-resolver.js";
-import { escalationDeadlineMs } from "./escalation.js";
+import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
 import {
   ORIGIN_KIND,
   type AlertStateRecord,
@@ -366,6 +366,20 @@ export async function handleResolved(
   } catch (err) {
     ctx.logger.warn(
       `Failed to apply resolution to issue ${existing.paperclipIssueId}: ${String(err)}`,
+    );
+  }
+
+  // BLO-16120: mark this source resolved within every cover it's a member
+  // of, and close each cover only once its last unresolved member resolves.
+  // Runs unconditionally (independent of autoCloseOnResolve) — the ladder
+  // exhausted because the alert kept firing, not because the underlying
+  // issue's status policy says so, so a resolved alert means its membership
+  // in the shared cover is done either way.
+  try {
+    await recordSourceResolvedAndCloseCovers(ctx, existing.paperclipCompanyId, existing.paperclipIssueId);
+  } catch (err) {
+    ctx.logger.warn(
+      `Failed to record resolution against escalation covers for issue ${existing.paperclipIssueId}: ${String(err)}`,
     );
   }
 
