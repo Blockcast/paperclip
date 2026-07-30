@@ -195,6 +195,31 @@ function hasAllyConsolidatedReviewHeader(body: string | null | undefined): boole
   return typeof body === "string" && /\bAlly\s*(?:—|-|:)\s*Consolidated\s+PR\s+Review\b/i.test(body);
 }
 
+// Narrow variant, used ONLY to disqualify an agent review request (BLO-18865).
+//
+// `hasAllyConsolidatedReviewHeader` scans the whole body, which is right at its
+// other call site (isActionablePrReviewComment, where a body carrying the header
+// counts as review feedback no matter who relayed it — a WIDENING use). Reusing
+// it here was too broad in the opposite direction: a legitimate marked request
+// that merely MENTIONS the review in prose ("your Ally — Consolidated PR Review
+// flagged X") was silently dropped. A silently dropped review request is the
+// exact failure this marker exists to fix, so the exclusion is scoped to the
+// shape Ally's own output actually has: the header on its own line, as a
+// Markdown heading or bold run.
+//
+// This keeps the #583 layer intact — Ally echoing the marker at byte 0 still
+// carries its `## Ally — Consolidated PR Review` line and is still rejected —
+// while a quoted (`> ## Ally — ...`) or indented copy reads as a quote, not as
+// Ally's output, and no longer suppresses a real request. The heading/bold
+// prefix is optional so a format change on Ally's side does not silently lapse
+// the guard; only a mid-line prose reference is let through.
+const ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN =
+  /^[ \t]{0,3}(?:#{1,6}[ \t]+|\*\*[ \t]*)?Ally[ \t]*(?:—|–|-|:)[ \t]*Consolidated[ \t]+PR[ \t]+Review\b/im;
+
+function hasAllyConsolidatedReviewHeading(body: string | null | undefined): boolean {
+  return typeof body === "string" && ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN.test(body);
+}
+
 // Explicit "a Paperclip agent is asking for review" marker (BLO-18865).
 //
 // Agents post PR comments through the Paperclip GitHub App, so their comment
@@ -225,9 +250,11 @@ function hasAllyConsolidatedReviewHeader(body: string | null | undefined): boole
 //      idempotency key — a self-refire loop with no dedup backstop. So: no
 //      `\s*` prefix, ever. A real requester controls its own body and can put
 //      the marker first.
-//   2. NEVER on Ally's own review output. A body carrying the consolidated
-//      review header is not a request regardless of any marker, so Ally
-//      echoing the marker into its own review verdict still enqueues nothing.
+//   2. NEVER on Ally's own review output. A body whose consolidated-review
+//      header stands on its own line is not a request regardless of any marker,
+//      so Ally echoing the marker into its own review verdict still enqueues
+//      nothing. See ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN for why this is
+//      matched on the heading shape rather than anywhere in the body.
 //
 // Trailing attributes are allowed (e.g. `<!-- paperclip:review-request
 // agent=cto -->`) so the marker can carry provenance without a parser change.
@@ -625,7 +652,7 @@ function resolveEventContext(
       const agentReviewRequest =
         commentAuthorIsReviewerBot &&
         hasPrReviewerAgentRequestMarker(commentBody) &&
-        !hasAllyConsolidatedReviewHeader(commentBody);
+        !hasAllyConsolidatedReviewHeading(commentBody);
       const reviewerRequest =
         (!commentAuthorIsReviewerBot || agentReviewRequest) &&
         hasPrReviewerRequestMention(commentBody);
@@ -2381,6 +2408,8 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
 export const __test_extractPaperclipIdentifiers = extractPaperclipIdentifiers;
 export const __test_hasPrReviewerRequestMention = hasPrReviewerRequestMention;
 export const __test_hasPrReviewerAgentRequestMarker = hasPrReviewerAgentRequestMarker;
+export const __test_hasAllyConsolidatedReviewHeading = hasAllyConsolidatedReviewHeading;
+export const __test_hasAllyConsolidatedReviewHeader = hasAllyConsolidatedReviewHeader;
 export const __test_verifyGithubSignature = verifyGithubSignature;
 export const __test_resolveEventContext = resolveEventContext;
 export const __test_shouldFirePrReviewerWake = shouldFirePrReviewerWake;

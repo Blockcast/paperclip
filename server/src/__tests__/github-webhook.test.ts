@@ -32,6 +32,8 @@ import {
   __test_isSelfReviewedPr,
   __test_hasPrReviewerRequestMention,
   __test_hasPrReviewerAgentRequestMarker,
+  __test_hasAllyConsolidatedReviewHeading,
+  __test_hasAllyConsolidatedReviewHeader,
   __test_resolveDependabotAlertContext,
   __test_resolveEventContext,
   __test_shouldFirePrReviewerWake,
@@ -555,6 +557,60 @@ describe("github-webhook pure helpers", () => {
 
     // And the original #583 bodies stay suppressed (no marker at all).
     expect(botComment(13, "Hey @allyblockcast[bot]! Before this PR can be reviewed...")).toBeNull();
+
+    // ...but a real request that merely REFERS to a past review in prose is
+    // still a request. The exclusion keys on Ally's own output shape (the
+    // header on its own line), not on the phrase appearing anywhere, so
+    // citing the review as context does not silently drop the ask.
+    expect(
+      botComment(
+        17,
+        "<!-- paperclip:review-request -->\n@ally re-review at head abc123 — your earlier Ally — Consolidated PR Review flagged the vault probe; that is fixed now.",
+      ),
+    ).not.toBeNull();
+
+    // A quoted copy of the header is likewise context, not Ally's output.
+    expect(
+      botComment(
+        18,
+        "<!-- paperclip:review-request -->\n@ally re-review at head abc123. For context:\n\n> ## Ally — Consolidated PR Review\n> Fix I1 before merge.\n",
+      ),
+    ).not.toBeNull();
+  });
+
+  it("scopes the consolidated-review exclusion to Ally's own output shape (BLO-18865)", () => {
+    // Ally's actual review opens with the header as a Markdown heading.
+    expect(__test_hasAllyConsolidatedReviewHeading("## Ally — Consolidated PR Review\n\nFindings...")).toBe(true);
+    expect(__test_hasAllyConsolidatedReviewHeading("# Ally - Consolidated PR Review")).toBe(true);
+    expect(__test_hasAllyConsolidatedReviewHeading("###### Ally: Consolidated PR Review")).toBe(true);
+    // Bold and bare-line variants stay excluded so a format change on Ally's
+    // side cannot silently lapse this layer.
+    expect(__test_hasAllyConsolidatedReviewHeading("**Ally — Consolidated PR Review**")).toBe(true);
+    expect(__test_hasAllyConsolidatedReviewHeading("Ally — Consolidated PR Review\n\nFindings...")).toBe(true);
+    // Still catches Ally echoing the marker at byte 0 -- the #583 layer.
+    expect(
+      __test_hasAllyConsolidatedReviewHeading(
+        "<!-- paperclip:review-request -->\n## Ally — Consolidated PR Review\n\n@ally ran 3 lenses.",
+      ),
+    ).toBe(true);
+
+    // A mid-line prose reference is a citation, not Ally's output.
+    expect(
+      __test_hasAllyConsolidatedReviewHeading("@ally re-review — your Ally — Consolidated PR Review flagged X"),
+    ).toBe(false);
+    // A blockquoted or indented copy is a quote, not Ally's output.
+    expect(__test_hasAllyConsolidatedReviewHeading("> ## Ally — Consolidated PR Review")).toBe(false);
+    expect(__test_hasAllyConsolidatedReviewHeading("    ## Ally — Consolidated PR Review")).toBe(false);
+    expect(__test_hasAllyConsolidatedReviewHeading(null)).toBe(false);
+    expect(__test_hasAllyConsolidatedReviewHeading(undefined)).toBe(false);
+
+    // The WHOLE-body helper keeps its broader behaviour: it gates a different
+    // call site (isActionablePrReviewComment), where a relayed review body must
+    // still count as review feedback whoever forwarded it.
+    expect(
+      __test_hasAllyConsolidatedReviewHeader("@ally re-review — your Ally — Consolidated PR Review flagged X"),
+    ).toBe(true);
+    expect(__test_hasAllyConsolidatedReviewHeader("> ## Ally — Consolidated PR Review")).toBe(true);
   });
 
   it("anchors the agent review-request marker to literal byte 0 of the body (BLO-18865)", () => {
