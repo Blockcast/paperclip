@@ -209,20 +209,32 @@ function hasAllyConsolidatedReviewHeader(body: string | null | undefined): boole
 // loop dead, and both matter — do not relax either without re-reading the
 // guard comment at the reviewerRequest assignment:
 //
-//   1. ANCHORED TO THE START of the body. The loop in #583 was driven by
-//      bot-authored bodies that mention the alias *somewhere* — a salutation,
-//      or the bot's own reply quoting the alias as a backtick example. A
-//      marker that Ally merely quotes back while explaining a request it is
-//      answering lands mid-body, never at offset 0, so a quoted marker
-//      cannot re-arm the trigger.
+//   1. ANCHORED TO LITERAL BYTE 0 of the body — not "the first non-whitespace
+//      character". The loop in #583 was driven by bot-authored bodies that
+//      mention the alias *somewhere* — a salutation, or the bot's own reply
+//      quoting the alias as an example. A marker Ally merely quotes back while
+//      explaining a request it is answering lands mid-body, so it cannot
+//      re-arm the trigger.
+//
+//      Allowing leading whitespace would reopen exactly that hole: four spaces
+//      at the start of a Markdown body is an indented CODE BLOCK, i.e. the
+//      canonical way a reviewer renders "here is the marker you should use".
+//      `    <!-- paperclip:review-request -->\n    @ally review` is a quoted
+//      example, but with `^\s*` it satisfies both this pattern and the alias
+//      mention, and each such comment carries a fresh comment-scoped
+//      idempotency key — a self-refire loop with no dedup backstop. So: no
+//      `\s*` prefix, ever. A real requester controls its own body and can put
+//      the marker first.
 //   2. NEVER on Ally's own review output. A body carrying the consolidated
 //      review header is not a request regardless of any marker, so Ally
 //      echoing the marker into its own review verdict still enqueues nothing.
 //
 // Trailing attributes are allowed (e.g. `<!-- paperclip:review-request
 // agent=cto -->`) so the marker can carry provenance without a parser change.
+// The token must be followed by whitespace or the closing `-->` so that a
+// longer lookalike token (`paperclip:review-request-something`) is not a match.
 const PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN =
-  /^\s*<!--\s*paperclip:review-request\b[^>]*-->/i;
+  /^<!--[ \t]*paperclip:review-request(?:[ \t][^>]*)?[ \t]*-->/i;
 
 function hasPrReviewerAgentRequestMarker(body: string | null | undefined): boolean {
   return typeof body === "string" && PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN.test(body);
@@ -422,13 +434,6 @@ interface ResolvedEventContext {
   commentBody?: string | null;
   commentAuthorLogin?: string | null;
   commentUrl?: string | null;
-  // BLO-18865: set when the review request came from a Paperclip AGENT (a
-  // reviewer-bot-authored comment carrying the explicit start-of-body marker)
-  // rather than from a human. Suppresses the author-assignee wake: the author
-  // IS the requester, so waking them is redundant, and a self-wake on
-  // "review requested" invites the requester to re-request — the #583 loop
-  // shape with the agent in the reviewer's seat.
-  agentReviewRequest?: boolean;
   // pull_request.closed only — merged-PR forward-capture (BLO-9117). Drives the
   // issue_pull_requests persist + authored-LOC enrichment. Author is
   // deliberately NOT captured: the link keys on the BLO- ref, never the author.
@@ -653,7 +658,6 @@ function resolveEventContext(
         commentAuthorLogin,
         prAuthorLogin: (issueUser?.login as string | undefined) ?? null,
         commentUrl,
-        agentReviewRequest: agentReviewRequest && reviewerRequest,
       };
     }
     case "pull_request_review": {
@@ -2115,16 +2119,30 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     // redundant. The author still gets woken by check_run/workflow_run on
     // terminal CI and by review-submitted/@ally feedback, as before.
     const synchronizeReviewerOnly = context.wakeReason === "github_pr_synchronized";
-    // BLO-18865: an agent-marker review request is reviewer-only for the same
-    // reason synchronize is — the requesting agent is the PR author, so the
-    // wake would tell it something it just did. It is also the loop guard: a
-    // self-wake reading "review requested on your PR" invites the agent to
-    // request again, which is #583 with the agent in the reviewer's seat. A
-    // HUMAN @ally request still wakes the author, as before.
+    // BLO-18865: a marker-carrying agent review request deliberately does NOT
+    // suppress the author wake, even though the requester is usually the PR
+    // author and the wake is then redundant.
+    //
+    // The marker proves only that the shared Paperclip GitHub App posted it —
+    // every agent shares that identity, so it carries no requester identity at
+    // all. Suppressing on it would also drop the author's notification when a
+    // MANAGER or a peer agent requests review on someone else's PR, which is
+    // the case the notification exists for. Trading a real notification for a
+    // redundant-wake saving is the wrong side of this issue: BLO-18865 exists
+    // because dropped review signals strand work for hours.
+    //
+    // Do not re-add suppression here on the marker alone. It needs a trusted
+    // requester identity (an outbound-comment record written by the run that
+    // posted the comment) checked against the matched issue's assignee; the
+    // marker's `agent=` attribute is self-asserted and is not that.
+    //
+    // Redundant self-wakes are already bounded: the author wake is
+    // comment-scoped-idempotent (one per request comment, replays skipped as
+    // duplicate_pr_author_wake), and the reason is "review requested", which
+    // no agent treats as an instruction to request review again. That is the
+    // same shape a human @ally request has always had.
     const suppressAuthorWake =
-      synchronizeReviewerOnly ||
-      context.wakeReason === "github_pr_converted_to_draft" ||
-      context.agentReviewRequest === true;
+      synchronizeReviewerOnly || context.wakeReason === "github_pr_converted_to_draft";
     if (
       eventName === "pull_request" &&
       synchronizeReviewerOnly &&
