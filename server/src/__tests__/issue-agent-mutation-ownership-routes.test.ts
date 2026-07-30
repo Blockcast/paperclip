@@ -945,8 +945,76 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
-  it("rejects non-mentioned peer agents from posting comments", async () => {
-    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+  // BLO-18906: recovery escalation reassigns the issue away from the previous
+  // owner, which costs it allow_self mid-run. The handoff grant restores exactly
+  // one capability — posting a comment — and nothing that changes issue state.
+  const recoveryHandoffDecide = async (input: { action: string }) => ({
+    allowed: input.action === "issue:comment",
+    action: input.action,
+    reason: input.action === "issue:comment" ? "allow_recovery_handoff_grant" : "deny_missing_grant",
+    explanation:
+      input.action === "issue:comment"
+        ? "Allowed by a recovery-handoff issue comment grant for the reassigned previous owner."
+        : "Missing permission.",
+  });
+
+  it("lets a recovery-transferred previous owner post its handoff comment", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+
+    const res = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Handoff: root cause is X, next step is Y." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "Handoff: root cause is X, next step is Y.",
+      expect.any(Object),
+      expect.any(Object),
+    );
+    // The comment must not drag the blocked issue back to todo.
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses reopen/resume from a recovery handoff grant instead of transitioning a blocked issue", async () => {
+    for (const transition of [{ reopen: true }, { resume: true }]) {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+      mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+
+      const res = await request(await createApp(ownerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Handoff plus a status grab.", ...transition });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Recovery handoff grant is comment-only");
+      expect(res.body.details).toMatchObject({ reason: "allow_recovery_handoff_grant" });
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    }
+  });
+
+  it("keeps mutation and deletion denied for a recovery handoff grant holder", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+
+    const patchRes = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo" });
+    expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(403);
+    expect(patchRes.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+
+    const deleteRes = await request(await createApp(ownerActor()))
+      .delete(`/api/issues/${issueId}`);
+    expect(deleteRes.status, JSON.stringify(deleteRes.body)).toBe(403);
+    expect(mockIssueService.remove).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-mentioned peer agents from posting comments", async () => {    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: input.action === "issue:read",
       action: input.action,
       reason: input.action === "issue:read" ? "allow_explicit_grant" : "deny_missing_grant",

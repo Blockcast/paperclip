@@ -3622,6 +3622,16 @@ export function issueRoutes(
     return decision !== true && decision.reason === "allow_issue_mention_grant";
   }
 
+  // A recovery-handoff grant (BLO-18906) is comment-only by construction: it
+  // exists so the agent a recovery transfer took the issue from can still write
+  // its diagnosis down. It must never carry a state transition, so the comment
+  // route strips reopen/resume for it on EVERY status — unlike the mention-grant
+  // neutering below, which only covers closed issues. Recovery leaves the issue
+  // `blocked`, and on a blocked issue `reopen: true` would move it to `todo`.
+  function isRecoveryHandoffGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    return decision !== true && decision.reason === "allow_recovery_handoff_grant";
+  }
+
   async function filterIssuesForActor<T extends Parameters<typeof decideIssueAccess>[1]>(req: Request, rows: T[]) {
     const decisions = await Promise.all(rows.map((issue) => decideIssueAccess(req, issue, "issue:read")));
     return rows.filter((_, index) => decisions[index]?.allowed);
@@ -10182,8 +10192,33 @@ export function issueRoutes(
       !reopenRequested &&
       !resumeRequested &&
       isIssueMentionGrantDecision(commentAccessDecision);
-    const effectiveReopenRequested = mentionGrantedPeerAgentCommentOnly ? false : reopenRequested;
-    const effectiveResumeRequested = mentionGrantedPeerAgentCommentOnly ? false : resumeRequested;
+    // Comment-only on every status, not just closed ones: recovery leaves the
+    // issue `blocked`, where an un-neutered `reopen` would transition it to
+    // `todo` — a status change the handoff grant must not confer (BLO-18906).
+    // Refuse explicitly rather than silently dropping the flag, and refuse here
+    // rather than deferring to assertAgentIssueMutationAllowed: that helper's
+    // isCurrentIssueExecutionRun bypass still matches the previous owner's stale
+    // execution lock, which would hand back the very transition recovery removed.
+    const recoveryHandoffGrantedCommentOnly =
+      req.actor.type === "agent" &&
+      isRecoveryHandoffGrantDecision(commentAccessDecision);
+    if (recoveryHandoffGrantedCommentOnly && (reopenRequested || resumeRequested)) {
+      res.status(403).json({
+        error: "Recovery handoff grant is comment-only",
+        details: {
+          issueId: issue.id,
+          assigneeAgentId: issue.assigneeAgentId,
+          actorAgentId: req.actor.agentId,
+          reason: "allow_recovery_handoff_grant",
+          hint: "Post the handoff evidence as a plain comment; the recovery owner controls status.",
+        },
+      });
+      return;
+    }
+    const commentOnlyGrantedPeerAgent =
+      mentionGrantedPeerAgentCommentOnly || recoveryHandoffGrantedCommentOnly;
+    const effectiveReopenRequested = commentOnlyGrantedPeerAgent ? false : reopenRequested;
+    const effectiveResumeRequested = commentOnlyGrantedPeerAgent ? false : resumeRequested;
     if (
       isClosed &&
       req.actor.type === "agent" &&
