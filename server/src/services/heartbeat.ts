@@ -14694,6 +14694,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // GC on every recurrence. Read before the Job delete below (staleKill) and
     // before the Job's TTL reaps its pods. Best-effort by construction: a null
     // here must never change how the run is finalized.
+    //
+    // This necessarily runs *before* the setRunStatusIfRunning compare-and-swap
+    // below, because its output feeds the resultJson that the CAS persists. So
+    // when two reaper passes race the same run, the loser also pays one capture
+    // before its CAS no-ops. That is deliberate: the reads are read-only and
+    // bounded, and paying a duplicate GET beats losing the artifact entirely,
+    // which is the failure mode this whole change exists to fix.
     const containerDiagnostics = terminalOutcome.status === "failed"
       ? await captureAgentJobFailureDiagnostics(input.run.id)
       : null;
