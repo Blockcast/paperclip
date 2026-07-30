@@ -34,6 +34,7 @@ import {
   resolveWorkspaceRuntimeReadinessTimeoutSec,
   resolveShell,
   sanitizeRuntimeServiceBaseEnv,
+  setSubmoduleInspectSettingsForTests,
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
   type RealizedExecutionWorkspace,
@@ -2415,15 +2416,12 @@ describe("realizeExecutionWorkspace", () => {
     // submodules are broken, so the run must survive it.
     const { repoRoot, submodulePath } = await createTempRepoWithSubmodule();
     const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-    const previous = {
-      timeout: process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS,
-      attempts: process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS,
-      delay: process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS,
-    };
-    // 1ms budget guarantees every attempt times out; short backoff keeps the test fast.
-    process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = "1";
-    process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS = "2";
-    process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS = "1";
+    // 1ms budget guarantees every attempt times out; short backoff keeps the test
+    // fast. Driven through the test-only seam, not the env overrides: a 1ms
+    // timeout is deliberately below what an operator can configure
+    // (WORKSPACE_SUBMODULE_INSPECT_MIN_TIMEOUT_MS), because a budget that small
+    // disables the check on every workspace rather than tuning it.
+    setSubmoduleInspectSettingsForTests({ timeoutMs: 1, attempts: 2, retryDelayMs: 1 });
 
     try {
       const realized = await realizeExecutionWorkspace({
@@ -2480,13 +2478,7 @@ describe("realizeExecutionWorkspace", () => {
       });
       expect(String(degradedOp?.metadata?.reason)).toContain("timed out after 1ms");
     } finally {
-      const restore = (name: string, value: string | undefined) => {
-        if (value === undefined) delete process.env[name];
-        else process.env[name] = value;
-      };
-      restore("PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS", previous.timeout);
-      restore("PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS", previous.attempts);
-      restore("PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS", previous.delay);
+      setSubmoduleInspectSettingsForTests(null);
     }
   }, 20_000);
 
@@ -2700,6 +2692,56 @@ describe("realizeExecutionWorkspace", () => {
 
       // Falls back to the 60s default, so the healthy checkout is inspected
       // normally rather than degrading on a 1ms timer.
+      expect(
+        realized.warnings.filter((warning) => warning.includes("Could not inspect git submodules")),
+      ).toEqual([]);
+      expect(
+        operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+      ).toBe(false);
+    } finally {
+      if (previousTimeout === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
+      else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = previousTimeout;
+    }
+  }, 20_000);
+
+  it("ignores an undersized submodule inspection timeout instead of turning the knob into a fail-open switch", async () => {
+    // A budget too small to ever complete fails open exactly like the oversized
+    // case above: every probe times out, so every workspace takes the degrade
+    // path and the submodule check stops running at all. `=60` -- meaning the
+    // documented 60s, in a field that takes milliseconds -- is the likeliest way
+    // to reach that state, so it must fall back rather than be honoured.
+    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const previousTimeout = process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
+    // Seconds-vs-milliseconds slip: the operator means 60s, the field takes ms.
+    process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = "60";
+
+    try {
+      const realized = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-tiny-override",
+          workspaceId: "workspace-submodule-tiny-override",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-tiny-override",
+          identifier: "PAP-SUBMODULE-TINY-OVERRIDE",
+          title: "Reject an undersized timeout override",
+        },
+        agent: {
+          id: "agent-submodule-tiny-override",
+          name: "Codex Coder",
+          companyId: "company-submodule-tiny-override",
+        },
+        recorder,
+      });
+
+      // Falls back to the 60s default, so the healthy checkout is inspected
+      // normally rather than degrading on a 60ms timer.
       expect(
         realized.warnings.filter((warning) => warning.includes("Could not inspect git submodules")),
       ).toEqual([]);

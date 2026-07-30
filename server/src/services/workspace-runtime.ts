@@ -169,17 +169,40 @@ const WORKSPACE_SUBMODULE_INSPECT_MAX_TIMEOUT_MS = 300_000;
 const WORKSPACE_SUBMODULE_INSPECT_MAX_ATTEMPTS = 5;
 const WORKSPACE_SUBMODULE_INSPECT_MAX_RETRY_DELAY_MS = 30_000;
 
+// Lower bound on the *timeout* override specifically. An oversized value and an
+// undersized one fail open identically -- every probe times out, so every
+// workspace takes the degrade path and the check stops running fleet-wide -- but
+// only the oversized end was guarded. A seconds-vs-milliseconds slip
+// (`...TIMEOUT_MS=60`, meaning the documented 60s) is the likeliest way to reach
+// that state, and it is indistinguishable from a deliberate tightening without a
+// floor.
+//
+// 5s sits below the measured cold worst case (5903ms, see above), so any smaller
+// budget cannot complete on a cold checkout and would degrade every first touch:
+// that is disabling the check, not tuning it. It is still ~3.7x warm p99
+// (1356ms), so it remains usable if an operator genuinely wants to tighten the
+// backstop during an incident.
+//
+// No floor on `attempts` or `retryDelayMs`: the minimum each can reach is 1, and
+// neither disables the check. `attempts=1` is a coherent "do not retry" choice
+// (the pre-BLO-18784 behaviour), and a 1ms backoff only retries sooner.
+const WORKSPACE_SUBMODULE_INSPECT_MIN_TIMEOUT_MS = 5_000;
+
 /**
  * Env overrides for the submodule-inspection budget. Read at call time so they
- * can be tuned on a running server without a deploy, and so tests can force a
- * timeout deterministically instead of waiting out a real stall.
+ * can be tuned on a running server without a deploy.
  *
- * Out-of-range values fall back to the default rather than clamping to `max`:
- * a value outside the operational range is a typo, and silently honouring
- * "some other number than the one you typed" is the same class of surprise as
- * the two truncation bugs called out below.
+ * Out-of-range values fall back to the default rather than clamping to the
+ * nearest bound: a value outside the operational range is a typo, and silently
+ * honouring "some other number than the one you typed" is the same class of
+ * surprise as the two truncation bugs called out below.
  */
-function readBoundedIntEnv(name: string, fallback: number, max: number): number {
+function readBoundedIntEnv(
+  name: string,
+  fallback: number,
+  bounds: { min?: number; max: number },
+): number {
+  const { min = 1, max } = bounds;
   const raw = process.env[name]?.trim();
   if (!raw) return fallback;
   const parsed = Number(raw);
@@ -189,6 +212,10 @@ function readBoundedIntEnv(name: string, fallback: number, max: number): number 
   // there) or skips the retry loop entirely. Both fail open silently, which is
   // the opposite of what an operator tuning this value would expect.
   if (!Number.isSafeInteger(parsed) || parsed <= 0) return fallback;
+  // Reject undersized values: a budget too small to ever complete makes every
+  // probe time out and takes the degrade path on a healthy checkout, which is
+  // the same fail-open as the oversized case below reached from the other end.
+  if (parsed < min) return fallback;
   // Reject oversized values for the same reason. Every one of these settings
   // feeds a `setTimeout`, and Node clamps any delay above `2^31 - 1` ms to *1ms*
   // with a `TimeoutOverflowWarning`. So a plausible-looking large override (an
@@ -198,23 +225,43 @@ function readBoundedIntEnv(name: string, fallback: number, max: number): number 
   return parsed;
 }
 
-function readSubmoduleInspectSettings(): { timeoutMs: number; attempts: number; retryDelayMs: number } {
+type SubmoduleInspectSettings = { timeoutMs: number; attempts: number; retryDelayMs: number };
+
+let submoduleInspectSettingsOverrideForTests: Partial<SubmoduleInspectSettings> | null = null;
+
+/**
+ * Test-only seam for the inspection budget. Tests need a timeout small enough to
+ * guarantee a stall, which is deliberately below what the env override accepts
+ * (see `WORKSPACE_SUBMODULE_INSPECT_MIN_TIMEOUT_MS`) -- so forcing a timeout must
+ * not go through the operator-facing path. Same convention as
+ * `resetRuntimeServicesForTests`: not reachable from configuration, which is the
+ * whole point of keeping it separate from the env overrides. Pass `null` to clear.
+ */
+export function setSubmoduleInspectSettingsForTests(override: Partial<SubmoduleInspectSettings> | null) {
+  submoduleInspectSettingsOverrideForTests = override;
+}
+
+function readSubmoduleInspectSettings(): SubmoduleInspectSettings {
   return {
     timeoutMs: readBoundedIntEnv(
       "PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS",
       WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS,
-      WORKSPACE_SUBMODULE_INSPECT_MAX_TIMEOUT_MS,
+      {
+        min: WORKSPACE_SUBMODULE_INSPECT_MIN_TIMEOUT_MS,
+        max: WORKSPACE_SUBMODULE_INSPECT_MAX_TIMEOUT_MS,
+      },
     ),
     attempts: readBoundedIntEnv(
       "PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS",
       WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS,
-      WORKSPACE_SUBMODULE_INSPECT_MAX_ATTEMPTS,
+      { max: WORKSPACE_SUBMODULE_INSPECT_MAX_ATTEMPTS },
     ),
     retryDelayMs: readBoundedIntEnv(
       "PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS",
       WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS,
-      WORKSPACE_SUBMODULE_INSPECT_MAX_RETRY_DELAY_MS,
+      { max: WORKSPACE_SUBMODULE_INSPECT_MAX_RETRY_DELAY_MS },
     ),
+    ...(submoduleInspectSettingsOverrideForTests ?? {}),
   };
 }
 
