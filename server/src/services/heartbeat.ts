@@ -286,7 +286,7 @@ import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
-import { recoveryService } from "./recovery/service.js";
+import { recoveryService, type RecoveryServiceTestHooks } from "./recovery/service.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
@@ -7586,6 +7586,13 @@ export interface HeartbeatServiceOptions {
    */
   workerBootAt?: Date;
   runtimeEnv?: Record<string, string | undefined>;
+  /** Test-only hooks for deterministic recovery race coverage. */
+  recoveryTestHooks?: RecoveryServiceTestHooks;
+  /** Test-only override for recovery wake dispatch without changing public wakeup behavior. */
+  recoveryEnqueueWakeupForTest?: (
+    agentId: string,
+    opts?: WakeupOptions,
+  ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -7711,7 +7718,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   };
   const budgets = budgetService(db, budgetHooks);
   const sweepWakePreflightGbrain = createServerGbrainClient();
-  const recovery = recoveryService(db, { enqueueWakeup });
+  const recovery = recoveryService(db, {
+    enqueueWakeup: options.recoveryEnqueueWakeupForTest ?? enqueueWakeup,
+    testHooks: options.recoveryTestHooks,
+  });
 
   function isPlanApprovalConfirmationPayload(payload: unknown) {
     const target = parseObject(parseObject(payload).target);
@@ -23683,6 +23693,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     reconcileStrandedAssignedIssues,
+
+    sweepRecoveryWakeOutbox: recovery.sweepRecoveryWakeOutbox,
 
     sweepStaleIssueLocks,
 

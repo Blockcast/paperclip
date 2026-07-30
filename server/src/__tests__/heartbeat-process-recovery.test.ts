@@ -41,6 +41,7 @@ import {
   issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
+  recoveryWakeOutbox,
   issueTreeHoldMembers,
   issueTreeHolds,
   issueWorkProducts,
@@ -7370,6 +7371,123 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(actions).toHaveLength(1);
     expect(actions[0]?.attemptCount).toBe(8);
     await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+  });
+
+  it("rolls back source-scoped recovery action and wake outbox rows when the blocked-status CAS loses", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "adapter_exit_code",
+    });
+    const racingHeartbeat = createHeartbeat({
+      recoveryTestHooks: {
+        beforeStrandedEscalationStatusCas: async ({ issueId: hookIssueId }) => {
+          if (hookIssueId !== issueId) return;
+          await db
+            .update(issues)
+            .set({ status: "in_review", updatedAt: new Date("2026-03-19T00:06:00.000Z") })
+            .where(eq(issues.id, hookIssueId));
+        },
+      },
+    });
+
+    const result = await racingHeartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_review");
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(actions).toHaveLength(0);
+
+    const outboxRows = await db
+      .select()
+      .from(recoveryWakeOutbox)
+      .where(and(eq(recoveryWakeOutbox.companyId, companyId), eq(recoveryWakeOutbox.sourceIssueId, issueId)));
+    expect(outboxRows).toHaveLength(0);
+
+    const recoveryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.reason, "source_scoped_recovery_action")));
+    expect(recoveryWakeups).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+  });
+
+  it("keeps a committed recovery wake recoverable when post-commit dispatch fails", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "adapter_exit_code",
+    });
+    const failingRecoveryWakeup = vi.fn(async () => {
+      throw new Error("simulated recovery wake dispatch crash");
+    });
+    const failingHeartbeat = createHeartbeat({
+      recoveryEnqueueWakeupForTest: failingRecoveryWakeup,
+    });
+
+    const result = await failingHeartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+    expect(failingRecoveryWakeup).toHaveBeenCalledTimes(1);
+
+    const queuedOutbox = await waitForValue(async () => {
+      const rows = await db
+        .select()
+        .from(recoveryWakeOutbox)
+        .where(and(eq(recoveryWakeOutbox.companyId, companyId), eq(recoveryWakeOutbox.sourceIssueId, issueId)));
+      const row = rows[0] ?? null;
+      return row?.status === "queued" && row.attempts === 1 ? row : null;
+    });
+    expect(queuedOutbox.lastError).toContain("simulated recovery wake dispatch crash");
+
+    const wakeupsBeforeRetry = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.reason, "source_scoped_recovery_action")));
+    expect(wakeupsBeforeRetry).toHaveLength(0);
+
+    await db
+      .update(recoveryWakeOutbox)
+      .set({ nextAttemptAt: new Date(Date.now() - 1_000) })
+      .where(eq(recoveryWakeOutbox.id, queuedOutbox.id));
+
+    const deliveryHeartbeat = createHeartbeat({ skipQueuedRunDispatch: true });
+    await expect(deliveryHeartbeat.sweepRecoveryWakeOutbox()).resolves.toEqual({
+      dispatched: 1,
+      failed: 0,
+    });
+
+    const sentOutbox = await db
+      .select()
+      .from(recoveryWakeOutbox)
+      .where(eq(recoveryWakeOutbox.id, queuedOutbox.id))
+      .then((rows) => rows[0] ?? null);
+    expect(sentOutbox).toMatchObject({
+      status: "sent",
+      attempts: 2,
+      lastError: null,
+    });
+    expect(sentOutbox?.dispatchedAt).toBeTruthy();
+
+    const recoveryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.reason, "source_scoped_recovery_action")));
+    expect(recoveryWakeups).toHaveLength(1);
+    expect(recoveryWakeups[0]?.payload).toMatchObject({
+      issueId,
+      sourceIssueId: issueId,
+    });
   });
 
   it("blocks stranded recovery issues in place instead of creating nested recovery issues", async () => {

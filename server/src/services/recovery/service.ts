@@ -207,6 +207,21 @@ type StrandedRecoveryCause =
 
 type StrandedPreviousStatus = "todo" | "in_progress" | "in_review";
 
+export type RecoveryServiceTestHooks = {
+  beforeStrandedEscalationStatusCas?: (input: {
+    companyId: string;
+    issueId: string;
+    previousStatus: StrandedPreviousStatus;
+    recoveryCause: StrandedRecoveryCause;
+    recoveryActionId: string;
+  }) => Promise<void> | void;
+};
+
+type RecoveryServiceDeps = {
+  enqueueWakeup: RecoveryWakeup;
+  testHooks?: RecoveryServiceTestHooks;
+};
+
 type SuccessfulRunHandoffRecoveryEvidence = {
   sourceRunId: string | null;
   correctiveRunId: string;
@@ -957,7 +972,7 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
-export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
+export function recoveryService(db: Db, deps: RecoveryServiceDeps) {
   const issuesSvc = issueService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -4454,6 +4469,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         dbOrTx: tx,
       });
 
+      await deps.testHooks?.beforeStrandedEscalationStatusCas?.({
+        companyId: fresh.companyId,
+        issueId: fresh.id,
+        previousStatus: input.previousStatus,
+        recoveryCause,
+        recoveryActionId: action.id,
+      });
+
       const updated = await issuesSvc.update(
         input.issue.id,
         {
@@ -4902,6 +4925,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function reconcileStrandedAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
+    await sweepRecoveryWakeOutbox().catch((err) => {
+      logger.warn({ err }, "recovery-wake-outbox: periodic sweep failed");
+    });
+
     const candidates = await db
       .select()
       .from(issues)
