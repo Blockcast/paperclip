@@ -740,11 +740,11 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           livenessProbe:
-            {{- toYaml .Values.probes.liveness | nindent 12 }}
+            {{- toYaml .Values.workerProbes.liveness | nindent 12 }}
           readinessProbe:
-            {{- toYaml .Values.probes.readiness | nindent 12 }}
+            {{- toYaml .Values.workerProbes.readiness | nindent 12 }}
           startupProbe:
-            {{- toYaml .Values.probes.startup | nindent 12 }}
+            {{- toYaml .Values.workerProbes.startup | nindent 12 }}
           lifecycle:
             preStop:
               exec:
