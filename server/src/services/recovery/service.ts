@@ -7174,18 +7174,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const runRows =
       referencedRunIds.length > 0
         ? await db
-            .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+            .select({
+              id: heartbeatRuns.id,
+              status: heartbeatRuns.status,
+              scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+            })
             .from(heartbeatRuns)
             .where(inArray(heartbeatRuns.id, referencedRunIds))
         : [];
-    const runStatusById = new Map<string, string>();
-    for (const row of runRows) runStatusById.set(row.id, row.status);
+    const runById = new Map<string, { status: string; scheduledRetryAt: Date | null }>();
+    for (const row of runRows) runById.set(row.id, row);
 
     const isCleanable = (runId: string | null) => {
       if (!runId) return true;
-      const status = runStatusById.get(runId);
-      if (!status) return true; // missing run row → no real claim
-      return TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);
+      const run = runById.get(runId);
+      if (!run) return true; // missing run row → no real claim
+      return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
     };
 
     // BLO-18995: a lock can also be held by a run that never started. Four
@@ -7212,9 +7216,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // for one issue from executing concurrently.
     const isPreClaimLockExpired = (runId: string | null, lockedAt: Date | null) => {
       if (!runId || !lockedAt) return false;
-      const status = runStatusById.get(runId);
-      if (status !== "queued" && status !== "scheduled_retry") return false;
-      return Date.now() - lockedAt.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
+      const run = runById.get(runId);
+      if (run?.status === "queued") {
+        return Date.now() - lockedAt.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
+      }
+      if (run?.status === "scheduled_retry") {
+        // Scheduled retries are intentionally parked until their retry deadline.
+        // Only clear them once that deadline itself has gone stale; provider
+        // capacity retries may be scheduled far into the future.
+        const staleBasis = run.scheduledRetryAt ?? lockedAt;
+        return Date.now() - staleBasis.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
+      }
+      return false;
     };
 
     for (const issue of candidates) {
@@ -7285,6 +7298,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             )
             .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id))
             .limit(1)
+            .for("update")
             .then((rows) => rows[0] ?? null);
 
           if (!deferred) {
@@ -7334,21 +7348,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
                 status: "failed",
                 finishedAt: now,
                 error: "Deferred wake could not be promoted: agent is not invokable",
-                updatedAt: now,
-              })
-              .where(eq(agentWakeupRequests.id, deferred.id));
-            continue;
-          }
-
-          if (updated.assigneeAgentId !== deferredAgent.id) {
-            const now = new Date();
-            skippedDeferredWakeIds.push(deferred.id);
-            await tx
-              .update(agentWakeupRequests)
-              .set({
-                status: "cancelled",
-                finishedAt: now,
-                error: "Deferred wake could not be promoted: agent no longer owns issue",
                 updatedAt: now,
               })
               .where(eq(agentWakeupRequests.id, deferred.id));
@@ -7453,7 +7452,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             .returning({ id: heartbeatRuns.id })
             .then((rows) => rows[0]);
 
-          await tx
+          const promotedWake = await tx
             .update(agentWakeupRequests)
             .set({
               status: "queued",
@@ -7464,7 +7463,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               error: null,
               updatedAt: now,
             })
-            .where(eq(agentWakeupRequests.id, deferred.id));
+            .where(
+              and(
+                eq(agentWakeupRequests.id, deferred.id),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              ),
+            )
+            .returning({ id: agentWakeupRequests.id })
+            .then((rows) => rows[0] ?? null);
+
+          if (!promotedWake) {
+            await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.id, newRun.id));
+            skippedDeferredWakeIds.push(deferred.id);
+            continue;
+          }
 
           await tx
             .update(issues)
@@ -7505,7 +7517,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           source: "recovery.sweep_stale_issue_locks",
           clearedCheckoutRunId: issue.checkoutRunId,
           clearedExecutionRunId: issue.executionRunId,
-          referencedRunStatuses: Object.fromEntries(runStatusById),
+          referencedRunStatuses: Object.fromEntries(
+            [...runById.entries()].map(([id, run]) => [id, run.status]),
+          ),
           promotedDeferredWakeId: sweepOutcome.promotedWakeId,
           promotedRunId: sweepOutcome.promotedRunId,
           promotedAgentId: sweepOutcome.promotedAgentId,

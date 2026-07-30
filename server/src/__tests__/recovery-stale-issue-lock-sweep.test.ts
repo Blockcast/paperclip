@@ -324,6 +324,49 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     expect(row?.executionRunId).toBe(queuedRunId);
   });
 
+  it("preserves a future scheduled retry even when its lock is older than the timeout", async () => {
+    const { companyId, agentId } = await seed();
+    const retryRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: retryRunId,
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      invocationSource: "automation",
+      startedAt: null,
+      scheduledRetryAt: new Date(Date.now() + 60 * 60 * 1000),
+      scheduledRetryAttempt: 0,
+      scheduledRetryReason: "ccrotate_capacity",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Future scheduled retry",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: retryRunId,
+      executionLockedAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(0);
+    const row = await db
+      .select({
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.executionRunId).toBe(retryRunId);
+    expect(row?.executionLockedAt).not.toBeNull();
+  });
+
   it("does not clear a live checkout lock just because the execution lock expired (BLO-18995)", async () => {
     // The sweeper nulls checkoutRunId and executionRunId in one UPDATE, so the
     // new pre-claim-expiry allowance must not become a blanket bypass of the
@@ -511,6 +554,111 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(heartbeatRuns.id, queuedRunId))
       .then((rows) => rows[0]);
     expect(originalRun?.status).toBe("queued");
+  });
+
+  it("promotes a deferred issue-scoped wake for a non-assignee without taking the issue lock", async () => {
+    const { companyId, agentId, queuedRunId } = await seed();
+    const mentionedAgentId = randomUUID();
+    const issueId = randomUUID();
+    const deferredWakeId = randomUUID();
+    await db.insert(agents).values({
+      id: mentionedAgentId,
+      companyId,
+      name: "Mentioned Coder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Expired holder with cross-agent mention",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      checkoutRunId: null,
+      executionRunId: queuedRunId,
+      executionLockedAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId: mentionedAgentId,
+      source: "comment",
+      triggerDetail: "issue_comment_mentioned",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId,
+        commentId: "comment-mention",
+        _paperclipWakeContext: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_comment_mentioned",
+        },
+      },
+      status: "deferred_issue_execution",
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+      requestedAt: new Date(Date.now() - 5 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    const wake = await db
+      .select({
+        status: agentWakeupRequests.status,
+        runId: agentWakeupRequests.runId,
+        error: agentWakeupRequests.error,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeId))
+      .then((rows) => rows[0]);
+    expect(wake).toMatchObject({
+      status: "queued",
+      error: null,
+    });
+    expect(wake?.runId).toBeTruthy();
+
+    const promotedRun = await db
+      .select({
+        agentId: heartbeatRuns.agentId,
+        wakeupRequestId: heartbeatRuns.wakeupRequestId,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, wake!.runId!))
+      .then((rows) => rows[0]);
+    expect(promotedRun).toMatchObject({
+      agentId: mentionedAgentId,
+      wakeupRequestId: deferredWakeId,
+    });
+    expect(promotedRun?.contextSnapshot).toMatchObject({
+      issueId,
+      taskId: issueId,
+      wakeReason: "issue_comment_mentioned",
+      commentId: "comment-mention",
+    });
+
+    const issue = await db
+      .select({
+        executionRunId: issues.executionRunId,
+        executionAgentNameKey: issues.executionAgentNameKey,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(issue).toEqual({
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+    });
   });
 
   it("fails non-invokable deferred wakes and promotes the next eligible wake", async () => {
