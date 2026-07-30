@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { authApi } from "../api/auth";
@@ -20,6 +20,8 @@ export function AuthPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // The mutation pending state updates after the click handler returns; lock now so rapid clicks cannot replace OAuth state.
+  const ssoStartLockedRef = useRef(false);
   const errorId = "auth-error";
 
   const nextPath = useMemo(
@@ -69,6 +71,7 @@ export function AuthPage() {
       window.location.assign(url);
     },
     onError: (err) => {
+      ssoStartLockedRef.current = false;
       setError(
         err instanceof Error
           ? `Microsoft sign-in unavailable: ${err.message}`
@@ -84,6 +87,7 @@ export function AuthPage() {
       window.location.assign(url);
     },
     onError: (err) => {
+      ssoStartLockedRef.current = false;
       setError(
         err instanceof Error
           ? `Google sign-in unavailable: ${err.message}`
@@ -226,6 +230,8 @@ export function AuthPage() {
                   className="w-full"
                   disabled={ssoPending}
                   onClick={() => {
+                    if (ssoStartLockedRef.current) return;
+                    ssoStartLockedRef.current = true;
                     setError(null);
                     googleMutation.mutate();
                   }}
@@ -238,6 +244,8 @@ export function AuthPage() {
                   className="w-full"
                   disabled={ssoPending}
                   onClick={() => {
+                    if (ssoStartLockedRef.current) return;
+                    ssoStartLockedRef.current = true;
                     setError(null);
                     microsoftMutation.mutate();
                   }}
