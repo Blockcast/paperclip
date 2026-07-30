@@ -153,7 +153,10 @@ const MIN_TERM_LENGTH = 4;
 
 const ISSUE_REFERENCE_RE = /\b[A-Z][A-Z0-9]{1,9}-\d{1,7}\b/g;
 const NUMERIC_REFERENCE_RE = /(?:^|[\s([])#(\d{1,7})\b/g;
-const CODE_SPAN_RE = /(?:```[\s\S]*?```|`[^`\n]+`)/g;
+const FENCED_CODE_BLOCK_RE = /^[ \t]*`{3,}[^\n`]*(?:\r?\n[\s\S]*?\r?\n[ \t]*`{3,}[ \t]*(?=\r?\n|$))/gm;
+const FENCED_CODE_BLOCK_OPEN_RE = /^[ \t]*`{3,}[^\n`]*\r?\n/;
+const FENCED_CODE_BLOCK_CLOSE_RE = /\r?\n[ \t]*`{3,}[ \t]*$/;
+const INLINE_CODE_SPAN_RE = /(`+)([^\n]*?)(?<!`)\1(?!`)/g;
 const URL_RE = /\bhttps?:\/\/\S+/g;
 const PATH_RE = /\b(?:[A-Za-z0-9_.-]+\/){1,}[A-Za-z0-9_.-]+\b/g;
 const IDENTIFIER_RE = /\b[A-Za-z_$][A-Za-z0-9_$]*(?:[.:][A-Za-z_$][A-Za-z0-9_$]*)*\b/g;
@@ -194,10 +197,27 @@ function stripTrailingLineNumber(token: string): string {
  * defect class turns on.
  */
 function unwrapCodeSpan(span: string): string {
-  if (span.startsWith("```")) {
-    return span.replace(/^```[A-Za-z0-9_+#-]*[ \t]*\r?\n?/, "").replace(/```$/, "");
+  if (FENCED_CODE_BLOCK_OPEN_RE.test(span)) {
+    return span.replace(FENCED_CODE_BLOCK_OPEN_RE, "").replace(FENCED_CODE_BLOCK_CLOSE_RE, "");
+  }
+  const delimiter = span.match(/^`+/)?.[0];
+  if (delimiter && span.endsWith(delimiter)) {
+    return span.slice(delimiter.length, -delimiter.length);
   }
   return span.replace(/^`+/, "").replace(/`+$/, "");
+}
+
+function extractCodeText(text: string): string {
+  const fencedBlocks = text.match(FENCED_CODE_BLOCK_RE) ?? [];
+  const withoutFencedBlocks = text.replace(FENCED_CODE_BLOCK_RE, " ");
+  const inlineSpans = withoutFencedBlocks.match(INLINE_CODE_SPAN_RE) ?? [];
+  return [...fencedBlocks, ...inlineSpans].map(unwrapCodeSpan).join("\n");
+}
+
+function stripCodeMarkup(text: string): string {
+  return text
+    .replace(FENCED_CODE_BLOCK_RE, (span) => `\n${unwrapCodeSpan(span)}\n`)
+    .replace(INLINE_CODE_SPAN_RE, (_span, _ticks: string, body: string) => body);
 }
 
 /**
@@ -244,9 +264,10 @@ export function extractIssueDuplicateFeatures(
 
   // Code spans are the densest evidence, so mine them before generic prose and
   // let their contents register as symbols/paths.
-  const codeText = (withoutUrls.match(CODE_SPAN_RE) ?? []).map(unwrapCodeSpan).join("\n");
+  const codeText = extractCodeText(withoutUrls);
+  const withoutCodeMarkup = stripCodeMarkup(withoutUrls);
 
-  for (const source of [codeText, withoutUrls]) {
+  for (const source of [codeText, withoutCodeMarkup]) {
     for (const rawPath of source.match(PATH_RE) ?? []) {
       const path = stripTrailingLineNumber(rawPath);
       if (looksLikePath(path)) add(path, "path");
@@ -273,7 +294,7 @@ export function extractIssueDuplicateFeatures(
     add(word, "symbol");
   }
 
-  for (const word of withoutUrls.match(WORD_RE) ?? []) {
+  for (const word of withoutCodeMarkup.match(WORD_RE) ?? []) {
     const lower = word.toLowerCase();
     if (lower.length < MIN_TERM_LENGTH) continue;
     if (STOPWORDS.has(lower)) continue;

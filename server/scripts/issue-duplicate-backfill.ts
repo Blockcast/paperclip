@@ -22,6 +22,7 @@
  *   --dump-corpus <path>  write the fetched window to JSON (test-fixture capture)
  */
 import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { and, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import { createDb, issues } from "@paperclipai/db";
 import { loadConfig } from "../src/config.js";
@@ -37,14 +38,20 @@ import {
  * disabled the evidence floor, reports numbers that look real and are not
  * reproducible from the command line that produced them.
  */
-function parseFlag(name: string): string | null {
-  const index = process.argv.indexOf(name);
+export function parseDuplicateBackfillFlag(args: readonly string[], name: string): string | null {
+  const index = args.indexOf(name);
   if (index < 0) return null;
-  const value = process.argv[index + 1];
+  const value = args[index + 1];
   if (value === undefined || value.startsWith("--")) {
     throw new Error(`${name} requires a value (got ${value === undefined ? "end of arguments" : value})`);
   }
-  return value;
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error(`${name} requires a non-empty value`);
+  return trimmed;
+}
+
+function parseFlag(name: string): string | null {
+  return parseDuplicateBackfillFlag(process.argv, name);
 }
 
 interface NumberFlagRange {
@@ -53,8 +60,13 @@ interface NumberFlagRange {
   integer?: boolean;
 }
 
-function parseNumberFlag(name: string, fallback: number, range: NumberFlagRange = {}): number {
-  const raw = parseFlag(name);
+export function parseDuplicateBackfillNumberFlag(
+  args: readonly string[],
+  name: string,
+  fallback: number,
+  range: NumberFlagRange = {},
+): number {
+  const raw = parseDuplicateBackfillFlag(args, name);
   if (raw === null) return fallback;
   const parsed = Number(raw);
   if (!Number.isFinite(parsed)) throw new Error(`${name} must be a number, got ${raw}`);
@@ -68,6 +80,10 @@ function parseNumberFlag(name: string, fallback: number, range: NumberFlagRange 
     throw new Error(`${name} must be <= ${range.max}, got ${raw}`);
   }
   return parsed;
+}
+
+function parseNumberFlag(name: string, fallback: number, range: NumberFlagRange = {}): number {
+  return parseDuplicateBackfillNumberFlag(process.argv, name, fallback, range);
 }
 
 async function main() {
@@ -186,10 +202,12 @@ async function main() {
   }
 }
 
-main().then(
-  () => process.exit(0),
-  (error) => {
-    console.error(error);
-    process.exit(1);
-  },
-);
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().then(
+    () => process.exit(0),
+    (error) => {
+      console.error(error);
+      process.exit(1);
+    },
+  );
+}

@@ -147,6 +147,15 @@ describe("extractIssueDuplicateFeatures", () => {
     expect(features.get("scheduled")).toBe("symbol");
   });
 
+  it("keeps a multi-backtick inline span as symbol evidence", () => {
+    const features = extractIssueDuplicateFeatures({
+      title: "Retry leaves the inline monitor unchanged",
+      description: "The span ```` ```monitor``` ```` is inline code, not a fenced block.",
+    });
+
+    expect(features.get("monitor")).toBe("symbol");
+  });
+
   it("drops a fenced block's language tag without swallowing its body", () => {
     const features = extractIssueDuplicateFeatures({
       title: "Read-back is null",
@@ -156,6 +165,17 @@ describe("extractIssueDuplicateFeatures", () => {
     expect(features.get("monitornextcheckat")).toBe("symbol");
     // The info string is markup, not evidence: it must not become a symbol.
     expect(features.get("typescript")).not.toBe("symbol");
+  });
+
+  it("drops a fenced block's full info string without turning it into symbol evidence", () => {
+    const features = extractIssueDuplicateFeatures({
+      title: "Read-back is still null",
+      description: ["```ts filename=handler.ts", "const monitorNextCheckAt = null;", "```"].join("\n"),
+    });
+
+    expect(features.get("monitornextcheckat")).toBe("symbol");
+    expect(features.get("ts")).not.toBe("symbol");
+    expect(features.get("handler.ts")).not.toBe("symbol");
   });
 });
 
