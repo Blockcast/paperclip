@@ -91,6 +91,10 @@ jobs:
 
       - name: Test standalone package build concurrency
         run: node --test ./scripts/__tests__/build-standalone-concurrency.test.mjs
+
+      - name: Test devDependency install guard (NODE_ENV=production)
+        run: node --test ./scripts/__tests__/npmrc-devdeps-guard.test.mjs
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 
