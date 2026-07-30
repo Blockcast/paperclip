@@ -7719,7 +7719,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     expect(duplicateIssue?.executionRunId).toBeNull();
   });
 
-  it("returns a typed 422 (not generic 409) for assignee-owned in_review checkout with no active owner", async () => {
+  it("preserves the expectedStatuses guard for assignee-owned in_review checkout", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
     await db.insert(companies).values({
@@ -7740,9 +7740,11 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       permissions: {},
     });
 
-    // Reproduction matrix (BLO-8454): status=in_review, assignee matches caller,
-    // checkoutRunId=null, executionRunId=null.
+    // Callers that do not include in_review in expectedStatuses still do not
+    // claim review work accidentally. Agent-facing checkout includes in_review
+    // explicitly; the route test pins that positive path.
     const issueId = randomUUID();
+    const checkoutRunId = randomUUID();
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -7755,13 +7757,14 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     });
 
     await expect(
-      svc.checkout(issueId, assigneeAgentId, ["todo", "backlog", "blocked"], randomUUID()),
+      svc.checkout(issueId, assigneeAgentId, ["todo", "backlog", "blocked"], checkoutRunId),
     ).rejects.toMatchObject({
-      status: 422,
-      details: { code: "issue_in_review_not_checkoutable", issueId },
+      status: 409,
+      message: "Issue checkout conflict",
+      details: { issueId },
     });
 
-    // The rejected checkout must not mutate the issue out of review (no state-machine side effect).
+    // The rejected checkout must not mutate the issue out of review.
     const after = await db
       .select({
         status: issues.status,

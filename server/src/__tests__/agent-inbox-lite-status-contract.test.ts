@@ -111,7 +111,7 @@ describe("GET /api/agents/me/inbox-lite status contract", () => {
     expect(res.body).toEqual([]);
   });
 
-  it("surfaces activeRun and dependency readiness so callers can skip run-owned work", async () => {
+  it("withholds work held by another live run while preserving dependency readiness on offered rows", async () => {
     mockIssueService.list.mockResolvedValue([
       {
         id: "issue-1",
@@ -125,9 +125,24 @@ describe("GET /api/agents/me/inbox-lite status contract", () => {
         updatedAt: "2026-07-30T01:41:56.125Z",
         activeRun: { id: "run-other", status: "running" },
       },
+      {
+        id: "issue-2",
+        identifier: "BLO-2",
+        title: "Blocked but unheld",
+        status: "blocked",
+        priority: "high",
+        projectId: null,
+        goalId: null,
+        parentId: null,
+        updatedAt: "2026-07-30T01:42:56.125Z",
+        activeRun: null,
+      },
     ]);
     mockIssueService.listDependencyReadiness.mockResolvedValue(
-      new Map([["issue-1", { isDependencyReady: false, unresolvedBlockerCount: 2, unresolvedBlockerIssueIds: ["b1", "b2"] }]]),
+      new Map([
+        ["issue-1", { isDependencyReady: true, unresolvedBlockerCount: 0, unresolvedBlockerIssueIds: [] }],
+        ["issue-2", { isDependencyReady: false, unresolvedBlockerCount: 2, unresolvedBlockerIssueIds: ["b1", "b2"] }],
+      ]),
     );
 
     const res = await request(await createApp()).get("/api/agents/me/inbox-lite");
@@ -135,8 +150,8 @@ describe("GET /api/agents/me/inbox-lite status contract", () => {
     expect(res.status).toBe(200);
     expect(res.body).toHaveLength(1);
     expect(res.body[0]).toMatchObject({
-      id: "issue-1",
-      activeRun: { id: "run-other", status: "running" },
+      id: "issue-2",
+      activeRun: null,
       dependencyReady: false,
       unresolvedBlockerCount: 2,
       unresolvedBlockerIssueIds: ["b1", "b2"],

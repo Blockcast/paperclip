@@ -878,6 +878,52 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     });
   });
 
+  it("atomically checks out an unlocked assigned in_review issue (BLO-18858)", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Review follow-up needs edits",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({
+        agentId,
+        expectedStatuses: ["todo", "backlog", "blocked", "in_review"],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.status).toBe("in_progress");
+    expect(res.body.checkoutRunId).toBe(currentRunId);
+    expect(res.body.executionRunId).toBe(currentRunId);
+
+    const row = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+    });
+  });
+
   it("409s a second live run of the SAME agent checking out an in_review issue (BLO-18858)", async () => {
     // The duplicate-work incident: two concurrent runs of one agent worked the same
     // in_review issue because the second run never called checkout. Assert the guard it
@@ -910,9 +956,6 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
     expect(res.body.error).toBe("Issue checkout conflict");
-    // Must NOT fall into the issue_in_review_not_checkoutable 422 — that branch is only for
-    // an unlocked in_review issue, and returning it here would read as "go ahead and work it".
-    expect(res.body.code).not.toBe("issue_in_review_not_checkoutable");
 
     // The live owner keeps the lock; the losing run must not have stolen or cleared it.
     const row = await db
