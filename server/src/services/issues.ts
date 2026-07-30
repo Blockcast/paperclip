@@ -7602,7 +7602,7 @@ export function issueService(db: Db) {
           issueData.projectId = workspace.projectId;
         }
         // Note for the inference below: reaching it with `projectId == null` PROVES both
-        // workspace ids are also null, so it needs no separate guard against them.
+        // workspace *ids* are also null, so it needs no separate guard against those two.
         // `execution_workspaces.project_id` and `project_workspaces.project_id` are both
         // `NOT NULL` (packages/db/src/schema/execution_workspaces.ts:20,
         // project_workspaces.ts:19; DDL in migrations/0035_marvelous_satana.sql, never
@@ -7611,6 +7611,13 @@ export function issueService(db: Db) {
         // state. Raised twice in review (PR #811) as a case where inference would fight
         // the re-validation at ~7729 and fail the create; recorded here because the
         // reasoning is non-local and the counterexample is unwritable as a test.
+        //
+        // This argument is about the two workspace *ids* ONLY, and does not extend to
+        // `executionWorkspacePreference` / `executionWorkspaceSettings`: those carry
+        // workspace intent with no project attached, nothing above resolves a project
+        // from them, and they DO reach the inference with `projectId` null. They get a
+        // real guard — see policy note 4 below. Don't read this paragraph as "no
+        // workspace guard is ever needed here."
         // BLO-18760: an issue created with none of the inheritance signals
         // above (no parent, no explicit workspace) is *born* with
         // projectId: null and, on its first run, falls back onto the
@@ -7653,11 +7660,30 @@ export function issueService(db: Db) {
         //    `inheritStrategyOnly` sub-issue path does exactly this), and it is non-null
         //    for an explicit `inheritExecutionWorkspaceFromIssueId` with no parent at all.
         //    Intake — the case BLO-18760 exists to fix — has neither.
+        //
+        // 4. No explicit workspace intent. `executionWorkspacePreference` /
+        //    `executionWorkspaceSettings` carry workspace intent without carrying a
+        //    project, so unlike a workspace *id* (whose `project_id` is NOT NULL, and
+        //    which the two blocks above already resolve a project from) they can reach
+        //    here with `projectId` still null. Inferring under them would not just add a
+        //    project — it would silently pull in that project's default goal, project
+        //    workspace, and repository, and would convert a deliberate error into a
+        //    success: a projectless `isolated_workspace` request is meant to fail
+        //    `assertExplicitPinnedWorktreeIssueRunnable` (WORKSPACE_WORKTREE_REQUIRES_PROJECT),
+        //    and inference would instead quietly bind it to whichever project the
+        //    assignee happens to lead. A caller who names a workspace mode has said
+        //    something about where this runs; honour it and let the validation speak.
+        //    Intake sends none of these fields, so the fix still fires where it matters.
+        //    Inert when `enableIsolatedWorkspaces` is off, and correctly so: create()
+        //    deletes all three fields in that mode, so the flag is already false — and
+        //    the same setting gates assertExplicitPinnedWorktreeIssueRunnable, so there
+        //    is no rejection left to preserve.
         if (
           issueData.projectId == null &&
           issueData.assigneeAgentId &&
           issueData.parentId == null &&
-          workspaceInheritanceIssueId == null
+          workspaceInheritanceIssueId == null &&
+          !hasExplicitExecutionWorkspaceOverride
         ) {
           const ledProjects = await tx
             .select({ id: projects.id })

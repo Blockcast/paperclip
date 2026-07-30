@@ -3331,6 +3331,155 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(issue.projectId).toBeNull();
   });
 
+  // Ally review (PR #811): unlike a workspace *id* (whose project_id is NOT NULL, so the
+  // blocks above always resolve a project from it), `executionWorkspacePreference` and
+  // `executionWorkspaceSettings` express workspace intent without carrying a project --
+  // they can reach the inference block with projectId still null. Inferring under them
+  // would pull in the led project's default goal, project workspace and repository behind
+  // the caller's back, and in the isolated_workspace case would turn a deliberate
+  // WORKSPACE_WORKTREE_REQUIRES_PROJECT rejection into a silent success.
+  //
+  // Both cases need enableIsolatedWorkspaces: when the flag is off, create() deletes these
+  // three fields outright, so hasExplicitExecutionWorkspaceOverride is already false and
+  // the guard is inert by construction -- which is correct, since the same flag also gates
+  // assertExplicitPinnedWorktreeIssueRunnable, so there is no rejection to preserve.
+  it("BLO-18760: does not infer a led project when the caller pins executionWorkspaceSettings", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Pinned shared workspace, deliberately projectless",
+      status: "todo",
+      assigneeAgentId: agentId,
+      executionWorkspaceSettings: { mode: "shared_workspace" },
+    });
+
+    expect(issue.projectId).toBeNull();
+  });
+
+  // The case with teeth: the assigned-agent variant of "rejects explicitly pinned isolated
+  // git worktrees without a project or reusable workspace" below. Pre-guard, inference
+  // supplied a projectId and this create SUCCEEDED, silently binding an explicitly
+  // projectless worktree request to whichever project the assignee happened to lead.
+  it("BLO-18760: still rejects a projectless isolated_workspace create for an assignee who leads one project", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    await expect(
+      svc.create(companyId, {
+        title: "Projectless worktree request",
+        status: "todo",
+        assigneeAgentId: agentId,
+        executionWorkspaceSettings: {
+          mode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree" },
+        },
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      message: WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
+      details: {
+        code: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
+        remediation: WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
+      },
+    });
+  });
+
+  it("BLO-18760: does not infer a led project when the caller pins executionWorkspacePreference", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Pinned workspace preference, deliberately projectless",
+      status: "todo",
+      assigneeAgentId: agentId,
+      executionWorkspacePreference: "agent_default",
+    });
+
+    expect(issue.projectId).toBeNull();
+  });
+
   it("inherits responsible user for agent-created child issues", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
