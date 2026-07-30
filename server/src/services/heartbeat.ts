@@ -22937,7 +22937,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       try {
-        await enqueueWakeup(row.agentId, originalOpts);
+        const recoveredRun = await enqueueWakeup(row.agentId, originalOpts);
+        if (!recoveredRun) {
+          // enqueueWakeup declined the wake rather than failing it: it wrote a
+          // status="skipped" row and returned null. Marking the original row
+          // `dispatch_recovered` here would claim a run that does not exist,
+          // and incrementing `queued` would close the funnel arithmetic on a
+          // delivery that is in fact terminally undelivered. Use the existing
+          // superseded terminal state (the reconciler never re-arms it) and
+          // count `suppressed` so the funnel still balances honestly.
+          await db
+            .update(agentWakeupRequests)
+            .set({
+              status: "dispatch_superseded",
+              error: "re-dispatch was declined by a scheduling gate (enqueueWakeup returned null)",
+              finishedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(agentWakeupRequests.id, row.id));
+          superseded += 1;
+          if (githubReviewReason !== null) {
+            recordGithubReviewRequestDelivery({ state: "suppressed", reason: githubReviewReason });
+          }
+          logger.warn(
+            { agentId: row.agentId, wakeupRequestId: row.id, attempts },
+            "wake dispatch re-attempt was suppressed by a scheduling gate; marking superseded "
+              + "rather than recovered (BLO-18859)",
+          );
+          continue;
+        }
         await db
           .update(agentWakeupRequests)
           .set({ status: "dispatch_recovered", finishedAt: now, updatedAt: now })
@@ -22945,9 +22973,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         recovered += 1;
         // The delivery reached the queued state after all, just later than the
         // inline path. Counting it here keeps the funnel arithmetic closed
-        // (received = queued + dead_lettered + in-flight chains); without it a
-        // reconciler-recovered delivery would leave a permanent phantom
-        // received-without-queued gap that reads as loss (BLO-18859).
+        // (received = queued + suppressed + dead_lettered + in-flight chains);
+        // without it a reconciler-recovered delivery would leave a permanent
+        // phantom received-without-queued gap that reads as loss (BLO-18859).
         if (githubReviewReason !== null) {
           recordGithubReviewRequestDelivery({ state: "queued", reason: githubReviewReason });
         }

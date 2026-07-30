@@ -1,3 +1,31 @@
+{{/*
+  READ BEFORE ADDING AN ALERT HERE — this file does not deploy on Blockcast.
+
+  `prometheusRule.enabled` is false in values.blockcast.yaml (BLO-14032 /
+  BLO-14556): the paperclip-ci-deploy ServiceAccount running `helm upgrade` has
+  no RBAC grant on prometheusrules.monitoring.coreos.com, so turning it on does
+  not merely skip this resource — it 403s the whole release. A regression test
+  (tests/prometheus-rule.test.mjs) fails CI if the flag flips back on.
+
+  So a rule added ONLY here is dead code on the cluster it is meant to protect.
+  The live alerting surface is Blockcast/onprem-k8s, and it is itself a pair:
+
+    1. monitoring/prometheus-configmap.yaml, key `paperclip-runtime-alerts.rules.yml`
+       — AUTHORITATIVE. The cluster runs a vanilla Prometheus StatefulSet that
+       loads rules from this static ConfigMap. This is the copy that fires.
+    2. paperclip/paperclip-runtime-alerts-prometheusrule.yaml
+       — a documentation copy of the same rules as a PrometheusRule CRD. No
+       prometheus-operator runs on this cluster, so the CRD is an orphaned
+       no-op, kept so a future operator install picks it up.
+
+  Those two are lockstep-enforced by onprem-k8s scripts/check-prometheus-rules-lockstep.sh
+  (edit both or CI fails). Nothing enforces lockstep with THIS chart file.
+
+  Groups below are therefore mirrors, kept so the chart stays coherent for a
+  cluster that does grant the RBAC. When you change a rule here, change it in
+  both onprem-k8s files too — see BLO-18859 for the review that caught an alert
+  landing here and nowhere else.
+*/}}
 {{- if .Values.prometheusRule.enabled }}
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule

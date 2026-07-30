@@ -123,7 +123,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedCompanyAndAgent(opts?: { agentStatus?: string }) {
+  async function seedCompanyAndAgent(opts?: { agentStatus?: string; companyStatus?: string }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     await db.insert(companies).values({
@@ -132,6 +132,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       issuePrefix: "BLO",
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
+      ...(opts?.companyStatus ? { status: opts.companyStatus } : {}),
     });
     await db.insert(agents).values({
       id: agentId,
@@ -431,6 +432,65 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         .from(agentWakeupRequests)
         .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "queued")));
       expect(queuedRows).toHaveLength(1);
+    });
+
+    it("marks a scheduling-gate-declined re-dispatch superseded, not recovered, and counts suppressed instead of queued", async () => {
+      // A paused company makes the reconciler's enqueueWakeup call resolve
+      // *null* instead of throwing. The pre-fix code treated any non-throwing
+      // return as success: it stamped `dispatch_recovered` and incremented
+      // `queued`, so a permanently undelivered review read as recovered and the
+      // funnel invariant (received = queued + suppressed + dead_lettered +
+      // in-flight) silently balanced on a run that never existed.
+      const { agentId, companyId } = await seedCompanyAndAgent({ companyStatus: "paused" });
+      const wakeupRequestId = randomUUID();
+      const now = new Date();
+      await db.insert(agentWakeupRequests).values({
+        id: wakeupRequestId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_review_requested",
+        payload: {
+          dispatchRetry: {
+            attempts: 1,
+            nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+            originalOpts: {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "github_pr_review_requested",
+              payload: GITHUB_REVIEW_PAYLOAD,
+            },
+          },
+        },
+        status: "dispatch_failed",
+      });
+
+      const result = await heartbeat.reconcileFailedWakeDispatches(now);
+      expect(result.recovered).toBe(0);
+      expect(result.superseded).toBe(1);
+      expect(result.exhausted).toBe(0);
+
+      // The pass itself is still a re-dispatch attempt, so `retried` moves.
+      expect(await deliveryCount("retried")).toBe(1);
+      // ...but the delivery did NOT reach the queued state.
+      expect(await deliveryCount("queued")).toBe(0);
+      expect(await deliveryCount("suppressed")).toBe(1);
+      // Suppressed is a deliberate decline, not a dispatch failure.
+      expect(await deliveryCount("dead_lettered")).toBe(0);
+
+      const [reconciled] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId));
+      expect(reconciled?.status).toBe("dispatch_superseded");
+
+      // No run was queued for this agent by the recovery attempt.
+      const queuedRows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "queued")));
+      expect(queuedRows).toHaveLength(0);
     });
 
     it("dead-letters exactly once when the retry chain exhausts, alongside exactly one dispatch_failed_exhausted row", async () => {

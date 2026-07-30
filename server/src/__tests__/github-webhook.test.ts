@@ -787,7 +787,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     return { companyId, agentId, issueId };
   }
 
-  async function seedCompanyAndAgent(opts?: { agentName?: string }) {
+  async function seedCompanyAndAgent(opts?: { agentName?: string; companyStatus?: string }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     await db.insert(companies).values({
@@ -796,6 +796,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       issuePrefix: "BLO",
       defaultResponsibleUserId: "test-board-user",
       requireBoardApprovalForNewAgents: false,
+      ...(opts?.companyStatus ? { status: opts.companyStatus } : {}),
     });
     await db.insert(agents).values({
       id: agentId,
@@ -1312,6 +1313,66 @@ describeEmbeddedPostgres("github-webhook route", () => {
     // permanent received/queued gap on a healthy fleet.
     expect(await deliveryCount("received")).toBe(1);
     expect(await deliveryCount("queued")).toBe(1);
+  });
+
+  it("counts a scheduling-gate-declined wake as suppressed, not queued, and does not claim reviewerWakeFired (BLO-18859)", async () => {
+    __resetMetricsForTest();
+    // A paused company makes enqueueWakeup take its `company.inactive` branch:
+    // it writes a status="skipped" row and resolves *null* rather than throwing.
+    // The pre-fix code counted that as `queued`, so a review that never ran
+    // rendered as a healthy received+queued delivery — the exact
+    // false-success this test pins down.
+    const { agentId: reviewerId } = await seedCompanyAndAgent({
+      agentName: "Ally",
+      companyStatus: "paused",
+    });
+
+    const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+    const payload = {
+      action: "opened",
+      pull_request: {
+        number: 18860,
+        title: "Suppressed delivery",
+        body: null,
+        head: { ref: "platform/blo-18859-suppressed" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-blo-18859-suppressed")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    // The 200 body must not advertise a wake that produced no run.
+    expect(res.body.reviewerWakeFired).toBe(false);
+
+    // The delivery cleared every receiver-side gate, so `received` still counts
+    // it — the loss happened downstream, which is what makes the
+    // received-vs-queued gap meaningful.
+    expect(await deliveryCount("received")).toBe(1);
+    expect(await deliveryCount("queued")).toBe(0);
+    expect(await deliveryCount("suppressed")).toBe(1);
+    expect(await deliveryCount("retried")).toBe(0);
+    expect(await deliveryCount("dead_lettered")).toBe(0);
+
+    // Ground the counter against the durable record: a skipped row, no run.
+    const wakeRows = await db
+      .select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, reviewerId));
+    expect(wakeRows).toHaveLength(1);
+    expect(wakeRows[0]!.status).toBe("skipped");
+    expect(wakeRows[0]!.reason).toBe("company.inactive");
+    const runs = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, reviewerId));
+    expect(runs).toHaveLength(0);
   });
 
   it("keeps follow-up PR review wakes with the reviewer already handling that PR", async () => {
