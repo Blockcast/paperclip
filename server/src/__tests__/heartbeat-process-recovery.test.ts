@@ -4826,6 +4826,92 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   );
 
   it(
+    "BLO-18829: a non-evidence-gate fault in the review-waiting park is contained per-issue -- the " +
+      "sweep survives, the issue's status is untouched, and it is not escalated on the fault",
+    async () => {
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "issue_continuation_waiting_on_review",
+        runError: "Continuation parked: issue is waiting on review/approval",
+      });
+
+      // Same fired-but-unrescheduled monitor shape as the BLO-18643 test above, so this
+      // candidate reaches parkReviewWaitingContinuationIssue's own db.transaction().
+      await db
+        .update(issues)
+        .set({
+          monitorNextCheckAt: null,
+          monitorLastTriggeredAt: new Date("2026-07-29T03:52:37.000Z"),
+          monitorAttemptCount: 1,
+          monitorScheduledBy: "assignee",
+        })
+        .where(eq(issues.id, issueId));
+
+      // The park paths now rethrow anything that is not the evidence gate, rather than
+      // relabelling it "nothing to review" and escalating on that basis. Inject exactly
+      // that class of fault -- a plain non-HttpError, standing in for a programming error
+      // or an unrelated service fault -- on the first transaction the pass opens, using
+      // the same seam as the cycle-fault test above.
+      const transactionSpy = vi.spyOn(db, "transaction");
+      let faultThrown = false;
+      transactionSpy.mockImplementationOnce(async () => {
+        faultThrown = true;
+        throw new Error("synthetic non-evidence-gate fault inside the review-waiting park");
+      });
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+      let result: Awaited<ReturnType<typeof heartbeat.reconcileStrandedAssignedIssues>>;
+      try {
+        // The whole point: this must RESOLVE. Before the runParkAttempt boundary the
+        // fault propagated out of here and aborted recovery for every remaining
+        // candidate in the company, not just this one.
+        result = await heartbeat.reconcileStrandedAssignedIssues();
+      } finally {
+        transactionSpy.mockRestore();
+      }
+
+      expect(faultThrown).toBe(true);
+      expect(result.parkFaulted).toBe(1);
+      expect(result.reviewWaitingParked).toBe(0);
+      // Not escalated: reporting a fault as "stranded and unreviewable" is the lie the
+      // rethrow exists to remove, so a faulted candidate is left for the next pass.
+      expect(result.escalated).toBe(0);
+      expect(result.issueIds).not.toContain(issueId);
+
+      const untouched = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(untouched?.status).toBe("in_progress");
+      expect(untouched?.assigneeAgentId).toBe(agentId);
+      await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+
+      const recoveryActions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+      expect(recoveryActions).toHaveLength(0);
+
+      // The next sweep pass, with no injected fault, still parks it normally -- the
+      // boundary skips the candidate, it does not poison it.
+      const recovered = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(recovered.parkFaulted).toBe(0);
+      expect(recovered.reviewWaitingParked).toBe(1);
+      expect(recovered.escalated).toBe(0);
+
+      const parked = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(parked?.status).toBe("in_review");
+    },
+  );
+
+  it(
     "BLO-18614/BLO-18643: a genuine review-park failure (evidence gate rejects in_review) still " +
       "escalates to blocked instead of being silently skipped",
     async () => {
