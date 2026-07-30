@@ -210,29 +210,73 @@ test("an empty token value falls through to the token file", () => {
   });
 });
 
-test("a line-terminator-only token value fails before ambient auth can be used", () => {
-  // Guards the tr-strip: a value that is only CR/LF is a malformed binding, not
-  // a request to use the App token or inherited caller credentials.
-  withTempDir((dir) => {
-    const stubGhPath = path.join(dir, "gh.real");
-    writeFileSync(stubGhPath, STUB_GH_SOURCE);
-    chmodSync(stubGhPath, 0o755);
-    const tokenFilePath = path.join(dir, "token");
-    writeFileSync(tokenFilePath, "ghs_apptoken\n");
+// Every rejection below is asserted with BOTH a readable token file and
+// ambient GH_TOKEN/GITHUB_TOKEN present, because those are the two things a
+// fall-through would silently authenticate as. Asserting only the exit code
+// against a bare env would pass even if the wrapper had fallen through.
+function runMalformedValue(dir, tokenValue) {
+  const stubGhPath = path.join(dir, "gh.real");
+  writeFileSync(stubGhPath, STUB_GH_SOURCE);
+  chmodSync(stubGhPath, 0o755);
+  const tokenFilePath = path.join(dir, "token");
+  writeFileSync(tokenFilePath, "ghs_apptoken\n");
 
-    const env = {
+  return spawnSync("sh", [WRAPPER, "api", "user"], {
+    encoding: "utf8",
+    env: {
       ...process.env,
       GH_TOKEN_WRAPPER_REAL_GH: stubGhPath,
       PAPERCLIP_GITHUB_TOKEN_FILE: tokenFilePath,
-      PAPERCLIP_GITHUB_TOKEN_VALUE: "\r\n",
+      PAPERCLIP_GITHUB_TOKEN_VALUE: tokenValue,
       GH_TOKEN: "user_supplied_override",
       GITHUB_TOKEN: "user_supplied_override",
-    };
+    },
+  });
+}
 
-    const proc = spawnSync("sh", [WRAPPER, "api", "user"], { env, encoding: "utf8" });
-    assert.equal(proc.status, 64);
-    assert.match(proc.stderr, /PAPERCLIP_GITHUB_TOKEN_VALUE is set but empty/);
-    assert.equal(proc.stdout, "");
+for (const [label, tokenValue] of [
+  ["CRLF only", "\r\n"],
+  ["spaces only", "   "],
+  ["tabs only", "\t\t"],
+  ["mixed whitespace only", " \t\r\n "],
+]) {
+  test(`a whitespace-only token value (${label}) fails before ambient auth can be used`, () => {
+    // A binding that resolved to nothing is a misconfiguration, not a request
+    // to fall back to the App token file or to inherited caller credentials.
+    withTempDir((dir) => {
+      const proc = runMalformedValue(dir, tokenValue);
+      assert.equal(proc.status, 64);
+      assert.match(proc.stderr, /PAPERCLIP_GITHUB_TOKEN_VALUE is set but holds only whitespace/);
+      assert.equal(proc.stdout, "");
+    });
+  });
+}
+
+for (const [label, tokenValue] of [
+  ["embedded LF", "ghu_aaa\nbbb"],
+  ["embedded CRLF", "ghu_aaa\r\nbbb"],
+  ["embedded space", "ghu_aaa bbb"],
+  ["embedded tab", "ghu_aaa\tbbb"],
+]) {
+  test(`a token value with interior whitespace (${label}) is rejected, not spliced`, () => {
+    // The pre-hardening `tr -d` would have joined these into "ghu_aaabbb" and
+    // authenticated as a token nobody issued. Refusing is the point.
+    withTempDir((dir) => {
+      const proc = runMalformedValue(dir, tokenValue);
+      assert.equal(proc.status, 64);
+      assert.match(proc.stderr, /contains embedded whitespace/);
+      assert.equal(proc.stdout, "");
+      // The malformed value must not be echoed into logs.
+      assert.doesNotMatch(proc.stderr, /ghu_aaa/);
+    });
+  });
+}
+
+test("trims surrounding whitespace, not just line terminators, from a token value", () => {
+  withTempDir((dir) => {
+    const result = runWrapper(dir, { tokenValue: " \tghu_padded \r\n" });
+    assert.equal(result.GH_TOKEN, "ghu_padded");
+    assert.equal(result.GITHUB_TOKEN, "ghu_padded");
   });
 });
 
