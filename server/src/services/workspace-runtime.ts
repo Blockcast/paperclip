@@ -154,12 +154,32 @@ const WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = 60_000;
 const WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS = 3;
 const WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS = 1_000;
 
+// Upper bounds for the env overrides below. Deliberately *operational* limits
+// rather than Node's `2^31 - 1` timer ceiling: clamping an oversized timeout to
+// the ceiling would mean ~24.8 days, which does not bound the preflight at all
+// -- it just trades fail-open for hang-forever. These keep the worst case an
+// operator can configure bounded at 5 x 300s + backoff ~= 30 minutes, while
+// staying far enough below the timer ceiling that no product of them can
+// overflow it.
+//
+// 300s is 50x the measured cold worst case (5903ms) and matches
+// `WORKSPACE_SUBMODULE_REPAIR_TIMEOUT_MS`. Past 5 attempts a checkout is broken,
+// not slow -- that is the deterministic-failure path, which throws.
+const WORKSPACE_SUBMODULE_INSPECT_MAX_TIMEOUT_MS = 300_000;
+const WORKSPACE_SUBMODULE_INSPECT_MAX_ATTEMPTS = 5;
+const WORKSPACE_SUBMODULE_INSPECT_MAX_RETRY_DELAY_MS = 30_000;
+
 /**
  * Env overrides for the submodule-inspection budget. Read at call time so they
  * can be tuned on a running server without a deploy, and so tests can force a
  * timeout deterministically instead of waiting out a real stall.
+ *
+ * Out-of-range values fall back to the default rather than clamping to `max`:
+ * a value outside the operational range is a typo, and silently honouring
+ * "some other number than the one you typed" is the same class of surprise as
+ * the two truncation bugs called out below.
  */
-function readPositiveIntEnv(name: string, fallback: number): number {
+function readBoundedIntEnv(name: string, fallback: number, max: number): number {
   const raw = process.env[name]?.trim();
   if (!raw) return fallback;
   const parsed = Number(raw);
@@ -169,22 +189,31 @@ function readPositiveIntEnv(name: string, fallback: number): number {
   // there) or skips the retry loop entirely. Both fail open silently, which is
   // the opposite of what an operator tuning this value would expect.
   if (!Number.isSafeInteger(parsed) || parsed <= 0) return fallback;
+  // Reject oversized values for the same reason. Every one of these settings
+  // feeds a `setTimeout`, and Node clamps any delay above `2^31 - 1` ms to *1ms*
+  // with a `TimeoutOverflowWarning`. So a plausible-looking large override (an
+  // extra digit, or seconds/ms confusion) would make every probe time out
+  // immediately and take the fail-open degradation path on a healthy checkout.
+  if (parsed > max) return fallback;
   return parsed;
 }
 
 function readSubmoduleInspectSettings(): { timeoutMs: number; attempts: number; retryDelayMs: number } {
   return {
-    timeoutMs: readPositiveIntEnv(
+    timeoutMs: readBoundedIntEnv(
       "PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS",
       WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS,
+      WORKSPACE_SUBMODULE_INSPECT_MAX_TIMEOUT_MS,
     ),
-    attempts: readPositiveIntEnv(
+    attempts: readBoundedIntEnv(
       "PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS",
       WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS,
+      WORKSPACE_SUBMODULE_INSPECT_MAX_ATTEMPTS,
     ),
-    retryDelayMs: readPositiveIntEnv(
+    retryDelayMs: readBoundedIntEnv(
       "PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS",
       WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS,
+      WORKSPACE_SUBMODULE_INSPECT_MAX_RETRY_DELAY_MS,
     ),
   };
 }
@@ -1091,7 +1120,10 @@ async function inspectGitSubmoduleReadiness(
       }
       lastTimeoutReason = error.message;
       if (attempt < settings.attempts) {
-        await delay(settings.retryDelayMs * attempt);
+        // Cap the linear backoff as well: the delay is a *product*, so bounding
+        // only the configured value would leave the effective delay unbounded
+        // if the caps above are ever raised.
+        await delay(Math.min(settings.retryDelayMs * attempt, WORKSPACE_SUBMODULE_INSPECT_MAX_RETRY_DELAY_MS));
       }
     }
   }

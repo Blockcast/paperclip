@@ -2661,6 +2661,57 @@ describe("realizeExecutionWorkspace", () => {
     }
   }, 20_000);
 
+  it("ignores an oversized submodule inspection timeout instead of letting Node clamp it to 1ms", async () => {
+    // Node clamps any `setTimeout` delay above `2^31 - 1` ms to *1ms* with a
+    // `TimeoutOverflowWarning`. A plausible-looking large override (an extra
+    // digit, or seconds/ms confusion) would therefore make every probe time out
+    // immediately and degrade a perfectly healthy checkout -- the same
+    // silent-fail-open class as the fractional-value bug above, arrived at from
+    // the opposite end of the range.
+    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const previousTimeout = process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
+    // 2^31, the first value Node cannot represent.
+    process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = "2147483648";
+
+    try {
+      const realized = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-huge-override",
+          workspaceId: "workspace-submodule-huge-override",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-huge-override",
+          identifier: "PAP-SUBMODULE-HUGE-OVERRIDE",
+          title: "Reject an oversized timeout override",
+        },
+        agent: {
+          id: "agent-submodule-huge-override",
+          name: "Codex Coder",
+          companyId: "company-submodule-huge-override",
+        },
+        recorder,
+      });
+
+      // Falls back to the 60s default, so the healthy checkout is inspected
+      // normally rather than degrading on a 1ms timer.
+      expect(
+        realized.warnings.filter((warning) => warning.includes("Could not inspect git submodules")),
+      ).toEqual([]);
+      expect(
+        operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+      ).toBe(false);
+    } finally {
+      if (previousTimeout === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
+      else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = previousTimeout;
+    }
+  }, 20_000);
+
   it("repairs worktree submodules before running provision commands", async () => {
     const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: false });
     const scriptsDir = path.join(repoRoot, "scripts");
