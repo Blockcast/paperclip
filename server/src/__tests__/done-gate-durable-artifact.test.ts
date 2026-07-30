@@ -344,6 +344,20 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
     expect(response.status).toBe(422);
   });
 
+  it("does not accept a whitespace-only document body", async () => {
+    // The cheapest possible evasion: a body that is not `''` but carries
+    // nothing. Must be indistinguishable from empty.
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    const { documentId } = await addRunAttributedDocument(companyId, issueId, agentId, runId);
+    await db.update(documents).set({ latestBody: "   \n\t  \n" }).where(eq(documents.id, documentId));
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(422);
+    expect(response.body.details).toMatchObject({ reason: "no_execution_run_and_no_pr_evidence" });
+  });
+
   it("does not accept a pull_request work product as a durable artifact (pr-link path owns that)", async () => {
     // Narrow on purpose: if `pull_request` counted here, a work-product row
     // with no verified PR URL would bypass the pr-link evidence check.

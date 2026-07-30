@@ -1945,8 +1945,15 @@ async function fetchDurableArtifactEvidence(dbOrTx: any, issueId: string): Promi
           eq(issueDocuments.issueId, issueId),
           notInArray(issueDocuments.key, [...DONE_GATE_NON_QUALIFYING_DOCUMENT_KEYS]),
           isNotNull(documentRevisions.createdByRunId),
-          isNotNull(documents.latestBody),
-          ne(documents.latestBody, ""),
+          // Must contain at least one non-whitespace character. A body of
+          // spaces, tabs or newlines is as empty as `''` and would otherwise
+          // be the cheapest way to satisfy the gate with no deliverable.
+          // NOT `length(trim(...)) > 0` — Postgres `trim`/`btrim` strips only
+          // SPACES by default, so "\n\t" survives it and passes. Deliberately
+          // not a minimum length beyond blank either: an arbitrary threshold
+          // invites padding, and the substantive check is a reviewer opening
+          // the artifact.
+          sql`${documents.latestBody} ~ '[^[:space:]]'`,
         ),
       )
       .limit(1),
