@@ -2493,7 +2493,10 @@ export function buildHostServices(
         requireInCompany("Agent", agent, companyId);
 
         const taskKey = readNonEmptyParam(params.taskKey);
-        const idempotencyKey = readNonEmptyParam(params.idempotencyKey);
+        // Namespaced so one plugin's delivery ids can never resolve to another's run.
+        const idempotencyKey = readNonEmptyParam(params.idempotencyKey)
+          ? `plugin:${pluginId}:${readNonEmptyParam(params.idempotencyKey)}`
+          : null;
 
         // Delivery-level replay guard: a redelivered webhook (same GitHub
         // delivery id) must resolve to the original run, not a second one.
@@ -2517,7 +2520,15 @@ export function buildHostServices(
         // coalesced into that run and silently dropped (BLO-18847: nine `@ally`
         // review requests, no runs). Distinct work must get a distinct scope,
         // so keyless invokes are made unique rather than defaulting to "same".
-        const scopeKey = taskKey ?? `plugin:${pluginId}:${randomUUID()}`;
+        //
+        // Plugin-supplied keys are namespaced by plugin. Coalescing merges the
+        // incoming snapshot over the target run's, so an un-namespaced key could
+        // be pointed at a live issue-execution run (whose task key is the issue
+        // id) and overwrite its context. Namespacing keeps a plugin's invokes
+        // able to coalesce only with its own.
+        const scopeKey = taskKey
+          ? `plugin:${pluginId}:${taskKey}`
+          : `plugin:${pluginId}:${randomUUID()}`;
 
         const run = await heartbeat.wakeup(params.agentId, {
           source: "automation",

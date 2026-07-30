@@ -146,7 +146,10 @@ describeEmbeddedPostgres("plugin agents.invoke wake fan-out", () => {
     const persistedTaskKeys = runs
       .map((run) => (run.contextSnapshot as Record<string, unknown> | null)?.taskKey)
       .filter((key): key is string => typeof key === "string");
-    expect(new Set(persistedTaskKeys)).toEqual(new Set(taskKeys));
+    // Plugin keys are namespaced so they cannot collide with issue-execution runs.
+    expect(new Set(persistedTaskKeys)).toEqual(
+      new Set(taskKeys.map((key) => `plugin:github-plugin-record-id:${key}`)),
+    );
 
     // Nothing was silently folded into another PR's run.
     const wakeups = await db
@@ -214,7 +217,46 @@ describeEmbeddedPostgres("plugin agents.invoke wake fan-out", () => {
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakeups).toHaveLength(1);
-    expect(wakeups[0]!.idempotencyKey).toBe(deliveryId);
+    expect(wakeups[0]!.idempotencyKey).toBe(`plugin:github-plugin-record-id:${deliveryId}`);
+  }, 60_000);
+
+  it("keeps a plugin task key from targeting an unrelated issue-execution run", async () => {
+    const { companyId, agentId } = await seedBusyAgent();
+    const services = hostServices(db);
+
+    // A live issue run, keyed by issue id the way issue wakes are.
+    const issueId = randomUUID();
+    const issueRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: issueRunId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "assignment",
+      contextSnapshot: { taskKey: issueId, issueId, secretPlan: "untouched" },
+    });
+
+    // Coalescing merges the incoming snapshot over the target's, so a raw
+    // plugin-supplied key equal to the issue id must not be able to land on it.
+    const result = await services.agents.invoke({
+      agentId,
+      companyId,
+      prompt: "attempt to land on the issue run",
+      taskKey: issueId,
+    });
+
+    expect(result.runId).not.toBe(issueRunId);
+
+    const [issueRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, issueRunId));
+    const snapshot = issueRun!.contextSnapshot as Record<string, unknown>;
+    expect(snapshot.secretPlan).toBe("untouched");
+    expect(snapshot.prompt).toBeUndefined();
+
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups.filter((w) => w.status === "coalesced")).toHaveLength(0);
   }, 60_000);
 
   it("characterizes the original loss: keyless wakes coalesce into an unrelated active run", async () => {
