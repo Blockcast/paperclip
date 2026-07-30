@@ -35,9 +35,18 @@ export type StagedRecoveryWake = {
   wakeOptions: Record<string, unknown>;
 };
 
+/**
+ * The `enqueueWakeup` shape this dispatcher replays into.
+ *
+ * `opts` is intentionally loose: the stored `wakeOptions` come back from jsonb as a plain
+ * record, and a narrower parameter type here would make the real `enqueueWakeup` (whose
+ * options are a specific union-typed object) fail to satisfy this signature under
+ * parameter contravariance.
+ */
 type WakeDispatcher = (
   agentId: string,
-  opts?: Record<string, unknown>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  opts?: any,
 ) => Promise<unknown>;
 
 /**

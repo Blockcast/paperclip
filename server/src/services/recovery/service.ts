@@ -3787,17 +3787,54 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         recoveryCause: input.recoveryCause,
         idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}:assignee_fallback`,
         wakeOptions: {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "source_scoped_recovery_action",
+          idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}:assignee_fallback`,
+          payload: withRecoveryModelProfileHint({
+            issueId: input.issue.id,
+            sourceIssueId: input.issue.id,
+            recoveryActionId: input.action.id,
+            strandedRunId: input.latestRun?.id ?? null,
+            recoveryCause: input.recoveryCause,
+            suppressedNonAssigneeWake: true,
+          }, "status_only"),
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          contextSnapshot: withRecoveryModelProfileHint({
+            issueId: input.issue.id,
+            taskId: input.issue.id,
+            wakeReason: "source_scoped_recovery_action",
+            skipIssueComment: true,
+            source: "issue_recovery_action",
+            recoveryActionId: input.action.id,
+            sourceIssueId: input.issue.id,
+            strandedRunId: input.latestRun?.id ?? null,
+            recoveryCause: input.recoveryCause,
+            suppressedNonAssigneeWake: true,
+          }, "status_only"),
+        },
+      });
+      return;
+    }
+    await stageRecoveryWake(dbOrTx, {
+      companyId: input.issue.companyId,
+      sourceIssueId: input.issue.id,
+      recoveryActionId: input.action.id,
+      agentId: input.action.ownerAgentId,
+      recoveryCause: input.recoveryCause,
+      idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}`,
+      wakeOptions: {
         source: "assignment",
         triggerDetail: "system",
         reason: "source_scoped_recovery_action",
-        idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}:assignee_fallback`,
+        idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}`,
         payload: withRecoveryModelProfileHint({
           issueId: input.issue.id,
           sourceIssueId: input.issue.id,
           recoveryActionId: input.action.id,
           strandedRunId: input.latestRun?.id ?? null,
           recoveryCause: input.recoveryCause,
-          suppressedNonAssigneeWake: true,
         }, "status_only"),
         requestedByActorType: "system",
         requestedByActorId: null,
@@ -3811,44 +3848,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           sourceIssueId: input.issue.id,
           strandedRunId: input.latestRun?.id ?? null,
           recoveryCause: input.recoveryCause,
-          suppressedNonAssigneeWake: true,
         }, "status_only"),
-        },
-      });
-      return;
-    }
-    await stageRecoveryWake(dbOrTx, {
-      companyId: input.issue.companyId,
-      sourceIssueId: input.issue.id,
-      recoveryActionId: input.action.id,
-      agentId: input.action.ownerAgentId,
-      recoveryCause: input.recoveryCause,
-      idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}`,
-      wakeOptions: {
-      source: "assignment",
-      triggerDetail: "system",
-      reason: "source_scoped_recovery_action",
-      idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}`,
-      payload: withRecoveryModelProfileHint({
-        issueId: input.issue.id,
-        sourceIssueId: input.issue.id,
-        recoveryActionId: input.action.id,
-        strandedRunId: input.latestRun?.id ?? null,
-        recoveryCause: input.recoveryCause,
-      }, "status_only"),
-      requestedByActorType: "system",
-      requestedByActorId: null,
-      contextSnapshot: withRecoveryModelProfileHint({
-        issueId: input.issue.id,
-        taskId: input.issue.id,
-        wakeReason: "source_scoped_recovery_action",
-        skipIssueComment: true,
-        source: "issue_recovery_action",
-        recoveryActionId: input.action.id,
-        sourceIssueId: input.issue.id,
-        strandedRunId: input.latestRun?.id ?? null,
-        recoveryCause: input.recoveryCause,
-      }, "status_only"),
       },
     });
   }
