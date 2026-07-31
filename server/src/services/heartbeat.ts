@@ -11912,10 +11912,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       parseObject(cancelled.contextSnapshot),
     );
     if (gateGithubReviewReason !== null) {
-      recordGithubReviewRequestSuppressed({
-        reason: gateGithubReviewReason,
-        cause: GITHUB_SUPPRESSION_CAUSE_SCHEDULED_RETRY_GATE,
-      });
+      const settledDeliveries = readGithubReviewDeliveryCount(parseObject(cancelled.contextSnapshot));
+      for (let i = 0; i < settledDeliveries; i++) {
+        recordGithubReviewRequestSuppressed({
+          reason: gateGithubReviewReason,
+          cause: GITHUB_SUPPRESSION_CAUSE_SCHEDULED_RETRY_GATE,
+        });
+      }
     }
 
     if (cancelled.wakeupRequestId) {
@@ -12457,10 +12460,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // suppression-outage alert deliberately does not select.
       const gateGithubReviewReason = githubPrReviewWakeReasonFromRunSnapshot(contextSnapshot);
       if (gateGithubReviewReason !== null) {
-        recordGithubReviewRequestSuppressed({
-          reason: gateGithubReviewReason,
-          cause: GITHUB_SUPPRESSION_CAUSE_SCHEDULED_RETRY_GATE,
-        });
+        const settledDeliveries = readGithubReviewDeliveryCount(contextSnapshot);
+        for (let i = 0; i < settledDeliveries; i++) {
+          recordGithubReviewRequestSuppressed({
+            reason: gateGithubReviewReason,
+            cause: GITHUB_SUPPRESSION_CAUSE_SCHEDULED_RETRY_GATE,
+          });
+        }
       }
       await appendRunEvent(atomicPromotion.run, await nextRunEventSeq(atomicPromotion.run.id), {
         eventType: "lifecycle",
@@ -21476,17 +21482,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // happens to have set. Null for every non-GitHub wake, so the promoter
       // stays scoped to this funnel.
       const githubReviewWakeReason = githubPrReviewWakeReason({ reason, payload });
-      const retryContextSnapshot = {
+      const retryContextSnapshotBase = {
         ...enrichedContextSnapshot,
         wakeSource: source,
         wakeTriggerDetail: triggerDetail,
         penstockProvider: gateResult.provider,
         penstockModel: gateResult.model,
-        ...(githubReviewWakeReason !== null
-          ? { githubReviewWakeReason, [GITHUB_REVIEW_DELIVERY_COUNT_KEY]: 1 }
-          : {}),
+        ...(githubReviewWakeReason !== null ? { githubReviewWakeReason } : {}),
         ...(resumeAtIso ? { penstockResumeAt: resumeAtIso } : {}),
       };
+      const retryContextSnapshot = githubReviewWakeReason !== null
+        ? { ...retryContextSnapshotBase, [GITHUB_REVIEW_DELIVERY_COUNT_KEY]: 1 }
+        : retryContextSnapshotBase;
 
       return db.transaction(async (tx) => {
         await tx.execute(
@@ -21501,13 +21508,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           triggerDetail,
           reason,
           payload,
-          contextSnapshot: retryContextSnapshot,
+          contextSnapshot: retryContextSnapshotBase,
           taskKey: effectiveTaskKey,
           requestedByActorType: opts.requestedByActorType,
           requestedByActorId: opts.requestedByActorId,
           idempotencyKey: opts.idempotencyKey,
         });
         if (coalescedRun) {
+          if (coalescedRun.status === "queued") {
+            return { run: coalescedRun, coalesced: true, deferred: false };
+          }
           // BLO-18859 review follow-up: this delivery was counted `deferred`
           // like any other, but coalescing means it will be settled by a run
           // that already exists — and the promoter emits one `queued` per run.
@@ -21519,9 +21529,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           //
           // Incremented in SQL rather than through the merged snapshot because
           // mergeCoalescedContextSnapshot is a last-writer-wins spread: the
-          // incoming `1` would clobber the accumulated count.
+          // incoming snapshot deliberately omits the count key so it cannot
+          // clobber the accumulated count before this bump.
           if (githubReviewWakeReason === null) {
-            return { run: coalescedRun, coalesced: true };
+            return { run: coalescedRun, coalesced: true, deferred: true };
           }
           const bumped = await tx
             .update(heartbeatRuns)
@@ -21538,10 +21549,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               )`,
               updatedAt: new Date(),
             })
-            .where(eq(heartbeatRuns.id, coalescedRun.id))
+            .where(and(eq(heartbeatRuns.id, coalescedRun.id), eq(heartbeatRuns.status, "scheduled_retry")))
             .returning()
             .then((rows) => rows[0] ?? coalescedRun);
-          return { run: bumped, coalesced: true };
+          return { run: bumped, coalesced: true, deferred: true };
         }
 
         const created = await tx
@@ -21568,7 +21579,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
           .returning()
           .then((rows) => rows[0]);
-        return { run: created, coalesced: false };
+        return { run: created, coalesced: false, deferred: true };
       });
     }
 
@@ -21621,7 +21632,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           adapter: agent.adapterType,
           provider: penstockGateResult.provider,
         });
-        await persistProviderCapacityRetry(penstockGateResult);
+        const capacityRetry = await persistProviderCapacityRetry(penstockGateResult);
+        if (!capacityRetry.deferred) return capacityRetry.run;
         // Signal the deferral to the caller *after* the scheduled_retry run is
         // committed, so nothing can read "deferred" for a retry that does not
         // exist. This is the only `return null` below that leaves

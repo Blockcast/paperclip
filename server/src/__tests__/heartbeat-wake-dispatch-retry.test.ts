@@ -799,6 +799,37 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         expect(await suppressionCount()).toBe(0);
       });
 
+      it("coalesces a capacity-denied delivery onto an existing queued run as queued, not deferred", async () => {
+        const { agentId } = await seedCompanyAndAgent();
+        const firstRun = await heartbeat.wakeup(agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "github_pr_review_submitted",
+          payload: GITHUB_REVIEW_PAYLOAD,
+        });
+        expect(firstRun).not.toBeNull();
+
+        const coalescedRun = await heartbeatWithCapacityDenied().wakeup(agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "github_pr_review_submitted",
+          payload: GITHUB_REVIEW_PAYLOAD,
+        });
+
+        expect(coalescedRun?.id).toBe(firstRun?.id);
+        // A queued run already exists, so the webhook caller will record the
+        // truthy wake result as `queued`; the capacity path must not park a
+        // phantom scheduled retry or count this delivery as `deferred`.
+        expect(await deliveryCount("deferred")).toBe(0);
+        expect(await deliveryCount("suppressed")).toBe(0);
+        const runs = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, agentId));
+        expect(runs.filter((row) => row.status === "queued")).toHaveLength(1);
+        expect(runs.filter((row) => row.status === "scheduled_retry")).toHaveLength(0);
+      });
+
       it("settles a deferred delivery as `queued` when its scheduled retry is promoted", async () => {
         const { agentId } = await seedCompanyAndAgent();
 
@@ -839,14 +870,14 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         expect(await deliveryCount("dead_lettered")).toBe(0);
       });
 
-      it("settles every coalesced delivery, not just the run, when N defer onto one retry", async () => {
+      it("settles every coalesced delivery, not just the run, when three defer onto one retry", async () => {
         const { agentId } = await seedCompanyAndAgent();
         const capacityDenied = heartbeatWithCapacityDenied();
 
-        // Two deliveries for the same PR land while the pool is exhausted. They
-        // share a task key, so the second coalesces onto the run the first
-        // parked — that dedup is intended and must stay.
-        for (const _ of [0, 1]) {
+        // Three deliveries for the same PR land while the pool is exhausted.
+        // They share a task key, so later deliveries coalesce onto the run the
+        // first parked — that dedup is intended and must stay.
+        for (const _ of [0, 1, 2]) {
           expect(
             await capacityDenied.wakeup(agentId, {
               source: "automation",
@@ -857,16 +888,17 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
           ).toBeNull();
         }
 
-        // Both deliveries were deferred; exactly one run holds them.
-        expect(await deliveryCount("deferred")).toBe(2);
+        // Every delivery was deferred; exactly one run holds them.
+        expect(await deliveryCount("deferred")).toBe(3);
         expect(await deliveryCount("queued")).toBe(0);
         const parked = await db
-          .select({ id: heartbeatRuns.id })
+          .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
           .from(heartbeatRuns)
           .where(
             and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "scheduled_retry")),
           );
         expect(parked).toHaveLength(1);
+        expect((parked[0]!.contextSnapshot as Record<string, unknown>)[GITHUB_REVIEW_DELIVERY_COUNT_KEY]).toBe(3);
 
         await db
           .update(heartbeatRuns)
@@ -880,22 +912,26 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         // the loss the alert is supposed to catch. The rest of the funnel counts
         // per delivery (the inline webhook path records `queued` for a coalesced
         // run too), so this path has to as well.
-        expect(await deliveryCount("queued")).toBe(2);
+        expect(await deliveryCount("queued")).toBe(3);
         expect(await deliveryCount("suppressed")).toBe(0);
         expect(await deliveryCount("dead_lettered")).toBe(0);
       });
 
-      it("settles a deferred delivery as `suppressed` on a non-alerting cause when promotion is gated", async () => {        const { agentId } = await seedCompanyAndAgent();
+      it("settles every coalesced delivery as `suppressed` on a non-alerting cause when promotion is gated", async () => {
+        const { agentId } = await seedCompanyAndAgent();
+        const capacityDenied = heartbeatWithCapacityDenied();
 
-        expect(
-          await heartbeatWithCapacityDenied().wakeup(agentId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "github_pr_review_submitted",
-            payload: GITHUB_REVIEW_PAYLOAD,
-          }),
-        ).toBeNull();
-        expect(await deliveryCount("deferred")).toBe(1);
+        for (const _ of [0, 1, 2]) {
+          expect(
+            await capacityDenied.wakeup(agentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "github_pr_review_submitted",
+              payload: GITHUB_REVIEW_PAYLOAD,
+            }),
+          ).toBeNull();
+        }
+        expect(await deliveryCount("deferred")).toBe(3);
 
         await db
           .update(heartbeatRuns)
@@ -909,11 +945,11 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         await heartbeatService(db, { skipQueuedRunDispatch: true }).promoteDueScheduledRetries(new Date());
 
         expect(await deliveryCount("queued")).toBe(0);
-        expect(await deliveryCount("suppressed")).toBe(1);
+        expect(await deliveryCount("suppressed")).toBe(3);
         // A gate decline is policy, not an outage, so it must land on a cause
         // the suppression-outage alert does not select — otherwise every
         // routine reassign/cancel would page and the rule would get silenced.
-        expect(await suppressionCount("scheduled_retry_gate_declined")).toBe(1);
+        expect(await suppressionCount("scheduled_retry_gate_declined")).toBe(3);
         expect(await suppressionCount("other")).toBe(0);
         expect(await suppressionCount("dispatch_rejected")).toBe(0);
       });
