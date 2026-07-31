@@ -804,4 +804,228 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .then((rows) => rows[0]);
     expect(issue).toEqual({ executionRunId: null, executionLockedAt: null });
   });
+
+  // BLO-19941: `running` is neither missing nor terminal, so isCleanable() was
+  // false forever and isPreClaimLockExpired() only covered queued/scheduled_retry.
+  // A run whose row is wedged at `running` therefore held the issue lock
+  // indefinitely and PATCH /api/issues/{id} returned 409 forever, with no
+  // self-service escape for the assignee. reapOrphanedRuns is the primary path
+  // but not a guarantee — several of its skips are clock-unbounded.
+  async function seedWedgedRunningIssue(input: {
+    companyId: string;
+    agentId: string;
+    // Most-recent genuine activity on the holder run.
+    lastOutputAt: Date | null;
+    startedAt?: Date | null;
+    lockedAt: Date;
+    // The wedge shape claims checkout + execution together.
+    sameRunHoldsCheckout?: boolean;
+    updatedAt?: Date;
+  }) {
+    const wedgedRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: wedgedRunId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status: "running",
+      invocationSource: "assignment",
+      // `??` would collapse an explicit null into the default, which is exactly
+      // the no-signal case these tests need to exercise.
+      startedAt: "startedAt" in input ? input.startedAt : new Date(Date.now() - 8 * 60 * 60 * 1000),
+      lastOutputAt: input.lastOutputAt,
+      ...(input.updatedAt ? { updatedAt: input.updatedAt } : {}),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: input.companyId,
+      title: "Lock held by a run wedged at running",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: input.agentId,
+      checkoutRunId: input.sameRunHoldsCheckout === false ? null : wedgedRunId,
+      executionRunId: wedgedRunId,
+      executionLockedAt: input.lockedAt,
+    });
+    return { wedgedRunId, issueId };
+  }
+
+  it("clears a lock whose holder has been running and silent past the bound (BLO-19941)", async () => {
+    const { companyId, agentId } = await seed();
+    const { wedgedRunId, issueId } = await seedWedgedRunningIssue({
+      companyId,
+      agentId,
+      // Silent for 3h — past STALE_RUNNING_ISSUE_LOCK_MS (2h).
+      lastOutputAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+      lockedAt: new Date(Date.now() - 8 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: null, executionRunId: null, executionLockedAt: null });
+
+    // Clearing the lock is non-destructive: the run row itself is untouched.
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, wedgedRunId))
+      .then((rows) => rows[0]);
+    expect(run?.status).toBe("running");
+
+    const audit = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.stale_lock_cleared"))
+      .then((rows) => rows[0]);
+    const details = audit?.details as
+      | { reason?: string; runningLockTimeoutMs?: number; runningLockSilentMs?: number }
+      | null;
+    expect(details?.reason).toBe("running_lock_silent");
+    expect(details?.runningLockTimeoutMs).toBe(2 * 60 * 60 * 1000);
+    expect(details?.runningLockSilentMs).toBeGreaterThanOrEqual(3 * 60 * 60 * 1000);
+  });
+
+  it("preserves a long-running holder that is still producing output (BLO-19941)", async () => {
+    // The bound must be measured from the run's own activity, never from
+    // executionLockedAt: a healthy 8h run legitimately holds an 8h-old lock, and
+    // keying on lock age would clear the locks of every long, healthy run.
+    const { companyId, agentId } = await seed();
+    const { wedgedRunId, issueId } = await seedWedgedRunningIssue({
+      companyId,
+      agentId,
+      lastOutputAt: new Date(Date.now() - 60 * 1000),
+      lockedAt: new Date(Date.now() - 8 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(0);
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: wedgedRunId, executionRunId: wedgedRunId });
+  });
+
+  it("preserves a running holder that is silent but still within the bound (BLO-19941)", async () => {
+    const { companyId, agentId } = await seed();
+    const { issueId } = await seedWedgedRunningIssue({
+      companyId,
+      agentId,
+      // 30m of silence: the reaper owns this window, not the sweeper.
+      lastOutputAt: new Date(Date.now() - 30 * 60 * 1000),
+      lockedAt: new Date(Date.now() - 8 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(0);
+    const row = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.executionRunId).not.toBeNull();
+  });
+
+  it("clears a silent running holder even while review churn bumps updatedAt (BLO-19941)", async () => {
+    // BLO-8827: review/recovery churn bumps heartbeat_runs.updatedAt every
+    // ~minute. Keying the bound on updatedAt would shield a dead run forever, so
+    // the sweeper must ignore it entirely.
+    const { companyId, agentId } = await seed();
+    const { issueId } = await seedWedgedRunningIssue({
+      companyId,
+      agentId,
+      lastOutputAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+      lockedAt: new Date(Date.now() - 8 * 60 * 60 * 1000),
+      updatedAt: new Date(),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+  });
+
+  it("falls back to lock age for a running holder with no activity signal (BLO-19941)", async () => {
+    // A `running` row with no startedAt/lastOutputAt is also the shape of a run
+    // mid-claim, so a freshly-taken lock must survive...
+    const { companyId, agentId } = await seed();
+    const fresh = await seedWedgedRunningIssue({
+      companyId,
+      agentId,
+      lastOutputAt: null,
+      startedAt: null,
+      lockedAt: new Date(Date.now() - 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    expect((await heartbeat.sweepStaleIssueLocks()).cleared).toBe(0);
+    const freshRow = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, fresh.issueId))
+      .then((rows) => rows[0]);
+    expect(freshRow?.executionRunId).toBe(fresh.wedgedRunId);
+
+    // ...while one held past the bound with no signal at all is reclaimed.
+    const stale = await seedWedgedRunningIssue({
+      companyId,
+      agentId,
+      lastOutputAt: null,
+      startedAt: null,
+      lockedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+    });
+    const result = await heartbeat.sweepStaleIssueLocks();
+    expect(result.issueIds).toEqual([stale.issueId]);
+  });
+
+  it("does not clear a live checkout lock held by a different run than the silent holder (BLO-19941)", async () => {
+    // The checkout allowance is deliberately narrow: it is satisfied only when
+    // the SAME wedged run holds both columns. A distinct, live checkout holder
+    // keeps its lock no matter how silent the execution holder is.
+    const { companyId, agentId, runningRunId } = await seed();
+    const { issueId } = await seedWedgedRunningIssue({
+      companyId,
+      agentId,
+      lastOutputAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+      lockedAt: new Date(Date.now() - 8 * 60 * 60 * 1000),
+      sameRunHoldsCheckout: false,
+    });
+    await db
+      .update(issues)
+      .set({ checkoutRunId: runningRunId })
+      .where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(0);
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.checkoutRunId).toBe(runningRunId);
+  });
 });
