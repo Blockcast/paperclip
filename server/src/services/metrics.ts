@@ -162,7 +162,7 @@ export function classifyAuthOutcome(statusCode: number): AuthOutcome {
 export function classifyAuthResponse(input: {
   operation: AuthOperation;
   statusCode: number;
-  location?: string | string[] | undefined;
+  location?: string | number | string[] | undefined;
 }): AuthOutcome {
   const statusOutcome = classifyAuthOutcome(input.statusCode);
   if (
@@ -176,7 +176,7 @@ export function classifyAuthResponse(input: {
 
   const locations = Array.isArray(input.location) ? input.location : [input.location];
   for (const location of locations) {
-    if (!location) continue;
+    if (typeof location !== "string" || !location) continue;
     try {
       const error = new URL(location, "http://paperclip.invalid").searchParams.get("error");
       if (error !== null) {
