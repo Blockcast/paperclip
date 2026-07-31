@@ -125,6 +125,11 @@ export type AuthOutcome = (typeof KNOWN_AUTH_OUTCOMES)[number];
 
 const knownAuthOperationSet: ReadonlySet<string> = new Set(KNOWN_AUTH_OPERATIONS);
 const knownAuthOutcomeSet: ReadonlySet<string> = new Set(KNOWN_AUTH_OUTCOMES);
+const oidcServerErrorRedirectCodes: ReadonlySet<string> = new Set([
+  "internal_server_error",
+  "oauth_code_verification_failed",
+  "user_info_is_missing",
+]);
 
 export function normalizeAuthOperation(operation: string | null | undefined): AuthOperation {
   return typeof operation === "string" && knownAuthOperationSet.has(operation)
@@ -151,6 +156,37 @@ export function classifyAuthOutcome(statusCode: number): AuthOutcome {
   if (statusCode === 429) return "rate_limited";
   if (statusCode >= 500) return "server_error";
   if (statusCode >= 400) return "client_error";
+  return "success";
+}
+
+export function classifyAuthResponse(input: {
+  operation: AuthOperation;
+  statusCode: number;
+  location?: string | string[] | undefined;
+}): AuthOutcome {
+  const statusOutcome = classifyAuthOutcome(input.statusCode);
+  if (
+    statusOutcome !== "success" ||
+    input.operation !== "oidc_callback" ||
+    input.statusCode < 300 ||
+    input.statusCode >= 400
+  ) {
+    return statusOutcome;
+  }
+
+  const locations = Array.isArray(input.location) ? input.location : [input.location];
+  for (const location of locations) {
+    if (!location) continue;
+    try {
+      const error = new URL(location, "http://paperclip.invalid").searchParams.get("error");
+      if (error !== null) {
+        return oidcServerErrorRedirectCodes.has(error) ? "server_error" : "client_error";
+      }
+    } catch {
+      // A malformed Location header is not an OAuth error redirect signal.
+    }
+  }
+
   return "success";
 }
 

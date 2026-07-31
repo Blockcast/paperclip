@@ -17,7 +17,7 @@ import { resolvePaperclipInstanceId } from "../home-paths.js";
 import { logger } from "../middleware/logger.js";
 import {
   classifyAuthOperation,
-  classifyAuthOutcome,
+  classifyAuthResponse,
   recordAuthRequest,
 } from "../services/metrics.js";
 import {
@@ -295,7 +295,11 @@ export function createBetterAuthHandler(auth: BetterAuthHandlerTarget): RequestH
   return (req, res, next) => {
     const operation = classifyAuthOperation(req.originalUrl);
     res.once("finish", () => {
-      const outcome = classifyAuthOutcome(res.statusCode);
+      const outcome = classifyAuthResponse({
+        operation,
+        statusCode: res.statusCode,
+        location: res.getHeader("location"),
+      });
       recordAuthRequest({ operation, outcome });
       logger.info(
         {

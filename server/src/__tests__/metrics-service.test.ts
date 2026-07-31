@@ -16,6 +16,7 @@ import {
   __resetMetricsForTest,
   classifyAuthOperation,
   classifyAuthOutcome,
+  classifyAuthResponse,
   normalizeAgentId,
   normalizeInvocationSource,
   normalizeIsolationMode,
@@ -62,6 +63,24 @@ describe("authentication request metrics", () => {
     expect(classifyAuthOutcome(400)).toBe("client_error");
     expect(classifyAuthOutcome(429)).toBe("rate_limited");
     expect(classifyAuthOutcome(503)).toBe("server_error");
+  });
+
+  it("classifies successful and failed OIDC callback redirects", () => {
+    expect(classifyAuthResponse({
+      operation: "oidc_callback",
+      statusCode: 302,
+      location: "/",
+    })).toBe("success");
+    expect(classifyAuthResponse({
+      operation: "oidc_callback",
+      statusCode: 302,
+      location: "/api/auth/error?error=access_denied&error_description=cancelled",
+    })).toBe("client_error");
+    expect(classifyAuthResponse({
+      operation: "oidc_callback",
+      statusCode: 302,
+      location: "/api/auth/error?error=oauth_code_verification_failed",
+    })).toBe("server_error");
   });
 
   it("exposes and increments the auth counter without unbounded labels", async () => {
