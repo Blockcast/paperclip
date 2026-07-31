@@ -386,6 +386,16 @@ prometheusRule:
   unschedulablePodThreshold: 0
   # -- How long agent pods must stay Unschedulable before warning (transient blips self-resolve; this catches sustained starvation).
   unschedulableFor: 15m
+  # -- Rolling window for the GitHub review-request dead-letter rate (BLO-18859). Any dead-lettered delivery in this window fires; the counter is flat at zero in steady state.
+  githubDeliveryDeadLetterWindow: 30m
+  # -- How long a non-zero dead-letter rate must persist before firing. Kept short: a dead-lettered delivery is already terminal, so there is nothing to self-resolve.
+  githubDeliveryDeadLetterFor: 5m
+  # -- Rolling window for outage-like terminal suppression of GitHub review-request wakes (BLO-18859).
+  githubDeliverySuppressionWindow: 30m
+  # -- How long outage-like suppression must persist before firing. Same reasoning as the dead-letter alert: suppression is terminal, nothing self-resolves.
+  githubDeliverySuppressionFor: 5m
+  # -- Prometheus regex of suppression causes that mean an outage rather than a deliberate decline (BLO-18859). Expected policy declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded so they never page. `other` is included: it is the bucket for a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES, and an untriaged cause is not a known-good decline.
+  githubDeliverySuppressionOutageCauses: "heartbeat.scheduling_suppressed|dispatch_rejected|other"
   # -- Additional PrometheusRule groups appended verbatim.
   additionalGroups: []
 

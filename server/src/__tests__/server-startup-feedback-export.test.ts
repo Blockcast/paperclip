@@ -19,6 +19,7 @@ const {
   fakeServer,
   heartbeatServiceFactoryMock,
   heartbeatServiceMock,
+  loadAuthCapabilitiesMock,
   loadConfigMock,
   resolveHeartbeatSchedulingSuppressionMock,
   routineServiceFactoryMock,
@@ -31,6 +32,10 @@ const {
   const createDbMock = vi.fn(() => ({}) as never);
   const detectPortMock = vi.fn(async (port: number) => port);
   const deriveAuthTrustedOriginsMock = vi.fn(() => []);
+  const loadAuthCapabilitiesMock = vi.fn(() => ({
+    emailPasswordEnabled: true,
+    oidcProviders: [],
+  }));
   const resolveHeartbeatSchedulingSuppressionMock = vi.fn(() => ({
     suppressed: false,
     reason: null,
@@ -102,6 +107,7 @@ const {
     fakeServer,
     heartbeatServiceFactoryMock,
     heartbeatServiceMock,
+    loadAuthCapabilitiesMock,
     loadConfigMock,
     resolveHeartbeatSchedulingSuppressionMock,
     routineServiceFactoryMock,
@@ -285,10 +291,7 @@ vi.mock("../auth/better-auth.js", () => ({
   createBetterAuthHandler: vi.fn(() => undefined),
   createBetterAuthInstance: createBetterAuthInstanceMock,
   deriveAuthTrustedOrigins: deriveAuthTrustedOriginsMock,
-  loadAuthCapabilities: vi.fn(() => ({
-    emailPasswordEnabled: true,
-    oidcProviders: [],
-  })),
+  loadAuthCapabilities: loadAuthCapabilitiesMock,
   resolveBetterAuthSession: vi.fn(async () => null),
   resolveBetterAuthSessionFromHeaders: vi.fn(async () => null),
 }));

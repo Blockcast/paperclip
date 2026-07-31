@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "packageName": "@paperclipai/skills-catalog",
   "packageVersion": "0.3.1",
-  "generatedAt": "2026-07-31T17:44:41.646Z",
+  "generatedAt": "2026-07-31T18:53:53.147Z",
   "skills": [
     {
       "id": "paperclipai:bundled:docs:doc-maintenance",
@@ -1075,7 +1075,8 @@
         "ref": "v3.3.0",
         "commit": "daca71f89eb71d0d56d01a43ed7627aa919dba4f",
         "path": "skills/last30days",
-        "url": "https://github.com/mvanhorn/last30days-skill/tree/v3.3.0/skills/last30days"
+        "url": "https://github.com/mvanhorn/last30days-skill/tree/v3.3.0/skills/last30days",
+        "descriptorSha256": "dc27aa8500e402d0dae63949052da966626c6e227e980ae597a51774bd92d0e5"
       }
     }
   ]
