@@ -462,6 +462,11 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "adapter_failed",
   "codex_transient_upstream",
   "claude_transient_upstream",
+  // BLO-18285: the server-side classification of a hint-less provider 503/529
+  // on the k8s adapters. The bounded retry in heartbeat should normally park
+  // such a run in `scheduled_retry` before this sweep ever sees it; listing the
+  // code here keeps the continuation path consistent if it does.
+  "provider_transient_upstream",
   "provider_quota",
   "timeout",
   // BLO-16182: `process_lost` means the run died before ANY adapter/model call
@@ -535,6 +540,31 @@ function isAutomaticContinuationRecoveryRun(
       latestRun.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
     )
   );
+}
+
+// Recovery handoffs for workspace-preflight failures used to route the operator to
+// a generic "restore a live execution path" instruction, which names neither the
+// failing check nor a first probe. Give the actual cause instead. (BLO-18784)
+const WORKSPACE_PREFLIGHT_RECOVERY_GUIDANCE: Record<string, string> = {
+  workspace_git_submodule_unavailable:
+    "the git submodule preflight (`git submodule status --recursive`) could not leave the execution " +
+    "workspace's submodules in a usable state. A merely slow inspection no longer strands an issue, " +
+    "so this handoff means one of three things: a submodule fault was actually detected (conflicted " +
+    "gitlinks, or still uninitialized after the automatic repair); the repair commands themselves " +
+    "failed -- which can be transient, e.g. a network/auth failure fetching a submodule; or the " +
+    "inspection itself failed deterministically (malformed `.gitmodules`, corrupt checkout, " +
+    "permission error, missing git binary). Check the run's failure output to tell them apart: if the " +
+    "repair failed transiently, re-running may be sufficient; if a gitlink is genuinely conflicted or " +
+    "`.gitmodules` will not parse, fix the shared checkout first.",
+  workspace_repo_mismatch:
+    "the execution workspace is checked out from a different repository than the issue expects. " +
+    "Repoint or re-provision the workspace, then re-run.",
+};
+
+function describeWorkspacePreflightRecoveryCause(latestRun: LatestIssueRun): string | null {
+  const errorCode = readNonEmptyString(latestRun?.errorCode);
+  if (!errorCode) return null;
+  return WORKSPACE_PREFLIGHT_RECOVERY_GUIDANCE[errorCode] ?? null;
 }
 
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
@@ -3977,6 +4007,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       : "none";
     const retryReason = readNonEmptyString(parseObject(input.latestRun?.contextSnapshot)?.retryReason) ?? "none";
     const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+    const workspacePreflightCause = describeWorkspacePreflightRecoveryCause(input.latestRun);
 
     return [
       "Paperclip stopped automatic stranded-work recovery for this recovery issue.",
@@ -3989,7 +4020,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       failureSummary ? `- Failure: ${failureSummary.trim()}` : "- Failure: none recorded",
       "- Guard: recovery issues do not create nested `stranded_issue_recovery` issues.",
       "",
-      "Next action: the current recovery owner should inspect the failed run evidence, restore a live execution path or record the manual resolution, then move this recovery issue out of `blocked`.",
+      workspacePreflightCause
+        ? `Next action: ${workspacePreflightCause} Then move this recovery issue out of \`blocked\`.`
+        : "Next action: the current recovery owner should inspect the failed run evidence, restore a live execution path or record the manual resolution, then move this recovery issue out of `blocked`.",
     ].join("\n");
   }
 
@@ -4543,6 +4576,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (isProviderQuotaWait) return updated;
 
       const prefix = await getCompanyIssuePrefix(fresh.companyId);
+      const workspacePreflightHandoffCause = describeWorkspacePreflightRecoveryCause(input.latestRun);
       const recoveryOwner = action.ownerAgentId ? await getAgent(action.ownerAgentId) : null;
       const sourceAssignee = fresh.assigneeAgentId ? await getAgent(fresh.assigneeAgentId) : null;
       let notice: SuccessfulRunHandoffNotice | null = null;
@@ -4587,7 +4621,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               `- ${reassignmentMarker}: taken over from ${agentUiLink(sourceAssignee, prefix)}, which can no longer PATCH or comment on this issue as its assignee.`,
             ]
             : []),
-          "- Next action: the recovery owner should restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
+          workspacePreflightHandoffCause
+            ? `- Next action: ${workspacePreflightHandoffCause}`
+            : "- Next action: the recovery owner should restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
         ].join("\n")
         : [
           "",
