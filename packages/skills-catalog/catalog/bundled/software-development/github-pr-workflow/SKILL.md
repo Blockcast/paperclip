@@ -45,14 +45,19 @@ Ship a PR a reviewer can land without follow-up clarifying questions. The aim is
 **Look for a repo-local PR template before you write anything.** When the
 repository ships one, its headings are the contract and the generic structure at
 the end of this section is only the fallback. GitHub honours a template at the
-repo root, under `.github/`, or under `docs/`, and a directory of named
-templates in place of a single file:
+repo root, under `.github/`, or under `docs/`, in either letter case, and a
+directory of named templates in place of a single file. Search all three
+locations case-insensitively — an enumeration that guesses the casing wrong
+prints nothing, which is indistinguishable from a repo that has no template:
 
 ```sh
-ls .github/PULL_REQUEST_TEMPLATE.md .github/pull_request_template.md \
-   .github/PULL_REQUEST_TEMPLATE/ PULL_REQUEST_TEMPLATE.md \
-   docs/PULL_REQUEST_TEMPLATE.md 2>/dev/null
+find . .github docs -maxdepth 1 -iname 'pull_request_template*' 2>/dev/null
 ```
+
+A `PULL_REQUEST_TEMPLATE/` **directory** is the one case with no default: GitHub
+applies none of its files unless the PR is opened with `?template=`. Read the
+repo's checker to see which file it enforces — that one is the contract. Absent a
+checker, pick the template whose headings fit the change and say which you used.
 
 Where one exists, follow it — and note that following it means more than copying
 it across:
@@ -83,7 +88,7 @@ is available in a second instead of costing a push, a red check, and a rewrite:
 ```sh
 ls .github/scripts/ .github/workflows/ 2>/dev/null   # find the checker
 # Typical shape: takes the body from a file or env var, prints JSON, exits non-zero.
-PR_BODY="$(cat pr-body.md)" node .github/scripts/check-pr-template.mjs
+PR_BODY="$(cat pr-body.md)" node .github/scripts/<checker>.mjs
 gh pr create --body-file pr-body.md                  # only once it passes
 ```
 
