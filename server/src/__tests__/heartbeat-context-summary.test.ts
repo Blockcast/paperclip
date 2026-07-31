@@ -147,6 +147,34 @@ describe("buildPaperclipTaskMarkdown", () => {
     expect(authorMarkdown).toContain("Do NOT close the PR or self-approve");
   });
 
+  // BLO-19067: the closing instruction was unconditional, so an APPROVED
+  // review woke the author telling them to "push a follow-up commit". There is
+  // nothing to address on an approved PR, and the resulting no-op push
+  // invalidates the approval and restarts CI.
+  it("tells an APPROVED-review author not to push a follow-up commit", () => {
+    const authorMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_submitted",
+        prNumber: 591,
+        repoFullName: "Blockcast/Network-Operator-Portal",
+        event: "pull_request_review",
+        prRole: "author",
+        reviewBody: "Looks good. No Critical or Important issues found.",
+        reviewState: "approved",
+        reviewAuthorLogin: "allyblockcast",
+      },
+    });
+    expect(authorMarkdown).toContain(
+      "allyblockcast just submitted a review on YOUR pull request (state: APPROVED).",
+    );
+    expect(authorMarkdown).toContain("It APPROVED your PR, so no implementation pass is required");
+    expect(authorMarkdown).not.toContain("push a follow-up commit");
+    expect(authorMarkdown).not.toContain("If the findings are correct");
+    // The non-state-specific guardrails must survive the branch.
+    expect(authorMarkdown).toContain("Do NOT close the PR or self-approve");
+  });
+
   it("falls back to a generic author-facing directive when reviewer login / state / body are missing", () => {
     const authorMarkdown = buildPaperclipTaskMarkdown({
       issue: null,

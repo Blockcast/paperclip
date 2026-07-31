@@ -62,6 +62,7 @@ Follow these steps every time you wake up:
 
 - They match → you hold it. Proceed.
 - They differ **and** `activeRun.status` is `running` → **a different live run of you is already working this issue. Cede.** Do not edit files, commit, push, or change status. Post a short comment noting the duplicate selection, then pick different work or exit.
+- `activeRun` is `null` → nobody is holding it. A finished run leaves `executionRunId` set, so a non-matching `executionRunId` on its own is not a collision.
 
 `inbox-lite` withholds these issues server-side, so in practice you should not see one. Keep the check anyway: it is one comparison, it covers the fallback issue-list path and any stale-lock takeover, and a duplicate run that starts working is destructive rather than merely wasteful — under a shared worktree both runs edit the same tree, and a routine `rm -rf node_modules` in one destroys the other's state mid-task. Note that "no comments yet" is **not** evidence an issue is unworked: the holding run may be minutes into its first pass and not have commented yet.
 
