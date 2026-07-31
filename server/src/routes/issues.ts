@@ -3885,6 +3885,8 @@ export function issueRoutes(
       return false;
     }
     if (await isActiveRecoveryActionOwner()) return true;
+    const isCreatorOrManagerChainDecision =
+      boundaryDecision.reason === "allow_issue_creator" || boundaryDecision.reason === "allow_manager_chain";
     // BLO-18113 / BLO-18797: decideIssueAccess just admitted this actor via
     // allow_issue_creator / allow_manager_chain. Both reasons are only ever
     // returned for an actor that is NOT the assignee (authorization.ts
@@ -3899,16 +3901,12 @@ export function issueRoutes(
     // checkout-management override below can widen the boundary decision.
     if (
       options.allowCreatorOrManagerChainOwnership &&
-      (boundaryDecision.reason === "allow_issue_creator" ||
-        boundaryDecision.reason === "allow_manager_chain") &&
+      isCreatorOrManagerChainDecision &&
       isCreatorOrManagerChainRecoveryPatch(issue, req.body as Record<string, unknown>)
     ) {
       return true;
     }
-    if (
-      boundaryDecision.reason === "allow_issue_creator" ||
-      boundaryDecision.reason === "allow_manager_chain"
-    ) {
+    if (isCreatorOrManagerChainDecision && !options.allowCreatorOrManagerChainOwnership) {
       res.status(403).json({
         error: "Agent cannot mutate another agent's issue outside delegate recovery",
         details: {
@@ -3930,6 +3928,19 @@ export function issueRoutes(
     if (issue.assigneeAgentId !== actorAgentId) {
       if (await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)) {
         return true;
+      }
+      if (isCreatorOrManagerChainDecision) {
+        res.status(403).json({
+          error: "Agent cannot mutate another agent's issue outside delegate recovery",
+          details: {
+            issueId: issue.id,
+            assigneeAgentId: issue.assigneeAgentId,
+            actorAgentId,
+            status: issue.status,
+            securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+          },
+        });
+        return false;
       }
       if (issue.status === "in_progress") {
         res.status(409).json({
