@@ -266,7 +266,8 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
     highChurnHourly: readPositiveInteger(
       overrides?.highChurnHourly ?? DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
       DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
-    ),    highChurnSixHours: readPositiveInteger(
+    ),
+    highChurnSixHours: readPositiveInteger(
       overrides?.highChurnSixHours ?? DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS,
       DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS,
     ),
