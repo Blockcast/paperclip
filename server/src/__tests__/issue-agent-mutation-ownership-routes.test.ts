@@ -1166,6 +1166,192 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
+  // BLO-18996: the reported deadlock. A `stranded_assigned_issue` action named an owner
+  // who is not the source issue's assignee and whose run is checked out elsewhere, so
+  // `issue:comment` denied and the owner could not discharge the action it was woken
+  // for. The action stayed `active` and the sweep re-fired it indefinitely.
+  describe("source-scoped recovery owner comment grant (BLO-18996)", () => {
+    // The ordinary peer-agent fall-through: every allow-path missed, so `issue:comment`
+    // ends at `deny_missing_grant`. That is the one denial the recovery-owner grant may
+    // override; `denyCommentWithReason` below covers the ones it may not.
+    function denyCommentGrantEverywhere() {
+      denyCommentWithReason("deny_missing_grant");
+    }
+
+    // The owner's run id deliberately does not match the issue's checkout/execution run:
+    // that is the "checked out against a different issue" half of the reported shape, and
+    // it is what makes `isCurrentIssueExecutionRun` fall through to the boundary check.
+    const recoveryOwnerActor = () => peerActor({ runId: "9a9a9a9a-9a9a-4a9a-8a9a-9a9a9a9a9a9a" });
+
+    it("lets the owner of an active recovery action comment on its source issue", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "I cannot restore this; escalating." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalledWith(
+        issueId,
+        "I cannot restore this; escalating.",
+        expect.any(Object),
+        expect.any(Object),
+      );
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("still rejects an agent who is not the named recovery owner", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: staleAgentId }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Not my recovery action." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (grant)");
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    it("does not admit a recovery action whose owner is unset", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: null, ownerType: "board" }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Board-owned action; not mine." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    // Ally's review of PR #837: the admission originally sat in a bare
+    // `if (!boundaryDecision.allowed)`, so it overrode EVERY denial reason — a low-trust
+    // actor scoped to an explicit trust boundary could step outside it just by being the
+    // named owner of an active recovery action. The grant is now gated on the single
+    // ordinary peer-agent fall-through reason (`deny_missing_grant`), so a hard denial
+    // stays terminal. Each of these actors IS the named owner; only the reason differs.
+    function denyCommentWithReason(reason: string) {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action === "issue:read",
+        action: input.action,
+        reason: input.action === "issue:read" ? "allow_explicit_grant" : reason,
+        explanation: input.action === "issue:read" ? "Allowed by test read grant." : "Denied by test.",
+      }));
+    }
+
+    it.each([
+      ["deny_low_trust_boundary", "trust-boundary"],
+      ["deny_policy_restricted", "trust-boundary"],
+      ["deny_scope", "scope"],
+      ["deny_missing_membership", "membership"],
+      ["deny_company_boundary", "company-mismatch"],
+    ])("does not let the recovery owner grant override a %s denial", async (reason, label) => {
+      denyCommentWithReason(reason);
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Owner of the action, but denied for a harder reason." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe(`Issue is outside this actor's authorization boundary (${label})`);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    // The complement of the case above: the grant must still do its job for the ordinary
+    // missing-grant denial, which is the deadlock this whole change exists to break.
+    it("still admits the recovery owner on the ordinary missing-grant denial", async () => {
+      denyCommentWithReason("deny_missing_grant");
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Discharging the recovery action." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalled();
+    });
+
+    // The grant is comment-only. A reopen/resume on a closed source issue still has to
+    // clear `assertAgentIssueMutationAllowed`, which is not passed
+    // `allowRecoveryActionOwner` here — so the grant cannot be used to smuggle a status
+    // change past the mutation boundary. Same hard-fail the mention grant already gets.
+    it("does not let the recovery owner reopen a closed source issue via the comment grant", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "done",
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Reopening this.", reopen: true });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (grant)");
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    // Company isolation fires earlier than the grant (the issue is not even resolvable
+    // for a foreign-company actor), so the grant can never be the thing that admits one.
+    it("does not admit a cross-company actor through the recovery owner grant", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+      );
+
+      const res = await request(await createApp(peerActor({
+        companyId: "88888888-8888-4888-8888-888888888888",
+        runId: "9a9a9a9a-9a9a-4a9a-8a9a-9a9a9a9a9a9a",
+      })))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Different company." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(404);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+  });
+
   it("rejects peer agents from listing comments when issue read is outside their boundary", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: false,

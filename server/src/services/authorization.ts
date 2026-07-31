@@ -105,6 +105,7 @@ export type AuthorizationDecision = {
     | "allow_consented_change"
     | "allow_legacy_agent_creator"
     | "allow_issue_mention_grant"
+    | "allow_source_scoped_recovery_owner"
     | "allow_recovery_handoff_grant"
     | "allow_self"
     | "allow_company_agent"
