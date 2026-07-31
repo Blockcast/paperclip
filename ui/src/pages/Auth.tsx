@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { authApi } from "../api/auth";
+import { healthApi } from "../api/health";
 import { queryKeys } from "../lib/queryKeys";
 import { getRememberedInvitePath } from "../lib/invite-memory";
 import { Button } from "@/components/ui/button";
@@ -33,6 +34,17 @@ export function AuthPage() {
     queryFn: () => authApi.getSession(),
     retry: false,
   });
+  const {
+    data: health,
+    isLoading: isHealthLoading,
+    isError: isHealthError,
+  } = useQuery({
+    queryKey: queryKeys.health,
+    queryFn: () => healthApi.get(),
+    retry: false,
+  });
+  const emailPasswordEnabled = health?.auth?.emailPasswordEnabled ?? false;
+  const oidcProviderId = health?.auth?.oidcProviders[0];
 
   useEffect(() => {
     if (session) {
@@ -64,24 +76,11 @@ export function AuthPage() {
     },
   });
 
-  const microsoftMutation = useMutation({
-    mutationFn: async () => authApi.signInSocial({ provider: "microsoft", callbackURL: nextPath }),
-    onSuccess: ({ url }) => {
-      setError(null);
-      window.location.assign(url);
-    },
-    onError: (err) => {
-      ssoStartLockedRef.current = false;
-      setError(
-        err instanceof Error
-          ? `Microsoft sign-in unavailable: ${err.message}`
-          : "Microsoft sign-in unavailable.",
-      );
-    },
-  });
-
   const googleMutation = useMutation({
-    mutationFn: async () => authApi.signInOAuth2({ providerId: "dex", callbackURL: nextPath }),
+    mutationFn: async () => {
+      if (!oidcProviderId) throw new Error("Dex is not configured.");
+      return authApi.signInOAuth2({ providerId: oidcProviderId, callbackURL: nextPath });
+    },
     onSuccess: ({ url }) => {
       setError(null);
       window.location.assign(url);
@@ -100,12 +99,22 @@ export function AuthPage() {
     email.trim().length > 0 &&
     password.trim().length > 0 &&
     (mode === "sign_in" || (name.trim().length > 0 && password.trim().length >= 8));
-  const ssoPending = googleMutation.isPending || microsoftMutation.isPending;
+  const ssoPending = googleMutation.isPending;
 
-  if (isSessionLoading) {
+  if (isSessionLoading || isHealthLoading) {
     return (
       <div className="fixed inset-0 flex items-center justify-center">
         <p className="text-sm text-muted-foreground">Loading…</p>
+      </div>
+    );
+  }
+
+  if (isHealthError || (!emailPasswordEnabled && !oidcProviderId)) {
+    return (
+      <div className="fixed inset-0 flex items-center justify-center bg-background px-6">
+        <p role="alert" className="text-sm text-destructive">
+          Authentication configuration is unavailable.
+        </p>
       </div>
     );
   }
@@ -124,110 +133,113 @@ export function AuthPage() {
           </div>
 
           <h1 className="text-xl font-semibold">
-            {mode === "sign_in" ? "Sign in to Paperclip" : "Create your Paperclip account"}
+            {mode === "sign_in" || !emailPasswordEnabled
+              ? "Sign in to Paperclip"
+              : "Create your Paperclip account"}
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            {mode === "sign_in"
-              ? "Use team SSO or email and password to access this instance."
-              : "Create an account for this instance. Email confirmation is not required in v1."}
+            {!emailPasswordEnabled
+              ? "Use your Blockcast Google Workspace account."
+              : mode === "sign_in"
+                ? "Use team SSO or email and password to access this instance."
+                : "Create an account for this instance. Email confirmation is not required in v1."}
           </p>
 
-          <form
-            className="mt-6 space-y-4"
-            method="post"
-            action={mode === "sign_up" ? "/api/auth/sign-up/email" : "/api/auth/sign-in/email"}
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (mutation.isPending) return;
-              if (!canSubmit) {
-                setError("Please fill in all required fields.");
-                return;
-              }
-              mutation.mutate();
-            }}
-          >
-            {mode === "sign_up" && (
+          {emailPasswordEnabled && (
+            <form
+              className="mt-6 space-y-4"
+              method="post"
+              action={mode === "sign_up" ? "/api/auth/sign-up/email" : "/api/auth/sign-in/email"}
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (mutation.isPending) return;
+                if (!canSubmit) {
+                  setError("Please fill in all required fields.");
+                  return;
+                }
+                mutation.mutate();
+              }}
+            >
+              {mode === "sign_up" && (
+                <div>
+                  <label htmlFor="name" className="text-xs text-muted-foreground mb-1 block">Name</label>
+                  <input
+                    id="name"
+                    name="name"
+                    className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
+                    value={name}
+                    onChange={(event) => setName(event.target.value)}
+                    autoComplete="name"
+                    required
+                    aria-required="true"
+                    aria-invalid={error ? true : undefined}
+                    aria-describedby={error ? errorId : undefined}
+                    autoFocus
+                  />
+                </div>
+              )}
               <div>
-                <label htmlFor="name" className="text-xs text-muted-foreground mb-1 block">Name</label>
+                <label htmlFor="email" className="text-xs text-muted-foreground mb-1 block">Email</label>
                 <input
-                  id="name"
-                  name="name"
+                  id="email"
+                  name="email"
                   className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
-                  value={name}
-                  onChange={(event) => setName(event.target.value)}
-                  autoComplete="name"
+                  type="email"
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  autoComplete="username"
                   required
                   aria-required="true"
                   aria-invalid={error ? true : undefined}
                   aria-describedby={error ? errorId : undefined}
-                  autoFocus
+                  autoFocus={mode === "sign_in"}
                 />
               </div>
-            )}
-            <div>
-              <label htmlFor="email" className="text-xs text-muted-foreground mb-1 block">Email</label>
-              <input
-                id="email"
-                name="email"
-                className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
-                type="email"
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
-                autoComplete="username"
-                required
-                aria-required="true"
-                aria-invalid={error ? true : undefined}
-                aria-describedby={error ? errorId : undefined}
-                autoFocus={mode === "sign_in"}
-              />
-            </div>
-            <div>
-              <label htmlFor="password" className="text-xs text-muted-foreground mb-1 block">Password</label>
-              <input
-                id="password"
-                name="password"
-                className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
-                type="password"
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-                autoComplete={mode === "sign_in" ? "current-password" : "new-password"}
-                required
-                aria-required="true"
-                aria-invalid={error ? true : undefined}
-                aria-describedby={error ? errorId : undefined}
-              />
-            </div>
-            {error && (
-              <p id={errorId} role="alert" className="text-xs text-destructive">
-                {error}
-              </p>
-            )}
-            <Button
-              type="submit"
-              disabled={mutation.isPending}
-              aria-disabled={!canSubmit || mutation.isPending}
-              className={`w-full ${!canSubmit && !mutation.isPending ? "opacity-50" : ""}`}
-            >
-              {mutation.isPending
-                ? "Working…"
-                : mode === "sign_in"
-                  ? "Sign In"
-                  : "Create Account"}
-            </Button>
-          </form>
-
-          {mode === "sign_in" && (
-            <>
-              <div className="my-5 flex items-center gap-3">
-                <div className="h-px flex-1 bg-border" />
-                <span className="text-xs text-muted-foreground">or</span>
-                <div className="h-px flex-1 bg-border" />
+              <div>
+                <label htmlFor="password" className="text-xs text-muted-foreground mb-1 block">Password</label>
+                <input
+                  id="password"
+                  name="password"
+                  className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
+                  type="password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  autoComplete={mode === "sign_in" ? "current-password" : "new-password"}
+                  required
+                  aria-required="true"
+                  aria-invalid={error ? true : undefined}
+                  aria-describedby={error ? errorId : undefined}
+                />
               </div>
+              <Button
+                type="submit"
+                disabled={mutation.isPending}
+                aria-disabled={!canSubmit || mutation.isPending}
+                className={`w-full ${!canSubmit && !mutation.isPending ? "opacity-50" : ""}`}
+              >
+                {mutation.isPending
+                  ? "Working…"
+                  : mode === "sign_in"
+                    ? "Sign In"
+                    : "Create Account"}
+              </Button>
+            </form>
+          )}
+
+          {mode === "sign_in" && oidcProviderId && (
+            <>
+              {emailPasswordEnabled && (
+                <div className="my-5 flex items-center gap-3">
+                  <div className="h-px flex-1 bg-border" />
+                  <span className="text-xs text-muted-foreground">or</span>
+                  <div className="h-px flex-1 bg-border" />
+                </div>
+              )}
               <div className="space-y-2">
                 <Button
                   type="button"
                   variant="outline"
-                  className="w-full"
+                  className={`w-full ${emailPasswordEnabled ? "" : "mt-6"}`}
                   disabled={ssoPending}
                   onClick={() => {
                     if (ssoStartLockedRef.current) return;
@@ -238,37 +250,31 @@ export function AuthPage() {
                 >
                   {googleMutation.isPending ? "Redirecting…" : "Sign in with Google"}
                 </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  className="w-full"
-                  disabled={ssoPending}
-                  onClick={() => {
-                    if (ssoStartLockedRef.current) return;
-                    ssoStartLockedRef.current = true;
-                    setError(null);
-                    microsoftMutation.mutate();
-                  }}
-                >
-                  {microsoftMutation.isPending ? "Redirecting…" : "Sign in with Microsoft"}
-                </Button>
               </div>
             </>
           )}
 
-          <div className="mt-5 text-sm text-muted-foreground">
-            {mode === "sign_in" ? "Need an account?" : "Already have an account?"}{" "}
-            <button
-              type="button"
-              className="font-medium text-foreground underline underline-offset-2"
-              onClick={() => {
-                setError(null);
-                setMode(mode === "sign_in" ? "sign_up" : "sign_in");
-              }}
-            >
-              {mode === "sign_in" ? "Create one" : "Sign in"}
-            </button>
-          </div>
+          {error && (
+            <p id={errorId} role="alert" className="mt-4 text-xs text-destructive">
+              {error}
+            </p>
+          )}
+
+          {emailPasswordEnabled && (
+            <div className="mt-5 text-sm text-muted-foreground">
+              {mode === "sign_in" ? "Need an account?" : "Already have an account?"}{" "}
+              <button
+                type="button"
+                className="font-medium text-foreground underline underline-offset-2"
+                onClick={() => {
+                  setError(null);
+                  setMode(mode === "sign_in" ? "sign_up" : "sign_in");
+                }}
+              >
+                {mode === "sign_in" ? "Create one" : "Sign in"}
+              </button>
+            </div>
+          )}
         </div>
       </div>
 

@@ -28,6 +28,7 @@ import {
 } from "./blocker-resolved-wake-metrics.js";
 
 export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_total";
+export const AUTH_REQUEST_METRIC = "paperclip_auth_request_total";
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
 /**
@@ -105,6 +106,53 @@ export const PROCESS_LOST_LIVENESS_NULL_METRIC = "paperclip_process_lost_livenes
  * while their pods keep running (the wedged-container leak this reaper closes).
  */
 export const ORPHANED_MANAGED_POD_REAPED_METRIC = "paperclip_orphaned_managed_pod_reaped_total";
+
+export const KNOWN_AUTH_OPERATIONS = [
+  "oidc_start",
+  "oidc_callback",
+  "password_sign_in",
+  "password_sign_up",
+  "other",
+] as const;
+export const KNOWN_AUTH_OUTCOMES = [
+  "success",
+  "rate_limited",
+  "client_error",
+  "server_error",
+] as const;
+export type AuthOperation = (typeof KNOWN_AUTH_OPERATIONS)[number];
+export type AuthOutcome = (typeof KNOWN_AUTH_OUTCOMES)[number];
+
+const knownAuthOperationSet: ReadonlySet<string> = new Set(KNOWN_AUTH_OPERATIONS);
+const knownAuthOutcomeSet: ReadonlySet<string> = new Set(KNOWN_AUTH_OUTCOMES);
+
+export function normalizeAuthOperation(operation: string | null | undefined): AuthOperation {
+  return typeof operation === "string" && knownAuthOperationSet.has(operation)
+    ? operation as AuthOperation
+    : "other";
+}
+
+export function normalizeAuthOutcome(outcome: string | null | undefined): AuthOutcome {
+  return typeof outcome === "string" && knownAuthOutcomeSet.has(outcome)
+    ? outcome as AuthOutcome
+    : "server_error";
+}
+
+export function classifyAuthOperation(requestUrl: string): AuthOperation {
+  const pathname = requestUrl.split("?", 1)[0]?.replace(/\/+$/, "") ?? "";
+  if (pathname.endsWith("/sign-in/oauth2")) return "oidc_start";
+  if (/\/(?:oauth2\/callback|callback)\/[^/]+$/.test(pathname)) return "oidc_callback";
+  if (pathname.endsWith("/sign-in/email")) return "password_sign_in";
+  if (pathname.endsWith("/sign-up/email")) return "password_sign_up";
+  return "other";
+}
+
+export function classifyAuthOutcome(statusCode: number): AuthOutcome {
+  if (statusCode === 429) return "rate_limited";
+  if (statusCode >= 500) return "server_error";
+  if (statusCode >= 400) return "client_error";
+  return "success";
+}
 
 /**
  * Bounded `reason` allow-list (mirrors the adapter-lane reasons defined in
@@ -291,6 +339,7 @@ let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | n
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let processLostLivenessNull: Counter | null = null;
 let orphanedManagedPodReaped: Counter<"adapter"> | null = null;
+let authRequest: Counter<"operation" | "outcome"> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -306,6 +355,7 @@ function ensureRegistry(): {
   externalLifecycleRunningRunsGauge: Gauge<"adapter">;
   processLostLivenessNullCounter: Counter;
   orphanedManagedPodReapedCounter: Counter<"adapter">;
+  authRequestCounter: Counter<"operation" | "outcome">;
 } {
   if (
     !registry
@@ -321,6 +371,7 @@ function ensureRegistry(): {
     || !externalLifecycleRunningRuns
     || !processLostLivenessNull
     || !orphanedManagedPodReaped
+    || !authRequest
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -431,6 +482,19 @@ function ensureRegistry(): {
       labelNames: ["adapter"],
       registers: [registry],
     });
+    authRequest = new Counter({
+      name: AUTH_REQUEST_METRIC,
+      help:
+        "Count of Better Auth requests labeled by bounded operation and outcome. "
+        + "No user, provider, IP address, callback state, or token is exposed.",
+      labelNames: ["operation", "outcome"],
+      registers: [registry],
+    });
+    for (const operation of KNOWN_AUTH_OPERATIONS) {
+      for (const outcome of KNOWN_AUTH_OUTCOMES) {
+        authRequest.inc({ operation, outcome }, 0);
+      }
+    }
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -449,6 +513,7 @@ function ensureRegistry(): {
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     processLostLivenessNullCounter: processLostLivenessNull,
     orphanedManagedPodReapedCounter: orphanedManagedPodReaped,
+    authRequestCounter: authRequest,
   };
 }
 
@@ -683,6 +748,18 @@ export function recordOrphanedManagedPodReaped(labels?: { adapterType?: string }
   });
 }
 
+export function recordAuthRequest(input: {
+  operation: string | null | undefined;
+  outcome: string | null | undefined;
+}): { operation: AuthOperation; outcome: AuthOutcome } {
+  const labels = {
+    operation: normalizeAuthOperation(input.operation),
+    outcome: normalizeAuthOutcome(input.outcome),
+  };
+  ensureRegistry().authRequestCounter.inc(labels);
+  return labels;
+}
+
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
   const reg = getMetricsRegistry();
   const depBlockedSnapshot = snapshotDepBlockedMetrics();
@@ -722,6 +799,7 @@ export function __resetMetricsForTest(): void {
   externalLifecycleRunningRuns = null;
   processLostLivenessNull = null;
   orphanedManagedPodReaped = null;
+  authRequest = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
 }

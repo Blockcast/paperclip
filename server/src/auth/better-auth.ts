@@ -14,12 +14,24 @@ import {
 } from "@paperclipai/db";
 import type { Config } from "../config.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
+import { logger } from "../middleware/logger.js";
+import {
+  classifyAuthOperation,
+  classifyAuthOutcome,
+  recordAuthRequest,
+} from "../services/metrics.js";
+import {
+  assertUsableAuthCapabilities,
+  loadAuthCapabilities,
+  resolveConfiguredDexProviderId,
+} from "./capabilities.js";
 import {
   loadDexRbacConfig,
   parseIdTokenGroups,
   reconcileDexUser,
-  reconcileMicrosoftUser,
-} from "./microsoft-rbac.js";
+} from "./oidc-rbac.js";
+
+export { loadAuthCapabilities } from "./capabilities.js";
 
 export type BetterAuthSessionUser = {
   id: string;
@@ -96,7 +108,8 @@ export function buildDexOAuthProviderConfigFromEnv(): GenericOAuthConfig | null 
   if (!issuerRaw || !clientId || !clientSecret) return null;
 
   const issuer = trimTrailingSlash(issuerRaw);
-  const providerId = process.env.PAPERCLIP_DEX_OIDC_PROVIDER_ID?.trim() || "dex";
+  const providerId = resolveConfiguredDexProviderId();
+  if (!providerId) return null;
   const scopesRaw = process.env.PAPERCLIP_DEX_OIDC_SCOPES?.trim();
   const scopes = (scopesRaw
     ? scopesRaw.split(/\s+/)
@@ -200,38 +213,22 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
     publicUrl,
   });
 
-  // Optional Microsoft Entra OIDC. Enabled only when all three env vars
-  // are set; otherwise the socialProviders block is omitted so dev/local
-  // installs without an Entra registration still work via email+password.
-  //
-  // The K8s Secret `paperclip-microsoft-oidc` (paperclip namespace) carries
-  // these for the cluster deploy — see deploy/helm/paperclip/values.blockcast.yaml.
-  // Redirect URI on the Entra app is `${publicUrl}/api/auth/callback/microsoft`,
-  // which better-auth wires up automatically when given a socialProviders.microsoft
-  // block. The Entra app issues a `groups` claim (configured server-side)
-  // that the account hooks below map to Paperclip company/RBAC state.
-  const microsoftClientId = process.env.MICROSOFT_CLIENT_ID?.trim() || undefined;
-  const microsoftClientSecret = process.env.MICROSOFT_CLIENT_SECRET?.trim() || undefined;
-  const microsoftTenantId = process.env.MICROSOFT_TENANT_ID?.trim() || undefined;
-  const microsoftOidcEnabled = Boolean(microsoftClientId && microsoftClientSecret && microsoftTenantId);
   const dexOAuthConfig = buildDexOAuthProviderConfigFromEnv();
   const dexRbacConfig = loadDexRbacConfig();
+  const authCapabilities = loadAuthCapabilities();
+  assertUsableAuthCapabilities(authCapabilities);
 
   const reconcileOauthAccountGroups = async (
     account: { providerId?: string; userId?: string; idToken?: string | null },
     hook: "create" | "update",
   ) => {
     if (!account?.userId) return;
-    if (account.providerId !== "microsoft" && account.providerId !== dexRbacConfig.providerId) return;
+    if (account.providerId !== dexRbacConfig.providerId) return;
 
     try {
       const groups = parseIdTokenGroups(account.idToken ?? null);
       if (groups.length === 0) return;
-      if (account.providerId === "microsoft") {
-        await reconcileMicrosoftUser(db, account.userId, groups);
-      } else {
-        await reconcileDexUser(db, account.userId, groups, dexRbacConfig);
-      }
+      await reconcileDexUser(db, account.userId, groups, dexRbacConfig);
     } catch (err) {
       console.error(`[better-auth] ${account.providerId} rbac reconcile (${hook}) failed:`, err);
     }
@@ -260,7 +257,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
         }
       : {}),
     emailAndPassword: {
-      enabled: true,
+      enabled: authCapabilities.emailPasswordEnabled,
       requireEmailVerification: false,
       disableSignUp: config.authDisableSignUp,
     },
@@ -278,17 +275,6 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
         },
       },
     },
-    ...(microsoftOidcEnabled
-      ? {
-          socialProviders: {
-            microsoft: {
-              clientId: microsoftClientId!,
-              clientSecret: microsoftClientSecret!,
-              tenantId: microsoftTenantId!,
-            },
-          },
-        }
-      : {}),
     rateLimit: buildBetterAuthRateLimitOptions({
       deploymentMode: config.deploymentMode,
       deploymentExposure: config.deploymentExposure,
@@ -307,6 +293,20 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
 export function createBetterAuthHandler(auth: BetterAuthHandlerTarget): RequestHandler {
   const handler = toNodeHandler(auth);
   return (req, res, next) => {
+    const operation = classifyAuthOperation(req.originalUrl);
+    res.once("finish", () => {
+      const outcome = classifyAuthOutcome(res.statusCode);
+      recordAuthRequest({ operation, outcome });
+      logger.info(
+        {
+          authOperation: operation,
+          authOutcome: outcome,
+          method: req.method,
+          statusCode: res.statusCode,
+        },
+        "authentication request completed",
+      );
+    });
     void Promise.resolve(handler(req, res)).catch(next);
   };
 }
