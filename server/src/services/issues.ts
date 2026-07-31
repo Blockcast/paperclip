@@ -4808,6 +4808,83 @@ export function issueService(db: Db) {
     return workspace;
   }
 
+  async function assertValidIssueProject(
+    companyId: string,
+    projectId: string | null | undefined,
+    dbOrTx: any = db,
+  ) {
+    if (!projectId) return;
+    const project = await dbOrTx
+      .select({ id: projects.id, companyId: projects.companyId })
+      .from(projects)
+      .where(eq(projects.id, projectId))
+      .then((rows: Array<{ id: string; companyId: string }>) => rows[0] ?? null);
+    if (!project) throw notFound("Project not found");
+    if (project.companyId !== companyId) throw unprocessable("Project must belong to the issue's company");
+  }
+
+  async function assertValidIssueMilestone(
+    companyId: string,
+    projectId: string | null | undefined,
+    milestoneId: string | null | undefined,
+    dbOrTx: any = db,
+  ) {
+    if (!milestoneId) return;
+    const milestone = await dbOrTx
+      .select({ id: milestones.id, companyId: milestones.companyId, projectId: milestones.projectId })
+      .from(milestones)
+      .where(eq(milestones.id, milestoneId))
+      .then((rows: Array<{ id: string; companyId: string; projectId: string | null }>) => rows[0] ?? null);
+    if (!milestone) throw notFound("Milestone not found");
+    if (milestone.companyId !== companyId) throw unprocessable("Milestone must belong to the issue's company");
+    if (milestone.projectId && milestone.projectId !== projectId) {
+      throw unprocessable("Milestone must belong to the selected project");
+    }
+  }
+
+  async function lockIssueParentMutationCompany(companyId: string, dbOrTx: any = db) {
+    await dbOrTx.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:issue-parent:${companyId}`}, 0))`,
+    );
+  }
+
+  async function assertValidIssueParent(
+    companyId: string,
+    issueId: string,
+    parentId: string | null | undefined,
+    dbOrTx: any = db,
+  ) {
+    if (!parentId) return;
+    if (parentId === issueId) throw unprocessable("Parent issue would create a cycle");
+    await dbOrTx.execute(
+      sql`SELECT ${issues.id} FROM ${issues}
+          WHERE ${and(eq(issues.companyId, companyId), inArray(issues.id, [issueId, parentId]))}
+          ORDER BY ${issues.id}
+          FOR UPDATE`,
+    );
+
+    let cursorId: string | null = parentId;
+    for (let depth = 0; cursorId; depth += 1) {
+      if (depth >= ISSUE_PARENT_ANCESTRY_VALIDATION_MAX_DEPTH) {
+        throw unprocessable("Parent issue ancestry is too deep");
+      }
+      await dbOrTx.execute(
+        sql`SELECT ${issues.id} FROM ${issues}
+            WHERE ${and(eq(issues.companyId, companyId), eq(issues.id, cursorId))}
+            FOR UPDATE`,
+      );
+      const cursor: { id: string; companyId: string; parentId: string | null } | null = await dbOrTx
+        .select({ id: issues.id, companyId: issues.companyId, parentId: issues.parentId })
+        .from(issues)
+        .where(eq(issues.id, cursorId))
+        .then((rows: Array<{ id: string; companyId: string; parentId: string | null }>) => rows[0] ?? null);
+      if (!cursor) throw notFound("Parent issue not found");
+      if (cursor.companyId !== companyId) throw unprocessable("Parent issue must belong to the issue's company");
+      if (cursor.id === issueId) throw unprocessable("Parent issue would create a cycle");
+      cursorId = cursor.parentId;
+    }
+  }
+
   async function assertValidLabelIds(companyId: string, labelIds: string[], dbOrTx: any = db) {
     if (labelIds.length === 0) return;
     const existing = await dbOrTx
@@ -8162,6 +8239,7 @@ export function issueService(db: Db) {
 
       const runUpdate = async (tx: any) => {
         if (issueData.parentId !== undefined) {
+          await lockIssueParentMutationCompany(existing.companyId, tx);
           await assertValidIssueParent(existing.companyId, id, issueData.parentId, tx);
         }
         await tx.execute(

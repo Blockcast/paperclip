@@ -6670,6 +6670,72 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  it("returns cycle validation instead of deadlocking intersecting multi-level reparent updates", async () => {
+    const companyId = randomUUID();
+    const issueAId = randomUUID();
+    const issueBId = randomUUID();
+    const issueXId = randomUUID();
+    const issueYId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      {
+        id: issueXId,
+        companyId,
+        title: "Issue X",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueYId,
+        companyId,
+        title: "Issue Y",
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: issueAId,
+        companyId,
+        title: "Issue A",
+        status: "todo",
+        priority: "medium",
+        parentId: issueYId,
+      },
+      {
+        id: issueBId,
+        companyId,
+        title: "Issue B",
+        status: "todo",
+        priority: "medium",
+        parentId: issueXId,
+      },
+    ]);
+
+    const results = await Promise.allSettled([
+      svc.update(issueXId, { parentId: issueAId }),
+      svc.update(issueYId, { parentId: issueBId }),
+    ]);
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.filter((result) => result.status === "rejected");
+
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    const rejection = rejected[0] as PromiseRejectedResult;
+    expect(String(rejection.reason?.message ?? rejection.reason)).not.toMatch(/deadlock/i);
+    expect(rejection.reason).toMatchObject({
+      status: 422,
+      message: "Parent issue would create a cycle",
+    });
+  });
+
   it("rejects updates that pin a projectless issue to an isolated git worktree", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
