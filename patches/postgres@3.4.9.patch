@@ -1,0 +1,36 @@
+diff --git a/src/connection.js b/src/connection.js
+index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..a525a04b16051640f5da4f7928de4f4be043df77 100644
+--- a/src/connection.js
++++ b/src/connection.js
+@@ -252,6 +252,31 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
+   function nextWrite(fn) {
++    // Paperclip patch (BLO-19722) — upstream porsager/postgres#1154, #1066.
++    //
++    // `write()` above can schedule this via setImmediate (:250), and `closed()`
++    // nulls `socket` (:448). A connection teardown landing between the two
++    // reaches this line with `socket === null` and throws
++    // `TypeError: Cannot read properties of null (reading 'write')` from a
++    // macrotask — no application frame on the stack, so nothing downstream can
++    // catch it and the whole process dies. That killed paperclip-0 on
++    // 2026-07-31 and orphaned every agent run the worker was supervising.
++    //
++    // Dropping the chunk is the correct behaviour, not merely the safe one:
++    // `socket === null` means `closed()` already ran, and `closed()` has
++    // already failed or requeued the pending queries (it calls `error()` with
++    // CONNECTION_CLOSED, or `reconnect()`). There is no live peer this buffer
++    // could still reach. Returning false mirrors the socket back-pressure
++    // signal the caller expects when a write could not be flushed.
++    //
++    // Remove this patch once #1154 is fixed upstream; 3.4.9 was the latest
++    // published release when it was written, so there was no version to
++    // upgrade to instead.
++    if (!socket) {
++      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
++      chunk = nextWriteTimer = null
++      return false
++    }
+     const x = socket.write(chunk, fn)
+     nextWriteTimer !== null && clearImmediate(nextWriteTimer)
+     chunk = nextWriteTimer = null

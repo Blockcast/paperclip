@@ -68,6 +68,7 @@ import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
 import { logShutdownSignal, writeShutdownBreadcrumb } from "./shutdown-log.js";
+import { installProcessCrashGuard } from "./process-crash-guard.js";
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 import { plugins } from "@paperclipai/db";
 import {
@@ -1071,6 +1072,29 @@ export async function startServer(): Promise<StartedServer> {
   let drainHeartbeatRunsForShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<unknown>) | null = null;
   let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{ skipDrain: boolean }>) | null = null;
   let workerHeartbeat: ReturnType<typeof heartbeatService> | null = null;
+
+  // BLO-19722: install the crash guard as soon as `workerHeartbeat` exists as a
+  // binding — the closure reads it lazily, so a crash before the heartbeat
+  // service is constructed still gets a logged, deliberate exit and simply has
+  // no runs to mark. Without this, an unhandled async throw (e.g. the
+  // postgres.js null-socket race, porsager/postgres#1154) killed the worker
+  // with a bare stack and left every run it supervised to be rediscovered
+  // minutes later as `job_missing`.
+  installProcessCrashGuard({
+    logger,
+    onCrash: async ({ kind, causeChain }) => {
+      const summary = causeChain[0] ? `${causeChain[0].name}: ${causeChain[0].message}` : "unknown error";
+      const result = await workerHeartbeat?.markRunsInterruptedByWorkerCrash({
+        reason: `${kind}: ${summary}`,
+      });
+      if (result?.markedRunIds.length) {
+        writeShutdownBreadcrumb(
+          `marked ${result.markedRunIds.length} in-flight run(s) interrupted by worker crash`,
+        );
+      }
+    },
+  });
+
   let heartbeatSchedulerStopped = false;
   let heartbeatStartupRecoveryPending = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;

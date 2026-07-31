@@ -131,7 +131,8 @@
   "pnpm": {
     "patchedDependencies": {
       "embedded-postgres@18.1.0-beta.16": "patches/embedded-postgres@18.1.0-beta.16.patch",
-      "brace-expansion@5.0.8": "patches/brace-expansion@5.0.8.patch"
+      "brace-expansion@5.0.8": "patches/brace-expansion@5.0.8.patch",
+      "postgres@3.4.9": "patches/postgres@3.4.9.patch"
     },
     "overrides": {
       "rollup": ">=4.59.0",

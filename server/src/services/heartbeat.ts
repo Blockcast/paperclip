@@ -11920,6 +11920,78 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  /**
+   * Crash-time counterpart to {@link drainRunningRunsForShutdown} (BLO-19722).
+   *
+   * A SIGTERM drain gets seconds and a healthy process; this runs from inside
+   * `process.on("uncaughtException")` with the process already dying, so it is
+   * deliberately the smallest thing that fixes the attribution problem:
+   *
+   *   1. one guarded bulk UPDATE flipping this worker's still-`running` runs to
+   *      `interrupted` with `errorCode: "worker_crashed"`, and
+   *   2. `finalizeAgentStatus` per affected agent.
+   *
+   * Step 2 costs a few queries per agent rather than one bulk statement, which
+   * is the deliberate trade: `finalizeAgentStatus` holds nuance we must not
+   * duplicate in ad-hoc SQL (paused/terminated agents are skipped, quota
+   * exhaustion stays idle rather than latching to error, the running-count
+   * decides the next status). The caller races this whole function against a
+   * timeout and exits regardless, and anything we fail to mark is still caught
+   * by the pre-existing reaper — so a partial pass is strictly better than
+   * today's zero-pass, and a slow-but-correct pass beats a fast wrong one.
+   *
+   * Without this, every run the crash orphaned stayed `running` until a reaper
+   * noticed minutes later and reconciled it as `job_missing` — "External
+   * lifecycle Job is missing while heartbeat run is still running" — which
+   * names the symptom (a Job we can no longer see) and hides the cause (this
+   * process died). Operators then chase Kubernetes for a fault that was ours.
+   *
+   * Runs are marked `interrupted`, matching how the graceful path already
+   * treats work cut short by the server going away, so restart-recovery retry
+   * semantics are inherited rather than reinvented.
+   */
+  async function markRunsInterruptedByWorkerCrash(input: {
+    reason: string;
+    now?: Date;
+  }): Promise<{ markedRunIds: string[] }> {
+    const now = input.now ?? new Date();
+    // Union of both live-execution registries — the same pair that
+    // `liveRunExecutions` consults, but enumerated rather than probed.
+    const runIds = Array.from(new Set([...runningProcesses.keys(), ...activeRunExecutions]));
+    if (runIds.length === 0) return { markedRunIds: [] };
+
+    const message = `Interrupted by worker process crash (${input.reason})`;
+
+    // Gated on status='running' so we never overwrite a run that already
+    // reached a terminal state on its way out.
+    const marked = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "interrupted",
+        finishedAt: now,
+        error: message,
+        errorCode: "worker_crashed",
+        updatedAt: now,
+      })
+      .where(and(inArray(heartbeatRuns.id, runIds), eq(heartbeatRuns.status, "running")))
+      .returning({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId });
+
+    for (const run of marked) {
+      // Best-effort per agent: one agent failing to finalize must not strand
+      // the rest, and we are on a clock.
+      try {
+        await finalizeAgentStatus(run.agentId, "interrupted", message, {
+          errorCode: "worker_crashed",
+          runId: run.id,
+        });
+      } catch {
+        /* keep going; the reaper remains the backstop */
+      }
+    }
+
+    return { markedRunIds: marked.map((run) => run.id) };
+  }
+
   async function drainRunningRunsForShutdown(signal: "SIGINT" | "SIGTERM", now = new Date()) {
     const activeRuns = await db
       .select({
@@ -24792,6 +24864,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // gate on suppression should prefer this over the env-only resolver.
     resolveSchedulingSuppression: getSchedulingSuppression,
     drainRunningRunsForShutdown,
+    markRunsInterruptedByWorkerCrash,
 
     promoteDueScheduledRetries,
     retryScheduledRetryNow,

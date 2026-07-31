@@ -1,0 +1,255 @@
+/**
+ * Process-level crash guard (BLO-19722).
+ *
+ * Node kills the process on an unhandled `uncaughtException`, and — since
+ * Node 15 — on an unhandled promise rejection too. Until this module landed
+ * there was no `process.on("uncaughtException")` anywhere in `server/src`, so
+ * a single throw from a callback we do not own took down the worker with a
+ * bare stack and no context.
+ *
+ * That is not hypothetical. On 2026-07-31 `paperclip-0` died `exitCode: 1`
+ * with:
+ *
+ *     TypeError: Cannot read properties of null (reading 'write')
+ *         at Immediate.nextWrite (…/postgres@3.4.9/src/connection.js:255:22)
+ *         at process.processImmediate (node:internal/timers:504:21)
+ *
+ * `postgres.js` schedules `nextWrite` via `setImmediate` (connection.js:250)
+ * and dereferences `socket` when it fires (:255), while `closed()` nulls
+ * `socket` (:448). A teardown landing between the two throws from a macrotask
+ * with no JS frame of ours on the stack, so no `try`/`catch` in application
+ * code can intercept it — the process-level handler is the only reachable
+ * containment. Upstream has it open and unfixed as porsager/postgres#1154 and
+ * #1066, and 3.4.9 is the latest published release, so there is no version to
+ * upgrade to. See `patches/postgres@3.4.9.patch` for the driver-side guard;
+ * this module is the backstop for everything we have not predicted.
+ *
+ * Two properties matter more than they look:
+ *
+ * 1. **The first write is synchronous stderr, not pino.** BLO-4137 established
+ *    that pino's async transport races libuv on `process.exit` and silently
+ *    drops queued lines — which is precisely how the original crash reached us
+ *    as an uncontextualised stack. A crash handler whose own diagnosis gets
+ *    dropped is worse than none, because it also suppresses Node's default
+ *    printer. See {@link ./shutdown-log.ts} for the same reasoning.
+ *
+ * 2. **Exit is guaranteed, on a timer we control.** `onCrash` touches the
+ *    database, and the most likely reason we are here is that the database
+ *    driver just died. It is therefore assumed to hang; it races a timeout and
+ *    the process exits either way. A crash guard that can wedge the process
+ *    turns a fast crash-and-restart into a silent hang, which kubelet only
+ *    catches at the liveness probe — strictly worse than the bug it replaces.
+ */
+
+import { writeShutdownBreadcrumb } from "./shutdown-log.js";
+
+/** Exit code used when the guard terminates the process deliberately. */
+export const CRASH_GUARD_EXIT_CODE = 1;
+
+/** How long `onCrash` gets before we stop waiting and exit anyway. */
+export const DEFAULT_CRASH_GUARD_TIMEOUT_MS = 5_000;
+
+export type CrashKind = "uncaughtException" | "unhandledRejection";
+
+export interface CrashGuardContext {
+  kind: CrashKind;
+  error: unknown;
+  /** Flattened `Error.cause` chain, outermost first. */
+  causeChain: SerializedError[];
+}
+
+export interface SerializedError {
+  name: string;
+  message: string;
+  stack?: string;
+  /** Present for non-Error throwables (`throw "boom"`, rejected strings, …). */
+  raw?: string;
+}
+
+interface CrashGuardLogger {
+  error: (obj: Record<string, unknown>, msg: string) => void;
+  flush?: () => void;
+}
+
+export interface InstallCrashGuardOptions {
+  logger: CrashGuardLogger;
+  /**
+   * Best-effort crash-time bookkeeping — marking this worker's in-flight runs
+   * so they carry a reason naming the crash instead of being rediscovered
+   * minutes later as `job_missing`. Must not throw; may hang (it is raced).
+   */
+  onCrash?: (context: CrashGuardContext) => Promise<void> | void;
+  timeoutMs?: number;
+  /** Seams for tests; default to the real process. */
+  exit?: (code: number) => void;
+  processRef?: Pick<NodeJS.Process, "on" | "off">;
+}
+
+const MAX_CAUSE_DEPTH = 10;
+
+function serializeOne(value: unknown): SerializedError {
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      message: value.message,
+      ...(value.stack ? { stack: value.stack } : {}),
+    };
+  }
+  // `throw "boom"` and `Promise.reject({code:…})` both reach here. Keep the
+  // raw rendering rather than coercing to an Error: the shape of what was
+  // thrown is itself a clue about which library threw it.
+  let raw: string;
+  try {
+    raw = typeof value === "string" ? value : JSON.stringify(value) ?? String(value);
+  } catch {
+    raw = String(value);
+  }
+  return { name: typeof value, message: raw, raw };
+}
+
+/**
+ * Flattens an `Error.cause` chain, outermost first.
+ *
+ * Errors reaching this guard are frequently wrapped several layers deep, and
+ * the outermost message is usually the least specific one. Logging only the
+ * top frame is how a "database error" hides the socket teardown underneath.
+ * Depth-capped and cycle-guarded because `cause` is attacker/library-controlled
+ * and a self-referential chain here would hang the crash path.
+ */
+export function serializeCauseChain(error: unknown): SerializedError[] {
+  const chain: SerializedError[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+
+  while (current !== undefined && current !== null && chain.length < MAX_CAUSE_DEPTH) {
+    if (typeof current === "object" && seen.has(current)) break;
+    if (typeof current === "object") seen.add(current);
+    chain.push(serializeOne(current));
+    current = current instanceof Error ? (current as { cause?: unknown }).cause : undefined;
+  }
+
+  return chain;
+}
+
+/** One-line stderr rendering; the structured record goes to pino separately. */
+function renderBreadcrumb(kind: CrashKind, chain: SerializedError[]): string {
+  const head = chain[0];
+  const summary = head ? `${head.name}: ${head.message}` : "unknown error";
+  const causes =
+    chain.length > 1 ? ` (caused by: ${chain.slice(1).map((c) => `${c.name}: ${c.message}`).join(" <- ")})` : "";
+  return `${kind}: ${summary}${causes}`;
+}
+
+/**
+ * Installs the crash handlers. Returns an uninstall function so tests (and any
+ * embedded use) can restore the previous state.
+ */
+export function installProcessCrashGuard(options: InstallCrashGuardOptions): () => void {
+  const {
+    logger,
+    onCrash,
+    timeoutMs = DEFAULT_CRASH_GUARD_TIMEOUT_MS,
+    exit = (code: number) => process.exit(code),
+    processRef = process,
+  } = options;
+
+  // Re-entrancy is the failure mode that turns a crash into a hang: `onCrash`
+  // touches the DB, and if that throws we are called again mid-handling. The
+  // second crash must exit immediately rather than start another bounded wait.
+  let handling = false;
+
+  const handle = (kind: CrashKind, error: unknown): void => {
+    if (handling) {
+      try {
+        writeShutdownBreadcrumb(`crash-guard re-entered during ${kind}; exiting immediately`);
+      } catch {
+        /* stderr is gone; nothing left to say */
+      }
+      exit(CRASH_GUARD_EXIT_CODE);
+      return;
+    }
+    handling = true;
+
+    const causeChain = serializeCauseChain(error);
+
+    // Synchronous first, always — see the module header. If everything after
+    // this line fails, this one line still reaches `kubectl logs --previous`.
+    try {
+      writeShutdownBreadcrumb(renderBreadcrumb(kind, causeChain));
+      const stack = causeChain[0]?.stack;
+      if (stack) writeShutdownBreadcrumb(stack);
+    } catch {
+      /* ignore */
+    }
+
+    try {
+      logger.error({ kind, causeChain, err: error }, `Fatal ${kind} — worker exiting deliberately`);
+    } catch {
+      /* a broken logger must not preempt the exit */
+    }
+
+    const finish = () => {
+      try {
+        logger.flush?.();
+      } catch {
+        /* ignore */
+      }
+      try {
+        writeShutdownBreadcrumb(`exiting ${CRASH_GUARD_EXIT_CODE} after ${kind}`);
+      } catch {
+        /* ignore */
+      }
+      exit(CRASH_GUARD_EXIT_CODE);
+    };
+
+    if (!onCrash) {
+      finish();
+      return;
+    }
+
+    let settled = false;
+    const settleOnce = (note?: string) => {
+      if (settled) return;
+      settled = true;
+      if (note) {
+        try {
+          writeShutdownBreadcrumb(note);
+        } catch {
+          /* ignore */
+        }
+      }
+      finish();
+    };
+
+    const timer = setTimeout(() => settleOnce(`crash bookkeeping timed out after ${timeoutMs}ms`), timeoutMs);
+    // Do not hold the loop open on our own account; if nothing else is
+    // pending we should exit rather than wait out the full timeout.
+    timer.unref?.();
+
+    void (async () => {
+      try {
+        await onCrash({ kind, error, causeChain });
+        clearTimeout(timer);
+        settleOnce();
+      } catch (bookkeepingError) {
+        clearTimeout(timer);
+        settleOnce(
+          `crash bookkeeping failed: ${
+            bookkeepingError instanceof Error ? bookkeepingError.message : String(bookkeepingError)
+          }`,
+        );
+      }
+    })();
+  };
+
+  const onUncaught = (error: unknown) => handle("uncaughtException", error);
+  const onRejection = (reason: unknown) => handle("unhandledRejection", reason);
+
+  processRef.on("uncaughtException", onUncaught as NodeJS.UncaughtExceptionListener);
+  processRef.on("unhandledRejection", onRejection as NodeJS.UnhandledRejectionListener);
+
+  return () => {
+    processRef.off("uncaughtException", onUncaught as NodeJS.UncaughtExceptionListener);
+    processRef.off("unhandledRejection", onRejection as NodeJS.UnhandledRejectionListener);
+  };
+}
