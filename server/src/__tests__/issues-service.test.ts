@@ -3182,6 +3182,53 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(issue.projectId).toBe(explicitProjectId);
   });
 
+  it("BLO-18760: derives projectId from an explicit projectWorkspaceId before led-project inference", async () => {
+    const companyId = randomUUID();
+    const ledProjectId = randomUUID();
+    const pinnedProjectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values([
+      { id: ledProjectId, companyId, name: "Led project", status: "in_progress", leadAgentId: agentId },
+      { id: pinnedProjectId, companyId, name: "Pinned workspace project", status: "in_progress" },
+    ]);
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId: pinnedProjectId,
+      name: "Pinned workspace",
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Issue pinned to a specific project workspace",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      projectWorkspaceId,
+    });
+
+    expect(issue.projectId).toBe(pinnedProjectId);
+    expect(issue.projectWorkspaceId).toBe(projectWorkspaceId);
+  });
+
   // Ally review (PR #811): the `== null` check treats an explicit `projectId: null`
   // identically to omitting the field. That is the intended contract, and it is the case
   // that actually matters -- the board/UI create path posts an explicit null, so if this

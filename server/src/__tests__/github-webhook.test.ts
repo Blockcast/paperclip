@@ -1161,30 +1161,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
   beforeEach(async () => {
     if (!db) return;
-    // Drain queued/running heartbeat runs before TRUNCATE so the scheduler
-    // isn't racing the cleanup (lifted from heartbeat-issue-liveness-escalation).
-    // The wake-driving test enqueues a real heartbeat run that runs in a
-    // fire-and-forget `void executeRun(...)` (see services/heartbeat.ts).
-    // Under load that background execution can outlive the test it was spawned
-    // in; if so, we force-finalize the row so the FK cascade in TRUNCATE isn't
-    // blocked on in-flight row locks. The 30s drain budget absorbs CI runner
-    // variance without sticking forever.
-    const drainDeadline = Date.now() + 30_000;
-    let idlePolls = 0;
-    while (Date.now() < drainDeadline) {
-      const runs = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns);
-      const hasActiveRun = runs.some((run) => run.status === "queued" || run.status === "running");
-      if (!hasActiveRun) {
-        idlePolls += 1;
-        if (idlePolls >= 3) break;
-      } else {
-        idlePolls = 0;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // These route tests default to skipQueuedRunDispatch, and several cases
+    // intentionally seed queued/running rows to exercise coalescing. Finalize
+    // test-owned rows directly so cleanup does not spend 30s waiting on
+    // heartbeat runs that will never dispatch in this suite.
     await db.execute(sql.raw(
       `UPDATE "heartbeat_runs" SET status='failed', finished_at=NOW() WHERE status IN ('queued','running')`,
     ));
@@ -3037,6 +3017,130 @@ describeEmbeddedPostgres("github-webhook route", () => {
     });
   });
 
+  it("dedupes an @ally comment redelivery on the author wake after it completed or was cancelled (BLO-18953)", async () => {
+    // Route-level companion to the reviewer redelivery test above. BLO-18953's
+    // final pass made terminal-status dedup depend on the key's SCOPE, and the
+    // author path shares that helper: its github_pr_review_requested key is
+    // comment-scoped, i.e. request-scoped, so `completed` and `cancelled` must
+    // dedup here too. __test_idempotentWakeStatuses pins the classification,
+    // and the BLO-13247 test above only redelivers while the wake is still
+    // `queued` -- neither proves the author dispatch threads the scope through
+    // to its precheck, so that wiring could regress with both staying green.
+    const { agentId } = await seedIssueWithIdentifier("BLO-9002");
+    const app = buildApp();
+    const commentPayload = (commentId: number) => ({
+      action: "created",
+      issue: {
+        number: 846,
+        title: "fix(github-webhook): dedup request-scoped redeliveries (BLO-9002)",
+        body: null,
+        html_url: "https://github.com/Blockcast/paperclip/pull/846",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/846" },
+        user: { login: "allyblockcast[bot]" },
+      },
+      comment: {
+        id: commentId,
+        body: "@ally please review",
+        html_url: `https://github.com/Blockcast/paperclip/pull/846#issuecomment-${commentId}`,
+        user: { login: "kkroo" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+    const deliver = async (commentId: number, deliveryId: string) => {
+      const signed = signedRequest(commentPayload(commentId));
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "issue_comment")
+        .set("x-hub-signature-256", signed.signature)
+        .set("x-github-delivery", deliveryId)
+        .set("content-type", "application/json")
+        .send(signed.body);
+    };
+    const authorWakes = async () =>
+      db
+        .select({ status: agentWakeupRequests.status, idempotencyKey: agentWakeupRequests.idempotencyKey })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+    const authorHeartbeatRuns = async () =>
+      db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    const keyForComment = (commentId: number) =>
+      expect.stringContaining(
+        `:Blockcast/paperclip:846:github_pr_review_requested:comment:${commentId}`,
+      );
+
+    const first = await deliver(4900000021, "delivery-author-terminal-1");
+    expect(first.status).toBe(200);
+    expect(first.body.wakes).toEqual([{ issueIdentifier: "BLO-9002", agentId }]);
+    expect(await authorWakes()).toEqual([
+      { status: "queued", idempotencyKey: keyForComment(4900000021) },
+    ]);
+
+    // The author's run consumed the wake and finished. Replaying that one
+    // delivery must not re-enqueue the request it already served.
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "completed", finishedAt: new Date() })
+      .where(eq(agentWakeupRequests.agentId, agentId));
+
+    const afterCompleted = await deliver(4900000021, "delivery-author-terminal-2");
+    expect(afterCompleted.status).toBe(200);
+    expect(afterCompleted.body.wakes).toEqual([]);
+    expect(afterCompleted.body.skipped).toContainEqual({
+      issueIdentifier: "BLO-9002",
+      reason: "duplicate_pr_author_wake",
+    });
+    expect(await authorWakes()).toEqual([
+      { status: "completed", idempotencyKey: keyForComment(4900000021) },
+    ]);
+
+    // Same rule once the request has been retired to `cancelled`.
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "cancelled" })
+      .where(eq(agentWakeupRequests.agentId, agentId));
+
+    const afterCancelled = await deliver(4900000021, "delivery-author-terminal-3");
+    expect(afterCancelled.status).toBe(200);
+    expect(afterCancelled.body.wakes).toEqual([]);
+    expect(afterCancelled.body.skipped).toContainEqual({
+      issueIdentifier: "BLO-9002",
+      reason: "duplicate_pr_author_wake",
+    });
+    expect(await authorWakes()).toEqual([
+      { status: "cancelled", idempotencyKey: keyForComment(4900000021) },
+    ]);
+
+    expect(await authorHeartbeatRuns()).toHaveLength(1);
+
+    // The other half of the scope rule: terminal dedup must stay confined to
+    // the redelivered event. A genuinely NEW @ally comment carries a new
+    // comment id, so the precheck lets it through -- otherwise request-scoping
+    // would inherit exactly the permanent block that stable keys suffer.
+    //
+    // Its wake lands `coalesced` rather than `queued` because the first run is
+    // still sitting in `queued`, and merging into a not-yet-started run is the
+    // benign case BLO-18953 deliberately preserved: that run reads live PR
+    // state when it starts, so the request is served, not lost. The point here
+    // is that a wake row for the new comment EXISTS at all -- under the old
+    // stable-key rule the terminal row above would have suppressed it forever.
+    const laterComment = await deliver(4900000022, "delivery-author-terminal-4");
+    expect(laterComment.status).toBe(200);
+    expect(laterComment.body.wakes).toEqual([{ issueIdentifier: "BLO-9002", agentId }]);
+    expect(laterComment.body.skipped ?? []).not.toContainEqual({
+      issueIdentifier: "BLO-9002",
+      reason: "duplicate_pr_author_wake",
+    });
+    const wakesAfterLaterComment = await authorWakes();
+    expect(wakesAfterLaterComment).toHaveLength(2);
+    expect(wakesAfterLaterComment).toEqual(
+      expect.arrayContaining([
+        { status: "cancelled", idempotencyKey: keyForComment(4900000021) },
+        { status: "coalesced", idempotencyKey: keyForComment(4900000022) },
+      ]),
+    );
+    expect(await authorHeartbeatRuns()).toHaveLength(1);
+  });
+
   it("drives the reviewer wake AND preserves the author wake for a marker-prefixed agent review request (BLO-18865)", async () => {
     // Route-level coverage for the marker path: the pure-helper tests stop at
     // context classification, so dispatch wiring could regress while they stay
@@ -3407,6 +3511,17 @@ describeEmbeddedPostgres("github-webhook route", () => {
         prNumber: 269,
         repoFullName: "Blockcast/penstock-llm-proxy-core",
       }),
+    });
+
+    const runs = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.contextSnapshot).toMatchObject({
+      commentId: comments[0]!.id,
+      wakeCommentId: comments[0]!.id,
+      githubReviewFeedbackCommentId: comments[0]!.id,
     });
 
     const duplicateRes = await request(app)
