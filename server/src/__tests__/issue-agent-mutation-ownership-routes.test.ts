@@ -1304,17 +1304,74 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.addComment).toHaveBeenCalled();
     });
 
-    // The grant is comment-only. A reopen/resume on a closed source issue still has to
-    // clear `assertAgentIssueMutationAllowed`, which is not passed
-    // `allowRecoveryActionOwner` here — so the grant cannot be used to smuggle a status
-    // change past the mutation boundary. Same hard-fail the mention grant already gets.
-    it("does not let the recovery owner reopen a closed source issue via the comment grant", async () => {
-      denyCommentGrantEverywhere();
+    // The grant is comment-only on EVERY status, not just closed ones. `blocked` is the
+    // case that matters: it is what a source-scoped recovery action normally leaves its
+    // source issue in, `isExplicitResumeCapableStatus` accepts it, and the only guard that
+    // used to stand between the grant and a `blocked` -> `todo` transition was
+    // `assertExplicitResumeIntentAllowed` — a state/intent check, not an authorization one.
+    // `getDependencyReadiness` is pinned to zero unresolved blockers on purpose, so the
+    // refusal has to come from authorization rather than from the dependency 409
+    // incidentally covering for it. Asserting the consequence (no move to `todo`) rather
+    // than only the status code.
+    it.each([["blocked"], ["done"], ["cancelled"], ["todo"], ["in_progress"]])(
+      "does not let the recovery owner reopen a %s source issue via the comment grant",
+      async (status) => {
+        denyCommentGrantEverywhere();
+        mockIssueService.getById.mockResolvedValue(makeIssue({
+          status,
+          checkoutRunId: ownerRunId,
+          executionRunId: ownerRunId,
+        }) as never);
+        mockIssueService.getDependencyReadiness.mockResolvedValue({
+          unresolvedBlockerCount: 0,
+          unresolvedBlockerIssueIds: [],
+        } as never);
+        mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+          makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+        );
+
+        const res = await request(await createApp(recoveryOwnerActor()))
+          .post(`/api/issues/${issueId}/comments`)
+          .send({ body: "Reopening this.", reopen: true });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(res.body.error).toBe("Recovery owner grant is comment-only");
+        expect(res.body.details?.reason).toBe("allow_source_scoped_recovery_owner");
+        expect(mockIssueService.addComment).not.toHaveBeenCalled();
+        // The consequence the guard exists to prevent: the issue must not be carried to `todo`.
+        expect(mockIssueService.update).not.toHaveBeenCalled();
+      },
+    );
+
+    // THE test that proves the hole rather than the error string. The peer refusal inside
+    // `assertExplicitResumeIntentAllowed` ("Agent cannot request follow-up for another
+    // agent's issue", routes/issues.ts:4613) is what stopped the plain-peer cases above, so
+    // those only ever proved a message change. It is short-circuited by
+    // `hasActiveCheckoutManagementOverride` -> `tasks:manage_active_checkouts`, which is
+    // exactly the action `allow_manager_chain` is wired to — and the reported BLO-18996
+    // instance named the assignee's *manager* (the CEO) as recovery owner. So for a manager
+    // owner on a `blocked` source issue with zero unresolved blockers, nothing on the path
+    // was an `issue:mutate` check and the comment grant carried the issue to `todo`.
+    // Pre-fix this reaches `svc.update(id, { status: "todo" })`; post-fix it must 403.
+    it("does not let a manager recovery owner reopen a blocked source issue to todo", async () => {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+        const allowed = input.action === "issue:read" || input.action === "tasks:manage_active_checkouts";
+        return {
+          allowed,
+          action: input.action,
+          reason: allowed ? "allow_manager_chain" : "deny_missing_grant",
+          explanation: allowed ? "Allowed by test manager override." : "Denied by test.",
+        };
+      });
       mockIssueService.getById.mockResolvedValue(makeIssue({
-        status: "done",
+        status: "blocked",
         checkoutRunId: ownerRunId,
         executionRunId: ownerRunId,
       }) as never);
+      mockIssueService.getDependencyReadiness.mockResolvedValue({
+        unresolvedBlockerCount: 0,
+        unresolvedBlockerIssueIds: [],
+      } as never);
       mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
         makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
       );
@@ -1324,8 +1381,60 @@ describe("agent issue mutation checkout ownership", () => {
         .send({ body: "Reopening this.", reopen: true });
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
-      expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (grant)");
+      expect(res.body.error).toBe("Recovery owner grant is comment-only");
+      // The consequence: the source issue must never be carried to `todo` by the grant.
+      expect(mockIssueService.update).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ status: "todo" }),
+      );
+    });
+
+    // `resume` is the other half of the same door; neutering only `reopen` would leave it open.
+    it("does not let the recovery owner resume a blocked source issue via the comment grant", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "blocked",
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueService.getDependencyReadiness.mockResolvedValue({
+        unresolvedBlockerCount: 0,
+        unresolvedBlockerIssueIds: [],
+      } as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Resuming this.", resume: true });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Recovery owner grant is comment-only");
       expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    // The refusal must not swallow the grant's actual purpose: a plain comment on a
+    // `blocked` source issue — the exact discharge path BLO-18996 exists to restore —
+    // still has to land.
+    it("still lets the recovery owner comment on a blocked source issue without reopen", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "blocked",
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(
+        makeRecoveryAction({ ownerAgentId: peerAgentId }) as never,
+      );
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "I cannot restore this; escalating." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalled();
     });
 
     // Company isolation fires earlier than the grant (the issue is not even resolvable

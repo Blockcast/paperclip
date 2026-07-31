@@ -232,6 +232,13 @@ export function issueRecoveryActionService(db: Db) {
       const existingTimeoutAt = toValidDate(existing.timeoutAt);
       const inputMaxAttempts = input.maxAttempts ?? null;
       const existingWakeHorizonAt = readSourceScopedWakeHorizonAt(existing.evidence);
+      // ROLLOUT NOTE: the `existing.maxAttempts !== null ? existingTimeoutAt : null` arm is the
+      // backfill for rows written before the evidence key existed. A row that is already
+      // mid-ownerless-phase at deploy time has `maxAttempts: null` AND no evidence key, so it
+      // reads as never-bounded and re-arms its horizon once on the first owned sweep after
+      // rollout. That is self-healing and bounded to a single extra horizon window; it is
+      // expected at deploy and is NOT a recurrence of the flap this code fixes. Distinguish
+      // them by count: the bug re-armed on EVERY ownerless flap, the backfill re-arms once.
       const carriedWakeHorizonAt = existingWakeHorizonAt ?? (existing.maxAttempts !== null ? existingTimeoutAt : null);
       // BLO-18996 (review follow-up): the row is long-lived and can gain a budget it did not
       // have when its `timeoutAt` was written, so "preserve the horizon" has to start

@@ -10336,12 +10336,12 @@ export function issueRoutes(
     const interruptRequested = req.body.interrupt === true;
     const isClosed = isClosedIssueStatus(issue.status);
     const isBlocked = issue.status === "blocked";
-    // BLO-18996: this also covers the recovery-action owner admitted by
-    // `recoveryOwnerCommentGrant`. Like a mention-granted peer, that owner may speak
-    // on a closed issue but may not reopen or resume it off the back of the comment
-    // grant alone — the branch below still routes any reopen/resume through
-    // `assertAgentIssueMutationAllowed`, so the `in_progress` 409 checkout guard and the
-    // rest of the mutation boundary continue to apply unchanged.
+    // Closed-issue neutering for the *mention*-granted peer. This deliberately no longer
+    // speaks for the recovery-action owner: `isCommentOnlyPeerGrantDecision` still matches
+    // that owner's reason, but because this branch and its `assertAgentIssueMutationAllowed`
+    // re-check are both `isClosed`-gated they only ever covered `done`/`cancelled`, and
+    // recovery leaves its source issue `blocked`. The owner is now refused on every status
+    // by `recoveryOwnerGrantedCommentOnly` below, which runs before this is consumed.
     const closedCommentGrantPeerAgentCommentOnly =
       isClosed &&
       req.actor.type === "agent" &&
@@ -10380,8 +10380,37 @@ export function issueRoutes(
       });
       return;
     }
+    // The source-scoped recovery-owner grant (BLO-18996) is comment-only on EVERY status,
+    // for the same reason the handoff grant above is. `closedCommentGrantPeerAgentCommentOnly`
+    // and its `assertAgentIssueMutationAllowed` re-check below are both gated on `isClosed`,
+    // which is `done | cancelled` — but a source-scoped recovery action normally leaves its
+    // source issue `blocked`, and `isExplicitResumeCapableStatus` accepts `blocked`. Neutering
+    // only on closed statuses therefore left the grant conferring `blocked` -> `todo` with no
+    // `issue:mutate` check anywhere on the path, in the one status recovery actually produces:
+    // `assertExplicitResumeIntentAllowed` is a state/intent check, not an authorization check.
+    // Refuse on every status instead, and refuse here rather than widening the `isClosed`
+    // re-check, so this does not inherit `assertAgentIssueMutationAllowed`'s
+    // `isCurrentIssueExecutionRun` bypass. The owner's legitimate restore path is unchanged:
+    // the PATCH allow-list in `isScopedRecoveryOwnerRestorePatch`, separately scoped and audited.
+    const recoveryOwnerGrantedCommentOnly =
+      req.actor.type === "agent" && isSourceScopedRecoveryOwnerDecision(commentAccessDecision);
+    if (recoveryOwnerGrantedCommentOnly && (reopenRequested || resumeRequested)) {
+      res.status(403).json({
+        error: "Recovery owner grant is comment-only",
+        details: {
+          issueId: issue.id,
+          assigneeAgentId: issue.assigneeAgentId,
+          actorAgentId: req.actor.agentId,
+          reason: "allow_source_scoped_recovery_owner",
+          hint: "Post the discharge evidence as a plain comment; restore status via PATCH, which is separately authorized.",
+        },
+      });
+      return;
+    }
     const commentOnlyGrantedPeerAgent =
-      closedCommentGrantPeerAgentCommentOnly || recoveryHandoffGrantedCommentOnly;
+      closedCommentGrantPeerAgentCommentOnly ||
+      recoveryHandoffGrantedCommentOnly ||
+      recoveryOwnerGrantedCommentOnly;
     const effectiveReopenRequested = commentOnlyGrantedPeerAgent ? false : reopenRequested;
     const effectiveResumeRequested = commentOnlyGrantedPeerAgent ? false : resumeRequested;
     if (
