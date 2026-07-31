@@ -639,6 +639,7 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
   it("stamps route-created work products with the authenticated run and rejects forged run ids", async () => {
     await enableDoneExecutionGate();
     const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    const attachmentId = await addIssueAttachment(companyId, issueId, agentId);
     const app = createApp(agentId, companyId, runId);
 
     const forged = await request(app).post(`/api/issues/${issueId}/work-products`).send({
@@ -656,6 +657,7 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
       provider: "paperclip",
       title: "Route artifact",
       url: "https://paperclip.blockcast.net/BLO/artifacts/route-artifact",
+      metadata: { attachmentId },
       createdByRunId: runId,
     }).expect(201);
 
