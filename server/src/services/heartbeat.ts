@@ -3152,6 +3152,32 @@ const TRANSIENT_UPSTREAM_TEXT_PATTERNS = [
   /\bserver_error\b/i,
 ];
 
+// BLO-19879: the penstock gateway answers `400 {"code":"allocation_missing"}`
+// when it routes a request to a BYOS vault node that does not serve the
+// requested provider. Despite the 4xx status this is a *gateway-side routing*
+// fault, not a malformed request: the same payload succeeds as soon as a
+// provider-capable node is back in the active set. On 2026-07-31, while the
+// only anthropic-capable node (`blockcast-omar`, replicas: 1) was unavailable
+// 16:50–17:20Z, provider-blind failover sent anthropic traffic to
+// `blockcast-sfo12` (PENSTOCK_VAULT_PROVIDERS=openai,codex) and stranded 80
+// runs as terminal `adapter_failed` — 70.5% of all failed runs in the burst.
+//
+// This MUST be tested before the authoritative-status short-circuit in
+// isHintlessTransientUpstreamFault: these runs carry api_error_status=400, so
+// a TRANSIENT_UPSTREAM_TEXT_PATTERNS entry alone would never be reached and
+// would be a silent no-op.
+//
+// Matched on the machine-readable `code`, not the prose, so a reworded gateway
+// message cannot silently drop it back to terminal. Scoped to this one code
+// rather than 400s generally — a genuine bad request must still fail fast
+// instead of burning the full 2m/10m/30m/2h retry curve.
+const GATEWAY_ALLOCATION_FAULT_PATTERN = /"code"\s*:\s*"allocation_missing"/i;
+
+function looksLikeGatewayAllocationFault(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  return GATEWAY_ALLOCATION_FAULT_PATTERN.test(value);
+}
+
 function looksLikeTransientUpstreamText(value: unknown): boolean {
   if (typeof value !== "string") return false;
   return TRANSIENT_UPSTREAM_TEXT_PATTERNS.some((re) => re.test(value));
@@ -3172,6 +3198,16 @@ export function isHintlessTransientUpstreamFault(
   resultJson: Record<string, unknown> | null | undefined,
   opts?: { errorMessage?: string | null },
 ): boolean {
+  // BLO-19879: checked first, above the authoritative-status short-circuit
+  // below, because the gateway allocation fault carries a 400 and would
+  // otherwise be rejected before any text matching runs.
+  if (resultJson) {
+    for (const key of ["result", "message", "error", "summary"] as const) {
+      if (looksLikeGatewayAllocationFault(resultJson[key])) return true;
+    }
+  }
+  if (looksLikeGatewayAllocationFault(opts?.errorMessage)) return true;
+
   // Two status surfaces: the Claude SDK's final result event uses
   // `api_error_status`, while the per-attempt `api_retry` events that precede
   // an exhausted retry budget use `error_status` — the latter is the field the
