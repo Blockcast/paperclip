@@ -292,6 +292,13 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
   return "Long active duration";
 }
 
+/**
+ * Either the pooled handle or an open transaction. Helpers that participate in
+ * the BLO-3737 refresh-throttle critical section accept this so the read and the
+ * write land on the same connection (and therefore inside the same advisory lock).
+ */
+type DbOrTx = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+
 export function productivityReviewService(db: Db, deps?: ProductivityReviewServiceDeps) {
   const issuesSvc = issueService(db);
   const budgets = budgetService(db);
@@ -532,8 +539,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     return streak;
   }
 
-  async function getRefreshCommentState(companyId: string, reviewIssueId: string) {
-    return db
+  async function getRefreshCommentState(companyId: string, reviewIssueId: string, executor: DbOrTx = db) {
+    return executor
       .select({
         count: sql<number>`count(*)::int`,
         latestCreatedAt: sql<Date | null>`max(${issueComments.createdAt})`,
@@ -555,13 +562,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       });
   }
 
-  async function addRefreshComment(reviewIssueId: string, body: string, generatedAt: Date) {
-    const comment = await issuesSvc.addComment(reviewIssueId, body, {});
-    await db
+  async function addRefreshComment(
+    reviewIssueId: string,
+    body: string,
+    generatedAt: Date,
+    executor: DbOrTx = db,
+  ) {
+    const comment = await issuesSvc.addComment(reviewIssueId, body, {}, undefined, executor);
+    await executor
       .update(issueComments)
       .set({ createdAt: generatedAt, updatedAt: generatedAt })
       .where(eq(issueComments.id, comment.id));
-    await db
+    await executor
       .update(issues)
       .set({ updatedAt: generatedAt })
       .where(eq(issues.id, reviewIssueId));
@@ -1076,28 +1088,54 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // skip the addComment so the review thread doesn't accumulate
       // ~identical "evidence refreshed" comments. The previous run
       // is reused as the {kind:"existing"} outcome.
-      const refreshState = await getRefreshCommentState(evidence.sourceIssue.companyId, existing.id);
-      const lastRefreshAt = refreshState.latestCreatedAt ?? existing.createdAt;
+      //
+      // BLO-3737: read-then-write across two statements let concurrent
+      // reconciles (the 30s scheduler overlapping itself) both observe the
+      // pre-write state and both pass the gate — BLO-3277 accumulated 14
+      // refreshes in 6 minutes that way. Hold a transaction-scoped advisory
+      // lock keyed on the review issue for the whole check-then-append, so
+      // the second reconcile blocks until the first commits and then sees
+      // its comment. `pg_advisory_xact_lock` waits rather than failing and
+      // is released on commit/rollback, so no unlock bookkeeping is needed.
       const effectiveRefreshIntervalMs = Math.max(
         PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS,
         opts.thresholds.refreshIntervalMs,
       );
-      if (
-        refreshState.count >= opts.thresholds.maxRefreshComments ||
-        evidence.generatedAt.getTime() - lastRefreshAt.getTime() < effectiveRefreshIntervalMs
-      ) {
+      const refreshOutcome = await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${evidence.sourceIssue.companyId} || ':' || ${existing.id}, 0))`,
+        );
+
+        const refreshState = await getRefreshCommentState(evidence.sourceIssue.companyId, existing.id, tx);
+        const lastRefreshAt = refreshState.latestCreatedAt ?? existing.createdAt;
+        if (
+          refreshState.count >= opts.thresholds.maxRefreshComments ||
+          evidence.generatedAt.getTime() - lastRefreshAt.getTime() < effectiveRefreshIntervalMs
+        ) {
+          return { throttled: true as const, lastRefreshAt };
+        }
+
+        await addRefreshComment(
+          existing.id,
+          buildRefreshComment(evidence, opts.prefix),
+          evidence.generatedAt,
+          tx,
+        );
+        return { throttled: false as const, lastRefreshAt };
+      });
+
+      if (refreshOutcome.throttled) {
         logger.debug(
           {
             reviewIssueId: existing.id,
             sourceIssueId: evidence.sourceIssue.id,
-            lastRefreshAt: lastRefreshAt.toISOString(),
+            lastRefreshAt: refreshOutcome.lastRefreshAt.toISOString(),
             minIntervalMs: effectiveRefreshIntervalMs,
           },
           "productivity review refresh throttled: previous refresh within hard-floor window",
         );
         return { kind: "existing" as const, reviewIssueId: existing.id };
       }
-      await addRefreshComment(existing.id, buildRefreshComment(evidence, opts.prefix), evidence.generatedAt);
       await logActivity(db, {
         companyId: evidence.sourceIssue.companyId,
         actorType: "system",
