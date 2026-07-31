@@ -1,7 +1,10 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
+import {
+  computeIssueMonitorGateFingerprint,
+  normalizeIssueExecutionPolicy,
+} from "../services/issue-execution-policy.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -12,6 +15,8 @@ const mockIssueService = vi.hoisted(() => ({
   findMentionedAgents: vi.fn(),
   getRelationSummaries: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
+  // BLO-18294: the monitor convergence guard reads live blocker edges on every arm.
+  listDependencyReadiness: vi.fn(async () => new Map()),
   getWakeableParentAfterChildCompletion: vi.fn(),
 }));
 
@@ -38,7 +43,14 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
       permissions: null,
     }]).then(onFulfilled, onRejected),
 })));
-const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
+// BLO-18294: the convergence escalation resolves unblock owners through a
+// leftJoin, which no other route in this file uses — give it its own stub so a
+// test can seed blocker rows without disturbing the auth lookups above.
+const mockDbLeftJoinWhere = vi.hoisted(() => vi.fn(async () => [] as unknown[]));
+const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({
+  where: mockDbSelectWhere,
+  leftJoin: vi.fn(() => ({ where: mockDbLeftJoinWhere })),
+})));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
 const mockDbInsertValues = vi.hoisted(() => vi.fn(async () => undefined));
 const mockDbInsert = vi.hoisted(() => vi.fn(() => ({ values: mockDbInsertValues })));
@@ -195,7 +207,12 @@ describe("issue execution policy routes", () => {
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
-    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
+    mockDbSelectFrom.mockImplementation(() => ({
+      where: mockDbSelectWhere,
+      leftJoin: vi.fn(() => ({ where: mockDbLeftJoinWhere })),
+    }));
+    mockDbLeftJoinWhere.mockResolvedValue([]);
+    mockIssueService.listDependencyReadiness.mockResolvedValue(new Map());
     mockDbSelectWhere.mockImplementation(() => ({
       then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
         Promise.resolve([{
@@ -1505,6 +1522,206 @@ describe("issue execution policy routes", () => {
       const overrideCall = decideCalls.find((call) => call.action === "tasks:override_execution_stage");
       expect(overrideCall?.resource?.assigneeAgentId).toBe(mandateBoundParticipantAgentId);
       expect(overrideCall?.resource?.assigneeAgentId).not.toBe(divergedAssigneeAgentId);
+    });
+  });
+
+  describe("monitor convergence guard (BLO-18294)", () => {
+    const CONVERGED_ISSUE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const BLOCKER_ISSUE_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const ACTING_AGENT_ID = "33333333-3333-4333-8333-333333333333";
+    const BLOCKER_OWNER_AGENT_ID = "44444444-4444-4444-8444-444444444444";
+
+    function armedMonitor(nextCheckAt: string) {
+      return {
+        nextCheckAt,
+        notes: "still waiting on the donor host drain",
+        scheduledBy: "assignee" as const,
+      };
+    }
+
+    it("refuses the re-arm, blocks the issue, and names the unblock owners", async () => {
+      // Three prior re-checks already reported this exact blocker set.
+      const { fingerprint, source } = computeIssueMonitorGateFingerprint({
+        unresolvedBlockerIssueIds: [BLOCKER_ISSUE_ID],
+      });
+      const issue = {
+        id: CONVERGED_ISSUE_ID,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: ACTING_AGENT_ID,
+        assigneeUserId: null,
+        checkoutRunId: "run-1",
+        executionRunId: "run-1",
+        createdByUserId: "local-board",
+        identifier: "PAP-13266",
+        title: "Donor host extraction",
+        // A monitor that has already fired has been stripped from the policy by
+        // `buildIssueMonitorTriggeredPatch`; only executionState still describes it.
+        executionPolicy: null,
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            status: "triggered",
+            nextCheckAt: null,
+            lastTriggeredAt: "2026-07-23T12:00:00.000Z",
+            attemptCount: 3,
+            notes: "still waiting on the donor host drain",
+            scheduledBy: "assignee",
+            gateFingerprint: fingerprint,
+            gateSource: source,
+            convergenceCount: 3,
+            clearedAt: null,
+            clearReason: null,
+          },
+        },
+        monitorAttemptCount: 3,
+        monitorNextCheckAt: null,
+        monitorLastTriggeredAt: new Date("2026-07-23T12:00:00.000Z"),
+        monitorNotes: "still waiting on the donor host drain",
+        monitorScheduledBy: "assignee",
+      };
+
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.listDependencyReadiness.mockResolvedValue(
+        new Map([[CONVERGED_ISSUE_ID, { issueId: CONVERGED_ISSUE_ID, unresolvedBlockerIssueIds: [BLOCKER_ISSUE_ID] }]]),
+      );
+      mockDbLeftJoinWhere.mockResolvedValue([
+        {
+          issueId: BLOCKER_ISSUE_ID,
+          identifier: "PAP-9001",
+          title: "Grant Proxmox migration window",
+          status: "todo",
+          assigneeAgentId: BLOCKER_OWNER_AGENT_ID,
+          assigneeUserId: null,
+          assigneeAgentName: "Platform SRE",
+        },
+      ]);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: ACTING_AGENT_ID,
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch(`/api/issues/${CONVERGED_ISSUE_ID}`)
+        .send({ executionPolicy: { monitor: armedMonitor("2099-12-01T12:30:00.000Z") } });
+
+      expect(res.status).toBe(200);
+
+      const patch = mockIssueService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+      expect(patch.status).toBe("blocked");
+      expect(patch.monitorNextCheckAt).toBeNull();
+
+      const comment = mockDbInsertValues.mock.calls
+        .map((call) => call[0] as { issueId?: string; body?: string })
+        .find((value) => value?.issueId === CONVERGED_ISSUE_ID && value?.body?.includes("Monitor stopped re-arming"));
+      expect(comment).toBeDefined();
+      expect(comment!.body).toContain("Unblock owners:");
+      expect(comment!.body).toContain("PAP-9001");
+      expect(comment!.body).toContain(`agent://${BLOCKER_OWNER_AGENT_ID}`);
+
+      const activity = mockLogActivity.mock.calls
+        .map((call) => call[1] as { action?: string; details?: Record<string, unknown> })
+        .find((value) => value?.action === "issue.monitor_convergence_stalled");
+      expect(activity).toBeDefined();
+      expect(activity!.details).toMatchObject({
+        gateSource: "gates",
+        convergenceCount: 4,
+        threshold: 3,
+        unresolvedBlockerIssueIds: [BLOCKER_ISSUE_ID],
+      });
+    });
+
+    it("leaves a re-arm alone while the blocker set is still narrowing", async () => {
+      const { fingerprint, source } = computeIssueMonitorGateFingerprint({
+        unresolvedBlockerIssueIds: [BLOCKER_ISSUE_ID, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"],
+      });
+      const issue = {
+        id: CONVERGED_ISSUE_ID,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: ACTING_AGENT_ID,
+        assigneeUserId: null,
+        checkoutRunId: "run-1",
+        executionRunId: "run-1",
+        createdByUserId: "local-board",
+        identifier: "PAP-13266",
+        title: "Donor host extraction",
+        executionPolicy: null,
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            status: "triggered",
+            nextCheckAt: null,
+            lastTriggeredAt: "2026-07-23T12:00:00.000Z",
+            attemptCount: 3,
+            notes: "still waiting",
+            scheduledBy: "assignee",
+            // Three prior re-checks, but against a WIDER blocker set — one has
+            // since resolved, so this arm is real progress.
+            gateFingerprint: fingerprint,
+            gateSource: source,
+            convergenceCount: 3,
+            clearedAt: null,
+            clearReason: null,
+          },
+        },
+        monitorAttemptCount: 3,
+        monitorNextCheckAt: null,
+        monitorLastTriggeredAt: new Date("2026-07-23T12:00:00.000Z"),
+        monitorNotes: "still waiting",
+        monitorScheduledBy: "assignee",
+      };
+
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.listDependencyReadiness.mockResolvedValue(
+        new Map([[CONVERGED_ISSUE_ID, { issueId: CONVERGED_ISSUE_ID, unresolvedBlockerIssueIds: [BLOCKER_ISSUE_ID] }]]),
+      );
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: ACTING_AGENT_ID,
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch(`/api/issues/${CONVERGED_ISSUE_ID}`)
+        .send({ executionPolicy: { monitor: armedMonitor("2099-12-01T12:30:00.000Z") } });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+      expect(patch.status).toBeUndefined();
+      expect(patch.monitorNextCheckAt).toEqual(new Date("2099-12-01T12:30:00.000Z"));
+      expect(
+        mockLogActivity.mock.calls.some((call) => (call[1] as { action?: string })?.action === "issue.monitor_convergence_stalled"),
+      ).toBe(false);
     });
   });
 });
