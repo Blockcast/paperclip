@@ -113,10 +113,11 @@ export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
 // healthy 4h run legitimately holds a 4h-old lock. Age must therefore be
 // measured against the run's own most-recent *genuine* activity
 // (lastUsefulActionAt > lastOutputAt > startedAt), which is exactly the metric
-// the dispatcher's slot gate uses (`nonStaleRunningRuns`, heartbeat.ts) and the
-// reaper's own silence test (`persistedSignalRef`). Deliberately NOT updatedAt:
+// the dispatcher's slot gate uses (`nonStaleRunningRuns`,
+// heartbeat.ts:17162-17171) and the reaper's own silence test
+// (`persistedSignalRef`, heartbeat.ts:16283-16289). Deliberately NOT updatedAt:
 // review/recovery churn bumps it every ~minute and would shield a dead run
-// forever (BLO-8827).
+// forever (BLO-8827, and the reaper's own note at heartbeat.ts:16444-16448).
 //
 // reapOrphanedRuns is the primary path and normally flips such a run terminal
 // within minutes, but it is not a guarantee: several of its skips are
