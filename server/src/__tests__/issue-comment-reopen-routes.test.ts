@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -41,8 +42,13 @@ const mockTx = vi.hoisted(() => ({
   insert: mockTxInsert,
 }));
 const mockDbSelectOrderBy = vi.hoisted(() => vi.fn(async () => []));
+const mockDbSelectLimit = vi.hoisted(() => vi.fn(() => ({
+  then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+    Promise.resolve([]).then(onFulfilled, onRejected),
+})));
 const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
   orderBy: mockDbSelectOrderBy,
+  limit: mockDbSelectLimit,
   then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
     Promise.resolve([]).then(onFulfilled, onRejected),
 })));
@@ -82,6 +88,20 @@ const mockIssueTreeControlService = vi.hoisted(() => ({
 const mockExternalObjectService = vi.hoisted(() => ({
   syncCommentSafely: vi.fn(async () => undefined),
   syncIssueSafely: vi.fn(async () => undefined),
+}));
+
+const mockIssueReferenceService = vi.hoisted(() => ({
+  deleteDocumentSource: vi.fn(async () => undefined),
+  diffIssueReferenceSummary: vi.fn(() => ({
+    addedReferencedIssues: [],
+    removedReferencedIssues: [],
+    currentReferencedIssues: [],
+  })),
+  emptySummary: vi.fn(() => ({ outbound: [], inbound: [] })),
+  listIssueReferenceSummary: vi.fn(async () => ({ outbound: [], inbound: [] })),
+  syncComment: vi.fn(async () => undefined),
+  syncDocument: vi.fn(async () => undefined),
+  syncIssue: vi.fn(async () => undefined),
 }));
 
 vi.mock("@paperclipai/shared/telemetry", () => ({
@@ -143,19 +163,7 @@ vi.mock("../services/index.js", () => ({
   instanceSettingsService: () => mockInstanceSettingsService,
   issueApprovalService: () => ({}),
   issueRecoveryActionService: () => mockIssueRecoveryActionService,
-  issueReferenceService: () => ({
-    deleteDocumentSource: async () => undefined,
-    diffIssueReferenceSummary: () => ({
-      addedReferencedIssues: [],
-      removedReferencedIssues: [],
-      currentReferencedIssues: [],
-    }),
-    emptySummary: () => ({ outbound: [], inbound: [] }),
-    listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
-    syncComment: async () => undefined,
-    syncDocument: async () => undefined,
-    syncIssue: async () => undefined,
-  }),
+  issueReferenceService: () => mockIssueReferenceService,
   issueService: () => mockIssueService,
   issueThreadInteractionService: () => mockIssueThreadInteractionService,
   issueTreeControlService: () => mockIssueTreeControlService,
@@ -272,18 +280,35 @@ describe.sequential("issue comment reopen routes", () => {
     mockDbSelectFrom.mockReset();
     mockDbSelectWhere.mockReset();
     mockDbSelectOrderBy.mockReset();
+    mockDbSelectLimit.mockReset();
     mockDb.transaction.mockReset();
     mockTxInsertValues.mockResolvedValue(undefined);
     mockTxInsert.mockImplementation(() => ({ values: mockTxInsertValues }));
     mockDbSelectOrderBy.mockResolvedValue([]);
+    mockDbSelectLimit.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([]).then(onFulfilled, onRejected),
+    }));
     mockDbSelectWhere.mockImplementation(() => ({
       orderBy: mockDbSelectOrderBy,
+      limit: mockDbSelectLimit,
       then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
         Promise.resolve([]).then(onFulfilled, onRejected),
     }));
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDb.transaction.mockImplementation(async (fn: (tx: typeof mockTx) => Promise<unknown>) => fn(mockTx));
+    mockIssueReferenceService.deleteDocumentSource.mockReset().mockResolvedValue(undefined);
+    mockIssueReferenceService.diffIssueReferenceSummary.mockReset().mockReturnValue({
+      addedReferencedIssues: [],
+      removedReferencedIssues: [],
+      currentReferencedIssues: [],
+    });
+    mockIssueReferenceService.emptySummary.mockReset().mockReturnValue({ outbound: [], inbound: [] });
+    mockIssueReferenceService.listIssueReferenceSummary.mockReset().mockResolvedValue({ outbound: [], inbound: [] });
+    mockIssueReferenceService.syncComment.mockReset().mockResolvedValue(undefined);
+    mockIssueReferenceService.syncDocument.mockReset().mockResolvedValue(undefined);
+    mockIssueReferenceService.syncIssue.mockReset().mockResolvedValue(undefined);
     mockHeartbeatService.wakeup.mockResolvedValue(undefined);
     mockHeartbeatService.reportRunActivity.mockResolvedValue(undefined);
     mockHeartbeatService.getRun.mockResolvedValue(null);
@@ -639,7 +664,111 @@ describe.sequential("issue comment reopen routes", () => {
     expect(patchRes.body.error).toBe("Issue is outside this actor's authorization boundary (trust-boundary)");
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    // BLO-18614 AC3: a denied write is not silently dropped — it is recorded
+    // on the activity log with its target and the payload the actor tried
+    // to send, so the content is recoverable rather than lost to the
+    // transcript when no other writable surface (e.g. a GitHub PR) exists.
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({
+        action: "issue_write_denied",
+        entityType: "issue",
+        entityId: "11111111-1111-4111-8111-111111111111",
+        actorId: outsideAgentId,
+        details: expect.objectContaining({
+          attemptedAction: "issue:comment",
+          reason: "deny_low_trust_boundary",
+          payload: expect.objectContaining({ body: "I should not be allowed." }),
+        }),
+      }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({
+        action: "issue_write_denied",
+        entityType: "issue",
+        entityId: "11111111-1111-4111-8111-111111111111",
+        details: expect.objectContaining({ attemptedAction: "issue:mutate" }),
+      }),
+    );
   });
+
+  it("bounds a deeply-nested denied payload instead of passing it through unbounded (BLO-18614 review fix)", async () => {
+    const outsideAgentId = "55555555-5555-4555-8555-555555555555";
+    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: false,
+      action: input.action,
+      reason: "deny_low_trust_boundary",
+      explanation: "Peer agent is outside this low-trust boundary.",
+    }));
+
+    // A nested object with a huge leaf string, via a request field
+    // (assigneeAdapterOverrides.adapterConfig) whose schema permits
+    // arbitrary nested values — the original truncation only capped
+    // top-level string fields, so this would have passed through unbounded.
+    const hugeLeaf = "x".repeat(50_000);
+    const secret = "sk-denied-secret-value";
+    const res = await request(await installActor(createApp(), agentActor(outsideAgentId)))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ assigneeAdapterOverrides: { adapterConfig: { apiKey: secret, a: { b: { c: hugeLeaf } } } } });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    const call = mockLogActivity.mock.calls.find(
+      ([, entry]) => (entry as { action?: string }).action === "issue_write_denied"
+        && (entry as { details?: { attemptedAction?: string } }).details?.attemptedAction === "issue:mutate",
+    );
+    expect(call, "expected an issue_write_denied log entry for issue:mutate").toBeTruthy();
+    const details = (call![1] as { details: Record<string, unknown> }).details;
+    expect(details.quarantined).toBe(true);
+    expect(details.sourceTrust).toBe("untrusted_boundary_denied");
+    // Whatever shape survives, it must not contain the raw 50k-char leaf —
+    // either the nested string got truncated, or the whole payload got
+    // replaced by a bounded preview.
+    const serializedPayload = JSON.stringify(details.payload);
+    expect(serializedPayload.length).toBeLessThan(hugeLeaf.length);
+    expect(serializedPayload.includes(hugeLeaf)).toBe(false);
+    expect(serializedPayload).not.toContain(secret);
+    expect(serializedPayload).toContain(REDACTED_EVENT_VALUE);
+  });
+
+  it("bounds the final serialized denied-write details after JSON escaping (BLO-18614 review fix)", async () => {
+    const outsideAgentId = "55555555-5555-4555-8555-555555555555";
+    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: false,
+      action: input.action,
+      reason: "deny_low_trust_boundary",
+      explanation: "Peer agent is outside this low-trust boundary.",
+    }));
+
+    const escapingHeavyConfig = Object.fromEntries(
+      Array.from({ length: 8 }, (_, index) => [`field${index}`, "\"\\\n".repeat(900)]),
+    );
+    const res = await request(await installActor(createApp(), agentActor(outsideAgentId)))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ assigneeAdapterOverrides: { adapterConfig: escapingHeavyConfig } });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    const call = mockLogActivity.mock.calls.find(
+      ([, entry]) => (entry as { action?: string }).action === "issue_write_denied"
+        && (entry as { details?: { attemptedAction?: string } }).details?.attemptedAction === "issue:mutate",
+    );
+    expect(call, "expected an issue_write_denied log entry for issue:mutate").toBeTruthy();
+    const details = (call![1] as { details: Record<string, unknown> }).details;
+    expect(Buffer.byteLength(JSON.stringify(details), "utf8")).toBeLessThanOrEqual(16_000);
+    expect(details.payload).toEqual(expect.objectContaining({
+      __redacted: true,
+      reason: "payload exceeded total audit size cap after redaction/truncation",
+    }));
+  });
+
+  // BLO-18614: the linked-execution-lock comment-widening (allow a comment
+  // on the parent/child of the actor's currently-locked issue) was split out
+  // of this PR per CEO direction after review — see PR #806 discussion. This
+  // PR ships denial-recording only; the widening may return as a separate,
+  // narrower follow-up if the observed cases still need it.
 
   it("implicitly reopens closed issues via POST comments when an agent is assigned", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
@@ -1270,6 +1399,20 @@ describe.sequential("issue comment reopen routes", () => {
 
     expect(res.status).toBe(403);
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue_write_denied",
+        entityType: "issue",
+        entityId: "11111111-1111-4111-8111-111111111111",
+        details: expect.objectContaining({
+          attemptedAction: "issue:comment",
+          reason: "deny_structured_comment_fields",
+          responseStatus: 403,
+          quarantined: true,
+        }),
+      }),
+    );
   });
 
   it("rejects invalid comment metadata before writing a comment", async () => {
@@ -1820,6 +1963,20 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue_write_denied",
+        entityType: "issue",
+        entityId: "11111111-1111-4111-8111-111111111111",
+        details: expect.objectContaining({
+          attemptedAction: "issue:mutate",
+          reason: "deny_resume_policy",
+          responseStatus: 403,
+          quarantined: true,
+        }),
+      }),
+    );
   });
 
   it("rejects explicit resume intent under an active pause hold", async () => {

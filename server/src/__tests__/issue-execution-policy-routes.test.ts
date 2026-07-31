@@ -9,6 +9,8 @@ const mockIssueService = vi.hoisted(() => ({
   update: vi.fn(),
   createChild: vi.fn(),
   addComment: vi.fn(),
+  listAttachments: vi.fn(),
+  remove: vi.fn(),
   findMentionedAgents: vi.fn(),
   getRelationSummaries: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
@@ -182,6 +184,8 @@ describe("issue execution policy routes", () => {
     registerModuleMocks();
     vi.clearAllMocks();
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+    mockIssueService.listAttachments.mockResolvedValue([]);
+    mockIssueService.remove.mockResolvedValue(null);
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
@@ -1409,6 +1413,72 @@ describe("issue execution policy routes", () => {
         }),
         expect.anything(),
       );
+    });
+
+    it("lets the current stage participant decide when recovery or reassignment drifted the issue assignee", async () => {
+      const divergedAssigneeAgentId = "44444444-4444-4444-8444-444444444444";
+      const issue = {
+        ...makeStuckReviewIssue(),
+        assigneeAgentId: divergedAssigneeAgentId,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: mandateBoundParticipantAgentId,
+        companyId: "company-1",
+        runId: "run-blo-18614-participant",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({
+          status: "done",
+          comment: "Approving as the active execution-stage participant.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        expect.objectContaining({
+          status: "done",
+          executionState: expect.objectContaining({
+            status: "completed",
+            completedStageIds: [reviewStageId],
+            lastDecisionOutcome: "approved",
+            lastDecisionId: expect.any(String),
+          }),
+        }),
+        expect.anything(),
+      );
+    });
+
+    it("does not let the current stage participant carry the stage-decision exception into DELETE", async () => {
+      const divergedAssigneeAgentId = "44444444-4444-4444-8444-444444444444";
+      const issue = {
+        ...makeStuckReviewIssue(),
+        assigneeAgentId: divergedAssigneeAgentId,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: mandateBoundParticipantAgentId,
+        companyId: "company-1",
+        runId: "run-blo-18614-participant-delete",
+      }))
+        .delete("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({
+          status: "done",
+          comment: "Trying to approve through the wrong route.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.remove).not.toHaveBeenCalled();
     });
 
     it("still rejects an unrelated, unauthorized agent (regression: override does not open the stage to anyone)", async () => {

@@ -324,6 +324,12 @@ function createRunContextDb(
   const buildQuery = (selection: Record<string, unknown>) => {
     const whereResult = {
       orderBy: vi.fn(async () => []),
+      // BLO-18614: this `.limit()` stub was added for a `.where(...).limit(1)`
+      // lookup used by a comment-widening grant that was split out of PR #806
+      // per CEO review direction (see issue-comment-reopen-routes.test.ts).
+      // Left in place as harmless scaffolding in case a future PR reintroduces
+      // a narrower version of that lookup.
+      limit: vi.fn(() => ({ then: async (resolve: (rows: unknown[]) => unknown) => resolve([]) })),
       then: async (resolve: (rows: unknown[]) => unknown) => resolve(rowsForSelection(selection)),
     };
     const query = {
@@ -813,6 +819,25 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockWorkProductService.update).not.toHaveBeenCalled();
     expect(mockStorageService.putFile).not.toHaveBeenCalled();
     expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId,
+        actorType: "agent",
+        actorId: peerAgentId,
+        action: "issue_write_denied",
+        entityType: "issue",
+        entityId: issueId,
+        issueId,
+        details: expect.objectContaining({
+          attemptedAction: "issue:mutate",
+          reason: "deny_active_checkout",
+          boundaryReason: "allow_company_agent",
+          responseStatus: 409,
+          quarantined: true,
+        }),
+      }),
+    );
   });
 
   it("allows a source-scoped recovery owner to clear a stale blocked source issue", async () => {
@@ -979,6 +1004,7 @@ describe("agent issue mutation checkout ownership", () => {
 
   it("refuses reopen/resume from a recovery handoff grant instead of transitioning a blocked issue", async () => {
     for (const transition of [{ reopen: true }, { resume: true }]) {
+      mockLogActivity.mockClear();
       mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
       mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
 
@@ -991,6 +1017,19 @@ describe("agent issue mutation checkout ownership", () => {
       expect(res.body.details).toMatchObject({ reason: "allow_recovery_handoff_grant" });
       expect(mockIssueService.addComment).not.toHaveBeenCalled();
       expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue_write_denied",
+          entityType: "issue",
+          entityId: issueId,
+          details: expect.objectContaining({
+            attemptedAction: "issue:mutate",
+            reason: "deny_recovery_handoff_comment_only",
+            responseStatus: 403,
+          }),
+        }),
+      );
     }
   });
 
@@ -2013,6 +2052,28 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId,
+        actorType: "agent",
+        actorId: peerAgentId,
+        action: "issue_write_denied",
+        entityType: "issue",
+        entityId: issueId,
+        issueId,
+        details: expect.objectContaining({
+          attemptedAction: "issue:mutate",
+          reason: "deny_assignee_mismatch",
+          boundaryReason: "allow_company_agent",
+          responseStatus: 403,
+          quarantined: true,
+          payload: expect.objectContaining({
+            title: `${status[0]!.toUpperCase()}${status.slice(1)} update`,
+          }),
+        }),
+      }),
+    );
   });
 
   it("allows same-company agent mutations on unassigned in-progress issues", async () => {
@@ -2489,6 +2550,12 @@ describe("agent issue mutation checkout ownership", () => {
       const buildQuery = (selection: Record<string, unknown>) => {
         const whereResult = {
           orderBy: vi.fn(async () => []),
+          // BLO-18614: same vestigial `.limit()` stub as above — the
+          // comment-widening lookup that needed it was split out of PR #806.
+          // Kept as a harmless default (resolves empty rather than reusing
+          // rowsForSelection, which would otherwise collide with the
+          // ancestry-row branch above via the shared "parentId" key).
+          limit: vi.fn(() => ({ then: async (resolve: (rows: unknown[]) => unknown) => resolve([]) })),
           then: async (resolve: (rows: unknown[]) => unknown) => resolve(rowsForSelection(selection)),
         };
         const query = {
@@ -2805,6 +2872,23 @@ describe("agent issue mutation checkout ownership", () => {
       expect(patchRes.body.error).toBe("Task-watchdog run context is not backed by an active persisted watchdog.");
       expect(mockIssueService.addComment).not.toHaveBeenCalled();
       expect(mockIssueService.update).not.toHaveBeenCalled();
+      const deniedWriteLogs = mockLogActivity.mock.calls
+        .map(([, entry]) => entry as { action?: string; details?: { attemptedAction?: string; reason?: string } })
+        .filter((entry) => entry.action === "issue_write_denied");
+      expect(deniedWriteLogs).toEqual([
+        expect.objectContaining({
+          details: expect.objectContaining({
+            attemptedAction: "issue:comment",
+            reason: "deny_task_watchdog_scope",
+          }),
+        }),
+        expect.objectContaining({
+          details: expect.objectContaining({
+            attemptedAction: "issue:mutate",
+            reason: "deny_task_watchdog_scope",
+          }),
+        }),
+      ]);
     });
   });
 });
