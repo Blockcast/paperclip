@@ -1865,8 +1865,8 @@ describeEmbeddedPostgres("authorization service", () => {
     });
 
     expect(mutateDecision).toMatchObject({
-      allowed: true,
-      reason: "allow_issue_creator",
+      allowed: false,
+      reason: "deny_missing_grant",
     });
   });
 
@@ -1896,6 +1896,24 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(decision).toMatchObject({
       allowed: true,
       reason: "allow_manager_chain",
+    });
+
+    const mutateDecision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: managerAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        assigneeAgentId: reportAgent.id,
+        createdByAgentId: issue.createdByAgentId,
+        status: issue.status,
+      },
+    });
+
+    expect(mutateDecision).toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
     });
   });
 

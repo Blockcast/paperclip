@@ -3838,15 +3838,6 @@ export function issueRoutes(
       return false;
     }
     if (await isActiveRecoveryActionOwner()) return true;
-    // BLO-18113: decideIssueAccess already admitted the actor via
-    // allow_issue_creator/allow_manager_chain — those grants are evaluated
-    // specifically for actors who are NOT the assignee (see the assigneeAgentId
-    // === actorAgentId short-circuit earlier in authorization.ts), so falling
-    // through into the assignee-ownership/checkout-run gate below would
-    // immediately re-reject the same actor it was just admitted for.
-    if (boundaryDecision.reason === "allow_issue_creator" || boundaryDecision.reason === "allow_manager_chain") {
-      return true;
-    }
     if (issue.assigneeAgentId === null) {
       return true;
     }
