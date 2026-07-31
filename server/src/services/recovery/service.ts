@@ -462,6 +462,11 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "adapter_failed",
   "codex_transient_upstream",
   "claude_transient_upstream",
+  // BLO-18285: the server-side classification of a hint-less provider 503/529
+  // on the k8s adapters. The bounded retry in heartbeat should normally park
+  // such a run in `scheduled_retry` before this sweep ever sees it; listing the
+  // code here keeps the continuation path consistent if it does.
+  "provider_transient_upstream",
   "provider_quota",
   "timeout",
   // BLO-16182: `process_lost` means the run died before ANY adapter/model call
