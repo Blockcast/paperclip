@@ -37,7 +37,10 @@ import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
-import { issueTreeControlService } from "../issue-tree-control.js";
+import {
+  isVerifiedIssueTreeControlInteractionWake,
+  issueTreeControlService,
+} from "../issue-tree-control.js";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
@@ -50,7 +53,10 @@ import {
   buildIssueBlockersResolvedWakeIdempotencyKey,
   findExistingIssueBlockersResolvedWakeForAnyKey,
 } from "../issue-dependency-wakeups.js";
-import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
+import {
+  evaluateAgentInvokability,
+  evaluateAgentInvokabilityFromDb,
+} from "../agent-invokability.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
@@ -88,6 +94,18 @@ export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
+// BLO-18995: how long an issue execution lock may be held by a run that has
+// not yet been claimed (status still `queued`/`scheduled_retry`, startedAt
+// null) before sweepStaleIssueLocks treats it as stale and clears it.
+//
+// Chosen well above any legitimate queue wait so this never races the
+// dispatcher: a queued run is forced to the front of its agent's queue once it
+// passes the 2h STARVATION_FULL_ESCALATION_MS floor in heartbeat.ts, so 6h
+// leaves several hours of drain headroom past that escalation even for a
+// heavily backlogged agent. Clearing the lock does not cancel or deprioritize
+// the run — it only stops subsequent wakes for the issue from being parked
+// behind a holder that may never start.
+export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 // BLO-7113: re-fire suppression for `stale_active_run_evaluation` wrappers.
 // When the underlying `runs.status='running'` row is the canonical
@@ -247,6 +265,12 @@ export type RunOutputSilenceSummary = {
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function normalizeAgentNameKey(value: string | null | undefined) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  return normalized.length > 0 ? normalized : null;
 }
 
 // `extractAgentMcpKeys` reads the adapter_config.mcpServers map (set by
@@ -7309,8 +7333,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .select({
         id: issues.id,
         companyId: issues.companyId,
+        assigneeAgentId: issues.assigneeAgentId,
+        responsibleUserId: issues.responsibleUserId,
         checkoutRunId: issues.checkoutRunId,
         executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
       })
       .from(issues)
       .where(
@@ -7327,49 +7354,332 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const runRows =
       referencedRunIds.length > 0
         ? await db
-            .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+            .select({
+              id: heartbeatRuns.id,
+              status: heartbeatRuns.status,
+              scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+            })
             .from(heartbeatRuns)
             .where(inArray(heartbeatRuns.id, referencedRunIds))
         : [];
-    const runStatusById = new Map<string, string>();
-    for (const row of runRows) runStatusById.set(row.id, row.status);
+    const runById = new Map<string, { status: string; scheduledRetryAt: Date | null }>();
+    for (const row of runRows) runById.set(row.id, row);
 
     const isCleanable = (runId: string | null) => {
       if (!runId) return true;
-      const status = runStatusById.get(runId);
-      if (!status) return true; // missing run row → no real claim
-      return TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);
+      const run = runById.get(runId);
+      if (!run) return true; // missing run row → no real claim
+      return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+    };
+
+    // BLO-18995: a lock can also be held by a run that never started. Four
+    // enqueue paths stamp executionRunId/executionLockedAt at *enqueue* time
+    // alongside a freshly-inserted `queued` run (enqueueMissingIssueCommentRetry,
+    // enqueueProcessLossRetry, and the two recovery-wake inserts), rather than
+    // lazily at claim time the way claimQueuedRun does. `queued` is neither
+    // missing nor terminal, so isCleanable() above returns false forever and
+    // this sweeper — the designated backstop — never clears it. Meanwhile
+    // enqueueWakeup parks every subsequent wake for that issue as
+    // `deferred_issue_execution` behind the apparent live holder, and those
+    // deferred wakes are only promoted by releaseIssueExecutionAndPromote when
+    // the holding run finishes. A run that is never claimed therefore strands
+    // them indefinitely, with no timeout anywhere in the path. Observed in
+    // production: BLO-18939 held executionLockedAt for a run still `queued`
+    // with startedAt null.
+    //
+    // Bound it: once a pre-claim lock has been held longer than
+    // STALE_PRE_CLAIM_ISSUE_LOCK_MS, treat it as cleanable. Clearing is safe
+    // and does not cancel the run — claimQueuedRun's lock update is guarded by
+    // `or(isNull(executionRunId), eq(executionRunId, claimed.id))`, so the run
+    // simply re-acquires the lock if and when it is finally claimed, and the
+    // per-issue dedupe in startNextQueuedRunForAgent still prevents two runs
+    // for one issue from executing concurrently.
+    const isPreClaimLockExpired = (runId: string | null, lockedAt: Date | null) => {
+      if (!runId || !lockedAt) return false;
+      const run = runById.get(runId);
+      if (run?.status === "queued") {
+        return Date.now() - lockedAt.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
+      }
+      if (run?.status === "scheduled_retry") {
+        // Scheduled retries are intentionally parked until their retry deadline.
+        // Only clear them once that deadline itself has gone stale; provider
+        // capacity retries may be scheduled far into the future.
+        const staleBasis = run.scheduledRetryAt ?? lockedAt;
+        return Date.now() - staleBasis.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
+      }
+      return false;
     };
 
     for (const issue of candidates) {
-      if (!isCleanable(issue.checkoutRunId) || !isCleanable(issue.executionRunId)) {
-        continue;
-      }
+      const executionLockExpired = isPreClaimLockExpired(
+        issue.executionRunId,
+        issue.executionLockedAt,
+      );
+      // Guards are kept separate on purpose. The update below nulls the
+      // checkout *and* execution columns together, so the new pre-claim-expiry
+      // allowance must not become a blanket bypass of the checkout check: an
+      // issue whose checkoutRunId points at a live (non-terminal) run keeps its
+      // checkout lock no matter how stale the execution lock is.
+      if (!isCleanable(issue.checkoutRunId)) continue;
+      if (!isCleanable(issue.executionRunId) && !executionLockExpired) continue;
 
-      const updated = await db
-        .update(issues)
-        .set({
-          checkoutRunId: null,
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(issues.id, issue.id),
-            issue.checkoutRunId
-              ? eq(issues.checkoutRunId, issue.checkoutRunId)
-              : isNull(issues.checkoutRunId),
-            issue.executionRunId
-              ? eq(issues.executionRunId, issue.executionRunId)
-              : isNull(issues.executionRunId),
-          ),
-        )
-        .returning({ id: issues.id })
-        .then((rows) => rows[0] ?? null);
+      const sweepOutcome = await db.transaction(async (tx) => {
+        const clearedAt = new Date();
+        const updated = await tx
+          .update(issues)
+          .set({
+            checkoutRunId: null,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: clearedAt,
+          })
+          .where(
+            and(
+              eq(issues.id, issue.id),
+              issue.checkoutRunId
+                ? eq(issues.checkoutRunId, issue.checkoutRunId)
+                : isNull(issues.checkoutRunId),
+              issue.executionRunId
+                ? eq(issues.executionRunId, issue.executionRunId)
+                : isNull(issues.executionRunId),
+              issue.executionLockedAt
+                ? eq(issues.executionLockedAt, issue.executionLockedAt)
+                : isNull(issues.executionLockedAt),
+            ),
+          )
+          .returning({
+            id: issues.id,
+            companyId: issues.companyId,
+            assigneeAgentId: issues.assigneeAgentId,
+            responsibleUserId: issues.responsibleUserId,
+          })
+          .then((rows) => rows[0] ?? null);
 
-      if (!updated) continue;
+        if (!updated) return null;
+
+        const skippedDeferredWakeIds: string[] = [];
+
+        while (true) {
+          const deferred = await tx
+            .select()
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.companyId, updated.companyId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                sql`(
+                  ${agentWakeupRequests.payload} ->> 'issueId' = ${updated.id}
+                  or ${agentWakeupRequests.payload} ->> 'taskId' = ${updated.id}
+                  or ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId' = ${updated.id}
+                  or ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId' = ${updated.id}
+                )`,
+              ),
+            )
+            .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id))
+            .limit(1)
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+
+          if (!deferred) {
+            return {
+              updated,
+              promotedRunId: null,
+              promotedWakeId: null,
+              promotedAgentId: null,
+              skippedDeferredWakeIds,
+            };
+          }
+
+          const deferredAgent = await tx
+            .select({
+              id: agents.id,
+              companyId: agents.companyId,
+              name: agents.name,
+              reportsTo: agents.reportsTo,
+              status: agents.status,
+            })
+            .from(agents)
+            .where(eq(agents.id, deferred.agentId))
+            .then((rows) => rows[0] ?? null);
+          const companyAgents = deferredAgent
+            ? await tx
+              .select({
+                id: agents.id,
+                companyId: agents.companyId,
+                name: agents.name,
+                reportsTo: agents.reportsTo,
+                status: agents.status,
+              })
+              .from(agents)
+              .where(eq(agents.companyId, updated.companyId))
+            : [];
+          const invokability =
+            deferredAgent?.companyId === updated.companyId
+              ? evaluateAgentInvokability(deferredAgent, companyAgents)
+              : evaluateAgentInvokability(null, companyAgents);
+
+          if (!deferredAgent || deferredAgent.companyId !== updated.companyId || !invokability.invokable) {
+            const now = new Date();
+            skippedDeferredWakeIds.push(deferred.id);
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "failed",
+                finishedAt: now,
+                error: "Deferred wake could not be promoted: agent is not invokable",
+                updatedAt: now,
+              })
+              .where(eq(agentWakeupRequests.id, deferred.id));
+            continue;
+          }
+
+          const deferredPayload = { ...parseObject(deferred.payload) };
+          const deferredContextSeed = {
+            ...parseObject(deferredPayload[DEFERRED_WAKE_CONTEXT_KEY]),
+          };
+          delete deferredPayload[DEFERRED_WAKE_CONTEXT_KEY];
+
+          const activePauseHold = await treeControlSvc.getActivePauseHoldGate(
+            updated.companyId,
+            updated.id,
+            tx,
+          );
+          const treeHoldInteractionWake = activePauseHold && await isVerifiedIssueTreeControlInteractionWake(tx, {
+            companyId: updated.companyId,
+            issueId: updated.id,
+            agentId: deferred.agentId,
+            contextSnapshot: deferredContextSeed,
+            requestedByActorType: deferred.requestedByActorType,
+            requestedByActorId: deferred.requestedByActorId,
+            wakeupRequestId: deferred.id,
+          });
+          if (activePauseHold && !treeHoldInteractionWake) {
+            const now = new Date();
+            skippedDeferredWakeIds.push(deferred.id);
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "cancelled",
+                finishedAt: now,
+                error: "Deferred wake suppressed by active subtree pause hold",
+                updatedAt: now,
+              })
+              .where(eq(agentWakeupRequests.id, deferred.id));
+            continue;
+          }
+
+          const promotedReason = readNonEmptyString(deferred.reason) ?? "issue_execution_promoted";
+          const promotedSource = readNonEmptyString(deferred.source) ?? "automation";
+          const promotedTriggerDetail = readNonEmptyString(deferred.triggerDetail);
+          const promotedContextSnapshot: Record<string, unknown> = { ...deferredContextSeed };
+          if (activePauseHold) {
+            promotedContextSnapshot.treeHoldInteraction = true;
+            promotedContextSnapshot.activeTreeHold = {
+              holdId: activePauseHold.holdId,
+              rootIssueId: activePauseHold.rootIssueId,
+              mode: activePauseHold.mode,
+              reason: activePauseHold.reason,
+              releasePolicy: activePauseHold.releasePolicy,
+              interaction: true,
+            };
+          }
+          if (!readNonEmptyString(promotedContextSnapshot.issueId)) {
+            promotedContextSnapshot.issueId = updated.id;
+          }
+          if (!readNonEmptyString(promotedContextSnapshot.taskId)) {
+            promotedContextSnapshot.taskId = updated.id;
+          }
+          if (!readNonEmptyString(promotedContextSnapshot.wakeReason)) {
+            promotedContextSnapshot.wakeReason = promotedReason;
+          }
+          if (!readNonEmptyString(promotedContextSnapshot.wakeSource)) {
+            promotedContextSnapshot.wakeSource = promotedSource;
+          }
+          if (
+            promotedTriggerDetail &&
+            !readNonEmptyString(promotedContextSnapshot.wakeTriggerDetail)
+          ) {
+            promotedContextSnapshot.wakeTriggerDetail = promotedTriggerDetail;
+          }
+          if (
+            readNonEmptyString(deferredPayload.commentId) &&
+            !readNonEmptyString(promotedContextSnapshot.commentId)
+          ) {
+            promotedContextSnapshot.commentId = deferredPayload.commentId;
+          }
+          if (
+            readNonEmptyString(deferredPayload.taskKey) &&
+            !readNonEmptyString(promotedContextSnapshot.taskKey)
+          ) {
+            promotedContextSnapshot.taskKey = deferredPayload.taskKey;
+          }
+
+          const now = new Date();
+          const newRun = await tx
+            .insert(heartbeatRuns)
+            .values({
+              companyId: deferredAgent.companyId,
+              agentId: deferredAgent.id,
+              invocationSource: promotedSource,
+              triggerDetail: promotedTriggerDetail,
+              status: "queued",
+              wakeupRequestId: deferred.id,
+              contextSnapshot: promotedContextSnapshot,
+              responsibleUserId: updated.responsibleUserId,
+              updatedAt: now,
+            })
+            .returning({ id: heartbeatRuns.id })
+            .then((rows) => rows[0]);
+
+          const promotedWake = await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "queued",
+              reason: "issue_execution_promoted",
+              runId: newRun.id,
+              claimedAt: null,
+              finishedAt: null,
+              error: null,
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(agentWakeupRequests.id, deferred.id),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              ),
+            )
+            .returning({ id: agentWakeupRequests.id })
+            .then((rows) => rows[0] ?? null);
+
+          if (!promotedWake) {
+            await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.id, newRun.id));
+            skippedDeferredWakeIds.push(deferred.id);
+            continue;
+          }
+
+          await tx
+            .update(issues)
+            .set({
+              executionRunId: newRun.id,
+              executionAgentNameKey: normalizeAgentNameKey(deferredAgent.name),
+              executionLockedAt: now,
+              updatedAt: now,
+            })
+            .where(and(eq(issues.id, updated.id), eq(issues.assigneeAgentId, deferredAgent.id)));
+
+          return {
+            updated,
+            promotedRunId: newRun.id,
+            promotedWakeId: deferred.id,
+            promotedAgentId: deferredAgent.id,
+            skippedDeferredWakeIds,
+          };
+        }
+      });
+
+      if (!sweepOutcome) continue;
+      const { updated } = sweepOutcome;
 
       result.cleared += 1;
       result.issueIds.push(updated.id);
@@ -7387,7 +7697,26 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           source: "recovery.sweep_stale_issue_locks",
           clearedCheckoutRunId: issue.checkoutRunId,
           clearedExecutionRunId: issue.executionRunId,
-          referencedRunStatuses: Object.fromEntries(runStatusById),
+          referencedRunStatuses: Object.fromEntries(
+            [...runById.entries()].map(([id, run]) => [id, run.status]),
+          ),
+          promotedDeferredWakeId: sweepOutcome.promotedWakeId,
+          promotedRunId: sweepOutcome.promotedRunId,
+          promotedAgentId: sweepOutcome.promotedAgentId,
+          skippedDeferredWakeIds: sweepOutcome.skippedDeferredWakeIds,
+          // BLO-18995: distinguishes the original terminal/missing-run path from
+          // the pre-claim lock timeout, so an operator reading the audit trail
+          // can tell whether a lock was released because its run finished or
+          // because it was never claimed within STALE_PRE_CLAIM_ISSUE_LOCK_MS.
+          reason: executionLockExpired ? "pre_claim_lock_expired" : "run_terminal_or_missing",
+          ...(executionLockExpired
+            ? {
+              preClaimLockHeldMs: issue.executionLockedAt
+                ? Date.now() - issue.executionLockedAt.getTime()
+                : null,
+              preClaimLockTimeoutMs: STALE_PRE_CLAIM_ISSUE_LOCK_MS,
+            }
+            : {}),
         },
       });
     }
