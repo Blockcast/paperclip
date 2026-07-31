@@ -1019,8 +1019,8 @@ const EXTERNAL_LIFECYCLE_PRE_ADAPTER_STALE_MS = 5 * 60 * 1000;
 // every tick. Aging closes this in two bounded steps: after
 // STARVATION_STATUS_BOOST_MS waited, forgive the todo/in_progress status
 // penalty (lets it tie same-priority in_progress work); after
-// STARVATION_FULL_ESCALATION_MS, force top-of-queue so it cannot be starved
-// indefinitely regardless of what else is queued.
+// STARVATION_FULL_ESCALATION_MS, promote it ahead of routine work while
+// preserving ranks 0-1 for explicit critical issues.
 const STARVATION_STATUS_BOOST_MS = 30 * 60 * 1000;
 const STARVATION_FULL_ESCALATION_MS = 2 * 60 * 60 * 1000;
 // BLO-16253 follow-up: a recovery/wake_owner run (contextSnapshot.recoveryActionId
@@ -17191,8 +17191,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const escalationFloorMs = isRecoveryWake
             ? STARVATION_RECOVERY_ESCALATION_MS
             : STARVATION_FULL_ESCALATION_MS;
-          if (waitedMs >= escalationFloorMs) return 0;
           const priorityRank = issueRunPriorityRank(issue?.priority);
+          // Aging must guarantee progress without erasing the emergency lane.
+          // Aged non-critical issue work joins rank 2 alongside aged issue-less
+          // work, ahead of routine medium/low work but behind critical ranks
+          // 0-1. Critical work itself still ages to rank 0 for FIFO ordering
+          // within that tier.
+          if (waitedMs >= escalationFloorMs) return priorityRank === 0 ? 0 : 2;
           const statusBonus =
             issue?.status === "in_progress" || waitedMs >= STARVATION_STATUS_BOOST_MS ? 0 : 1;
           return priorityRank * 2 + statusBonus;
