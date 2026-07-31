@@ -154,6 +154,7 @@ function monitorConvergenceFields(
       gateSource: previous?.gateSource ?? null,
       convergenceCount: previous?.convergenceCount ?? 0,
       convergenceStallCount: previous?.convergenceStallCount ?? 0,
+      convergenceStalledAssigneeAgentId: previous?.convergenceStalledAssigneeAgentId ?? null,
     };
   }
   return {
@@ -164,6 +165,7 @@ function monitorConvergenceFields(
     gateSource: convergence?.source ?? previous?.gateSource ?? null,
     convergenceCount: convergence?.count ?? previous?.convergenceCount ?? 0,
     convergenceStallCount: previous?.convergenceStallCount ?? 0,
+    convergenceStalledAssigneeAgentId: previous?.convergenceStalledAssigneeAgentId ?? null,
   };
 }
 
@@ -327,6 +329,7 @@ function buildClearedMonitorState(input: {
   clearReason: IssueExecutionMonitorClearReason;
   clearedAt: Date;
   convergence?: IssueMonitorConvergence | null;
+  assigneeAgentId?: string | null;
 }): IssueExecutionMonitorState {
   return {
     status: "cleared",
@@ -341,6 +344,10 @@ function buildClearedMonitorState(input: {
       input.clearReason === "convergence_stalled"
         ? (input.previous?.convergenceStallCount ?? 0) + 1
         : input.previous?.convergenceStallCount ?? 0,
+    convergenceStalledAssigneeAgentId:
+      input.clearReason === "convergence_stalled"
+        ? input.assigneeAgentId ?? input.previous?.convergenceStalledAssigneeAgentId ?? null
+        : input.previous?.convergenceStalledAssigneeAgentId ?? null,
     clearedAt: input.clearedAt.toISOString(),
     clearReason: input.clearReason,
   };
@@ -1163,7 +1170,9 @@ function applyMonitorTransition(
     resetConvergenceAfterStalledClear &&
     (currentMonitorState?.convergenceStallCount ?? 0) > 0 &&
     input.actor.agentId &&
-    input.actor.agentId === assigneeAgentId,
+    input.actor.agentId === (
+      currentMonitorState?.convergenceStalledAssigneeAgentId ?? input.issue.assigneeAgentId ?? null
+    ),
   );
 
   if (input.policy?.monitor) {
@@ -1206,6 +1215,8 @@ function applyMonitorTransition(
         // an existing monitor forward (a status-only return, a stage auto-approval)
         // are not re-checks, and those call sites do not supply blocker edges —
         // scoring them would reset the counter against an empty gate set.
+        // Provider-quota recovery scheduling passes no actor agent id, so this
+        // same-assignee guard cannot block that recovery-owned monitor path.
         const preserveConvergence = input.monitorExplicitlyUpdated && input.unresolvedBlockerIssueIds === null;
         if (sameAssigneeResetAfterPriorStall) {
           throw unprocessable(MONITOR_CONVERGENCE_RESET_REQUIRES_NON_ASSIGNEE_MESSAGE);
@@ -1228,6 +1239,7 @@ function applyMonitorTransition(
             clearReason: "convergence_stalled",
             clearedAt: new Date(),
             convergence,
+            assigneeAgentId,
           });
         } else {
           patch.monitorNextCheckAt = new Date(input.policy.monitor.nextCheckAt);

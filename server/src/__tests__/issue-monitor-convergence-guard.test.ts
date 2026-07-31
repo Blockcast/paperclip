@@ -75,6 +75,7 @@ function arm(
     blockers?: string[] | null;
     threshold?: number;
     actor?: { agentId?: string | null; userId?: string | null };
+    requestedAssigneePatch?: { assigneeAgentId?: string | null; assigneeUserId?: string | null };
   } = {},
 ) {
   const policy = normalizeIssueExecutionPolicy({
@@ -88,7 +89,7 @@ function arm(
     issue,
     policy,
     previousPolicy: normalizeIssueExecutionPolicy(issue.executionPolicy),
-    requestedAssigneePatch: {},
+    requestedAssigneePatch: options.requestedAssigneePatch ?? {},
     actor: options.actor ?? { agentId: assigneeAgentId },
     monitorExplicitlyUpdated: true,
     unresolvedBlockerIssueIds,
@@ -396,12 +397,40 @@ describe("issue monitor convergence guard (BLO-18294)", () => {
         status: "cleared",
         clearReason: "convergence_stalled",
         convergenceStallCount: 1,
+        convergenceStalledAssigneeAgentId: assigneeAgentId,
       });
 
       issue.status = "in_progress";
       expect(() => arm(issue, { nextCheckAt: checkAt(5) }, { blockers })).toThrow(
         /must be re-armed by a non-assignee actor/,
       );
+    });
+
+    it("does not let the stalled assignee reset budget by naming a new assignee in the re-arm patch", () => {
+      const successorAgentId = "22222222-2222-4222-8222-222222222222";
+      const issue = newIssue();
+      const blockers = [BLOCKER_A];
+
+      for (let cycle = 1; cycle <= DEFAULT_ISSUE_MONITOR_CONVERGENCE_THRESHOLD; cycle += 1) {
+        arm(issue, { nextCheckAt: checkAt(cycle) }, { blockers });
+        fire(issue, checkAt(cycle));
+      }
+
+      const refused = arm(issue, { nextCheckAt: checkAt(4) }, { blockers });
+      expect(refused.patch.status).toBe("blocked");
+      expect(monitorState(issue)).toMatchObject({
+        status: "cleared",
+        clearReason: "convergence_stalled",
+        convergenceStalledAssigneeAgentId: assigneeAgentId,
+      });
+
+      issue.status = "in_progress";
+      expect(() =>
+        arm(issue, { nextCheckAt: checkAt(5) }, {
+          blockers,
+          requestedAssigneePatch: { assigneeAgentId: successorAgentId },
+        })
+      ).toThrow(/must be re-armed by a non-assignee actor/);
     });
 
     it("falls back to the notes signature when nothing structured is declared", () => {

@@ -1596,6 +1596,24 @@ describe("issue execution policy routes", () => {
       };
     }
 
+    function issueWithClearedStalledMonitor() {
+      const issue = issueWithTriggeredMonitor({ convergenceCount: 4 });
+      return {
+        ...issue,
+        executionState: {
+          ...issue.executionState,
+          monitor: {
+            ...(issue.executionState.monitor as Record<string, unknown>),
+            status: "cleared",
+            convergenceStallCount: 1,
+            convergenceStalledAssigneeAgentId: ACTING_AGENT_ID,
+            clearedAt: "2026-07-23T12:05:00.000Z",
+            clearReason: "convergence_stalled",
+          },
+        },
+      };
+    }
+
     it("refuses the re-arm, blocks the issue, and names the unblock owners", async () => {
       // Three prior re-checks already reported this exact blocker set.
       const issue = issueWithTriggeredMonitor();
@@ -1729,6 +1747,30 @@ describe("issue execution policy routes", () => {
           (call) => call[0] === CONVERGED_ISSUE_ID && String(call[1]).includes("Monitor stopped re-arming"),
         ),
       ).toBe(false);
+    });
+
+    it("returns 422 when the stalled assignee re-arms by naming a new assignee", async () => {
+      const successorAgentId = "55555555-5555-4555-8555-555555555555";
+      const issue = issueWithClearedStalledMonitor();
+
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: ACTING_AGENT_ID,
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch(`/api/issues/${CONVERGED_ISSUE_ID}`)
+        .send({
+          status: "in_progress",
+          assigneeAgentId: successorAgentId,
+          executionPolicy: { monitor: armedMonitor("2099-12-01T12:30:00.000Z") },
+        });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toBe("A monitor cleared for convergence_stalled must be re-armed by a non-assignee actor");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
     it("does not fail the PATCH when convergence side-effect comments fail", async () => {

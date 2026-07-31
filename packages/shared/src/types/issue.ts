@@ -655,6 +655,7 @@ export interface IssueExecutionMonitorState {
   gateSource?: IssueMonitorGateSource | null;
   convergenceCount?: number;
   convergenceStallCount?: number;
+  convergenceStalledAssigneeAgentId?: string | null;
   clearedAt: string | null;
   clearReason: IssueExecutionMonitorClearReason | null;
 }

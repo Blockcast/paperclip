@@ -235,6 +235,7 @@ export const issueExecutionMonitorStateSchema = z.object({
   gateSource: z.enum(ISSUE_MONITOR_GATE_SOURCES).nullable().optional().default(null),
   convergenceCount: z.number().int().nonnegative().optional().default(0),
   convergenceStallCount: z.number().int().nonnegative().optional().default(0),
+  convergenceStalledAssigneeAgentId: z.string().uuid().nullable().optional().default(null),
   kind: z.enum(ISSUE_EXECUTION_MONITOR_KINDS).nullable().optional().default(null),
   serviceName: z.string().trim().min(1).max(120).nullable().optional().default(null),
   externalRef: z.string().trim().min(1).max(500).nullable().optional().default(null),
