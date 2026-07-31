@@ -179,6 +179,8 @@ import {
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
 import type { IssueMonitorConvergence } from "../services/issue-execution-policy.js";
+import { monitorConvergenceComment } from "../services/issue-monitor-convergence-message.js";
+import type { IssueUnblockOwner } from "../services/issue-monitor-convergence-message.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import {
@@ -1722,52 +1724,6 @@ function summarizeIssueMonitor(
     status: state?.monitor?.status ?? (policy?.monitor ? "scheduled" : null),
     clearReason: state?.monitor?.clearReason ?? null,
   };
-}
-
-type IssueUnblockOwner = {
-  issueId: string;
-  identifier: string | null;
-  title: string | null;
-  status: string;
-  assigneeAgentId: string | null;
-  assigneeAgentName: string | null;
-  assigneeUserId: string | null;
-};
-
-/**
- * BLO-18294: renders the convergence escalation. The point of the comment is
- * that the next reader sees WHO can move this, not that a timer stopped —
- * BLO-13266 burned ~30h and ~$197 producing the opposite.
- */
-function monitorConvergenceComment(input: {
-  convergence: IssueMonitorConvergence;
-  unblockOwners: IssueUnblockOwner[];
-}): string {
-  const { convergence, unblockOwners } = input;
-  const lines = [
-    `Monitor stopped re-arming: ${convergence.count} consecutive re-checks reported the same unresolved gate set ` +
-      `(threshold ${convergence.threshold}, compared on \`${convergence.source}\`). ` +
-      `Polling cannot narrow a gate that polling has already failed to narrow, so this issue is now \`blocked\`.`,
-    "",
-  ];
-  if (unblockOwners.length > 0) {
-    lines.push("Unblock owners:");
-    for (const owner of unblockOwners) {
-      const who = owner.assigneeAgentId
-        ? `[${owner.assigneeAgentName ?? "assignee"}](agent://${owner.assigneeAgentId})`
-        : owner.assigneeUserId
-          ? "a board user"
-          : "**unassigned — needs an owner**";
-      lines.push(`- ${owner.identifier ?? owner.issueId} (${owner.status}) — ${who}${owner.title ? `: ${owner.title}` : ""}`);
-    }
-  } else {
-    lines.push(
-      "No unresolved blocker edges are recorded on this issue, so there is no owner to route to. " +
-        "Either model the real gate as a blocking issue (or declare it via `executionPolicy.monitor.gateSignals`) " +
-        "and re-arm, or escalate it to a human — a human-only gate never resolves on a timer.",
-    );
-  }
-  return lines.join("\n");
 }
 
 function activityExecutionParticipantKey(participant: ActivityExecutionParticipant): string {
