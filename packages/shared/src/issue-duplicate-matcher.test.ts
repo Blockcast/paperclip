@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { performance } from "node:perf_hooks";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
@@ -128,6 +129,101 @@ describe("extractIssueDuplicateFeatures", () => {
     expect(features.has("and/or")).toBe(false);
     expect(features.has("24/7")).toBe(false);
   });
+
+  /**
+   * Regression: the inline span `` `monitor` `` used to be erased outright. The
+   * fenced-block language-tag pattern consumed the opening backtick plus the
+   * all-letters body, and the closing replacement removed the remaining
+   * backtick, so lowercase inline identifiers never reached the symbol class —
+   * the exact tokens this defect class is recognised by.
+   */
+  it("keeps a lowercase inline identifier as a symbol", () => {
+    const features = extractIssueDuplicateFeatures({
+      title: "Re-arm ignored once the monitor is `triggered`",
+      description: "The `monitor` stays null even after a `scheduled` write lands.",
+    });
+
+    expect(features.get("monitor")).toBe("symbol");
+    expect(features.get("triggered")).toBe("symbol");
+    expect(features.get("scheduled")).toBe("symbol");
+  });
+
+  it("keeps a multi-backtick inline span as symbol evidence", () => {
+    const features = extractIssueDuplicateFeatures({
+      title: "Retry leaves the inline monitor unchanged",
+      description: "The span ```` ```monitor``` ```` is inline code, not a fenced block.",
+    });
+
+    expect(features.get("monitor")).toBe("symbol");
+  });
+
+  it("drops a fenced block's language tag without swallowing its body", () => {
+    const features = extractIssueDuplicateFeatures({
+      title: "Read-back is null",
+      description: ["```typescript", "const monitorNextCheckAt = null;", "```"].join("\n"),
+    });
+
+    expect(features.get("monitornextcheckat")).toBe("symbol");
+    // The info string is markup, not evidence: it must not become a symbol.
+    expect(features.get("typescript")).not.toBe("symbol");
+  });
+
+  it("drops a fenced block's full info string without turning it into symbol evidence", () => {
+    const features = extractIssueDuplicateFeatures({
+      title: "Read-back is still null",
+      description: ["```ts filename=handler.ts", "const monitorNextCheckAt = null;", "```"].join("\n"),
+    });
+
+    expect(features.get("monitornextcheckat")).toBe("symbol");
+    expect(features.get("ts")).not.toBe("symbol");
+    expect(features.get("handler.ts")).not.toBe("symbol");
+  });
+
+  it("does not close a longer fenced block on a shorter backtick line", () => {
+    const features = extractIssueDuplicateFeatures({
+      title: "Nested fence marker remains code",
+      description: [
+        "````ts",
+        "const beforeShortFence = true;",
+        "```",
+        "const afterShortFence = true;",
+        "````",
+      ].join("\n"),
+    });
+
+    expect(features.get("beforeshortfence")).toBe("symbol");
+    expect(features.get("aftershortfence")).toBe("symbol");
+    expect(features.get("ts")).not.toBe("symbol");
+  });
+
+  it("handles many unmatched fenced-code openers in bounded time", () => {
+    const description = Array.from({ length: 8_000 }, () => "```ts").join("\n");
+
+    const started = performance.now();
+    const features = extractIssueDuplicateFeatures({
+      title: "Malformed unmatched code fences",
+      description,
+    });
+    const elapsedMs = performance.now() - started;
+
+    expect(features.get("malformed")).toBe("term");
+    expect(elapsedMs).toBeLessThan(1_000);
+  });
+
+  it("handles an unmatched inline backtick run in bounded time", () => {
+    const description = "`".repeat(1_200);
+
+    const started = performance.now();
+    const features = extractIssueDuplicateFeatures({
+      title: "Malformed inline code run",
+      description,
+    });
+    const elapsedMs = performance.now() - started;
+
+    expect(features.get("malformed")).toBe("term");
+    expect(features.get("inline")).toBe("term");
+    expect(elapsedMs).toBeLessThan(1_000);
+  });
 });
 
 describe("findIssueDuplicateCandidates — the four real monitor filings", () => {
@@ -204,6 +300,67 @@ describe("findIssueDuplicateCandidates — precision", () => {
   it("never matches a document against itself", () => {
     const document = asDocument(filings[0]!);
     expect(findIssueDuplicateCandidates(document, [document]).candidates).toEqual([]);
+  });
+});
+
+/**
+ * Regression: feature classes must stay per-document.
+ *
+ * Classifying a token at the strongest class *any* document in the window gave
+ * it let one author's formatting reclassify that word everywhere. Two issues
+ * overlapping only in prose could then clear both the score threshold and
+ * `minSharedDistinctiveFeatures` on the strength of a third, unrelated issue —
+ * breaking the stated invariant that prose overlap alone can never match.
+ *
+ * Against the pre-fix matcher the pair below scored 0.66 with 8 "distinctive"
+ * features, every one of them a prose word promoted by `codeMarker`.
+ */
+describe("findIssueDuplicateCandidates — distinctive features are pair-local", () => {
+  const shared = "request handler payload response timeout retry window closes";
+
+  /** Two unrelated issues whose only overlap is the generic prose above. */
+  const proseOnlyA: IssueDuplicateDocument = {
+    id: "prose-a",
+    identifier: "BLO-17101",
+    title: "Billing export drops the trailing month",
+    description: `The billing export skips a month whenever the ${shared} mid-cycle, so the report is short.`,
+  };
+  const proseOnlyB: IssueDuplicateDocument = {
+    id: "prose-b",
+    identifier: "BLO-17102",
+    title: "Avatar upload rejects large images",
+    description: `The avatar upload rejects a image whenever the ${shared} mid-cycle, so the report is short.`,
+  };
+
+  /** A third, unrelated issue that happens to list those words as code. */
+  const codeMarker: IssueDuplicateDocument = {
+    id: "code-marker",
+    identifier: "BLO-17103",
+    title: "Adapter contract review",
+    description: ["```", ...shared.split(" "), "```"].join("\n"),
+  };
+
+  it("does not match on prose alone", () => {
+    const { candidates } = findIssueDuplicateCandidates(proseOnlyA, [proseOnlyB]);
+    expect(candidates.map((candidate) => candidate.identifier)).toEqual([]);
+  });
+
+  it("does not let a third issue's code block promote that prose into evidence", () => {
+    const { candidates } = findIssueDuplicateCandidates(proseOnlyA, [proseOnlyB, codeMarker]);
+    expect(candidates.map((candidate) => candidate.identifier)).toEqual([]);
+  });
+
+  it("still counts a token both sides marked as code", () => {
+    const withCode = (document: IssueDuplicateDocument): IssueDuplicateDocument => ({
+      ...document,
+      description: `${document.description}\n${codeMarker.description}`,
+    });
+    const { candidates } = findIssueDuplicateCandidates(withCode(proseOnlyA), [
+      withCode(proseOnlyB),
+    ]);
+    const [candidate] = candidates;
+    expect(candidate?.identifier).toBe("BLO-17102");
+    expect(candidate!.sharedDistinctiveFeatureCount).toBeGreaterThanOrEqual(5);
   });
 });
 

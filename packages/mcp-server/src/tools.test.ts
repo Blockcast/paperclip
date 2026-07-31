@@ -90,8 +90,35 @@ describe("paperclip MCP tools", () => {
     expect(response.content[0]?.text).toContain("issue-1");
   });
 
-  it("maps paperclip_search_issues query to issue text search", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
+  it("forwards relational hydration and hierarchy filters on the issues list", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse([{ id: "issue-1" }]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipListIssues");
+    await tool.execute({
+      includeBlockedBy: true,
+      parentId: "22222222-2222-2222-2222-222222222222",
+    });
+
+    const [url] = fetchMock.mock.calls[0] as [string];
+    // Without these params reaching the server, agents cannot hydrate blockers or
+    // enumerate children at all, and an absent `blockedBy` reads as "no blockers".
+    expect(String(url)).toContain("includeBlockedBy=true");
+    expect(String(url)).toContain("parentId=22222222-2222-2222-2222-222222222222");
+  });
+
+  it("forwards descendantOf for subtree enumeration", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse([{ id: "issue-1" }]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipListIssues");
+    await tool.execute({ descendantOf: "33333333-3333-3333-3333-333333333333" });
+
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(String(url)).toContain("descendantOf=33333333-3333-3333-3333-333333333333");
+  });
+
+  it("maps paperclip_search_issues query to issue text search", async () => {    const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse([{ id: "issue-1", title: "CDN+ M0 rollout" }]),
     );
     vi.stubGlobal("fetch", fetchMock);
@@ -189,6 +216,7 @@ describe("paperclip MCP tools", () => {
       priority: "medium",
       assigneeAgentId: "22222222-2222-2222-2222-222222222222",
       requestDepth: 0,
+      allowDuplicate: false,
     });
   });
 

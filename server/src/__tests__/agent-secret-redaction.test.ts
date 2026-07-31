@@ -84,6 +84,8 @@ const mockAccessService = vi.hoisted(() => ({
 const mockApprovalService = vi.hoisted(() => ({
   create: vi.fn(),
   getById: vi.fn(),
+  findOpenHireApprovalForAgent: vi.fn(),
+  reject: vi.fn(),
 }));
 
 const mockBudgetService = vi.hoisted(() => ({
@@ -93,6 +95,8 @@ const mockBudgetService = vi.hoisted(() => ({
 const mockHeartbeatService = vi.hoisted(() => ({
   listTaskSessions: vi.fn(),
   resetRuntimeSession: vi.fn(),
+  cancelActiveForAgent: vi.fn(),
+  cancelInvocationsForAgents: vi.fn(),
 }));
 
 const mockIssueApprovalService = vi.hoisted(() => ({
@@ -133,15 +137,19 @@ vi.mock("../services/index.js", () => ({
 }));
 
 function createDbStub() {
+  const rows = [{
+    id: companyId,
+    name: "Paperclip",
+    requireBoardApprovalForNewAgents: false,
+  }];
   return {
     select: vi.fn().mockReturnValue({
       from: vi.fn().mockReturnValue({
+        // A real thenable: `await db.select()...where()` must resolve. A mock
+        // that merely *returns* a promise from `then` never calls the awaiting
+        // continuation, so the request hangs instead of failing.
         where: vi.fn().mockReturnValue({
-          then: vi.fn().mockResolvedValue([{
-            id: companyId,
-            name: "Paperclip",
-            requireBoardApprovalForNewAgents: false,
-          }]),
+          then: (resolve: (value: unknown) => unknown) => Promise.resolve(resolve(rows)),
         }),
       }),
     }),
@@ -330,6 +338,299 @@ describe("agent secret redaction in API responses", () => {
   });
 });
 
+// BLO-18969 (2026-07-30): the redaction above was applied only on the read
+// paths. Every mutating route returned the agent row verbatim, so a budget-only
+// `PATCH /api/agents/:id` handed the caller the agent's entire credential set —
+// plaintext env bindings plus `Bearer …` in mcpServers headers. Those responses
+// land in agent transcripts and run logs, which are read far more widely than
+// the secret store. A CEO cap-adjustment pass harvested ~9 credential
+// categories, including a wallet private key, from 12 such patches.
+describe("agent secret redaction on mutating responses", () => {
+  const SECRET_STRINGS = [
+    "sk-secret-key-12345",
+    "sk-ant-secret-67890",
+    "postgres://user:pass@host/db",
+    "gbrain_at_secret_12345",
+  ];
+
+  function expectNoPlaintextSecrets(body: unknown) {
+    const serialized = JSON.stringify(body);
+    for (const secret of SECRET_STRINGS) {
+      expect(serialized).not.toContain(secret);
+    }
+    // The shapes that carry them, per the BLO-18969 acceptance criteria.
+    expect(serialized).not.toContain("Bearer ");
+    expect(serialized).not.toMatch(/"type":"plain","value":"(?!\*\*\*)/);
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAgentService.getById.mockResolvedValue(baseAgent);
+    mockAgentService.update.mockResolvedValue(baseAgent);
+    mockAgentService.updatePermissions.mockResolvedValue(baseAgent);
+    mockAgentService.pause.mockResolvedValue({ ...baseAgent, status: "paused" });
+    mockAgentService.resume.mockResolvedValue({ ...baseAgent, status: "idle" });
+    mockAgentService.terminate.mockResolvedValue({ ...baseAgent, status: "terminated" });
+    mockAgentService.rollbackConfigRevision.mockResolvedValue(baseAgent);
+    mockAgentService.getChainOfCommand.mockResolvedValue([]);
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: baseAgent });
+    mockAccessService.getMembership.mockResolvedValue(null);
+    mockAccessService.listPrincipalGrants.mockResolvedValue([]);
+    mockAccessService.canUser.mockResolvedValue(true);
+    mockAccessService.decide.mockResolvedValue({ allowed: true });
+    mockApprovalService.findOpenHireApprovalForAgent.mockResolvedValue(null);
+    mockHeartbeatService.cancelActiveForAgent.mockResolvedValue(undefined);
+    mockHeartbeatService.cancelInvocationsForAgents.mockResolvedValue({
+      agentIds: [agentId],
+      runsCancelled: 0,
+      wakeupsCancelled: 0,
+    });
+    mockCompanySkillService.listRuntimeSkillEntries.mockResolvedValue([]);
+    mockSecretService.normalizeAdapterConfigForPersistence.mockImplementation(async (_companyId, config) => config);
+    mockSecretService.resolveAdapterConfigForRuntime.mockImplementation(async (_companyId, config) => ({ config }));
+    mockLogActivity.mockResolvedValue(undefined);
+  });
+
+  // The reported case: a patch that touches no credential field at all.
+  it("PATCH /agents/:id redacts secrets on a budget-only patch", async () => {
+    mockAgentService.update.mockResolvedValue({ ...baseAgent, budgetMonthlyCents: 123_456 });
+
+    const app = createApp(boardActor);
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 123_456 });
+
+    expect(res.status).toBe(200);
+    // The patch itself still has to work.
+    expect(res.body.budgetMonthlyCents).toBe(123_456);
+    expect(res.body.adapterConfig.env).toEqual({
+      OPENAI_API_KEY: "***",
+      ANTHROPIC_API_KEY: "***",
+      DATABASE_URL: "***",
+      PAPERCLIP_API_URL: "***",
+    });
+    expect(res.body.adapterConfig.mcpServers.gbrain.headers.Authorization).toBe("***REDACTED***");
+    expectNoPlaintextSecrets(res.body);
+  });
+
+  it("PATCH /agents/:id/permissions redacts secrets", async () => {
+    const app = createApp(boardActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}/permissions`)
+      .send({ canCreateAgents: true, canAssignTasks: false });
+
+    expect(res.status).toBe(200);
+    expectNoPlaintextSecrets(res.body);
+  });
+
+  for (const route of ["pause", "resume", "terminate"] as const) {
+    it(`POST /agents/:id/${route} redacts secrets`, async () => {
+      const app = createApp(boardActor);
+      const res = await request(app).post(`/api/agents/${agentId}/${route}`).send({});
+
+      // Assert the success path explicitly — an early 4xx would let this pass
+      // vacuously and hide a live leak.
+      expect(res.status).toBe(200);
+      expectNoPlaintextSecrets(res.body);
+    });
+  }
+
+  it("POST /agents/:id/config-revisions/:revisionId/rollback redacts secrets", async () => {
+    const app = createApp(boardActor);
+    const res = await request(app)
+      .post(`/api/agents/${agentId}/config-revisions/33333333-3333-4333-8333-333333333333/rollback`)
+      .send({});
+
+    expect(res.status).toBe(200);
+    expectNoPlaintextSecrets(res.body);
+  });
+
+  // secret_ref bindings are pointers, never plaintext. They must not gain a
+  // resolved `value` on any response regardless of projectionClass.
+  it("never serializes a resolved value for a secret_ref env binding", async () => {
+    const refAgent = {
+      ...baseAgent,
+      adapterConfig: {
+        env: {
+          WALLET_PRIVATE_KEY: {
+            type: "secret_ref",
+            secretId: "44444444-4444-4444-8444-444444444444",
+            projectionClass: "unclassified",
+          },
+        },
+      },
+    };
+    mockAgentService.getById.mockResolvedValue(refAgent);
+    mockAgentService.update.mockResolvedValue(refAgent);
+
+    const app = createApp(boardActor);
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 1 });
+
+    expect(res.status).toBe(200);
+    expect(JSON.stringify(res.body)).not.toContain("\"value\"");
+  });
+
+  // Redaction used to be decided by the key's *name*. Everything below uses
+  // keys that no secret-name regex matches, so each of these leaked plaintext
+  // before the redactor became structural.
+  const ORDINARY_KEY_SECRET = "s3cret-material-not-in-any-key-name";
+
+  it("redacts a nested runtimeConfig model-profile env binding under an ordinary key", async () => {
+    const nestedAgent = {
+      ...baseAgent,
+      runtimeConfig: {
+        modelProfiles: {
+          cheap: {
+            adapterConfig: {
+              model: "openai/gpt-5.6-sol",
+              env: {
+                // Neither key matches SECRET_PAYLOAD_KEY_RE.
+                SIGNING_MATERIAL: { type: "plain", value: ORDINARY_KEY_SECRET },
+                FOO: { type: "plain", value: ORDINARY_KEY_SECRET },
+              },
+            },
+          },
+        },
+      },
+    };
+    mockAgentService.getById.mockResolvedValue(nestedAgent);
+    mockAgentService.update.mockResolvedValue({ ...nestedAgent, budgetMonthlyCents: 42 });
+
+    const app = createApp(boardActor);
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 42 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.budgetMonthlyCents).toBe(42);
+    const profile = res.body.runtimeConfig.modelProfiles.cheap.adapterConfig;
+    // Non-credential config stays readable; only the bindings are masked.
+    expect(profile.model).toBe("openai/gpt-5.6-sol");
+    expect(profile.env).toEqual({
+      SIGNING_MATERIAL: { type: "plain", value: "***REDACTED***" },
+      FOO: { type: "plain", value: "***REDACTED***" },
+    });
+    expect(JSON.stringify(res.body)).not.toContain(ORDINARY_KEY_SECRET);
+  });
+
+  it("redacts a legacy bare-string env value under an ordinary key at any depth", async () => {
+    const nestedAgent = {
+      ...baseAgent,
+      runtimeConfig: {
+        modelProfiles: {
+          cheap: { adapterConfig: { env: { FOO: ORDINARY_KEY_SECRET } } },
+        },
+      },
+    };
+    mockAgentService.getById.mockResolvedValue(nestedAgent);
+    mockAgentService.update.mockResolvedValue(nestedAgent);
+
+    const app = createApp(boardActor);
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 1 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.runtimeConfig.modelProfiles.cheap.adapterConfig.env).toEqual({
+      FOO: "***REDACTED***",
+    });
+  });
+
+  it("redacts a plain binding under an ordinary key outside env", async () => {
+    const nestedAgent = {
+      ...baseAgent,
+      adapterConfig: {
+        cwd: "/workspace",
+        // Not under `env`, not a secret-shaped key name.
+        signingMaterial: { type: "plain", value: ORDINARY_KEY_SECRET },
+      },
+    };
+    mockAgentService.getById.mockResolvedValue(nestedAgent);
+    mockAgentService.update.mockResolvedValue(nestedAgent);
+
+    const app = createApp(boardActor);
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 1 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig.cwd).toBe("/workspace");
+    expect(res.body.adapterConfig.signingMaterial).toEqual({ type: "plain", value: "***REDACTED***" });
+    expect(JSON.stringify(res.body)).not.toContain(ORDINARY_KEY_SECRET);
+  });
+
+  it("strips a resolved value smuggled onto a secret_ref binding", async () => {
+    // envBindingSecretRefSchema has no `value` field, so its presence can only
+    // mean a resolved secret rode along — projectionClass must not matter.
+    const refAgent = {
+      ...baseAgent,
+      runtimeConfig: {
+        modelProfiles: {
+          cheap: {
+            adapterConfig: {
+              env: {
+                FOO: {
+                  type: "secret_ref",
+                  secretId: "44444444-4444-4444-8444-444444444444",
+                  projectionClass: "unclassified",
+                  value: ORDINARY_KEY_SECRET,
+                },
+              },
+            },
+          },
+        },
+      },
+    };
+    mockAgentService.getById.mockResolvedValue(refAgent);
+    mockAgentService.update.mockResolvedValue(refAgent);
+
+    const app = createApp(boardActor);
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 1 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.runtimeConfig.modelProfiles.cheap.adapterConfig.env.FOO).toEqual({
+      type: "secret_ref",
+      secretId: "44444444-4444-4444-8444-444444444444",
+      projectionClass: "unclassified",
+    });
+    expect(JSON.stringify(res.body)).not.toContain(ORDINARY_KEY_SECRET);
+  });
+
+  it("restores recursive runtimeConfig sentinels before persisting PATCH updates", async () => {
+    const runtimeSecretAgent = {
+      ...baseAgent,
+      runtimeConfig: {
+        credentials: { type: "plain", value: ORDINARY_KEY_SECRET },
+        mode: "production",
+      },
+    };
+    mockAgentService.getById.mockResolvedValue(runtimeSecretAgent);
+    mockAgentService.update.mockImplementation(async (_id, patch) => ({
+      ...runtimeSecretAgent,
+      ...(patch as Record<string, unknown>),
+    }));
+
+    const app = createApp(boardActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({
+        runtimeConfig: {
+          credentials: { type: "plain", value: "***REDACTED***" },
+          mode: "maintenance",
+        },
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalledWith(
+      agentId,
+      expect.objectContaining({
+        runtimeConfig: {
+          credentials: { type: "plain", value: ORDINARY_KEY_SECRET },
+          mode: "maintenance",
+        },
+      }),
+      expect.anything(),
+    );
+    expect(res.body.runtimeConfig.credentials).toEqual({
+      type: "plain",
+      value: "***REDACTED***",
+    });
+    expect(JSON.stringify(res.body)).not.toContain(ORDINARY_KEY_SECRET);
+  });
+});
+
 describe("stripRedactedEnvBindingsFromAdapterConfig — round-trip guard", () => {
   // BLO-5xxx (2026-05-15): redactAgentSecrets() replaces every
   // adapter_config.env value with "***" on GET responses. A naive UI/operator
@@ -467,6 +768,17 @@ describe("stripRedactedEnvBindingsFromAdapterConfig — round-trip guard", () =>
     };
 
     expect(stripRedactedEnvBindingsFromAdapterConfig(incoming, existing)).toEqual(existing);
+  });
+
+  it("drops nested plain binding sentinels that have no existing value", () => {
+    const incoming = {
+      credentials: { type: "plain", value: "***REDACTED***" },
+      model: "openai/gpt-5.6-sol",
+    };
+
+    expect(stripRedactedEnvBindingsFromAdapterConfig(incoming, null)).toEqual({
+      model: "openai/gpt-5.6-sol",
+    });
   });
 
   it("drops recursive redaction sentinels that have no existing value", () => {

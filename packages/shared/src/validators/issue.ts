@@ -634,12 +634,21 @@ export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
 
 export const addIssueCommentSchema = z.object({
   body: multilineTextSchema.pipe(z.string().min(1)),
+  idempotencyKey: z.string().trim().min(1).max(255).optional(),
   authorType: issueCommentAuthorTypeSchema.optional(),
   presentation: issueCommentPresentationSchema.nullable().optional(),
   metadata: issueCommentMetadataSchema.nullable().optional(),
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
+}).superRefine((value, ctx) => {
+  if (value.idempotencyKey && (value.reopen || value.resume || value.interrupt)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Idempotent comments cannot reopen, resume, or interrupt issues",
+      path: ["idempotencyKey"],
+    });
+  }
 });
 
 export type AddIssueComment = z.infer<typeof addIssueCommentSchema>;

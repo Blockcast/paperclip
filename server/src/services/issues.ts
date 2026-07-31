@@ -1848,6 +1848,44 @@ async function withIssueLabels(dbOrTx: any, rows: IssueRow[]): Promise<IssueWith
  * operator overrides, and any work_products. Caller supplies the description
  * (already on the existing row in the PATCH handler, no need to re-select).
  */
+/**
+ * Shapes that record a DURABLE fact ("a PR/commit was attached to this issue"),
+ * as opposed to a fact about the current comment window.
+ */
+const DURABLE_LANDING_SHAPES = ["pr-link", "landing-artifact"] as const;
+
+/**
+ * Carry forward durable landing evidence when re-evaluating an already-in_review
+ * issue.
+ *
+ * The evaluator only scans the 10 most recent agent comments, so once ten
+ * comments accumulate after the one bearing the PR link, a fresh evaluation
+ * reports `allDetected: []`. On the in_review TRANSITION that is the honest
+ * answer and it is what gets stored. But `done-gate.ts` reads the STORED
+ * verdict's `allDetected` as the standing record that a PR was ever attached
+ * (`hasPrLinkEvidence`), so letting a re-evaluation overwrite it would make an
+ * issue that legitimately shipped a PR fail its later `done` transition with
+ * `no_execution_run_and_no_pr_evidence` purely because the comment thread grew.
+ * Before BLO-19047 the re-evaluation was a no-op, so the transition-time verdict
+ * was durable by accident; this keeps it durable on purpose.
+ *
+ * Only `allDetected` is merged — `verdict`, `missing` and `requiredFound` stay
+ * exactly as freshly computed, which is the whole point of re-evaluating.
+ */
+function preserveDurableLandingEvidence<T extends { allDetected?: unknown }>(
+  fresh: T,
+  stored: unknown,
+): T {
+  const storedDetected = (stored as { allDetected?: unknown } | null)?.allDetected;
+  if (!Array.isArray(storedDetected)) return fresh;
+  const freshDetected = Array.isArray(fresh.allDetected) ? fresh.allDetected : [];
+  const carried = DURABLE_LANDING_SHAPES.filter(
+    (shape) => storedDetected.includes(shape) && !freshDetected.includes(shape),
+  );
+  if (carried.length === 0) return fresh;
+  return { ...fresh, allDetected: [...freshDetected, ...carried] };
+}
+
 async function fetchEvidenceForIssue(
   dbOrTx: any,
   issueId: string,
@@ -2054,20 +2092,26 @@ type IssueBlockerAttentionAgentRow = {
   status: string;
 };
 
+function activeRunMapKey(companyId: string, runId: string) {
+  return `${companyId}:${runId}`;
+}
+
 async function activeRunMapForIssues(
   dbOrTx: any,
-  issueRows: IssueWithLabels[],
+  issueRows: Array<Pick<IssueRow, "companyId" | "executionRunId">>,
 ): Promise<Map<string, IssueActiveRunRow>> {
   const map = new Map<string, IssueActiveRunRow>();
   const runIds = issueRows
     .map((row) => row.executionRunId)
     .filter((id): id is string => id != null);
   if (runIds.length === 0) return map;
+  const companyIds = [...new Set(issueRows.map((row) => row.companyId))];
 
   for (const runIdChunk of chunkList([...new Set(runIds)], ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
     const rows = await dbOrTx
       .select({
         id: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
         status: heartbeatRuns.status,
         agentId: heartbeatRuns.agentId,
         invocationSource: heartbeatRuns.invocationSource,
@@ -2082,12 +2126,14 @@ async function activeRunMapForIssues(
       .where(
         and(
           inArray(heartbeatRuns.id, runIdChunk),
+          inArray(heartbeatRuns.companyId, companyIds),
           inArray(heartbeatRuns.status, ACTIVE_RUN_STATUSES),
         ),
       );
 
     for (const row of rows) {
-      map.set(row.id, row);
+      const { companyId, ...activeRun } = row;
+      map.set(activeRunMapKey(companyId, row.id), activeRun);
     }
   }
   return map;
@@ -2954,7 +3000,7 @@ function withActiveRuns(
 ): IssueWithLabelsAndRun[] {
   return issueRows.map((row) => ({
     ...row,
-    activeRun: row.executionRunId ? (runMap.get(row.executionRunId) ?? null) : null,
+    activeRun: row.executionRunId ? (runMap.get(activeRunMapKey(row.companyId, row.executionRunId)) ?? null) : null,
   }));
 }
 
@@ -4357,6 +4403,16 @@ export function issueService(db: Db) {
     if (!actor.agentId && !actor.userId && authorType !== "system") {
       throw unprocessable("System comments cannot use user or agent authorType without an author id");
     }
+  }
+
+  function issueCommentIdempotencyAuthorScope(actor: { agentId?: string | null; userId?: string | null }) {
+    if (actor.agentId) {
+      return and(eq(issueComments.authorAgentId, actor.agentId), isNull(issueComments.authorUserId));
+    }
+    if (actor.userId) {
+      return and(eq(issueComments.authorUserId, actor.userId), isNull(issueComments.authorAgentId));
+    }
+    return and(isNull(issueComments.authorAgentId), isNull(issueComments.authorUserId));
   }
 
   function redactIssueComment<T extends {
@@ -5902,6 +5958,30 @@ export function issueService(db: Db) {
 
     getByIdentifier: async (identifier: string) => {
       return getIssueByIdentifier(identifier);
+    },
+
+    /**
+     * The queued-or-running run recorded for this issue, or null.
+     *
+     * BLO-19001: single-issue counterpart to the `activeRun` the list paths
+     * attach via `withActiveRuns`. `getById` deliberately stays lean, so the
+     * issue-detail route composes this in alongside its other enrichments.
+     *
+     * Null covers "no run recorded", "the recorded run belongs to another
+     * company", and "the recorded run has already
+     * terminalized" — `activeRunMapForIssues` only returns rows whose status is
+     * in ACTIVE_RUN_STATUSES. That is the distinction a caller needs: a stale
+     * `executionRunId` left behind by a finished run reads as not-held, while a
+     * live sibling run reads as present. A queued run is present but does not
+     * yet hold a worktree; callers should use `isRunHoldingIssue` for that
+     * stricter cede decision.
+     */
+    getActiveRun: async (
+      issue: Pick<IssueRow, "companyId" | "executionRunId">,
+    ): Promise<IssueActiveRunRow | null> => {
+      if (!issue.executionRunId) return null;
+      const map = await activeRunMapForIssues(db, [issue]);
+      return map.get(activeRunMapKey(issue.companyId, issue.executionRunId)) ?? null;
     },
 
     /**
@@ -8078,10 +8158,21 @@ export function issueService(db: Db) {
 
       // Evaluation failures remain fail-open, but a computed block verdict
       // rejects every new transition to in_review.
-      if (
-        issueData.status === "in_review" &&
-        existing.status !== "in_review"
-      ) {
+      //
+      // The gate re-evaluates on EVERY patch that carries `status: "in_review"`,
+      // including in_review → in_review. It used to be transition-only, which
+      // silently froze `lastEvidenceVerdict` at its first evaluation: an agent
+      // following the documented remediation loop ("add the missing evidence,
+      // comment again, re-send in_review") got a 200 with an unchanged stale
+      // verdict and no way to tell "gate ran and still fails" from "gate never
+      // ran" — the same silent-no-op class as BLO-18790. (BLO-19047)
+      //
+      // Only a real transition INTO in_review can throw. A re-evaluation on an
+      // already-in_review issue refreshes the recorded verdict but never
+      // rejects the patch, so unrelated edits (labels, description, assignee)
+      // to an in_review issue cannot start failing with a 422.
+      if (issueData.status === "in_review") {
+        const isInReviewTransition = existing.status !== "in_review";
         let inReviewVerdict: Awaited<ReturnType<typeof runEvidenceGate>> | null = null;
         try {
           const verdict = await runEvidenceGate(
@@ -8095,7 +8186,9 @@ export function issueService(db: Db) {
             id,
           );
           inReviewVerdict = verdict;
-          patch.lastEvidenceVerdict = verdict;
+          patch.lastEvidenceVerdict = isInReviewTransition
+            ? verdict
+            : preserveDurableLandingEvidence(verdict, existing.lastEvidenceVerdict);
           patch.lastEvidenceVerdictEvaluatedAt = new Date(verdict.evaluatedAt);
           logger.info(
             {
@@ -8108,8 +8201,11 @@ export function issueService(db: Db) {
               diagnostics: verdict.diagnostics,
               overridden: verdict.overridden,
               overrideReason: verdict.overrideReason,
+              inReviewTransition: isInReviewTransition,
             },
-            `evidence-gate: ${verdict.verdict} on in_review transition`,
+            `evidence-gate: ${verdict.verdict} on ${
+              isInReviewTransition ? "in_review transition" : "in_review re-evaluation"
+            }`,
           );
         } catch (err) {
           logger.warn(
@@ -8121,7 +8217,7 @@ export function issueService(db: Db) {
           );
         }
 
-        if (inReviewVerdict?.verdict === "block") {
+        if (isInReviewTransition && inReviewVerdict?.verdict === "block") {
           throw unprocessable("missing-evidence", {
             code: "missing-evidence",
             missing: inReviewVerdict.missing,
@@ -9318,6 +9414,42 @@ export function issueService(db: Db) {
       });
     },
 
+    getCommentByIdempotencyKey: async (
+      issueId: string,
+      idempotencyKey: string,
+      actor: { agentId?: string | null; userId?: string | null },
+      dbOrTx: any = db,
+    ) => {
+      const comment = await dbOrTx
+        .select()
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.idempotencyKey, idempotencyKey),
+          issueCommentIdempotencyAuthorScope(actor),
+          isNull(issueComments.deletedAt),
+        ))
+        .then((rows: Array<typeof issueComments.$inferSelect>) => rows[0] ?? null);
+      if (!comment) return null;
+
+      const currentUserRedactionOptions = {
+        enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+      };
+      return redactIssueComment(comment, currentUserRedactionOptions.enabled);
+    },
+
+    markCommentIdempotencyProcessed: async (commentId: string, dbOrTx: any = db) => {
+      await dbOrTx
+        .update(issueComments)
+        .set({ idempotencyProcessedAt: new Date() })
+        .where(and(
+          eq(issueComments.id, commentId),
+          isNotNull(issueComments.idempotencyKey),
+          isNull(issueComments.idempotencyProcessedAt),
+          isNull(issueComments.deletedAt),
+        ));
+    },
+
     addComment: async (
       issueId: string,
       body: string,
@@ -9326,6 +9458,7 @@ export function issueService(db: Db) {
         authorType?: IssueCommentAuthorType | null;
         presentation?: IssueCommentPresentation | null;
         metadata?: IssueCommentMetadata | null;
+        idempotencyKey?: string | null;
         sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
       },
@@ -9350,7 +9483,7 @@ export function issueService(db: Db) {
       const presentation = issueCommentPresentationSchema.nullable().parse(options?.presentation ?? null);
       const metadata = issueCommentMetadataSchema.nullable().parse(options?.metadata ?? null);
       const createdAt = options?.createdAt ? new Date(options.createdAt) : null;
-      const [comment] = await dbOrTx
+      const [insertedComment] = await dbOrTx
         .insert(issueComments)
         .values({
           companyId: issue.companyId,
@@ -9359,13 +9492,37 @@ export function issueService(db: Db) {
           authorUserId: actor.userId ?? null,
           authorType,
           createdByRunId: actor.runId ?? null,
+          idempotencyKey: options?.idempotencyKey ?? null,
           body: redactedBody,
           presentation,
           metadata,
           sourceTrust: options?.sourceTrust ?? null,
           ...(createdAt && !Number.isNaN(createdAt.getTime()) ? { createdAt } : {}),
         })
+        .onConflictDoNothing()
         .returning();
+
+      const comment = insertedComment ?? (options?.idempotencyKey
+        ? await dbOrTx
+            .select()
+            .from(issueComments)
+            .where(and(
+              eq(issueComments.issueId, issueId),
+              eq(issueComments.idempotencyKey, options.idempotencyKey),
+              issueCommentIdempotencyAuthorScope(actor),
+              isNull(issueComments.deletedAt),
+            ))
+            .then((rows: Array<typeof issueComments.$inferSelect>) => rows[0] ?? null)
+        : null);
+
+      if (!comment) throw conflict("Issue comment idempotency conflict");
+
+      if (!insertedComment) {
+        return {
+          ...redactIssueComment(comment, currentUserRedactionOptions.enabled),
+          deduplicated: true as const,
+        };
+      }
 
       // Update issue's updatedAt so comment activity is reflected in recency sorting
       await dbOrTx

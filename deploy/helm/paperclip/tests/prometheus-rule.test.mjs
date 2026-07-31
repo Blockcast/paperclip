@@ -102,3 +102,113 @@ test("PaperclipAgentPodUnschedulable keys on kube_pod_status_scheduled, not the 
     "kube_pod_status_unschedulable is not portable across kube-state-metrics builds; do not use it in alert expressions",
   );
 });
+
+test("PaperclipGithubReviewRequestDeadLettered fires on any dead-lettered delivery and is silent at zero (BLO-18859)", () => {
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.match(rendered, /alert: PaperclipGithubReviewRequestDeadLettered/);
+  // Pin the state selector: the alert is meaningless if a future edit drops
+  // it and starts summing all four funnel states (received/queued would fire
+  // it continuously in normal operation).
+  assert.match(
+    rendered,
+    /increase\(paperclip_github_review_request_delivery_total\{state="dead_lettered"\}\[[^\]]+\]\)/,
+    "dead-letter alert must select only state=dead_lettered",
+  );
+  // `> 0` is the silent-in-steady-state guarantee: the counter is
+  // zero-initialized, so increase() over a flat series is 0 and never fires.
+  // A threshold of >= 0 or a missing comparison would fire permanently.
+  assert.match(
+    rendered,
+    /state="dead_lettered"\}\[[^\]]+\]\)\) > 0/,
+    "dead-letter alert must fire only on a strictly positive increase",
+  );
+  // BLO-18859 review follow-up: the durable-gauge arm. Without it a dead letter
+  // recorded before the first scrape (no baseline for increase()) or one whose
+  // pod is replaced before `for` elapses (series retires out of the range) is
+  // silently un-alertable — a terminal loss that pages nobody. The gauge is
+  // re-derived from committed rows every reconcile pass, so it survives both.
+  assert.match(
+    rendered,
+    /or \(sum\(paperclip_github_review_request_dead_letter_unresolved\) > 0\)/,
+    "dead-letter alert must also key on the restart-safe durable gauge",
+  );
+});
+
+test("PaperclipGithubReviewRequestSuppressionOutage pages on outage-like causes only (BLO-18859)", () => {
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.match(rendered, /alert: PaperclipGithubReviewRequestSuppressionOutage/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipGithubReviewRequestSuppressionOutage[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "suppression alert must render an expr");
+
+  // Must key on the cause-breakdown counter, not the funnel state: alerting on
+  // delivery_total{state="suppressed"} would page on every expected decline.
+  assert.match(
+    expr,
+    /increase\(paperclip_github_review_request_suppression_total\{cause=~"[^"]+"\}\[[^\]]+\]\)\) > 0$/,
+    "suppression alert must select a cause regex on the suppression counter and fire only on a strictly positive increase",
+  );
+
+  const [, causes] = expr.match(/cause=~"([^"]+)"/) ?? [];
+  const selected = causes.split("|");
+  // The outage cases. `other` is deliberately pageable: it means the server
+  // emitted a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES, which
+  // has not been triaged as an expected decline.
+  for (const cause of ["heartbeat.scheduling_suppressed", "dispatch_rejected", "other"]) {
+    assert.ok(selected.includes(cause), `outage-like cause ${cause} must be alertable`);
+  }
+  // The whole point of the cause split: a paused company or a cooldown is the
+  // fleet correctly declining. Paging on those would force an operator to
+  // silence the rule, which is what left a stuck scheduling-suppression flag
+  // unalertable in the first place.
+  for (const expected of [
+    "company.inactive",
+    "heartbeat.cooldown.active",
+    "heartbeat.disabled",
+    "heartbeat.wakeOnDemand.disabled",
+    "budget.blocked",
+    "agent.not_invokable",
+    "heartbeat.worktree_execution_cutoff",
+    "issue_tree_hold_active",
+  ]) {
+    assert.ok(
+      !selected.includes(expected),
+      `expected policy decline ${expected} must not page`,
+    );
+  }
+});

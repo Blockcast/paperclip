@@ -75,13 +75,13 @@ export interface IssueDuplicateMatcherOptions {
 
 /**
  * Calibrated against the trailing-30-day, manual-origin Paperclip corpus
- * (2983 issues; see `server/scripts/issue-duplicate-backfill.ts`).
+ * (3645 issues; see `server/scripts/issue-duplicate-backfill.ts`).
  *
  * Every one of the 12 ordered pairs among the four BLO-18168/18782/18783/18790
- * filings scores in 0.178–0.284, and each of the four ranks the other three as
+ * filings scores in 0.174–0.299, and each of the four ranks the other three as
  * its top three neighbours. The strongest neighbour outside the group scores
- * 0.145 (BLO-18799, the issue *about* those four) and the first genuinely
- * unrelated issue scores 0.118, so 0.16 sits in the gap.
+ * 0.133 and the issue *about* those four (BLO-18799) scores 0.117–0.126, so
+ * 0.16 sits in the gap.
  *
  * `minSharedDistinctiveFeatures` is deliberately a low floor rather than a
  * discriminator: real pairs in that corpus shared 47-59 distinctive features and
@@ -153,7 +153,8 @@ const MIN_TERM_LENGTH = 4;
 
 const ISSUE_REFERENCE_RE = /\b[A-Z][A-Z0-9]{1,9}-\d{1,7}\b/g;
 const NUMERIC_REFERENCE_RE = /(?:^|[\s([])#(\d{1,7})\b/g;
-const CODE_SPAN_RE = /(?:```[\s\S]*?```|`[^`\n]+`)/g;
+const FENCED_CODE_OPEN_LINE_RE = /^[ \t]*(`{3,})[^\n`]*\r?\n$/;
+const FENCED_CODE_CLOSE_LINE_RE = /^[ \t]*(`{3,})[ \t]*$/;
 const URL_RE = /\bhttps?:\/\/\S+/g;
 const PATH_RE = /\b(?:[A-Za-z0-9_.-]+\/){1,}[A-Za-z0-9_.-]+\b/g;
 const IDENTIFIER_RE = /\b[A-Za-z_$][A-Za-z0-9_$]*(?:[.:][A-Za-z_$][A-Za-z0-9_$]*)*\b/g;
@@ -180,6 +181,171 @@ function looksLikePath(token: string): boolean {
 function stripTrailingLineNumber(token: string): string {
   // "server/src/routes/issues.ts:8242" -> "server/src/routes/issues.ts"
   return token.replace(/:\d+(?::\d+)?$/, "");
+}
+
+function splitMarkdownLines(text: string): string[] {
+  const lines = text.match(/[^\n]*(?:\n|$)/g) ?? [];
+  if (lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
+function stripMarkdownLineEnding(line: string): string {
+  return line.replace(/\r?\n$/, "");
+}
+
+function scanFencedCodeBlocks(text: string): {
+  codeBlocks: string[];
+  withoutFencedBlocks: string;
+  withFencedCodeUnwrapped: string;
+} {
+  const codeBlocks: string[] = [];
+  const withoutFencedParts: string[] = [];
+  const unwrappedParts: string[] = [];
+  let openerLine: string | null = null;
+  let openerLength = 0;
+  let bodyLines: string[] = [];
+
+  const flushUnmatchedFence = () => {
+    if (openerLine === null) return;
+    const original = openerLine + bodyLines.join("");
+    withoutFencedParts.push(original);
+    unwrappedParts.push(original);
+    openerLine = null;
+    openerLength = 0;
+    bodyLines = [];
+  };
+
+  for (const line of splitMarkdownLines(text)) {
+    if (openerLine === null) {
+      const opener = FENCED_CODE_OPEN_LINE_RE.exec(line);
+      if (opener) {
+        openerLine = line;
+        openerLength = opener[1]!.length;
+        bodyLines = [];
+        continue;
+      }
+      withoutFencedParts.push(line);
+      unwrappedParts.push(line);
+      continue;
+    }
+
+    const close = FENCED_CODE_CLOSE_LINE_RE.exec(stripMarkdownLineEnding(line));
+    if (close && close[1]!.length >= openerLength) {
+      const body = bodyLines.join("");
+      codeBlocks.push(body);
+      withoutFencedParts.push(" ");
+      unwrappedParts.push("\n", body, "\n");
+      openerLine = null;
+      openerLength = 0;
+      bodyLines = [];
+      continue;
+    }
+
+    bodyLines.push(line);
+  }
+
+  flushUnmatchedFence();
+  return {
+    codeBlocks,
+    withoutFencedBlocks: withoutFencedParts.join(""),
+    withFencedCodeUnwrapped: unwrappedParts.join(""),
+  };
+}
+
+interface InlineCodeRun {
+  start: number;
+  end: number;
+  length: number;
+}
+
+function scanInlineCodeSpansInLine(line: string): { codeSpans: string[]; withoutInlineCodeMarkup: string } {
+  const runs: InlineCodeRun[] = [];
+  for (let index = 0; index < line.length;) {
+    if (line[index] !== "`") {
+      index += 1;
+      continue;
+    }
+    const start = index;
+    while (index < line.length && line[index] === "`") index += 1;
+    runs.push({ start, end: index, length: index - start });
+  }
+
+  if (runs.length === 0) {
+    return { codeSpans: [], withoutInlineCodeMarkup: line };
+  }
+
+  const runsByLength = new Map<number, number[]>();
+  for (const [runIndex, run] of runs.entries()) {
+    const runIndexes = runsByLength.get(run.length);
+    if (runIndexes) runIndexes.push(runIndex);
+    else runsByLength.set(run.length, [runIndex]);
+  }
+
+  const codeSpans: string[] = [];
+  const withoutParts: string[] = [];
+  const nextRunByLength = new Map<number, number>();
+  let cursor = 0;
+  let runIndex = 0;
+
+  while (runIndex < runs.length) {
+    const opener = runs[runIndex]!;
+    if (opener.start < cursor) {
+      runIndex += 1;
+      continue;
+    }
+
+    withoutParts.push(line.slice(cursor, opener.start));
+    const sameLengthRuns = runsByLength.get(opener.length)!;
+    let sameLengthCursor = nextRunByLength.get(opener.length) ?? 0;
+    while (sameLengthRuns[sameLengthCursor] !== undefined && sameLengthRuns[sameLengthCursor]! <= runIndex) {
+      sameLengthCursor += 1;
+    }
+
+    const closerIndex = sameLengthRuns[sameLengthCursor];
+    if (closerIndex === undefined) {
+      withoutParts.push(line.slice(opener.start, opener.end));
+      cursor = opener.end;
+      nextRunByLength.set(opener.length, sameLengthCursor);
+      runIndex += 1;
+      continue;
+    }
+
+    const closer = runs[closerIndex]!;
+    const body = line.slice(opener.end, closer.start);
+    codeSpans.push(body);
+    withoutParts.push(body);
+    cursor = closer.end;
+    nextRunByLength.set(opener.length, sameLengthCursor + 1);
+    while (runIndex < runs.length && runs[runIndex]!.start < cursor) runIndex += 1;
+  }
+
+  withoutParts.push(line.slice(cursor));
+  return { codeSpans, withoutInlineCodeMarkup: withoutParts.join("") };
+}
+
+function scanInlineCodeSpans(text: string): { codeSpans: string[]; withoutInlineCodeMarkup: string } {
+  const codeSpans: string[] = [];
+  const withoutParts: string[] = [];
+
+  for (const line of splitMarkdownLines(text)) {
+    const lineEnding = line.match(/\r?\n$/)?.[0] ?? "";
+    const lineBody = lineEnding ? line.slice(0, -lineEnding.length) : line;
+    const scanned = scanInlineCodeSpansInLine(lineBody);
+    codeSpans.push(...scanned.codeSpans);
+    withoutParts.push(scanned.withoutInlineCodeMarkup, lineEnding);
+  }
+
+  return { codeSpans, withoutInlineCodeMarkup: withoutParts.join("") };
+}
+
+function extractCodeMarkup(text: string): { codeText: string; withoutCodeMarkup: string } {
+  const { codeBlocks, withoutFencedBlocks, withFencedCodeUnwrapped } = scanFencedCodeBlocks(text);
+  const inlineCode = scanInlineCodeSpans(withoutFencedBlocks);
+  const inlineUnwrapped = scanInlineCodeSpans(withFencedCodeUnwrapped);
+  return {
+    codeText: [...codeBlocks, ...inlineCode.codeSpans].join("\n"),
+    withoutCodeMarkup: inlineUnwrapped.withoutInlineCodeMarkup,
+  };
 }
 
 /**
@@ -226,11 +392,9 @@ export function extractIssueDuplicateFeatures(
 
   // Code spans are the densest evidence, so mine them before generic prose and
   // let their contents register as symbols/paths.
-  const codeText = (withoutUrls.match(CODE_SPAN_RE) ?? [])
-    .map((span) => span.replace(/^`{1,3}[A-Za-z]*\n?/, "").replace(/`{1,3}$/, ""))
-    .join("\n");
+  const { codeText, withoutCodeMarkup } = extractCodeMarkup(withoutUrls);
 
-  for (const source of [codeText, withoutUrls]) {
+  for (const source of [codeText, withoutCodeMarkup]) {
     for (const rawPath of source.match(PATH_RE) ?? []) {
       const path = stripTrailingLineNumber(rawPath);
       if (looksLikePath(path)) add(path, "path");
@@ -257,7 +421,7 @@ export function extractIssueDuplicateFeatures(
     add(word, "symbol");
   }
 
-  for (const word of withoutUrls.match(WORD_RE) ?? []) {
+  for (const word of withoutCodeMarkup.match(WORD_RE) ?? []) {
     const lower = word.toLowerCase();
     if (lower.length < MIN_TERM_LENGTH) continue;
     if (STOPWORDS.has(lower)) continue;
@@ -272,25 +436,62 @@ function isDistinctiveClass(featureClass: IssueDuplicateFeatureClass): boolean {
 }
 
 /**
- * A scored window. Token class, idf, and per-token weight are corpus-level
- * properties rather than per-document ones: a token is classified at the
- * strongest class any document in the window gave it, so `monitor` counts as a
- * symbol once someone marked it as code, and every pair scores it identically.
- * That makes the weighted union collapse to `totalA + totalB - intersection`,
- * which is what keeps pairwise scoring O(min(|A|,|B|)) instead of O(|A|+|B|).
+ * A scored window.
+ *
+ * idf is a corpus-level property, but the feature *class* is deliberately
+ * per-document. Promoting a token to the strongest class any document gave it
+ * would let a single author's backticks reclassify that word for everyone: one
+ * issue writing `` `request` `` would turn the same word into "symbol" evidence
+ * in every prose-only issue in the window, and enough of those could carry a
+ * pair over `minSharedDistinctiveFeatures` on prose alone — the one thing the
+ * distinctive floor exists to prevent.
+ *
+ * Keeping classes per-document makes a shared token's weight differ by side, so
+ * the weighted Jaccard uses min/max over the pair: the intersection takes
+ * `min(weightLeft, weightRight)` and the union is
+ * `totalLeft + totalRight - sum(min)`. That still collapses to one pass over
+ * the smaller token set, so pairwise scoring stays O(min(|A|,|B|)).
  */
 interface ScoredWindow {
   documents: IssueDuplicateDocument[];
-  /** Token sets, index-aligned with `documents`. */
-  tokens: Set<string>[];
+  /** Per-document token -> class maps, index-aligned with `documents`. */
+  features: Map<string, IssueDuplicateFeatureClass>[];
   totalWeight: number[];
-  featureClass: Map<string, IssueDuplicateFeatureClass>;
   idf: Map<string, number>;
-  weight: Map<string, number>;
   /** Distinctive token -> document indices, for candidate-pair blocking. */
   postings: Map<string, number[]>;
   /** The floor `postings` was built with; shared-feature counting must agree. */
   distinctiveIdfFloor: number;
+}
+
+/** Weight of a token given the class *one document* assigned it; 0 if absent. */
+function weightFor(tokenClass: IssueDuplicateFeatureClass | undefined, tokenIdf: number): number {
+  if (tokenClass === undefined) return 0;
+  return ISSUE_DUPLICATE_FEATURE_CLASS_WEIGHTS[tokenClass] * tokenIdf;
+}
+
+/** Whether a token is concrete evidence under one document's own classification. */
+function isDistinctiveFor(
+  tokenClass: IssueDuplicateFeatureClass | undefined,
+  tokenIdf: number,
+  distinctiveIdfFloor: number,
+): boolean {
+  if (tokenClass === undefined || !isDistinctiveClass(tokenClass)) return false;
+  return tokenIdf >= distinctiveIdfFloor;
+}
+
+/** Weight of `token` *as document `index` classified it*; 0 if absent. */
+function tokenWeightIn(window: ScoredWindow, index: number, token: string): number {
+  return weightFor(window.features[index]!.get(token), window.idf.get(token) ?? 0);
+}
+
+/** Whether `token` is evidence *in document `index`*, not merely somewhere. */
+function isDistinctiveIn(window: ScoredWindow, index: number, token: string): boolean {
+  return isDistinctiveFor(
+    window.features[index]!.get(token),
+    window.idf.get(token) ?? 0,
+    window.distinctiveIdfFloor,
+  );
 }
 
 function buildScoredWindow(
@@ -298,54 +499,40 @@ function buildScoredWindow(
   distinctiveIdfFloor: number,
   referenceCorpusSize: number,
 ): ScoredWindow {
-  const perDocument = documents.map((document) => extractIssueDuplicateFeatures(document));
+  const features = documents.map((document) => extractIssueDuplicateFeatures(document));
 
-  const featureClass = new Map<string, IssueDuplicateFeatureClass>();
   const documentFrequency = new Map<string, number>();
-  for (const features of perDocument) {
-    for (const [token, tokenClass] of features) {
+  for (const perDocument of features) {
+    for (const token of perDocument.keys()) {
       documentFrequency.set(token, (documentFrequency.get(token) ?? 0) + 1);
-      const existing = featureClass.get(token);
-      if (
-        existing === undefined ||
-        ISSUE_DUPLICATE_FEATURE_CLASS_WEIGHTS[tokenClass] >
-          ISSUE_DUPLICATE_FEATURE_CLASS_WEIGHTS[existing]
-      ) {
-        featureClass.set(token, tokenClass);
-      }
     }
   }
 
   const total = Math.max(documents.length, referenceCorpusSize);
   const idf = new Map<string, number>();
-  const weight = new Map<string, number>();
   for (const [token, df] of documentFrequency) {
     // BM25-style idf: a token in every document lands near zero, which is what
     // discounts our shared issue-template boilerplate without a blocklist.
-    const tokenIdf = Math.log(1 + (total - df + 0.5) / (df + 0.5));
-    idf.set(token, tokenIdf);
-    weight.set(token, ISSUE_DUPLICATE_FEATURE_CLASS_WEIGHTS[featureClass.get(token)!] * tokenIdf);
+    idf.set(token, Math.log(1 + (total - df + 0.5) / (df + 0.5)));
   }
 
-  const tokens = perDocument.map((features) => new Set(features.keys()));
-  const totalWeight = tokens.map((set) => {
+  const totalWeight = features.map((perDocument) => {
     let sum = 0;
-    for (const token of set) sum += weight.get(token) ?? 0;
+    for (const [token, tokenClass] of perDocument) sum += weightFor(tokenClass, idf.get(token) ?? 0);
     return sum;
   });
 
   const postings = new Map<string, number[]>();
-  for (const [index, set] of tokens.entries()) {
-    for (const token of set) {
-      if (!isDistinctiveClass(featureClass.get(token)!)) continue;
-      if ((idf.get(token) ?? 0) < distinctiveIdfFloor) continue;
+  for (const [index, perDocument] of features.entries()) {
+    for (const [token, tokenClass] of perDocument) {
+      if (!isDistinctiveFor(tokenClass, idf.get(token) ?? 0, distinctiveIdfFloor)) continue;
       const list = postings.get(token);
       if (list) list.push(index);
       else postings.set(token, [index]);
     }
   }
 
-  return { documents: [...documents], tokens, totalWeight, featureClass, idf, weight, postings, distinctiveIdfFloor };
+  return { documents: [...documents], features, totalWeight, idf, postings, distinctiveIdfFloor };
 }
 
 export interface IssueDuplicatePairScore {
@@ -355,22 +542,27 @@ export interface IssueDuplicatePairScore {
 }
 
 function scorePair(window: ScoredWindow, leftIndex: number, rightIndex: number): IssueDuplicatePairScore {
-  const left = window.tokens[leftIndex]!;
-  const right = window.tokens[rightIndex]!;
+  const left = window.features[leftIndex]!;
+  const right = window.features[rightIndex]!;
   const [smaller, larger] = left.size <= right.size ? [left, right] : [right, left];
 
   const sharedFeatures: IssueDuplicateSharedFeature[] = [];
   let intersectionWeight = 0;
   let sharedDistinctiveFeatureCount = 0;
 
-  for (const token of smaller) {
+  for (const token of smaller.keys()) {
     if (!larger.has(token)) continue;
-    const tokenClass = window.featureClass.get(token)!;
     const tokenIdf = window.idf.get(token) ?? 0;
-    const tokenWeight = window.weight.get(token) ?? 0;
-    intersectionWeight += tokenWeight;
-    sharedFeatures.push({ token, featureClass: tokenClass, idf: tokenIdf, weight: tokenWeight });
-    if (isDistinctiveClass(tokenClass) && tokenIdf >= window.distinctiveIdfFloor) {
+    const leftWeight = tokenWeightIn(window, leftIndex, token);
+    const rightWeight = tokenWeightIn(window, rightIndex, token);
+    // A token counts for the pair only as strongly as the *weaker* side saw it,
+    // so one side's backticks cannot upgrade the other side's prose.
+    const pairWeight = Math.min(leftWeight, rightWeight);
+    const pairClass = leftWeight <= rightWeight ? left.get(token)! : right.get(token)!;
+    intersectionWeight += pairWeight;
+    sharedFeatures.push({ token, featureClass: pairClass, idf: tokenIdf, weight: pairWeight });
+    // Likewise distinctive only when *both* documents treated it as evidence.
+    if (isDistinctiveIn(window, leftIndex, token) && isDistinctiveIn(window, rightIndex, token)) {
       sharedDistinctiveFeatureCount += 1;
     }
   }
@@ -395,6 +587,10 @@ function scorePair(window: ScoredWindow, leftIndex: number, rightIndex: number):
  * `minSharedDistinctiveFeatures` applies, so blocking here cannot drop a pair
  * that would otherwise have matched. It just avoids scoring the vast majority
  * of pairs that share no concrete evidence at all.
+ *
+ * Only tokens `index` itself classified as distinctive are walked, which is
+ * what makes the count agree with `scorePair`'s both-sides rule: `postings`
+ * already holds only the documents that classified the token distinctively.
  */
 function distinctiveNeighbours(
   window: ScoredWindow,
@@ -403,7 +599,8 @@ function distinctiveNeighbours(
   onlyGreaterThanIndex: boolean,
 ): Map<number, number> {
   const counts = new Map<number, number>();
-  for (const token of window.tokens[index]!) {
+  for (const token of window.features[index]!.keys()) {
+    if (!isDistinctiveIn(window, index, token)) continue;
     const list = window.postings.get(token);
     if (!list) continue;
     for (const other of list) {

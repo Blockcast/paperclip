@@ -100,6 +100,7 @@ export async function cleanupHeartbeatTestState(
   }, {
     maxAttempts: 5,
     baseDelayMs: 50,
+    jitterMs: 100,
   });
 }
 
