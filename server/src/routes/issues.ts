@@ -3780,10 +3780,14 @@ export function issueRoutes(
     if (issue.status !== "in_review") return false;
     const executionState = parseIssueExecutionState(issue.executionState);
     if (executionState?.status !== "pending") return false;
-    const actor = { type: "agent" as const, agentId: req.actor.agentId, userId: null };
+    // Standardized on actorMatchesExecutionParticipant (was executionPrincipalsEqual,
+    // which is equivalent here — both require the kind to match before comparing
+    // ids). One spelling across the adjacent participant checks so a future change
+    // to the comparison cannot silently apply to only one of them.
+    const actor = { actorType: "agent" as const, actorId: req.actor.agentId };
     return (
-      executionPrincipalsEqual(executionState.currentParticipant, actor) ||
-      executionPrincipalsEqual(executionState.returnAssignee, actor)
+      actorMatchesExecutionParticipant(actor, executionState.currentParticipant) ||
+      actorMatchesExecutionParticipant(actor, executionState.returnAssignee)
     );
   }
 
