@@ -71,7 +71,11 @@ function newIssue(): IssueFixture {
 function arm(
   issue: IssueFixture,
   monitor: MonitorInput,
-  options: { blockers?: string[] | null; threshold?: number } = {},
+  options: {
+    blockers?: string[] | null;
+    threshold?: number;
+    actor?: { agentId?: string | null; userId?: string | null };
+  } = {},
 ) {
   const policy = normalizeIssueExecutionPolicy({
     stages: [],
@@ -85,7 +89,7 @@ function arm(
     policy,
     previousPolicy: normalizeIssueExecutionPolicy(issue.executionPolicy),
     requestedAssigneePatch: {},
-    actor: { agentId: assigneeAgentId },
+    actor: options.actor ?? { agentId: assigneeAgentId },
     monitorExplicitlyUpdated: true,
     unresolvedBlockerIssueIds,
     monitorConvergenceThreshold: options.threshold ?? null,
@@ -151,6 +155,7 @@ describe("issue monitor convergence guard (BLO-18294)", () => {
         clearReason: "convergence_stalled",
         gateSource: "gates",
         convergenceCount: DEFAULT_ISSUE_MONITOR_CONVERGENCE_THRESHOLD + 1,
+        convergenceStallCount: 1,
       });
       // The monitor is stripped from the policy, so nothing re-arms it implicitly.
       expect((refused.patch.executionPolicy as IssueExecutionPolicy | null)?.monitor ?? null).toBeNull();
@@ -342,7 +347,7 @@ describe("issue monitor convergence guard (BLO-18294)", () => {
       });
     });
 
-    it("resets stale convergence bookkeeping after a stalled issue is explicitly moved out of blocked", () => {
+    it("lets a non-assignee reset stale consecutive bookkeeping after a stalled issue leaves blocked", () => {
       const issue = newIssue();
       const blockers = [BLOCKER_A];
 
@@ -360,7 +365,10 @@ describe("issue monitor convergence guard (BLO-18294)", () => {
       });
 
       issue.status = "in_progress";
-      const rearmed = arm(issue, { nextCheckAt: checkAt(5) }, { blockers });
+      const rearmed = arm(issue, { nextCheckAt: checkAt(5) }, {
+        blockers,
+        actor: { userId: "board-user-1" },
+      });
 
       expect(rearmed.monitorConvergence).toMatchObject({ count: 1, converged: false });
       expect(rearmed.patch.status).toBeUndefined();
@@ -369,7 +377,31 @@ describe("issue monitor convergence guard (BLO-18294)", () => {
         status: "scheduled",
         clearReason: null,
         convergenceCount: 1,
+        convergenceStallCount: 1,
       });
+    });
+
+    it("does not let the same assignee reset a previously stalled monitor budget", () => {
+      const issue = newIssue();
+      const blockers = [BLOCKER_A];
+
+      for (let cycle = 1; cycle <= DEFAULT_ISSUE_MONITOR_CONVERGENCE_THRESHOLD; cycle += 1) {
+        arm(issue, { nextCheckAt: checkAt(cycle) }, { blockers });
+        fire(issue, checkAt(cycle));
+      }
+
+      const refused = arm(issue, { nextCheckAt: checkAt(4) }, { blockers });
+      expect(refused.patch.status).toBe("blocked");
+      expect(monitorState(issue)).toMatchObject({
+        status: "cleared",
+        clearReason: "convergence_stalled",
+        convergenceStallCount: 1,
+      });
+
+      issue.status = "in_progress";
+      expect(() => arm(issue, { nextCheckAt: checkAt(5) }, { blockers })).toThrow(
+        /must be re-armed by a non-assignee actor/,
+      );
     });
 
     it("falls back to the notes signature when nothing structured is declared", () => {

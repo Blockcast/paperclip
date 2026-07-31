@@ -654,6 +654,7 @@ export interface IssueExecutionMonitorState {
   gateFingerprint?: string | null;
   gateSource?: IssueMonitorGateSource | null;
   convergenceCount?: number;
+  convergenceStallCount?: number;
   clearedAt: string | null;
   clearReason: IssueExecutionMonitorClearReason | null;
 }

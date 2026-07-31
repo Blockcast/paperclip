@@ -94,6 +94,8 @@ const PENDING_STATUS: IssueExecutionState["status"] = "pending";
 const CHANGES_REQUESTED_STATUS: IssueExecutionState["status"] = "changes_requested";
 const MONITOR_INVALID_MESSAGE = "Monitor can only be scheduled on issues assigned to an agent in in_progress or in_review";
 const MONITOR_BOUNDS_EXHAUSTED_MESSAGE = "Monitor bounds are already exhausted";
+const MONITOR_CONVERGENCE_RESET_REQUIRES_NON_ASSIGNEE_MESSAGE =
+  "A monitor cleared for convergence_stalled must be re-armed by a non-assignee actor";
 export const REDACTED_ISSUE_MONITOR_EXTERNAL_REF = "[redacted]";
 
 function normalizeMonitorNotes(notes: string | null | undefined) {
@@ -151,6 +153,7 @@ function monitorConvergenceFields(
       gateFingerprint: previous?.gateFingerprint ?? null,
       gateSource: previous?.gateSource ?? null,
       convergenceCount: previous?.convergenceCount ?? 0,
+      convergenceStallCount: previous?.convergenceStallCount ?? 0,
     };
   }
   return {
@@ -160,6 +163,7 @@ function monitorConvergenceFields(
     gateFingerprint: convergence?.fingerprint ?? previous?.gateFingerprint ?? null,
     gateSource: convergence?.source ?? previous?.gateSource ?? null,
     convergenceCount: convergence?.count ?? previous?.convergenceCount ?? 0,
+    convergenceStallCount: previous?.convergenceStallCount ?? 0,
   };
 }
 
@@ -333,6 +337,10 @@ function buildClearedMonitorState(input: {
     scheduledBy: input.previous?.scheduledBy ?? null,
     ...monitorMetadataFromState(input.previous),
     ...monitorConvergenceFields(input.previous, null, input.convergence),
+    convergenceStallCount:
+      input.clearReason === "convergence_stalled"
+        ? (input.previous?.convergenceStallCount ?? 0) + 1
+        : input.previous?.convergenceStallCount ?? 0,
     clearedAt: input.clearedAt.toISOString(),
     clearReason: input.clearReason,
   };
@@ -1151,6 +1159,12 @@ function applyMonitorTransition(
   const convergenceBaseMonitorState = resetConvergenceAfterStalledClear
     ? resetMonitorConvergenceFields(currentMonitorState)
     : currentMonitorState;
+  const sameAssigneeResetAfterPriorStall = Boolean(
+    resetConvergenceAfterStalledClear &&
+    (currentMonitorState?.convergenceStallCount ?? 0) > 0 &&
+    input.actor.agentId &&
+    input.actor.agentId === assigneeAgentId,
+  );
 
   if (input.policy?.monitor) {
     if (invalidReason) {
@@ -1193,6 +1207,9 @@ function applyMonitorTransition(
         // are not re-checks, and those call sites do not supply blocker edges —
         // scoring them would reset the counter against an empty gate set.
         const preserveConvergence = input.monitorExplicitlyUpdated && input.unresolvedBlockerIssueIds === null;
+        if (sameAssigneeResetAfterPriorStall) {
+          throw unprocessable(MONITOR_CONVERGENCE_RESET_REQUIRES_NON_ASSIGNEE_MESSAGE);
+        }
         convergence = input.monitorExplicitlyUpdated && input.unresolvedBlockerIssueIds !== null
           ? evaluateIssueMonitorConvergence({
             monitor: input.policy.monitor,
