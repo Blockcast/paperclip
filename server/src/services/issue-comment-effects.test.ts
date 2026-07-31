@@ -160,7 +160,8 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
 
   it("reclaims an effect whose owner died mid-flight and completes it once", async () => {
     await seed();
-    await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
+    // Single effect so "is this comment resumable?" reflects only this row.
+    await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: [intents[0]] });
     const [effect] = await listUnfinishedEffects(db as never, commentId);
 
     // Simulate a crash: the claim is taken and the process dies without ever
@@ -188,7 +189,8 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
 
   it("requeues a leaseless processing row so it cannot strand a comment", async () => {
     await seed();
-    await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
+    // Single effect so "is this comment resumable?" reflects only this row.
+    await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: [intents[0]] });
     const [effect] = await listUnfinishedEffects(db as never, commentId);
     await db
       .update(issueCommentEffects)
