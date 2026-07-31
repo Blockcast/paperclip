@@ -153,11 +153,8 @@ const MIN_TERM_LENGTH = 4;
 
 const ISSUE_REFERENCE_RE = /\b[A-Z][A-Z0-9]{1,9}-\d{1,7}\b/g;
 const NUMERIC_REFERENCE_RE = /(?:^|[\s([])#(\d{1,7})\b/g;
-const FENCED_CODE_BLOCK_OPEN_RE = /^[ \t]*`{3,}[^\n`]*\r?\n/;
-const FENCED_CODE_BLOCK_CLOSE_RE = /\r?\n[ \t]*`{3,}[ \t]*$/;
 const FENCED_CODE_OPEN_LINE_RE = /^[ \t]*(`{3,})[^\n`]*\r?\n$/;
 const FENCED_CODE_CLOSE_LINE_RE = /^[ \t]*(`{3,})[ \t]*$/;
-const INLINE_CODE_SPAN_RE = /(`+)([^\n]*?)(?<!`)\1(?!`)/g;
 const URL_RE = /\bhttps?:\/\/\S+/g;
 const PATH_RE = /\b(?:[A-Za-z0-9_.-]+\/){1,}[A-Za-z0-9_.-]+\b/g;
 const IDENTIFIER_RE = /\b[A-Za-z_$][A-Za-z0-9_$]*(?:[.:][A-Za-z_$][A-Za-z0-9_$]*)*\b/g;
@@ -184,28 +181,6 @@ function looksLikePath(token: string): boolean {
 function stripTrailingLineNumber(token: string): string {
   // "server/src/routes/issues.ts:8242" -> "server/src/routes/issues.ts"
   return token.replace(/:\d+(?::\d+)?$/, "");
-}
-
-/**
- * Unwrap one code span to its contents.
- *
- * Fenced and inline spans must be unwrapped by different rules. A fence may
- * carry an info string (```` ```ts ````) that is markup, not evidence, so it is
- * dropped; an inline span never does, and treating its leading word as one is
- * how `` `monitor` `` used to be erased entirely — the language-tag pattern ate
- * the backtick *and* the all-letters body, and the closing replacement removed
- * what was left. That silently excluded exactly the lowercase identifiers this
- * defect class turns on.
- */
-function unwrapCodeSpan(span: string): string {
-  if (FENCED_CODE_BLOCK_OPEN_RE.test(span)) {
-    return span.replace(FENCED_CODE_BLOCK_OPEN_RE, "").replace(FENCED_CODE_BLOCK_CLOSE_RE, "");
-  }
-  const delimiter = span.match(/^`+/)?.[0];
-  if (delimiter && span.endsWith(delimiter)) {
-    return span.slice(delimiter.length, -delimiter.length);
-  }
-  return span.replace(/^`+/, "").replace(/`+$/, "");
 }
 
 function splitMarkdownLines(text: string): string[] {
@@ -277,12 +252,99 @@ function scanFencedCodeBlocks(text: string): {
   };
 }
 
+interface InlineCodeRun {
+  start: number;
+  end: number;
+  length: number;
+}
+
+function scanInlineCodeSpansInLine(line: string): { codeSpans: string[]; withoutInlineCodeMarkup: string } {
+  const runs: InlineCodeRun[] = [];
+  for (let index = 0; index < line.length;) {
+    if (line[index] !== "`") {
+      index += 1;
+      continue;
+    }
+    const start = index;
+    while (index < line.length && line[index] === "`") index += 1;
+    runs.push({ start, end: index, length: index - start });
+  }
+
+  if (runs.length === 0) {
+    return { codeSpans: [], withoutInlineCodeMarkup: line };
+  }
+
+  const runsByLength = new Map<number, number[]>();
+  for (const [runIndex, run] of runs.entries()) {
+    const runIndexes = runsByLength.get(run.length);
+    if (runIndexes) runIndexes.push(runIndex);
+    else runsByLength.set(run.length, [runIndex]);
+  }
+
+  const codeSpans: string[] = [];
+  const withoutParts: string[] = [];
+  const nextRunByLength = new Map<number, number>();
+  let cursor = 0;
+  let runIndex = 0;
+
+  while (runIndex < runs.length) {
+    const opener = runs[runIndex]!;
+    if (opener.start < cursor) {
+      runIndex += 1;
+      continue;
+    }
+
+    withoutParts.push(line.slice(cursor, opener.start));
+    const sameLengthRuns = runsByLength.get(opener.length)!;
+    let sameLengthCursor = nextRunByLength.get(opener.length) ?? 0;
+    while (sameLengthRuns[sameLengthCursor] !== undefined && sameLengthRuns[sameLengthCursor]! <= runIndex) {
+      sameLengthCursor += 1;
+    }
+
+    const closerIndex = sameLengthRuns[sameLengthCursor];
+    if (closerIndex === undefined) {
+      withoutParts.push(line.slice(opener.start, opener.end));
+      cursor = opener.end;
+      nextRunByLength.set(opener.length, sameLengthCursor);
+      runIndex += 1;
+      continue;
+    }
+
+    const closer = runs[closerIndex]!;
+    const body = line.slice(opener.end, closer.start);
+    codeSpans.push(body);
+    withoutParts.push(body);
+    cursor = closer.end;
+    nextRunByLength.set(opener.length, sameLengthCursor + 1);
+    while (runIndex < runs.length && runs[runIndex]!.start < cursor) runIndex += 1;
+  }
+
+  withoutParts.push(line.slice(cursor));
+  return { codeSpans, withoutInlineCodeMarkup: withoutParts.join("") };
+}
+
+function scanInlineCodeSpans(text: string): { codeSpans: string[]; withoutInlineCodeMarkup: string } {
+  const codeSpans: string[] = [];
+  const withoutParts: string[] = [];
+
+  for (const line of splitMarkdownLines(text)) {
+    const lineEnding = line.match(/\r?\n$/)?.[0] ?? "";
+    const lineBody = lineEnding ? line.slice(0, -lineEnding.length) : line;
+    const scanned = scanInlineCodeSpansInLine(lineBody);
+    codeSpans.push(...scanned.codeSpans);
+    withoutParts.push(scanned.withoutInlineCodeMarkup, lineEnding);
+  }
+
+  return { codeSpans, withoutInlineCodeMarkup: withoutParts.join("") };
+}
+
 function extractCodeMarkup(text: string): { codeText: string; withoutCodeMarkup: string } {
   const { codeBlocks, withoutFencedBlocks, withFencedCodeUnwrapped } = scanFencedCodeBlocks(text);
-  const inlineSpans = withoutFencedBlocks.match(INLINE_CODE_SPAN_RE) ?? [];
+  const inlineCode = scanInlineCodeSpans(withoutFencedBlocks);
+  const inlineUnwrapped = scanInlineCodeSpans(withFencedCodeUnwrapped);
   return {
-    codeText: [...codeBlocks, ...inlineSpans.map(unwrapCodeSpan)].join("\n"),
-    withoutCodeMarkup: withFencedCodeUnwrapped.replace(INLINE_CODE_SPAN_RE, (_span, _ticks: string, body: string) => body),
+    codeText: [...codeBlocks, ...inlineCode.codeSpans].join("\n"),
+    withoutCodeMarkup: inlineUnwrapped.withoutInlineCodeMarkup,
   };
 }
 

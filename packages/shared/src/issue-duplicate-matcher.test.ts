@@ -209,6 +209,21 @@ describe("extractIssueDuplicateFeatures", () => {
     expect(features.get("malformed")).toBe("term");
     expect(elapsedMs).toBeLessThan(1_000);
   });
+
+  it("handles an unmatched inline backtick run in bounded time", () => {
+    const description = "`".repeat(1_200);
+
+    const started = performance.now();
+    const features = extractIssueDuplicateFeatures({
+      title: "Malformed inline code run",
+      description,
+    });
+    const elapsedMs = performance.now() - started;
+
+    expect(features.get("malformed")).toBe("term");
+    expect(features.get("inline")).toBe("term");
+    expect(elapsedMs).toBeLessThan(1_000);
+  });
 });
 
 describe("findIssueDuplicateCandidates — the four real monitor filings", () => {
