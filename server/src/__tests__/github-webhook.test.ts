@@ -22,6 +22,7 @@ import {
 import { and, eq, inArray, sql } from "drizzle-orm";
 import {
   __test_backLinkAbsoluteUrl,
+  __test_buildDependabotAlertIssueBody,
   __test_buildIssueBackLinkBody,
   __test_buildPrReviewerTaskKey,
   __test_buildPrReviewerWakeIdempotencyKey,
@@ -1084,6 +1085,47 @@ describe("github-webhook pure helpers", () => {
       patchedVersion: "3.2.6",
       alertUrl: "https://github.com/Blockcast/paperclip/security/dependabot/58",
     });
+  });
+
+  it("builds Dependabot alert instructions with separate remediation and dismissal paths", () => {
+    const alert = __test_resolveDependabotAlertContext({
+      action: "created",
+      alert: {
+        number: 58,
+        html_url: "https://github.com/Blockcast/paperclip/security/dependabot/58",
+        dependency: {
+          package: { ecosystem: "npm", name: "vitest" },
+          manifest_path: "packages/mcp-gateway/package.json",
+        },
+        security_advisory: {
+          ghsa_id: "GHSA-5xrq-8626-4rwp",
+          cve_id: "CVE-2026-47429",
+          summary: "When Vitest UI server is listening, arbitrary file can be read and executed",
+          severity: "critical",
+        },
+        security_vulnerability: {
+          package: { ecosystem: "npm", name: "vitest" },
+          severity: "critical",
+          vulnerable_version_range: "< 3.2.6",
+          first_patched_version: { identifier: "3.2.6" },
+        },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+    expect(alert).not.toBeNull();
+
+    const description = __test_buildDependabotAlertIssueBody({
+      repoFullName: "Blockcast/paperclip",
+      alert: alert!,
+    });
+
+    expect(description).toContain("Remediation path:");
+    expect(description).toContain("Dismissal path:");
+    expect(description).toContain("For the remediation path");
+    expect(description).toContain("For the dismissal path");
+    expect(description).toMatch(
+      /^1\. The remediation PR merges into the default branch of `Blockcast\/paperclip`, AND the default-branch manifest `packages\/mcp-gateway\/package\.json` resolves vitest at 3\.2\.6 or newer\.$/m,
+    );
   });
 
   it("resolves terminal dependabot alert actions for receipt recording", () => {
@@ -3651,6 +3693,60 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(issue!.description).toContain("3.2.6");
     expect(issue!.description).toContain("packages/mcp-gateway/package.json");
     expect(issue!.description).toContain("security/dependabot/58");
+  });
+
+  // BLO-19113: the verifying signal used to be a single bullet holding a
+  // three-branch disjunction, followed by a bare paragraph about the Dependabot
+  // Alerts REST API. A downstream task author read that block, silently dropped
+  // the merged-PR branch, and re-read the operational REST aside as an
+  // evidentiary rule ("authenticated UI or webhook only") — a standard no agent
+  // can satisfy. That misreading blocked an already-remediated high-severity CVE
+  // for six days. These assertions pin the disambiguated wording so the
+  // disjunction cannot be flattened back into prose.
+  it("states the verifying signal as an explicit any-one-of checklist and scopes the REST note", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    const res = await postDependabot(app, dependabotPayload("critical"));
+    expect(res.status).toBe(200);
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "github_dependabot_alert")));
+    const description = issue!.description!;
+
+    // All three sufficient branches survive, each on its own numbered line.
+    expect(description).toContain("Any ONE of the following is sufficient and complete evidence");
+    expect(description).toMatch(/^1\. The remediation PR merges into the default branch/m);
+    expect(description).toMatch(/^2\. .*shows `state: fixed`\.$/m);
+    expect(description).toMatch(/^3\. .*shows `state: dismissed`/m);
+    // Branch 1 names the concrete manifest + patched version, so it is actionable
+    // without re-deriving anything from the alert page.
+    expect(description).toMatch(
+      /^1\. The remediation PR merges into the default branch of `Blockcast\/paperclip`, AND the default-branch manifest `packages\/mcp-gateway\/package\.json` resolves vitest at 3\.2\.6 or newer\.$/m,
+    );
+
+    // Acceptance criteria split remediation from dismissal instead of implying
+    // the dismissal path also needs a merged PR.
+    expect(description).toContain("Remediation path:");
+    expect(description).toContain("Dismissal path:");
+    expect(description).toContain("For the remediation path");
+    expect(description).toContain("For the dismissal path");
+
+    // The two sentences that directly refute the misreading.
+    expect(description).toContain("Do NOT require a screenshot of the alert page");
+    expect(description).toContain("never prerequisites");
+
+    // The REST note is a separately-headed operational aside, not a rule about
+    // which evidence counts.
+    expect(description).toContain("## Note on the Dependabot Alerts REST API (operational, not evidentiary)");
+    expect(description).toContain("403 Dependabot alerts are disabled for this repository");
+    expect(description).toContain("It is NOT an evidentiary standard");
+    expect(description).toContain("does not forbid the repository contents API or GraphQL");
+
+    // The alert-state acceptance criterion must not read as an evidence demand.
+    expect(description).toContain("observing it directly is optional");
   });
 
   it("does not wake below the severity floor (default high)", async () => {
