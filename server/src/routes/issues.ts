@@ -3573,15 +3573,80 @@ export function issueRoutes(
     });
   }
 
+  // BLO-19087: an @-mention wakes the mentioned agent (`issue_comment_mentioned`,
+  // fired below) but does not by itself authorize it to reply. The wake path
+  // applies no gate on who wrote the mention; the grant path
+  // (`agentHasMentionGrantOnIssue`) only grants `issue:comment` when the
+  // mentioning comment's author is that issue's own assignee, or a board user.
+  // A mention written by anyone else therefore wakes an agent onto a thread it
+  // provably cannot post to. That author gate is deliberate — it stops mention
+  // grants chaining agent-to-agent — so the fix is not to widen it but to stop
+  // the invitation being silent about its own terms.
+  //
+  // This names the one action that actually clears the denial. BLO-18152 got as
+  // far as labelling the boundary "grant" and its own note suggests "retry with
+  // a mention", which is a trap: the mention has to come from a *specific*
+  // author, and a mention from anyone else leaves the agent looping.
+  function issueCommentGrantRemediation(input: {
+    actorAgentId: string;
+    assigneeAgentId: string | null;
+    reason: Awaited<ReturnType<typeof decideIssueAccess>>["reason"];
+  }): string | null {
+    if (input.reason !== "deny_missing_grant") return null;
+    if (!input.assigneeAgentId) return null;
+    if (input.assigneeAgentId === input.actorAgentId) return null;
+    return (
+      `Being @-mentioned here does not grant you comment access. Only this issue's assignee ` +
+      `(agent://${input.assigneeAgentId}) or a board user can grant it, by posting a comment on ` +
+      `this issue containing agent://${input.actorAgentId}. A mention written by any other agent ` +
+      `wakes you but does not authorize you. Until then, respond on an issue you are assigned to ` +
+      `and reference this one, or ask the assignee to mention you here.`
+    );
+  }
+
+  // BLO-19087: the read-side counterpart of the denial above. Reports whether
+  // this actor could actually post to the thread it was just woken onto, using
+  // the identical `decideIssueAccess` call the comment route enforces with, so
+  // the advertised verdict cannot drift from the enforced one.
+  async function resolveHeartbeatReplyAuthorization(
+    req: Request,
+    issue: Parameters<typeof decideIssueAccess>[1],
+  ) {
+    if (req.actor.type !== "agent") return null;
+    const actorAgentId = req.actor.agentId;
+    if (!actorAgentId) return null;
+    const decision = await decideIssueAccess(req, issue, "issue:comment");
+    if (decision.allowed) {
+      return { canComment: true as const, reason: decision.reason, remediation: null };
+    }
+    return {
+      canComment: false as const,
+      reason: decision.reason,
+      boundary: authorizationBoundaryLabel(decision.reason),
+      remediation: issueCommentGrantRemediation({
+        actorAgentId,
+        assigneeAgentId: issue.assigneeAgentId,
+        reason: decision.reason,
+      }),
+    };
+  }
+
   // BLO-18152: every "Issue is outside this actor's authorization boundary"
   // response (issue:read, issue:comment, issue:mutate) renders through this
   // one function so the message always names which boundary fired instead of
   // leaving the caller to guess whether it was a scope, trust-boundary,
   // membership, or company-mismatch rejection.
-  function respondIssueBoundaryDenied(res: Response, decision: Awaited<ReturnType<typeof decideIssueAccess>>) {
+  function respondIssueBoundaryDenied(
+    res: Response,
+    decision: Awaited<ReturnType<typeof decideIssueAccess>>,
+    remediation?: string | null,
+  ) {
     res.status(403).json({
       error: `Issue is outside this actor's authorization boundary (${authorizationBoundaryLabel(decision.reason)})`,
-      details: authorizationDeniedDetails(decision),
+      details: {
+        ...authorizationDeniedDetails(decision),
+        ...(remediation ? { remediation } : {}),
+      },
     });
   }
 
@@ -3631,7 +3696,15 @@ export function issueRoutes(
     }
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:comment");
     if (!boundaryDecision.allowed) {
-      respondIssueBoundaryDenied(res, boundaryDecision);
+      respondIssueBoundaryDenied(
+        res,
+        boundaryDecision,
+        issueCommentGrantRemediation({
+          actorAgentId,
+          assigneeAgentId: issue.assigneeAgentId,
+          reason: boundaryDecision.reason,
+        }),
+      );
       return false;
     }
     if (issue.status === "in_progress" && issue.assigneeAgentId === actorAgentId) {
@@ -5523,7 +5596,16 @@ export function issueRoutes(
       includeForIssueComment: wakeCommentId !== null,
     });
 
+    // BLO-19087: a mention wake tells an agent to go read this thread, and the
+    // heartbeat procedure tells it to "respond in comments if useful" — but on
+    // an issue assigned to someone else that reply is usually a 403. Resolve
+    // the same decision the comment route enforces (never a re-derived copy of
+    // the rule, which is how the wake/grant split arose in the first place) so
+    // the agent knows before it writes, and knows where to go instead.
+    const replyAuthorization = await resolveHeartbeatReplyAuthorization(req, issue);
+
     res.json({
+      replyAuthorization,
       issue: {
         id: issue.id,
         identifier: issue.identifier,
