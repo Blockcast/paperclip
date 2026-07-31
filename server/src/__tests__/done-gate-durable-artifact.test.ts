@@ -567,7 +567,7 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
   it("accepts a run-attributed work product that references a real issue document", async () => {
     await enableDoneExecutionGate();
     const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
-    const { documentId } = await addRunAttributedDocument(companyId, issueId, agentId, null);
+    const { documentId } = await addRunAttributedDocument(companyId, issueId, agentId, runId);
     await db.insert(issueWorkProducts).values({
       id: randomUUID(),
       companyId,
@@ -588,7 +588,7 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
   it("accepts a run-attributed work product that references a real issue document by key", async () => {
     await enableDoneExecutionGate();
     const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
-    await addRunAttributedDocument(companyId, issueId, agentId, null, "findings");
+    await addRunAttributedDocument(companyId, issueId, agentId, runId, "findings");
     await db.insert(issueWorkProducts).values({
       id: randomUUID(),
       companyId,
@@ -604,6 +604,50 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
     const response = await patchToDone(agentId, companyId, runId, issueId);
 
     expect(response.status).toBe(200);
+  });
+
+  it("does not accept a document work product that points at a runless document by id", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    const { documentId } = await addRunAttributedDocument(companyId, issueId, agentId, null);
+    await db.insert(issueWorkProducts).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      type: "document",
+      provider: "paperclip",
+      title: "Runless findings pointer",
+      status: "active",
+      createdByRunId: runId,
+      metadata: { documentId },
+    });
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(422);
+    expect(response.body.details).toMatchObject({ reason: "no_execution_run_and_no_pr_evidence" });
+  });
+
+  it("does not accept a document work product that points at a runless document by key", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    await addRunAttributedDocument(companyId, issueId, agentId, null, "findings");
+    await db.insert(issueWorkProducts).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      type: "document",
+      provider: "paperclip",
+      title: "Runless findings pointer",
+      status: "active",
+      createdByRunId: runId,
+      metadata: { documentKey: "findings" },
+    });
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(422);
+    expect(response.body.details).toMatchObject({ reason: "no_execution_run_and_no_pr_evidence" });
   });
 
   it("accepts a run-attributed work product that references a real execution workspace file", async () => {

@@ -2001,6 +2001,7 @@ function hasInspectableWorkProductLocator(issueId: string): SQL {
           and durable_issue_document.issue_id = ${issueWorkProducts.issueId}
           and durable_issue_document.key not in (${DONE_GATE_NON_QUALIFYING_DOCUMENT_KEY_SQL_LIST})
           and (durable_document.source_trust is null or durable_document.source_trust->>'disposition' = 'promoted')
+          and durable_revision.created_by_run_id is not null
           and durable_revision.body ~ '[^[:space:]]'
       )
       else false
@@ -2017,6 +2018,7 @@ function hasInspectableWorkProductLocator(issueId: string): SQL {
         and durable_issue_document.key = ${issueWorkProducts.metadata}->>'documentKey'
         and durable_issue_document.key not in (${DONE_GATE_NON_QUALIFYING_DOCUMENT_KEY_SQL_LIST})
         and (durable_document.source_trust is null or durable_document.source_trust->>'disposition' = 'promoted')
+        and durable_revision.created_by_run_id is not null
         and durable_revision.body ~ '[^[:space:]]'
     )`,
   )!;
@@ -2051,13 +2053,13 @@ const DONE_GATE_NON_QUALIFYING_DOCUMENT_KEY_SQL_LIST = sql.join(
  *  - an active, trusted-or-promoted, inspectable `artifact`/`document` work
  *    product stamped `createdByRunId`.
  *
- * `createdByRunId` is written from the authenticated actor's run context in the
- * route layer, never from the request body, so it cannot be forged by a client.
+ * `createdByRunId` is validated against the authenticated actor's run context in
+ * the route layer, so an agent cannot attribute evidence to another run.
  *
  * Call this LAZILY — only when the cheaper gate checks have already decided to
  * block — so the common update path pays no extra query.
  */
-async function fetchDurableArtifactEvidence(dbOrTx: any, issueId: string): Promise<boolean> {
+async function fetchDurableArtifactEvidence(dbOrTx: any, issueId: string, companyId: string): Promise<boolean> {
   const [documentRows, workProductRows] = await Promise.all([
     dbOrTx
       .select({ key: issueDocuments.key })
@@ -2066,6 +2068,7 @@ async function fetchDurableArtifactEvidence(dbOrTx: any, issueId: string): Promi
       .innerJoin(documentRevisions, eq(documentRevisions.id, documents.latestRevisionId))
       .where(
         and(
+          eq(issueDocuments.companyId, companyId),
           eq(issueDocuments.issueId, issueId),
           notInArray(issueDocuments.key, [...DONE_GATE_NON_QUALIFYING_DOCUMENT_KEYS]),
           hasTrustedOrPromotedSourceTrust(documents.sourceTrust),
@@ -2088,6 +2091,7 @@ async function fetchDurableArtifactEvidence(dbOrTx: any, issueId: string): Promi
       .from(issueWorkProducts)
       .where(
         and(
+          eq(issueWorkProducts.companyId, companyId),
           eq(issueWorkProducts.issueId, issueId),
           inArray(issueWorkProducts.type, [...DURABLE_ARTIFACT_WORK_PRODUCT_TYPES]),
           eq(issueWorkProducts.status, "active"),
@@ -8400,17 +8404,20 @@ export function issueService(db: Db) {
         if (doneGateNeedsDurableArtifactCheck) {
           let doneGateHasDurableArtifact = false;
           try {
-            doneGateHasDurableArtifact = await fetchDurableArtifactEvidence(tx, id);
+            doneGateHasDurableArtifact = await fetchDurableArtifactEvidence(tx, id, existing.companyId);
           } catch (err) {
-            // Fail CLOSED: an artifact lookup we could not complete is not
-            // evidence, so leave the flag false and let the gate block.
             logger.warn(
               {
                 issueId: id,
                 err: err instanceof Error ? err.message : String(err),
               },
-              "done-execution gate: durable-artifact lookup failed; preserving block posture",
+              "done-execution gate: durable-artifact lookup failed; returning retryable error",
             );
+            throw new HttpError(503, "Done-gate durable artifact evidence lookup failed", {
+              reason: "done_gate_evidence_lookup_failed",
+              issueId: id,
+              retryable: true,
+            });
           }
           if (
             shouldBlockNarratedDone({

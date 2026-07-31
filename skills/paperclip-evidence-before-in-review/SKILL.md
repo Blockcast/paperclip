@@ -274,7 +274,7 @@ Then `PATCH {status: "done"}` passes. What qualifies:
 
 Either must carry `createdByRunId`, which the server stamps from your run context — so write the artifact **from inside the run that closes the issue**, not via a runless board-API call. Low-trust output must be promoted before it qualifies; quarantined documents or work products do not satisfy the done gate.
 
-For work products, "inspectable" means a reviewer can resolve the artifact: use an absolute `http(s)://` URL, a canonical `/api/attachments/{id}/content` URL for an attachment on this issue, a complete `metadata.resourceRef` workspace-file reference for this issue, a canonical Paperclip attachment metadata block that points at a real same-issue attachment, or a `documentId`/`documentKey` that resolves to a real same-issue document. Empty `resourceRef` objects, relative or bare URL paths, fabricated attachment paths, dangling attachment IDs, and dangling document IDs/keys do not qualify.
+For work products, "inspectable" means a reviewer can resolve the artifact: use an absolute `http(s)://` URL, a canonical `/api/attachments/{id}/content` URL for an attachment on this issue, a complete `metadata.resourceRef` workspace-file reference for this issue, a canonical Paperclip attachment metadata block that points at a real same-issue attachment, or a `documentId`/`documentKey` that resolves to a real same-issue document whose latest revision is run-attributed. Empty `resourceRef` objects, relative or bare URL paths, fabricated attachment paths, dangling attachment IDs, dangling document IDs/keys, and pointers to runless documents do not qualify.
 
 ### What will not work
 
