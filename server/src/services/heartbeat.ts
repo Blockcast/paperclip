@@ -1921,6 +1921,15 @@ async function isGitCheckout(cwd: string | null | undefined) {
     .catch(() => false);
 }
 
+async function pathIsAbsent(cwd: string): Promise<boolean> {
+  try {
+    await fs.lstat(cwd);
+    return false;
+  } catch (error: unknown) {
+    return (error as NodeJS.ErrnoException)?.code === "ENOENT";
+  }
+}
+
 // Unlike isGitCheckout(), this does not fail open: a probe error that isn't
 // positively identifiable as "cwd is not a git checkout" (missing directory,
 // or git's own "not a git repository" fatal) is treated as "could be a
@@ -1940,7 +1949,9 @@ async function probeGitCheckoutStateStrict(
     });
     return readNonEmptyString(result.stdout) ? "checkout" : "indeterminate";
   } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return "not_a_checkout";
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return await pathIsAbsent(cwd) ? "not_a_checkout" : "indeterminate";
+    }
     const stderr = typeof (error as { stderr?: unknown })?.stderr === "string"
       ? (error as { stderr: string }).stderr
       : "";

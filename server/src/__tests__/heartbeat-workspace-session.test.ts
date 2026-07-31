@@ -871,6 +871,26 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
     }
   });
 
+  it("rejects when the fallback cwd exists but git cannot be resolved", async () => {
+    const fakeBin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-empty-git-path-"));
+    const previousPath = process.env.PATH;
+    try {
+      await fs.mkdir(fallbackCwd, { recursive: true });
+      await runGit(fallbackCwd, ["init"]);
+      process.env.PATH = fakeBin;
+
+      await expectWorkspaceValidationFailure(
+        fallbackInput(),
+        "k8s_agent_home_git_bootstrap_unsupported",
+        "Refusing to dispatch claude_k8s run isolation from the shared agent-home fallback cwd",
+      );
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await fs.rm(fakeBin, { recursive: true, force: true });
+    }
+  });
+
   it("allows stateless dispatch without issue context", async () => {
     await fs.mkdir(fallbackCwd, { recursive: true });
     await runGit(fallbackCwd, ["init"]);
