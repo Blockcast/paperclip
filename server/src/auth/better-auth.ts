@@ -295,11 +295,10 @@ export function createBetterAuthHandler(auth: BetterAuthHandlerTarget): RequestH
   return (req, res, next) => {
     const operation = classifyAuthOperation(req.originalUrl);
     res.once("finish", () => {
-      const locationHeader = res.getHeader("location");
       const outcome = classifyAuthResponse({
         operation,
         statusCode: res.statusCode,
-        location: typeof locationHeader === "number" ? String(locationHeader) : locationHeader,
+        location: res.getHeader("location"),
       });
       recordAuthRequest({ operation, outcome });
       logger.info(

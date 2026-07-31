@@ -299,10 +299,71 @@ function makeRecoveryAction(overrides: Record<string, unknown> = {}) {
   };
 }
 
+// `hasRecentDeniedIssueWriteLog` (server/src/routes/issues.ts) is the only
+// `.where(...).limit(1)` lookup these routes issue: it selects `{ entityId }`
+// from activity_log to find a recent `issue_write_denied` row for the same
+// actor + run + target + action + reason + responseStatus + payload fingerprint,
+// and short-circuits recording when one exists.
+//
+// The stub used to resolve `[]` unconditionally, which meant the dedupe
+// early-return never executed in CI at all. Because the lookup deliberately
+// fails open (a throw is caught and recording proceeds), a regression that broke
+// dedupe outright — a renamed `details` key, a wrong column — would have stayed
+// green while silently recording without bound. `recentRows` drives the
+// duplicate branch; `onLookup` captures the predicate so a test can assert the
+// discriminators it keys on.
+type DeniedWriteLookupStub = {
+  recentRows?: unknown[];
+  rowsFor?: (where: unknown) => unknown[];
+  onLookup?: (where: unknown) => void;
+};
+
+function deniedWriteLookupLimitStub(
+  selection: Record<string, unknown>,
+  where: unknown,
+  stub: DeniedWriteLookupStub,
+) {
+  const isDeniedWriteLookup = Object.keys(selection).includes("entityId");
+  return vi.fn((count: number) => ({
+    then: async (resolve: (rows: unknown[]) => unknown) => {
+      if (!isDeniedWriteLookup) return resolve([]);
+      stub.onLookup?.(where);
+      const rows = stub.rowsFor ? stub.rowsFor(where) : (stub.recentRows ?? []);
+      return resolve(rows.slice(0, count));
+    },
+  }));
+}
+
+// Drizzle keeps bound values as raw primitives inside `queryChunks` until the
+// dialect compiles the statement, so a predicate's parameters can be read back
+// without a database. Used to assert the dedupe key actually carries the fields
+// the recorded row exposes — if the two sides ever drift (one renamed, the other
+// not) dedupe silently stops matching, and only comparing them catches it.
+function collectSqlParams(node: unknown, out: unknown[] = []): unknown[] {
+  if (typeof node === "string" || typeof node === "number") {
+    out.push(node);
+    return out;
+  }
+  if (!node || typeof node !== "object") return out;
+  if (Array.isArray(node)) {
+    for (const child of node) collectSqlParams(child, out);
+    return out;
+  }
+  const chunks = (node as { queryChunks?: unknown }).queryChunks;
+  if (Array.isArray(chunks)) {
+    for (const child of chunks) collectSqlParams(child, out);
+    return out;
+  }
+  const value = (node as { value?: unknown }).value;
+  if (typeof value === "string" || typeof value === "number") out.push(value);
+  return out;
+}
+
 function createRunContextDb(
   contextSnapshot: Record<string, unknown> = {},
   runAgentOrRows: string | Record<string, unknown>[] = ownerAgentId,
   runId: string = ownerRunId,
+  deniedWriteLookup: DeniedWriteLookupStub = {},
 ) {
   const runRows = Array.isArray(runAgentOrRows)
     ? runAgentOrRows
@@ -324,19 +385,14 @@ function createRunContextDb(
     return [{ id: runAgentId, companyId: runAgentCompanyId, permissions: {}, role: "engineer", reportsTo: null }];
   };
   const buildQuery = (selection: Record<string, unknown>) => {
-    const whereResult = {
+    const makeWhereResult = (where: unknown) => ({
       orderBy: vi.fn(async () => []),
-      // BLO-18614: this `.limit()` stub was added for a `.where(...).limit(1)`
-      // lookup used by a comment-widening grant that was split out of PR #806
-      // per CEO review direction (see issue-comment-reopen-routes.test.ts).
-      // Left in place as harmless scaffolding in case a future PR reintroduces
-      // a narrower version of that lookup.
-      limit: vi.fn(() => ({ then: async (resolve: (rows: unknown[]) => unknown) => resolve([]) })),
+      limit: deniedWriteLookupLimitStub(selection, where, deniedWriteLookup),
       then: async (resolve: (rows: unknown[]) => unknown) => resolve(rowsForSelection(selection)),
-    };
+    });
     const query = {
       innerJoin: vi.fn(() => query),
-      where: vi.fn(() => whereResult),
+      where: vi.fn((where: unknown) => makeWhereResult(where)),
     };
     return query;
   };
@@ -500,6 +556,10 @@ describe("agent issue mutation checkout ownership", () => {
     vi.doUnmock("../middleware/index.js");
     registerRouteMocks();
     vi.clearAllMocks();
+    // `clearAllMocks` clears calls but keeps implementations, so a test that
+    // installs one on `logActivity` (see `cheapRecoveryDedupeHarness`) would
+    // otherwise leak it into every test that follows.
+    mockLogActivity.mockImplementation((async () => undefined) as never);
     mockAccessService.canUser.mockReset();
     mockAccessService.decide.mockReset();
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
@@ -1653,6 +1713,44 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
+  it("records the missing-run-id comment denial so the assignee's own content stays recoverable", async () => {
+    // This denial fires only when the issue is in_progress AND assigned to the
+    // actor, so it is an authenticated agent commenting on its own active issue.
+    // It used to share a branch with `agent_auth_required` — which genuinely
+    // cannot be recorded, having no agentId to attribute — and so responded 401
+    // and dropped the body. A dropped 401 loses the comment exactly the way a
+    // dropped 403 does, and this is the payload most worth keeping.
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:comment" || input.action === "issue:read",
+      action: input.action,
+      reason: "allow_test_default",
+      explanation: "Allowed by missing-run-id recording regression test.",
+    }));
+    const app = await createApp({ ...ownerActor(), runId: undefined });
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "diagnosis worth preserving" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(401);
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    const denied = mockLogActivity.mock.calls
+      .map(([, entry]) => entry as {
+        action?: string;
+        runId?: string | null;
+        details?: { attemptedAction?: string; reason?: string; responseStatus?: number; payload?: unknown };
+      })
+      .filter((entry) => entry.action === "issue_write_denied");
+    expect(denied, "the 401 comment denial must leave a recovery record").toHaveLength(1);
+    expect(denied[0].details).toMatchObject({
+      attemptedAction: "issue:comment",
+      reason: "deny_missing_run_id",
+      responseStatus: 401,
+    });
+    expect(denied[0].runId, "no run id is exactly why this denied").toBeNull();
+    expect(JSON.stringify(denied[0].details?.payload)).toContain("diagnosis worth preserving");
+  });
+
   it("still enforces checkout run ownership for same-assignee state mutations", async () => {
     const app = await createApp(ownerActorFromSweepRun());
     const { HttpError } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
@@ -1922,6 +2020,107 @@ describe("agent issue mutation checkout ownership", () => {
     const serializedPayload = JSON.stringify(payload);
     expect(serializedPayload).not.toContain("sk-cheap-secret-value");
     expect(serializedPayload).toContain(REDACTED_EVENT_VALUE);
+  });
+
+  // Emulates the activity_log rows `hasRecentDeniedIssueWriteLog` reads back,
+  // applying the same discriminators its SQL predicate does: a stored row counts
+  // as a duplicate only when every value the predicate binds is present. So if
+  // the route stops keying on one of them, it stops suppressing here too — which
+  // is what makes these regression tests for the dedupe *key*, not merely for
+  // the early-return.
+  function cheapRecoveryDedupeHarness() {
+    const recorded: {
+      attemptedAction: string;
+      reason: string;
+      responseStatus: number;
+      payloadFingerprint: string;
+    }[] = [];
+    const lookups: unknown[][] = [];
+    mockLogActivity.mockImplementation((async (_db: unknown, entry: unknown) => {
+      const typed = entry as { action?: string; details?: Record<string, unknown> };
+      if (typed.action === "issue_write_denied" && typed.details) {
+        recorded.push({
+          attemptedAction: String(typed.details.attemptedAction),
+          reason: String(typed.details.reason),
+          responseStatus: Number(typed.details.responseStatus),
+          payloadFingerprint: String(typed.details.payloadFingerprint),
+        });
+      }
+      return undefined;
+    }) as never);
+    const deniedWriteLookup: DeniedWriteLookupStub = {
+      onLookup: (where) => lookups.push(collectSqlParams(where)),
+      rowsFor: (where) => {
+        const params = collectSqlParams(where);
+        const duplicate = recorded.some((row) => params.includes(row.attemptedAction)
+          && params.includes(row.reason)
+          && params.includes(String(row.responseStatus))
+          && params.includes(row.payloadFingerprint));
+        return duplicate ? [{ entityId: issueId }] : [];
+      },
+    };
+    const cheapProfile = {
+      modelProfile: "cheap",
+      recoveryIntent: "status_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: false,
+      resumeRequiresNormalModel: true,
+    };
+    const denyPatch = async (comment: string) => {
+      const app = await createApp(
+        ownerActor(),
+        createRunContextDb(cheapProfile, ownerAgentId, ownerRunId, deniedWriteLookup),
+      );
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAdapterOverrides: { modelProfile: "cheap" }, comment });
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      return res;
+    };
+    return { recorded, lookups, denyPatch };
+  }
+
+  it("suppresses an exact repeat denial inside the window but records one whose payload differs", async () => {
+    const { recorded, denyPatch } = cheapRecoveryDedupeHarness();
+
+    await denyPatch("first denied diagnosis");
+    expect(recorded).toHaveLength(1);
+
+    // Same actor, run, target, action, reason and status, same body: a true
+    // repeat, and the only case dedupe should collapse.
+    await denyPatch("first denied diagnosis");
+    expect(recorded, "an identical repeat must not add a second recovery row").toHaveLength(1);
+
+    // Differing content is different recoverable evidence. AC3 exists to keep
+    // the payload, so this must record even though every other key matches.
+    await denyPatch("second, materially different diagnosis");
+    expect(recorded, "a denial with a different payload must still be recorded").toHaveLength(2);
+    expect(recorded[0].payloadFingerprint).not.toBe(recorded[1].payloadFingerprint);
+  });
+
+  it("keys the dedupe lookup on every discriminator it records", async () => {
+    const { recorded, lookups, denyPatch } = cheapRecoveryDedupeHarness();
+
+    await denyPatch("denied diagnosis");
+
+    expect(recorded).toHaveLength(1);
+    const [row] = recorded;
+    expect(row.reason).toBe("deny_cheap_recovery_profile");
+    expect(row.responseStatus).toBe(403);
+    expect(row.payloadFingerprint).toMatch(/^[\w-]{24}$/);
+
+    // The recorded row and the predicate must agree on both key names and
+    // values. Comparing them is the only thing that catches a rename on one
+    // side: the lookup fails open, so a predicate that silently matches nothing
+    // records without bound instead of erroring.
+    expect(lookups).toHaveLength(1);
+    const [params] = lookups;
+    expect(params).toContain(row.attemptedAction);
+    expect(params).toContain(row.reason);
+    expect(params).toContain(String(row.responseStatus));
+    expect(params).toContain(row.payloadFingerprint);
+    expect(params, "dedupe must be scoped to the acting run").toContain(ownerRunId);
+    expect(params).toContain(issueId);
   });
 
   it("defaults agent-created root follow-up issues to inherit the current run workspace", async () => {
@@ -2923,6 +3122,7 @@ describe("agent issue mutation checkout ownership", () => {
       watchdogIssueId?: string | null;
       ancestryParentId?: string | null;
       watchdogRows?: Record<string, unknown>[];
+      deniedWriteLookup?: DeniedWriteLookupStub;
     } = {}) {
       const watchedIssueId = options.watchedIssueId ?? issueId;
       const runRows = [{
@@ -2955,19 +3155,17 @@ describe("agent issue mutation checkout ownership", () => {
         return [{ id: peerAgentId, companyId, permissions: {}, role: "engineer", reportsTo: null }];
       };
       const buildQuery = (selection: Record<string, unknown>) => {
-        const whereResult = {
+        const makeWhereResult = (where: unknown) => ({
           orderBy: vi.fn(async () => []),
-          // BLO-18614: same vestigial `.limit()` stub as above — the
-          // comment-widening lookup that needed it was split out of PR #806.
-          // Kept as a harmless default (resolves empty rather than reusing
-          // rowsForSelection, which would otherwise collide with the
-          // ancestry-row branch above via the shared "parentId" key).
-          limit: vi.fn(() => ({ then: async (resolve: (rows: unknown[]) => unknown) => resolve([]) })),
+          // Same `hasRecentDeniedIssueWriteLog` lookup as the top-level factory.
+          // It must not fall through to `rowsForSelection`, which would collide
+          // with the ancestry-row branch above via the shared "parentId" key.
+          limit: deniedWriteLookupLimitStub(selection, where, options.deniedWriteLookup ?? {}),
           then: async (resolve: (rows: unknown[]) => unknown) => resolve(rowsForSelection(selection)),
-        };
+        });
         const query = {
           innerJoin: vi.fn(() => query),
-          where: vi.fn(() => whereResult),
+          where: vi.fn((where: unknown) => makeWhereResult(where)),
         };
         return query;
       };

@@ -3835,18 +3835,39 @@ export function issueRoutes(
   const DENIED_ISSUE_WRITE_MAX_TOTAL_BYTES = 16000;
   const DENIED_ISSUE_WRITE_DEDUPE_WINDOW_MS = 5 * 60_000;
   type IssueAccessDecision = Awaited<ReturnType<typeof decideIssueAccess>>;
+  // Review fix: only the `deny_*` half of the decision union is a denial
+  // reason. Unioning the whole set let `allow_company_agent` / `allow_issue_creator`
+  // type-check at every `recordDeniedIssueWrite` call site and inside
+  // `isUntrustedDenialReason`, where an allow reason is nonsense.
   type DeniedIssueWriteReason =
-    | IssueAccessDecision["reason"]
+    | Extract<IssueAccessDecision["reason"], `deny_${string}`>
     | "deny_active_checkout"
     | "deny_assignee_mismatch"
     | "deny_cheap_recovery_profile"
     | "deny_closed_execution_workspace"
     | "deny_low_trust_control_plane"
+    | "deny_missing_run_id"
     | "deny_patch_policy"
     | "deny_recovery_handoff_comment_only"
     | "deny_resume_policy"
     | "deny_structured_comment_fields"
     | "deny_task_watchdog_scope";
+
+  // `decideIssueAccess` returns `allowed` and `reason` as independent fields
+  // rather than a union discriminated on `allowed`, so even inside an
+  // `if (!decision.allowed)` branch the reason still widens to include the
+  // `allow_*` variants. Narrow here rather than widening
+  // `DeniedIssueWriteReason` back to the full set at every call site.
+  function deniedBoundaryReason(reason: IssueAccessDecision["reason"]): DeniedIssueWriteReason {
+    if (reason.startsWith("deny_")) {
+      return reason as Extract<IssueAccessDecision["reason"], `deny_${string}`>;
+    }
+    // Unreachable for a denied decision. Falling back beats throwing — a
+    // recovery-logging path must never turn an already-denied write into a 500 —
+    // and callers pass the original through as `boundaryReason`, so the verbatim
+    // value survives on the row if this ever fires.
+    return "deny_missing_grant";
+  }
 
   // BLO-18614 review fix: the previous version only truncated top-level
   // string fields, so a nested object (e.g. {a: {b: {c: "...50kb..."}}})
@@ -3957,11 +3978,39 @@ export function issueRoutes(
       || reason === "deny_policy_restricted";
   }
 
+  // Review fix: `reason` alone is far too coarse to be the dedupe key. Several
+  // reasons cover more than one call site at more than one status — e.g.
+  // `deny_patch_policy` covers both the 400 "Follow-up intent requires a
+  // comment" body-validation failure and the 403 recovery-action authorization
+  // denial; `deny_task_watchdog_scope` covers both the 409 staleness denial and
+  // the 403 forged-scope denial. Keying on reason alone let an agent send
+  // `{resume: true}` with no comment, plant a cheap self-triggerable row, and
+  // suppress the genuine authorization denial that followed within the window —
+  // exactly the unrecoverable-attempt gap AC3 exists to close.
+  //
+  // So the key also carries the response status, the run, and a fingerprint of
+  // the bounded payload. The payload is the load-bearing one: two denials with
+  // differing content are two distinct pieces of recoverable evidence, and
+  // preserving content is the whole point of the record. What collapses is only
+  // a true repeat — same run, same target, same reason, same status, same body.
+  function deniedIssueWritePayloadFingerprint(payload: unknown) {
+    let serialized = "";
+    try {
+      serialized = JSON.stringify(payload) ?? "";
+    } catch {
+      serialized = "";
+    }
+    return createHash("sha256").update(serialized).digest("base64url").slice(0, 24);
+  }
+
   async function hasRecentDeniedIssueWriteLog(input: {
     issue: { id: string; companyId: string };
     actorId: string;
+    runId: string | null;
     action: "issue:comment" | "issue:mutate";
     reason: DeniedIssueWriteReason;
+    responseStatus: number;
+    payloadFingerprint: string;
   }) {
     const windowStart = new Date(Date.now() - DENIED_ISSUE_WRITE_DEDUPE_WINDOW_MS);
     const [existing] = await db
@@ -3975,8 +4024,13 @@ export function issueRoutes(
         eq(activityLog.entityType, "issue"),
         eq(activityLog.entityId, input.issue.id),
         gte(activityLog.createdAt, windowStart),
+        // `eq(col, null)` renders as `col = NULL`, which is never true, so a
+        // null run would silently disable dedupe rather than scope it.
+        input.runId === null ? isNull(activityLog.runId) : eq(activityLog.runId, input.runId),
         sql`${activityLog.details} ->> 'attemptedAction' = ${input.action}`,
         sql`${activityLog.details} ->> 'reason' = ${input.reason}`,
+        sql`${activityLog.details} ->> 'responseStatus' = ${String(input.responseStatus)}`,
+        sql`${activityLog.details} ->> 'payloadFingerprint' = ${input.payloadFingerprint}`,
       ))
       .limit(1);
     return Boolean(existing);
@@ -3996,35 +4050,46 @@ export function issueRoutes(
     denial: {
       reason: DeniedIssueWriteReason;
       boundaryReason?: IssueAccessDecision["reason"];
-      responseStatus?: number;
+      responseStatus: number;
     },
   ) {
     if (req.actor.type !== "agent" || !req.actor.agentId) return;
-    let recentDuplicate = false;
-    try {
-      recentDuplicate = await hasRecentDeniedIssueWriteLog({
-        issue,
-        actorId: req.actor.agentId,
-        action,
-        reason: denial.reason,
-      });
-    } catch (err) {
-      logger.warn(
-        { err, issueId: issue.id, action, reason: denial.reason },
-        "BLO-18614: failed to check recent denied issue write for recovery",
-      );
-    }
-    if (recentDuplicate) return;
 
     try {
       const rawBody = (req.body ?? {}) as Record<string, unknown>;
       const payload = boundDenialPayload(rawBody);
+      // Fingerprint the *bounded* payload, not the raw body, so the dedupe key
+      // describes what would actually be stored: two attempts that redact and
+      // truncate to the same record are a true repeat.
+      const payloadFingerprint = deniedIssueWritePayloadFingerprint(payload);
+      const runId = req.actor.runId ?? null;
+
+      let recentDuplicate = false;
+      try {
+        recentDuplicate = await hasRecentDeniedIssueWriteLog({
+          issue,
+          actorId: req.actor.agentId,
+          runId,
+          action,
+          reason: denial.reason,
+          responseStatus: denial.responseStatus,
+          payloadFingerprint,
+        });
+      } catch (err) {
+        logger.warn(
+          { err, issueId: issue.id, action, reason: denial.reason },
+          "BLO-18614: failed to check recent denied issue write for recovery",
+        );
+      }
+      if (recentDuplicate) return;
+
       const untrusted = isUntrustedDenialReason(denial.reason);
       const details = boundDeniedIssueWriteDetails({
         attemptedAction: action,
         reason: denial.reason,
         boundaryReason: denial.boundaryReason,
         responseStatus: denial.responseStatus,
+        payloadFingerprint,
         quarantined: true,
         sourceTrust: untrusted ? "untrusted_boundary_denied" : "unauthorized_actor",
         quarantineNotice:
@@ -4036,7 +4101,7 @@ export function issueRoutes(
         actorType: "agent",
         actorId: req.actor.agentId,
         agentId: req.actor.agentId,
-        runId: req.actor.runId ?? null,
+        runId,
         action: "issue_write_denied",
         entityType: "issue",
         entityId: issue.id,
@@ -4059,7 +4124,24 @@ export function issueRoutes(
   ) {
     const authorization = await evaluateAgentIssueCommentAuthorization(req, issue);
     if (authorization.allowed) return authorization.decision;
-    if (authorization.kind === "agent_auth_required" || authorization.kind === "missing_run_id") {
+    if (authorization.kind === "agent_auth_required") {
+      // Nothing to attribute a recovery record to: without an `agentId` on the
+      // actor `recordDeniedIssueWrite` no-ops anyway.
+      res.status(authorization.status).json({ error: authorization.error });
+      return false;
+    }
+    if (authorization.kind === "missing_run_id") {
+      // Review fix: this used to share the branch above and so responded 401
+      // without recording — losing the one payload most worth keeping. Unlike
+      // `agent_auth_required`, this fires only when the issue is `in_progress`
+      // and assigned to the actor, i.e. an authenticated agent (with an
+      // `agentId`) commenting on its own active issue. That is the assignee's
+      // own content, and a dropped 401 loses it exactly the way a dropped 403
+      // does.
+      await recordDeniedIssueWrite(req, issue, "issue:comment", {
+        reason: "deny_missing_run_id",
+        responseStatus: authorization.status,
+      });
       res.status(authorization.status).json({ error: authorization.error });
       return false;
     }
@@ -4072,7 +4154,8 @@ export function issueRoutes(
       return false;
     }
     await recordDeniedIssueWrite(req, issue, "issue:comment", {
-      reason: authorization.decision.reason,
+      reason: deniedBoundaryReason(authorization.decision.reason),
+      boundaryReason: authorization.decision.reason,
       responseStatus: 403,
     });
     respondIssueBoundaryDenied(res, authorization.decision, authorization.remediation);
@@ -4321,7 +4404,8 @@ export function issueRoutes(
     if (!boundaryDecision.allowed) {
       if (await isActiveRecoveryActionOwner()) return true;
       await recordDeniedIssueWrite(req, issue, "issue:mutate", {
-        reason: boundaryDecision.reason,
+        reason: deniedBoundaryReason(boundaryDecision.reason),
+        boundaryReason: boundaryDecision.reason,
         responseStatus: 403,
       });
       respondIssueBoundaryDenied(res, boundaryDecision);
