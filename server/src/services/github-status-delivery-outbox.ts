@@ -377,6 +377,7 @@ export async function enqueueGithubCommitStatusDelivery(
     lastError: null,
     lastErrorKind: null,
     lastResult: null,
+    createdAt: now,
     updatedAt: now,
   } satisfies typeof githubCommitStatusDeliveries.$inferInsert;
 
@@ -402,6 +403,7 @@ export async function enqueueGithubCommitStatusDelivery(
         lastError: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.lastError} else null end`,
         lastErrorKind: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.lastErrorKind} else null end`,
         lastResult: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.lastResult} else null end`,
+        createdAt: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.createdAt} else ${nowSql} end`,
         updatedAt: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.updatedAt} else ${nowSql} end`,
       },
     })

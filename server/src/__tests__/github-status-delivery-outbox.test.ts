@@ -338,6 +338,54 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(false);
   });
 
+  it("refreshes the freshness baseline when reviving a failed delivery", async () => {
+    setCreds();
+    const { companyId, runId, delivery } = await seedRun();
+    const originalQueuedAt = new Date(Date.now() - 60_000);
+    const interveningStatusAt = new Date(Date.now() - 30_000);
+    await db
+      .update(githubCommitStatusDeliveries)
+      .set({
+        status: "failed_permanent",
+        createdAt: originalQueuedAt,
+        updatedAt: originalQueuedAt,
+        nextAttemptAt: originalQueuedAt,
+        lastError: "commit_status_write_http_403",
+        lastErrorKind: "permanent",
+      })
+      .where(eq(githubCommitStatusDeliveries.id, delivery.id));
+
+    const revived = await enqueueGithubCommitStatusDelivery(db, {
+      companyId,
+      sourceRunId: runId,
+      repoFullName: "Blockcast/hang",
+      sha: HEAD_SHA,
+      context: "review/ally-complete",
+      state: "failure",
+      description: "Paperclip reviewer run exhausted again; no review was posted.",
+      targetUrl: "https://github.com/Blockcast/hang/pull/7?attempt=2",
+      prNumber: 7,
+      prUrl: "https://github.com/Blockcast/hang/pull/7?attempt=2",
+    });
+    const fetchMock = stubGithub({
+      latestStatuses: [
+        {
+          context: "review/ally-complete",
+          state: "pending",
+          created_at: interveningStatusAt.toISOString(),
+        },
+      ],
+      reviews: [],
+      comments: [],
+    });
+
+    expect(revived.createdAt.getTime()).toBeGreaterThan(interveningStatusAt.getTime());
+    await pollGitHubCommitStatusDeliveriesOnce(db);
+
+    expect(await readDelivery(delivery.id)).toMatchObject({ status: "delivered" });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(true);
+  });
+
   it("skips the failure write when reviewer evidence now exists on GitHub", async () => {
     setCreds();
     const { delivery } = await seedRun();
