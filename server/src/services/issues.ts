@@ -1843,12 +1843,6 @@ async function withIssueLabels(dbOrTx: any, rows: IssueRow[]): Promise<IssueWith
 }
 
 /**
- * Evidence-gate fetcher (BLO-4824 / BLO-4461). Loads the data the pure
- * evaluator needs: issue labels, the 10 most-recent comments, any recent
- * operator overrides, and any work_products. Caller supplies the description
- * (already on the existing row in the PATCH handler, no need to re-select).
- */
-/**
  * Shapes that record a DURABLE fact ("a PR/commit was attached to this issue"),
  * as opposed to a fact about the current comment window.
  */
@@ -1886,12 +1880,24 @@ function preserveDurableLandingEvidence<T extends { allDetected?: unknown }>(
   return { ...fresh, allDetected: [...freshDetected, ...carried] };
 }
 
+/**
+ * Evidence-gate fetcher (BLO-4824 / BLO-4461). Loads the data the pure
+ * evaluator needs: issue labels, the 10 most-recent comments, any recent
+ * operator overrides, and any work_products. Caller supplies the description
+ * (already on the existing row in the PATCH handler, no need to re-select).
+ *
+ * `effectiveLabelNames` overrides the labels read from the DB. A PATCH may
+ * carry `labelIds` alongside the status change, and `syncIssueLabels` only runs
+ * later inside the update transaction — so the stored rows are the PRE-patch
+ * labels and evaluating against them applies the wrong policy. (BLO-19047)
+ */
 async function fetchEvidenceForIssue(
   dbOrTx: any,
   issueId: string,
   description: string | null,
   previousDescription: string | null = description,
   now: Date = new Date(),
+  effectiveLabelNames: Array<{ name: string }> | null = null,
 ): Promise<EvidenceFetchResult> {
   const [recentComments, operatorOverrideComments, workProductRows, labelsByIssueId, descriptionHistory] = await Promise.all([
     dbOrTx
@@ -1953,7 +1959,7 @@ async function fetchEvidenceForIssue(
     description,
     doneWhenBulletsRemoved:
       countDoneWhenBullets(description ?? "") === 0 && hadPriorDoneWhenBullets,
-    labels: issueLabels.map((l: { name: string }) => ({ name: l.name })),
+    labels: effectiveLabelNames ?? issueLabels.map((l: { name: string }) => ({ name: l.name })),
     comments: recentComments as EvidenceFetchResult["comments"],
     operatorOverrideComments: operatorOverrideComments as EvidenceFetchResult["operatorOverrideComments"],
     workProducts: workProductRows as EvidenceFetchResult["workProducts"],
@@ -4836,6 +4842,33 @@ export function issueService(db: Db) {
         companyId,
       })),
     );
+  }
+
+  /**
+   * Label NAMES for an explicit `labelIds` patch, validated against the company.
+   *
+   * The evidence gate keys its policy off label names, and it runs before the
+   * update transaction that calls `syncIssueLabels`. Reading names from the DB
+   * at gate time therefore yields the labels the issue is moving AWAY from.
+   * Validation is duplicated from `assertValidLabelIds` deliberately: it has to
+   * happen before the gate so an invalid-label patch reports the label error
+   * rather than a misleading `missing-evidence`. (BLO-19047)
+   */
+  async function resolveLabelNames(
+    dbOrTx: any,
+    companyId: string,
+    labelIds: string[],
+  ): Promise<Array<{ name: string }>> {
+    const deduped = [...new Set(labelIds)];
+    if (deduped.length === 0) return [];
+    const rows = await dbOrTx
+      .select({ name: labels.name })
+      .from(labels)
+      .where(and(eq(labels.companyId, companyId), inArray(labels.id, deduped)));
+    if (rows.length !== deduped.length) {
+      throw unprocessable("One or more labels are invalid for this company");
+    }
+    return rows.map((row: { name: string }) => ({ name: row.name }));
   }
 
   async function getIssueRelationSummaryMap(
@@ -7960,6 +7993,19 @@ export function issueService(db: Db) {
         assertTransition(existing.status, issueData.status);
       }
 
+      // Labels the issue will HAVE once this patch lands. Both gates below run
+      // before `runUpdate`'s transaction, and `syncIssueLabels` runs inside it,
+      // so a combined `{ status: "in_review", labelIds: [frontend] }` on an
+      // unlabeled issue would otherwise be judged under the unlabeled fallback
+      // and only then acquire the stricter frontend policy — recording a
+      // pass/warn against a policy the issue no longer has, and letting a
+      // single call sidestep the requirements its new labels demand.
+      // (BLO-19047 review)
+      const effectiveLabelNames =
+        nextLabelIds === undefined
+          ? null
+          : await resolveLabelNames(dbOrTx, existing.companyId, nextLabelIds);
+
       // Done-execution gate (narrated-completion hardening, instance flag
       // `enableDoneExecutionGate`, default off). Blocks an agent self-marking
       // an issue `done` when no real execution run ever occurred and no
@@ -7984,6 +8030,7 @@ export function issueService(db: Db) {
               issueData.description !== undefined ? issueData.description : existing.description,
               existing.description,
               now,
+              effectiveLabelNames,
             ),
             id,
           );
@@ -8137,6 +8184,7 @@ export function issueService(db: Db) {
               issueData.description !== undefined ? issueData.description : existing.description,
               existing.description,
               now,
+              effectiveLabelNames,
             ),
             id,
           );
