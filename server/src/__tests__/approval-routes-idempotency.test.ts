@@ -384,6 +384,27 @@ describe("approval routes idempotent retries", () => {
     );
   });
 
+  it("rejects an agent id on the generic hire approval route", async () => {
+    mockSecretService.normalizeHireApprovalPayloadForPersistence.mockResolvedValue({
+      name: "Untrusted hire",
+      agentId: "00000000-0000-0000-0000-000000000002",
+    });
+
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "hire_agent",
+        payload: {
+          name: "Untrusted hire",
+          agentId: "00000000-0000-0000-0000-000000000002",
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("cannot bind an existing agent");
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+  });
+
   it("carries the payload `note` into details as description (note alias)", async () => {
     mockApprovalService.create.mockResolvedValue({
       id: "approval-note",

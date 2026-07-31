@@ -1,6 +1,6 @@
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agents, approvalComments, approvals } from "@paperclipai/db";
+import { agents, approvalComments, approvals } from "@paperclipai/db";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
@@ -40,6 +40,35 @@ export function approvalService(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (!existing) throw notFound("Approval not found");
     return existing;
+  }
+
+  async function getBoundPendingAgent(
+    approval: ApprovalRecord,
+    dbOrTx: Db = db,
+  ) {
+    const payloadAgentId = typeof approval.payload.agentId === "string" ? approval.payload.agentId : null;
+    if (!approval.linkedAgentId) {
+      if (!payloadAgentId) return null;
+      throw conflict("Hire approval is not bound to a pending agent", { approvalId: approval.id });
+    }
+    if (payloadAgentId !== approval.linkedAgentId) {
+      throw conflict("Hire approval is not bound to a pending agent", { approvalId: approval.id });
+    }
+    const boundAgent = await dbOrTx
+      .select({ id: agents.id })
+      .from(agents)
+      .where(
+        and(
+          eq(agents.id, approval.linkedAgentId),
+          eq(agents.companyId, approval.companyId),
+          eq(agents.status, "pending_approval"),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (!boundAgent) {
+      throw conflict("Hire approval is not bound to a pending agent", { approvalId: approval.id });
+    }
+    return boundAgent;
   }
 
   async function resolveApproval(
@@ -109,7 +138,7 @@ export function approvalService(db: Db) {
             eq(approvals.companyId, companyId),
             eq(approvals.type, "hire_agent"),
             inArray(approvals.status, resolvableStatuses),
-            sql`${approvals.payload} ->> 'agentId' = ${agentId}`,
+            eq(approvals.linkedAgentId, agentId),
           ),
         );
       return rows[0] ?? null;
@@ -134,11 +163,10 @@ export function approvalService(db: Db) {
       const now = new Date();
       if (applied && updated.type === "hire_agent") {
         const payload = updated.payload as Record<string, unknown>;
-        const payloadAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
-        if (payloadAgentId) {
-          await agentsSvc.activatePendingApproval(payloadAgentId, payload);
+        if (updated.linkedAgentId) {
+          await agentsSvc.activatePendingApproval(updated.linkedAgentId, payload);
           await reconcileApprovedBuiltInAgent(updated.companyId, payload);
-          hireApprovedAgentId = payloadAgentId;
+          hireApprovedAgentId = updated.linkedAgentId;
         } else {
           const created = await agentsSvc.create(updated.companyId, {
             name: String(payload.name ?? "New Agent"),
@@ -201,10 +229,8 @@ export function approvalService(db: Db) {
       );
 
       if (applied && updated.type === "hire_agent") {
-        const payload = updated.payload as Record<string, unknown>;
-        const payloadAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
-        if (payloadAgentId) {
-          await agentsSvc.terminate(payloadAgentId);
+        if (updated.linkedAgentId) {
+          await agentsSvc.terminate(updated.linkedAgentId);
         }
       }
 
@@ -300,37 +326,8 @@ export function approvalService(db: Db) {
         // terminates it; withdrawing must too, or the agent is stranded frozen
         // with no remaining approval to decide it.
         if (updated.type === "hire_agent") {
-          const payload = updated.payload as Record<string, unknown>;
-          const payloadAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
-          const boundPendingAgent = payloadAgentId
-            ? await txDb
-                .select({ id: agents.id })
-                .from(agents)
-                .innerJoin(
-                  activityLog,
-                  and(
-                    eq(activityLog.companyId, agents.companyId),
-                    eq(activityLog.action, "approval.created"),
-                    eq(activityLog.entityType, "approval"),
-                    eq(activityLog.entityId, updated.id),
-                    sql`${activityLog.details} ->> 'linkedAgentId' = ${agents.id}::text`,
-                  ),
-                )
-                .where(
-                  and(
-                    eq(agents.id, payloadAgentId),
-                    eq(agents.companyId, updated.companyId),
-                    eq(agents.status, "pending_approval"),
-                  ),
-                )
-                .then((rows) => rows[0] ?? null)
-            : null;
-          if (!boundPendingAgent) {
-            throw conflict("Hire approval is not bound to a pending agent", {
-              approvalId: updated.id,
-            });
-          }
-          await agentService(txDb).terminate(boundPendingAgent.id);
+          const boundPendingAgent = await getBoundPendingAgent(updated, txDb);
+          if (boundPendingAgent) await agentService(txDb).terminate(boundPendingAgent.id);
         }
 
         await logActivity(txDb, {

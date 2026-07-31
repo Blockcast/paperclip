@@ -43,6 +43,7 @@ function createApproval(status: string): ApprovalRecord {
     id: "approval-1",
     companyId: "company-1",
     type: "hire_agent",
+    linkedAgentId: "agent-1",
     status,
     payload: { agentId: "agent-1" },
     requestedByAgentId: "requester-1",
@@ -136,6 +137,7 @@ describe("approvalService resolution idempotency", () => {
   it("creates the agent from payload when approval does not reference a pending agent", async () => {
     const approved = {
       ...createApproval("approved"),
+      linkedAgentId: null,
       payload: {
         name: "New Agent",
         adapterConfig: {
@@ -323,6 +325,8 @@ describeEmbeddedPostgres("approvalService.withdraw adversarial hire targets", ()
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockAgentService.terminate.mockResolvedValue(undefined);
+    mockLogActivity.mockResolvedValue(undefined);
   });
 
   afterAll(async () => {
@@ -347,6 +351,7 @@ describeEmbeddedPostgres("approvalService.withdraw adversarial hire targets", ()
       type: "hire_agent",
       status: "pending",
       payload: { agentId: targetAgentId },
+      linkedAgentId: null,
     });
     return id;
   }
@@ -395,5 +400,35 @@ describeEmbeddedPostgres("approvalService.withdraw adversarial hire targets", ()
     const approvalId = await seedCraftedApproval(approvalCompanyId, targetAgentId);
 
     await expectRejectedWithoutMutation(approvalId, targetAgentId);
+  });
+
+  it("withdraws and terminates the exact linked pending agent", async () => {
+    const companyId = await seedCompany("Bound pending agent company");
+    const targetAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: targetAgentId,
+      companyId,
+      name: "Bound pending agent",
+      role: "engineer",
+      status: "pending_approval",
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      payload: { agentId: targetAgentId },
+      linkedAgentId: targetAgentId,
+    });
+
+    const result = await approvalService(db).withdraw(
+      approvalId,
+      "hire no longer needed",
+      withdrawalActor,
+    );
+
+    expect(result.status).toBe("withdrawn");
+    expect(mockAgentService.terminate).toHaveBeenCalledWith(targetAgentId);
   });
 });
