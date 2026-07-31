@@ -3593,6 +3593,7 @@ export function issueRoutes(
   }
 
   const DENIED_ISSUE_WRITE_FIELD_MAX_CHARS = 4000;
+  const DENIED_ISSUE_WRITE_REDACTION_HEADROOM_CHARS = 512;
   const DENIED_ISSUE_WRITE_MAX_DEPTH = 4;
   const DENIED_ISSUE_WRITE_MAX_ENTRIES = 25;
   const DENIED_ISSUE_WRITE_MAX_TOTAL_BYTES = 16000;
@@ -3601,6 +3602,8 @@ export function issueRoutes(
     | IssueAccessDecision["reason"]
     | "deny_active_checkout"
     | "deny_assignee_mismatch"
+    | "deny_cheap_recovery_profile"
+    | "deny_closed_execution_workspace"
     | "deny_patch_policy"
     | "deny_recovery_handoff_comment_only"
     | "deny_resume_policy"
@@ -3613,12 +3616,21 @@ export function issueRoutes(
   // an attacker-controlled payload can be unbounded, and caps breadth (keys
   // / array items) as well as depth so a wide-but-shallow payload can't
   // evade the string-length cap either.
+  //
+  // Every string leaf also goes through `redactSensitiveText` before truncation.
+  // `redactEventPayload` only redacts by field name plus exact JWT-shaped values,
+  // so a credential in prose under an ordinary key must be redacted by value.
+  function redactDenialAuditString(value: string) {
+    const scanWindow = DENIED_ISSUE_WRITE_FIELD_MAX_CHARS + DENIED_ISSUE_WRITE_REDACTION_HEADROOM_CHARS;
+    const droppedBeyondWindow = Math.max(0, value.length - scanWindow);
+    const redacted = redactSensitiveText(value.slice(0, scanWindow));
+    if (redacted.length <= DENIED_ISSUE_WRITE_FIELD_MAX_CHARS && droppedBeyondWindow === 0) return redacted;
+    const dropped = Math.max(0, redacted.length - DENIED_ISSUE_WRITE_FIELD_MAX_CHARS) + droppedBeyondWindow;
+    return `${redacted.slice(0, DENIED_ISSUE_WRITE_FIELD_MAX_CHARS)}…[truncated ${dropped} chars]`;
+  }
+
   function truncateForDenialAudit(value: unknown, depth = 0): unknown {
-    if (typeof value === "string") {
-      return value.length > DENIED_ISSUE_WRITE_FIELD_MAX_CHARS
-        ? `${value.slice(0, DENIED_ISSUE_WRITE_FIELD_MAX_CHARS)}…[truncated ${value.length - DENIED_ISSUE_WRITE_FIELD_MAX_CHARS} chars]`
-        : value;
-    }
+    if (typeof value === "string") return redactDenialAuditString(value);
     if (value === null || typeof value !== "object") return value;
     if (depth >= DENIED_ISSUE_WRITE_MAX_DEPTH) return "[redacted: max nesting depth exceeded]";
     if (Array.isArray(value)) {
@@ -3639,9 +3651,9 @@ export function issueRoutes(
     return result;
   }
 
-  // Depth/breadth truncation happens before central secret redaction so field
-  // names such as `apiKey` or nested `AUTH_TOKEN` never enter the activity log
-  // with their raw values.
+  // Per-leaf value redaction + depth/breadth truncation happen before central
+  // key-based redaction, so both a credential embedded in free text and a
+  // field *named* `apiKey` / nested `AUTH_TOKEN` are covered.
   function boundDenialPayload(rawBody: Record<string, unknown>): unknown {
     const truncated = truncateForDenialAudit(rawBody);
     if (!truncated || typeof truncated !== "object" || Array.isArray(truncated)) return truncated;
@@ -4595,6 +4607,12 @@ export function issueRoutes(
         resumeRequiresNormalModel: true,
       },
     });
+    if (issue.id) {
+      await recordDeniedIssueWrite(req, { id: issue.id, companyId: issue.companyId }, "issue:mutate", {
+        reason: "deny_cheap_recovery_profile",
+        responseStatus: responseStatusForDeniedWrite(res, 403),
+      });
+    }
     return false;
   }
 
@@ -8518,7 +8536,7 @@ export function issueRoutes(
     if (closedExecutionWorkspace && (commentBody || isAgentWorkUpdate)) {
       respondClosedIssueExecutionWorkspace(res, closedExecutionWorkspace);
       await recordDeniedIssueWrite(req, existing, "issue:mutate", {
-        reason: "deny_patch_policy",
+        reason: "deny_closed_execution_workspace",
         responseStatus: responseStatusForDeniedWrite(res, 409),
       });
       return;
@@ -10564,6 +10582,10 @@ export function issueRoutes(
       const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
       if (closedExecutionWorkspace) {
         respondClosedIssueExecutionWorkspace(res, closedExecutionWorkspace);
+        await recordDeniedIssueWrite(req, issue, "issue:comment", {
+          reason: "deny_closed_execution_workspace",
+          responseStatus: responseStatusForDeniedWrite(res, 409),
+        });
         return;
       }
     }

@@ -90,6 +90,10 @@ const mockExternalObjectService = vi.hoisted(() => ({
   syncIssueSafely: vi.fn(async () => undefined),
 }));
 
+const mockExecutionWorkspaceService = vi.hoisted(() => ({
+  getById: vi.fn(async () => null),
+}));
+
 const mockIssueReferenceService = vi.hoisted(() => ({
   deleteDocumentSource: vi.fn(async () => undefined),
   diffIssueReferenceSummary: vi.fn(() => ({
@@ -156,7 +160,7 @@ vi.mock("../services/index.js", () => ({
   }),
   documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
   documentService: () => ({}),
-  executionWorkspaceService: () => ({}),
+  executionWorkspaceService: () => mockExecutionWorkspaceService,
   feedbackService: () => mockFeedbackService,
   goalService: () => ({}),
   heartbeatService: () => mockHeartbeatService,
@@ -175,6 +179,10 @@ vi.mock("../services/index.js", () => ({
 
 vi.mock("../services/external-objects.js", () => ({
   externalObjectService: () => mockExternalObjectService,
+}));
+
+vi.mock("../services/execution-workspaces.js", () => ({
+  executionWorkspaceService: () => mockExecutionWorkspaceService,
 }));
 
 function createApp() {
@@ -274,6 +282,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockIssueTreeControlService.getActivePauseHoldGate.mockReset();
     mockExternalObjectService.syncCommentSafely.mockReset();
     mockExternalObjectService.syncIssueSafely.mockReset();
+    mockExecutionWorkspaceService.getById.mockReset();
     mockTxInsertValues.mockReset();
     mockTxInsert.mockReset();
     mockDbSelect.mockReset();
@@ -316,6 +325,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockHeartbeatService.cancelRun.mockResolvedValue(null);
     mockExternalObjectService.syncCommentSafely.mockResolvedValue(undefined);
     mockExternalObjectService.syncIssueSafely.mockResolvedValue(undefined);
+    mockExecutionWorkspaceService.getById.mockResolvedValue(null);
     mockLogActivity.mockResolvedValue(undefined);
     mockFeedbackService.listIssueVotesForUser.mockResolvedValue([]);
     mockFeedbackService.saveIssueVote.mockResolvedValue({
@@ -730,6 +740,33 @@ describe.sequential("issue comment reopen routes", () => {
     expect(serializedPayload.length).toBeLessThan(hugeLeaf.length);
     expect(serializedPayload.includes(hugeLeaf)).toBe(false);
     expect(serializedPayload).not.toContain(secret);
+    expect(serializedPayload).toContain(REDACTED_EVENT_VALUE);
+  });
+
+  it("redacts denied payload strings before truncating when a secret straddles the cap", async () => {
+    const outsideAgentId = "55555555-5555-4555-8555-555555555555";
+    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: false,
+      action: input.action,
+      reason: "deny_low_trust_boundary",
+      explanation: "Peer agent is outside this low-trust boundary.",
+    }));
+
+    const description = `${"a".repeat(3960)} Authorization: Bearer sk-live-straddle0987654321`;
+    const res = await request(await installActor(createApp(), agentActor(outsideAgentId)))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ description });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    const call = mockLogActivity.mock.calls.find(
+      ([, entry]) => (entry as { action?: string }).action === "issue_write_denied"
+        && (entry as { details?: { attemptedAction?: string } }).details?.attemptedAction === "issue:mutate",
+    );
+    expect(call, "expected an issue_write_denied log entry for issue:mutate").toBeTruthy();
+    const details = (call![1] as { details: Record<string, unknown> }).details;
+    const serializedPayload = JSON.stringify(details.payload);
+    expect(serializedPayload).not.toContain("sk-live-straddle");
     expect(serializedPayload).toContain(REDACTED_EVENT_VALUE);
   });
 
@@ -1413,6 +1450,43 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       }),
     );
+  });
+
+  it("records closed workspace POST comment denials with redacted payload", async () => {
+    const app = await installActor(createApp(), agentActor());
+    mockIssueService.getById.mockResolvedValue({
+      ...makeIssue("todo"),
+      executionWorkspaceId: "workspace-1",
+    });
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "workspace-1",
+      name: "Archived workspace",
+      mode: "isolated_workspace",
+      status: "archived",
+      closedAt: new Date("2026-07-30T00:00:00.000Z"),
+    });
+
+    const res = await request(app)
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Authorization: Bearer sk-denied-secret-value" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    const call = mockLogActivity.mock.calls.find(
+      ([, entry]) => (entry as { action?: string }).action === "issue_write_denied"
+        && (entry as { details?: { attemptedAction?: string } }).details?.attemptedAction === "issue:comment",
+    );
+    expect(call, "expected an issue_write_denied log entry for issue:comment").toBeTruthy();
+    const details = (call![1] as { details: Record<string, unknown> }).details;
+    expect(details).toEqual(expect.objectContaining({
+      attemptedAction: "issue:comment",
+      reason: "deny_closed_execution_workspace",
+      responseStatus: 409,
+      quarantined: true,
+    }));
+    const serializedPayload = JSON.stringify(details.payload);
+    expect(serializedPayload).not.toContain("sk-denied-secret-value");
+    expect(serializedPayload).toContain(REDACTED_EVENT_VALUE);
   });
 
   it("rejects invalid comment metadata before writing a comment", async () => {

@@ -2,6 +2,7 @@ import { Readable } from "node:stream";
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 
 const issueId = "11111111-1111-4111-8111-111111111111";
 const companyId = "22222222-2222-4222-8222-222222222222";
@@ -1715,6 +1716,56 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.create).not.toHaveBeenCalled();
     expect(mockIssueService.createChild).not.toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("records cheap status-only recovery profile PATCH denials with redacted payload", async () => {
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        modelProfile: "cheap",
+        recoveryIntent: "status_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: false,
+        resumeRequiresNormalModel: true,
+      }),
+    );
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        assigneeAdapterOverrides: { modelProfile: "cheap" },
+        comment: "Authorization: Bearer sk-cheap-secret-value",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId,
+        actorType: "agent",
+        actorId: ownerAgentId,
+        action: "issue_write_denied",
+        entityType: "issue",
+        entityId: issueId,
+        issueId,
+        details: expect.objectContaining({
+          attemptedAction: "issue:mutate",
+          reason: "deny_cheap_recovery_profile",
+          responseStatus: 403,
+          quarantined: true,
+        }),
+      }),
+    );
+    const call = mockLogActivity.mock.calls.find(
+      ([, entry]) => (entry as { action?: string }).action === "issue_write_denied"
+        && (entry as { details?: { reason?: string } }).details?.reason === "deny_cheap_recovery_profile",
+    );
+    expect(call, "expected an issue_write_denied log entry for cheap profile denial").toBeTruthy();
+    const payload = (call![1] as { details: { payload: unknown } }).details.payload;
+    const serializedPayload = JSON.stringify(payload);
+    expect(serializedPayload).not.toContain("sk-cheap-secret-value");
+    expect(serializedPayload).toContain(REDACTED_EVENT_VALUE);
   });
 
   it("defaults agent-created root follow-up issues to inherit the current run workspace", async () => {
