@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { performance } from "node:perf_hooks";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
@@ -193,6 +194,20 @@ describe("extractIssueDuplicateFeatures", () => {
     expect(features.get("beforeshortfence")).toBe("symbol");
     expect(features.get("aftershortfence")).toBe("symbol");
     expect(features.get("ts")).not.toBe("symbol");
+  });
+
+  it("handles many unmatched fenced-code openers in bounded time", () => {
+    const description = Array.from({ length: 8_000 }, () => "```ts").join("\n");
+
+    const started = performance.now();
+    const features = extractIssueDuplicateFeatures({
+      title: "Malformed unmatched code fences",
+      description,
+    });
+    const elapsedMs = performance.now() - started;
+
+    expect(features.get("malformed")).toBe("term");
+    expect(elapsedMs).toBeLessThan(1_000);
   });
 });
 

@@ -153,9 +153,10 @@ const MIN_TERM_LENGTH = 4;
 
 const ISSUE_REFERENCE_RE = /\b[A-Z][A-Z0-9]{1,9}-\d{1,7}\b/g;
 const NUMERIC_REFERENCE_RE = /(?:^|[\s([])#(\d{1,7})\b/g;
-const FENCED_CODE_BLOCK_RE = /^[ \t]*(`{3,})[^\n`]*(?:\r?\n[\s\S]*?\r?\n[ \t]*\1`*[ \t]*(?=\r?\n|$))/gm;
 const FENCED_CODE_BLOCK_OPEN_RE = /^[ \t]*`{3,}[^\n`]*\r?\n/;
 const FENCED_CODE_BLOCK_CLOSE_RE = /\r?\n[ \t]*`{3,}[ \t]*$/;
+const FENCED_CODE_OPEN_LINE_RE = /^[ \t]*(`{3,})[^\n`]*\r?\n$/;
+const FENCED_CODE_CLOSE_LINE_RE = /^[ \t]*(`{3,})[ \t]*$/;
 const INLINE_CODE_SPAN_RE = /(`+)([^\n]*?)(?<!`)\1(?!`)/g;
 const URL_RE = /\bhttps?:\/\/\S+/g;
 const PATH_RE = /\b(?:[A-Za-z0-9_.-]+\/){1,}[A-Za-z0-9_.-]+\b/g;
@@ -207,17 +208,82 @@ function unwrapCodeSpan(span: string): string {
   return span.replace(/^`+/, "").replace(/`+$/, "");
 }
 
-function extractCodeText(text: string): string {
-  const fencedBlocks = text.match(FENCED_CODE_BLOCK_RE) ?? [];
-  const withoutFencedBlocks = text.replace(FENCED_CODE_BLOCK_RE, " ");
-  const inlineSpans = withoutFencedBlocks.match(INLINE_CODE_SPAN_RE) ?? [];
-  return [...fencedBlocks, ...inlineSpans].map(unwrapCodeSpan).join("\n");
+function splitMarkdownLines(text: string): string[] {
+  const lines = text.match(/[^\n]*(?:\n|$)/g) ?? [];
+  if (lines[lines.length - 1] === "") lines.pop();
+  return lines;
 }
 
-function stripCodeMarkup(text: string): string {
-  return text
-    .replace(FENCED_CODE_BLOCK_RE, (span) => `\n${unwrapCodeSpan(span)}\n`)
-    .replace(INLINE_CODE_SPAN_RE, (_span, _ticks: string, body: string) => body);
+function stripMarkdownLineEnding(line: string): string {
+  return line.replace(/\r?\n$/, "");
+}
+
+function scanFencedCodeBlocks(text: string): {
+  codeBlocks: string[];
+  withoutFencedBlocks: string;
+  withFencedCodeUnwrapped: string;
+} {
+  const codeBlocks: string[] = [];
+  const withoutFencedParts: string[] = [];
+  const unwrappedParts: string[] = [];
+  let openerLine: string | null = null;
+  let openerLength = 0;
+  let bodyLines: string[] = [];
+
+  const flushUnmatchedFence = () => {
+    if (openerLine === null) return;
+    const original = openerLine + bodyLines.join("");
+    withoutFencedParts.push(original);
+    unwrappedParts.push(original);
+    openerLine = null;
+    openerLength = 0;
+    bodyLines = [];
+  };
+
+  for (const line of splitMarkdownLines(text)) {
+    if (openerLine === null) {
+      const opener = FENCED_CODE_OPEN_LINE_RE.exec(line);
+      if (opener) {
+        openerLine = line;
+        openerLength = opener[1]!.length;
+        bodyLines = [];
+        continue;
+      }
+      withoutFencedParts.push(line);
+      unwrappedParts.push(line);
+      continue;
+    }
+
+    const close = FENCED_CODE_CLOSE_LINE_RE.exec(stripMarkdownLineEnding(line));
+    if (close && close[1]!.length >= openerLength) {
+      const body = bodyLines.join("");
+      codeBlocks.push(body);
+      withoutFencedParts.push(" ");
+      unwrappedParts.push("\n", body, "\n");
+      openerLine = null;
+      openerLength = 0;
+      bodyLines = [];
+      continue;
+    }
+
+    bodyLines.push(line);
+  }
+
+  flushUnmatchedFence();
+  return {
+    codeBlocks,
+    withoutFencedBlocks: withoutFencedParts.join(""),
+    withFencedCodeUnwrapped: unwrappedParts.join(""),
+  };
+}
+
+function extractCodeMarkup(text: string): { codeText: string; withoutCodeMarkup: string } {
+  const { codeBlocks, withoutFencedBlocks, withFencedCodeUnwrapped } = scanFencedCodeBlocks(text);
+  const inlineSpans = withoutFencedBlocks.match(INLINE_CODE_SPAN_RE) ?? [];
+  return {
+    codeText: [...codeBlocks, ...inlineSpans.map(unwrapCodeSpan)].join("\n"),
+    withoutCodeMarkup: withFencedCodeUnwrapped.replace(INLINE_CODE_SPAN_RE, (_span, _ticks: string, body: string) => body),
+  };
 }
 
 /**
@@ -264,8 +330,7 @@ export function extractIssueDuplicateFeatures(
 
   // Code spans are the densest evidence, so mine them before generic prose and
   // let their contents register as symbols/paths.
-  const codeText = extractCodeText(withoutUrls);
-  const withoutCodeMarkup = stripCodeMarkup(withoutUrls);
+  const { codeText, withoutCodeMarkup } = extractCodeMarkup(withoutUrls);
 
   for (const source of [codeText, withoutCodeMarkup]) {
     for (const rawPath of source.match(PATH_RE) ?? []) {
