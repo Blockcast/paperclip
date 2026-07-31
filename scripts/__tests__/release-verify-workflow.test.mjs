@@ -15,7 +15,15 @@ test("release workflow delegates stable and canary verification to the reusable 
 
   assert.match(
     releaseWorkflow,
-    /verify_canary:\n\s+if: github\.event_name == 'push'\n\s+uses: \.\/\.github\/workflows\/release-verify\.yml\n\s+with:\n\s+ref: \$\{\{ github\.sha \}\}/,
+    /verify_canary:\n(?:\s+#.*\n)*\s+if: github\.event_name == 'push' && github\.repository == 'paperclipai\/paperclip'\n\s+uses: \.\/\.github\/workflows\/release-verify\.yml\n\s+with:\n\s+ref: \$\{\{ github\.sha \}\}/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /publish_canary:\n(?:\s+#.*\n)*\s+if: github\.event_name == 'push' && github\.repository == 'paperclipai\/paperclip'\n\s+needs: verify_canary/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /publish_stable:\n\s+if: github\.event_name == 'workflow_dispatch' && !inputs\.dry_run && github\.repository == 'paperclipai\/paperclip'\n\s+needs: verify_stable/,
   );
   assert.match(
     releaseWorkflow,

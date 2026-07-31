@@ -466,7 +466,9 @@ spec:
                 #                    tier (cluster-wide get/list/watch, no
                 #                    secrets). Direct in-cluster reach via the
                 #                    `-readonly` Service; bypasses the public
-                #                    paperclip-mcp-gateway hop. Named to match
+                #                    paperclip-mcp-gateway hop. Uses Streamable
+                #                    HTTP to match the stateless server. Its
+                #                    name matches
                 #                    the public path convention (/k8s-ro/mcp,
                 #                    /k8s-rw/mcp, /k8s-admin/mcp) so escalations
                 #                    layered in by claude_k8s adapterConfig
@@ -497,8 +499,8 @@ spec:
                     "url": "http://tempo.monitoring.svc.cluster.local:3200/api/mcp"
                   },
                   "k8s-ro": {
-                    "type": "sse",
-                    "url": "http://kubernetes-mcp-server-readonly.paperclip.svc.cluster.local:8080/sse"
+                    "type": "http",
+                    "url": "http://kubernetes-mcp-server-readonly.paperclip.svc.cluster.local:8080/mcp"
                   },
                   "github": {
                     "command": "/paperclip/.local/bin/github-mcp-server",
