@@ -15,6 +15,7 @@ const mockIssueService = vi.hoisted(() => ({
   listProductivityReviews: vi.fn(),
   getCurrentScheduledRetry: vi.fn(),
   getActiveInboxArchiveFields: vi.fn(),
+  getActiveRun: vi.fn(),
   listAttachments: vi.fn(),
 }));
 
@@ -212,6 +213,7 @@ describe.sequential("issue goal context routes", () => {
     mockIssueService.listProductivityReviews.mockResolvedValue(new Map());
     mockIssueService.getCurrentScheduledRetry.mockResolvedValue(null);
     mockIssueService.getActiveInboxArchiveFields.mockResolvedValue({});
+    mockIssueService.getActiveRun.mockResolvedValue(null);
     mockIssueService.listAttachments.mockResolvedValue([]);
     mockDocumentsService.getIssueDocumentPayload.mockResolvedValue({});
     mockDocumentsService.getIssueDocumentByKey.mockResolvedValue(null);
@@ -368,7 +370,7 @@ describe.sequential("issue goal context routes", () => {
         updatedAt: new Date("2026-03-20T00:00:00Z"),
       },
     });
-    mockExecutionWorkspaceService.getById.mockResolvedValueOnce({
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
       id: workspaceId,
       companyId: "company-1",
       projectId: legacyProjectLinkedIssue.projectId,
