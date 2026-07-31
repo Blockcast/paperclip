@@ -355,6 +355,44 @@ function assertExplicitPinnedWorktreeIssueRunnable(input: {
   }
 }
 
+// Two deliberately different questions about the same three fields. Collapsing
+// them into one `!= null` predicate regressed recovery escalation once already
+// (PR #811), so they stay separate and each call site picks explicitly.
+//
+// Did the caller *mention* any workspace field? An explicit `null` counts.
+// Passing all three as null is how a caller opts OUT of inheriting a parent's
+// execution workspace — recovery/service.ts does exactly that for a liveness
+// escalation it parents to the recovery issue, to stop the escalation adopting
+// the blocker's checkout. The inheritance-suppression sites must therefore read
+// null as a real override, or that opt-out silently stops working.
+function hasExplicitExecutionWorkspaceOverride(input: {
+  executionWorkspaceId?: string | null;
+  executionWorkspacePreference?: string | null;
+  executionWorkspaceSettings?: unknown;
+}) {
+  return (
+    input.executionWorkspaceId !== undefined ||
+    input.executionWorkspacePreference !== undefined ||
+    input.executionWorkspaceSettings !== undefined
+  );
+}
+
+// Did the caller supply an actual workspace *value*? Explicit nulls do not
+// count. Sole-led-project inference keys off this one, because the board/UI
+// intake path serializes explicit nulls and must still get inference — that
+// intake case is the whole point of BLO-18760.
+function hasExecutionWorkspaceIntent(input: {
+  executionWorkspaceId?: string | null;
+  executionWorkspacePreference?: string | null;
+  executionWorkspaceSettings?: unknown;
+}) {
+  return (
+    input.executionWorkspaceId != null ||
+    input.executionWorkspacePreference != null ||
+    input.executionWorkspaceSettings != null
+  );
+}
+
 function readStringFromRecord(record: unknown, key: string) {
   if (!record || typeof record !== "object") return null;
   const value = (record as Record<string, unknown>)[key];
@@ -7198,12 +7236,9 @@ export function issueService(db: Db) {
         ...issueData
       } = data;
       const inheritStrategyOnly = executionWorkspaceInheritanceMode === "strategy_only";
-      const hasExplicitExecutionWorkspaceOverride =
-        issueData.executionWorkspaceId !== undefined ||
-        issueData.executionWorkspacePreference !== undefined ||
-        issueData.executionWorkspaceSettings !== undefined;
+      const hasExplicitWorkspaceOverride = hasExplicitExecutionWorkspaceOverride(issueData);
       const inheritedPreRealizationWorkspaceSettings =
-        inheritStrategyOnly && !hasExplicitExecutionWorkspaceOverride
+        inheritStrategyOnly && !hasExplicitWorkspaceOverride
           ? buildPreRealizationExecutionWorkspaceSettings(parent.executionWorkspaceSettings)
           : null;
       let child = await issueService(db).create(parent.companyId, {
@@ -7644,10 +7679,8 @@ export function issueService(db: Db) {
         const workspaceInheritanceIssueId = skipExecutionWorkspaceInheritance
           ? null
           : inheritExecutionWorkspaceFromIssueId ?? issueData.parentId ?? null;
-        const hasExplicitExecutionWorkspaceOverride =
-          issueData.executionWorkspaceId !== undefined ||
-          issueData.executionWorkspacePreference !== undefined ||
-          issueData.executionWorkspaceSettings !== undefined;
+        const hasExplicitWorkspaceOverride = hasExplicitExecutionWorkspaceOverride(issueData);
+        const hasWorkspaceIntent = hasExecutionWorkspaceIntent(issueData);
         if (workspaceInheritanceIssueId) {
           const workspaceSource = await getWorkspaceInheritanceIssue(tx, companyId, workspaceInheritanceIssueId);
           if (issueData.projectId == null && workspaceSource.projectId) {
@@ -7658,7 +7691,7 @@ export function issueService(db: Db) {
           }
           if (
             isolatedWorkspacesEnabled &&
-            !hasExplicitExecutionWorkspaceOverride &&
+            !hasExplicitWorkspaceOverride &&
             workspaceSource.executionWorkspaceId
           ) {
             const sourceWorkspace = await tx
@@ -7686,6 +7719,114 @@ export function issueService(db: Db) {
         if (issueData.projectId == null && executionWorkspaceId) {
           const workspace = await assertValidExecutionWorkspace(companyId, null, executionWorkspaceId, tx);
           issueData.projectId = workspace.projectId;
+        }
+        // Note for the inference below: reaching it with `projectId == null` PROVES both
+        // workspace *ids* are also null, so it needs no separate guard against those two.
+        // `execution_workspaces.project_id` and `project_workspaces.project_id` are both
+        // `NOT NULL` (packages/db/src/schema/execution_workspaces.ts:20,
+        // project_workspaces.ts:19; DDL in migrations/0035_marvelous_satana.sql, never
+        // relaxed since). So each block above either assigns a non-null projectId or
+        // throws — a *projectless* explicit/inherited workspace is not a representable
+        // state. Raised twice in review (PR #811) as a case where inference would fight
+        // the re-validation at ~7729 and fail the create; recorded here because the
+        // reasoning is non-local and the counterexample is unwritable as a test.
+        //
+        // This argument is about the two workspace *ids* ONLY, and does not extend to
+        // `executionWorkspacePreference` / `executionWorkspaceSettings`: those carry
+        // workspace intent with no project attached, nothing above resolves a project
+        // from them, and they DO reach the inference with `projectId` null. They get a
+        // real guard — see policy note 4 below. Don't read this paragraph as "no
+        // workspace guard is ever needed here."
+        // BLO-18760: an issue created with none of the inheritance signals
+        // above (no parent, no explicit workspace) is *born* with
+        // projectId: null and, on its first run, falls back onto the
+        // per-agent fallback workspace — a long-lived, shared directory that
+        // can accumulate a real (but unrelated, concurrently-touched) git
+        // checkout from past work, making a local `git clone --shared` from
+        // it a coin-flip to fail with a fatal git error before the agent
+        // ever starts. Give the issue a real managed checkout instead of
+        // leaving it workspace-less, but only when the signal is
+        // unambiguous: exactly one non-archived project the assignee leads.
+        // Anything murkier (no assignee, no lead project, or more than one
+        // candidate) is left alone rather than guessing at which repo the
+        // agent meant.
+        //
+        // Two policy decisions encoded here, both deliberate (Ally review, PR #811):
+        //
+        // 1. `== null` treats an *explicit* `projectId: null` the same as omitting the
+        //    field. This is required, not incidental: the board/UI create path posts an
+        //    explicit null, which is precisely the intake case BLO-18760 exists to fix.
+        //    Honoring explicit null as "definitely no project" would make this a no-op
+        //    for the only caller that matters. A caller that genuinely wants a
+        //    workspace-less issue can still get one by leaving the issue unassigned, or
+        //    by assigning an agent with no (or an ambiguous) lead project.
+        //
+        // 2. `archivedAt` is the ONLY exclusion. A `completed` or `paused` project stays
+        //    a candidate on purpose — what the issue inherits is the project's git
+        //    checkout, and that checkout is just as valid on a finished project as an
+        //    active one. Project status describes the *work*, not the repo. Archived is
+        //    excluded because archival is the one signal that the checkout itself is no
+        //    longer maintained.
+        //
+        // 3. Root creates ONLY. A child whose parent is *intentionally* projectless must
+        //    stay projectless rather than be inferred onto its assignee's led project:
+        //    projectId carries the default goal, the execution-workspace policy, and the
+        //    repository, so inferring here would silently split parent and child across
+        //    all three — a child quietly doing work against a different repo than the
+        //    parent it reports into. Both guards are load-bearing and neither implies the
+        //    other: `workspaceInheritanceIssueId` is null when a caller passes
+        //    `skipExecutionWorkspaceInheritance` even though a parent exists (the
+        //    `inheritStrategyOnly` sub-issue path does exactly this), and it is non-null
+        //    for an explicit `inheritExecutionWorkspaceFromIssueId` with no parent at all.
+        //    Intake — the case BLO-18760 exists to fix — has neither.
+        //
+        // 4. No explicit workspace intent. `executionWorkspacePreference` /
+        //    `executionWorkspaceSettings` carry workspace intent without carrying a
+        //    project, so unlike a workspace *id* (whose `project_id` is NOT NULL, and
+        //    which the two blocks above already resolve a project from) they can reach
+        //    here with `projectId` still null. Inferring under them would not just add a
+        //    project — it would silently pull in that project's default goal, project
+        //    workspace, and repository, and would convert a deliberate error into a
+        //    success: a projectless `isolated_workspace` request is meant to fail
+        //    `assertExplicitPinnedWorktreeIssueRunnable` (WORKSPACE_WORKTREE_REQUIRES_PROJECT),
+        //    and inference would instead quietly bind it to whichever project the
+        //    assignee happens to lead. A caller who names a workspace mode has said
+        //    something about where this runs; honour it and let the validation speak.
+        //    Nullable API payloads are not workspace intent: explicit null workspace
+        //    fields mean "no workspace override" and follow the same inference path as
+        //    omitted fields, matching `projectId: null` above. That null-tolerance is
+        //    scoped to THIS guard — hence `hasExecutionWorkspaceIntent` here versus
+        //    `hasExplicitExecutionWorkspaceOverride` at the two inheritance sites above.
+        //    Do not re-merge them: for inheritance, explicit nulls are a deliberate
+        //    opt-out ("do not adopt the parent's workspace") and must keep suppressing
+        //    it. Collapsing both onto `!= null` regressed exactly that and let a
+        //    liveness escalation adopt its blocker's checkout.
+        //    Intake sends none of these fields, so the fix still fires where it matters.
+        //    Inert when `enableIsolatedWorkspaces` is off, and correctly so: create()
+        //    deletes all three fields in that mode, so the flag is already false — and
+        //    the same setting gates assertExplicitPinnedWorktreeIssueRunnable, so there
+        //    is no rejection left to preserve.
+        if (
+          issueData.projectId == null &&
+          issueData.assigneeAgentId &&
+          issueData.parentId == null &&
+          workspaceInheritanceIssueId == null &&
+          !hasWorkspaceIntent
+        ) {
+          const ledProjects = await tx
+            .select({ id: projects.id })
+            .from(projects)
+            .where(
+              and(
+                eq(projects.companyId, companyId),
+                eq(projects.leadAgentId, issueData.assigneeAgentId),
+                isNull(projects.archivedAt),
+              ),
+            )
+            .limit(2);
+          if (ledProjects.length === 1) {
+            issueData.projectId = ledProjects[0].id;
+          }
         }
         const projectGoalId = await getProjectDefaultGoalId(tx, companyId, issueData.projectId);
         // Cache the project policy lookup for this insert. Both the
