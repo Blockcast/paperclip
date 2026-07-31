@@ -1694,6 +1694,54 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .toBe(true);
   });
 
+  it("does not preserve a local review claim without trusted-App GitHub evidence", async () => {
+    const jobName = "agent-opencode-untrusted-review-claim";
+    const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+        githubRepoFullName: "Blockcast/onprem-k8s",
+        githubPrNumber: 1648,
+        githubHeadSha: headSha,
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    await db
+      .update(heartbeatRuns)
+      .set({ resultJson: { summary: `Posted the consolidated Ally review on #1648 at ${headSha}.` } })
+      .where(eq(heartbeatRuns.id, runId));
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ found: false });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledWith({
+      repoFullName: "Blockcast/onprem-k8s",
+      prNumber: 1648,
+      headSha,
+    });
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "failed",
+      errorCode: "job_missing",
+    });
+    const retries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(retries).toHaveLength(1);
+  });
+
   it("fails and retries once when a PR-review request comment is not outcome evidence", async () => {
     const jobName = "agent-opencode-review-lost";
     const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
@@ -2944,6 +2992,48 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(progressAfterKeepalive?.lastOutputSeq).toBe(progressBeforeKeepalive?.lastOutputSeq);
     expect(progressAfterKeepalive?.lastOutputStream).toBe(progressBeforeKeepalive?.lastOutputStream);
     expect(settledRun?.stdoutExcerpt ?? "").not.toContain("[paperclip] keepalive");
+  });
+
+  it("fails a completed PR-review run whose local claim has no trusted-App evidence", async () => {
+    const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
+    const summary = `Posted the consolidated Ally review on #1648 at ${headSha}.`;
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      errorMessage: null,
+      summary,
+      resultJson: { summary },
+      provider: "test",
+      model: "test-model",
+    });
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ found: false });
+    const { runId } = await seedQueuedIssueRunFixture();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          reviewKind: "pr_review",
+          taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+          githubRepoFullName: "Blockcast/onprem-k8s",
+          githubPrNumber: 1648,
+          githubHeadSha: headSha,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    await heartbeat.resumeQueuedRuns();
+    const settledRun = await waitForRunToSettle(heartbeat, runId);
+
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledWith({
+      repoFullName: "Blockcast/onprem-k8s",
+      prNumber: 1648,
+      headSha,
+    });
+    expect(settledRun).toMatchObject({
+      status: "failed",
+      errorCode: "pr_review_output_missing",
+    });
   });
 
   it("materializes missing opencode_k8s shared docs before adapter dispatch", async () => {

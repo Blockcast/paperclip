@@ -14724,7 +14724,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         parseObject(input.run.contextSnapshot),
         { resultJson: parseObject(input.run.resultJson) },
       );
-      if (reviewEvidence.status === "missing") {
+      const claimedReview =
+        reviewEvidence.status === "posted_review" || reviewEvidence.status === "already_reviewed";
+      if (reviewEvidence.status === "missing" || claimedReview) {
+        let authoritativeReviewFound = false;
         try {
           const prReview = derivePaperclipPrReview(parseObject(input.run.contextSnapshot));
           if (prReview?.repoFullName && prReview.prNumber !== null) {
@@ -14734,11 +14737,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               headSha: prReview.headSha,
             });
             if ("found" in verified && verified.found) {
+              authoritativeReviewFound = true;
               reviewEvidence = { status: "posted_review" };
             }
           }
         } catch {
-          // GitHub verification is additive; failures retain the local missing verdict.
+          // A local posting claim is not authoritative. The fallback below fails
+          // closed when GitHub verification is unavailable or rejects it.
+        }
+        if (claimedReview && !authoritativeReviewFound) {
+          reviewEvidence = {
+            status: "missing",
+            errorCode: "pr_review_output_missing",
+            errorMessage:
+              "PR reviewer run claimed a posted review, but GitHub has no exact-head review from the configured App identity",
+          };
         }
       }
       preserveRecordedOutcome = reviewEvidence.status === "posted_review" ||
@@ -19494,14 +19507,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           summary: adapterResult.summary ?? null,
         })
         : { status: "not_applicable" as const };
-      // BLO-10448: the evidence guard above is a text heuristic over the agent's
-      // free-text summary and misfires on legitimate runs (idempotency skips,
-      // comment-mode reviews) — the PR WAS reviewed but the phrasing wasn't
-      // matched, flagging a false pr_review_output_missing. Before keeping that
-      // verdict, authoritatively check GitHub for a reviewer-bot review/comment at
-      // THIS head. Only rescues a false `missing`; any error / unconfigured creds /
-      // not-found leaves the heuristic verdict intact (safe, additive fallback).
-      if (prReviewCompletionEvidence.status === "missing") {
+      // BLO-10448/BLO-19573: GitHub is authoritative for both missing evidence
+      // and local "posted/already reviewed" claims. The latter must not complete
+      // a task when the side effect came from an ineligible user-seat identity.
+      const claimedReview =
+        prReviewCompletionEvidence.status === "posted_review" ||
+        prReviewCompletionEvidence.status === "already_reviewed";
+      if (prReviewCompletionEvidence.status === "missing" || claimedReview) {
+        let authoritativeReviewFound = false;
         try {
           const prReview = derivePaperclipPrReview(context);
           if (prReview && prReview.repoFullName && prReview.prNumber !== null) {
@@ -19511,11 +19524,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               headSha: prReview.headSha,
             });
             if ("found" in verified && verified.found) {
+              authoritativeReviewFound = true;
               await appendRunEvent(run, await nextRunEventSeq(run.id), {
                 eventType: "lifecycle",
                 stream: "system",
                 level: "info",
-                message: `GitHub-verified ${verified.via} by the reviewer bot on ${prReview.repoFullName}#${prReview.prNumber}; suppressing false pr_review_output_missing`,
+                message: `GitHub-verified ${verified.via} by the reviewer App on ${prReview.repoFullName}#${prReview.prNumber}`,
                 payload: {
                   repoFullName: prReview.repoFullName,
                   prNumber: prReview.prNumber,
@@ -19533,7 +19547,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 eventType: "lifecycle",
                 stream: "system",
                 level: "info",
-                message: `GitHub reviewer-evidence check kept pr_review_output_missing on ${prReview.repoFullName}#${prReview.prNumber}: ${"error" in verified ? verified.error : "no_evidence_found"}`,
+                message: `GitHub reviewer-evidence check rejected PR-review completion on ${prReview.repoFullName}#${prReview.prNumber}: ${"error" in verified ? verified.error : "no_evidence_found"}`,
                 payload: {
                   repoFullName: prReview.repoFullName,
                   prNumber: prReview.prNumber,
@@ -19544,8 +19558,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
           }
         } catch {
-          // Verification is best-effort; on any unexpected fault we keep the
-          // heuristic `missing` verdict (unchanged pre-BLO-10448 behavior).
+          // The fallback below fails closed for a local posting claim.
+        }
+        if (claimedReview && !authoritativeReviewFound) {
+          prReviewCompletionEvidence = {
+            status: "missing",
+            errorCode: "pr_review_output_missing",
+            errorMessage:
+              "PR reviewer run claimed a posted review, but GitHub has no exact-head review from the configured App identity",
+          };
         }
       }
       const prReviewIncompleteOverride =

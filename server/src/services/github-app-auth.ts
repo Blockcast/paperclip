@@ -51,6 +51,34 @@ export function normalizeGithubLogin(login: string): string {
     .trim();
 }
 
+function exactGithubLogin(login: string): string {
+  return login.trim().toLowerCase().replace(/^@/, "");
+}
+
+/**
+ * Match only the configured GitHub App identity. GitHub can expose that App as
+ * either `<slug>[bot]` or `app/<slug>` depending on the API surface, but the
+ * bare `<slug>` user seat is a distinct principal and must never count as the
+ * reviewer bot.
+ */
+export function githubReviewerIdentityMatches(login: string, configuredLogin: string): boolean {
+  const candidate = exactGithubLogin(login);
+  const configured = exactGithubLogin(configuredLogin);
+  if (!candidate || !configured) return false;
+
+  let appSlug: string;
+  if (configured.startsWith("app/")) {
+    appSlug = configured.slice("app/".length);
+  } else if (configured.endsWith("[bot]")) {
+    appSlug = configured.slice(0, -"[bot]".length);
+  } else {
+    return false;
+  }
+  if (!appSlug) return false;
+
+  return candidate === `${appSlug}[bot]` || candidate === `app/${appSlug}`;
+}
+
 /**
  * Mint an RS256 GitHub App JWT (valid ~9 min). Returns null when the App id or
  * private key is unconfigured.
@@ -220,7 +248,7 @@ export async function githubHasReviewerEvidenceForPr(input: {
   headSha: string | null;
 }): Promise<ReviewerEvidenceResult> {
   const cfg = loadConfig();
-  const botLogin = normalizeGithubLogin(cfg.prReviewerBotLogin);
+  const botLogin = cfg.prReviewerBotLogin.trim();
   if (!botLogin) return { error: "no_bot_login" };
 
   const token = await getInstallationToken();
@@ -249,7 +277,7 @@ export async function githubHasReviewerEvidenceForPr(input: {
       if (!res.ok) return { error: `reviews_http_${res.status}` };
       const batch = (await res.json()) as Array<{ user?: { login?: string }; commit_id?: string | null }>;
       for (const review of batch) {
-        if (normalizeGithubLogin(review.user?.login ?? "") !== botLogin) continue;
+        if (!githubReviewerIdentityMatches(review.user?.login ?? "", botLogin)) continue;
         if (!headSha) return { found: true, via: "review" };
         const commitId = headShaHex(review.commit_id);
         if (commitId === headSha) return { found: true, via: "review" };
@@ -272,7 +300,7 @@ export async function githubHasReviewerEvidenceForPr(input: {
         if (!res.ok) return { error: `comments_http_${res.status}` };
         const batch = (await res.json()) as Array<{ user?: { login?: string }; body?: string }>;
         for (const comment of batch) {
-          if (normalizeGithubLogin(comment.user?.login ?? "") !== botLogin) continue;
+          if (!githubReviewerIdentityMatches(comment.user?.login ?? "", botLogin)) continue;
           const rawBody = comment.body ?? "";
           const reviewedHead = consolidatedReviewHead(rawBody);
           if (!reviewedHead) continue;

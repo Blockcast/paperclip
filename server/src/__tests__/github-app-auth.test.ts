@@ -18,6 +18,7 @@ import {
   mintAppJwt,
   getInstallationToken,
   githubHasReviewerEvidenceForPr,
+  githubReviewerIdentityMatches,
   normalizeGithubLogin,
   _resetInstallationTokenCache,
 } from "../services/github-app-auth.js";
@@ -65,6 +66,15 @@ describe("normalizeGithubLogin", () => {
     expect(normalizeGithubLogin("allyblockcast[bot]")).toBe("allyblockcast");
     expect(normalizeGithubLogin("app/AllyBlockcast")).toBe("allyblockcast");
     expect(normalizeGithubLogin("@Ally")).toBe("ally");
+  });
+});
+
+describe("githubReviewerIdentityMatches", () => {
+  it("accepts the App API variants but rejects the same-slug user seat", () => {
+    expect(githubReviewerIdentityMatches("allyblockcast[bot]", "allyblockcast[bot]")).toBe(true);
+    expect(githubReviewerIdentityMatches("app/AllyBlockcast", "allyblockcast[bot]")).toBe(true);
+    expect(githubReviewerIdentityMatches("allyblockcast", "allyblockcast[bot]")).toBe(false);
+    expect(githubReviewerIdentityMatches("allyblockcast", "allyblockcast")).toBe(false);
   });
 });
 
@@ -168,6 +178,26 @@ describe("githubHasReviewerEvidenceForPr", () => {
   it("finds a bot review at the exact head commit", async () => {
     setCreds();
     stubGithub({ reviews: [{ user: { login: "allyblockcast[bot]" }, commit_id: headSha }] });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: true,
+      via: "review",
+    });
+  });
+
+  it("rejects an exact-head review from the same-slug user seat", async () => {
+    setCreds();
+    stubGithub({
+      reviews: [{ user: { login: "allyblockcast" }, commit_id: headSha }],
+      comments: [],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: false,
+    });
+  });
+
+  it("accepts the App-prefixed reviewer identity variant", async () => {
+    setCreds();
+    stubGithub({ reviews: [{ user: { login: "app/allyblockcast" }, commit_id: headSha }] });
     await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
       found: true,
       via: "review",
