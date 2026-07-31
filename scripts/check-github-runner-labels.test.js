@@ -12,11 +12,11 @@ test("runner-label guard accepts only ARC workflows", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-runner-labels-"));
   t.after(() => rm(root, { recursive: true, force: true }));
 
-  await t.test("allows the three ARC runner scales", async () => {
+  await t.test("allows the ARC runner scales", async () => {
     await mkdir(path.join(root, ".github/workflows"), { recursive: true });
     await writeFile(
       path.join(root, ".github/workflows/arc.yml"),
-      "jobs:\n  check:\n    runs-on: default\n  image:\n    runs-on: arc-dind\n  release:\n    runs-on: arc-deploy\n",
+      "jobs:\n  check:\n    runs-on: default\n  aggregate:\n    runs-on: arc-light\n  image:\n    runs-on: arc-dind\n  release:\n    runs-on: arc-deploy\n",
     );
 
     const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });

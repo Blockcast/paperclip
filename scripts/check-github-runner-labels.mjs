@@ -21,7 +21,7 @@ for (const file of workflowFiles) {
 }
 
 if (violations.length > 0) {
-  console.error("GitHub-hosted and legacy self-hosted runner labels are forbidden; use default, arc-dind, or arc-deploy:");
+  console.error("GitHub-hosted and legacy self-hosted runner labels are forbidden; use default, arc-light, arc-dind, or arc-deploy:");
   console.error(violations.join("\n"));
   process.exitCode = 1;
 } else {

@@ -5,7 +5,8 @@ import type {
   IssueCommentPresentation,
   SourceTrustMetadata,
 } from "@paperclipai/shared";
-import { pgTable, uuid, text, timestamp, index, jsonb } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { pgTable, uuid, text, timestamp, index, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { issues } from "./issues.js";
 import { agents } from "./agents.js";
@@ -28,6 +29,8 @@ export const issueComments = pgTable(
     derivedAuthorAgentId: uuid("derived_author_agent_id").references(() => agents.id, { onDelete: "set null" }),
     derivedCreatedByRunId: uuid("derived_created_by_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     derivedAuthorSource: text("derived_author_source").$type<IssueCommentDerivedAuthorSource>(),
+    idempotencyKey: text("idempotency_key"),
+    idempotencyProcessedAt: timestamp("idempotency_processed_at", { withTimezone: true }),
     body: text("body").notNull(),
     presentation: jsonb("presentation").$type<IssueCommentPresentation | null>(),
     metadata: jsonb("metadata").$type<IssueCommentMetadata | null>(),
@@ -43,6 +46,15 @@ export const issueComments = pgTable(
   (table) => ({
     issueIdx: index("issue_comments_issue_idx").on(table.issueId),
     companyIdx: index("issue_comments_company_idx").on(table.companyId),
+    issueAgentIdempotencyIdx: uniqueIndex("issue_comments_issue_agent_idempotency_idx")
+      .on(table.issueId, table.authorAgentId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} IS NOT NULL AND ${table.authorAgentId} IS NOT NULL AND ${table.deletedAt} IS NULL`),
+    issueUserIdempotencyIdx: uniqueIndex("issue_comments_issue_user_idempotency_idx")
+      .on(table.issueId, table.authorUserId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} IS NOT NULL AND ${table.authorUserId} IS NOT NULL AND ${table.deletedAt} IS NULL`),
+    issueSystemIdempotencyIdx: uniqueIndex("issue_comments_issue_system_idempotency_idx")
+      .on(table.issueId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} IS NOT NULL AND ${table.authorAgentId} IS NULL AND ${table.authorUserId} IS NULL AND ${table.deletedAt} IS NULL`),
     companyIssueCreatedAtIdx: index("issue_comments_company_issue_created_at_idx").on(
       table.companyId,
       table.issueId,

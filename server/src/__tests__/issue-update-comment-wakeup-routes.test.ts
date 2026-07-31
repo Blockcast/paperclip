@@ -10,12 +10,28 @@ const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
   update: vi.fn(),
   addComment: vi.fn(),
+  getCommentByIdempotencyKey: vi.fn(),
+  markCommentIdempotencyProcessed: vi.fn(),
   findMentionedAgents: vi.fn(),
   getRelationSummaries: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
   getCurrentScheduledRetry: vi.fn(),
 }));
+const mockIssueReferenceService = vi.hoisted(() => ({
+  deleteDocumentSource: vi.fn(async () => undefined),
+  diffIssueReferenceSummary: vi.fn(() => ({
+    addedReferencedIssues: [],
+    removedReferencedIssues: [],
+    currentReferencedIssues: [],
+  })),
+  emptySummary: vi.fn(() => ({ outbound: [], inbound: [] })),
+  listIssueReferenceSummary: vi.fn(async () => ({ outbound: [], inbound: [] })),
+  syncComment: vi.fn(async () => undefined),
+  syncDocument: vi.fn(async () => undefined),
+  syncIssue: vi.fn(async () => undefined),
+}));
+const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 
 const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
@@ -73,26 +89,14 @@ vi.mock("../services/index.js", () => ({
     listCompanyIds: vi.fn(async () => ["company-1"]),
   }),
   issueApprovalService: () => ({}),
-  issueReferenceService: () => ({
-    deleteDocumentSource: async () => undefined,
-    diffIssueReferenceSummary: () => ({
-      addedReferencedIssues: [],
-      removedReferencedIssues: [],
-      currentReferencedIssues: [],
-    }),
-    emptySummary: () => ({ outbound: [], inbound: [] }),
-    listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
-    syncComment: async () => undefined,
-    syncDocument: async () => undefined,
-    syncIssue: async () => undefined,
-  }),
+  issueReferenceService: () => mockIssueReferenceService,
   issueRecoveryActionService: () => ({
     getActiveForIssue: vi.fn(async () => null),
     listActiveForIssues: vi.fn(async () => new Map()),
   }),
   issueService: () => mockIssueService,
   issueThreadInteractionService: () => mockIssueThreadInteractionService,
-  logActivity: vi.fn(async () => undefined),
+  logActivity: mockLogActivity,
   projectService: () => ({}),
   routineService: () => ({
     syncRunStatusForIssue: vi.fn(async () => undefined),
@@ -145,26 +149,14 @@ function registerModuleMocks() {
       listCompanyIds: vi.fn(async () => ["company-1"]),
     }),
     issueApprovalService: () => ({}),
-    issueReferenceService: () => ({
-      deleteDocumentSource: async () => undefined,
-      diffIssueReferenceSummary: () => ({
-        addedReferencedIssues: [],
-        removedReferencedIssues: [],
-        currentReferencedIssues: [],
-      }),
-      emptySummary: () => ({ outbound: [], inbound: [] }),
-      listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
-      syncComment: async () => undefined,
-      syncDocument: async () => undefined,
-      syncIssue: async () => undefined,
-    }),
+    issueReferenceService: () => mockIssueReferenceService,
     issueRecoveryActionService: () => ({
       getActiveForIssue: vi.fn(async () => null),
       listActiveForIssues: vi.fn(async () => new Map()),
     }),
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
-    logActivity: vi.fn(async () => undefined),
+    logActivity: mockLogActivity,
     projectService: () => ({}),
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
@@ -224,11 +216,23 @@ describe("issue update comment wakeups", () => {
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    mockIssueService.getCommentByIdempotencyKey.mockResolvedValue(null);
+    mockIssueService.markCommentIdempotencyProcessed.mockResolvedValue(undefined);
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueService.getCurrentScheduledRetry.mockResolvedValue(null);
+    mockIssueReferenceService.diffIssueReferenceSummary.mockReturnValue({
+      addedReferencedIssues: [],
+      removedReferencedIssues: [],
+      currentReferencedIssues: [],
+    });
+    mockIssueReferenceService.emptySummary.mockReturnValue({ outbound: [], inbound: [] });
+    mockIssueReferenceService.listIssueReferenceSummary.mockResolvedValue({ outbound: [], inbound: [] });
+    mockIssueReferenceService.syncComment.mockResolvedValue(undefined);
+    mockIssueReferenceService.syncDocument.mockResolvedValue(undefined);
+    mockIssueReferenceService.syncIssue.mockResolvedValue(undefined);
   });
 
   it("includes the new comment in assignment wakes from issue updates", async () => {
@@ -516,6 +520,68 @@ describe("issue update comment wakeups", () => {
         }),
       }),
     );
+  });
+
+  it("replays an unprocessed idempotent top-level comment through post-insert side effects", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    const comment = {
+      id: "comment-idempotent",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      authorType: "user",
+      authorAgentId: null,
+      authorUserId: "local-board",
+      body: "please handle this idempotently",
+      presentation: null,
+      metadata: null,
+      idempotencyKey: "health:window:fingerprint",
+      idempotencyProcessedAt: null,
+      createdAt: new Date("2026-07-30T12:00:00.000Z"),
+      updatedAt: new Date("2026-07-30T12:00:00.000Z"),
+    };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.getCommentByIdempotencyKey
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(comment);
+    mockIssueService.addComment.mockResolvedValue(comment);
+    mockIssueReferenceService.syncComment
+      .mockRejectedValueOnce(new Error("sync failed after insert"))
+      .mockResolvedValueOnce(undefined);
+
+    const app = await createApp();
+    const first = await request(app)
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({
+        body: "please handle this idempotently",
+        idempotencyKey: "health:window:fingerprint",
+      });
+    const second = await request(app)
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({
+        body: "please handle this idempotently",
+        idempotencyKey: "health:window:fingerprint",
+      });
+
+    expect(first.status).toBe(500);
+    expect(second.status).toBe(200);
+    expect(second.body).toMatchObject({ id: "comment-idempotent", deduplicated: true });
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+    expect(mockIssueReferenceService.syncComment).toHaveBeenCalledTimes(2);
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_commented",
+        idempotencyKey: "issue_comment:comment-idempotent:assignee:11111111-1111-4111-8111-111111111111",
+      }),
+    );
+    expect(mockIssueService.markCommentIdempotencyProcessed).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.markCommentIdempotencyProcessed).toHaveBeenCalledWith("comment-idempotent");
   });
 
   it("does not route a plain-text agent name on a human-owned issue comment", async () => {

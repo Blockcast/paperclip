@@ -4,7 +4,8 @@ import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import { REDACTED_EVENT_VALUE, redactEventPayload } from "../redaction.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
-import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, not, or, sql } from "drizzle-orm";
+import { z } from "zod";
 import {
   agentSkillSyncSchema,
   agentMineInboxQuerySchema,
@@ -64,6 +65,7 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
+import { derivePaperclipPrReview } from "../services/heartbeat.js";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type {
   AdapterEnvironmentCheck,
@@ -88,6 +90,8 @@ import {
   isTruthyRuntimeEnvValue,
   resolveWorktreeRunExecutionActivationState,
 } from "../services/instance-settings.js";
+import { isIssueHeldByForeignRun } from "../services/issue-run-holding.js";
+import { logger } from "../middleware/logger.js";
 import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
 import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/adapter-codex-local";
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
@@ -811,7 +815,7 @@ export function agentRoutes(
     ]);
 
     return {
-      ...(options?.restricted ? redactForRestrictedAgentView(agent) : agent),
+      ...(options?.restricted ? redactForRestrictedAgentView(agent) : redactAgentSecrets(agent)),
       chainOfCommand,
       access: accessState,
     };
@@ -1804,6 +1808,24 @@ export function agentRoutes(
     };
   }
 
+  /**
+   * Strip credential material out of an agent row before it goes on the wire.
+   *
+   * `adapterConfig` holds live secrets — `{type:"plain",value}` env bindings and
+   * literal `Bearer …` values in `mcpServers.*.headers`. This used to be applied
+   * only on the read paths, so a budget-only `PATCH /api/agents/:id` handed the
+   * caller the agent's entire credential set, and it landed verbatim in agent
+   * transcripts and run logs, which are read far more widely than the secret
+   * store (BLO-18969).
+   *
+   * `secret_ref` / `user_secret_ref` bindings are pointers, not plaintext, so
+   * `redactEventPayload` passes them through untouched — they never carry a
+   * resolved `value` on a response.
+   *
+   * Every response that serializes an agent MUST go through here,
+   * `redactForRestrictedAgentView`, or `redactAgentConfiguration`. Adding an
+   * agent-serializing route without one of them reopens this hole.
+   */
   function redactAgentSecrets<T extends { adapterConfig?: unknown; runtimeConfig?: unknown }>(agent: T): T {
     let result = { ...agent };
     const config = asRecord(agent.adapterConfig);
@@ -2315,7 +2337,7 @@ export function agentRoutes(
       });
       return;
     }
-    res.json(redactAgentSecrets(await buildAgentDetail(agent)));
+    res.json(await buildAgentDetail(agent));
   });
 
   router.get("/agents/me/inbox-lite", async (req, res) => {
@@ -2347,8 +2369,43 @@ export function agentRoutes(
       recoveryActionsSvc.listActiveForIssues(req.actor.companyId, issueIds),
     ]);
 
+    // BLO-19001: never offer an issue that a *different* live run already holds.
+    //
+    // Dispatch enforces one-live-run-per-issue only for runs that already carry
+    // an issueId. An autonomous heartbeat run carries none, so it is dispatched
+    // freely and then self-selects here — landing on an issue a sibling run of
+    // this same agent is mid-way through. Under a shared worktree both runs then
+    // edit one tree, and a routine `rm -rf node_modules` in one destroys the
+    // other's state.
+    //
+    // Suppressed rather than flagged: a flag only works if every agent honours
+    // it, and in the observed incident an in-thread warning did not stop the
+    // next run from selecting the same issue 8 minutes later.
+    const callerRunId = req.actor.runId ?? null;
+    const nowMs = Date.now();
+    const offeredRows = eligibleRows.filter((issue) => {
+      const held = isIssueHeldByForeignRun({
+        activeRun: issue.activeRun,
+        callerRunId,
+        nowMs,
+      });
+      if (held) {
+        logger.info(
+          {
+            agentId: req.actor.agentId,
+            issueId: issue.id,
+            identifier: issue.identifier,
+            callerRunId,
+            holdingRunId: issue.activeRun?.id ?? null,
+          },
+          "inbox-lite: withheld issue already held by another live run of this agent",
+        );
+      }
+      return !held;
+    });
+
     res.json(
-      eligibleRows.map((issue) => ({
+      offeredRows.map((issue) => ({
         id: issue.id,
         identifier: issue.identifier,
         title: issue.title,
@@ -2410,7 +2467,7 @@ export function agentRoutes(
       res.json(await buildAgentDetail(agent, { restricted: true }));
       return;
     }
-    res.json(redactAgentSecrets(await buildAgentDetail(agent)));
+    res.json(await buildAgentDetail(agent));
   });
 
   router.get("/agents/:id/configuration", async (req, res) => {
@@ -2483,7 +2540,7 @@ export function agentRoutes(
       details: { revisionId },
     });
 
-    res.json(updated);
+    res.json(redactAgentSecrets(updated));
   });
 
   router.get("/agents/:id/runtime-state", async (req, res) => {
@@ -2721,7 +2778,13 @@ export function agentRoutes(
       });
     }
 
-    res.status(201).json({ agent, approval });
+    // The hire approval payload embeds the requested adapterConfig (twice —
+    // also under requestedConfigurationSnapshot), so redacting only `agent`
+    // would leave the same credentials on the wire one key over. BLO-18969.
+    res.status(201).json({
+      agent: redactAgentSecrets(agent),
+      approval: approval ? { ...approval, payload: redactEventPayload(asRecord(approval.payload) ?? null) } : approval,
+    });
   });
 
   router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {
@@ -2845,7 +2908,7 @@ export function agentRoutes(
       );
     }
 
-    res.status(201).json(agent);
+    res.status(201).json(redactAgentSecrets(agent));
   });
 
   router.patch("/agents/:id/permissions", validate(updateAgentPermissionsSchema), async (req, res) => {
@@ -3340,7 +3403,7 @@ export function agentRoutes(
       details: summarizeAgentUpdateDetails(patchData),
     });
 
-    res.json(agent);
+    res.json(redactAgentSecrets(agent));
   });
 
   router.post("/agents/:id/pause", async (req, res) => {
@@ -3366,7 +3429,7 @@ export function agentRoutes(
       entityId: agent.id,
     });
 
-    res.json(agent);
+    res.json(redactAgentSecrets(agent));
   });
 
   router.post("/agents/:id/resume", async (req, res) => {
@@ -3397,7 +3460,7 @@ export function agentRoutes(
       entityId: agent.id,
     });
 
-    res.json(agent);
+    res.json(redactAgentSecrets(agent));
   });
 
   router.post("/agents/:id/clear-error", async (req, res) => {
@@ -3429,7 +3492,7 @@ export function agentRoutes(
       entityId: agent.id,
     });
 
-    res.json(agent);
+    res.json(redactAgentSecrets(agent));
   });
 
   router.post("/agents/:id/approve", async (req, res) => {
@@ -3483,7 +3546,7 @@ export function agentRoutes(
       details: { source: "agent_detail", approvalId: openApproval?.id ?? null },
     });
 
-    res.json(agent);
+    res.json(redactAgentSecrets(agent));
   });
 
   router.post("/agents/:id/terminate", async (req, res) => {
@@ -3553,7 +3616,7 @@ export function agentRoutes(
       },
     });
 
-    res.json(agent);
+    res.json(redactAgentSecrets(agent));
   });
 
   router.delete("/agents/:id", async (req, res) => {
@@ -3852,6 +3915,198 @@ export function agentRoutes(
     const summary = req.query.summary === "true" || req.query.summary === "1";
     const runs = await heartbeat.list(companyId, agentId, limit, { summary });
     res.json(runs);
+  });
+
+  router.get("/companies/:companyId/pr-review-queue", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertBoard(req);
+    assertCompanyAccess(req, companyId);
+
+    const { lookbackHours = 24, limit = 200 } = z.object({
+      lookbackHours: z.coerce.number().int().min(1).max(168).optional(),
+      limit: z.coerce.number().int().min(1).max(1000).optional(),
+    }).parse(req.query);
+    const now = new Date();
+    const terminalCutoff = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
+
+    const columns = {
+      id: heartbeatRuns.id,
+      agentId: heartbeatRuns.agentId,
+      agentName: agentsTable.name,
+      status: heartbeatRuns.status,
+      errorCode: heartbeatRuns.errorCode,
+      contextSnapshot: heartbeatRuns.contextSnapshot,
+      createdAt: heartbeatRuns.createdAt,
+      startedAt: heartbeatRuns.startedAt,
+      finishedAt: heartbeatRuns.finishedAt,
+      scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+    };
+    const prReviewPredicate = and(
+      or(
+        sql`starts_with(${heartbeatRuns.contextWakeReason}, 'github_pr_')`,
+        sql`${heartbeatRuns.contextSnapshot} ->> 'reviewKind' = 'pr_review'`,
+      ),
+      sql`case jsonb_typeof(${heartbeatRuns.contextSnapshot} -> 'githubPrNumber')
+        when 'number' then pg_input_is_valid(${heartbeatRuns.contextSnapshot} ->> 'githubPrNumber', 'double precision')
+        when 'string' then
+          btrim(${heartbeatRuns.contextSnapshot} ->> 'githubPrNumber') ~ '^[+-]?([0-9]+(\\.[0-9]*)?|\\.[0-9]+)([eE][+-]?[0-9]+)?$'
+          and pg_input_is_valid(btrim(${heartbeatRuns.contextSnapshot} ->> 'githubPrNumber'), 'double precision')
+        else false
+      end`,
+    );
+    const activePredicate = and(
+      eq(heartbeatRuns.companyId, companyId),
+      prReviewPredicate,
+      inArray(heartbeatRuns.status, ["queued", "scheduled_retry", "running"]),
+    );
+    const [activeSummary, activeCandidates, oldestQueuedCandidates, terminalCandidates] = await db.transaction(async (tx) => {
+      const baseQuery = () => tx
+        .select(columns)
+        .from(heartbeatRuns)
+        .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id));
+      const activeSummaryPromise = tx
+        .select({
+          agentId: heartbeatRuns.agentId,
+          agentName: agentsTable.name,
+          activeCount: sql<number>`count(*)::int`,
+          queuedCount: sql<number>`count(*) filter (where ${heartbeatRuns.status} in ('queued', 'scheduled_retry'))::int`,
+          oldestQueuedAt: sql<Date | null>`min(${heartbeatRuns.createdAt}) filter (where ${heartbeatRuns.status} in ('queued', 'scheduled_retry'))`,
+        })
+        .from(heartbeatRuns)
+        .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
+        .where(activePredicate)
+        .groupBy(heartbeatRuns.agentId, agentsTable.name);
+      const activeRowsPromise = baseQuery()
+        .where(activePredicate)
+        .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+        .limit(limit + 1);
+      const oldestQueuedRowsPromise = tx
+        .selectDistinctOn([heartbeatRuns.agentId], columns)
+        .from(heartbeatRuns)
+        .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            prReviewPredicate,
+            inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+          ),
+        )
+        .orderBy(heartbeatRuns.agentId, asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+      const terminalRowsPromise = baseQuery()
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            prReviewPredicate,
+            gte(heartbeatRuns.finishedAt, terminalCutoff),
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.id))
+        .limit(limit + 1);
+
+      return Promise.all([
+        activeSummaryPromise,
+        activeRowsPromise,
+        oldestQueuedRowsPromise,
+        terminalRowsPromise,
+      ]);
+    }, {
+      isolationLevel: "repeatable read",
+      accessMode: "read only",
+    });
+
+    const terminalRowsTruncated = terminalCandidates.length > limit;
+    const activePrReviewRows = [...oldestQueuedCandidates, ...activeCandidates.slice(0, limit)]
+      .filter((row, index, allRows) =>
+        ["queued", "scheduled_retry", "running"].includes(row.status)
+        && derivePaperclipPrReview(row.contextSnapshot) !== null
+        && allRows.findIndex((candidate) => candidate.id === row.id) === index
+      );
+    const activeRowsTruncated = activeSummary.reduce((count, summary) => count + summary.activeCount, 0)
+      > activePrReviewRows.length;
+    const terminalRows = terminalCandidates.slice(0, limit).filter((row) =>
+      row.finishedAt !== null && derivePaperclipPrReview(row.contextSnapshot) !== null
+    );
+    const rows = [...activePrReviewRows, ...terminalRows]
+      .filter((row, index, allRows) => allRows.findIndex((candidate) => candidate.id === row.id) === index)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime() || b.id.localeCompare(a.id));
+
+    const byAgent = new Map<string, {
+      agentId: string;
+      agentName: string;
+      queuedCount: number;
+      oldestQueuedAt: Date | null;
+      runs: Array<Record<string, unknown>>;
+    }>();
+
+    for (const summary of activeSummary) {
+      byAgent.set(summary.agentId, {
+        agentId: summary.agentId,
+        agentName: summary.agentName,
+        queuedCount: summary.queuedCount,
+        oldestQueuedAt: summary.oldestQueuedAt,
+        runs: [],
+      });
+    }
+
+    for (const row of rows) {
+      const prReview = derivePaperclipPrReview(row.contextSnapshot);
+      if (!prReview) continue;
+      const group = byAgent.get(row.agentId) ?? {
+        agentId: row.agentId,
+        agentName: row.agentName,
+        queuedCount: 0,
+        oldestQueuedAt: null,
+        runs: [],
+      };
+      const ageEnd = row.finishedAt ?? now;
+      const disposition = row.status === "queued"
+        ? "queued"
+        : row.status === "scheduled_retry"
+          ? "scheduled_retry"
+          : row.status === "running"
+            ? "dispatched"
+            : row.status === "succeeded"
+              ? "succeeded"
+              : row.errorCode ?? row.status;
+      group.runs.push({
+        id: row.id,
+        status: row.status,
+        disposition,
+        errorCode: row.errorCode,
+        repoFullName: prReview.repoFullName,
+        prNumber: prReview.prNumber,
+        headSha: prReview.headSha,
+        ageMs: Math.max(0, ageEnd.getTime() - row.createdAt.getTime()),
+        createdAt: row.createdAt,
+        startedAt: row.startedAt,
+        finishedAt: row.finishedAt,
+        scheduledRetryAt: row.scheduledRetryAt,
+      });
+      byAgent.set(row.agentId, group);
+    }
+
+    res.json({
+      generatedAt: now,
+      lookbackHours,
+      detailLimit: limit,
+      truncated: activeRowsTruncated || terminalRowsTruncated,
+      truncatedSections: {
+        activeRuns: activeRowsTruncated,
+        terminalRuns: terminalRowsTruncated,
+      },
+      agents: [...byAgent.values()]
+        .sort((a, b) => a.agentName.localeCompare(b.agentName) || a.agentId.localeCompare(b.agentId))
+        .map((group) => ({
+          agentId: group.agentId,
+          agentName: group.agentName,
+          queuedCount: group.queuedCount,
+          oldestQueuedAt: group.oldestQueuedAt,
+          oldestQueuedAgeMs: group.oldestQueuedAt
+            ? Math.max(0, now.getTime() - group.oldestQueuedAt.getTime())
+            : null,
+          runs: group.runs,
+        })),
+    });
   });
 
   router.get("/companies/:companyId/live-runs", async (req, res) => {

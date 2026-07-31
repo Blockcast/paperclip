@@ -515,6 +515,8 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
   const issueInteractions = new Map<string, IssueThreadInteraction[]>();
   const issueDocuments = new Map<string, IssueDocument>();
   const agents = new Map<string, Agent>();
+  /** Mirrors host-side `agents.invoke` delivery dedup: idempotencyKey -> runId. */
+  const invokeRunsByIdempotencyKey = new Map<string, string>();
   const goals = new Map<string, Goal>();
   const milestones = new Map<string, Milestone>();
   const accessMembers = new Map<string, PluginAccessMember>();
@@ -2095,7 +2097,16 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         ) {
           throw new Error(`Agent is not invokable in its current state: ${agent!.status}`);
         }
-        return { runId: randomUUID() };
+        const idempotencyKey = opts.idempotencyKey?.trim();
+        if (idempotencyKey) {
+          const existing = invokeRunsByIdempotencyKey.get(`${agentId}:${idempotencyKey}`);
+          if (existing) return { runId: existing, deduplicated: true };
+        }
+        // Distinct invokes always get distinct runs — keyless invokes are never
+        // coalesced into one another (BLO-18847).
+        const runId = randomUUID();
+        if (idempotencyKey) invokeRunsByIdempotencyKey.set(`${agentId}:${idempotencyKey}`, runId);
+        return { runId };
       },
       async updateAdapterOverrides(agentId, companyId, overrides) {
         requireCapability(manifest, capabilitySet, "agents.adapter.write");

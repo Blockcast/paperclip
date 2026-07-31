@@ -202,7 +202,13 @@ export const issueExecutionPolicySchema = z.object({
   mode: z.enum(ISSUE_EXECUTION_POLICY_MODES).optional().default("normal"),
   commentRequired: z.boolean().optional().default(true),
   stages: z.array(issueExecutionStageSchema).default([]),
-  monitor: issueExecutionMonitorPolicySchema.optional().nullable(),
+  monitor: issueExecutionMonitorPolicySchema
+    .optional()
+    .nullable()
+    .describe(
+      "The ONLY accepted way to arm, re-arm, or clear an issue monitor (wake) is this nested field, `executionPolicy.monitor`. There is no top-level `monitor` / `monitorNextCheckAt` / `monitorNotes` input — those keys are rejected, because they used to be silently discarded (BLO-18790). Carry a re-check signature in `monitor.notes`. Every write REPLACES the whole `executionPolicy` rather than merging into it, and that applies to arming and re-arming exactly as much as to clearing: read the issue's current `executionPolicy` first, then re-send it complete with `monitor` set (arm/re-arm) or omitted (clear). The short {\"executionPolicy\":{\"monitor\":{…}}} body is safe ONLY on an issue whose policy has nothing else in it — on any other issue it erases `stages`, `reviewPreset` and `authorizationPolicy`, and a bare {\"executionPolicy\":{}} normalizes to null and erases them along with the monitor. Re-arming supersedes a `triggered` monitor, which is how you reset a wedged one — but `attemptCount` is preserved across re-arm, so re-sending a `maxAttempts` at or below that count (or a `timeoutAt` already in the past) is rejected 422 as exhausted instead of re-arming; omit `maxAttempts` when resetting a wedged monitor. Monitors only hold on an `in_progress`/`in_review` issue assigned to an agent, and an unresolved `blockedBy` edge suppresses the wake even while it reads as `scheduled` — so ALWAYS re-read `monitorNextCheckAt` in the same run and treat `null` as failure rather than reporting success off a 200.",
+
+    ),
   reviewPreset: lowTrustReviewPresetPolicySchema.optional(),
   authorizationPolicy: trustAuthorizationPolicySchema.optional(),
 });
@@ -376,7 +382,54 @@ function withCreateIssueStatusDefault<T extends z.ZodRawShape>(schema: z.ZodObje
   }, schema);
 }
 
+/**
+ * BLO-18790: monitors are armed through the nested `executionPolicy.monitor` input, which the
+ * server maps onto the server-owned `monitor_*` columns. There has never been a top-level
+ * `monitor` input, nor a writable top-level `monitorNextCheckAt` / `monitorNotes` / ... field.
+ *
+ * Because the issue create/update schemas are non-strict, zod used to *strip* those keys, so a
+ * caller that guessed the wrong shape got `200 OK` with a bumped `updatedAt` and nothing
+ * persisted — a silent no-op only detectable by re-reading the row. Agents following the fleet
+ * monitor re-check protocol hit this repeatedly and stranded their own wakes (BLO-12852 sat with
+ * a dead monitor for ~4h across three runs; re-filed four times as BLO-18168 / BLO-18782 /
+ * BLO-18783 / BLO-18790).
+ *
+ * Declaring each misplaced key as "must be absent" turns the silent strip into a loud 4xx that
+ * names the correct shape. Keep these in the base schema so create, update, child-issue, MCP and
+ * CLI paths all inherit the same answer.
+ */
+export const MISPLACED_ISSUE_MONITOR_INPUT_KEYS = [
+  "monitor",
+  "monitorNextCheckAt",
+  "monitorNotes",
+  "monitorScheduledBy",
+  "monitorAttemptCount",
+  "monitorLastTriggeredAt",
+  "monitorWakeRequestedAt",
+] as const;
+
+export function misplacedIssueMonitorInputMessage(key: string) {
+  return `\`${key}\` is not a writable issue field, so it would be silently discarded. Arm, re-arm or clear a monitor with the nested shape \`executionPolicy.monitor\`. Every write REPLACES the whole \`executionPolicy\` — it is never merged — so read the issue's current \`executionPolicy\` first and re-send it complete, with \`monitor\` set to arm/re-arm or omitted to clear: {"executionPolicy":{<the issue's current mode/commentRequired/stages/reviewPreset/authorizationPolicy>,"monitor":{"nextCheckAt":"<ISO-8601>","notes":"<signature>","scheduledBy":"assignee"}}}. Sending only \`monitor\` is safe ONLY on an issue whose policy has nothing else in it; otherwise it erases \`stages\`, \`reviewPreset\` and \`authorizationPolicy\`, and a bare {"executionPolicy":{}} normalizes the whole policy to null. The \`monitor_*\` columns are server-owned: they are derived from that input and cannot be written directly.`;
+}
+
+function misplacedIssueMonitorInputSchema(key: (typeof MISPLACED_ISSUE_MONITOR_INPUT_KEYS)[number]) {
+  return z
+    .undefined({ errorMap: () => ({ message: misplacedIssueMonitorInputMessage(key) }) })
+    .optional();
+}
+
+const misplacedIssueMonitorInputShape = {
+  monitor: misplacedIssueMonitorInputSchema("monitor"),
+  monitorNextCheckAt: misplacedIssueMonitorInputSchema("monitorNextCheckAt"),
+  monitorNotes: misplacedIssueMonitorInputSchema("monitorNotes"),
+  monitorScheduledBy: misplacedIssueMonitorInputSchema("monitorScheduledBy"),
+  monitorAttemptCount: misplacedIssueMonitorInputSchema("monitorAttemptCount"),
+  monitorLastTriggeredAt: misplacedIssueMonitorInputSchema("monitorLastTriggeredAt"),
+  monitorWakeRequestedAt: misplacedIssueMonitorInputSchema("monitorWakeRequestedAt"),
+};
+
 const createIssueBaseSchema = z.object({
+  ...misplacedIssueMonitorInputShape,
   projectId: z.string().uuid().optional().nullable(),
   projectWorkspaceId: z.string().uuid().optional().nullable(),
   goalId: z.string().uuid().optional().nullable(),
@@ -581,12 +634,21 @@ export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
 
 export const addIssueCommentSchema = z.object({
   body: multilineTextSchema.pipe(z.string().min(1)),
+  idempotencyKey: z.string().trim().min(1).max(255).optional(),
   authorType: issueCommentAuthorTypeSchema.optional(),
   presentation: issueCommentPresentationSchema.nullable().optional(),
   metadata: issueCommentMetadataSchema.nullable().optional(),
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
+}).superRefine((value, ctx) => {
+  if (value.idempotencyKey && (value.reopen || value.resume || value.interrupt)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Idempotent comments cannot reopen, resume, or interrupt issues",
+      path: ["idempotencyKey"],
+    });
+  }
 });
 
 export type AddIssueComment = z.infer<typeof addIssueCommentSchema>;

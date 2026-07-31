@@ -321,6 +321,17 @@ function isGithubPrReviewRun(run: HeartbeatRunRow) {
   return reviewKind === "pr_review";
 }
 
+function hasPreservedMissingJobOutcome(run: HeartbeatRunRow) {
+  if (!run.resultJson || typeof run.resultJson !== "object" || Array.isArray(run.resultJson)) return false;
+  const recovery = (run.resultJson as Record<string, unknown>).externalLifecycleRecovery;
+  return Boolean(
+    recovery &&
+    typeof recovery === "object" &&
+    !Array.isArray(recovery) &&
+    (recovery as Record<string, unknown>).reason === "job_missing_recorded_outcome_preserved",
+  );
+}
+
 function isCommentDrivenWake(run: HeartbeatRunRow) {
   const context = readRecord(run.contextSnapshot);
   const wakeReason = readString(context.wakeReason);
@@ -389,7 +400,7 @@ export function decideSuccessfulRunHandoff(input: {
   if (run.status !== "succeeded") return { kind: "skip", reason: "source run did not succeed" };
   if (isCorrectiveHandoffRun(run)) return { kind: "skip", reason: "source run is already a corrective handoff run" };
   if (isIssueMonitorMaintenanceRun(run)) return { kind: "skip", reason: "issue monitor run owns its own recovery path" };
-  if (isGithubPrReviewRun(run)) {
+  if (isGithubPrReviewRun(run) && !hasPreservedMissingJobOutcome(run)) {
     return { kind: "skip", reason: "successful PR review run already may have emitted an external side effect" };
   }
   if (isCommentDrivenWake(run)) return { kind: "skip", reason: "comment-driven wake already owns the next action" };

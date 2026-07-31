@@ -28,6 +28,7 @@ import {
 } from "./blocker-resolved-wake-metrics.js";
 
 export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_total";
+export const AUTH_REQUEST_METRIC = "paperclip_auth_request_total";
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
 /**
@@ -105,6 +106,89 @@ export const PROCESS_LOST_LIVENESS_NULL_METRIC = "paperclip_process_lost_livenes
  * while their pods keep running (the wedged-container leak this reaper closes).
  */
 export const ORPHANED_MANAGED_POD_REAPED_METRIC = "paperclip_orphaned_managed_pod_reaped_total";
+
+export const KNOWN_AUTH_OPERATIONS = [
+  "oidc_start",
+  "oidc_callback",
+  "password_sign_in",
+  "password_sign_up",
+  "other",
+] as const;
+export const KNOWN_AUTH_OUTCOMES = [
+  "success",
+  "rate_limited",
+  "client_error",
+  "server_error",
+] as const;
+export type AuthOperation = (typeof KNOWN_AUTH_OPERATIONS)[number];
+export type AuthOutcome = (typeof KNOWN_AUTH_OUTCOMES)[number];
+
+const knownAuthOperationSet: ReadonlySet<string> = new Set(KNOWN_AUTH_OPERATIONS);
+const knownAuthOutcomeSet: ReadonlySet<string> = new Set(KNOWN_AUTH_OUTCOMES);
+const oidcServerErrorRedirectCodes: ReadonlySet<string> = new Set([
+  "internal_server_error",
+  "oauth_code_verification_failed",
+  "user_info_is_missing",
+]);
+
+export function normalizeAuthOperation(operation: string | null | undefined): AuthOperation {
+  return typeof operation === "string" && knownAuthOperationSet.has(operation)
+    ? operation as AuthOperation
+    : "other";
+}
+
+export function normalizeAuthOutcome(outcome: string | null | undefined): AuthOutcome {
+  return typeof outcome === "string" && knownAuthOutcomeSet.has(outcome)
+    ? outcome as AuthOutcome
+    : "server_error";
+}
+
+export function classifyAuthOperation(requestUrl: string): AuthOperation {
+  const pathname = requestUrl.split("?", 1)[0]?.replace(/\/+$/, "") ?? "";
+  if (pathname.endsWith("/sign-in/oauth2")) return "oidc_start";
+  if (/\/(?:oauth2\/callback|callback)\/[^/]+$/.test(pathname)) return "oidc_callback";
+  if (pathname.endsWith("/sign-in/email")) return "password_sign_in";
+  if (pathname.endsWith("/sign-up/email")) return "password_sign_up";
+  return "other";
+}
+
+export function classifyAuthOutcome(statusCode: number): AuthOutcome {
+  if (statusCode === 429) return "rate_limited";
+  if (statusCode >= 500) return "server_error";
+  if (statusCode >= 400) return "client_error";
+  return "success";
+}
+
+export function classifyAuthResponse(input: {
+  operation: AuthOperation;
+  statusCode: number;
+  location?: string | number | string[] | undefined;
+}): AuthOutcome {
+  const statusOutcome = classifyAuthOutcome(input.statusCode);
+  if (
+    statusOutcome !== "success" ||
+    input.operation !== "oidc_callback" ||
+    input.statusCode < 300 ||
+    input.statusCode >= 400
+  ) {
+    return statusOutcome;
+  }
+
+  const locations = Array.isArray(input.location) ? input.location : [input.location];
+  for (const location of locations) {
+    if (typeof location !== "string" || !location) continue;
+    try {
+      const error = new URL(location, "http://paperclip.invalid").searchParams.get("error");
+      if (error !== null) {
+        return oidcServerErrorRedirectCodes.has(error) ? "server_error" : "client_error";
+      }
+    } catch {
+      // A malformed Location header is not an OAuth error redirect signal.
+    }
+  }
+
+  return "success";
+}
 
 /**
  * Bounded `reason` allow-list (mirrors the adapter-lane reasons defined in
@@ -273,7 +357,15 @@ export function normalizeProcessLossClassification(classification: string | null
 let registry: Registry | null = null;
 let concurrentRunBlocked: Counter<"agent_id" | "reason" | "isolation_mode"> | null = null;
 let isolatedRunStarted: Counter<"agent_id" | "isolation_mode"> | null = null;
-let heartbeatRunFailed: Counter<"adapter" | "error_code" | "invocation_source"> | null = null;
+type HeartbeatRunFailedLabel =
+  | "agent_id"
+  | "issue_id"
+  | "adapter"
+  | "error_code"
+  | "invocation_source"
+  | "isolation_mode";
+
+let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
 let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = null;
 let externalRuntimeReservationEvents: Counter<"event"> | null = null;
@@ -283,12 +375,13 @@ let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | n
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let processLostLivenessNull: Counter | null = null;
 let orphanedManagedPodReaped: Counter<"adapter"> | null = null;
+let authRequest: Counter<"operation" | "outcome"> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
   counter: Counter<"agent_id" | "reason" | "isolation_mode">;
   isolatedStartedCounter: Counter<"agent_id" | "isolation_mode">;
-  failedCounter: Counter<"adapter" | "error_code" | "invocation_source">;
+  failedCounter: Counter<HeartbeatRunFailedLabel>;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
   zeroTokenCompletedRunStreakGauge: Gauge<"agent_id" | "adapter">;
   externalRuntimeReservationEventsCounter: Counter<"event">;
@@ -298,6 +391,7 @@ function ensureRegistry(): {
   externalLifecycleRunningRunsGauge: Gauge<"adapter">;
   processLostLivenessNullCounter: Counter;
   orphanedManagedPodReapedCounter: Counter<"adapter">;
+  authRequestCounter: Counter<"operation" | "outcome">;
 } {
   if (
     !registry
@@ -313,6 +407,7 @@ function ensureRegistry(): {
     || !externalLifecycleRunningRuns
     || !processLostLivenessNull
     || !orphanedManagedPodReaped
+    || !authRequest
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -338,10 +433,13 @@ function ensureRegistry(): {
     heartbeatRunFailed = new Counter({
       name: HEARTBEAT_RUN_FAILED_METRIC,
       help:
-        "Count of heartbeat runs that reached terminal status 'failed', labeled by adapter type, "
-        + "error_code, and invocation_source (wake reason). Used to compute webhook-driven "
-        + "PR-review failure rate (BLO-7457 / BLO-9147). Cardinality bounded by allow-lists.",
-      labelNames: ["adapter", "error_code", "invocation_source"],
+        "Count of heartbeat runs that reached terminal status 'failed', labeled by agent, source issue, "
+        + "adapter, error_code, invocation_source (wake reason), and bounded isolation_mode. Used to "
+        + "compute webhook-driven PR-review failure rate and detect repeated run-isolated execution-pod "
+        + "failures for one issue (BLO-7457 / BLO-9147 / BLO-17953). Agent and issue identifiers are "
+        + "retained only for run-isolated k8s_pod_schedule_failed; other failures collapse them to "
+        + "bounded fallbacks.",
+      labelNames: ["agent_id", "issue_id", "adapter", "error_code", "invocation_source", "isolation_mode"],
       registers: [registry],
     });
     ccrotateCapacityDeferred = new Counter({
@@ -420,6 +518,19 @@ function ensureRegistry(): {
       labelNames: ["adapter"],
       registers: [registry],
     });
+    authRequest = new Counter({
+      name: AUTH_REQUEST_METRIC,
+      help:
+        "Count of Better Auth requests labeled by bounded operation and outcome. "
+        + "No user, provider, IP address, callback state, or token is exposed.",
+      labelNames: ["operation", "outcome"],
+      registers: [registry],
+    });
+    for (const operation of KNOWN_AUTH_OPERATIONS) {
+      for (const outcome of KNOWN_AUTH_OUTCOMES) {
+        authRequest.inc({ operation, outcome }, 0);
+      }
+    }
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -438,6 +549,7 @@ function ensureRegistry(): {
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     processLostLivenessNullCounter: processLostLivenessNull,
     orphanedManagedPodReapedCounter: orphanedManagedPodReaped,
+    authRequestCounter: authRequest,
   };
 }
 
@@ -499,6 +611,10 @@ export function recordIsolatedRunStarted(
 }
 
 export interface RecordHeartbeatRunFailedInput {
+  /** Agent that owned the finalized run. */
+  agentId: string | null | undefined;
+  /** Source issue for issue-scoped execution, or null for non-issue work. */
+  issueId: string | null | undefined;
   /** Agent adapter type (e.g. "claude_k8s", "claude_local"). */
   adapter: string | null | undefined;
   /** Finalized error code on the heartbeat_runs row. */
@@ -508,6 +624,8 @@ export interface RecordHeartbeatRunFailedInput {
    * Maps to `invocation_source` label.
    */
   invocationSource: string | null | undefined;
+  /** K8s workspace isolation mode; non-K8s and malformed values become unknown. */
+  isolationMode: string | null | undefined;
 }
 
 /**
@@ -517,11 +635,23 @@ export interface RecordHeartbeatRunFailedInput {
  */
 export function recordHeartbeatRunFailed(
   input: RecordHeartbeatRunFailedInput,
-): { adapter: string; error_code: string; invocation_source: string } {
+): Record<HeartbeatRunFailedLabel, string> {
+  // Per-issue labels are intentionally limited to the retry-loop failure this
+  // monitor needs. Keeping them on every terminal failure would retain one
+  // Prometheus counter series per historical issue for the process lifetime.
+  const isolationMode = normalizeIsolationMode(input.isolationMode);
+  const retainSourceIds = input.errorCode === "k8s_pod_schedule_failed" && isolationMode === "run";
   const labels = {
+    agent_id: retainSourceIds && typeof input.agentId === "string" && input.agentId.length > 0
+      ? input.agentId
+      : UNKNOWN_AGENT_ID,
+    issue_id: retainSourceIds && typeof input.issueId === "string" && input.issueId.length > 0
+      ? input.issueId
+      : "none",
     adapter: typeof input.adapter === "string" && input.adapter.length > 0 ? input.adapter : "unknown",
     error_code: typeof input.errorCode === "string" && input.errorCode.length > 0 ? input.errorCode : "unknown",
     invocation_source: normalizeInvocationSource(input.invocationSource),
+    isolation_mode: isolationMode,
   };
   ensureRegistry().failedCounter.inc(labels);
   return labels;
@@ -654,6 +784,18 @@ export function recordOrphanedManagedPodReaped(labels?: { adapterType?: string }
   });
 }
 
+export function recordAuthRequest(input: {
+  operation: string | null | undefined;
+  outcome: string | null | undefined;
+}): { operation: AuthOperation; outcome: AuthOutcome } {
+  const labels = {
+    operation: normalizeAuthOperation(input.operation),
+    outcome: normalizeAuthOutcome(input.outcome),
+  };
+  ensureRegistry().authRequestCounter.inc(labels);
+  return labels;
+}
+
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
   const reg = getMetricsRegistry();
   const depBlockedSnapshot = snapshotDepBlockedMetrics();
@@ -693,6 +835,7 @@ export function __resetMetricsForTest(): void {
   externalLifecycleRunningRuns = null;
   processLostLivenessNull = null;
   orphanedManagedPodReaped = null;
+  authRequest = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
 }

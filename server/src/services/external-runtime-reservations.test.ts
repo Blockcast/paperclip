@@ -137,6 +137,32 @@ describeEmbeddedPostgres("external runtime reservations", () => {
     expect(runs.filter((run) => run.status === "queued")).toHaveLength(1);
   });
 
+  it("clears parked retry error metadata when an external runtime run is claimed", async () => {
+    const [runId] = await seedQueuedRuns(1);
+    const claimedAt = new Date("2026-07-14T12:30:00.000Z");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        error: "provider capacity retry parked",
+        errorCode: "rate_limit_exhausted",
+        scheduledRetryAt: claimedAt,
+        scheduledRetryAttempt: 2,
+        scheduledRetryReason: "ccrotate_capacity",
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const claim = await claimRunWithExternalRuntimeSlotPool(db, runId, claimedAt, 1);
+
+    expect(claim?.run).toMatchObject({
+      status: "running",
+      error: null,
+      errorCode: null,
+      scheduledRetryAt: claimedAt,
+      scheduledRetryAttempt: 2,
+      scheduledRetryReason: "ccrotate_capacity",
+    });
+  });
+
   it("keeps two same-agent runs progressing through intentionally skewed launches", async () => {
     const [slowRunId, fastRunId] = await seedQueuedRuns(2);
     const claimedAt = new Date("2026-07-15T12:00:00.000Z");

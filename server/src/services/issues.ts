@@ -153,14 +153,14 @@ const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_PARALLEL_READS = 8;
 function awaitingUserInputReason(body: string): string | null {
   const normalized = body.toLowerCase();
   const hasExplicitPhrase = [
-    "pick a",
-    "confirm",
-    "let me know",
-    "blocked on clarification",
-    "blocked awaiting",
-    "awaiting user",
-    "awaiting your",
-  ].some((phrase) => normalized.includes(phrase));
+    /\bpick (?:a|an)\b/,
+    /\bconfirm\b/,
+    /\blet me know\b/,
+    /\bblocked on clarification\b/,
+    /\bblocked awaiting\b/,
+    /\bawaiting user\b/,
+    /\bawaiting your\b/,
+  ].some((phrase) => phrase.test(normalized));
   if (hasExplicitPhrase) return "explicit_phrase";
 
   const hasQuestion = body.includes("?");
@@ -170,21 +170,29 @@ function awaitingUserInputReason(body: string): string | null {
   return null;
 }
 
-async function findBlockedPromotionAwaitingUserInput(
+async function findBlockedPromotionsAwaitingUserInput(
   dbOrTx: any,
-  issue: Pick<typeof issues.$inferSelect, "id" | "companyId">,
+  companyId: string,
+  issueIds: string[],
 ) {
-  const latestAgentComment = await dbOrTx
-    .select({
+  if (issueIds.length === 0) return new Map<string, {
+    commentId: string;
+    commentCreatedAt: Date;
+    reason: string;
+  }>();
+
+  const latestAgentComments = await dbOrTx
+    .selectDistinctOn([issueComments.issueId], {
       id: issueComments.id,
+      issueId: issueComments.issueId,
       body: issueComments.body,
       createdAt: issueComments.createdAt,
     })
     .from(issueComments)
     .where(
       and(
-        eq(issueComments.companyId, issue.companyId),
-        eq(issueComments.issueId, issue.id),
+        eq(issueComments.companyId, companyId),
+        inArray(issueComments.issueId, issueIds),
         or(
           sql<boolean>`${issueComments.authorAgentId} IS NOT NULL`,
           sql<boolean>`${issueComments.createdByRunId} IS NOT NULL`,
@@ -192,34 +200,69 @@ async function findBlockedPromotionAwaitingUserInput(
         )!,
       ),
     )
-    .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
-    .limit(1)
-    .then((rows: Array<{ id: string; body: string; createdAt: Date }>) => rows[0] ?? null);
+    .orderBy(issueComments.issueId, desc(issueComments.createdAt), desc(issueComments.id)) as Array<{
+      id: string;
+      issueId: string;
+      body: string;
+      createdAt: Date;
+    }>;
 
-  if (!latestAgentComment) return null;
-  const reason = awaitingUserInputReason(latestAgentComment.body);
-  if (!reason) return null;
+  const awaitingComments = latestAgentComments.flatMap((comment) => {
+    const reason = awaitingUserInputReason(comment.body);
+    return reason ? [{ ...comment, reason }] : [];
+  });
+  if (awaitingComments.length === 0) return new Map();
 
-  const userReplyAfterAgentQuestion = await dbOrTx
-    .select({ id: issueComments.id })
+  const latestUserReplies = await dbOrTx
+    .selectDistinctOn([issueComments.issueId], {
+      issueId: issueComments.issueId,
+      createdAt: issueComments.createdAt,
+    })
     .from(issueComments)
     .where(
       and(
-        eq(issueComments.companyId, issue.companyId),
-        eq(issueComments.issueId, issue.id),
+        eq(issueComments.companyId, companyId),
+        inArray(issueComments.issueId, awaitingComments.map((comment) => comment.issueId)),
         sql<boolean>`${issueComments.authorUserId} IS NOT NULL`,
-        gt(issueComments.createdAt, latestAgentComment.createdAt),
       ),
     )
-    .limit(1)
-    .then((rows: Array<{ id: string }>) => rows[0] ?? null);
+    .orderBy(issueComments.issueId, desc(issueComments.createdAt), desc(issueComments.id)) as Array<{
+      issueId: string;
+      createdAt: Date;
+    }>;
+  const latestUserReplyByIssueId = new Map(
+    latestUserReplies.map((comment) => [comment.issueId, comment.createdAt] as const),
+  );
 
-  if (userReplyAfterAgentQuestion) return null;
-  return {
-    commentId: latestAgentComment.id,
-    commentCreatedAt: latestAgentComment.createdAt,
-    reason,
+  return new Map(awaitingComments.flatMap((comment) => {
+    const latestUserReply = latestUserReplyByIssueId.get(comment.issueId);
+    if (latestUserReply && latestUserReply > comment.createdAt) return [];
+    return [[comment.issueId, {
+      commentId: comment.id,
+      commentCreatedAt: comment.createdAt,
+      reason: comment.reason,
+    }] as const];
+  }));
+}
+
+function recordBlockedPromotionAwaitingUserSkip(input: {
+  issueId: string;
+  commentId: string;
+  commentCreatedAt: Date;
+  reason: string;
+  triggerPath: "blocker_done" | "resolved_blocker_sweep";
+}) {
+  const details = {
+    event: BLOCKED_PROMOTION_AWAITING_USER_EVENT,
+    counter: BLOCKED_PROMOTION_AWAITING_USER_COUNTER,
+    ...input,
+    commentCreatedAt: input.commentCreatedAt.toISOString(),
   };
+  logger.info(details, "automatic blocked issue wake skipped because latest agent comment awaits user input");
+  getTelemetryClient()?.track(BLOCKED_PROMOTION_AWAITING_USER_COUNTER, {
+    reason: input.reason,
+    triggerPath: input.triggerPath,
+  });
 }
 
 export const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS = 7;
@@ -635,6 +678,10 @@ type IssueActiveRunRow = {
   startedAt: Date | null;
   finishedAt: Date | null;
   createdAt: Date;
+  // BLO-19001: liveness signals, so a consumer can tell a run that is actually
+  // holding this issue from one that has been silent long enough to be stale.
+  lastOutputAt: Date | null;
+  lastUsefulActionAt: Date | null;
 };
 type IssueScheduledRetryRow = {
   runId: string;
@@ -1801,6 +1848,44 @@ async function withIssueLabels(dbOrTx: any, rows: IssueRow[]): Promise<IssueWith
  * operator overrides, and any work_products. Caller supplies the description
  * (already on the existing row in the PATCH handler, no need to re-select).
  */
+/**
+ * Shapes that record a DURABLE fact ("a PR/commit was attached to this issue"),
+ * as opposed to a fact about the current comment window.
+ */
+const DURABLE_LANDING_SHAPES = ["pr-link", "landing-artifact"] as const;
+
+/**
+ * Carry forward durable landing evidence when re-evaluating an already-in_review
+ * issue.
+ *
+ * The evaluator only scans the 10 most recent agent comments, so once ten
+ * comments accumulate after the one bearing the PR link, a fresh evaluation
+ * reports `allDetected: []`. On the in_review TRANSITION that is the honest
+ * answer and it is what gets stored. But `done-gate.ts` reads the STORED
+ * verdict's `allDetected` as the standing record that a PR was ever attached
+ * (`hasPrLinkEvidence`), so letting a re-evaluation overwrite it would make an
+ * issue that legitimately shipped a PR fail its later `done` transition with
+ * `no_execution_run_and_no_pr_evidence` purely because the comment thread grew.
+ * Before BLO-19047 the re-evaluation was a no-op, so the transition-time verdict
+ * was durable by accident; this keeps it durable on purpose.
+ *
+ * Only `allDetected` is merged — `verdict`, `missing` and `requiredFound` stay
+ * exactly as freshly computed, which is the whole point of re-evaluating.
+ */
+function preserveDurableLandingEvidence<T extends { allDetected?: unknown }>(
+  fresh: T,
+  stored: unknown,
+): T {
+  const storedDetected = (stored as { allDetected?: unknown } | null)?.allDetected;
+  if (!Array.isArray(storedDetected)) return fresh;
+  const freshDetected = Array.isArray(fresh.allDetected) ? fresh.allDetected : [];
+  const carried = DURABLE_LANDING_SHAPES.filter(
+    (shape) => storedDetected.includes(shape) && !freshDetected.includes(shape),
+  );
+  if (carried.length === 0) return fresh;
+  return { ...fresh, allDetected: [...freshDetected, ...carried] };
+}
+
 async function fetchEvidenceForIssue(
   dbOrTx: any,
   issueId: string,
@@ -2028,6 +2113,8 @@ async function activeRunMapForIssues(
         startedAt: heartbeatRuns.startedAt,
         finishedAt: heartbeatRuns.finishedAt,
         createdAt: heartbeatRuns.createdAt,
+        lastOutputAt: heartbeatRuns.lastOutputAt,
+        lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
       })
       .from(heartbeatRuns)
       .where(
@@ -4308,6 +4395,16 @@ export function issueService(db: Db) {
     if (!actor.agentId && !actor.userId && authorType !== "system") {
       throw unprocessable("System comments cannot use user or agent authorType without an author id");
     }
+  }
+
+  function issueCommentIdempotencyAuthorScope(actor: { agentId?: string | null; userId?: string | null }) {
+    if (actor.agentId) {
+      return and(eq(issueComments.authorAgentId, actor.agentId), isNull(issueComments.authorUserId));
+    }
+    if (actor.userId) {
+      return and(eq(issueComments.authorUserId, actor.userId), isNull(issueComments.authorAgentId));
+    }
+    return and(isNull(issueComments.authorAgentId), isNull(issueComments.authorUserId));
   }
 
   function redactIssueComment<T extends {
@@ -6601,6 +6698,20 @@ export function issueService(db: Db) {
 
       const suppressedIssueIds = new Set<string>();
       if (blockedCandidateIds.length > 0) {
+        const awaitingUserInputByIssueId = await findBlockedPromotionsAwaitingUserInput(
+          db,
+          blockerIssue.companyId,
+          blockedCandidateIds,
+        );
+        for (const [issueId, awaitingUserInput] of awaitingUserInputByIssueId) {
+          suppressedIssueIds.add(issueId);
+          recordBlockedPromotionAwaitingUserSkip({
+            issueId,
+            ...awaitingUserInput,
+            triggerPath: "blocker_done",
+          });
+        }
+
         const commentRows = await db
           .select({
             id: issueComments.id,
@@ -6732,6 +6843,7 @@ export function issueService(db: Db) {
         latestBlockerResolvedAt: Date | null;
       }> = [];
       const candidateStatusById = new Map(candidates.map((c) => [c.id, c.status]));
+      const candidateCompanyIdById = new Map(candidates.map((c) => [c.id, c.companyId]));
       for (const candidate of candidates) {
         const blockers = byDependent.get(candidate.id);
         if (!blockers || blockers.ids.length === 0 || !blockers.allDone) continue;
@@ -6871,6 +6983,33 @@ export function issueService(db: Db) {
         .map((r) => r.id);
       if (blockedResultIds.length === 0) return resultsAfterExplicitWaitingSuppression;
 
+      const blockedResultIdsByCompanyId = new Map<string, string[]>();
+      for (const issueId of blockedResultIds) {
+        const candidateCompanyId = candidateCompanyIdById.get(issueId);
+        if (!candidateCompanyId) continue;
+        const ids = blockedResultIdsByCompanyId.get(candidateCompanyId) ?? [];
+        ids.push(issueId);
+        blockedResultIdsByCompanyId.set(candidateCompanyId, ids);
+      }
+      const awaitingUserInputByIssueId = new Map<string, {
+        commentId: string;
+        commentCreatedAt: Date;
+        reason: string;
+      }>();
+      for (const [candidateCompanyId, issueIds] of blockedResultIdsByCompanyId) {
+        const companyResults = await findBlockedPromotionsAwaitingUserInput(db, candidateCompanyId, issueIds);
+        for (const [issueId, awaitingUserInput] of companyResults) {
+          awaitingUserInputByIssueId.set(issueId, awaitingUserInput);
+        }
+      }
+      for (const [issueId, awaitingUserInput] of awaitingUserInputByIssueId) {
+        recordBlockedPromotionAwaitingUserSkip({
+          issueId,
+          ...awaitingUserInput,
+          triggerPath: "resolved_blocker_sweep",
+        });
+      }
+
       const pendingConfirmationRows = await db
         .select({ issueId: issueThreadInteractions.issueId })
         .from(issueThreadInteractions)
@@ -6879,7 +7018,10 @@ export function issueService(db: Db) {
           eq(issueThreadInteractions.kind, "request_confirmation"),
           eq(issueThreadInteractions.status, "pending"),
         ));
-      const suppressedIssueIds = new Set<string>(pendingConfirmationRows.map((row) => row.issueId));
+      const suppressedIssueIds = new Set<string>([
+        ...pendingConfirmationRows.map((row) => row.issueId),
+        ...awaitingUserInputByIssueId.keys(),
+      ]);
 
       const commentRows = await db
         .select({
@@ -7782,25 +7924,6 @@ export function issueService(db: Db) {
         delete issueData.executionWorkspaceSettings;
       }
 
-      if (existing.status === "blocked" && issueData.status === "todo") {
-        const awaitingUserInput = await findBlockedPromotionAwaitingUserInput(dbOrTx, existing);
-        if (awaitingUserInput) {
-          const details = {
-            event: BLOCKED_PROMOTION_AWAITING_USER_EVENT,
-            counter: BLOCKED_PROMOTION_AWAITING_USER_COUNTER,
-            issueId: existing.id,
-            commentId: awaitingUserInput.commentId,
-            commentCreatedAt: awaitingUserInput.commentCreatedAt.toISOString(),
-            reason: awaitingUserInput.reason,
-          };
-          logger.warn(details, "blocked to todo promotion skipped because latest agent comment awaits user input");
-          getTelemetryClient()?.track(BLOCKED_PROMOTION_AWAITING_USER_COUNTER, {
-            reason: awaitingUserInput.reason,
-          });
-          throw conflict("Blocked issue is awaiting user input", details);
-        }
-      }
-
       if (issueData.status) {
         assertTransition(existing.status, issueData.status);
       }
@@ -7958,10 +8081,21 @@ export function issueService(db: Db) {
 
       // Evaluation failures remain fail-open, but a computed block verdict
       // rejects every new transition to in_review.
-      if (
-        issueData.status === "in_review" &&
-        existing.status !== "in_review"
-      ) {
+      //
+      // The gate re-evaluates on EVERY patch that carries `status: "in_review"`,
+      // including in_review → in_review. It used to be transition-only, which
+      // silently froze `lastEvidenceVerdict` at its first evaluation: an agent
+      // following the documented remediation loop ("add the missing evidence,
+      // comment again, re-send in_review") got a 200 with an unchanged stale
+      // verdict and no way to tell "gate ran and still fails" from "gate never
+      // ran" — the same silent-no-op class as BLO-18790. (BLO-19047)
+      //
+      // Only a real transition INTO in_review can throw. A re-evaluation on an
+      // already-in_review issue refreshes the recorded verdict but never
+      // rejects the patch, so unrelated edits (labels, description, assignee)
+      // to an in_review issue cannot start failing with a 422.
+      if (issueData.status === "in_review") {
+        const isInReviewTransition = existing.status !== "in_review";
         let inReviewVerdict: Awaited<ReturnType<typeof runEvidenceGate>> | null = null;
         try {
           const verdict = await runEvidenceGate(
@@ -7975,7 +8109,9 @@ export function issueService(db: Db) {
             id,
           );
           inReviewVerdict = verdict;
-          patch.lastEvidenceVerdict = verdict;
+          patch.lastEvidenceVerdict = isInReviewTransition
+            ? verdict
+            : preserveDurableLandingEvidence(verdict, existing.lastEvidenceVerdict);
           patch.lastEvidenceVerdictEvaluatedAt = new Date(verdict.evaluatedAt);
           logger.info(
             {
@@ -7988,8 +8124,11 @@ export function issueService(db: Db) {
               diagnostics: verdict.diagnostics,
               overridden: verdict.overridden,
               overrideReason: verdict.overrideReason,
+              inReviewTransition: isInReviewTransition,
             },
-            `evidence-gate: ${verdict.verdict} on in_review transition`,
+            `evidence-gate: ${verdict.verdict} on ${
+              isInReviewTransition ? "in_review transition" : "in_review re-evaluation"
+            }`,
           );
         } catch (err) {
           logger.warn(
@@ -8001,7 +8140,7 @@ export function issueService(db: Db) {
           );
         }
 
-        if (inReviewVerdict?.verdict === "block") {
+        if (isInReviewTransition && inReviewVerdict?.verdict === "block") {
           throw unprocessable("missing-evidence", {
             code: "missing-evidence",
             missing: inReviewVerdict.missing,
@@ -9169,6 +9308,42 @@ export function issueService(db: Db) {
       });
     },
 
+    getCommentByIdempotencyKey: async (
+      issueId: string,
+      idempotencyKey: string,
+      actor: { agentId?: string | null; userId?: string | null },
+      dbOrTx: any = db,
+    ) => {
+      const comment = await dbOrTx
+        .select()
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.idempotencyKey, idempotencyKey),
+          issueCommentIdempotencyAuthorScope(actor),
+          isNull(issueComments.deletedAt),
+        ))
+        .then((rows: Array<typeof issueComments.$inferSelect>) => rows[0] ?? null);
+      if (!comment) return null;
+
+      const currentUserRedactionOptions = {
+        enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+      };
+      return redactIssueComment(comment, currentUserRedactionOptions.enabled);
+    },
+
+    markCommentIdempotencyProcessed: async (commentId: string, dbOrTx: any = db) => {
+      await dbOrTx
+        .update(issueComments)
+        .set({ idempotencyProcessedAt: new Date() })
+        .where(and(
+          eq(issueComments.id, commentId),
+          isNotNull(issueComments.idempotencyKey),
+          isNull(issueComments.idempotencyProcessedAt),
+          isNull(issueComments.deletedAt),
+        ));
+    },
+
     addComment: async (
       issueId: string,
       body: string,
@@ -9177,6 +9352,7 @@ export function issueService(db: Db) {
         authorType?: IssueCommentAuthorType | null;
         presentation?: IssueCommentPresentation | null;
         metadata?: IssueCommentMetadata | null;
+        idempotencyKey?: string | null;
         sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
       },
@@ -9201,7 +9377,7 @@ export function issueService(db: Db) {
       const presentation = issueCommentPresentationSchema.nullable().parse(options?.presentation ?? null);
       const metadata = issueCommentMetadataSchema.nullable().parse(options?.metadata ?? null);
       const createdAt = options?.createdAt ? new Date(options.createdAt) : null;
-      const [comment] = await dbOrTx
+      const [insertedComment] = await dbOrTx
         .insert(issueComments)
         .values({
           companyId: issue.companyId,
@@ -9210,13 +9386,37 @@ export function issueService(db: Db) {
           authorUserId: actor.userId ?? null,
           authorType,
           createdByRunId: actor.runId ?? null,
+          idempotencyKey: options?.idempotencyKey ?? null,
           body: redactedBody,
           presentation,
           metadata,
           sourceTrust: options?.sourceTrust ?? null,
           ...(createdAt && !Number.isNaN(createdAt.getTime()) ? { createdAt } : {}),
         })
+        .onConflictDoNothing()
         .returning();
+
+      const comment = insertedComment ?? (options?.idempotencyKey
+        ? await dbOrTx
+            .select()
+            .from(issueComments)
+            .where(and(
+              eq(issueComments.issueId, issueId),
+              eq(issueComments.idempotencyKey, options.idempotencyKey),
+              issueCommentIdempotencyAuthorScope(actor),
+              isNull(issueComments.deletedAt),
+            ))
+            .then((rows: Array<typeof issueComments.$inferSelect>) => rows[0] ?? null)
+        : null);
+
+      if (!comment) throw conflict("Issue comment idempotency conflict");
+
+      if (!insertedComment) {
+        return {
+          ...redactIssueComment(comment, currentUserRedactionOptions.enabled),
+          deduplicated: true as const,
+        };
+      }
 
       // Update issue's updatedAt so comment activity is reflected in recency sorting
       await dbOrTx

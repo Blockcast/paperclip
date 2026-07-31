@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   review:
-    runs-on: default
+    runs-on: arc-light
     # ARC runners have no warm toolcache, so setup-node's download plus
     # Dependency Review can exceed a tight 5-min cap and cancel the job (the
     # cancelled job surfaces as a red `review` check). 10 min gives headroom
@@ -50,7 +50,7 @@ jobs:
         if: env.COMMITPERCLIP_ENABLED == 'true'
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: Generate commitperclip token
         id: token

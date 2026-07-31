@@ -378,6 +378,8 @@ export {
   issueBlockedInboxSeveritySchema,
   issueBlockedInboxStateSchema,
   updateIssueSchema,
+  MISPLACED_ISSUE_MONITOR_INPUT_KEYS,
+  misplacedIssueMonitorInputMessage,
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
   issueRecoveryActionReadModelSchema,

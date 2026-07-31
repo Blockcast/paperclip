@@ -36,6 +36,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueDocuments,
+  issueLabels,
   issuePlanDecompositions,
   issueRecoveryActions,
   issueRelations,
@@ -44,6 +45,7 @@ import {
   issueTreeHolds,
   issueWorkProducts,
   issues,
+  labels,
   projects,
   projectWorkspaces,
   workspaceOperations,
@@ -57,6 +59,7 @@ import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-stat
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
 const mockTerminateLocalService = vi.hoisted(() => vi.fn());
+const mockGithubHasReviewerEvidenceForPr = vi.hoisted(() => vi.fn());
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn<
     (ctx: {
@@ -95,6 +98,16 @@ const mockAdapterExecute = vi.hoisted(() =>
 vi.mock("../telemetry.ts", () => ({
   getTelemetryClient: () => mockTelemetryClient,
 }));
+
+vi.mock("../services/github-app-auth.ts", async () => {
+  const actual = await vi.importActual<typeof import("../services/github-app-auth.ts")>(
+    "../services/github-app-auth.ts",
+  );
+  return {
+    ...actual,
+    githubHasReviewerEvidenceForPr: mockGithubHasReviewerEvidenceForPr,
+  };
+});
 
 const mockListLiveAgentJobRunIds = vi.hoisted(() =>
   vi.fn<() => Promise<Set<string> | null>>(async () => null),
@@ -446,6 +459,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
     mockTerminateLocalService.mockImplementation(localServiceSupervisor.terminateLocalService);
     mockHasActiveJobForAgent.mockImplementation(async () => false);
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValue({ found: false });
     mockAdapterExecute.mockImplementation(async () => ({
       exitCode: 0,
       signal: null,
@@ -1603,6 +1617,212 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       state: "released",
       releaseReason: "job_missing",
     });
+  });
+
+  it("preserves an exact-head GitHub review when its external Job disappears", async () => {
+    const jobName = "agent-opencode-review-posted";
+    const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+        githubRepoFullName: "Blockcast/onprem-k8s",
+        githubPrNumber: 1648,
+        githubHeadSha: headSha,
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: {
+          summary: "No locally recorded review outcome is available.",
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ found: true, via: "review" });
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      createdByRunId: runId,
+      body: "Submitted GitHub review 4781882116 and recorded the terminal outcome.",
+    });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledWith({
+      repoFullName: "Blockcast/onprem-k8s",
+      prNumber: 1648,
+      headSha,
+    });
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledTimes(1);
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "succeeded",
+      errorCode: null,
+      resultJson: expect.objectContaining({
+        externalLifecycleRecovery: expect.objectContaining({
+          reason: "job_missing_recorded_outcome_preserved",
+        }),
+      }),
+    });
+    const retries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(retries).toHaveLength(0);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.filter((comment) => comment.body.includes("Submitted GitHub review 4781882116")))
+      .toHaveLength(1);
+    expect(comments.map((comment) => comment.body)).toContain(SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY);
+    const dispositionWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(dispositionWakeups.some((wakeup) => wakeup.reason === "finish_successful_run_handoff"))
+      .toBe(true);
+  });
+
+  it("fails and retries once when a PR-review request comment is not outcome evidence", async () => {
+    const jobName = "agent-opencode-review-lost";
+    const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+        githubRepoFullName: "Blockcast/onprem-k8s",
+        githubPrNumber: 1648,
+        githubHeadSha: headSha,
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    await db
+      .update(heartbeatRuns)
+      .set({ resultJson: { summary: `@ally review exact head ${headSha}` } })
+      .where(eq(heartbeatRuns.id, runId));
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ found: false });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledWith({
+      repoFullName: "Blockcast/onprem-k8s",
+      prNumber: 1648,
+      headSha,
+    });
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledTimes(1);
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "failed",
+      errorCode: "job_missing",
+    });
+    const retries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: 1 });
+  });
+
+  it("does not treat generic run artifacts as a completed missing-Job outcome", async () => {
+    const jobName = "agent-opencode-progress-only";
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      createdByRunId: runId,
+      body: "Progress update written before the lifecycle Job disappeared.",
+    });
+    const documentId = randomUUID();
+    const revisionId = randomUUID();
+    await db.insert(documents).values({
+      id: documentId,
+      companyId,
+      title: "Incomplete recovery notes",
+      format: "markdown",
+      latestBody: "# Incomplete recovery notes",
+      latestRevisionId: revisionId,
+      latestRevisionNumber: 1,
+      createdByAgentId: agentId,
+      updatedByAgentId: agentId,
+    });
+    await db.insert(documentRevisions).values({
+      id: revisionId,
+      companyId,
+      documentId,
+      revisionNumber: 1,
+      title: "Incomplete recovery notes",
+      format: "markdown",
+      body: "# Incomplete recovery notes",
+      createdByAgentId: agentId,
+      createdByRunId: runId,
+    });
+    await db.insert(issueDocuments).values({
+      companyId,
+      issueId,
+      documentId,
+      key: "progress",
+    });
+    await db.insert(issueWorkProducts).values({
+      companyId,
+      issueId,
+      type: "report",
+      provider: "test",
+      externalId: "incomplete-recovery-notes",
+      title: "Incomplete recovery notes",
+      status: "draft",
+      createdByRunId: runId,
+    });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    expect(mockGithubHasReviewerEvidenceForPr).not.toHaveBeenCalled();
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "failed",
+      errorCode: "job_missing",
+    });
+    const handoffWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.reason, "finish_successful_run_handoff"),
+      ));
+    expect(handoffWakeups).toHaveLength(0);
   });
 
   it("keeps a fresh ownerless run when the exact Job lookup is inconclusive", async () => {
@@ -4017,6 +4237,114 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).toBe(true);
   });
 
+  it("parks a review-waiting continuation when an open child blocker would create a cycle", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const openChildId = randomUUID();
+
+    await db.insert(issues).values({
+      id: openChildId,
+      companyId,
+      parentId: issueId,
+      title: "Child already blocked by parent",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 10,
+      identifier: `${issuePrefix}-10`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId,
+      relatedIssueId: openChildId,
+      type: "blocks",
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.waitingOnReviewResolved).toBe(0);
+    expect(result.reviewWaitingParked).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const parked = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(parked?.status).toBe("in_review");
+    expect(parked?.assigneeAgentId).toBe(agentId);
+
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+    await expect(sourceBlockerIssueIds(companyId, openChildId)).resolves.toEqual([issueId]);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.authorType).toBe("system");
+    expect(comments[0]?.body).toContain("review/approval");
+    expect(comments[0]?.body).not.toContain(`${issuePrefix}-10`);
+    expect(comments[0]?.body).not.toContain("issue_continuation_waiting_on_review");
+  });
+
+  it("parks a review-waiting continuation in_review when the blocker write races a concurrent cycle-forming relation", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const openChildId = randomUUID();
+
+    await db.insert(issues).values({
+      id: openChildId,
+      companyId,
+      parentId: issueId,
+      title: "Child not yet blocked by parent",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 10,
+      identifier: `${issuePrefix}-10`,
+    });
+    // No reverse `blocks` relation is seeded, so the recovery reachability check
+    // (findCycleFormingBlockerIssueIds) will not flag openChildId as cycle-forming - it
+    // only sees a cycle at write time, simulating a relation update that lands between
+    // the check and the write. The real write-time check (assertNoBlockingCycles) runs
+    // inside issuesSvc.update's db.transaction(), so the fault is injected on the first
+    // transaction the reconcile pass opens rather than on db.update directly (that
+    // transaction's tx.update/tx.select calls are a separate client, invisible to a
+    // db.update spy).
+    const transactionSpy = vi.spyOn(db, "transaction");
+    let cycleErrorThrown = false;
+    transactionSpy.mockImplementationOnce(async () => {
+      cycleErrorThrown = true;
+      throw new Error("Blocking relations cannot contain cycles");
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    let result: Awaited<ReturnType<typeof heartbeat.reconcileStrandedAssignedIssues>>;
+    try {
+      result = await heartbeat.reconcileStrandedAssignedIssues();
+    } finally {
+      transactionSpy.mockRestore();
+    }
+
+    expect(cycleErrorThrown).toBe(true);
+    expect(result.waitingOnReviewResolved).toBe(0);
+    expect(result.reviewWaitingParked).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const parked = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(parked?.status).toBe("in_review");
+    expect(parked?.assigneeAgentId).toBe(agentId);
+
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+  });
+
   it("converts a continuation parked for review into a dependency wait on its existing blockers", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
@@ -4142,6 +4470,131 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       ),
     ).toBe(true);
   });
+
+  it(
+    "BLO-18643: does not re-escalate a review-waiting park to blocked when its monitor already " +
+      "fired and was never rescheduled",
+    async () => {
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "issue_continuation_waiting_on_review",
+        runError: "Continuation parked: issue is waiting on review/approval",
+      });
+
+      // Replay BLO-18614's exact monitor shape: the monitor already fired
+      // (`status: "triggered"`) and was never rescheduled (`monitorNextCheckAt: null`).
+      await db
+        .update(issues)
+        .set({
+          monitorNextCheckAt: null,
+          monitorLastTriggeredAt: new Date("2026-07-29T03:52:37.000Z"),
+          monitorAttemptCount: 1,
+          monitorScheduledBy: "assignee",
+          monitorNotes: "PR #806 (Blockcast/paperclip): watching for CI green + Ally review decision before merge.",
+        })
+        .where(eq(issues.id, issueId));
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const firstResult = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(firstResult.reviewWaitingParked).toBe(1);
+      expect(firstResult.escalated).toBe(0);
+      expect(firstResult.issueIds).toEqual([issueId]);
+
+      const parked = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(parked?.status).toBe("in_review");
+      expect(parked?.assigneeAgentId).toBe(agentId);
+
+      // Simulate the next sweep tick (BLO-18614 recurred 21s later) finding the same
+      // now-`in_review` issue with the same cancelled/waiting-on-review latest run: it
+      // must be a no-op, not a second, clobbering escalation to `blocked`.
+      const secondResult = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(secondResult.escalated).toBe(0);
+      expect(secondResult.reviewWaitingParked).toBe(0);
+      expect(secondResult.issueIds).not.toContain(issueId);
+
+      const stillParked = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(stillParked?.status).toBe("in_review");
+      await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+
+      // No recovery action or recovery issue was ever created for this deliberate wait.
+      const recoveryActions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+      expect(recoveryActions).toHaveLength(0);
+
+      const recoveryIssues = await db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+      expect(recoveryIssues).toHaveLength(0);
+
+      // The monitor is now recognized as an active watch, so the park goes through the
+      // monitor-path branch (which relies on the monitor's own visible notes rather than
+      // posting a redundant comment) -- not the no-monitor fallback. Either way, no
+      // escalation comment ever lands on the thread.
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      for (const comment of comments) {
+        expect(comment.body).not.toContain("Moving it to `blocked`");
+      }
+
+      const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+      expect(
+        activity.some(
+          (event) =>
+            event.action === "issue.updated" &&
+            (event.details as { source?: string } | null)?.source ===
+              "recovery.reconcile_review_waiting_continuation",
+        ),
+      ).toBe(true);
+      expect(
+        activity.some((event) => (event.details as { status?: string } | null)?.status === "blocked"),
+      ).toBe(false);
+    },
+  );
+
+  it(
+    "BLO-18669: a genuine review-park failure still escalates to blocked",
+    async () => {
+      const { companyId, issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "issue_continuation_waiting_on_review",
+        runError: "Continuation parked: issue is waiting on review/approval",
+      });
+
+      // The "pr" evidence shape requires a PR link. Leaving it absent makes the
+      // `in_review` transition throw from the evidence gate; this is a true
+      // park failure, not the already-parked race.
+      const labelId = randomUUID();
+      await db.insert(labels).values({ id: labelId, companyId, name: "pr", color: "#000000" });
+      await db.insert(issueLabels).values({ issueId, labelId, companyId });
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.reviewWaitingParked).toBe(0);
+      expect(result.escalated).toBe(1);
+      expect(result.issueIds).toEqual([issueId]);
+
+      const escalated = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(escalated?.status).toBe("blocked");
+
+      const recoveryActions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+      expect(recoveryActions).toHaveLength(1);
+    },
+  );
 
   // BLO-16182: process_lost is reclassified as transient_infra (3 attempts +
   // 60s backoff). These two guard the COMBINED attempt cap end-to-end through

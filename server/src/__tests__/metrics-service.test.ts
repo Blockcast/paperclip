@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   AGENT_NO_USAGE_STREAK_METRIC,
+  AUTH_REQUEST_METRIC,
   CONCURRENT_RUN_BLOCKED_METRIC,
   DEP_BLOCKED_WAKEUP_METRIC,
   HEARTBEAT_RUN_FAILED_METRIC,
@@ -13,12 +14,16 @@ import {
   UNKNOWN_ISOLATION_MODE,
   UNKNOWN_REASON,
   __resetMetricsForTest,
+  classifyAuthOperation,
+  classifyAuthOutcome,
+  classifyAuthResponse,
   normalizeAgentId,
   normalizeInvocationSource,
   normalizeIsolationMode,
   normalizeReason,
   recordConcurrentRunBlocked,
   recordAgentZeroTokenCompletedRunStreak,
+  recordAuthRequest,
   recordHeartbeatRunFailed,
   recordIsolatedRunStarted,
   renderMetrics,
@@ -45,6 +50,56 @@ import {
 
 afterEach(() => {
   __resetMetricsForTest();
+});
+
+describe("authentication request metrics", () => {
+  it("classifies auth paths and response outcomes into bounded labels", () => {
+    expect(classifyAuthOperation("/api/auth/sign-in/oauth2?next=%2F")).toBe("oidc_start");
+    expect(classifyAuthOperation("/api/auth/oauth2/callback/dex?code=redacted")).toBe("oidc_callback");
+    expect(classifyAuthOperation("/api/auth/sign-in/email")).toBe("password_sign_in");
+    expect(classifyAuthOperation("/api/auth/sign-up/email")).toBe("password_sign_up");
+    expect(classifyAuthOperation("/api/auth/sign-out")).toBe("other");
+    expect(classifyAuthOutcome(200)).toBe("success");
+    expect(classifyAuthOutcome(400)).toBe("client_error");
+    expect(classifyAuthOutcome(429)).toBe("rate_limited");
+    expect(classifyAuthOutcome(503)).toBe("server_error");
+  });
+
+  it("classifies successful and failed OIDC callback redirects", () => {
+    expect(classifyAuthResponse({
+      operation: "oidc_callback",
+      statusCode: 302,
+      location: "/",
+    })).toBe("success");
+    expect(classifyAuthResponse({
+      operation: "oidc_callback",
+      statusCode: 302,
+      location: 0,
+    })).toBe("success");
+    expect(classifyAuthResponse({
+      operation: "oidc_callback",
+      statusCode: 302,
+      location: "/api/auth/error?error=access_denied&error_description=cancelled",
+    })).toBe("client_error");
+    expect(classifyAuthResponse({
+      operation: "oidc_callback",
+      statusCode: 302,
+      location: "/api/auth/error?error=oauth_code_verification_failed",
+    })).toBe("server_error");
+  });
+
+  it("exposes and increments the auth counter without unbounded labels", async () => {
+    expect(recordAuthRequest({ operation: "untrusted-path", outcome: "untrusted-outcome" })).toEqual({
+      operation: "other",
+      outcome: "server_error",
+    });
+    recordAuthRequest({ operation: "oidc_callback", outcome: "rate_limited" });
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${AUTH_REQUEST_METRIC} counter`);
+    expect(body).toContain(`${AUTH_REQUEST_METRIC}{operation="other",outcome="server_error"} 1`);
+    expect(body).toContain(`${AUTH_REQUEST_METRIC}{operation="oidc_callback",outcome="rate_limited"} 1`);
+  });
 });
 
 describe("normalizeReason", () => {
@@ -235,56 +290,111 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
 
   it("emits normalized labels for a known invocation source", async () => {
     const labels = recordHeartbeatRunFailed({
+      agentId: "agent-a",
+      issueId: "issue-a",
       adapter: "claude_k8s",
-      errorCode: "adapter_failed",
+      errorCode: "k8s_pod_schedule_failed",
       invocationSource: "github_pr_review_submitted",
+      isolationMode: "run",
     });
     expect(labels).toEqual({
+      agent_id: "agent-a",
+      issue_id: "issue-a",
       adapter: "claude_k8s",
-      error_code: "adapter_failed",
+      error_code: "k8s_pod_schedule_failed",
       invocation_source: "github_pr_review_submitted",
+      isolation_mode: "run",
     });
 
     const { body } = await renderMetrics();
     expect(body).toContain(
-      `${HEARTBEAT_RUN_FAILED_METRIC}{adapter="claude_k8s",error_code="adapter_failed",invocation_source="github_pr_review_submitted"} 1`,
+      `${HEARTBEAT_RUN_FAILED_METRIC}{agent_id="agent-a",issue_id="issue-a",adapter="claude_k8s",error_code="k8s_pod_schedule_failed",invocation_source="github_pr_review_submitted",isolation_mode="run"} 1`,
     );
   });
 
+  it.each([
+    ["workspace", "workspace"],
+    ["shared", "shared"],
+    ["not-a-mode", UNKNOWN_ISOLATION_MODE],
+  ])(
+    "collapses source identifiers for %s pod-schedule failures",
+    async (isolationMode, expectedIsolationMode) => {
+      const labels = recordHeartbeatRunFailed({
+        agentId: "agent-a",
+        issueId: "issue-a",
+        adapter: "claude_k8s",
+        errorCode: "k8s_pod_schedule_failed",
+        invocationSource: "github_pr_review_submitted",
+        isolationMode,
+      });
+
+      expect(labels).toEqual({
+        agent_id: UNKNOWN_AGENT_ID,
+        issue_id: "none",
+        adapter: "claude_k8s",
+        error_code: "k8s_pod_schedule_failed",
+        invocation_source: "github_pr_review_submitted",
+        isolation_mode: expectedIsolationMode,
+      });
+
+      const { body } = await renderMetrics();
+      expect(body).toContain(
+        `${HEARTBEAT_RUN_FAILED_METRIC}{agent_id="${UNKNOWN_AGENT_ID}",issue_id="none",adapter="claude_k8s",error_code="k8s_pod_schedule_failed",invocation_source="github_pr_review_submitted",isolation_mode="${expectedIsolationMode}"} 1`,
+      );
+    },
+  );
+
   it("collapses unknown invocation source to the bounded fallback (cardinality guardrail)", async () => {
     const labels = recordHeartbeatRunFailed({
+      agentId: "agent-a",
+      issueId: "issue-a",
       adapter: "claude_k8s",
       errorCode: "process_lost",
       invocationSource: "some_unlisted_source",
+      isolationMode: "workspace",
     });
     expect(labels.invocation_source).toBe(UNKNOWN_INVOCATION_SOURCE);
 
     const { body } = await renderMetrics();
     expect(body).toContain(
-      `${HEARTBEAT_RUN_FAILED_METRIC}{adapter="claude_k8s",error_code="process_lost",invocation_source="${UNKNOWN_INVOCATION_SOURCE}"} 1`,
+      `${HEARTBEAT_RUN_FAILED_METRIC}{agent_id="${UNKNOWN_AGENT_ID}",issue_id="none",adapter="claude_k8s",error_code="process_lost",invocation_source="${UNKNOWN_INVOCATION_SOURCE}",isolation_mode="workspace"} 1`,
     );
   });
 
   it("falls back adapter/error_code to 'unknown' when null or empty", async () => {
     const labels = recordHeartbeatRunFailed({
+      agentId: null,
+      issueId: null,
       adapter: null,
       errorCode: "",
       invocationSource: "capacity_blocked_retry",
+      isolationMode: "invalid",
     });
     expect(labels).toEqual({
+      agent_id: UNKNOWN_AGENT_ID,
+      issue_id: "none",
       adapter: "unknown",
       error_code: "unknown",
       invocation_source: "capacity_blocked_retry",
+      isolation_mode: UNKNOWN_ISOLATION_MODE,
     });
   });
 
   it("accumulates repeated failures into the same bounded series", async () => {
-    recordHeartbeatRunFailed({ adapter: "claude_k8s", errorCode: "k8s_concurrent_run_blocked", invocationSource: "transient_failure_retry" });
-    recordHeartbeatRunFailed({ adapter: "claude_k8s", errorCode: "k8s_concurrent_run_blocked", invocationSource: "transient_failure_retry" });
+    const input = {
+      agentId: "agent-a",
+      issueId: "issue-a",
+      adapter: "claude_k8s",
+      errorCode: "k8s_pod_schedule_failed",
+      invocationSource: "transient_failure_retry",
+      isolationMode: "run",
+    };
+    recordHeartbeatRunFailed(input);
+    recordHeartbeatRunFailed(input);
 
     const { body } = await renderMetrics();
     expect(body).toContain(
-      `${HEARTBEAT_RUN_FAILED_METRIC}{adapter="claude_k8s",error_code="k8s_concurrent_run_blocked",invocation_source="transient_failure_retry"} 2`,
+      `${HEARTBEAT_RUN_FAILED_METRIC}{agent_id="agent-a",issue_id="issue-a",adapter="claude_k8s",error_code="k8s_pod_schedule_failed",invocation_source="transient_failure_retry",isolation_mode="run"} 2`,
     );
   });
 });

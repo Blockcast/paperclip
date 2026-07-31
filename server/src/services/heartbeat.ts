@@ -206,6 +206,7 @@ import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
 } from "./issue-tree-control.js";
+import { RUN_STALE_SILENCE_MS } from "./issue-run-holding.js";
 import {
   continuationSummaryParksExecutor,
   getIssueContinuationSummaryDocument,
@@ -517,6 +518,9 @@ const CAPACITY_BLOCKED_HEARTBEAT_RETRY_REASON = "capacity_blocked";
 const CAPACITY_BLOCKED_HEARTBEAT_RETRY_WAKE_REASON = "capacity_blocked_retry";
 export const CAPACITY_BLOCKED_HEARTBEAT_RETRY_DELAY_MS = 90 * 1000;
 export const CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS = 20;
+export const JOB_FAILED_HEARTBEAT_RETRY_REASON = "job_failed";
+export const JOB_FAILED_HEARTBEAT_RETRY_WAKE_REASON = "job_failed_retry";
+export const JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS = 4;
 export const DEP_BLOCKED_RETRY_REASON = "dependency_blocked";
 export const DEP_BLOCKED_BASE_DELAY_MS = 5 * 60 * 1000;
 export const DEP_BLOCKED_MAX_DELAY_MS = 60 * 60 * 1000;
@@ -708,11 +712,21 @@ export function shouldScheduleAutomaticRunRetry(
     return isPrReviewRetryContext(parseObject(run.contextSnapshot));
   }
 
-  // BLO-9147 AC2: capacity-class dispatch refusals (k8s_concurrent_run_blocked)
-  // are re-queued for pr_review wakes with bounded backoff so the review lands
-  // once a slot frees. Non-PR wakes remain terminal (BLO-7913 leak guard).
+  const contextSnapshot = parseObject(run.contextSnapshot);
+  const isIssueRun = Boolean(readNonEmptyString(contextSnapshot.issueId));
+
+  // Capacity refusals are safe to retry for durable issue work as well as PR
+  // reviews. Timer and maintenance runs remain terminal to avoid retry leaks.
   if (run.errorCode === "k8s_concurrent_run_blocked") {
-    return isPrReviewRetryContext(parseObject(run.contextSnapshot));
+    return isIssueRun || isPrReviewRetryContext(contextSnapshot);
+  }
+
+  // A failed external-lifecycle Job may have performed non-idempotent work.
+  // Retry only when the reconciler durably proved adapter invocation never
+  // began; lock/status gates alone cannot make partial external writes safe.
+  if (run.errorCode === "job_failed") {
+    const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
+    return isIssueRun && recovery.adapterInvocationStarted === false;
   }
 
   // BLO-10448: scheduler-level transient infra failures where the agent pod
@@ -792,7 +806,26 @@ function resolveAutomaticRunRetryOpts(
       delayMs: CAPACITY_BLOCKED_HEARTBEAT_RETRY_DELAY_MS,
     };
   }
+  if (run.errorCode === "job_failed") {
+    return {
+      retryReason: JOB_FAILED_HEARTBEAT_RETRY_REASON,
+      wakeReason: JOB_FAILED_HEARTBEAT_RETRY_WAKE_REASON,
+      maxAttempts: JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+    };
+  }
   return undefined;
+}
+
+function requiresIssueExecutionRetryLock(retryReason: string | null | undefined) {
+  return (
+    retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
+    retryReason === CAPACITY_BLOCKED_HEARTBEAT_RETRY_REASON ||
+    retryReason === JOB_FAILED_HEARTBEAT_RETRY_REASON
+  );
+}
+
+function requiresInProgressIssueRetry(retryReason: string | null | undefined) {
+  return requiresIssueExecutionRetryLock(retryReason);
 }
 
 function isResolvedInteractionContinuationWakeContext(contextSnapshot: unknown) {
@@ -894,7 +927,10 @@ const EXTERNAL_LIFECYCLE_ADAPTERS = new Set([
 // Jobs immediately; this threshold only applies when that probe returns
 // null. Kept generous so a slow probe + a healthy long-running Claude
 // session don't collide.
-const EXTERNAL_LIFECYCLE_STALE_MS = 15 * 60 * 1000;
+// Shared with issue-run-holding.ts for one named 15-minute slot-accounting
+// threshold. Issue/worktree ownership stays more conservative: a running row
+// holds its issue until it reaches a terminal/missing lifecycle state.
+const EXTERNAL_LIFECYCLE_STALE_MS = RUN_STALE_SILENCE_MS;
 // External-lifecycle adapters create a DB run before the adapter.invoke event
 // is appended. Startup and periodic reapers can overlap that setup window;
 // give slow pre-run hooks and kube Job creation time to reach adapter.invoke.
@@ -4117,9 +4153,10 @@ export function buildK8sRunIsolationDescriptor(input: {
   const cacheRoot = isolationMode === "shared"
     ? path.join(sharedHomeRoot, ".cache")
     : path.posix.join(ephemeralIsolationRoot!, "cache");
-  const tmpRoot = isolationMode === "shared"
-    ? path.join(sharedHomeRoot, ".cache", "tmp")
-    : path.posix.join(ephemeralIsolationRoot!, "tmp");
+  // Keep this root isolated but short: Chromium appends its singleton socket
+  // path and aborts when the resulting Unix socket exceeds the platform limit.
+  const tmpKey = createHash("sha256").update(isolationKey).digest("hex").slice(0, 16);
+  const tmpRoot = path.posix.join("/runtime-cache/t", tmpKey);
   const persistent = isolationMode === "run" ? "ephemeral" : "persistent";
 
   return {
@@ -4140,6 +4177,25 @@ export function buildK8sRunIsolationDescriptor(input: {
       taskKey: input.taskKey,
       isolationKey,
     },
+  };
+}
+
+export function buildHeartbeatRunFailedMetricInput(input: {
+  agent: { id: string; adapterType: string | null };
+  issueId: string | null;
+  run: { errorCode: string | null; contextSnapshot: unknown };
+  k8sRunIsolation: { isolationMode: string } | null;
+}) {
+  const contextSnapshotObj = parseObject(input.run.contextSnapshot);
+  return {
+    agentId: input.agent.id,
+    issueId: input.issueId,
+    adapter: input.agent.adapterType,
+    errorCode: input.run.errorCode,
+    invocationSource:
+      readNonEmptyString(contextSnapshotObj.wakeReason) ??
+      readNonEmptyString(contextSnapshotObj.retryReason),
+    isolationMode: input.k8sRunIsolation?.isolationMode ?? null,
   };
 }
 
@@ -6216,7 +6272,9 @@ async function coalesceQueuedGithubStateWake(input: {
     })
     .where(and(eq(heartbeatRuns.id, existingRun.id), eq(heartbeatRuns.status, "queued")))
     .returning()
-    .then((rows) => rows[0] ?? existingRun);
+    .then((rows) => rows[0] ?? null);
+
+  if (!mergedRun) return null;
 
   let coalescedEventCount: number | null = null;
   if (mergedRun.wakeupRequestId) {
@@ -6326,7 +6384,9 @@ async function coalescePendingTaskScopeWake(input: {
       ),
     )
     .returning()
-    .then((rows) => rows[0] ?? existingRun);
+    .then((rows) => rows[0] ?? null);
+
+  if (!mergedRun) return null;
 
   if (mergedRun.wakeupRequestId) {
     await input.tx
@@ -6741,6 +6801,67 @@ export function evaluatePrReviewCompletionEvidence(
     errorMessage:
       "PR reviewer run exited successfully but did not leave durable evidence of a posted review or intentional skip",
   };
+}
+
+// Reviewer wake reasons that must refresh review work for the current head:
+// an @ally comment / requested_reviewer, the draft->ready toggle, and a PR
+// synchronize push. Contrast with github_pr_opened/reopened, where a wake
+// already in flight genuinely covers the event.
+const EXPLICIT_PR_REVIEW_REQUEST_WAKE_REASONS = new Set([
+  "github_pr_review_requested",
+  "github_pr_ready_for_review",
+  "github_pr_synchronized",
+]);
+
+// BLO-18953: an explicit review request must never be absorbed into a review
+// run that is already RUNNING for the same PR. The reviewer task key is
+// PR-scoped and carries no head sha (deliberately: it also scopes the reviewer
+// affinity lookup, the withPrReviewerTaskLock serialization, and the
+// cancel-on-close sweep), so same-scope coalescing cannot tell "the run about
+// to start will read this head" from "the run already reviewing an older head
+// will never re-read head". Coalescing into a `queued` run is benign — that run
+// reads head when it starts. Coalescing into a `running` one silently drops the
+// request: observed on Blockcast/pim-multicast-gateway#1888 (human @ally
+// comment), Blockcast/paperclip#822 (ready_for_review), and synchronize pushes
+// that arrived while a previous-head review was already running.
+//
+// Head-sha comparison is NOT a workable discriminator here: the issue_comment
+// branch of resolveEventContext never populates headSha (GitHub's issue_comment
+// payload has no PR head), so the most common request path would compare
+// null-to-null and coalesce anyway.
+function isExplicitPrReviewRequestWake(contextSnapshot: Record<string, unknown> | null | undefined) {
+  const review = derivePaperclipPrReview(contextSnapshot);
+  if (!review || review.prRole !== "reviewer") return false;
+  return EXPLICIT_PR_REVIEW_REQUEST_WAKE_REASONS.has(review.wakeReason);
+}
+
+/**
+ * Decides whether a wake that finds a same-task-scope run already RUNNING must
+ * get its own queued follow-up run instead of being absorbed into that run.
+ *
+ * Extracted from enqueueWakeup so the property can be asserted directly: the
+ * in-situ path applies zombie filtering afterwards, which makes a DB-only
+ * `running` row (no live process) fall through for unrelated reasons and would
+ * render an end-to-end assertion vacuous.
+ *
+ * Returns false when a same-scope QUEUED run exists — that run has not started
+ * and will read the current head when it does, so absorbing into it is both
+ * correct and the desired rapid-event coalescing.
+ */
+export function shouldQueueFollowupInsteadOfAbsorbingIntoRunningRun(input: {
+  hasRunningSameScopeRun: boolean;
+  hasQueuedSameScopeRun: boolean;
+  contextSnapshot: Record<string, unknown> | null | undefined;
+  wakeCommentId: string | null;
+}): boolean {
+  if (!input.hasRunningSameScopeRun || input.hasQueuedSameScopeRun) return false;
+  return (
+    isExplicitPrReviewRequestWake(input.contextSnapshot) ||
+    shouldQueueFollowupForRunningIssueWake({
+      contextSnapshot: input.contextSnapshot,
+      wakeCommentId: input.wakeCommentId,
+    })
+  );
 }
 
 function isCrossPrReviewWakeForActiveRun(input: {
@@ -11640,24 +11761,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON && issue.status !== "in_progress") {
+    if (requiresInProgressIssueRetry(retryReason) && issue.status !== "in_progress") {
       return {
         allowed: false,
-        reason: `Scheduled max-turn continuation suppressed because issue is no longer in_progress (current status: ${issue.status})`,
+        reason: `Scheduled retry suppressed because issue is no longer in_progress (current status: ${issue.status})`,
         errorCode: "issue_not_in_progress",
         issueId,
         details: { issueId, currentStatus: issue.status, requiredStatus: "in_progress" },
       };
     }
 
-    if (
-      retryReason === MAX_TURN_CONTINUATION_RETRY_REASON &&
-      input.enforceIssueExecutionLock &&
-      issue.executionRunId !== run.id
-    ) {
+    if (input.enforceIssueExecutionLock && issue.executionRunId !== run.id) {
       return {
         allowed: false,
-        reason: "Scheduled max-turn continuation suppressed because the issue execution lock belongs to a different run",
+        reason: "Scheduled retry suppressed because the issue execution lock belongs to a different run",
         errorCode: "issue_execution_lock_changed",
         issueId,
         details: {
@@ -11835,7 +11952,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agent,
       contextSnapshot,
       retryReason: dueRun.scheduledRetryReason,
-      enforceIssueExecutionLock: dueRun.scheduledRetryReason === MAX_TURN_CONTINUATION_RETRY_REASON,
+      enforceIssueExecutionLock: requiresIssueExecutionRetryLock(dueRun.scheduledRetryReason),
     });
     if (!gate.allowed) {
       if (
@@ -12123,21 +12240,167 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    const promoted = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "queued",
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(heartbeatRuns.id, dueRun.id),
-          eq(heartbeatRuns.status, "scheduled_retry"),
-          lte(heartbeatRuns.scheduledRetryAt, now),
-        ),
-      )
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const promotionIssueId = readNonEmptyString(contextSnapshot.issueId);
+    const atomicPromotion = await db.transaction(async (tx) => {
+      let promotionGate: BlockedScheduledRetryGate | null = null;
+
+      if (promotionIssueId && requiresIssueExecutionRetryLock(dueRun.scheduledRetryReason)) {
+        const lockedIssue = await tx
+          .select({
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(and(eq(issues.companyId, dueRun.companyId), eq(issues.id, promotionIssueId)))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+
+        if (!lockedIssue) {
+          promotionGate = {
+            allowed: false,
+            reason: "Scheduled retry suppressed because the target issue no longer exists",
+            errorCode: "issue_not_found",
+            issueId: promotionIssueId,
+            details: { issueId: promotionIssueId },
+          };
+        } else if (lockedIssue.assigneeAgentId !== dueRun.agentId) {
+          promotionGate = {
+            allowed: false,
+            reason: "Scheduled retry suppressed because issue ownership changed",
+            errorCode: "issue_reassigned",
+            issueId: promotionIssueId,
+            details: {
+              issueId: promotionIssueId,
+              previousAssigneeAgentId: dueRun.agentId,
+              currentAssigneeAgentId: lockedIssue.assigneeAgentId,
+            },
+          };
+        } else if (lockedIssue.status === "cancelled" || lockedIssue.status === "done") {
+          promotionGate = {
+            allowed: false,
+            reason: `Scheduled retry suppressed because issue reached terminal status (${lockedIssue.status})`,
+            errorCode: lockedIssue.status === "cancelled" ? "issue_cancelled" : "issue_terminal_status",
+            issueId: promotionIssueId,
+            details: { issueId: promotionIssueId, currentStatus: lockedIssue.status },
+          };
+        } else if (requiresInProgressIssueRetry(dueRun.scheduledRetryReason) && lockedIssue.status !== "in_progress") {
+          promotionGate = {
+            allowed: false,
+            reason: `Scheduled retry suppressed because issue is no longer in_progress (current status: ${lockedIssue.status})`,
+            errorCode: "issue_not_in_progress",
+            issueId: promotionIssueId,
+            details: { issueId: promotionIssueId, currentStatus: lockedIssue.status, requiredStatus: "in_progress" },
+          };
+        } else if (lockedIssue.executionRunId !== dueRun.id) {
+          promotionGate = {
+            allowed: false,
+            reason: "Scheduled retry suppressed because the issue execution lock belongs to a different run",
+            errorCode: "issue_execution_lock_changed",
+            issueId: promotionIssueId,
+            details: {
+              issueId: promotionIssueId,
+              expectedExecutionRunId: dueRun.id,
+              currentExecutionRunId: lockedIssue.executionRunId,
+            },
+          };
+        }
+      }
+
+      if (promotionGate) {
+        const cancelled = await tx
+          .update(heartbeatRuns)
+          .set({
+            status: "cancelled",
+            finishedAt: now,
+            error: promotionGate.reason,
+            errorCode: promotionGate.errorCode,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(heartbeatRuns.id, dueRun.id),
+              eq(heartbeatRuns.status, "scheduled_retry"),
+              lte(heartbeatRuns.scheduledRetryAt, now),
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!cancelled) return { outcome: "not_promoted" as const, run: null };
+
+        if (cancelled.wakeupRequestId) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: now,
+              error: promotionGate.reason,
+              updatedAt: now,
+            })
+            .where(eq(agentWakeupRequests.id, cancelled.wakeupRequestId));
+        }
+        await tx
+          .update(issues)
+          .set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.companyId, cancelled.companyId),
+              eq(issues.id, promotionIssueId!),
+              eq(issues.executionRunId, cancelled.id),
+            ),
+          );
+        return { outcome: "gate_suppressed" as const, run: cancelled, gate: promotionGate };
+      }
+
+      const promoted = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "queued",
+          error: null,
+          errorCode: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(heartbeatRuns.id, dueRun.id),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            lte(heartbeatRuns.scheduledRetryAt, now),
+          ),
+        )
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      return { outcome: promoted ? "promoted" as const : "not_promoted" as const, run: promoted };
+    });
+
+    if (atomicPromotion.outcome === "gate_suppressed") {
+      await appendRunEvent(atomicPromotion.run, await nextRunEventSeq(atomicPromotion.run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: atomicPromotion.gate.reason,
+        payload: {
+          ...atomicPromotion.gate.details,
+          scheduledRetryAttempt: atomicPromotion.run.scheduledRetryAttempt,
+          scheduledRetryAt: atomicPromotion.run.scheduledRetryAt
+            ? new Date(atomicPromotion.run.scheduledRetryAt).toISOString()
+            : null,
+          scheduledRetryReason: atomicPromotion.run.scheduledRetryReason,
+        },
+      });
+      return {
+        outcome: "gate_suppressed",
+        run: atomicPromotion.run,
+        reason: atomicPromotion.gate.reason,
+        errorCode: atomicPromotion.gate.errorCode,
+      };
+    }
+
+    const promoted = atomicPromotion.run;
     if (!promoted) return { outcome: "not_promoted", run: null };
 
     if (promoted.scheduledRetryReason === DEP_BLOCKED_RETRY_REASON) {
@@ -12300,7 +12563,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : baseSchedule;
 
     const requiresIssueGate =
-      retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
+      requiresIssueExecutionRetryLock(retryReason) ||
       retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON;
     if (requiresIssueGate) {
       const gate = await evaluateScheduledRetryGate({
@@ -12308,7 +12571,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         agent,
         contextSnapshot,
         retryReason,
-        enforceIssueExecutionLock: retryReason === MAX_TURN_CONTINUATION_RETRY_REASON,
+        enforceIssueExecutionLock: requiresIssueExecutionRetryLock(retryReason),
       });
       if (!gate.allowed) {
         await appendRunEvent(run, await nextRunEventSeq(run.id), {
@@ -12457,7 +12720,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
 
-      if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON) {
+      if (requiresIssueExecutionRetryLock(retryReason)) {
         if (issueId) {
           await tx.execute(
             sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} for update`,
@@ -12526,7 +12789,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (!lockedIssue) {
             return {
               outcome: "not_scheduled",
-              reason: "Scheduled max-turn continuation suppressed because the target issue no longer exists",
+              reason: "Scheduled retry suppressed because the target issue no longer exists",
               errorCode: "issue_not_found",
               issueId,
               details: { issueId },
@@ -12536,7 +12799,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (lockedIssue.assigneeAgentId !== run.agentId) {
             return {
               outcome: "not_scheduled",
-              reason: "Scheduled max-turn continuation suppressed because issue ownership changed",
+              reason: "Scheduled retry suppressed because issue ownership changed",
               errorCode: "issue_reassigned",
               issueId,
               details: {
@@ -12550,17 +12813,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (lockedIssue.status === "cancelled" || lockedIssue.status === "done") {
             return {
               outcome: "not_scheduled",
-              reason: `Scheduled max-turn continuation suppressed because issue reached terminal status (${lockedIssue.status})`,
+              reason: `Scheduled retry suppressed because issue reached terminal status (${lockedIssue.status})`,
               errorCode: lockedIssue.status === "cancelled" ? "issue_cancelled" : "issue_terminal_status",
               issueId,
               details: { issueId, currentStatus: lockedIssue.status },
             };
           }
 
-          if (lockedIssue.status !== "in_progress") {
+          if (requiresInProgressIssueRetry(retryReason) && lockedIssue.status !== "in_progress") {
             return {
               outcome: "not_scheduled",
-              reason: `Scheduled max-turn continuation suppressed because issue is no longer in_progress (current status: ${lockedIssue.status})`,
+              reason: `Scheduled retry suppressed because issue is no longer in_progress (current status: ${lockedIssue.status})`,
               errorCode: "issue_not_in_progress",
               issueId,
               details: { issueId, currentStatus: lockedIssue.status, requiredStatus: "in_progress" },
@@ -12570,8 +12833,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (lockedIssue.executionRunId !== run.id) {
             return {
               outcome: "not_scheduled",
-              reason:
-                "Scheduled max-turn continuation suppressed because the issue execution lock belongs to a different run",
+              reason: "Scheduled retry suppressed because the issue execution lock belongs to a different run",
               errorCode: "issue_execution_lock_changed",
               issueId,
               details: {
@@ -13427,6 +13689,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .update(heartbeatRuns)
           .set({
             status: "running",
+            error: null,
+            errorCode: null,
             responsibleUserId,
             startedAt: run.startedAt ?? claimedAt,
             updatedAt: claimedAt,
@@ -13736,21 +14000,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON && issue.status !== "in_progress") {
+    if (requiresInProgressIssueRetry(retryReason) && issue.status !== "in_progress") {
       return {
         stale: true,
         errorCode: "issue_not_in_progress",
-        reason: `Cancelled because max-turn continuation issue is no longer in_progress (current status: ${issue.status}) before the queued run could start`,
+        reason: `Cancelled because retry issue is no longer in_progress (current status: ${issue.status}) before the queued run could start`,
         details: { issueId, currentStatus: issue.status, requiredStatus: "in_progress" },
       };
     }
 
-    if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON && issue.executionRunId !== run.id) {
+    if (requiresIssueExecutionRetryLock(retryReason) && issue.executionRunId !== run.id) {
       return {
         stale: true,
         errorCode: "issue_execution_lock_changed",
-        reason:
-          "Cancelled because max-turn continuation no longer owns the issue execution lock before the queued run could start",
+        reason: "Cancelled because retry no longer owns the issue execution lock before the queued run could start",
         details: {
           issueId,
           expectedExecutionRunId: run.id,
@@ -14356,8 +14619,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
-  function externalLifecycleTerminalOutcome(jobStatus: AgentJobRunStatus | null) {
+  function externalLifecycleTerminalOutcome(
+    jobStatus: AgentJobRunStatus | null,
+    preserveRecordedOutcome = false,
+  ) {
     if (!jobStatus) {
+      if (preserveRecordedOutcome) {
+        return {
+          status: "succeeded" as const,
+          wakeupStatus: "completed" as const,
+          errorCode: null,
+          error: null,
+          recoveryReason: "job_missing_recorded_outcome_preserved",
+          jobPhase: "missing",
+          jobReason: null,
+          jobMessage: null,
+        };
+      }
       return {
         status: "failed" as const,
         wakeupStatus: "failed" as const,
@@ -14430,6 +14708,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     now: Date;
     staleKill?: boolean;
   }) {
+    let preserveRecordedOutcome = false;
+    if (!input.staleKill && !input.jobStatus) {
+      let reviewEvidence = evaluatePrReviewCompletionEvidence(
+        parseObject(input.run.contextSnapshot),
+        { resultJson: parseObject(input.run.resultJson) },
+      );
+      if (reviewEvidence.status === "missing") {
+        try {
+          const prReview = derivePaperclipPrReview(parseObject(input.run.contextSnapshot));
+          if (prReview?.repoFullName && prReview.prNumber !== null) {
+            const verified = await githubHasReviewerEvidenceForPr({
+              repoFullName: prReview.repoFullName,
+              prNumber: prReview.prNumber,
+              headSha: prReview.headSha,
+            });
+            if ("found" in verified && verified.found) {
+              reviewEvidence = { status: "posted_review" };
+            }
+          }
+        } catch {
+          // GitHub verification is additive; failures retain the local missing verdict.
+        }
+      }
+      preserveRecordedOutcome = reviewEvidence.status === "posted_review" ||
+        reviewEvidence.status === "already_reviewed" ||
+        reviewEvidence.status === "archived_repo_skipped" ||
+        reviewEvidence.status === "self_review_skipped";
+    }
     const terminalOutcome = input.staleKill
       ? {
           status: "failed" as const,
@@ -14442,8 +14748,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           jobReason: input.jobStatus?.reason ?? null,
           jobMessage: input.jobStatus?.message ?? null,
         }
-      : externalLifecycleTerminalOutcome(input.jobStatus);
+      : externalLifecycleTerminalOutcome(input.jobStatus, preserveRecordedOutcome);
     if (!terminalOutcome) return false;
+
+    const adapterInvocationStarted = terminalOutcome.errorCode === "job_failed"
+      ? await hasAdapterInvocationEvent(input.run.id)
+      : null;
 
     const resultJson = mergeRunStopMetadataForAgent(
       { adapterType: input.adapterType, adapterConfig: parseObject(input.adapterConfig) },
@@ -14456,6 +14766,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             jobPhase: terminalOutcome.jobPhase,
             jobReason: terminalOutcome.jobReason,
             jobMessage: terminalOutcome.jobMessage,
+            ...(adapterInvocationStarted !== null ? { adapterInvocationStarted } : {}),
           },
         },
         errorCode: terminalOutcome.errorCode,
@@ -14533,16 +14844,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // reviewer path). Mirror the liveness retry decision so the bounded re-queue
     // fires for these reconciler-finalized failures as well. Non-pr / non-retryable
     // codes return false from the predicate and stay terminal (BLO-7913 leak guard).
-    if (terminalOutcome.status === "failed" && shouldScheduleAutomaticRunRetry(finalizedRun)) {
-      const retryAgent = await getAgent(finalizedRun.agentId);
-      if (retryAgent) {
-        await scheduleBoundedRetryForRun(
-          finalizedRun,
-          retryAgent,
-          resolveAutomaticRunRetryOpts(finalizedRun),
-        );
-        finalizedRun = (await getRun(finalizedRun.id)) ?? finalizedRun;
-      }
+    const finalizationAgent = await getAgent(finalizedRun.agentId);
+    if (
+      terminalOutcome.status === "failed" &&
+      shouldScheduleAutomaticRunRetry(finalizedRun) &&
+      finalizationAgent
+    ) {
+      await scheduleBoundedRetryForRun(
+        finalizedRun,
+        finalizationAgent,
+        resolveAutomaticRunRetryOpts(finalizedRun),
+      );
+      finalizedRun = (await getRun(finalizedRun.id)) ?? finalizedRun;
     }
 
     await releaseEnvironmentLeasesForRun({
@@ -14560,6 +14873,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     await finalizeAgentStatus(input.run.agentId, terminalOutcome.status);
     const promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun);
+    await handleRunLivenessContinuation(finalizedRun);
+    if (finalizationAgent) {
+      await handleSuccessfulRunHandoff(finalizedRun, finalizationAgent);
+    }
     await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
       eventType: "lifecycle",
       stream: "system",
@@ -14802,14 +15119,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(externalRuntimeReservations)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, externalRuntimeReservations.runId))
       .where(
-        or(
-          eq(externalRuntimeReservations.state, "release_pending"),
-          and(
-            inArray(externalRuntimeReservations.state, ["reserved", "launching"]),
-            isNull(externalRuntimeReservations.expectedJobName),
-            isNull(externalRuntimeReservations.jobName),
-            isNull(externalRuntimeReservations.jobUid),
-            inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+        and(
+          isNull(externalRuntimeReservations.releasedAt),
+          or(
+            eq(externalRuntimeReservations.state, "release_pending"),
+            and(
+              inArray(externalRuntimeReservations.state, ["reserved", "launching"]),
+              isNull(externalRuntimeReservations.expectedJobName),
+              isNull(externalRuntimeReservations.jobName),
+              isNull(externalRuntimeReservations.jobUid),
+              inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+            ),
+            // BLO-18995: an *identified* reservation (a Job name was recorded)
+            // whose run reached a terminal status without the normal
+            // finalize-time release running — the canonical case is
+            // `drainRunningRunsForShutdown` marking a running run
+            // `interrupted` on SIGTERM, which never releases the reservation.
+            // The two branches above cannot see it: it is not
+            // `release_pending`, and it is `launched` with a non-null
+            // `jobName`. The row then keeps `released_at IS NULL` forever and
+            // the partial unique index
+            // `external_runtime_reservations_active_slot_idx (agent_id,
+            // slot_id) WHERE released_at IS NULL` blocks that slot
+            // permanently, so every worker restart with a run in flight
+            // ratchets the agent's effective concurrency down by one. Observed
+            // in production: four agents each stuck a slot for 1-5 days (Ally
+            // 4/5 slots, Release Engineer 1/2).
+            //
+            // Selecting the row here is safe because it does not release it:
+            // the loop below still verifies the recorded Job is genuinely gone
+            // or finished (exact `readAgentJobRunStatusByName` lookup plus
+            // jobUid identity match) and skips any reservation whose Job is
+            // still `active`. A Job that outlives the worker therefore keeps
+            // its slot until it actually terminates.
+            and(
+              inArray(externalRuntimeReservations.state, ["reserved", "launching", "launched"]),
+              or(
+                isNotNull(externalRuntimeReservations.jobName),
+                isNotNull(externalRuntimeReservations.jobUid),
+              ),
+              inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+            ),
           ),
         ),
       );
@@ -16487,7 +16837,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           waitedMs: number,
           isRecoveryWake: boolean,
         ): number => {
-          if (!hasId) return 10;
+          if (!hasId) {
+            // BLO-18995: issue-less runs (every GitHub PR-review wake) used to
+            // return a flat 10 here, *above* the aging escalation below, so the
+            // BLO-16253 anti-starvation floor was unreachable for the entire
+            // class. Every dependency-ready issue-bound run ranks
+            // `priorityRank * 2 + statusBonus` ∈ [0,9], so even a `low`-priority
+            // `todo` (7) permanently outranked an arbitrarily old PR review.
+            // Escalate aged issue-less runs to 2: they outrank routine medium/
+            // low work while preserving ranks 0-1 for explicit critical issue
+            // work. The PR-review fairness promotion above remains the bounded
+            // path for an aged review to jump even critical work.
+            return waitedMs >= STARVATION_FULL_ESCALATION_MS ? 2 : 10;
+          }
+          // NB: the aging escalation below stays *underneath* this `!ready`
+          // check on purpose. A dependency-blocked run must never escalate to
+          // the front of the queue no matter how long it has waited, because it
+          // cannot run yet.
           if (!ready) return 12 + issueRunPriorityRank(issue?.priority);
           const escalationFloorMs = isRecoveryWake
             ? STARVATION_RECOVERY_ESCALATION_MS
@@ -16523,13 +16889,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Per-issue dedupe: if a queued run targets an issue that already has a
       // running sibling (this iteration's claim OR a prior tick's still-running
       // run), suppress it instead of letting two dispatches race for the same
-      // k8s Job slot. Cross-agent and null-issueId (autonomous) runs are
-      // unaffected — withAgentStartLock already scopes this to one agent and
-      // the gate only fires when issueId is present. Stale runs are excluded
-      // (consistent with Fix #1 above) so a queued retry for a stale issue
-      // can proceed once the stale run's job is gone.
+      // k8s Job slot/worktree. Cross-agent and null-issueId (autonomous) runs
+      // are unaffected — withAgentStartLock already scopes this to one agent
+      // and the gate only fires when issueId is present. Unlike the slot gate
+      // above, issue ownership is not released merely because a running row has
+      // been silent for 15 minutes; an external Job can be quiet and still edit
+      // its shared worktree. Reaper/lifecycle checks must move the old run out
+      // of "running" before a queued same-issue retry can proceed.
       const inFlightIssueIds = new Set<string>();
-      for (const row of nonStaleRunningRuns) {
+      for (const row of runningRunRows) {
         const id = readNonEmptyString(parseObject(row.contextSnapshot).issueId);
         if (id) inFlightIssueIds.add(id);
       }
@@ -19421,12 +19789,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
         if (outcome === "failed") {
-          const contextSnapshotObj = parseObject(livenessRun.contextSnapshot);
-          recordHeartbeatRunFailed({
-            adapter: agent.adapterType,
-            errorCode: livenessRun.errorCode,
-            invocationSource: readNonEmptyString(contextSnapshotObj.wakeReason) ?? readNonEmptyString(contextSnapshotObj.retryReason),
-          });
+          recordHeartbeatRunFailed(buildHeartbeatRunFailedMetricInput({
+            agent,
+            issueId,
+            run: livenessRun,
+            k8sRunIsolation,
+          }));
         }
         await recordZeroTokenCompletedRunStreak(agent);
         if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
@@ -22304,10 +22672,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const sameScopeRunningRun = activeRuns.find(
       (candidate) => candidate.status === "running" && isSameTaskScope(runTaskKey(candidate), effectiveTaskKey),
     );
-    const shouldQueueFollowupForRunningWake =
-      Boolean(sameScopeRunningRun) &&
-      !sameScopeQueuedRun &&
-      shouldQueueFollowupForRunningIssueWake({ contextSnapshot: enrichedContextSnapshot, wakeCommentId });
+    // BLO-18953: an explicit review request is never satisfied by a review
+    // already in flight against an older head, so it must not be absorbed into
+    // a running same-scope run. Queued/scheduled_retry coalescing is preserved:
+    // those runs read head when they start.
+    const explicitPrReviewRequestWake = isExplicitPrReviewRequestWake(enrichedContextSnapshot);
+    const shouldQueueFollowupForRunningWake = shouldQueueFollowupInsteadOfAbsorbingIntoRunningRun({
+      hasRunningSameScopeRun: Boolean(sameScopeRunningRun),
+      hasQueuedSameScopeRun: Boolean(sameScopeQueuedRun),
+      contextSnapshot: enrichedContextSnapshot,
+      wakeCommentId,
+    });
     const rawCoalescedTarget =
       sameScopeQueuedRun ??
       sameScopeScheduledRetryRun ??
@@ -22323,32 +22698,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         coalescedTargetRun.contextSnapshot,
         enrichedContextSnapshot,
       );
+      const observedStatus = coalescedTargetRun.status;
       const mergedRun = await db
         .update(heartbeatRuns)
         .set({
           contextSnapshot: mergedContextSnapshot,
           updatedAt: new Date(),
         })
-        .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
+        .where(and(eq(heartbeatRuns.id, coalescedTargetRun.id), eq(heartbeatRuns.status, observedStatus)))
         .returning()
-        .then((rows) => rows[0] ?? coalescedTargetRun);
+        .then((rows) => rows[0] ?? null);
 
-      await db.insert(agentWakeupRequests).values({
-        companyId: agent.companyId,
-        agentId,
-        source,
-        triggerDetail,
-        reason,
-        payload,
-        status: "coalesced",
-        coalescedCount: 1,
-        requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
-        runId: mergedRun.id,
-        finishedAt: new Date(),
-      });
-      return mergedRun;
+      if (mergedRun) {
+        await db.insert(agentWakeupRequests).values({
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          reason,
+          payload,
+          status: "coalesced",
+          coalescedCount: 1,
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          runId: mergedRun.id,
+          finishedAt: new Date(),
+        });
+        return mergedRun;
+      }
     }
 
     const queueOutcome = await db.transaction(async (tx) => {
@@ -22377,8 +22755,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // found after taking the agent lock was created while this enqueue was
         // waiting. It is therefore a live concurrency race, not a pre-existing
         // zombie. Merge into it unless this wake intentionally needs a new run
-        // boundary (for example, an issue-comment follow-up).
-        includeRunning: !sameScopeRunningRun && !shouldQueueFollowupForRunningWake,
+        // boundary (for example, an issue-comment follow-up, or an explicit PR
+        // review request that a run already reviewing this PR cannot satisfy —
+        // BLO-18953).
+        includeRunning:
+          !sameScopeRunningRun &&
+          !shouldQueueFollowupForRunningWake &&
+          !explicitPrReviewRequestWake,
       });
       if (coalescedTaskScopeRun) {
         return { kind: "coalesced" as const, run: coalescedTaskScopeRun };

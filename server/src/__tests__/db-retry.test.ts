@@ -26,6 +26,10 @@ describe("isTransientDbError", () => {
     expect(isTransientDbError(undefined)).toBe(false);
     expect(isTransientDbError({ code: 40001 })).toBe(false); // numeric, not string
   });
+
+  it("recognizes transient SQLSTATEs wrapped by higher-level database errors", () => {
+    expect(isTransientDbError(new Error("Failed query", { cause: pgError("40P01") }))).toBe(true);
+  });
 });
 
 describe("runWithTransientDbRetry", () => {

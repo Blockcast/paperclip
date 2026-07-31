@@ -91,6 +91,7 @@ import { createPluginHostServiceCleanup } from "./services/plugin-host-service-c
 import { pluginRegistryService } from "./services/plugin-registry.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
+import type { AuthCapabilities } from "./auth/capabilities.js";
 import { createCachedViteHtmlRenderer } from "./vite-html-renderer.js";
 import { registerBodyParsers } from "./http/body-parsers.js";
 import { apiCompression } from "./middleware/api-compression.js";
@@ -276,6 +277,7 @@ export async function createApp(
     allowedHostnames: string[];
     bindHost: string;
     authReady: boolean;
+    authCapabilities?: AuthCapabilities;
     companyDeletionEnabled: boolean;
     authPublicBaseUrl?: string | null;
     instanceId?: string;
@@ -449,6 +451,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
       deploymentMode: opts.deploymentMode,
       deploymentExposure: opts.deploymentExposure,
       authReady: opts.authReady,
+      authCapabilities: opts.authCapabilities,
       companyDeletionEnabled: opts.companyDeletionEnabled,
       databaseBackupHealth: opts.databaseBackupHealth,
     }),

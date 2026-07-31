@@ -1,6 +1,6 @@
 import * as React from "react";
 import { useMemo } from "react";
-import * as RouterDom from "react-router-dom";
+import * as RouterDom from "react-router";
 import type { Issue } from "@paperclipai/shared";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { timeAgo } from "@/lib/timeAgo";

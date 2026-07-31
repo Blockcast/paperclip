@@ -370,6 +370,140 @@ describe("deriveIssueCommentRunLogAttribution", () => {
   });
 });
 
+describeEmbeddedPostgres("issueService.addComment idempotency", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-comment-idempotency-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issues);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("suppresses a same-window unchanged fingerprint even when the renderer changes", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "BLO",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Agent health and stalled-issue alerts",
+      status: "done",
+      priority: "medium",
+    });
+
+    const idempotencyKey = "agent-health:2026-07-30T12:00:00.000Z:7bedaee78643280797da9151a9d5a08572aaa17d7e345c884069924f040fdc0c";
+    const first = await svc.addComment(issueId, "13:38 renderer payload\n", {}, { idempotencyKey });
+    const second = await svc.addComment(issueId, "13:39 renderer payload in a new format", {}, { idempotencyKey });
+
+    expect(second).toMatchObject({ id: first.id, body: first.body, deduplicated: true });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+  });
+
+  it("scopes comment idempotency keys to the authenticated author", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "BLO",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Agent health and stalled-issue alerts",
+      status: "done",
+      priority: "medium",
+    });
+
+    const key = "agent-health:2026-07-30T12:00:00.000Z:shared-fingerprint";
+    const first = await svc.addComment(issueId, "Alice alert", { userId: "alice" }, { idempotencyKey: key });
+    const second = await svc.addComment(issueId, "Bob alert", { userId: "bob" }, { idempotencyKey: key });
+    const replay = await svc.addComment(issueId, "Alice alert replay", { userId: "alice" }, { idempotencyKey: key });
+
+    expect(second.id).not.toBe(first.id);
+    expect(replay).toMatchObject({ id: first.id, body: first.body, deduplicated: true });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(2);
+  });
+
+  it("keeps different fingerprints in the same window distinct", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "BLO",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Agent health and stalled-issue alerts",
+      status: "done",
+      priority: "medium",
+    });
+
+    await svc.addComment(issueId, "First alert set", {}, {
+      idempotencyKey: "agent-health:2026-07-30T12:00:00.000Z:fingerprint-a",
+    });
+    await svc.addComment(issueId, "Meaningfully changed alert set", {}, {
+      idempotencyKey: "agent-health:2026-07-30T12:00:00.000Z:fingerprint-b",
+    });
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(2);
+  });
+
+  it("serializes concurrent emits for the same window and fingerprint", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "BLO",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Agent health and stalled-issue alerts",
+      status: "done",
+      priority: "medium",
+    });
+
+    const key = "agent-health:2026-07-30T12:00:00.000Z:7bedaee78643280797da9151a9d5a08572aaa17d7e345c884069924f040fdc0c";
+    const [first, second] = await Promise.all([
+      issueService(db).addComment(issueId, "13:38 payload", {}, { idempotencyKey: key }),
+      issueService(db).addComment(issueId, "13:39 payload", {}, { idempotencyKey: key }),
+    ]);
+
+    expect(first.id).toBe(second.id);
+    expect(["deduplicated" in first, "deduplicated" in second]).toContain(true);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+  });
+});
+
 async function ensureIssueRelationsTable(db: ReturnType<typeof createDb>) {
   await db.execute(sql.raw(`
     CREATE TABLE IF NOT EXISTS "issue_relations" (
@@ -2634,6 +2768,103 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(byId.get(unblockedId)?.blockedBy).toEqual([]);
   });
 
+  it("reports the same blocker set on list rows and single-issue reads", async () => {
+    // Regression guard for BLO-19046. Two shapes taken from the field reports:
+    // BLO-15080 (exactly one blocker) and BLO-18836 (two blockers). The failure
+    // this pins is not a wrong array but a *missing* one: an absent `blockedBy`
+    // deserializes to undefined, every `?? []` consumer renders that as "no
+    // blockers", and triage inverts silently.
+    const companyId = randomUUID();
+    const singleBlockedId = randomUUID();
+    const singleBlockerId = randomUUID();
+    const doubleBlockedId = randomUUID();
+    const doubleBlockerAId = randomUUID();
+    const doubleBlockerBId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      { id: singleBlockerId, companyId, title: "H1 design dependency", status: "blocked", priority: "low" },
+      { id: singleBlockedId, companyId, title: "H4 Rust PathMux port", status: "blocked", priority: "low" },
+      { id: doubleBlockerAId, companyId, title: "Bearer provisioning", status: "in_progress", priority: "high" },
+      { id: doubleBlockerBId, companyId, title: "Scope review", status: "todo", priority: "high" },
+      { id: doubleBlockedId, companyId, title: "Track D TO bearer", status: "blocked", priority: "critical" },
+    ]);
+
+    await db.insert(issueRelations).values([
+      { companyId, issueId: singleBlockerId, relatedIssueId: singleBlockedId, type: "blocks" },
+      { companyId, issueId: doubleBlockerAId, relatedIssueId: doubleBlockedId, type: "blocks" },
+      { companyId, issueId: doubleBlockerBId, relatedIssueId: doubleBlockedId, type: "blocks" },
+    ]);
+
+    type WithBlockedBy = { id: string; blockedBy?: Array<{ id: string }> };
+    const ids = (rows?: Array<{ id: string }>) => [...(rows ?? [])].map((row) => row.id).sort();
+
+    // The list must not silently claim emptiness when it simply did not hydrate.
+    const unhydrated = (await svc.list(companyId)) as WithBlockedBy[];
+    for (const row of unhydrated) {
+      expect(row.blockedBy).toBeUndefined();
+    }
+
+    const hydrated = (await svc.list(companyId, { includeBlockedBy: true })) as WithBlockedBy[];
+    const listById = new Map(hydrated.map((row) => [row.id, row]));
+
+    for (const issueId of [singleBlockedId, doubleBlockedId, singleBlockerId]) {
+      const fromList = ids(listById.get(issueId)?.blockedBy);
+      const fromSingle = ids((await svc.getRelationSummaries(issueId)).blockedBy);
+      expect(fromList).toEqual(fromSingle);
+    }
+
+    // And the sets are the expected non-empty ones, so the assertion above cannot
+    // pass by both sides being empty.
+    expect(ids(listById.get(singleBlockedId)?.blockedBy)).toEqual([singleBlockerId].sort());
+    expect(ids(listById.get(doubleBlockedId)?.blockedBy)).toEqual([doubleBlockerAId, doubleBlockerBId].sort());
+  });
+
+  it("zeroes blockerAttention on non-blocked rows even when blockers exist", async () => {
+    // BLO-19046: blockerAttention is computed only for rows whose status is
+    // literally `blocked`; every other row gets an all-zero default. That zero
+    // means "not computed", NOT "no blockers", and is the second silent-empty
+    // trap in this family. Pinned so the semantics stay documented rather than
+    // being mistaken for a summary of `blockedBy`.
+    const companyId = randomUUID();
+    const blockerId = randomUUID();
+    const todoDependentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Real blocker", status: "todo", priority: "high" },
+      { id: todoDependentId, companyId, title: "Dependent still in todo", status: "todo", priority: "high" },
+    ]);
+
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: todoDependentId,
+      type: "blocks",
+    });
+
+    type Row = { id: string; blockedBy?: Array<{ id: string }>; blockerAttention?: { unresolvedBlockerCount: number } };
+    const rows = (await svc.list(companyId, { includeBlockedBy: true })) as Row[];
+    const dependent = rows.find((row) => row.id === todoDependentId);
+
+    // The blocker edge is real and `blockedBy` reports it...
+    expect(dependent?.blockedBy?.map((row) => row.id)).toEqual([blockerId]);
+    // ...while blockerAttention reports zero purely because status !== "blocked".
+    expect(dependent?.blockerAttention?.unresolvedBlockerCount).toBe(0);
+  });
+
   it("trims list payload fields that can grow large on issue index routes", async () => {
     const companyId = randomUUID();
     const issueId = randomUUID();
@@ -4196,6 +4427,19 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       ]);
     });
 
+    it("suppresses the wake when the latest agent comment asks the user to pick an option", async () => {
+      const ctx = await setupBlockedDependentWithExecutive();
+      await insertComment({
+        companyId: ctx.companyId,
+        issueId: ctx.blockedIssueId,
+        authorAgentId: ctx.assigneeAgentId,
+        body: "Please pick an option before work resumes.",
+        createdAt: new Date(),
+      });
+
+      await expect(svc.listWakeableBlockedDependents(ctx.blockerId)).resolves.toEqual([]);
+    });
+
     it("uses the newest matching executive comment when multiple holds are present", async () => {
       const ctx = await setupBlockedDependentWithExecutive();
       const oldFuture = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
@@ -4385,6 +4629,37 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         issueId: ctx.blockedIssueId,
         authorAgentId: ctx.ctoAgentId,
         body: "Just a status update from the CTO, no hold marker here.",
+        createdAt: new Date(),
+      });
+
+      await expect(svc.listResolvedBlockerDependentsToSweep(ctx.companyId, sweepOpts)).resolves.toEqual([
+        expect.objectContaining({
+          id: ctx.blockedIssueId,
+          assigneeAgentId: ctx.assigneeAgentId,
+        }),
+      ]);
+    });
+
+    it("suppresses the sweep when the latest agent comment asks the user to pick an option", async () => {
+      const ctx = await setupBlockedDependentWithExecutive();
+      await insertComment({
+        companyId: ctx.companyId,
+        issueId: ctx.blockedIssueId,
+        authorAgentId: ctx.assigneeAgentId,
+        body: "Please pick an option before work resumes.",
+        createdAt: new Date(),
+      });
+
+      await expect(svc.listResolvedBlockerDependentsToSweep(ctx.companyId, sweepOpts)).resolves.toEqual([]);
+    });
+
+    it("does not treat BLO-18012's completed-work status report as awaiting user input", async () => {
+      const ctx = await setupBlockedDependentWithExecutive();
+      await insertComment({
+        companyId: ctx.companyId,
+        issueId: ctx.blockedIssueId,
+        authorAgentId: ctx.assigneeAgentId,
+        body: "**CTO — bookkeeping confirmed, sequencing respected, one new live finding**\n\n**Attempted:** Verified BLO-18012 state per CEO's 17:34/17:37 comments before doing any further work.\n\n**Found:** State is exactly as CEO described — `in_progress`, workspace-bound (`projectId 584f37b3`, `executionWorkspaceId 575c743b`, shared_workspace/project_primary), and this very run (`8ef4da9d-da05-48f4-ad79-bc68215d6b6f`, locked 17:39:53Z) is executing cleanly in that workspace — no exit-128, confirming the BLO-18147 workspace-binding fix continues to hold for this issue specifically.\n\nNew finding while checking the shared checkout at `/paperclip/.../584f37b3.../paperclip` (same physical directory BLO-18147's live run 378f95f7 is also using): `git status` briefly showed **661 tracked files deleted from the working tree** (confirmed 3 samples missing from disk: `DESIGN.md`, `.github/workflows/release-verify.yml`, `packages/shared/src/types/tool-access.ts`), while the git index matched HEAD (nothing staged — no destructive-commit risk materialized). A concurrent `find`/`du` timed out at 2 min. ~90s later, re-checking: the files were back on disk and `git status` was clean. Transient, self-resolving, CephFS-backed PVC at 83% (850G/1.0T). Posted as evidence to [BLO-18147](https://paperclip.blockcast.net/BLO/issues/BLO-18147) since it's live corroboration for the storage-stress hypothesis there and for BLO-17793.\n\n**Next:** No further action needed on BLO-18012 itself this run — respecting the sequencing instruction (behind BLO-18141, BLO-18140, BLO-18147). Picking up BLO-18141 next per that stated order.",
         createdAt: new Date(),
       });
 
@@ -5432,7 +5707,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     ).rejects.toMatchObject({ status: 422 });
   });
 
-  it("rejects blocked to todo promotion when the latest unanswered agent comment awaits user input", async () => {
+  it("allows a deliberate blocked to todo promotion when the latest agent comment awaits user input", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
     const commentId = randomUUID();
@@ -5471,15 +5746,9 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       createdAt: new Date("2026-05-16T10:08:00.000Z"),
     });
 
-    await expect(
-      svc.update(issueId, { status: "todo" }),
-    ).rejects.toMatchObject({
-      status: 409,
-      details: expect.objectContaining({
-        event: "sweep_blocked_promotion_skipped_awaiting_user",
-        counter: "sweep.blocked_promotion_skipped_awaiting_user",
-        commentId,
-      }),
+    await expect(svc.update(issueId, { status: "todo" })).resolves.toMatchObject({
+      id: issueId,
+      status: "todo",
     });
   });
 

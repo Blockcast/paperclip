@@ -30,7 +30,7 @@ import {
   UserRound,
   Users,
 } from "lucide-react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import type {
   CompanySecret,
   CompanySecretUsageBinding,

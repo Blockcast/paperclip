@@ -891,6 +891,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
         toolName: gatewayToolName,
       });
       const gateway = createTestToolGatewayService(db, {
+        now: () => Date.UTC(2026, 0, 1, 12, 0, 0),
         mcpGatewayProtocolLimits: {
           gatewayRequests: { max: 1, windowMs: 60_000 },
           tokenRequests: { max: 1, windowMs: 60_000 },
