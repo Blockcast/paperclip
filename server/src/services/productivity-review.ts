@@ -89,6 +89,7 @@ type ProductivityReviewEvidence = {
   commentCountLastHour: number;
   commentCountLastSixHours: number;
   elapsedMs: number | null;
+  monitorGating: { gatedMs: number; unattendedMs: number; lapsedAt: Date | null; armedUntil: Date | null } | null;
   latestRuns: HeartbeatRunRow[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
@@ -204,6 +205,45 @@ function deliberateFutureMonitor(issue: IssueRow, now: Date) {
   if (!monitorNextCheckAt || monitorNextCheckAt.getTime() <= now.getTime()) return null;
   if (!monitorScheduledBy || !MONITOR_SCHEDULED_SUPPRESSION_ACTORS.has(monitorScheduledBy)) return null;
   return { monitorNextCheckAt, monitorScheduledBy };
+}
+
+/**
+ * Splits an active episode into the portion an armed monitor was accounting for
+ * and the portion nobody was watching, so a manager adjudicating a
+ * `long_active_duration` review can tell a deliberate monitor-gated wait from an
+ * unattended stall without cross-checking the source issue.
+ *
+ * Derived from the server-owned monitor columns rather than a full monitor
+ * history, so `gatedMs` is an upper bound: re-arm gaps inside the covered span
+ * are counted as gated. This is reporting only — it does not gate whether the
+ * review fires.
+ */
+function monitorGatingBreakdown(issue: IssueRow, activeStartedAt: Date | null, elapsedMs: number | null, now: Date) {
+  if (elapsedMs === null || !activeStartedAt) return null;
+  const armedUntil = coerceDate(issue.monitorNextCheckAt);
+  const lastTriggeredAt = coerceDate(issue.monitorLastTriggeredAt);
+
+  // Still armed for a future check: the whole episode is accounted for.
+  if (armedUntil && armedUntil.getTime() > now.getTime()) {
+    return { gatedMs: elapsedMs, unattendedMs: 0, lapsedAt: null, armedUntil };
+  }
+
+  // A monitor ran at some point and has since lapsed. Coverage ended at the
+  // later of its last trigger and its last scheduled check.
+  const lapseCandidates = [lastTriggeredAt, armedUntil].filter((d): d is Date => Boolean(d));
+  if (lapseCandidates.length === 0) {
+    return { gatedMs: 0, unattendedMs: elapsedMs, lapsedAt: null, armedUntil: null };
+  }
+  const lapsedAt = new Date(Math.max(...lapseCandidates.map((d) => d.getTime())));
+  const gatedMs = Math.min(elapsedMs, Math.max(0, lapsedAt.getTime() - activeStartedAt.getTime()));
+  return { gatedMs, unattendedMs: Math.max(0, elapsedMs - gatedMs), lapsedAt, armedUntil: null };
+}
+
+function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["monitorGating"]>) {
+  const split = `${msToHuman(gating.gatedMs)} monitor-gated, ${msToHuman(gating.unattendedMs)} unattended`;
+  if (gating.armedUntil) return `${split} (monitor armed until ${gating.armedUntil.toISOString()})`;
+  if (gating.lapsedAt) return `${split} (monitor lapsed at ${gating.lapsedAt.toISOString()}, never re-armed)`;
+  return `${split} (no monitor armed during this episode)`;
 }
 
 function isMonitorScheduledSuppression(
@@ -888,6 +928,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       commentCountLastHour: assigneeRunCommentCountLastHour,
       commentCountLastSixHours: assigneeRunCommentCountLastSixHours,
       elapsedMs,
+      monitorGating: monitorGatingBreakdown(sourceIssue, activeStartedAt, elapsedMs, now),
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -996,6 +1037,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
+      ...(evidence.monitorGating
+        ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
+        : []),
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,

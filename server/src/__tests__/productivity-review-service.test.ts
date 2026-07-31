@@ -60,6 +60,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     startedAt?: Date;
     monitorNextCheckAt?: Date | null;
     monitorScheduledBy?: "assignee" | "board" | null;
+    monitorLastTriggeredAt?: Date | null;
     parentId?: string | null;
     originKind?: string;
     executionPolicy?: Record<string, unknown> | null;
@@ -124,6 +125,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       startedAt: opts?.startedAt ?? createdAt,
       monitorNextCheckAt: opts?.monitorNextCheckAt ?? null,
       monitorScheduledBy: opts?.monitorScheduledBy ?? null,
+      monitorLastTriggeredAt: opts?.monitorLastTriggeredAt ?? null,
       executionPolicy: opts?.executionPolicy ?? null,
       createdAt,
       updatedAt: createdAt,
@@ -619,6 +621,58 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.monitorScheduledSuppressed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("reports the whole episode as unattended when no monitor was ever armed", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      "- Elapsed accounting: 0m monitor-gated, 7h 0m unattended (no monitor armed during this episode)",
+    );
+  });
+
+  // Replay of the BLO-19067 episode that prompted BLO-19774, using its real
+  // timestamps from the issues row. The ticket asserted the monitor was still
+  // armed with a future nextCheckAt; it was not — monitor_next_check_at was NULL
+  // and monitor_last_triggered_at was 2026-07-30T22:36:42.405Z, so only the
+  // first 1h23m of the 15h53m episode was monitor-gated. The review therefore
+  // still fires (correctly: 14h30m genuinely unattended), and the evidence block
+  // must make that split legible to the adjudicating manager.
+  it("splits monitor-gated from unattended elapsed time when the monitor lapsed (BLO-19067 replay)", async () => {
+    const startedAt = new Date("2026-07-30T21:13:34.758Z");
+    const monitorLastTriggeredAt = new Date("2026-07-30T22:36:42.405Z");
+    const now = new Date("2026-07-31T13:07:26.406Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorScheduledBy: "assignee",
+      monitorLastTriggeredAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.monitorScheduledSuppressed).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Current active elapsed time: 15h 53m");
+    expect(review?.description).toContain(
+      `- Elapsed accounting: 1h 23m monitor-gated, 14h 30m unattended (monitor lapsed at ${monitorLastTriggeredAt.toISOString()}, never re-armed)`,
+    );
   });
 
   it("does not suppress no-comment productivity reviews for future monitor waits", async () => {
