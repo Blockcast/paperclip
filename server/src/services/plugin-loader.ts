@@ -103,10 +103,13 @@ const MONOREPO_NODE_MODULES = path.resolve(__dirname, "../../../node_modules/.pn
  * below npm install's own 120s timeout.
  */
 const SDK_INSTALL_RACE_RETRY_DELAYS_MS = [500, 1500, 3500, 7500, 15500];
-// Same boot-time store-reconciliation window as the SDK import retry above:
-// static torn-store snapshots fail on the first repeated problem key, while
-// changing snapshots get the full observed install-race budget to settle.
+// Same boot-time store-reconciliation window as the SDK import retry above.
+// A stable mismatch must remain unchanged for at least 10s before we fail
+// closed, so static-but-transient install snapshots get more than the observed
+// <5s reconciliation time while permanent mismatches still fail well below the
+// 60s worker initialize timeout.
 const SDK_STORE_CONSISTENCY_RECHECK_DELAYS_MS = SDK_INSTALL_RACE_RETRY_DELAYS_MS;
+const SDK_STORE_CONSISTENCY_MIN_STABLE_MISMATCH_MS = 10_000;
 const SDK_INSTALL_RACE_PACKAGE_MARKER = "@paperclipai/plugin-sdk";
 const SDK_INSTALL_RACE_ERR_MARKER = "ERR_MODULE_NOT_FOUND";
 
@@ -365,6 +368,7 @@ async function checkSharedDependencyConsistencyAfterRecheck(
 ): Promise<SharedDependencyConsistencyCheck> {
   let check = await checkSharedDependencyConsistency(installDir, packageName);
   let previousProblemKey = sharedDependencyProblemKey(check);
+  let previousProblemFirstSeenAt = Date.now();
   if (!previousProblemKey) return check;
 
   for (const delayMs of SDK_STORE_CONSISTENCY_RECHECK_DELAYS_MS) {
@@ -372,9 +376,16 @@ async function checkSharedDependencyConsistencyAfterRecheck(
     const next = await checkSharedDependencyConsistency(installDir, packageName);
     const nextProblemKey = sharedDependencyProblemKey(next);
     if (!nextProblemKey) return next;
-    if (nextProblemKey === previousProblemKey) return next;
+    const now = Date.now();
+    if (
+      nextProblemKey === previousProblemKey &&
+      now - previousProblemFirstSeenAt >= SDK_STORE_CONSISTENCY_MIN_STABLE_MISMATCH_MS
+    ) {
+      return next;
+    }
     check = next;
     previousProblemKey = nextProblemKey;
+    previousProblemFirstSeenAt = now;
   }
 
   return check;

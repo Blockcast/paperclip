@@ -341,7 +341,7 @@ describeEmbeddedPostgres("torn plugin store — activation fails closed", () => 
     return plugin;
   }
 
-  it("waits past the first activation-time recheck when shared SDK reconciliation is still changing", async () => {
+  it("waits past the first activation-time recheck when a static shared SDK mismatch is still reconciling", async () => {
     const fixture = await createFixturePluginPackage();
     const installDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-plugin-store-"));
     cleanupPaths.add(installDir);
@@ -349,9 +349,7 @@ describeEmbeddedPostgres("torn plugin store — activation fails closed", () => 
     await writeInstalledPackageVersion(installDir, SDK_PACKAGE, "1.0.0");
 
     const settleStore = (async () => {
-      await sleep(100);
-      await writeInstalledPackageVersion(installDir, SDK_PACKAGE, "2026.400.0");
-      await sleep(700);
+      await sleep(800);
       await writeInstalledPackageVersion(installDir, SDK_PACKAGE, "2026.513.0");
     })();
     const { runtimeServices, startWorker, markError } = createRuntimeServices();
@@ -461,10 +459,10 @@ describeEmbeddedPostgres("torn plugin store — activation fails closed", () => 
     const elapsedMs = Date.now() - startedAt;
 
     // The real bug hangs for INITIALIZE_TIMEOUT_MS (60s) before failing with
-    // an opaque timeout. The consistency guard now waits through bounded
-    // rechecks for an in-flight install to settle, but must still fail far
-    // below the worker initialize timeout.
-    expect(elapsedMs).toBeLessThan(10_000);
+    // an opaque timeout. The consistency guard now gives a stable mismatch a
+    // meaningful reconciliation window, but must still fail far below the
+    // worker initialize timeout.
+    expect(elapsedMs).toBeLessThan(30_000);
 
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/Torn plugin store detected/);
@@ -475,5 +473,5 @@ describeEmbeddedPostgres("torn plugin store — activation fails closed", () => 
     expect(startWorker).not.toHaveBeenCalled();
     expect(markError).toHaveBeenCalledTimes(1);
     expect(markError).toHaveBeenCalledWith(installedRow.id, expect.stringContaining("Torn plugin store detected"));
-  }, 20_000);
+  }, 35_000);
 });
