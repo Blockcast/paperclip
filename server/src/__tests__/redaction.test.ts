@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { REDACTED_EVENT_VALUE, redactEventPayload, redactSensitiveText, sanitizeRecord } from "../redaction.js";
+import {
+  REDACTED_EVENT_VALUE,
+  redactAgentConfigPayload,
+  redactApprovalPayloadByType,
+  redactEventPayload,
+  redactSensitiveText,
+  sanitizeRecord,
+} from "../redaction.js";
 
 describe("redaction", () => {
   it("redacts sensitive keys and nested secret values", () => {
@@ -155,5 +162,187 @@ describe("redaction", () => {
 
     expect(result?.args).toEqual(["--api-key", "not-a-command-secret"]);
     expect(result?.argv).toEqual(["--api-key", REDACTED_EVENT_VALUE]);
+  });
+});
+
+// BLO-18969: `redactEventPayload` masks by key *name*, which is the wrong test
+// for an agent config — a plain binding is credential material by construction.
+// These pin the two redactors apart; the agent-config one must be strictly
+// stronger, and the generic one must not change for its many other callers.
+describe("redactAgentConfigPayload", () => {
+  const SECRET = "value-under-a-key-no-regex-matches";
+
+  it("masks a plain binding under an ordinary key at any depth", () => {
+    const result = redactAgentConfigPayload({
+      modelProfiles: {
+        cheap: { adapterConfig: { env: { SIGNING_MATERIAL: { type: "plain", value: SECRET } } } },
+      },
+    });
+
+    expect(result).toEqual({
+      modelProfiles: {
+        cheap: {
+          adapterConfig: { env: { SIGNING_MATERIAL: { type: "plain", value: REDACTED_EVENT_VALUE } } },
+        },
+      },
+    });
+  });
+
+  it("masks a legacy bare-string env value under an ordinary key", () => {
+    expect(redactAgentConfigPayload({ env: { FOO: SECRET } })).toEqual({
+      env: { FOO: REDACTED_EVENT_VALUE },
+    });
+  });
+
+  it("keeps non-credential config readable", () => {
+    expect(redactAgentConfigPayload({ cwd: "/workspace", model: "openai/gpt-5.6-sol" })).toEqual({
+      cwd: "/workspace",
+      model: "openai/gpt-5.6-sol",
+    });
+  });
+
+  it("keeps secret_ref readable as a pointer but drops a resolved value", () => {
+    const result = redactAgentConfigPayload({
+      env: {
+        FOO: {
+          type: "secret_ref",
+          secretId: "44444444-4444-4444-8444-444444444444",
+          projectionClass: "unclassified",
+          extra: "not-schema-owned",
+          value: SECRET,
+        },
+      },
+    });
+
+    expect(result).toEqual({
+      env: {
+        FOO: {
+          type: "secret_ref",
+          secretId: "44444444-4444-4444-8444-444444444444",
+          projectionClass: "unclassified",
+        },
+      },
+    });
+  });
+
+  it("masks malformed object-valued env entries wholesale", () => {
+    expect(redactAgentConfigPayload({
+      runtimeConfig: {
+        custom: {
+          env: {
+            FOO: { legacyValue: SECRET },
+            BAR: { type: "unknown", value: SECRET },
+            PLAIN: { type: "plain", value: SECRET, label: "ignored" },
+            USER: {
+              type: "user_secret_ref",
+              key: "github_token",
+              version: "latest",
+              required: false,
+              allowMissingOverride: true,
+              value: SECRET,
+              extra: "ignored",
+            },
+            BAD_SECRET_REF: {
+              type: "secret_ref",
+              secretId: "not-a-uuid",
+              version: { value: SECRET },
+              projectionClass: "unclassified",
+            },
+            BAD_USER_SECRET_REF: {
+              type: "user_secret_ref",
+              key: "github_token",
+              required: { value: SECRET },
+              allowMissingOverride: "yes",
+            },
+          },
+        },
+      },
+    })).toEqual({
+      runtimeConfig: {
+        custom: {
+          env: {
+            FOO: REDACTED_EVENT_VALUE,
+            BAR: REDACTED_EVENT_VALUE,
+            PLAIN: { type: "plain", value: REDACTED_EVENT_VALUE },
+            USER: {
+              type: "user_secret_ref",
+              key: "github_token",
+              version: "latest",
+              required: false,
+              allowMissingOverride: true,
+            },
+            BAD_SECRET_REF: REDACTED_EVENT_VALUE,
+            BAD_USER_SECRET_REF: REDACTED_EVENT_VALUE,
+          },
+        },
+      },
+    });
+  });
+
+  it("masks malformed env containers wholesale in agent config mode", () => {
+    expect(redactAgentConfigPayload({
+      runtimeConfig: {
+        scalar: { env: SECRET },
+        array: { env: [SECRET] },
+        missing: { env: null },
+      },
+    })).toEqual({
+      runtimeConfig: {
+        scalar: { env: REDACTED_EVENT_VALUE },
+        array: { env: REDACTED_EVENT_VALUE },
+        missing: { env: REDACTED_EVENT_VALUE },
+      },
+    });
+  });
+
+  it("propagates structural redaction through non-string command args", () => {
+    expect(redactAgentConfigPayload({
+      commandArgs: [
+        "--safe",
+        { type: "plain", value: SECRET },
+        { nested: { type: "plain", value: SECRET } },
+        { type: "secret_ref", version: { value: SECRET } },
+      ],
+      argv: [{ type: "plain", value: SECRET }],
+    })).toEqual({
+      commandArgs: [
+        "--safe",
+        { type: "plain", value: REDACTED_EVENT_VALUE },
+        { nested: { type: "plain", value: REDACTED_EVENT_VALUE } },
+        REDACTED_EVENT_VALUE,
+      ],
+      argv: [{ type: "plain", value: REDACTED_EVENT_VALUE }],
+    });
+  });
+
+  it("uses structural redaction only for hire approval payloads", () => {
+    const payload = {
+      title: "Pick deployment target",
+      env: { target: "production" },
+      colorChoice: { type: "plain", value: "blue" },
+    };
+
+    expect(redactApprovalPayloadByType("request_board_approval", structuredClone(payload))).toEqual(payload);
+    expect(redactApprovalPayloadByType("hire_agent", structuredClone(payload))).toEqual({
+      title: "Pick deployment target",
+      env: { target: REDACTED_EVENT_VALUE },
+      colorChoice: { type: "plain", value: REDACTED_EVENT_VALUE },
+    });
+  });
+
+  it("leaves redactEventPayload unchanged for the same input", () => {
+    // The generic redactor is shared with events, heartbeats and tool guards;
+    // widening it was explicitly not the fix.
+    const input = { env: { FOO: { type: "plain", value: SECRET } } };
+
+    expect(redactEventPayload(structuredClone(input))).toEqual(input);
+    expect(redactAgentConfigPayload(structuredClone(input))).toEqual({
+      env: { FOO: { type: "plain", value: REDACTED_EVENT_VALUE } },
+    });
+  });
+
+  it("returns null for nullish payloads", () => {
+    expect(redactAgentConfigPayload(null)).toBeNull();
+    expect(redactAgentConfigPayload(undefined)).toBeNull();
   });
 });

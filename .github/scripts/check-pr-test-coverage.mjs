@@ -8,9 +8,13 @@
  */
 import { fileURLToPath } from 'node:url';
 
+// `.mjs`/`.cjs` are included deliberately: the repo's own Node-native suites use
+// `*.test.mjs` (38 of them, including this checker's tests and everything run by
+// the `node --test` steps in pr.yml). Omitting them made the gate report "no test
+// files detected" on PRs whose only tests were written in that convention.
 const TEST_PATTERNS = [
-  /\.test\.(ts|js|tsx|jsx)$/,
-  /\.spec\.(ts|js|tsx|jsx)$/,
+  /\.test\.(ts|js|tsx|jsx|mjs|cjs)$/,
+  /\.spec\.(ts|js|tsx|jsx|mjs|cjs)$/,
   /(?:^|\/)tests?\//,
   /\/__tests__\//,
 ];

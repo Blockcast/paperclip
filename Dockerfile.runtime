@@ -40,6 +40,22 @@ RUN mv /usr/bin/gh /usr/bin/gh.real \
   && ln -s /usr/bin/gh-token-wrapper.sh /usr/bin/gh \
   && chmod 0755 /usr/bin/gh-token-wrapper.sh
 
+# Let the git CLI authenticate as the bot too (BLO-18484). The wrapper above
+# only injects the token into `gh`'s own process env, so git itself had no
+# credential at all: every `git push`/`git fetch` against a *private* repo
+# failed with "Invalid username or token", which reads like a permissions
+# problem but is actually the absence of any credential. Public repos hid it,
+# because those clone anonymously.
+#
+# Must point at /usr/bin/gh (the wrapper), NOT /usr/bin/gh.real. `gh auth
+# setup-git` writes a `gh.real` helper here — it resolves its own argv[0] after
+# the wrapper exec's it — and gh.real never reads the token file, so that
+# helper returns no credential and git falls through to prompting. Writing
+# /etc/gitconfig rather than ~/.gitconfig because each agent run gets a fresh
+# HOME, so a per-user config would not survive.
+RUN git config --system credential.https://github.com.helper \
+  '!/usr/bin/gh auth git-credential'
+
 # Match the host/PVC ownership expected by the production Helm deployment.
 RUN usermod -u "$USER_UID" --non-unique node \
   && groupmod -g "$USER_GID" --non-unique node \
