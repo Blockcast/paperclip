@@ -255,42 +255,44 @@ probes:
     periodSeconds: 10
     failureThreshold: 30
 
-# -- Worker StatefulSet probe configuration. The worker role does not bind the
-# HTTP port reliably during startup, but it does run the same Node entrypoint;
-# use a process check for the single StatefulSet pod and keep the API tier on
-# `probes.*` HTTP checks.
+# -- Worker StatefulSet probe configuration. The worker serves the same
+# `/healthz` endpoint as the API tier; probing HTTP prevents Kubernetes from
+# routing API-to-worker requests before the worker is actually listening.
 workerProbes:
   # -- Worker liveness probe.
   liveness:
-    exec:
-      command:
-        - /bin/sh
-        - -c
-        - "grep -qa 'server/dist/index.js' /proc/[0-9]*/cmdline"
+    httpGet:
+      path: /healthz
+      port: http
+      httpHeaders:
+        - name: Host
+          value: 127.0.0.1:3100
     initialDelaySeconds: 30
     periodSeconds: 30
-    timeoutSeconds: 2
+    timeoutSeconds: 5
     failureThreshold: 3
   # -- Worker readiness probe.
   readiness:
-    exec:
-      command:
-        - /bin/sh
-        - -c
-        - "grep -qa 'server/dist/index.js' /proc/[0-9]*/cmdline"
+    httpGet:
+      path: /healthz
+      port: http
+      httpHeaders:
+        - name: Host
+          value: 127.0.0.1:3100
     initialDelaySeconds: 5
     periodSeconds: 10
-    timeoutSeconds: 2
+    timeoutSeconds: 5
     failureThreshold: 3
   # -- Worker startup probe.
   startup:
-    exec:
-      command:
-        - /bin/sh
-        - -c
-        - "grep -qa 'server/dist/index.js' /proc/[0-9]*/cmdline"
+    httpGet:
+      path: /healthz
+      port: http
+      httpHeaders:
+        - name: Host
+          value: 127.0.0.1:3100
     periodSeconds: 10
-    timeoutSeconds: 2
+    timeoutSeconds: 5
     failureThreshold: 30
 
 # -- Node selector.
