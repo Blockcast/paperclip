@@ -93,13 +93,16 @@ decides whether the PR can receive a formal review at all:
 - **Default App-installation token** — identity `app/allyblockcast[bot]`. This is
   the **authoring identity**: commits, branch push, `gh pr create`, comments,
   replies, status, reads, and merges. The review bot posts its **comment-mode**
-  reviews under this identity. Every reviewer outcome, including a formal
-  approval, must also leave the canonical consolidated review as an exact-head
-  App-authored comment; Paperclip does not trust the user-seat review by itself.
+  reviews under this identity. Paperclip trusts App-authored review output when
+  it carries the canonical consolidated review body with an exact-head
+  attestation.
 - **User-seat token** — mounted at `/paperclip/.secrets/github-merge-token/token`
   when provisioned. This is the **`allyblockcast` user** account, a *distinct*
   GitHub identity from the `app/allyblockcast[bot]` App. The review bot posts its
-  **formal approvals** under this seat. It is *not* an authoring credential.
+  **formal approvals** under this seat. Paperclip trusts that seat review only
+  when it is `APPROVED` and contains the canonical consolidated review body with
+  exactly one exact-head `Reviewed head: <sha>` attestation. It is *not* an
+  authoring credential.
 
 GitHub forbids an identity from submitting a **formal review** (`APPROVE` /
 `REQUEST_CHANGES`) on a PR it authored, so the author and the reviewer must be
@@ -111,18 +114,19 @@ same login, which is both why authoring under it blocks review and why you must
 never submit a review under it outside the dedicated reviewer pipeline (see
 [Why the user seat must never post a review](#why-the-user-seat-must-never-post-a-review)).
 
-The dedicated reviewer pipeline has a two-part clean-review contract:
+The dedicated reviewer pipeline has two trusted clean-review evidence shapes:
 
 1. Post the canonical `## Ally — Consolidated PR Review` body, with exactly one
-   full `Reviewed head: <sha>` attestation, as the App identity.
+   full `Reviewed head: <sha>` attestation, as the App identity for comment-mode
+   reviews or App-authored review output.
 2. If the review is clean and the PR is App-authored, submit the formal approval
-   under the user-seat identity. The approval satisfies branch protection; the
-   App comment is the durable evidence Paperclip requires before completing the
-   reviewer run.
+   under the user-seat identity with that same canonical body and exact-head
+   attestation. The approval satisfies branch protection, and the attested body
+   is the durable evidence Paperclip requires before completing the reviewer run.
 
-Neither artifact is a substitute for the other. A seat approval without the App
-attestation is untrusted, and an App comment cannot satisfy a repository rule
-that explicitly requires a formal approval.
+A seat approval without the canonical `APPROVED` exact-head attestation is
+untrusted, and an App comment cannot satisfy a repository rule that explicitly
+requires a formal approval.
 
 **Author and push under the default App token. Never author or push a PR under
 the user-seat token.** No token selection is needed — the default `gh` and `git`
@@ -330,8 +334,8 @@ Rules:
 - Use the **default App token** for authoring, pushing, commenting, and merging.
 - **Never submit a formal review under the user-seat token.** No `gh pr review`
   with it — not `--approve`, not `--request-changes`, not `--comment`. This rule
-  governs agents consuming this workflow; the dedicated reviewer service's
-  two-artifact contract above is not a general credential exception. Never post
+  governs agents consuming this workflow; only the dedicated reviewer service may
+  produce the canonical exact-head `APPROVED` review under that seat. Never post
   an `ally-verdict:` marker or a `Reviewed head: <sha>` line under it, on a review
   or in a comment. This holds even when the review is honest and even when the
   change is yours: the prohibition is on the *credential*, not on your intent.
@@ -352,10 +356,11 @@ the reviewer's own**, to a human reader and to CI alike.
 
 The `review/ally-complete` merge gate keys off exactly that: an `APPROVED` review
 from an `allyblockcast` login. An approval posted under the seat therefore clears
-the gate for a change no reviewer ever looked at, and the review object alone
-cannot afterwards distinguish the two. Only the reviewer's own pipeline may
-produce a review that clears that gate, and Paperclip completes that pipeline
-only after GitHub also confirms the exact-head App attestation described above.
+the gate for a change no reviewer ever looked at, and a manually forged canonical
+body is indistinguishable from the reviewer's own evidence after the fact. Only
+the reviewer's own pipeline may produce a review that clears that gate, and
+Paperclip completes that pipeline only after GitHub confirms the exact-head
+trusted evidence described above.
 
 So when you are looking at a red `review/ally-complete` on your own PR, the
 sanctioned move is to **get a review** — re-request one (see the repo's review

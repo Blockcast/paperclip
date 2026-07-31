@@ -144,6 +144,7 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
     githubAppId: "3966421",
     githubAppInstallationId: "12345678",
     githubAppPrivateKey: "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----",
+    githubPrReviewerAgentIds: [],
     prReviewerBotLogin: "allyblockcast[bot]",
     feedbackExportBackendUrl: "https://telemetry.example.com",
     feedbackExportBackendToken: "telemetry-token",
@@ -326,6 +327,7 @@ describe("startServer feedback export wiring", () => {
       githubAppId: "",
       githubAppInstallationId: "",
       githubAppPrivateKey: "",
+      githubPrReviewerAgentIds: ["reviewer-agent"],
       prReviewerBotLogin: "allyblockcast[bot]",
     }));
 
@@ -336,6 +338,26 @@ describe("startServer feedback export wiring", () => {
         configuredLogin: "allyblockcast[bot]",
         missingCredentials: ["GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY"],
       },
+      "GitHub App credentials are required to verify PR-review evidence; missing credentials will fail reviewer completion closed",
+    );
+  });
+
+  it("does not warn about missing PR-review GitHub App credentials when no PR-reviewer agent is configured", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      githubAppId: "",
+      githubAppInstallationId: "",
+      githubAppPrivateKey: "",
+      githubPrReviewerAgentIds: [],
+      prReviewerBotLogin: "allyblockcast[bot]",
+    }));
+
+    await startServer();
+
+    expect(logger.warn).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        configuredLogin: "allyblockcast[bot]",
+        missingCredentials: expect.any(Array),
+      }),
       "GitHub App credentials are required to verify PR-review evidence; missing credentials will fail reviewer completion closed",
     );
   });

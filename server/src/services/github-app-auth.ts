@@ -230,7 +230,7 @@ function consolidatedReviewHead(body: string): string | null {
 
 /**
  * Authoritatively check whether the reviewer bot left a review or comment for
- * THIS PR head on GitHub. Used to rescue a false `pr_review_output_missing`.
+ * THIS PR head on GitHub before a claimed PR-review run can complete.
  *
  * Found when either:
  *  - a review authored by the bot has `commit_id === headSha` (precise: reviewed
@@ -310,6 +310,9 @@ export async function githubHasReviewerEvidenceForPr(input: {
           if (!reviewedHead) continue;
           if (!headSha) return { found: true, via: "review" };
           if (reviewedHead === headSha) return { found: true, via: "review" };
+          // Formal user-seat approvals are trusted only from the dedicated
+          // reviewer pipeline's canonical body. The at-or-newer fallback still
+          // proves this self-attested SHA is a real descendant before crediting it.
           reviewCandidates.push(reviewedHead);
         }
       }
