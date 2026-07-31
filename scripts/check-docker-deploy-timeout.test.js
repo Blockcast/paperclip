@@ -55,6 +55,19 @@ test("manual Docker deploys carry one full immutable SHA between jobs", () => {
   assert.match(deployJob, /\[ "\$\{full\}" != "\$\{expected\}" \]/);
 });
 
+test("master pushes cannot cancel protected manual deploy builds", () => {
+  const buildJob = getBuildJobBlock();
+
+  assert.match(
+    buildJob,
+    /group: docker-\$\{\{ github\.ref \}\}-\$\{\{ github\.event_name == 'workflow_dispatch' && 'deploy' \|\| 'publish' \}\}/,
+  );
+  assert.match(
+    buildJob,
+    /cancel-in-progress: \$\{\{ github\.event_name != 'workflow_dispatch' \}\}/,
+  );
+});
+
 test("Docker deploy job provisions Buildx before inspecting the artifact", () => {
   const deployJob = getDeployJobBlock();
   const setup = deployJob.indexOf("uses: docker/setup-buildx-action@v4");

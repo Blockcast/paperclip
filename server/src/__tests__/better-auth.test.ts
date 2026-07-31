@@ -9,9 +9,15 @@ import {
   deriveAuthTrustedOrigins,
   shouldDisableSecureAuthCookies,
 } from "../auth/better-auth.js";
+import {
+  assertUsableAuthCapabilities,
+  loadAuthCapabilities,
+  resolveEmailPasswordAuthEnabled,
+} from "../auth/capabilities.js";
 
 const ORIGINAL_INSTANCE_ID = process.env.PAPERCLIP_INSTANCE_ID;
 const ORIGINAL_PUBLIC_URL = process.env.PAPERCLIP_PUBLIC_URL;
+const ORIGINAL_EMAIL_PASSWORD_ENABLED = process.env.PAPERCLIP_AUTH_EMAIL_PASSWORD_ENABLED;
 const ORIGINAL_DEX_ENV = {
   issuer: process.env.PAPERCLIP_DEX_OIDC_ISSUER,
   clientId: process.env.PAPERCLIP_DEX_OIDC_CLIENT_ID,
@@ -25,6 +31,8 @@ afterEach(() => {
   else process.env.PAPERCLIP_INSTANCE_ID = ORIGINAL_INSTANCE_ID;
   if (ORIGINAL_PUBLIC_URL === undefined) delete process.env.PAPERCLIP_PUBLIC_URL;
   else process.env.PAPERCLIP_PUBLIC_URL = ORIGINAL_PUBLIC_URL;
+  if (ORIGINAL_EMAIL_PASSWORD_ENABLED === undefined) delete process.env.PAPERCLIP_AUTH_EMAIL_PASSWORD_ENABLED;
+  else process.env.PAPERCLIP_AUTH_EMAIL_PASSWORD_ENABLED = ORIGINAL_EMAIL_PASSWORD_ENABLED;
   if (ORIGINAL_DEX_ENV.issuer === undefined) delete process.env.PAPERCLIP_DEX_OIDC_ISSUER;
   else process.env.PAPERCLIP_DEX_OIDC_ISSUER = ORIGINAL_DEX_ENV.issuer;
   if (ORIGINAL_DEX_ENV.clientId === undefined) delete process.env.PAPERCLIP_DEX_OIDC_CLIENT_ID;
@@ -268,6 +276,36 @@ describe("Dex OAuth provider config", () => {
       providerId: "blockcast",
       scopes: ["openid", "email", "groups"],
     });
+  });
+});
+
+describe("authentication capabilities", () => {
+  it("keeps email/password enabled by default and accepts explicit booleans", () => {
+    expect(resolveEmailPasswordAuthEnabled(undefined)).toBe(true);
+    expect(resolveEmailPasswordAuthEnabled(" true ")).toBe(true);
+    expect(resolveEmailPasswordAuthEnabled("FALSE")).toBe(false);
+    expect(() => resolveEmailPasswordAuthEnabled("disabled")).toThrow(
+      "PAPERCLIP_AUTH_EMAIL_PASSWORD_ENABLED must be 'true' or 'false'",
+    );
+  });
+
+  it("reports only fully configured OIDC providers", () => {
+    process.env.PAPERCLIP_AUTH_EMAIL_PASSWORD_ENABLED = "false";
+    process.env.PAPERCLIP_DEX_OIDC_ISSUER = "https://dex.example.test";
+    process.env.PAPERCLIP_DEX_OIDC_CLIENT_ID = "paperclip";
+    process.env.PAPERCLIP_DEX_OIDC_CLIENT_SECRET = "secret";
+
+    expect(loadAuthCapabilities()).toEqual({
+      emailPasswordEnabled: false,
+      oidcProviders: ["dex"],
+    });
+  });
+
+  it("rejects disabling password auth without a complete Dex provider", () => {
+    expect(() => assertUsableAuthCapabilities({
+      emailPasswordEnabled: false,
+      oidcProviders: [],
+    })).toThrow("requires a complete Dex OIDC configuration");
   });
 });
 

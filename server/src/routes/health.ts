@@ -15,6 +15,7 @@ import {
 } from "../services/database-backup-health.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { serverVersion } from "../version.js";
+import type { AuthCapabilities } from "../auth/capabilities.js";
 
 function shouldExposeFullHealthDetails(
   actorType: "none" | "board" | "agent" | null | undefined,
@@ -62,6 +63,7 @@ export function healthRoutes(
     deploymentMode: DeploymentMode;
     deploymentExposure: DeploymentExposure;
     authReady: boolean;
+    authCapabilities?: AuthCapabilities;
     companyDeletionEnabled: boolean;
     serverInfo?: ServerInfoSnapshot;
     databaseBackupHealth?: InspectDatabaseBackupHealthOptions;
@@ -126,8 +128,18 @@ export function healthRoutes(
     if (!db) {
       res.json(
         exposeFullDetails
-          ? { status: "ok", version: serverVersion, serverVersion: serverVersion, serverInfo }
-          : { status: "ok", deploymentMode: opts.deploymentMode },
+          ? {
+              status: "ok",
+              version: serverVersion,
+              serverVersion: serverVersion,
+              serverInfo,
+              ...(opts.authCapabilities ? { auth: opts.authCapabilities } : {}),
+            }
+          : {
+              status: "ok",
+              deploymentMode: opts.deploymentMode,
+              ...(opts.authCapabilities ? { auth: opts.authCapabilities } : {}),
+            },
       );
       return;
     }
@@ -205,6 +217,7 @@ export function healthRoutes(
         deploymentExposure: opts.deploymentExposure,
         bootstrapStatus,
         bootstrapInviteActive,
+        ...(opts.authCapabilities ? { auth: opts.authCapabilities } : {}),
         ...(redactedDatabaseBackup ? { databaseBackup: redactedDatabaseBackup } : {}),
         ...(redactedWarnings ? { warnings: redactedWarnings } : {}),
         ...(devServer ? { devServer } : {}),
@@ -219,6 +232,7 @@ export function healthRoutes(
       deploymentMode: opts.deploymentMode,
       deploymentExposure: opts.deploymentExposure,
       authReady: opts.authReady,
+      ...(opts.authCapabilities ? { auth: opts.authCapabilities } : {}),
       bootstrapStatus,
       bootstrapInviteActive,
       features: {

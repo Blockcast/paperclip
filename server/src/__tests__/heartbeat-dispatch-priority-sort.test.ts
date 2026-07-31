@@ -1089,4 +1089,328 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       .then((rows) => rows[0] ?? null);
     expect(starvedRun?.status).not.toBe("queued");
   });
+
+  it("dispatches critical issue work before an aged issue-less run without starving routine issue work (BLO-19337)", async () => {
+    // Regression for BLO-18995: dispatchRank returned a flat `10` for any run
+    // without an issueId *above* the STARVATION_* aging escalation, so that
+    // entire class had no anti-starvation path at all. Every dependency-ready
+    // issue-bound run ranks `priorityRank * 2 + statusBonus` ∈ [0,9], so even a
+    // `low`-priority `todo` (rank 7) permanently outranked an arbitrarily old
+    // issue-less run. Rank 0 fixed that starvation but also put the entire aged
+    // webhook backlog ahead of fresh critical issue work. The bounded rank 2
+    // must preserve both sides: critical first, aged issue-less second, routine
+    // medium work third.
+    //
+    // The starved run here deliberately carries NO `reviewKind`/`taskKey`
+    // pr_review markers, so selectAgedPrReviewRunForFairDispatch cannot promote
+    // it. That isolates the aging fix: without it, nothing in the scheduler can
+    // rescue this run.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const criticalIssueId = randomUUID();
+    const freshIssueId = randomUUID();
+    const issuePrefix = `W${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "IssuelessStarvationTestCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "IssuelessStarvationTestAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    await db.insert(issues).values([
+      {
+        // Fresh, dependency-ready, critical todo => rank 1.
+        id: criticalIssueId,
+        companyId,
+        title: "Critical exact-head review",
+        status: "todo",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        // Fresh, dependency-ready, in_progress, medium priority => rank 4.
+        id: freshIssueId,
+        companyId,
+        title: "Fresh medium priority in-progress work",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+        startedAt: new Date(),
+      },
+    ]);
+
+    // Well past STARVATION_FULL_ESCALATION_MS (2h).
+    const starvedCreatedAt = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    const freshCreatedAt = new Date();
+
+    const starvedWakeId = randomUUID();
+    const starvedRunId = randomUUID();
+    const criticalWakeId = randomUUID();
+    const criticalRunId = randomUUID();
+    const freshWakeId = randomUUID();
+    const freshRunId = randomUUID();
+
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: starvedWakeId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_ready_for_review",
+        payload: {},
+        status: "queued",
+        runId: starvedRunId,
+        requestedAt: starvedCreatedAt,
+        updatedAt: starvedCreatedAt,
+      },
+      {
+        id: criticalWakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "heartbeat_timer",
+        payload: { issueId: criticalIssueId },
+        status: "queued",
+        runId: criticalRunId,
+        requestedAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
+      },
+      {
+        id: freshWakeId,
+        companyId,
+        agentId,
+        source: "heartbeat",
+        triggerDetail: "timer",
+        reason: "heartbeat_timer",
+        payload: { issueId: freshIssueId },
+        status: "queued",
+        runId: freshRunId,
+        requestedAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: starvedRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: starvedWakeId,
+        // No issueId, and no pr_review markers.
+        contextSnapshot: { wakeReason: "github_pr_ready_for_review" },
+        createdAt: starvedCreatedAt,
+        updatedAt: starvedCreatedAt,
+      },
+      {
+        id: criticalRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: criticalWakeId,
+        contextSnapshot: { issueId: criticalIssueId, wakeReason: "heartbeat_timer" },
+        createdAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
+      },
+      {
+        id: freshRunId,
+        companyId,
+        agentId,
+        invocationSource: "heartbeat",
+        triggerDetail: "timer",
+        status: "queued",
+        wakeupRequestId: freshWakeId,
+        contextSnapshot: { issueId: freshIssueId, wakeReason: "heartbeat_timer" },
+        createdAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
+      },
+    ]);
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, starvedRunId);
+
+    // REGRESSION GUARD: critical work keeps the emergency lane, while the aged
+    // issue-less run still advances ahead of routine issue work.
+    expect(dispatchedRunIds[0]).toBe(criticalRunId);
+    const starvedDispatchIdx = dispatchedRunIds.indexOf(starvedRunId);
+    expect(starvedDispatchIdx).toBeGreaterThan(0);
+    const freshDispatchIdx = dispatchedRunIds.indexOf(freshRunId);
+    if (freshDispatchIdx !== -1) {
+      expect(freshDispatchIdx).toBeGreaterThan(starvedDispatchIdx);
+    }
+
+    const starvedRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, starvedRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(starvedRun?.status).not.toBe("queued");
+  });
+
+  it("keeps a fresh issue-less run behind issue work (BLO-18995 does not invert normal order)", async () => {
+    // Guard the other side of the BLO-18995 change: the escalation must be an
+    // aging floor, not a blanket promotion. A *fresh* issue-less run still
+    // ranks 10 and must lose to dependency-ready issue work, otherwise every
+    // PR-review wake would preempt issue execution on arrival.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const freshIssueId = randomUUID();
+    const issuePrefix = `X${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "IssuelessFreshTestCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "IssuelessFreshTestAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    await db.insert(issues).values({
+      id: freshIssueId,
+      companyId,
+      title: "Fresh medium priority in-progress work",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      startedAt: new Date(),
+    });
+
+    // Both fresh: the issue-less run is a few minutes old, nowhere near the
+    // 2h floor, and carries no pr_review markers (so the 10-minute PR-review
+    // fairness valve cannot promote it either).
+    const issuelessCreatedAt = new Date(Date.now() - 3 * 60 * 1000);
+    const freshCreatedAt = new Date(Date.now() - 60 * 1000);
+
+    const issuelessWakeId = randomUUID();
+    const issuelessRunId = randomUUID();
+    const freshWakeId = randomUUID();
+    const freshRunId = randomUUID();
+
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: issuelessWakeId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_ready_for_review",
+        payload: {},
+        status: "queued",
+        runId: issuelessRunId,
+        requestedAt: issuelessCreatedAt,
+        updatedAt: issuelessCreatedAt,
+      },
+      {
+        id: freshWakeId,
+        companyId,
+        agentId,
+        source: "heartbeat",
+        triggerDetail: "timer",
+        reason: "heartbeat_timer",
+        payload: { issueId: freshIssueId },
+        status: "queued",
+        runId: freshRunId,
+        requestedAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: issuelessRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: issuelessWakeId,
+        contextSnapshot: { wakeReason: "github_pr_ready_for_review" },
+        createdAt: issuelessCreatedAt,
+        updatedAt: issuelessCreatedAt,
+      },
+      {
+        id: freshRunId,
+        companyId,
+        agentId,
+        invocationSource: "heartbeat",
+        triggerDetail: "timer",
+        status: "queued",
+        wakeupRequestId: freshWakeId,
+        contextSnapshot: { issueId: freshIssueId, wakeReason: "heartbeat_timer" },
+        createdAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
+      },
+    ]);
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, freshRunId);
+
+    expect(dispatchedRunIds[0]).toBe(freshRunId);
+  });
 });
