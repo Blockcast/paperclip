@@ -1000,30 +1000,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
   beforeEach(async () => {
     if (!db) return;
-    // Drain queued/running heartbeat runs before TRUNCATE so the scheduler
-    // isn't racing the cleanup (lifted from heartbeat-issue-liveness-escalation).
-    // The wake-driving test enqueues a real heartbeat run that runs in a
-    // fire-and-forget `void executeRun(...)` (see services/heartbeat.ts).
-    // Under load that background execution can outlive the test it was spawned
-    // in; if so, we force-finalize the row so the FK cascade in TRUNCATE isn't
-    // blocked on in-flight row locks. The 30s drain budget absorbs CI runner
-    // variance without sticking forever.
-    const drainDeadline = Date.now() + 30_000;
-    let idlePolls = 0;
-    while (Date.now() < drainDeadline) {
-      const runs = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns);
-      const hasActiveRun = runs.some((run) => run.status === "queued" || run.status === "running");
-      if (!hasActiveRun) {
-        idlePolls += 1;
-        if (idlePolls >= 3) break;
-      } else {
-        idlePolls = 0;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // These route tests default to skipQueuedRunDispatch, and several cases
+    // intentionally seed queued/running rows to exercise coalescing. Finalize
+    // test-owned rows directly so cleanup does not spend 30s waiting on
+    // heartbeat runs that will never dispatch in this suite.
     await db.execute(sql.raw(
       `UPDATE "heartbeat_runs" SET status='failed', finished_at=NOW() WHERE status IN ('queued','running')`,
     ));
