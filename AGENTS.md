@@ -152,13 +152,50 @@ When adding endpoints:
 - write activity log entries for mutations
 - return consistent HTTP errors (`400/401/403/404/409/422/500`)
 
-## 9. UI Expectations
+## 9. GitHub Access From Agent Workspaces
+
+Agent pods authenticate to GitHub as the `allyblockcast[bot]` GitHub App
+installation. The token is mounted at `/paperclip/.secrets/github-token/token`
+and injected by the `gh` wrapper (`scripts/gh-token-wrapper.sh`) on every
+invocation. It is deliberately **not** exported into the shell environment, so
+`$GH_TOKEN` is empty in your terminal even though `gh` is fully authenticated.
+
+**Never treat `permissions.push: false` as proof you lack write access.** Every
+GitHub repository payload — `GET /repos/{owner}/{repo}`, `search_repositories`,
+even `/installation/repositories` — carries a `permissions` object describing a
+*user's* role (`admin`/`maintain`/`push`/`pull`/`triage`). An App installation
+token has no user role, so GitHub returns **all-false for every repo**,
+including ones the installation can demonstrably write to. The field is
+structurally meaningless for our credential; reading it as an access check
+returns a false negative 100% of the time. `/installation/repositories` makes
+this obvious: it only lists repos the installation *can* access, and still
+reports `push: false` for all of them.
+
+Probe the actual write path before concluding you lack access, and before
+filing any access-escalation issue:
+
+```bash
+gh api /installation/repositories --paginate --jq '.repositories[].full_name' | grep <repo>
+git push origin HEAD:refs/heads/probe/<ticket>   # delete the branch afterwards
+```
+
+If the repo is in the installation list, you have access — a failure is a
+tooling bug, not a permissions gap. In particular, `git push` to a **private**
+repo failing with `remote: Invalid username or token` means git had *no*
+credential, not an insufficient one. Public repos hide this because they clone
+anonymously. The image wires `credential.https://github.com.helper` to the `gh`
+wrapper in `Dockerfile.runtime` to close that gap; do not "fix" a recurrence by
+running `gh auth setup-git`, which writes a `gh.real` helper that cannot read
+the token file. Widening an installation's repository selection is never the
+right remedy for these symptoms.
+
+## 10. UI Expectations
 
 - Keep routes and nav aligned with available API surface
 - Use company selection context for company-scoped pages
 - Surface failures clearly; do not silently ignore API errors
 
-## 10. Pull Request Requirements
+## 11. Pull Request Requirements
 
 When creating a pull request (via `gh pr create` or any other method), you **must** read and fill in every section of [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md). Do not craft ad-hoc PR bodies — use the template as the structure for your PR description. Required sections:
 
@@ -169,7 +206,7 @@ When creating a pull request (via `gh pr create` or any other method), you **mus
 - **Model Used** — the AI model that produced or assisted with the change (provider, exact model ID, context window, capabilities). Write "None — human-authored" if no AI was used.
 - **Checklist** — all items checked
 
-## 11. Definition of Done
+## 12. Definition of Done
 
 A change is done when all are true:
 
@@ -179,7 +216,7 @@ A change is done when all are true:
 4. Docs updated when behavior or commands change
 5. PR description follows the [PR template](.github/PULL_REQUEST_TEMPLATE.md) with all sections filled in (including Model Used)
 
-## 11. Fork-Specific: HenkDz/paperclip
+## 13. Fork-Specific: HenkDz/paperclip
 
 This is a fork of `paperclipai/paperclip` with QoL patches and an **external-only** Hermes adapter story on branch `feat/externalize-hermes-adapter` ([tree](https://github.com/HenkDz/paperclip/tree/feat/externalize-hermes-adapter)).
 
