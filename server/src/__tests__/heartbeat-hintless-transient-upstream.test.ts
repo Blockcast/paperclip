@@ -94,6 +94,7 @@ describe("isHintlessTransientUpstreamFault", () => {
     expect(isHintlessTransientUpstreamFault({ result: "ok", is_error: false })).toBe(false);
     // 500 is a real server bug, not a brownout — it must stay terminal.
     expect(isHintlessTransientUpstreamFault({ api_error_status: 500 })).toBe(false);
+    expect(isHintlessTransientUpstreamFault({ api_error_status: 500, error: "server_error" })).toBe(false);
     expect(isHintlessTransientUpstreamFault(null, { errorMessage: "TypeError: x is not a function" })).toBe(false);
   });
 

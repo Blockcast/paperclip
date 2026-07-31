@@ -3012,6 +3012,17 @@ function looksLikeTransientUpstreamText(value: unknown): boolean {
   return TRANSIENT_UPSTREAM_TEXT_PATTERNS.some((re) => re.test(value));
 }
 
+function normalizeHttpStatusCode(value: unknown): string | null {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim().length > 0
+        ? Number(value.trim())
+        : NaN;
+  if (!Number.isInteger(parsed) || parsed < 100 || parsed > 599) return null;
+  return String(parsed);
+}
+
 export function isHintlessTransientUpstreamFault(
   resultJson: Record<string, unknown> | null | undefined,
   opts?: { errorMessage?: string | null },
@@ -3020,11 +3031,14 @@ export function isHintlessTransientUpstreamFault(
   // `api_error_status`, while the per-attempt `api_retry` events that precede
   // an exhausted retry budget use `error_status` — the latter is the field the
   // BLO-18138 run actually carried, so matching only the former misses it.
+  let hasAuthoritativeStatus = false;
   for (const key of ["api_error_status", "error_status"] as const) {
-    const status = resultJson?.[key];
+    const status = normalizeHttpStatusCode(resultJson?.[key]);
     if (status == null) continue;
-    if (TRANSIENT_UPSTREAM_STATUS_CODES.has(String(status))) return true;
+    if (TRANSIENT_UPSTREAM_STATUS_CODES.has(status)) return true;
+    hasAuthoritativeStatus = true;
   }
+  if (hasAuthoritativeStatus) return false;
 
   if (resultJson) {
     for (const key of ["result", "message", "error", "summary"] as const) {
