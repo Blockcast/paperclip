@@ -51,6 +51,46 @@ const PRIORITY_RANK = new Map<string, number>(
 );
 
 /**
+ * Escalation thresholds in days of human silence, by priority (BLO-19130).
+ *
+ * Derived from the actual distribution of the Blockcast human queue on
+ * 2026-07-31 (n=237, measured on the human clock, not `updatedAt`):
+ *
+ * | older than | all | in_review | todo+backlog |
+ * |------------|-----|-----------|--------------|
+ * | 14d        | 152 |        61 |           83 |
+ * | 21d        | 107 |        50 |           50 |
+ * | 30d        |  73 |        37 |           29 |
+ * | 45d        |  36 |        15 |           14 |
+ * | 60d        |  15 |         9 |            5 |
+ * | 90d        |   2 |         0 |            1 |
+ *
+ * A flat 14d threshold — the original proposal — fires on **152 of 237**, and a
+ * flat 30d still fires on 73 of which **55 are `low`**. Either produces a report
+ * that is mostly low-priority noise, which is a report that gets muted. Zero
+ * `critical` issues are older than 30d, so severity and age are not correlated
+ * here and a single number cannot serve both ends of the queue.
+ *
+ * These values fire on 45 of 237 on day one (critical 2, high 15, medium 6,
+ * low 22) with the actionable list capped at {@link DEFAULT_MAX_ESCALATED}.
+ */
+export const DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY: Readonly<Record<string, number>> =
+  Object.freeze({
+    critical: 14,
+    high: 14,
+    medium: 30,
+    low: 45,
+    unset: 45,
+  });
+
+/**
+ * Attention budget for one weekly digest. The threshold decides what counts as
+ * overdue; this decides how much of it a human is asked to look at in one
+ * sitting. The remainder is reported as a count, never silently dropped.
+ */
+export const DEFAULT_MAX_ESCALATED = 15;
+
+/**
  * What the issue is actually waiting for. `in_review` is waiting on a reviewer
  * to look at finished work; `todo`/`backlog` is waiting on someone to begin.
  * They need different nudges, so the report never merges them.
@@ -126,12 +166,21 @@ export function isHumanGatedOpenIssue(issue: HumanGatedIssue): boolean {
 
 export type SelectAgedHumanGatedOptions = {
   now: Date;
-  /** Silence in days past which an issue is escalated. */
-  escalateAfterDays: number;
+  /**
+   * Silence in days past which an issue is escalated, per priority. A flat
+   * threshold does not work on the observed distribution: measured on the human
+   * clock, 14d fires on 152 of 237 issues and 55 of the 73 issues past 30d are
+   * `low`, so a flat rule produces a report that is ~75% low-priority — i.e. a
+   * report that gets muted. Weighting by priority puts the urgent tail at the
+   * top and lets the long `low` tail age longer before it shouts.
+   *
+   * Unknown priorities fall back to `unset`, else the largest configured value.
+   */
+  escalateAfterDaysByPriority: Readonly<Record<string, number>>;
   /**
    * Optional cap on how many issues the actionable list may contain, applied
-   * after the oldest-first sort. A report that names 120 issues is a report
-   * that gets muted, so the sweep escalates a bounded head and reports the
+   * after the oldest-first sort. A report that names 45 issues is a report that
+   * gets skimmed, so the sweep escalates a bounded head and reports the
    * remainder as a count. Omit for no cap.
    */
   maxEscalated?: number;
@@ -140,12 +189,12 @@ export type SelectAgedHumanGatedOptions = {
 export type HumanGatedAgeingReport = {
   /** Every open human-gated issue considered, oldest human-touch first. */
   scanned: AgedHumanGatedIssue[];
-  /** Issues past the threshold, oldest first, truncated to `maxEscalated`. */
+  /** Issues past their priority's threshold, oldest first, truncated to `maxEscalated`. */
   escalated: AgedHumanGatedIssue[];
-  /** How many issues were past the threshold but dropped by `maxEscalated`. */
+  /** How many issues were past threshold but dropped by `maxEscalated`. */
   escalatedOmitted: number;
   totalOverThreshold: number;
-  escalateAfterDays: number;
+  escalateAfterDaysByPriority: Readonly<Record<string, number>>;
   countsByWaitKind: Record<HumanGatedWaitKind, number>;
   countsByPriority: Record<string, number>;
 };
@@ -157,8 +206,26 @@ function comparePriority(a: string | null | undefined, b: string | null | undefi
 }
 
 /**
+ * The threshold that applies to one issue. Falls back to the most lenient
+ * configured threshold for an unrecognised priority, so a new priority value
+ * can never silently escalate the whole queue.
+ */
+export function escalateAfterDaysFor(
+  priority: string | null | undefined,
+  byPriority: Readonly<Record<string, number>>,
+): number {
+  const direct = byPriority[priority ?? "unset"];
+  if (typeof direct === "number") return direct;
+  const configured = Object.values(byPriority);
+  if (configured.length === 0) {
+    throw new Error("escalateAfterDaysByPriority must configure at least one priority");
+  }
+  return Math.max(...configured);
+}
+
+/**
  * Select and rank open human-gated issues whose human clock has been silent
- * past `escalateAfterDays`.
+ * past their priority's threshold.
  *
  * Selection is `assigneeUserId IS NOT NULL` and an open status. Ordering is
  * strictly oldest-human-touch first; ties break on priority then identifier so
@@ -168,7 +235,7 @@ export function selectAgedHumanGatedIssues(
   issues: HumanGatedIssue[],
   options: SelectAgedHumanGatedOptions,
 ): HumanGatedAgeingReport {
-  const { now, escalateAfterDays, maxEscalated } = options;
+  const { now, escalateAfterDaysByPriority, maxEscalated } = options;
 
   const scanned = issues
     .filter(isHumanGatedOpenIssue)
@@ -190,7 +257,11 @@ export function selectAgedHumanGatedIssues(
       return (a.identifier ?? a.id).localeCompare(b.identifier ?? b.id);
     });
 
-  const overThreshold = scanned.filter((issue) => issue.humanSilenceDays > escalateAfterDays);
+  const overThreshold = scanned.filter(
+    (issue) =>
+      issue.humanSilenceDays >
+      escalateAfterDaysFor(issue.priority, escalateAfterDaysByPriority),
+  );
   const escalated =
     typeof maxEscalated === "number" ? overThreshold.slice(0, maxEscalated) : overThreshold;
 
@@ -211,7 +282,7 @@ export function selectAgedHumanGatedIssues(
     escalated,
     escalatedOmitted: overThreshold.length - escalated.length,
     totalOverThreshold: overThreshold.length,
-    escalateAfterDays,
+    escalateAfterDaysByPriority,
     countsByWaitKind,
     countsByPriority,
   };
@@ -261,8 +332,16 @@ function formatIssueRef(issue: AgedHumanGatedIssue): string {
  * grouped by priority within each split.
  */
 export function formatHumanGatedAgeingSections(report: HumanGatedAgeingReport): string {
+  const thresholds = HUMAN_GATED_PRIORITY_ORDER.filter(
+    (priority) => typeof report.escalateAfterDaysByPriority[priority] === "number",
+  )
+    .map((priority) => `${priority} >${report.escalateAfterDaysByPriority[priority]}d`)
+    .join(", ");
+
   const lines: string[] = [
-    `### Human-gated work aged past ${report.escalateAfterDays}d of human silence (${report.totalOverThreshold})`,
+    `### Human-gated work past its human-silence threshold (${report.totalOverThreshold})`,
+    "",
+    `Thresholds: ${thresholds}. Clock is last human touch, not \`updatedAt\`.`,
   ];
 
   if (report.totalOverThreshold === 0) {
@@ -273,7 +352,7 @@ export function formatHumanGatedAgeingSections(report: HumanGatedAgeingReport): 
   if (report.escalatedOmitted > 0) {
     lines.push(
       "",
-      `Showing the ${report.escalated.length} oldest; ${report.escalatedOmitted} further issues are also past the threshold.`,
+      `Showing the ${report.escalated.length} oldest; ${report.escalatedOmitted} further issues are also past threshold.`,
     );
   }
 

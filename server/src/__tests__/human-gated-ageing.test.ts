@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY,
+  DEFAULT_MAX_ESCALATED,
+  escalateAfterDaysFor,
   classifyHumanGatedWait,
   formatHumanGatedAgeingSections,
   humanClockAt,
@@ -14,6 +17,11 @@ const NOW = new Date("2026-07-31T00:00:00.000Z");
 
 function daysAgo(days: number): string {
   return new Date(NOW.getTime() - days * 86_400_000).toISOString();
+}
+
+/** Same threshold for every priority — for tests that are not about weighting. */
+function flat(days: number): Record<string, number> {
+  return { critical: days, high: days, medium: days, low: days, unset: days };
 }
 
 /**
@@ -54,7 +62,7 @@ describe("human-gated selection", () => {
       "keep-blocked",
     ]);
 
-    const report = selectAgedHumanGatedIssues(rows, { now: NOW, escalateAfterDays: 0 });
+    const report = selectAgedHumanGatedIssues(rows, { now: NOW, escalateAfterDaysByPriority: flat(0) });
     expect(report.scanned.map((row) => row.id)).toHaveLength(3);
     expect(report.scanned.every((row) => Boolean(row.assigneeUserId))).toBe(true);
   });
@@ -66,7 +74,7 @@ describe("human-gated selection", () => {
         issue({ id: "newest", lastHumanTouchAt: daysAgo(2) }),
         issue({ id: "oldest", lastHumanTouchAt: daysAgo(64) }),
       ],
-      { now: NOW, escalateAfterDays: 0 },
+      { now: NOW, escalateAfterDaysByPriority: flat(0) },
     );
 
     expect(report.scanned.map((row) => row.id)).toEqual(["oldest", "middle", "newest"]);
@@ -94,7 +102,7 @@ describe("the escalation clock ignores agent-movable timestamps", () => {
 
     expect(humanSilenceDays(abandoned, NOW)).toBeCloseTo(64, 5);
 
-    const report = selectAgedHumanGatedIssues([abandoned], { now: NOW, escalateAfterDays: 30 });
+    const report = selectAgedHumanGatedIssues([abandoned], { now: NOW, escalateAfterDaysByPriority: flat(30) });
     expect(report.totalOverThreshold).toBe(1);
     expect(report.escalated[0]!.id).toBe("abandoned");
   });
@@ -109,7 +117,7 @@ describe("the escalation clock ignores agent-movable timestamps", () => {
     expect(humanClockAt(untouched).toISOString()).toBe(daysAgo(52));
     expect(humanSilenceDays(untouched, NOW)).toBeCloseTo(52, 5);
 
-    const report = selectAgedHumanGatedIssues([untouched], { now: NOW, escalateAfterDays: 30 });
+    const report = selectAgedHumanGatedIssues([untouched], { now: NOW, escalateAfterDaysByPriority: flat(30) });
     expect(report.escalated[0]!.neverTouchedByHuman).toBe(true);
   });
 
@@ -125,6 +133,77 @@ describe("the escalation clock ignores agent-movable timestamps", () => {
   });
 });
 
+describe("priority-weighted thresholds", () => {
+  it("applies a different threshold per priority", () => {
+    // All four have identical 20d silence; only those whose priority threshold
+    // is under 20 should fire.
+    const rows = [
+      issue({ id: "crit", priority: "critical", lastHumanTouchAt: daysAgo(20) }),
+      issue({ id: "high", priority: "high", lastHumanTouchAt: daysAgo(20) }),
+      issue({ id: "med", priority: "medium", lastHumanTouchAt: daysAgo(20) }),
+      issue({ id: "low", priority: "low", lastHumanTouchAt: daysAgo(20) }),
+    ];
+
+    const report = selectAgedHumanGatedIssues(rows, {
+      now: NOW,
+      escalateAfterDaysByPriority: DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY,
+    });
+
+    expect(report.escalated.map((row) => row.id).sort()).toEqual(["crit", "high"]);
+    expect(report.countsByPriority).toEqual({ critical: 1, high: 1 });
+  });
+
+  it("keeps the long low-priority tail quiet until it is genuinely old", () => {
+    // The distribution this module was built against: 55 of the 73 issues past
+    // 30d are `low`. A flat 30d rule would make the report 75% low-priority.
+    const lowAt35 = issue({ id: "low-35d", priority: "low", lastHumanTouchAt: daysAgo(35) });
+    const lowAt50 = issue({ id: "low-50d", priority: "low", lastHumanTouchAt: daysAgo(50) });
+
+    const weighted = selectAgedHumanGatedIssues([lowAt35, lowAt50], {
+      now: NOW,
+      escalateAfterDaysByPriority: DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY,
+    });
+    expect(weighted.escalated.map((row) => row.id)).toEqual(["low-50d"]);
+
+    // Guard against a regression back to a flat rule: under flat-30d both fire.
+    const flatRule = selectAgedHumanGatedIssues([lowAt35, lowAt50], {
+      now: NOW,
+      escalateAfterDaysByPriority: flat(30),
+    });
+    expect(flatRule.totalOverThreshold).toBe(2);
+  });
+
+  it("falls back to the most lenient threshold for an unrecognised priority", () => {
+    // A new priority value must never silently escalate the whole queue.
+    expect(escalateAfterDaysFor("critical", DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY)).toBe(14);
+    expect(escalateAfterDaysFor("low", DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY)).toBe(45);
+    expect(escalateAfterDaysFor("urgent-ish", DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY)).toBe(45);
+    expect(escalateAfterDaysFor(null, DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY)).toBe(45);
+
+    const report = selectAgedHumanGatedIssues(
+      [issue({ id: "odd", priority: "urgent-ish", lastHumanTouchAt: daysAgo(20) })],
+      { now: NOW, escalateAfterDaysByPriority: DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY },
+    );
+    expect(report.totalOverThreshold).toBe(0);
+  });
+
+  it("ships a default attention budget so an unbounded list cannot be published", () => {
+    expect(DEFAULT_MAX_ESCALATED).toBeLessThanOrEqual(20);
+    expect(DEFAULT_MAX_ESCALATED).toBeGreaterThan(0);
+  });
+
+  it("names its thresholds in the rendered report", () => {
+    const report = selectAgedHumanGatedIssues(
+      [issue({ id: "old", priority: "high", lastHumanTouchAt: daysAgo(65) })],
+      { now: NOW, escalateAfterDaysByPriority: DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY },
+    );
+    const rendered = formatHumanGatedAgeingSections(report);
+    expect(rendered).toContain("high >14d");
+    expect(rendered).toContain("low >45d");
+    expect(rendered).toContain("last human touch, not `updatedAt`");
+  });
+});
+
 describe("threshold and reporting", () => {
   it("uses a strict comparison so an issue exactly at the threshold does not fire", () => {
     const exactly = issue({ id: "exactly-30d", lastHumanTouchAt: daysAgo(30) });
@@ -132,7 +211,7 @@ describe("threshold and reporting", () => {
 
     const report = selectAgedHumanGatedIssues([exactly, justOver], {
       now: NOW,
-      escalateAfterDays: 30,
+      escalateAfterDaysByPriority: flat(30),
     });
     expect(report.escalated.map((row) => row.id)).toEqual(["just-over-30d"]);
   });
@@ -144,7 +223,7 @@ describe("threshold and reporting", () => {
 
     const report = selectAgedHumanGatedIssues(rows, {
       now: NOW,
-      escalateAfterDays: 30,
+      escalateAfterDaysByPriority: flat(30),
       maxEscalated: 10,
     });
 
@@ -171,7 +250,7 @@ describe("threshold and reporting", () => {
         issue({ id: "start-2", status: "backlog", lastHumanTouchAt: daysAgo(35) }),
         issue({ id: "flight-1", status: "blocked", lastHumanTouchAt: daysAgo(33) }),
       ],
-      { now: NOW, escalateAfterDays: 30 },
+      { now: NOW, escalateAfterDaysByPriority: flat(30) },
     );
 
     expect(report.countsByWaitKind).toEqual({
@@ -195,7 +274,7 @@ describe("threshold and reporting", () => {
         issue({ id: "crit-1", priority: "critical", lastHumanTouchAt: daysAgo(40) }),
         issue({ id: "high-1", priority: "high", lastHumanTouchAt: daysAgo(50) }),
       ],
-      { now: NOW, escalateAfterDays: 30 },
+      { now: NOW, escalateAfterDaysByPriority: flat(30) },
     );
 
     expect(report.countsByPriority).toEqual({ low: 1, critical: 1, high: 1 });
@@ -208,7 +287,7 @@ describe("threshold and reporting", () => {
   it("reports an empty queue without inventing rows", () => {
     const report = selectAgedHumanGatedIssues(
       [issue({ id: "fresh", lastHumanTouchAt: daysAgo(1) })],
-      { now: NOW, escalateAfterDays: 30 },
+      { now: NOW, escalateAfterDaysByPriority: flat(30) },
     );
     expect(report.totalOverThreshold).toBe(0);
     expect(formatHumanGatedAgeingSections(report)).toContain("- None.");
@@ -224,7 +303,7 @@ describe("threshold and reporting", () => {
         issue({ id: "d40", lastHumanTouchAt: daysAgo(40) }),
         issue({ id: "d95", lastHumanTouchAt: daysAgo(95) }),
       ],
-      { now: NOW, escalateAfterDays: 30 },
+      { now: NOW, escalateAfterDaysByPriority: flat(30) },
     );
 
     expect(humanGatedAgeHistogram(report.scanned)).toEqual([
