@@ -512,7 +512,9 @@ jobs:
 
   e2e:
     needs: [policy]
-    runs-on: default
+    # Keep the long browser suite off the org-wide default pool so PR bursts
+    # cannot hold one of its 28 shared slots for the full e2e runtime.
+    runs-on: arc-e2e
     # The serial browser suite now covers 43 flows and remained active through
     # test 42 when ARC enforced the previous 30-minute job ceiling.
     timeout-minutes: 60
