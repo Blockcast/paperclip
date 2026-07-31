@@ -51,9 +51,59 @@ Retrieve a single issue by ID or identifier, with all relations expanded.
 - `assignee` (expanded Agent, if set)
 - `labels` (expanded Label[])
 - `relations` (IssueRelation[] with expanded related issues)
-- `children` (sub-issue summaries: id, identifier, title, state, assignee)
 - `parent` (summary, if this is a sub-issue)
 - `comments` (Comment[], most recent first)
+
+> **No `children` field.** This document previously listed `children` here. No
+> implementation has ever returned it, and reading its absence as "this issue has
+> no sub-issues" has caused duplicate work to be authorized against epics that
+> did have children. Enumerate sub-issues with `list_issues` using `parentId`
+> (direct children) or `descendantOf` (whole subtree).
+
+See [Relational field hydration](#relational-field-hydration) for which
+relational fields are populated on list reads versus single-issue reads.
+
+---
+
+### Relational field hydration
+
+Relational fields are **not** uniformly populated. The list endpoint is a
+projection, not a smaller single-issue read, and the difference is silent: an
+absent key deserializes to `undefined`, which every `?? []` consumer turns into
+"this relation is empty". That coercion has already inverted real triage
+decisions, so the table below is the contract.
+
+| Field           | List (`GET /companies/{id}/issues`)                    | Single (`GET /issues/{id}`) |
+| --------------- | ------------------------------------------------------ | --------------------------- |
+| `blockedBy`     | absent unless `includeBlockedBy=true`; `[]` when on and genuinely unblocked | always hydrated, plus `terminalBlockers` |
+| `blocks`        | **never present** — no opt-in exists                   | always hydrated             |
+| `children`      | **never present** — use `parentId` / `descendantOf`    | **never present**           |
+| `blockerAttention` | present, but see the caveats below                  | present                     |
+
+**Absent is not empty.** Only treat a relation as empty when you asked for it
+and got `[]`. If you did not pass `includeBlockedBy=true`, a list row tells you
+nothing about whether the issue has blockers.
+
+**`blockerAttention` is not a summary of `blockedBy`.** It is a coarse triage
+ranking signal computed over a different graph, and it misleads in three
+distinct ways:
+
+1. It is computed **only for rows whose status is literally `blocked`**
+   (`listIssueBlockerAttentionMap`). Every other row receives an all-zero
+   default, so `unresolvedBlockerCount: 0` on a `todo` / `in_progress` /
+   `in_review` row means *not computed*, not *no blockers*.
+2. `unresolvedBlockerCount` counts explicit blocker edges **union open child
+   issues**, so it can legitimately exceed `blockedBy.length`.
+3. `sampleBlockerIdentifier` is drawn from the **transitive** closure and is
+   frequently an issue that never appears in `blockedBy`. Membership tests
+   against `blockedBy` will return false negatives.
+
+Additionally, an explicit blocker counts as unresolved unless its status is
+`done` — a **`cancelled`** blocker still counts.
+
+Use `blockerAttention` to decide *what to look at first*. To decide whether a
+specific issue is actually unblocked, read `blockedBy` — from
+`GET /issues/{id}`, or from the list with `includeBlockedBy=true`.
 
 ---
 

@@ -237,7 +237,7 @@
     "server/src/__tests__/mcp-http.test.ts": 42,
     "server/src/__tests__/metrics-ccrotate-capacity-deferred.test.ts": 16,
     "server/src/__tests__/metrics-service.test.ts": 140,
-    "server/src/__tests__/microsoft-rbac.test.ts": 18,
+    "server/src/__tests__/oidc-rbac.test.ts": 18,
     "server/src/__tests__/monthly-spend-service.test.ts": 108,
     "server/src/__tests__/normalize-agent-mention-token.test.ts": 11,
     "server/src/__tests__/openclaw-gateway-adapter.test.ts": 102,

@@ -78,49 +78,34 @@ env:
     # `/webflow`, `/tempo`, `/gbrain` accepts wholesale (the proxy validates
     # via `/api/cli-auth/me` and does not check company-membership). Verified
     # end-to-end against production 2026-05-20T20:14Z with synthetic users
-    # since cleaned up. Proper fix is OIDC + auth-proxy membership check
-    # (PCL-1879); this is the stopgap.
+    # since cleaned up. Production login is now Dex-only; keep this defense
+    # in depth alongside the full email/password disable.
     - name: PAPERCLIP_AUTH_DISABLE_SIGN_UP
       value: "true"
-    # Microsoft Entra OIDC for SSO. The Entra app `paperclip-prod`
-    # (appId 6c125fa4-deda-43c9-8475-f9c15d0f2976) is registered in the
-    # blockcast.net tenant with redirect URI
-    # https://paperclip.blockcast.net/api/auth/callback/microsoft. The
-    # better-auth instance reads these env vars and enables
-    # socialProviders.microsoft when all three are present
-    # (server/src/auth/better-auth.ts). 24-month client secret rotation:
-    # `az ad app credential reset --id 6c125fa4-... --display-name <name>`,
-    # then `kubectl create secret … --dry-run=client -o yaml | kubectl apply -f -`
-    # to replace the K8s Secret in-place.
-    - name: MICROSOFT_CLIENT_ID
+    - name: PAPERCLIP_AUTH_EMAIL_PASSWORD_ENABLED
+      value: "false"
+    # Dex OIDC for Google Workspace SSO. Dex fronts Google so the ID token
+    # includes Workspace `groups`; Paperclip uses those claims for company
+    # membership grants. Register the Dex static client `paperclip` with:
+    #   redirectURI: https://paperclip.blockcast.net/api/auth/oauth2/callback/dex
+    # and create this namespace Secret out-of-band:
+    #   kubectl -n paperclip create secret generic paperclip-dex-oidc \
+    #     --from-literal=PAPERCLIP_DEX_OIDC_CLIENT_SECRET='<dex static client secret>'
+    - name: PAPERCLIP_DEX_OIDC_ISSUER
+      value: https://dex.sfo12.bcast.id
+    - name: PAPERCLIP_DEX_OIDC_CLIENT_ID
+      value: paperclip
+    - name: PAPERCLIP_DEX_OIDC_CLIENT_SECRET
       valueFrom:
         secretKeyRef:
-          name: paperclip-microsoft-oidc
-          key: MICROSOFT_CLIENT_ID
-    - name: MICROSOFT_TENANT_ID
-      valueFrom:
-        secretKeyRef:
-          name: paperclip-microsoft-oidc
-          key: MICROSOFT_TENANT_ID
-    - name: MICROSOFT_CLIENT_SECRET
-      valueFrom:
-        secretKeyRef:
-          name: paperclip-microsoft-oidc
-          key: MICROSOFT_CLIENT_SECRET
-    # BLO-6295 piece D — daily Entra group reconciler. Loops every
-    # MICROSOFT_GROUP_RECONCILE_INTERVAL_HOURS (default 24h) over every
-    # paperclip user with a linked Microsoft account, queries Graph
-    # for current group memberships, and applies the same reconcile
-    # logic as the signin-time better-auth hook
-    # (server/src/auth/microsoft-rbac.ts): ssh-users → Blockcast
-    # operator membership, AdminAgents → pending admin-elevation
-    # approval (NOT auto-grant). Catches off-boarding from AdminAgents
-    # even when the affected user doesn't sign in. The paperclip-prod
-    # Entra app has Group.Read.All app-permission granted with admin
-    # consent so the client_credentials grant against Microsoft Graph
-    # works.
-    - name: MICROSOFT_GROUP_RECONCILE_ENABLED
-      value: "true"
+          name: paperclip-dex-oidc
+          key: PAPERCLIP_DEX_OIDC_CLIENT_SECRET
+    # Until a Paperclip-specific Workspace group exists, reuse the same
+    # operator group used for PVE/opkssh access. This only grants company
+    # operator membership; instance-admin elevation remains manual unless
+    # PAPERCLIP_DEX_ADMIN_GROUP is set.
+    - name: PAPERCLIP_DEX_OPERATOR_GROUP
+      value: infra-pve-sudo@blockcast.net
     - name: PAPERCLIP_DEPLOYMENT_MODE
       value: authenticated
     - name: PAPERCLIP_DEPLOYMENT_EXPOSURE

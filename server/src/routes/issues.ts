@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -2668,6 +2668,7 @@ export function issueRoutes(
     wakeups: Map<string, { agentId: string; wakeup: IssueWakeupRequest }>,
     genericFailureMessage: string = "failed to wake agent on issue update",
   ) {
+    const dispatched: Array<Promise<unknown>> = [];
     for (const { agentId, wakeup } of wakeups.values()) {
       const isBlockerResolvedWake = wakeup.reason === "issue_blockers_resolved";
       const dependentIssueId =
@@ -2680,7 +2681,7 @@ export function issueRoutes(
           : null;
       const promise = heartbeat.wakeup(agentId, wakeup);
       if (isBlockerResolvedWake) {
-        promise
+        dispatched.push(promise
           .then((result) => {
             const outcome = result ? "sent" : "skipped";
             incrementBlockerResolvedWakeMetric(outcome === "sent" ? "fast_path_sent" : "fast_path_skipped");
@@ -2695,11 +2696,12 @@ export function issueRoutes(
               { err, issueId, dependentIssueId, resolvedBlockerIssueId, agentId, outcome: "failed" },
               "blocker-resolved dependent wake failed",
             );
-          });
+          }));
       } else {
-        promise.catch((err) => logger.warn({ err, issueId, agentId }, genericFailureMessage));
+        dispatched.push(promise.catch((err) => logger.warn({ err, issueId, agentId }, genericFailureMessage)));
       }
     }
+    return Promise.all(dispatched).then(() => undefined);
   }
   const enqueueRecoveryActionWakeup = opts.recoveryActionEnqueueWakeup ?? heartbeat.wakeup;
   const feedback = feedbackService(db);
@@ -2781,6 +2783,26 @@ export function issueRoutes(
       .catch((err) => {
         logger.warn({ err, issueId: issue.id }, "task watchdog evaluation hook failed");
       });
+  }
+
+  async function hasIssueCommentAddedActivity(input: { issueId: string; commentId: string }) {
+    if (typeof (db as { select?: unknown }).select !== "function") return false;
+    try {
+      const [existing] = await db
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.action, "issue.comment_added"),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, input.issueId),
+          sql`${activityLog.details}->>'commentId' = ${input.commentId}`,
+        ))
+        .limit(1);
+      return Boolean(existing);
+    } catch (err) {
+      logger.warn({ err, issueId: input.issueId, commentId: input.commentId }, "failed to check issue comment activity");
+      return false;
+    }
   }
 
   async function sourceTrustForActorWrite(
@@ -3620,6 +3642,61 @@ export function issueRoutes(
 
   function isIssueMentionGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
     return decision !== true && decision.reason === "allow_issue_mention_grant";
+  }
+
+  // A recovery-handoff grant (BLO-18906) is comment-only by construction: it
+  // exists so the agent a recovery transfer took the issue from can still write
+  // its diagnosis down. It must never carry a state transition, so the comment
+  // route strips reopen/resume for it on EVERY status — unlike the mention-grant
+  // neutering below, which only covers closed issues. Recovery leaves the issue
+  // `blocked`, and on a blocked issue `reopen: true` would move it to `todo`.
+  function isRecoveryHandoffGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    return decision !== true && decision.reason === "allow_recovery_handoff_grant";
+  }
+
+  // The decision reason alone is not a sufficient test for "this caller is a
+  // recovery-transferred previous owner". assertAgentIssueCommentAllowed short-
+  // circuits with a bare `true` when isCurrentIssueExecutionRun matches (the
+  // BLO-18152 parity bypass), which discards the reason — so any caller that
+  // reached the route through a run lock rather than through decideIssueAccess
+  // would read as "not a handoff grant" and keep the transitions the grant is
+  // supposed to withhold. Resolve it from the recovery row instead, so the
+  // comment-only contract holds no matter which allow-path let the caller in.
+  //
+  // Mirrors the authorization-service predicate: active action, actor is
+  // `previousOwnerAgentId`, ownership moved to someone else, and that someone
+  // is still the assignee.
+  async function isRecoveryHandoffPreviousOwner(
+    req: Request,
+    issue: { id: string; companyId: string; assigneeAgentId: string | null },
+  ) {
+    if (req.actor.type !== "agent") return false;
+    const actorAgentId = req.actor.agentId;
+    if (!actorAgentId) return false;
+    if (req.actor.companyId !== issue.companyId) return false;
+    // The assignee is never a handoff caller, so the common path never pays for
+    // the lookup — and a lookup failure can never affect an ordinary assignee.
+    if (issue.assigneeAgentId === actorAgentId) return false;
+    let action: Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>>;
+    try {
+      action = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+    } catch (err) {
+      // Fail closed: if we cannot tell whether this non-assignee is a handoff
+      // caller, withhold the state transitions rather than granting them. The
+      // comment itself still lands — only reopen/resume and comment-triggered
+      // auto-approval are refused, which is the conservative direction for an
+      // authorization boundary.
+      logger.warn({
+        err,
+        issueId: issue.id,
+        companyId: issue.companyId,
+        actorAgentId,
+      }, "recovery handoff lookup failed; treating comment as comment-only");
+      return true;
+    }
+    if (!action || action.previousOwnerAgentId !== actorAgentId) return false;
+    if (!action.ownerAgentId || action.ownerAgentId === actorAgentId) return false;
+    return action.ownerAgentId === issue.assigneeAgentId;
   }
 
   async function filterIssuesForActor<T extends Parameters<typeof decideIssueAccess>[1]>(req: Request, rows: T[]) {
@@ -5670,6 +5747,7 @@ export function issueRoutes(
       activeRecoveryAction,
       linkedCases,
       inboxArchiveFields,
+      activeRun,
     ] = await Promise.all([
       resolveIssueProjectAndGoal(issue),
       svc.getAncestors(issue.id),
@@ -5684,6 +5762,13 @@ export function issueRoutes(
       recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
       listIssueLinkedCases(db, issue.companyId, issue.id),
       inboxArchiveFieldsPromise,
+      // BLO-19001: agents compare their own $PAPERCLIP_RUN_ID against the run
+      // holding this issue before touching a shared worktree. `executionRunId`
+      // alone cannot answer that — it can point at a run that already finished
+      // — so ship the run's lifecycle status with it. Same shape `inbox-lite`
+      // returns, and null (no run, or the recorded run is terminal) means the
+      // issue is not held.
+      svc.getActiveRun(issue),
     ]);
     const recoveryActionsByRelationIssue = await relationRecoveryActionMap(
       recoveryActionsSvc,
@@ -5712,6 +5797,7 @@ export function issueRoutes(
       ...inboxArchiveFields,
       goalId: goal?.id ?? issue.goalId,
       ancestors,
+      activeRun,
       ...(blockerAttention ? { blockerAttention } : {}),
       productivityReview,
       successfulRunHandoff: successfulRunHandoffStates.get(issue.id) ?? null,
@@ -10162,13 +10248,32 @@ export function issueRoutes(
       presentation: req.body.presentation,
       metadata: req.body.metadata,
     })) return;
-    const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
-    if (closedExecutionWorkspace) {
-      respondClosedIssueExecutionWorkspace(res, closedExecutionWorkspace);
-      return;
-    }
 
     const actor = getActorInfo(req);
+    let comment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
+    let idempotentReplay = false;
+    if (req.body.idempotencyKey) {
+      const existingComment = await svc.getCommentByIdempotencyKey(id, req.body.idempotencyKey, {
+        agentId: actor.agentId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      });
+      if (existingComment) {
+        idempotentReplay = true;
+        if (existingComment.idempotencyProcessedAt) {
+          res.status(200).json({ ...existingComment, deduplicated: true });
+          return;
+        }
+        comment = { ...existingComment, deduplicated: true };
+      }
+    }
+    if (!idempotentReplay) {
+      const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
+      if (closedExecutionWorkspace) {
+        respondClosedIssueExecutionWorkspace(res, closedExecutionWorkspace);
+        return;
+      }
+    }
+
     const reopenRequested = req.body.reopen === true;
     const resumeRequested = req.body.resume === true;
     const interruptRequested = req.body.interrupt === true;
@@ -10182,8 +10287,40 @@ export function issueRoutes(
       !reopenRequested &&
       !resumeRequested &&
       isIssueMentionGrantDecision(commentAccessDecision);
-    const effectiveReopenRequested = mentionGrantedPeerAgentCommentOnly ? false : reopenRequested;
-    const effectiveResumeRequested = mentionGrantedPeerAgentCommentOnly ? false : resumeRequested;
+    // Comment-only on every status, not just closed ones: recovery leaves the
+    // issue `blocked`, where an un-neutered `reopen` would transition it to
+    // `todo` — a status change the handoff grant must not confer (BLO-18906).
+    // Refuse explicitly rather than silently dropping the flag, and refuse here
+    // rather than deferring to assertAgentIssueMutationAllowed: that helper's
+    // isCurrentIssueExecutionRun bypass still matches the previous owner's stale
+    // execution lock, which would hand back the very transition recovery removed.
+    //
+    // Detect the handoff caller from the recovery row as well as from the
+    // decision reason. The reason is absent whenever assertAgentIssueComment-
+    // Allowed took its own current-execution-run short-circuit and returned a
+    // bare `true`, so a reason-only test would let exactly the stale-lock case
+    // this guard exists for slip past it.
+    const recoveryHandoffGrantedCommentOnly =
+      req.actor.type === "agent" &&
+      (isRecoveryHandoffGrantDecision(commentAccessDecision) ||
+        await isRecoveryHandoffPreviousOwner(req, issue));
+    if (recoveryHandoffGrantedCommentOnly && (reopenRequested || resumeRequested)) {
+      res.status(403).json({
+        error: "Recovery handoff grant is comment-only",
+        details: {
+          issueId: issue.id,
+          assigneeAgentId: issue.assigneeAgentId,
+          actorAgentId: req.actor.agentId,
+          reason: "allow_recovery_handoff_grant",
+          hint: "Post the handoff evidence as a plain comment; the recovery owner controls status.",
+        },
+      });
+      return;
+    }
+    const commentOnlyGrantedPeerAgent =
+      mentionGrantedPeerAgentCommentOnly || recoveryHandoffGrantedCommentOnly;
+    const effectiveReopenRequested = commentOnlyGrantedPeerAgent ? false : reopenRequested;
+    const effectiveResumeRequested = commentOnlyGrantedPeerAgent ? false : resumeRequested;
     if (
       isClosed &&
       req.actor.type === "agent" &&
@@ -10200,7 +10337,7 @@ export function issueRoutes(
     }
     const explicitMoveToTodoRequested = effectiveReopenRequested || effectiveResumeRequested === true;
     const scheduledRetryForHumanComment =
-      shouldHumanCommentResumeInProgressScheduledRetry({
+      !idempotentReplay && shouldHumanCommentResumeInProgressScheduledRetry({
         hasComment: true,
         issueStatus: issue.status,
         assigneeAgentId: issue.assigneeAgentId,
@@ -10220,6 +10357,7 @@ export function issueRoutes(
       actorId: actor.actorId,
     });
     const effectiveMoveToTodoRequested =
+      !idempotentReplay &&
       !assigneeSelfCommentOnTerminal &&
       (explicitMoveToTodoRequested ||
         shouldImplicitlyMoveCommentedIssueToTodo({
@@ -10233,12 +10371,18 @@ export function issueRoutes(
         }) ||
         shouldResumeInProgressScheduledRetry);
     const hasUnresolvedFirstClassBlockers =
-      isBlocked && effectiveMoveToTodoRequested
+      !idempotentReplay && isBlocked && effectiveMoveToTodoRequested
         ? (await svc.getDependencyReadiness(issue.id)).unresolvedBlockerCount > 0
         : false;
     if (resumeRequested === true && isBlocked && hasUnresolvedFirstClassBlockers) {
       res.status(409).json({ error: "Issue follow-up blocked by unresolved blockers" });
       return;
+    }
+    if (req.body.idempotencyKey && !idempotentReplay) {
+      if (effectiveMoveToTodoRequested) {
+        res.status(400).json({ error: "Idempotent comments cannot change issue state" });
+        return;
+      }
     }
     let reopened = false;
     let reopenFromStatus: string | null = null;
@@ -10247,7 +10391,6 @@ export function issueRoutes(
     let issueBeforeCommentDecision = issue;
     let commentDecisionStageWakeup: ReturnType<typeof buildExecutionStageWakeup> | null = null;
     const commentReferenceSummaryBefore = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-    let comment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
     let commentReferenceDiff: ReturnType<typeof issueReferencesSvc.diffIssueReferenceSummary> | null = null;
     const persistUserReplyBeforeBlockedReopen =
       actor.actorType === "user" &&
@@ -10395,8 +10538,23 @@ export function issueRoutes(
       const shouldAutoApproveReviewComment =
         currentIssue.status === "in_review" &&
         currentExecutionState?.status === "pending" &&
+        // A recovery-handoff caller is comment-only, so its comment must never
+        // be read as a review decision (BLO-18906). Without this, an approval-
+        // shaped comment from a previous owner who happens to still be named as
+        // the pending stage participant would transition the issue to `done` and
+        // insert an execution decision — a state mutation the grant does not
+        // confer, reached without ever passing an `issue:mutate` check.
+        // Deliberately NOT extended to `mentionGrantedPeerAgentCommentOnly`: a
+        // mentioned non-assignee reviewer approving its own stage is the
+        // established path this branch exists to serve.
+        !recoveryHandoffGrantedCommentOnly &&
         actorMatchesExecutionParticipant(actor, currentExecutionState.currentParticipant ?? null) &&
         isApprovalReviewComment(req.body.body);
+
+      if (req.body.idempotencyKey && shouldAutoApproveReviewComment) {
+        res.status(400).json({ error: "Idempotent comments cannot approve review stages" });
+        return;
+      }
 
       // Persist the comment and the auto-approval state transition atomically when both apply.
       // Without a single transaction, a later status-update error would leave an orphan comment.
@@ -10521,6 +10679,7 @@ export function issueRoutes(
           authorType: req.body.authorType ?? (actor.actorType === "agent" ? "agent" : "user"),
           presentation: req.body.presentation ?? null,
           metadata: req.body.metadata ?? null,
+          idempotencyKey: req.body.idempotencyKey ?? null,
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
         });
       }
@@ -10528,6 +10687,14 @@ export function issueRoutes(
 
     if (!comment) {
       throw new Error("Issue comment was not persisted");
+    }
+
+    if ("deduplicated" in comment && comment.deduplicated) {
+      idempotentReplay = true;
+      if (comment.idempotencyProcessedAt) {
+        res.status(200).json(comment);
+        return;
+      }
     }
 
     if (commentReferenceDiff === null) {
@@ -10544,47 +10711,52 @@ export function issueRoutes(
         logger.warn({ err, runId: actor.runId }, "failed to clear detached run warning after issue comment"));
     }
 
-    await logActivity(db, {
-      companyId: currentIssue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      agentApiKeyId: actor.agentApiKeyId,
-      action: "issue.comment_added",
-      entityType: "issue",
-      entityId: currentIssue.id,
-      details: {
-        commentId: comment.id,
-        bodySnippet: comment.body.slice(0, 120),
-        identifier: currentIssue.identifier,
-        issueTitle: currentIssue.title,
-        ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
-        ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
-        ...(scheduledRetrySupersededByComment
-          ? {
-              scheduledRetrySupersededByComment: true,
-              scheduledRetryRunId: scheduledRetryForHumanComment?.runId ?? null,
-              ...(cancelledScheduledRetryRunId ? { cancelledScheduledRetryRunId } : {}),
-            }
-          : {}),
-        ...(interruptedRunId ? { interruptedRunId } : {}),
-        ...summarizeIssueReferenceActivityDetails({
-          addedReferencedIssues: (commentReferenceDiff?.addedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
-          removedReferencedIssues: (commentReferenceDiff?.removedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
-          currentReferencedIssues: (commentReferenceDiff?.currentReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
-        }),
-      },
-      // Full body + author ride on the emitted issue.comment.created plugin
-      // event only (not the persisted activity_log row, which keeps the
-      // bodySnippet) so the Linear comment bridge can mirror Paperclip
-      // comments. The bridge handler reads payload.body / payload.authorName.
-      pluginEventPayloadExtra: {
-        issueId: currentIssue.id,
-        body: comment.body,
-        authorName: await resolveCommentAuthorName(actor),
-      },
-    });
+    const commentAddedActivityAlreadyLogged = idempotentReplay
+      ? await hasIssueCommentAddedActivity({ issueId: currentIssue.id, commentId: comment.id })
+      : false;
+    if (!commentAddedActivityAlreadyLogged) {
+      await logActivity(db, {
+        companyId: currentIssue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: currentIssue.id,
+        details: {
+          commentId: comment.id,
+          bodySnippet: comment.body.slice(0, 120),
+          identifier: currentIssue.identifier,
+          issueTitle: currentIssue.title,
+          ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+          ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
+          ...(scheduledRetrySupersededByComment
+            ? {
+                scheduledRetrySupersededByComment: true,
+                scheduledRetryRunId: scheduledRetryForHumanComment?.runId ?? null,
+                ...(cancelledScheduledRetryRunId ? { cancelledScheduledRetryRunId } : {}),
+              }
+            : {}),
+          ...(interruptedRunId ? { interruptedRunId } : {}),
+          ...summarizeIssueReferenceActivityDetails({
+            addedReferencedIssues: (commentReferenceDiff?.addedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+            removedReferencedIssues: (commentReferenceDiff?.removedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+            currentReferencedIssues: (commentReferenceDiff?.currentReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+          }),
+        },
+        // Full body + author ride on the emitted issue.comment.created plugin
+        // event only (not the persisted activity_log row, which keeps the
+        // bodySnippet) so the Linear comment bridge can mirror Paperclip
+        // comments. The bridge handler reads payload.body / payload.authorName.
+        pluginEventPayloadExtra: {
+          issueId: currentIssue.id,
+          body: comment.body,
+          authorName: await resolveCommentAuthorName(actor),
+        },
+      });
+    }
 
     const expiredInteractions = await issueThreadInteractionService(db).expireRequestConfirmationsSupersededByComment(
       currentIssue,
@@ -10612,7 +10784,7 @@ export function issueRoutes(
     });
 
     // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.
-    void (async () => {
+    await (async () => {
       type WakeupRequest = NonNullable<Parameters<typeof heartbeat.wakeup>[1]>;
       const wakeups = new Map<string, { agentId: string; wakeup: WakeupRequest }>();
       const addWakeup = (agentId: string, wakeup: WakeupRequest) => {
@@ -10697,6 +10869,7 @@ export function issueRoutes(
             },
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
+            idempotencyKey: `issue_comment:${comment.id}:reopen:${assigneeId}`,
             contextSnapshot: {
               issueId: currentIssue.id,
               taskId: currentIssue.id,
@@ -10723,6 +10896,7 @@ export function issueRoutes(
             },
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
+            idempotencyKey: `issue_comment:${comment.id}:assignee:${assigneeId}`,
             contextSnapshot: {
               issueId: currentIssue.id,
               taskId: currentIssue.id,
@@ -10739,7 +10913,7 @@ export function issueRoutes(
 
       let mentionedIds: string[] = [];
       try {
-        mentionedIds = await svc.findMentionedAgents(issue.companyId, req.body.body);
+        mentionedIds = await svc.findMentionedAgents(issue.companyId, comment.body);
       } catch (err) {
         logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
       }
@@ -10753,6 +10927,7 @@ export function issueRoutes(
           payload: { issueId: id, commentId: comment.id },
           requestedByActorType: actor.actorType,
           requestedByActorId: actor.actorId,
+          idempotencyKey: `issue_comment:${comment.id}:mention:${mentionedId}`,
           contextSnapshot: {
             issueId: id,
             taskId: id,
@@ -10799,6 +10974,7 @@ export function issueRoutes(
             },
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
+            idempotencyKey: `issue_comment:${comment.id}:children_completed:${parent.id}`,
             contextSnapshot: {
               issueId: parent.id,
               taskId: parent.id,
@@ -10813,11 +10989,14 @@ export function issueRoutes(
         }
       }
 
-      dispatchIssueWakeups(currentIssue.id, wakeups, "failed to wake agent on issue comment");
+      await dispatchIssueWakeups(currentIssue.id, wakeups, "failed to wake agent on issue comment");
     })();
 
     await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
-    res.status(201).json(comment);
+    if (req.body.idempotencyKey) {
+      await svc.markCommentIdempotencyProcessed(comment.id);
+    }
+    res.status(idempotentReplay ? 200 : 201).json(comment);
   });
 
   router.post("/issues/:id/feedback-votes", validate(upsertIssueFeedbackVoteSchema), async (req, res) => {

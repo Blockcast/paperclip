@@ -37,7 +37,10 @@ import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
-import { issueTreeControlService } from "../issue-tree-control.js";
+import {
+  isVerifiedIssueTreeControlInteractionWake,
+  issueTreeControlService,
+} from "../issue-tree-control.js";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
@@ -50,7 +53,10 @@ import {
   buildIssueBlockersResolvedWakeIdempotencyKey,
   findExistingIssueBlockersResolvedWakeForAnyKey,
 } from "../issue-dependency-wakeups.js";
-import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
+import {
+  evaluateAgentInvokability,
+  evaluateAgentInvokabilityFromDb,
+} from "../agent-invokability.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
@@ -88,6 +94,18 @@ export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
+// BLO-18995: how long an issue execution lock may be held by a run that has
+// not yet been claimed (status still `queued`/`scheduled_retry`, startedAt
+// null) before sweepStaleIssueLocks treats it as stale and clears it.
+//
+// Chosen well above any legitimate queue wait so this never races the
+// dispatcher: a queued run is forced to the front of its agent's queue once it
+// passes the 2h STARVATION_FULL_ESCALATION_MS floor in heartbeat.ts, so 6h
+// leaves several hours of drain headroom past that escalation even for a
+// heavily backlogged agent. Clearing the lock does not cancel or deprioritize
+// the run — it only stops subsequent wakes for the issue from being parked
+// behind a holder that may never start.
+export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 // BLO-7113: re-fire suppression for `stale_active_run_evaluation` wrappers.
 // When the underlying `runs.status='running'` row is the canonical
@@ -249,6 +267,12 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+function normalizeAgentNameKey(value: string | null | undefined) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  return normalized.length > 0 ? normalized : null;
+}
+
 // `extractAgentMcpKeys` reads the adapter_config.mcpServers map (set by
 // adapter-specific configs like claude_k8s) and returns the sorted list of
 // MCP names. Used in the recovery prompt so the recovery agent can see at
@@ -340,6 +364,28 @@ function isNonRetryableTerminalRun(latestRun: LatestIssueRun) {
   }
   const errorCode = readNonEmptyString(latestRun.errorCode);
   return Boolean(errorCode && NON_RETRYABLE_RUN_ERROR_CODES.has(errorCode));
+}
+
+// BLO-18860: `issue_checkout_adopted` is a HANDOVER marker, not a failure.
+// `adoptStaleCheckoutRun`/`adoptUnownedCheckoutRun` (services/issues.ts) cancel
+// an issue's older context runs when a *live* run of the same assignee writes to
+// that issue, and deliberately keep the adopting run alive (`keepRunId`). The
+// cancellation is bookkeeping about the run that lost the checkout; it says
+// nothing about the issue's health, so it must never be the evidence that
+// escalates the issue away from the agent whose write produced it. Observed live
+// on BLO-18237 (2026-07-30): CTO — the assignee — PATCHed a stale issue at
+// 02:40:42Z (200 OK, adoption), and 25s later the resulting cancellation was
+// classified as a stranded-work failure and the issue was reassigned CTO → CEO
+// and flipped to `blocked`, taking CTO's write access with it.
+const CHECKOUT_ADOPTED_RUN_ERROR_CODE = "issue_checkout_adopted";
+
+function isCheckoutAdoptionCancelledRun(
+  latestRun: LatestIssueRun,
+): latestRun is NonNullable<LatestIssueRun> {
+  return (
+    latestRun?.status === "cancelled" &&
+    readNonEmptyString(latestRun.errorCode) === CHECKOUT_ADOPTED_RUN_ERROR_CODE
+  );
 }
 
 function buildNonRetryableEscalationComment(input: {
@@ -953,20 +999,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return (await evaluateAgentInvokabilityFromDb(db, agent)).invokable;
   }
 
+  // Column set behind `LatestIssueRun`. Shared by every helper that produces
+  // run evidence for the recovery classifiers so the shapes cannot drift apart.
+  const LATEST_ISSUE_RUN_COLUMNS = {
+    id: heartbeatRuns.id,
+    agentId: heartbeatRuns.agentId,
+    status: heartbeatRuns.status,
+    error: heartbeatRuns.error,
+    errorCode: heartbeatRuns.errorCode,
+    contextSnapshot: heartbeatRuns.contextSnapshot,
+    livenessState: heartbeatRuns.livenessState,
+    resultJson: heartbeatRuns.resultJson,
+    usageJson: heartbeatRuns.usageJson,
+    createdAt: heartbeatRuns.createdAt,
+  } as const;
+
   async function getLatestIssueRun(companyId: string, issueId: string): Promise<LatestIssueRun> {
     return db
-      .select({
-        id: heartbeatRuns.id,
-        agentId: heartbeatRuns.agentId,
-        status: heartbeatRuns.status,
-        error: heartbeatRuns.error,
-        errorCode: heartbeatRuns.errorCode,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
-        livenessState: heartbeatRuns.livenessState,
-        resultJson: heartbeatRuns.resultJson,
-        usageJson: heartbeatRuns.usageJson,
-        createdAt: heartbeatRuns.createdAt,
-      })
+      .select(LATEST_ISSUE_RUN_COLUMNS)
       .from(heartbeatRuns)
       .where(
         and(
@@ -975,6 +1025,29 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         ),
       )
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  // BLO-18860: the run that took over `adoptedRun`'s checkout — i.e. the run the
+  // issue's execution lock now points at. `getLatestIssueRun` cannot find it:
+  // that query matches on `contextSnapshot ->> 'issueId'`, and the hazardous
+  // adoption is precisely an agent touching a *stale other* issue from a run
+  // scoped to a different issue, so the adopting run carries someone else's
+  // issueId (or none). Returns null when the lock no longer names a different
+  // run, in which case there is no successor evidence to judge the issue on.
+  async function getCheckoutAdoptingRun(
+    issue: Pick<typeof issues.$inferSelect, "companyId" | "executionRunId" | "checkoutRunId">,
+    adoptedRun: NonNullable<LatestIssueRun>,
+  ): Promise<LatestIssueRun> {
+    const adoptingRunId = issue.executionRunId ?? issue.checkoutRunId;
+    if (!adoptingRunId || adoptingRunId === adoptedRun.id) return null;
+    return db
+      .select(LATEST_ISSUE_RUN_COLUMNS)
+      .from(heartbeatRuns)
+      .where(
+        and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, adoptingRunId)),
+      )
       .limit(1)
       .then((rows) => rows[0] ?? null);
   }
@@ -4170,6 +4243,45 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows.map((row) => row.blockerIssueId));
   }
 
+  async function findCycleFormingBlockerIssueIds(
+    companyId: string,
+    issueId: string,
+    blockerIssueIds: string[],
+  ) {
+    const candidates = new Set(blockerIssueIds);
+    const cycleForming = new Set<string>();
+    if (candidates.size === 0) return cycleForming;
+
+    const rows = await db
+      .select({
+        blockerIssueId: issueRelations.issueId,
+        blockedIssueId: issueRelations.relatedIssueId,
+      })
+      .from(issueRelations)
+      .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.type, "blocks")));
+
+    const adjacency = new Map<string, string[]>();
+    for (const row of rows) {
+      const blocked = adjacency.get(row.blockerIssueId) ?? [];
+      blocked.push(row.blockedIssueId);
+      adjacency.set(row.blockerIssueId, blocked);
+    }
+
+    const queue = [...(adjacency.get(issueId) ?? [])];
+    const visited = new Set<string>([issueId]);
+    while (queue.length > 0 && cycleForming.size < candidates.size) {
+      const current = queue.shift()!;
+      if (candidates.has(current)) {
+        cycleForming.add(current);
+      }
+      if (visited.has(current)) continue;
+      visited.add(current);
+      queue.push(...(adjacency.get(current) ?? []));
+    }
+
+    return cycleForming;
+  }
+
   async function unresolvedBlockerHumanDecisionEscalationState(companyId: string, issueId: string) {
     const blockerRows = await db
       .select({
@@ -4263,15 +4375,70 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           notInArray(issues.status, ["done", "cancelled"]),
         ),
       );
-    const blockedByIssueIds = [
-      ...new Set([...existingBlockers.map((row) => row.id), ...openChildren.map((row) => row.id)]),
-    ];
-    if (blockedByIssueIds.length === 0) return null;
+    const blockerRowsById = new Map<string, { id: string; identifier: string | null; source: string }>();
+    for (const row of existingBlockers) {
+      blockerRowsById.set(row.id, { ...row, source: "existing_unresolved_blocker" });
+    }
+    for (const row of openChildren) {
+      if (!blockerRowsById.has(row.id)) {
+        blockerRowsById.set(row.id, { ...row, source: "open_child" });
+      }
+    }
 
-    const updated = await issuesSvc.update(issue.id, { status: "blocked", blockedByIssueIds });
+    let blockedByIssueIds = [...blockerRowsById.keys()];
+    if (blockedByIssueIds.length === 0) return null;
+    const cycleFormingBlockerIds = await findCycleFormingBlockerIssueIds(
+      issue.companyId,
+      issue.id,
+      blockedByIssueIds,
+    );
+    if (cycleFormingBlockerIds.size > 0) {
+      const skippedBlockers = [...cycleFormingBlockerIds]
+        .map((id) => blockerRowsById.get(id))
+        .filter((row): row is { id: string; identifier: string | null; source: string } => Boolean(row));
+      logger.warn(
+        {
+          companyId: issue.companyId,
+          issueId: issue.id,
+          identifier: issue.identifier,
+          skippedBlockerIssueIds: skippedBlockers.map((row) => row.id),
+          skippedBlockerIdentifiers: skippedBlockers.map((row) => row.identifier).filter(Boolean),
+          skippedBlockerSources: skippedBlockers.map((row) => ({ id: row.id, source: row.source })),
+        },
+        "skipping cycle-forming review-wait blocker relations",
+      );
+      blockedByIssueIds = blockedByIssueIds.filter((id) => !cycleFormingBlockerIds.has(id));
+      if (blockedByIssueIds.length === 0) return null;
+    }
+
+    // The reachability check above and this write are not atomic: another relation
+    // update can add a path from `issue` to one of these blockers between the read and
+    // this write. The issue service re-validates on write and throws in that case -
+    // catch it here so one race falls through to the caller's existing no-dependency
+    // `in_review` park instead of aborting the whole periodic recovery sweep.
+    let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
+    try {
+      updated = await issuesSvc.update(issue.id, { status: "blocked", blockedByIssueIds });
+    } catch (error) {
+      if (!isBlockingRelationCycleError(error)) throw error;
+      logger.warn(
+        {
+          companyId: issue.companyId,
+          issueId: issue.id,
+          identifier: issue.identifier,
+          blockedByIssueIds,
+        },
+        "review-wait blocker write raced a concurrent relation update and formed a cycle; parking without dependency",
+      );
+      return null;
+    }
     if (!updated) return null;
 
-    const waitingOn = formatIssueLinksForComment([...openChildren, ...existingBlockers]);
+    const waitingOn = formatIssueLinksForComment(
+      blockedByIssueIds
+        .map((id) => blockerRowsById.get(id))
+        .filter((row): row is { id: string; identifier: string | null; source: string } => Boolean(row)),
+    );
     await issuesSvc.addComment(
       issue.id,
       `This task is waiting on ${waitingOn} to finish. ` +
@@ -4433,26 +4600,53 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           missingDisposition: input.successfulRunHandoffEvidence.missingDisposition,
         });
       }
+      // BLO-18860: a recovery escalation that moves the issue to a NEW owner is
+      // a transfer of write access away from the previous assignee — after it,
+      // that agent's `allow_self` grant is gone and its next PATCH/comment on
+      // the issue 403s. Make the transfer legible in the issue history (naming
+      // the recovery action AND the cause) instead of only in
+      // `activeRecoveryAction`, so the previous owner and any reader can see
+      // who owns it now and why. `fresh` was read before the status/assignee
+      // update below, so its `assigneeAgentId` is the pre-transfer owner.
+      const reassignsAssignee = Boolean(
+        action.ownerAgentId && action.ownerAgentId !== fresh.assigneeAgentId,
+      );
+      // Stable dedup key for the transfer announcement: one comment per
+      // (recovery action, new owner), so a repeated escalation to the SAME
+      // owner stays silent while a transfer to a new owner is always announced.
+      const reassignmentMarker = `Reassigned by recovery action \`${action.id}\` to owner \`${action.ownerAgentId}\``;
       const recoveryLine = action.ownerAgentId
         ? [
           "",
-          `- Recovery action: \`${action.id}\``,
+          `- Recovery action: \`${action.id}\` (cause \`${recoveryCause}\`, attempt ${action.attemptCount})`,
           `- Recovery owner: ${agentUiLink(recoveryOwner, prefix)}`,
+          ...(reassignsAssignee
+            ? [
+              `- ${reassignmentMarker}: taken over from ${agentUiLink(sourceAssignee, prefix)}, which can no longer PATCH or comment on this issue as its assignee.`,
+            ]
+            : []),
           "- Next action: the recovery owner should restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
         ].join("\n")
         : [
           "",
-          `- Recovery action: \`${action.id}\``,
+          `- Recovery action: \`${action.id}\` (cause \`${recoveryCause}\`, attempt ${action.attemptCount})`,
           "- Recovery owner: board escalation, because Paperclip could not find an invokable manager, creator, or executive owner with budget available.",
           "- Next action: a board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
         ].join("\n");
 
+      // A later attempt normally stays silent (one comment per action), but a
+      // reassignment on that attempt must still be announced. The notice path
+      // keeps its own metadata-based dedup, so leave it on the original gate.
+      const announcesReassignment = reassignsAssignee && !notice;
       const shouldPostEscalationComment =
         action.attemptCount === 1 ||
         recoveryCause === "workspace_validation_failed" ||
-        recoveryCause === "configuration_incomplete";
+        recoveryCause === "configuration_incomplete" ||
+        announcesReassignment;
       if (shouldPostEscalationComment) {
-        const escalationCommentMarker = `Recovery action: \`${action.id}\``;
+        const escalationCommentMarker = announcesReassignment
+          ? reassignmentMarker
+          : `Recovery action: \`${action.id}\``;
         const hasEscalationComment = await db
           .select({ id: issueComments.id, body: issueComments.body, metadata: issueComments.metadata })
           .from(issueComments)
@@ -4885,6 +5079,48 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      // Set when this issue's newest run is a handover marker whose successor
+      // can no longer be identified. Distinguishes "adopted, then the lock was
+      // cleaned up" from "this issue genuinely has no run history at all" —
+      // the no-run/no-lock guard below must skip only the latter.
+      let adoptionHandoverLostSuccessor = false;
+      // BLO-18860: never judge an issue on a checkout-adoption cancellation.
+      // The adopting run is by construction the assignee's own *live* run, so
+      // this issue has continuity, not a lost execution path — but the
+      // `hasActiveExecutionPath` check above cannot see that run (it matches on
+      // `contextSnapshot ->> 'issueId'`, and the adopting run is scoped to
+      // whichever issue its own dispatch was for). Left unhandled, the handover
+      // marker is the newest run row for this issue, reads as
+      // terminal-unsuccessful, and escalates the issue away from the agent that
+      // had just written to it. Resolve the evidence to the adopting run
+      // instead: live same-assignee run → continuity, otherwise judge the issue
+      // on that run's real outcome so no escalation ever cites
+      // `issue_checkout_adopted` as its cause.
+      if (isCheckoutAdoptionCancelledRun(latestRun)) {
+        const adoptingRun = await getCheckoutAdoptingRun(issue, latestRun);
+        // Compare against the assignee, not `agentId`: adoption is only ever
+        // performed by the assignee's own run (`adoptStaleCheckoutRun` requires
+        // `assigneeAgentId = actor`), and on an `in_review` issue `agentId` is
+        // the review participant instead.
+        if (
+          adoptingRun &&
+          adoptingRun.agentId === issue.assigneeAgentId &&
+          !isTerminalIssueRun(adoptingRun)
+        ) {
+          result.skipped += 1;
+          continue;
+        }
+        // No successor run resolvable: the adopter went terminal and
+        // `clearCheckoutRunIfTerminal` (services/issues.ts) nulled BOTH lock
+        // columns, so `getCheckoutAdoptingRun` has no id left to look up. That
+        // is the ordinary cleanup sequence, not an anomaly. Record it — the
+        // handover marker stays the newest run scoped to this issue forever, so
+        // without this flag the no-run/no-lock guard below would skip the issue
+        // on this sweep and on every sweep after it, stranding for good an
+        // issue whose only crime was being adopted once.
+        adoptionHandoverLostSuccessor = !adoptingRun;
+        latestRun = adoptingRun;
+      }
       if (latestRun?.status === "succeeded" && await hasPersistedDurableWaitPath(issue)) {
         result.skipped += 1;
         continue;
@@ -5340,7 +5576,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
-      if (!latestRun && !issue.checkoutRunId && !issue.executionRunId) {
+      // No run evidence and no lock: nothing to recover from. A lost-successor
+      // handover is the exception — there the absence of both is the *result*
+      // of normal adoption cleanup, and the issue still needs a live path, so
+      // let it fall through to the continuation re-dispatch at the end.
+      if (
+        !latestRun &&
+        !issue.checkoutRunId &&
+        !issue.executionRunId &&
+        !adoptionHandoverLostSuccessor
+      ) {
         result.skipped += 1;
         continue;
       }
@@ -6381,6 +6626,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         },
         "skipping cycle-forming liveness escalation blocker relation",
       );
+      if (blockerIds.length === 0) {
+        // No pre-existing blocker to fall back to. Forcing `blocked` here
+        // would strand the issue with an empty blockedByIssueIds set --
+        // blocked, but with no dependency edge to ever unblock it. Leave
+        // the issue's current status untouched so its existing continuation
+        // path (e.g. the same liveness finding re-triggering next sweep)
+        // keeps working, and persist nothing that didn't actually happen.
+        return input.issue;
+      }
       persistedBlockerIds = blockerIds;
       updated = isAlreadyBlocked
         ? input.issue
@@ -7126,8 +7380,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .select({
         id: issues.id,
         companyId: issues.companyId,
+        assigneeAgentId: issues.assigneeAgentId,
+        responsibleUserId: issues.responsibleUserId,
         checkoutRunId: issues.checkoutRunId,
         executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
       })
       .from(issues)
       .where(
@@ -7144,49 +7401,332 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const runRows =
       referencedRunIds.length > 0
         ? await db
-            .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+            .select({
+              id: heartbeatRuns.id,
+              status: heartbeatRuns.status,
+              scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+            })
             .from(heartbeatRuns)
             .where(inArray(heartbeatRuns.id, referencedRunIds))
         : [];
-    const runStatusById = new Map<string, string>();
-    for (const row of runRows) runStatusById.set(row.id, row.status);
+    const runById = new Map<string, { status: string; scheduledRetryAt: Date | null }>();
+    for (const row of runRows) runById.set(row.id, row);
 
     const isCleanable = (runId: string | null) => {
       if (!runId) return true;
-      const status = runStatusById.get(runId);
-      if (!status) return true; // missing run row → no real claim
-      return TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);
+      const run = runById.get(runId);
+      if (!run) return true; // missing run row → no real claim
+      return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+    };
+
+    // BLO-18995: a lock can also be held by a run that never started. Four
+    // enqueue paths stamp executionRunId/executionLockedAt at *enqueue* time
+    // alongside a freshly-inserted `queued` run (enqueueMissingIssueCommentRetry,
+    // enqueueProcessLossRetry, and the two recovery-wake inserts), rather than
+    // lazily at claim time the way claimQueuedRun does. `queued` is neither
+    // missing nor terminal, so isCleanable() above returns false forever and
+    // this sweeper — the designated backstop — never clears it. Meanwhile
+    // enqueueWakeup parks every subsequent wake for that issue as
+    // `deferred_issue_execution` behind the apparent live holder, and those
+    // deferred wakes are only promoted by releaseIssueExecutionAndPromote when
+    // the holding run finishes. A run that is never claimed therefore strands
+    // them indefinitely, with no timeout anywhere in the path. Observed in
+    // production: BLO-18939 held executionLockedAt for a run still `queued`
+    // with startedAt null.
+    //
+    // Bound it: once a pre-claim lock has been held longer than
+    // STALE_PRE_CLAIM_ISSUE_LOCK_MS, treat it as cleanable. Clearing is safe
+    // and does not cancel the run — claimQueuedRun's lock update is guarded by
+    // `or(isNull(executionRunId), eq(executionRunId, claimed.id))`, so the run
+    // simply re-acquires the lock if and when it is finally claimed, and the
+    // per-issue dedupe in startNextQueuedRunForAgent still prevents two runs
+    // for one issue from executing concurrently.
+    const isPreClaimLockExpired = (runId: string | null, lockedAt: Date | null) => {
+      if (!runId || !lockedAt) return false;
+      const run = runById.get(runId);
+      if (run?.status === "queued") {
+        return Date.now() - lockedAt.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
+      }
+      if (run?.status === "scheduled_retry") {
+        // Scheduled retries are intentionally parked until their retry deadline.
+        // Only clear them once that deadline itself has gone stale; provider
+        // capacity retries may be scheduled far into the future.
+        const staleBasis = run.scheduledRetryAt ?? lockedAt;
+        return Date.now() - staleBasis.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
+      }
+      return false;
     };
 
     for (const issue of candidates) {
-      if (!isCleanable(issue.checkoutRunId) || !isCleanable(issue.executionRunId)) {
-        continue;
-      }
+      const executionLockExpired = isPreClaimLockExpired(
+        issue.executionRunId,
+        issue.executionLockedAt,
+      );
+      // Guards are kept separate on purpose. The update below nulls the
+      // checkout *and* execution columns together, so the new pre-claim-expiry
+      // allowance must not become a blanket bypass of the checkout check: an
+      // issue whose checkoutRunId points at a live (non-terminal) run keeps its
+      // checkout lock no matter how stale the execution lock is.
+      if (!isCleanable(issue.checkoutRunId)) continue;
+      if (!isCleanable(issue.executionRunId) && !executionLockExpired) continue;
 
-      const updated = await db
-        .update(issues)
-        .set({
-          checkoutRunId: null,
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(issues.id, issue.id),
-            issue.checkoutRunId
-              ? eq(issues.checkoutRunId, issue.checkoutRunId)
-              : isNull(issues.checkoutRunId),
-            issue.executionRunId
-              ? eq(issues.executionRunId, issue.executionRunId)
-              : isNull(issues.executionRunId),
-          ),
-        )
-        .returning({ id: issues.id })
-        .then((rows) => rows[0] ?? null);
+      const sweepOutcome = await db.transaction(async (tx) => {
+        const clearedAt = new Date();
+        const updated = await tx
+          .update(issues)
+          .set({
+            checkoutRunId: null,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: clearedAt,
+          })
+          .where(
+            and(
+              eq(issues.id, issue.id),
+              issue.checkoutRunId
+                ? eq(issues.checkoutRunId, issue.checkoutRunId)
+                : isNull(issues.checkoutRunId),
+              issue.executionRunId
+                ? eq(issues.executionRunId, issue.executionRunId)
+                : isNull(issues.executionRunId),
+              issue.executionLockedAt
+                ? eq(issues.executionLockedAt, issue.executionLockedAt)
+                : isNull(issues.executionLockedAt),
+            ),
+          )
+          .returning({
+            id: issues.id,
+            companyId: issues.companyId,
+            assigneeAgentId: issues.assigneeAgentId,
+            responsibleUserId: issues.responsibleUserId,
+          })
+          .then((rows) => rows[0] ?? null);
 
-      if (!updated) continue;
+        if (!updated) return null;
+
+        const skippedDeferredWakeIds: string[] = [];
+
+        while (true) {
+          const deferred = await tx
+            .select()
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.companyId, updated.companyId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                sql`(
+                  ${agentWakeupRequests.payload} ->> 'issueId' = ${updated.id}
+                  or ${agentWakeupRequests.payload} ->> 'taskId' = ${updated.id}
+                  or ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId' = ${updated.id}
+                  or ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId' = ${updated.id}
+                )`,
+              ),
+            )
+            .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id))
+            .limit(1)
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+
+          if (!deferred) {
+            return {
+              updated,
+              promotedRunId: null,
+              promotedWakeId: null,
+              promotedAgentId: null,
+              skippedDeferredWakeIds,
+            };
+          }
+
+          const deferredAgent = await tx
+            .select({
+              id: agents.id,
+              companyId: agents.companyId,
+              name: agents.name,
+              reportsTo: agents.reportsTo,
+              status: agents.status,
+            })
+            .from(agents)
+            .where(eq(agents.id, deferred.agentId))
+            .then((rows) => rows[0] ?? null);
+          const companyAgents = deferredAgent
+            ? await tx
+              .select({
+                id: agents.id,
+                companyId: agents.companyId,
+                name: agents.name,
+                reportsTo: agents.reportsTo,
+                status: agents.status,
+              })
+              .from(agents)
+              .where(eq(agents.companyId, updated.companyId))
+            : [];
+          const invokability =
+            deferredAgent?.companyId === updated.companyId
+              ? evaluateAgentInvokability(deferredAgent, companyAgents)
+              : evaluateAgentInvokability(null, companyAgents);
+
+          if (!deferredAgent || deferredAgent.companyId !== updated.companyId || !invokability.invokable) {
+            const now = new Date();
+            skippedDeferredWakeIds.push(deferred.id);
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "failed",
+                finishedAt: now,
+                error: "Deferred wake could not be promoted: agent is not invokable",
+                updatedAt: now,
+              })
+              .where(eq(agentWakeupRequests.id, deferred.id));
+            continue;
+          }
+
+          const deferredPayload = { ...parseObject(deferred.payload) };
+          const deferredContextSeed = {
+            ...parseObject(deferredPayload[DEFERRED_WAKE_CONTEXT_KEY]),
+          };
+          delete deferredPayload[DEFERRED_WAKE_CONTEXT_KEY];
+
+          const activePauseHold = await treeControlSvc.getActivePauseHoldGate(
+            updated.companyId,
+            updated.id,
+            tx,
+          );
+          const treeHoldInteractionWake = activePauseHold && await isVerifiedIssueTreeControlInteractionWake(tx, {
+            companyId: updated.companyId,
+            issueId: updated.id,
+            agentId: deferred.agentId,
+            contextSnapshot: deferredContextSeed,
+            requestedByActorType: deferred.requestedByActorType,
+            requestedByActorId: deferred.requestedByActorId,
+            wakeupRequestId: deferred.id,
+          });
+          if (activePauseHold && !treeHoldInteractionWake) {
+            const now = new Date();
+            skippedDeferredWakeIds.push(deferred.id);
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "cancelled",
+                finishedAt: now,
+                error: "Deferred wake suppressed by active subtree pause hold",
+                updatedAt: now,
+              })
+              .where(eq(agentWakeupRequests.id, deferred.id));
+            continue;
+          }
+
+          const promotedReason = readNonEmptyString(deferred.reason) ?? "issue_execution_promoted";
+          const promotedSource = readNonEmptyString(deferred.source) ?? "automation";
+          const promotedTriggerDetail = readNonEmptyString(deferred.triggerDetail);
+          const promotedContextSnapshot: Record<string, unknown> = { ...deferredContextSeed };
+          if (activePauseHold) {
+            promotedContextSnapshot.treeHoldInteraction = true;
+            promotedContextSnapshot.activeTreeHold = {
+              holdId: activePauseHold.holdId,
+              rootIssueId: activePauseHold.rootIssueId,
+              mode: activePauseHold.mode,
+              reason: activePauseHold.reason,
+              releasePolicy: activePauseHold.releasePolicy,
+              interaction: true,
+            };
+          }
+          if (!readNonEmptyString(promotedContextSnapshot.issueId)) {
+            promotedContextSnapshot.issueId = updated.id;
+          }
+          if (!readNonEmptyString(promotedContextSnapshot.taskId)) {
+            promotedContextSnapshot.taskId = updated.id;
+          }
+          if (!readNonEmptyString(promotedContextSnapshot.wakeReason)) {
+            promotedContextSnapshot.wakeReason = promotedReason;
+          }
+          if (!readNonEmptyString(promotedContextSnapshot.wakeSource)) {
+            promotedContextSnapshot.wakeSource = promotedSource;
+          }
+          if (
+            promotedTriggerDetail &&
+            !readNonEmptyString(promotedContextSnapshot.wakeTriggerDetail)
+          ) {
+            promotedContextSnapshot.wakeTriggerDetail = promotedTriggerDetail;
+          }
+          if (
+            readNonEmptyString(deferredPayload.commentId) &&
+            !readNonEmptyString(promotedContextSnapshot.commentId)
+          ) {
+            promotedContextSnapshot.commentId = deferredPayload.commentId;
+          }
+          if (
+            readNonEmptyString(deferredPayload.taskKey) &&
+            !readNonEmptyString(promotedContextSnapshot.taskKey)
+          ) {
+            promotedContextSnapshot.taskKey = deferredPayload.taskKey;
+          }
+
+          const now = new Date();
+          const newRun = await tx
+            .insert(heartbeatRuns)
+            .values({
+              companyId: deferredAgent.companyId,
+              agentId: deferredAgent.id,
+              invocationSource: promotedSource,
+              triggerDetail: promotedTriggerDetail,
+              status: "queued",
+              wakeupRequestId: deferred.id,
+              contextSnapshot: promotedContextSnapshot,
+              responsibleUserId: updated.responsibleUserId,
+              updatedAt: now,
+            })
+            .returning({ id: heartbeatRuns.id })
+            .then((rows) => rows[0]);
+
+          const promotedWake = await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "queued",
+              reason: "issue_execution_promoted",
+              runId: newRun.id,
+              claimedAt: null,
+              finishedAt: null,
+              error: null,
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(agentWakeupRequests.id, deferred.id),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              ),
+            )
+            .returning({ id: agentWakeupRequests.id })
+            .then((rows) => rows[0] ?? null);
+
+          if (!promotedWake) {
+            await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.id, newRun.id));
+            skippedDeferredWakeIds.push(deferred.id);
+            continue;
+          }
+
+          await tx
+            .update(issues)
+            .set({
+              executionRunId: newRun.id,
+              executionAgentNameKey: normalizeAgentNameKey(deferredAgent.name),
+              executionLockedAt: now,
+              updatedAt: now,
+            })
+            .where(and(eq(issues.id, updated.id), eq(issues.assigneeAgentId, deferredAgent.id)));
+
+          return {
+            updated,
+            promotedRunId: newRun.id,
+            promotedWakeId: deferred.id,
+            promotedAgentId: deferredAgent.id,
+            skippedDeferredWakeIds,
+          };
+        }
+      });
+
+      if (!sweepOutcome) continue;
+      const { updated } = sweepOutcome;
 
       result.cleared += 1;
       result.issueIds.push(updated.id);
@@ -7204,7 +7744,26 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           source: "recovery.sweep_stale_issue_locks",
           clearedCheckoutRunId: issue.checkoutRunId,
           clearedExecutionRunId: issue.executionRunId,
-          referencedRunStatuses: Object.fromEntries(runStatusById),
+          referencedRunStatuses: Object.fromEntries(
+            [...runById.entries()].map(([id, run]) => [id, run.status]),
+          ),
+          promotedDeferredWakeId: sweepOutcome.promotedWakeId,
+          promotedRunId: sweepOutcome.promotedRunId,
+          promotedAgentId: sweepOutcome.promotedAgentId,
+          skippedDeferredWakeIds: sweepOutcome.skippedDeferredWakeIds,
+          // BLO-18995: distinguishes the original terminal/missing-run path from
+          // the pre-claim lock timeout, so an operator reading the audit trail
+          // can tell whether a lock was released because its run finished or
+          // because it was never claimed within STALE_PRE_CLAIM_ISSUE_LOCK_MS.
+          reason: executionLockExpired ? "pre_claim_lock_expired" : "run_terminal_or_missing",
+          ...(executionLockExpired
+            ? {
+              preClaimLockHeldMs: issue.executionLockedAt
+                ? Date.now() - issue.executionLockedAt.getTime()
+                : null,
+              preClaimLockTimeoutMs: STALE_PRE_CLAIM_ISSUE_LOCK_MS,
+            }
+            : {}),
         },
       });
     }

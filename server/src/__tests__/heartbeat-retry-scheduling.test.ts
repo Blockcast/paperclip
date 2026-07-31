@@ -30,6 +30,7 @@ import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
+  isRetryableInteractionContinuationInfrastructureFailure,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
 
@@ -382,6 +383,82 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(heartbeatRuns.retryOfRunId, runId))
       .then((rows) => rows.find((row) => row.scheduledRetryReason === "transient_failure") ?? null);
   }
+
+  it("clears parked retry error metadata when claiming a queued local run", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2026-07-30T03:30:00.000Z");
+
+    await seedQueuedRunFixture({
+      companyId,
+      agentId,
+      runId,
+      now,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_assigned",
+      },
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        error: "provider capacity retry parked",
+        errorCode: "rate_limit_exhausted",
+        scheduledRetryAt: now,
+        scheduledRetryAttempt: 2,
+        scheduledRetryReason: "ccrotate_capacity",
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    let observedClaim = false;
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      const [claimed] = await db
+        .select({
+          status: heartbeatRuns.status,
+          error: heartbeatRuns.error,
+          errorCode: heartbeatRuns.errorCode,
+          scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+          scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+          scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+
+      expect(claimed).toMatchObject({
+        status: "running",
+        error: null,
+        errorCode: null,
+        scheduledRetryAt: now,
+        scheduledRetryAttempt: 2,
+        scheduledRetryReason: "ccrotate_capacity",
+      });
+      observedClaim = true;
+
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "ok",
+        resultJson: { summary: "ok", result: "ok" },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await heartbeat.__test_executeRunForTesting(runId);
+    expect(observedClaim).toBe(true);
+
+    const finished = await heartbeat.getRun(runId);
+    expect(finished).toMatchObject({
+      status: "succeeded",
+      error: null,
+      errorCode: null,
+      scheduledRetryAttempt: 2,
+      scheduledRetryReason: "ccrotate_capacity",
+    });
+  });
 
   async function expectPlainPrReviewFailureSchedulesRetry(errorCode: "adapter_failed" | "process_lost") {
     const companyId = randomUUID();
@@ -810,6 +887,20 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue?.executionRunId).toBe(scheduled.run.id);
+  });
+
+  it("does not retry the permanent claude_k8s agent-home workspace failure", () => {
+    expect(
+      isRetryableInteractionContinuationInfrastructureFailure({
+        error: "workspace validation failed before dispatch",
+        errorCode: "workspace_validation_failed",
+        resultJson: {
+          workspaceValidation: {
+            reason: "k8s_agent_home_git_bootstrap_unsupported",
+          },
+        },
+      }),
+    ).toBe(false);
   });
 
   it("coalesces duplicate accepted interaction continuation infra retry schedules", async () => {

@@ -206,6 +206,7 @@ import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
 } from "./issue-tree-control.js";
+import { RUN_STALE_SILENCE_MS } from "./issue-run-holding.js";
 import {
   continuationSummaryParksExecutor,
   getIssueContinuationSummaryDocument,
@@ -418,6 +419,7 @@ const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
+const STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_DEFAULT_MS = 5_000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
@@ -488,6 +490,16 @@ function readIntegerEnv(name: string, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function strictGitCheckoutProbeTimeoutMs(): number {
+  return Math.max(
+    100,
+    readIntegerEnv(
+      "PAPERCLIP_STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_MS",
+      STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_DEFAULT_MS,
+    ),
+  );
+}
+
 const K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS = Math.max(
   0,
   readIntegerEnv("PAPERCLIP_K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS", 6),
@@ -553,6 +565,17 @@ const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "opencode_local",
   "pi_local",
 ]);
+// BLO-18147: claude_k8s pods bootstrap their own git workspace in-pod by
+// locally `git clone --shared`-ing from the adapter's resolved cwd (confirmed
+// live from a running pod's entrypoint). When no project or session
+// workspace is available, that cwd falls back to the shared, actively-
+// mutated per-agent AGENT_HOME directory on the same storage-sensitive
+// cephfs PVC implicated in BLO-17793; a clone failure there surfaces as
+// git's raw exit 128 and kills the container before `claude` even starts,
+// burning Job backoff budget instead of a recoverable error. Scoped to
+// claude_k8s only — opencode_k8s pods were observed healthy through the same
+// incident window (BLO-18145) and are not known to share this bootstrap path.
+const K8S_GIT_SENSITIVE_ADAPTER_TYPES = new Set(["claude_k8s"]);
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -849,10 +872,20 @@ function isSpawnLikeFailureMessage(value: unknown) {
   return /failed to start command|spawn\b|\bENOENT\b/i.test(value);
 }
 
-function isRetryableInteractionContinuationInfrastructureFailure(
+export function isRetryableInteractionContinuationInfrastructureFailure(
   run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "resultJson">,
 ) {
-  if (run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE || run.errorCode === "process_lost") {
+  if (run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE) {
+    const workspaceValidation = parseObject(parseObject(run.resultJson).workspaceValidation);
+    if (
+      readNonEmptyString(workspaceValidation.reason) ===
+      "k8s_agent_home_git_bootstrap_unsupported"
+    ) {
+      return false;
+    }
+    return true;
+  }
+  if (run.errorCode === "process_lost") {
     return true;
   }
 
@@ -926,7 +959,10 @@ const EXTERNAL_LIFECYCLE_ADAPTERS = new Set([
 // Jobs immediately; this threshold only applies when that probe returns
 // null. Kept generous so a slow probe + a healthy long-running Claude
 // session don't collide.
-const EXTERNAL_LIFECYCLE_STALE_MS = 15 * 60 * 1000;
+// Shared with issue-run-holding.ts for one named 15-minute slot-accounting
+// threshold. Issue/worktree ownership stays more conservative: a running row
+// holds its issue until it reaches a terminal/missing lifecycle state.
+const EXTERNAL_LIFECYCLE_STALE_MS = RUN_STALE_SILENCE_MS;
 // External-lifecycle adapters create a DB run before the adapter.invoke event
 // is appended. Startup and periodic reapers can overlap that setup window;
 // give slow pre-run hooks and kube Job creation time to reach adapter.invoke.
@@ -1921,6 +1957,45 @@ async function isGitCheckout(cwd: string | null | undefined) {
     .catch(() => false);
 }
 
+async function pathIsAbsent(cwd: string): Promise<boolean> {
+  try {
+    await fs.lstat(cwd);
+    return false;
+  } catch (error: unknown) {
+    return (error as NodeJS.ErrnoException)?.code === "ENOENT";
+  }
+}
+
+// Unlike isGitCheckout(), this does not fail open: a probe error that isn't
+// positively identifiable as "cwd is not a git checkout" (missing directory,
+// or git's own "not a git repository" fatal) is treated as "could be a
+// checkout". That covers the storage-layer failures (permission denied,
+// stale handle, I/O error, timeout) BLO-18147 exists to guard against —
+// those must reject dispatch, not silently wave it through because the probe
+// itself couldn't complete. Uses try/await rather than .then/.catch because
+// execFile can throw synchronously (e.g. ENOTDIR when cwd is not a
+// directory) before returning a promise to chain onto.
+async function probeGitCheckoutStateStrict(
+  cwd: string,
+): Promise<"checkout" | "not_a_checkout" | "indeterminate"> {
+  try {
+    const result = await execFile("git", ["rev-parse", "--show-toplevel"], {
+      cwd,
+      timeout: strictGitCheckoutProbeTimeoutMs(),
+    });
+    return readNonEmptyString(result.stdout) ? "checkout" : "indeterminate";
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return await pathIsAbsent(cwd) ? "not_a_checkout" : "indeterminate";
+    }
+    const stderr = typeof (error as { stderr?: unknown })?.stderr === "string"
+      ? (error as { stderr: string }).stderr
+      : "";
+    if (/not a git repository/i.test(stderr)) return "not_a_checkout";
+    return "indeterminate";
+  }
+}
+
 function sameResolvedPath(left: string | null | undefined, right: string | null | undefined) {
   const leftPath = readNonEmptyString(left);
   const rightPath = readNonEmptyString(right);
@@ -2053,9 +2128,49 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   executionWorkspace: RealizedExecutionWorkspace;
   persistedExecutionWorkspace: ExecutionWorkspace | null;
   executionTarget: unknown;
+  k8sRunIsolation?: { isolationMode: "shared" | "run" | "workspace" } | null;
   environmentDriver?: string | null;
   leaseMetadata?: unknown;
 }) {
+  const k8sIssue = input.issue;
+  const effectiveCwd = readNonEmptyString(input.executionWorkspace.cwd);
+  const agentFallbackCwd = resolveDefaultAgentWorkspaceDir(input.agentId);
+  // claude_k8s only clones the source checkout for per-run isolation. Key the
+  // invariant on that effective source path, not the resolver label: a missing
+  // project cwd can retain source="project_primary" while falling back here.
+  if (
+    K8S_GIT_SENSITIVE_ADAPTER_TYPES.has(input.adapterType) &&
+    k8sIssue &&
+    input.k8sRunIsolation?.isolationMode === "run" &&
+    !input.resolvedWorkspace.realizationFailure &&
+    effectiveCwd !== null &&
+    path.resolve(effectiveCwd) === path.resolve(agentFallbackCwd)
+  ) {
+    // Deliberately not isGitCheckout(): that helper fails open (any probe
+    // error -> false), which would wave a storage-layer probe failure
+    // straight through to dispatch and reproduce the exact exit-128 this
+    // guard exists to prevent. Reject dispatch unless the probe positively
+    // confirms the fallback cwd is NOT a git checkout.
+    const gitProbeState = await probeGitCheckoutStateStrict(effectiveCwd);
+    if (gitProbeState !== "not_a_checkout") {
+      throw new WorkspaceValidationFailure(
+        `Issue ${k8sIssue.identifier ?? k8sIssue.id} has no usable project or session execution workspace. Refusing to dispatch ${input.adapterType} run isolation from the shared agent-home fallback cwd "${effectiveCwd}" because its in-pod git bootstrap clones locally from this checkout and can exit 128 under storage pressure. Bind a project or execution workspace to this issue before retrying.`,
+        {
+          workspaceValidation: {
+            reason: "k8s_agent_home_git_bootstrap_unsupported",
+            adapterType: input.adapterType,
+            issueId: k8sIssue?.id ?? null,
+            issueIdentifier: k8sIssue?.identifier ?? null,
+            resolvedWorkspaceSource: input.resolvedWorkspace.source,
+            resolvedWorkspaceCwd: effectiveCwd,
+            isolationMode: input.k8sRunIsolation.isolationMode,
+            gitProbeState,
+          },
+        },
+      );
+    }
+  }
+
   if (!GIT_SENSITIVE_LOCAL_ADAPTER_TYPES.has(input.adapterType)) return;
 
   const executionTargetKind = readNonEmptyString((input.executionTarget as { kind?: unknown } | null)?.kind) ?? "local";
@@ -2073,9 +2188,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     readNonEmptyString(leaseMetadata.remoteCwd) ??
     readNonEmptyString(leaseProviderMetadata.remoteCwd);
 
-  const effectiveCwd = readNonEmptyString(input.executionWorkspace.cwd);
   const persistedCwd = readNonEmptyString(input.persistedExecutionWorkspace?.cwd);
-  const agentFallbackCwd = resolveDefaultAgentWorkspaceDir(input.agentId);
   const workspaceExpectation =
     Boolean(issue.projectWorkspaceId) ||
     Boolean(resolvedWorkspace.workspaceId) ||
@@ -6268,7 +6381,9 @@ async function coalesceQueuedGithubStateWake(input: {
     })
     .where(and(eq(heartbeatRuns.id, existingRun.id), eq(heartbeatRuns.status, "queued")))
     .returning()
-    .then((rows) => rows[0] ?? existingRun);
+    .then((rows) => rows[0] ?? null);
+
+  if (!mergedRun) return null;
 
   let coalescedEventCount: number | null = null;
   if (mergedRun.wakeupRequestId) {
@@ -6378,7 +6493,9 @@ async function coalescePendingTaskScopeWake(input: {
       ),
     )
     .returning()
-    .then((rows) => rows[0] ?? existingRun);
+    .then((rows) => rows[0] ?? null);
+
+  if (!mergedRun) return null;
 
   if (mergedRun.wakeupRequestId) {
     await input.tx
@@ -6795,6 +6912,67 @@ export function evaluatePrReviewCompletionEvidence(
   };
 }
 
+// Reviewer wake reasons that must refresh review work for the current head:
+// an @ally comment / requested_reviewer, the draft->ready toggle, and a PR
+// synchronize push. Contrast with github_pr_opened/reopened, where a wake
+// already in flight genuinely covers the event.
+const EXPLICIT_PR_REVIEW_REQUEST_WAKE_REASONS = new Set([
+  "github_pr_review_requested",
+  "github_pr_ready_for_review",
+  "github_pr_synchronized",
+]);
+
+// BLO-18953: an explicit review request must never be absorbed into a review
+// run that is already RUNNING for the same PR. The reviewer task key is
+// PR-scoped and carries no head sha (deliberately: it also scopes the reviewer
+// affinity lookup, the withPrReviewerTaskLock serialization, and the
+// cancel-on-close sweep), so same-scope coalescing cannot tell "the run about
+// to start will read this head" from "the run already reviewing an older head
+// will never re-read head". Coalescing into a `queued` run is benign — that run
+// reads head when it starts. Coalescing into a `running` one silently drops the
+// request: observed on Blockcast/pim-multicast-gateway#1888 (human @ally
+// comment), Blockcast/paperclip#822 (ready_for_review), and synchronize pushes
+// that arrived while a previous-head review was already running.
+//
+// Head-sha comparison is NOT a workable discriminator here: the issue_comment
+// branch of resolveEventContext never populates headSha (GitHub's issue_comment
+// payload has no PR head), so the most common request path would compare
+// null-to-null and coalesce anyway.
+function isExplicitPrReviewRequestWake(contextSnapshot: Record<string, unknown> | null | undefined) {
+  const review = derivePaperclipPrReview(contextSnapshot);
+  if (!review || review.prRole !== "reviewer") return false;
+  return EXPLICIT_PR_REVIEW_REQUEST_WAKE_REASONS.has(review.wakeReason);
+}
+
+/**
+ * Decides whether a wake that finds a same-task-scope run already RUNNING must
+ * get its own queued follow-up run instead of being absorbed into that run.
+ *
+ * Extracted from enqueueWakeup so the property can be asserted directly: the
+ * in-situ path applies zombie filtering afterwards, which makes a DB-only
+ * `running` row (no live process) fall through for unrelated reasons and would
+ * render an end-to-end assertion vacuous.
+ *
+ * Returns false when a same-scope QUEUED run exists — that run has not started
+ * and will read the current head when it does, so absorbing into it is both
+ * correct and the desired rapid-event coalescing.
+ */
+export function shouldQueueFollowupInsteadOfAbsorbingIntoRunningRun(input: {
+  hasRunningSameScopeRun: boolean;
+  hasQueuedSameScopeRun: boolean;
+  contextSnapshot: Record<string, unknown> | null | undefined;
+  wakeCommentId: string | null;
+}): boolean {
+  if (!input.hasRunningSameScopeRun || input.hasQueuedSameScopeRun) return false;
+  return (
+    isExplicitPrReviewRequestWake(input.contextSnapshot) ||
+    shouldQueueFollowupForRunningIssueWake({
+      contextSnapshot: input.contextSnapshot,
+      wakeCommentId: input.wakeCommentId,
+    })
+  );
+}
+
 function isCrossPrReviewWakeForActiveRun(input: {
   activeContextSnapshot: unknown;
   incomingContextSnapshot: Record<string, unknown>;
@@ -7128,9 +7306,19 @@ export function buildPaperclipTaskMarkdown(input: {
       if (prReview.reviewBody) {
         lines.push("", "Latest review body:", fenceTaskText(prReview.reviewBody));
       }
+      // BLO-19067: the closing instruction must agree with the review state.
+      // It used to unconditionally say "push a follow-up commit addressing
+      // them", so an APPROVED review told the author to make an implementation
+      // pass that has no findings to act on. A no-op push invalidates the
+      // approval it just earned and restarts CI, looping for hours.
+      const normalizedReviewState = prReview.reviewState?.trim().toLowerCase().replace(/-/g, "_") ?? null;
+      const commonClosing =
+        "Do NOT close the PR or self-approve. The PR's status is your responsibility this run; don't bounce to inbox-only mode.";
       lines.push(
         "",
-        "Read the latest review on the PR above (use `gh pr view` / `gh api` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. Do NOT close the PR or self-approve. The PR's status is your responsibility this run; don't bounce to inbox-only mode.",
+        normalizedReviewState === "approved"
+          ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). It APPROVED your PR, so no implementation pass is required: do NOT push a no-op or invented follow-up commit, because any new push invalidates this approval and restarts CI. Act on a note only if it identifies a real defect; otherwise proceed to merge once required checks pass. ${commonClosing}`
+          : `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. ${commonClosing}`,
       );
     } else {
       lines.push(
@@ -12292,6 +12480,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(heartbeatRuns)
         .set({
           status: "queued",
+          error: null,
+          errorCode: null,
           updatedAt: now,
         })
         .where(
@@ -13618,6 +13808,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .update(heartbeatRuns)
           .set({
             status: "running",
+            error: null,
+            errorCode: null,
             responsibleUserId,
             startedAt: run.startedAt ?? claimedAt,
             updatedAt: claimedAt,
@@ -15046,14 +15238,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(externalRuntimeReservations)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, externalRuntimeReservations.runId))
       .where(
-        or(
-          eq(externalRuntimeReservations.state, "release_pending"),
-          and(
-            inArray(externalRuntimeReservations.state, ["reserved", "launching"]),
-            isNull(externalRuntimeReservations.expectedJobName),
-            isNull(externalRuntimeReservations.jobName),
-            isNull(externalRuntimeReservations.jobUid),
-            inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+        and(
+          isNull(externalRuntimeReservations.releasedAt),
+          or(
+            eq(externalRuntimeReservations.state, "release_pending"),
+            and(
+              inArray(externalRuntimeReservations.state, ["reserved", "launching"]),
+              isNull(externalRuntimeReservations.expectedJobName),
+              isNull(externalRuntimeReservations.jobName),
+              isNull(externalRuntimeReservations.jobUid),
+              inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+            ),
+            // BLO-18995: an *identified* reservation (a Job name was recorded)
+            // whose run reached a terminal status without the normal
+            // finalize-time release running — the canonical case is
+            // `drainRunningRunsForShutdown` marking a running run
+            // `interrupted` on SIGTERM, which never releases the reservation.
+            // The two branches above cannot see it: it is not
+            // `release_pending`, and it is `launched` with a non-null
+            // `jobName`. The row then keeps `released_at IS NULL` forever and
+            // the partial unique index
+            // `external_runtime_reservations_active_slot_idx (agent_id,
+            // slot_id) WHERE released_at IS NULL` blocks that slot
+            // permanently, so every worker restart with a run in flight
+            // ratchets the agent's effective concurrency down by one. Observed
+            // in production: four agents each stuck a slot for 1-5 days (Ally
+            // 4/5 slots, Release Engineer 1/2).
+            //
+            // Selecting the row here is safe because it does not release it:
+            // the loop below still verifies the recorded Job is genuinely gone
+            // or finished (exact `readAgentJobRunStatusByName` lookup plus
+            // jobUid identity match) and skips any reservation whose Job is
+            // still `active`. A Job that outlives the worker therefore keeps
+            // its slot until it actually terminates.
+            and(
+              inArray(externalRuntimeReservations.state, ["reserved", "launching", "launched"]),
+              or(
+                isNotNull(externalRuntimeReservations.jobName),
+                isNotNull(externalRuntimeReservations.jobUid),
+              ),
+              inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+            ),
           ),
         ),
       );
@@ -16731,7 +16956,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           waitedMs: number,
           isRecoveryWake: boolean,
         ): number => {
-          if (!hasId) return 10;
+          if (!hasId) {
+            // BLO-18995: issue-less runs (every GitHub PR-review wake) used to
+            // return a flat 10 here, *above* the aging escalation below, so the
+            // BLO-16253 anti-starvation floor was unreachable for the entire
+            // class. Every dependency-ready issue-bound run ranks
+            // `priorityRank * 2 + statusBonus` ∈ [0,9], so even a `low`-priority
+            // `todo` (7) permanently outranked an arbitrarily old PR review.
+            // Escalate aged issue-less runs to 2: they outrank routine medium/
+            // low work while preserving ranks 0-1 for explicit critical issue
+            // work. The PR-review fairness promotion above remains the bounded
+            // path for an aged review to jump even critical work.
+            return waitedMs >= STARVATION_FULL_ESCALATION_MS ? 2 : 10;
+          }
+          // NB: the aging escalation below stays *underneath* this `!ready`
+          // check on purpose. A dependency-blocked run must never escalate to
+          // the front of the queue no matter how long it has waited, because it
+          // cannot run yet.
           if (!ready) return 12 + issueRunPriorityRank(issue?.priority);
           const escalationFloorMs = isRecoveryWake
             ? STARVATION_RECOVERY_ESCALATION_MS
@@ -16767,13 +17008,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Per-issue dedupe: if a queued run targets an issue that already has a
       // running sibling (this iteration's claim OR a prior tick's still-running
       // run), suppress it instead of letting two dispatches race for the same
-      // k8s Job slot. Cross-agent and null-issueId (autonomous) runs are
-      // unaffected — withAgentStartLock already scopes this to one agent and
-      // the gate only fires when issueId is present. Stale runs are excluded
-      // (consistent with Fix #1 above) so a queued retry for a stale issue
-      // can proceed once the stale run's job is gone.
+      // k8s Job slot/worktree. Cross-agent and null-issueId (autonomous) runs
+      // are unaffected — withAgentStartLock already scopes this to one agent
+      // and the gate only fires when issueId is present. Unlike the slot gate
+      // above, issue ownership is not released merely because a running row has
+      // been silent for 15 minutes; an external Job can be quiet and still edit
+      // its shared worktree. Reaper/lifecycle checks must move the old run out
+      // of "running" before a queued same-issue retry can proceed.
       const inFlightIssueIds = new Set<string>();
-      for (const row of nonStaleRunningRuns) {
+      for (const row of runningRunRows) {
         const id = readNonEmptyString(parseObject(row.contextSnapshot).issueId);
         if (id) inFlightIssueIds.add(id);
       }
@@ -18625,6 +18868,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         executionWorkspace,
         persistedExecutionWorkspace,
         executionTarget,
+        k8sRunIsolation,
         environmentDriver: selectedEnvironment.driver,
         leaseMetadata: activeEnvironmentLease.lease.metadata,
       });
@@ -22548,10 +22792,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const sameScopeRunningRun = activeRuns.find(
       (candidate) => candidate.status === "running" && isSameTaskScope(runTaskKey(candidate), effectiveTaskKey),
     );
-    const shouldQueueFollowupForRunningWake =
-      Boolean(sameScopeRunningRun) &&
-      !sameScopeQueuedRun &&
-      shouldQueueFollowupForRunningIssueWake({ contextSnapshot: enrichedContextSnapshot, wakeCommentId });
+    // BLO-18953: an explicit review request is never satisfied by a review
+    // already in flight against an older head, so it must not be absorbed into
+    // a running same-scope run. Queued/scheduled_retry coalescing is preserved:
+    // those runs read head when they start.
+    const explicitPrReviewRequestWake = isExplicitPrReviewRequestWake(enrichedContextSnapshot);
+    const shouldQueueFollowupForRunningWake = shouldQueueFollowupInsteadOfAbsorbingIntoRunningRun({
+      hasRunningSameScopeRun: Boolean(sameScopeRunningRun),
+      hasQueuedSameScopeRun: Boolean(sameScopeQueuedRun),
+      contextSnapshot: enrichedContextSnapshot,
+      wakeCommentId,
+    });
     const rawCoalescedTarget =
       sameScopeQueuedRun ??
       sameScopeScheduledRetryRun ??
@@ -22567,32 +22818,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         coalescedTargetRun.contextSnapshot,
         enrichedContextSnapshot,
       );
+      const observedStatus = coalescedTargetRun.status;
       const mergedRun = await db
         .update(heartbeatRuns)
         .set({
           contextSnapshot: mergedContextSnapshot,
           updatedAt: new Date(),
         })
-        .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
+        .where(and(eq(heartbeatRuns.id, coalescedTargetRun.id), eq(heartbeatRuns.status, observedStatus)))
         .returning()
-        .then((rows) => rows[0] ?? coalescedTargetRun);
+        .then((rows) => rows[0] ?? null);
 
-      await db.insert(agentWakeupRequests).values({
-        companyId: agent.companyId,
-        agentId,
-        source,
-        triggerDetail,
-        reason,
-        payload,
-        status: "coalesced",
-        coalescedCount: 1,
-        requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
-        runId: mergedRun.id,
-        finishedAt: new Date(),
-      });
-      return mergedRun;
+      if (mergedRun) {
+        await db.insert(agentWakeupRequests).values({
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          reason,
+          payload,
+          status: "coalesced",
+          coalescedCount: 1,
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          runId: mergedRun.id,
+          finishedAt: new Date(),
+        });
+        return mergedRun;
+      }
     }
 
     const queueOutcome = await db.transaction(async (tx) => {
@@ -22621,8 +22875,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // found after taking the agent lock was created while this enqueue was
         // waiting. It is therefore a live concurrency race, not a pre-existing
         // zombie. Merge into it unless this wake intentionally needs a new run
-        // boundary (for example, an issue-comment follow-up).
-        includeRunning: !sameScopeRunningRun && !shouldQueueFollowupForRunningWake,
+        // boundary (for example, an issue-comment follow-up, or an explicit PR
+        // review request that a run already reviewing this PR cannot satisfy —
+        // BLO-18953).
+        includeRunning:
+          !sameScopeRunningRun &&
+          !shouldQueueFollowupForRunningWake &&
+          !explicitPrReviewRequestWake,
       });
       if (coalescedTaskScopeRun) {
         return { kind: "coalesced" as const, run: coalescedTaskScopeRun };
