@@ -1244,6 +1244,29 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.addComment).not.toHaveBeenCalled();
     });
 
+    // Ally's review of PR #837 (suggestion 2): the lookup ran unguarded inside the
+    // denial branch, so a transient failure surfaced as an unlabelled 500 instead of
+    // the ordinary 403 the caller would have received anyway. It must fail CLOSED —
+    // an unreadable action grants nothing — and stay diagnosable in logs via the
+    // `recovery_lookup_failed` discriminator the sibling checkout path already uses.
+    it("fails closed with a plain 403 when the recovery-action lookup errors", async () => {
+      denyCommentGrantEverywhere();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+      }) as never);
+      mockIssueRecoveryActionService.getActiveForIssue.mockRejectedValue(new Error("database timeout"));
+
+      const res = await request(await createApp(recoveryOwnerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Owner comment during a lookup outage." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (grant)");
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
     // Ally's review of PR #837: the admission originally sat in a bare
     // `if (!boundaryDecision.allowed)`, so it overrode EVERY denial reason — a low-trust
     // actor scoped to an explicit trust boundary could step outside it just by being the

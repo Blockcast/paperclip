@@ -3679,7 +3679,29 @@ export function issueRoutes(
   ) {
     if (req.actor.type !== "agent" || !req.actor.agentId) return false;
     if (req.actor.companyId !== issue.companyId) return false;
-    const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+    // A lookup outage must not become an unlabelled 500 on the comment path: the
+    // caller is already inside the denial branch, so the correct outcome is the
+    // ordinary 403 it would have received anyway. Log with `recovery_lookup_failed`
+    // — the same discriminator the sibling checkout path uses (see the
+    // `recoveryCheckoutLookupError` handler) — so a recovery-lookup outage stays
+    // distinguishable from an ordinary denial in logs. Failing closed is deliberate:
+    // an unreadable action grants nothing.
+    let activeRecoveryAction: Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>>;
+    try {
+      activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+    } catch (err) {
+      logger.error(
+        {
+          err,
+          reason: "recovery_lookup_failed",
+          issueId: issue.id,
+          companyId: issue.companyId,
+          agentId: req.actor.agentId,
+        },
+        "failed to load active recovery action for issue comment authorization",
+      );
+      return false;
+    }
     const ownerAgentId = activeRecoveryAction?.ownerAgentId ?? null;
     return ownerAgentId !== null && ownerAgentId === req.actor.agentId;
   }
@@ -10413,6 +10435,14 @@ export function issueRoutes(
       recoveryOwnerGrantedCommentOnly;
     const effectiveReopenRequested = commentOnlyGrantedPeerAgent ? false : reopenRequested;
     const effectiveResumeRequested = commentOnlyGrantedPeerAgent ? false : resumeRequested;
+    // Reachable only for the MENTION-GRANT arm of `isCommentOnlyPeerGrantDecision`.
+    // The recovery-owner arm cannot get here: any recovery-owner request carrying
+    // `reopen`/`resume` already returned 403 at the comment-only refusal above, so
+    // this re-check never routes a recovery owner through
+    // `assertAgentIssueMutationAllowed`. The predicate is left wide rather than
+    // narrowed back to the mention grant so that this stays correct by construction
+    // if that refusal is ever relaxed — the reachability is the thing that changed,
+    // not the policy this branch encodes.
     if (
       isClosed &&
       req.actor.type === "agent" &&

@@ -1448,9 +1448,22 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     // Once past the horizon the loop stops for everyone, regardless of whose turn it is.
     const wakesBeforeHorizon = enqueueWakeup.mock.calls.length;
+    // Rewind BOTH the column and the evidence key. Since the ownerless-flap fix the
+    // horizon's source of truth is `evidence.sourceScopedWakeHorizonAt`, and every
+    // `upsertSourceScoped` rewrites `timeoutAt` FROM that key — so rewinding the column
+    // alone is undone by the very next sweep and the horizon never reads as reached.
+    const pastHorizon = new Date(Date.now() - 1_000);
     await db
       .update(issueRecoveryActions)
-      .set({ timeoutAt: new Date(Date.now() - 1_000) })
+      .set({
+        timeoutAt: pastHorizon,
+        evidence: {
+          ...(action!.evidence && typeof action!.evidence === "object" && !Array.isArray(action!.evidence)
+            ? (action!.evidence as Record<string, unknown>)
+            : {}),
+          sourceScopedWakeHorizonAt: pastHorizon.toISOString(),
+        },
+      })
       .where(eq(issueRecoveryActions.id, action!.id));
     for (let i = 0; i < SWEEPS; i += 1) await sweep();
     expect(enqueueWakeup.mock.calls.length).toBe(wakesBeforeHorizon);
@@ -1710,7 +1723,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(new Date(ownerless!.timeoutAt as unknown as string).getTime()).toBe(originalHorizonMs);
     expect(wakesToManager()).toBe(1);
 
-    vi.useFakeTimers();
+    // Fake ONLY `Date`. This block performs Postgres I/O (`db.update`, and the selects and
+    // updates inside `sweep()`), and the pg driver depends on the real timer wheel for
+    // pool acquisition and socket handling — installing the full fake-timer set here
+    // deadlocks the query until the 120s test timeout and then wedges the cleanup hook
+    // too, which is what stalled the whole `server 2/4` shard. Moving the clock is all
+    // this test needs: the service reads the horizon off `Date.now()`.
+    vi.useFakeTimers({ toFake: ["Date"] });
     try {
       vi.setSystemTime(new Date(originalHorizonMs + 1_000));
       await db.update(agents).set({ status: "idle" }).where(eq(agents.id, managerId));
