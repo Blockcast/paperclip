@@ -272,16 +272,19 @@ PUT /api/issues/{issueId}/documents/findings
 
 Then `PATCH {status: "done"}` passes. What qualifies:
 
-- an **issue document** with a non-empty body, **excluding** the `plan` key and system keys (`continuation-summary`, `pipeline-case-body`);
-- an **`artifact`** or **`document`** work product.
+- an **issue document** with a non-empty latest body, **excluding** the `plan` key and system keys (`continuation-summary`, `pipeline-case-body`);
+- an **active `artifact` or `document` work product** with an inspectable locator.
 
-Either must carry `createdByRunId`, which the server stamps from your run context — so write the artifact **from inside the run that closes the issue**, not via a runless board-API call.
+Either must carry `createdByRunId`, which the server stamps from your run context — so write the artifact **from inside the run that closes the issue**, not via a runless board-API call. Low-trust output must be promoted before it qualifies; quarantined documents or work products do not satisfy the done gate.
+
+For work products, "inspectable" means a reviewer can resolve the artifact: use a non-empty URL, a complete `metadata.resourceRef` workspace-file reference for this issue, a canonical Paperclip attachment metadata block that points at a real same-issue attachment, or a `documentId`/`documentKey` that resolves to a real same-issue document. Empty `resourceRef` objects, fabricated attachment paths, dangling attachment IDs, and dangling document IDs/keys do not qualify.
 
 ### What will not work
 
 - **A comment body.** However long or well-sourced, prose in a comment never satisfies this gate. That is deliberate and it is under test; do not try to shape a comment to pass.
 - **The `plan` document.** A plan is authored at the start of the work, so it is intent, not deliverable.
 - **A `pull_request` work product row** without a real PR URL — the `pr-link` path owns that.
+- **A title-only or dangling work product row.** The row must be active, trusted/promoted, run-attributed, and point to something a reviewer can open.
 
 This is also the right thing independent of the gate: a finding that a follow-up issue must consume, or that a design will cite later, belongs in a durable, revisionable, deep-linkable document — not comment #7 of a thread that keeps growing.
 

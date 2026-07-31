@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
   agents,
+  assets,
   companies,
   createDb,
   documentRevisions,
@@ -13,6 +14,7 @@ import {
   heartbeatRuns,
   instanceSettings,
   issueComments,
+  issueAttachments,
   issueDocuments,
   issueWorkProducts,
   issues,
@@ -26,6 +28,7 @@ import { issueRoutes } from "../routes/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const LOW_TRUST_REVIEW_PRESET = "low_trust_review" as const;
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -56,9 +59,11 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
 
   afterEach(async () => {
     await db.delete(issueWorkProducts);
+    await db.delete(issueAttachments);
     await db.delete(issueDocuments);
     await db.delete(documentRevisions);
     await db.delete(documents);
+    await db.delete(assets);
     await db.delete(issueComments);
     await db.delete(activityLog);
     await db.delete(issues);
@@ -187,6 +192,7 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
     agentId: string,
     runId: string | null,
     key = "findings",
+    sourceTrust: Record<string, unknown> | null = null,
   ) {
     const documentId = randomUUID();
     const revisionId = randomUUID();
@@ -199,6 +205,7 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
       latestRevisionId: revisionId,
       latestRevisionNumber: 1,
       createdByAgentId: agentId,
+      sourceTrust,
     });
     await db.insert(documentRevisions).values({
       id: revisionId,
@@ -219,6 +226,55 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
       key,
     });
     return { documentId, revisionId };
+  }
+
+  async function addIssueAttachment(companyId: string, issueId: string, agentId: string) {
+    const assetId = randomUUID();
+    const attachmentId = randomUUID();
+    await db.insert(assets).values({
+      id: assetId,
+      companyId,
+      provider: "memory",
+      objectKey: `test/${assetId}.md`,
+      contentType: "text/markdown",
+      byteSize: 128,
+      sha256: "0".repeat(64),
+      originalFilename: "findings.md",
+      createdByAgentId: agentId,
+    });
+    await db.insert(issueAttachments).values({
+      id: attachmentId,
+      companyId,
+      issueId,
+      assetId,
+    });
+    return attachmentId;
+  }
+
+  function quarantinedSourceTrust(issueId: string, runId: string, agentId: string) {
+    return {
+      preset: LOW_TRUST_REVIEW_PRESET,
+      disposition: "quarantined",
+      sourceIssueId: issueId,
+      sourceRunId: runId,
+      sourceAgentId: agentId,
+    };
+  }
+
+  function promotedSourceTrust(issueId: string, artifactKind: "document" | "work_product", artifactId: string) {
+    return {
+      preset: LOW_TRUST_REVIEW_PRESET,
+      disposition: "promoted",
+      sourceIssueId: issueId,
+      promotedFrom: {
+        artifactKind,
+        artifactId,
+        issueId,
+      },
+      promotedByActorType: "user",
+      promotedByActorId: "board-user",
+      promotedAt: "2026-07-31T00:00:00.000Z",
+    };
   }
 
   async function patchToDone(agentId: string, companyId: string, runId: string | null, issueId: string) {
@@ -259,6 +315,38 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
     expect(persisted.status).toBe("done");
     // The premise of the test: neither legacy escape hatch was available.
     expect(persisted.executionRunId).toBeNull();
+  });
+
+  it("does not accept a quarantined low-trust issue document as completion evidence", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    await addRunAttributedDocument(
+      companyId,
+      issueId,
+      agentId,
+      runId,
+      "findings",
+      quarantinedSourceTrust(issueId, runId, agentId),
+    );
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(422);
+    expect(response.body.details).toMatchObject({ reason: "no_execution_run_and_no_pr_evidence" });
+  });
+
+  it("accepts a promoted low-trust issue document as completion evidence", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    const { documentId } = await addRunAttributedDocument(companyId, issueId, agentId, runId);
+    await db
+      .update(documents)
+      .set({ sourceTrust: promotedSourceTrust(issueId, "document", documentId) })
+      .where(eq(documents.id, documentId));
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(200);
   });
 
   it("does not accept an old run-attributed document revision when the latest revision is runless", async () => {
@@ -325,7 +413,79 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
     expect(response.status).toBe(200);
   });
 
-  it("accepts a close backed by an attachment-backed artifact work product", async () => {
+  it("does not accept a quarantined low-trust artifact work product", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    await db.insert(issueWorkProducts).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      type: "artifact",
+      provider: "paperclip",
+      title: "Timeout archaeology dump",
+      url: "https://paperclip.blockcast.net/BLO/artifacts/timeout-archaeology",
+      status: "active",
+      createdByRunId: runId,
+      sourceTrust: quarantinedSourceTrust(issueId, runId, agentId),
+    });
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(422);
+    expect(response.body.details).toMatchObject({ reason: "no_execution_run_and_no_pr_evidence" });
+  });
+
+  it("accepts a promoted low-trust artifact work product", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    const workProductId = randomUUID();
+    await db.insert(issueWorkProducts).values({
+      id: workProductId,
+      companyId,
+      issueId,
+      type: "artifact",
+      provider: "paperclip",
+      title: "Timeout archaeology dump",
+      url: "https://paperclip.blockcast.net/BLO/artifacts/timeout-archaeology",
+      status: "active",
+      createdByRunId: runId,
+      sourceTrust: promotedSourceTrust(issueId, "work_product", workProductId),
+    });
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(200);
+  });
+
+  it("accepts a close backed by a real attachment-backed artifact work product", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    const attachmentId = await addIssueAttachment(companyId, issueId, agentId);
+    await db.insert(issueWorkProducts).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      type: "artifact",
+      provider: "paperclip",
+      title: "Timeout archaeology dump",
+      status: "active",
+      createdByRunId: runId,
+      metadata: {
+        attachmentId,
+        contentType: "text/markdown",
+        byteSize: 128,
+        contentPath: `/api/attachments/${attachmentId}/content`,
+        openPath: `/api/attachments/${attachmentId}/content`,
+        downloadPath: `/api/attachments/${attachmentId}/content?download=1`,
+      },
+    });
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(200);
+  });
+
+  it("does not accept a dangling attachment-backed artifact work product", async () => {
     await enableDoneExecutionGate();
     const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
     const attachmentId = randomUUID();
@@ -350,7 +510,50 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
 
     const response = await patchToDone(agentId, companyId, runId, issueId);
 
+    expect(response.status).toBe(422);
+    expect(response.body.details).toMatchObject({ reason: "no_execution_run_and_no_pr_evidence" });
+  });
+
+  it("accepts a run-attributed work product that references a real issue document", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    const { documentId } = await addRunAttributedDocument(companyId, issueId, agentId, null);
+    await db.insert(issueWorkProducts).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      type: "document",
+      provider: "paperclip",
+      title: "Findings document",
+      status: "active",
+      createdByRunId: runId,
+      metadata: { documentId },
+    });
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
     expect(response.status).toBe(200);
+  });
+
+  it("does not accept a work product that references a dangling document id", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    await db.insert(issueWorkProducts).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      type: "document",
+      provider: "paperclip",
+      title: "Findings document",
+      status: "active",
+      createdByRunId: runId,
+      metadata: { documentId: randomUUID() },
+    });
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(422);
+    expect(response.body.details).toMatchObject({ reason: "no_execution_run_and_no_pr_evidence" });
   });
 
   // Narrowing tests: these are the shapes that must NOT qualify. Each one is a
@@ -431,6 +634,73 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
       title: "Timeout archaeology dump",
       status: "active",
       createdByRunId: runId,
+    });
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(422);
+    expect(response.body.details).toMatchObject({ reason: "no_execution_run_and_no_pr_evidence" });
+  });
+
+  it("does not accept an empty resourceRef artifact work product", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    await db.insert(issueWorkProducts).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      type: "artifact",
+      provider: "paperclip",
+      title: "Timeout archaeology dump",
+      status: "active",
+      createdByRunId: runId,
+      metadata: { resourceRef: {} },
+    });
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(422);
+    expect(response.body.details).toMatchObject({ reason: "no_execution_run_and_no_pr_evidence" });
+  });
+
+  it("does not accept fabricated attachment paths without a resolved attachment id", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    await db.insert(issueWorkProducts).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      type: "artifact",
+      provider: "paperclip",
+      title: "Timeout archaeology dump",
+      status: "active",
+      createdByRunId: runId,
+      metadata: {
+        contentPath: "/api/attachments/not-real/content",
+        openPath: "/api/attachments/not-real/content",
+        downloadPath: "/api/attachments/not-real/content?download=1",
+      },
+    });
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(422);
+    expect(response.body.details).toMatchObject({ reason: "no_execution_run_and_no_pr_evidence" });
+  });
+
+  it("does not accept a work product that references a dangling document key", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    await db.insert(issueWorkProducts).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      type: "document",
+      provider: "paperclip",
+      title: "Findings document",
+      status: "active",
+      createdByRunId: runId,
+      metadata: { documentKey: "nonexistent-findings" },
     });
 
     const response = await patchToDone(agentId, companyId, runId, issueId);

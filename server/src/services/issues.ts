@@ -1902,23 +1902,98 @@ function preserveDurableLandingEvidence<T extends { allDetected?: unknown }>(
  * describe ephemeral infrastructure rather than a reviewable artifact.
  */
 const DURABLE_ARTIFACT_WORK_PRODUCT_TYPES = ["artifact", "document"] as const;
-const DURABLE_ARTIFACT_WORK_PRODUCT_METADATA_LOCATOR_KEYS = [
-  "attachmentId",
-  "contentPath",
-  "openPath",
-  "downloadPath",
-  "documentId",
-  "documentKey",
-] as const;
+const UUID_SQL_PATTERN =
+  "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$";
 
-function hasInspectableWorkProductLocator(): SQL {
+function hasTrustedOrPromotedSourceTrust(sourceTrustColumn: any): SQL {
+  return or(
+    isNull(sourceTrustColumn as any),
+    sql`${sourceTrustColumn}->>'disposition' = 'promoted'`,
+  )!;
+}
+
+function hasInspectableWorkProductLocator(issueId: string): SQL {
   return or(
     sql`${issueWorkProducts.url} ~ '[^[:space:]]'`,
-    sql`${issueWorkProducts.externalId} ~ '[^[:space:]]'`,
-    sql`jsonb_typeof(${issueWorkProducts.metadata}->'resourceRef') = 'object'`,
-    ...DURABLE_ARTIFACT_WORK_PRODUCT_METADATA_LOCATOR_KEYS.map(
-      (key) => sql`${issueWorkProducts.metadata}->>${key} ~ '[^[:space:]]'`,
-    ),
+    and(
+      sql`jsonb_typeof(${issueWorkProducts.metadata}->'resourceRef') = 'object'`,
+      sql`${issueWorkProducts.metadata}->'resourceRef'->>'kind' = 'workspace_file'`,
+      sql`${issueWorkProducts.metadata}->'resourceRef'->>'issueId' = ${issueId}`,
+      sql`${issueWorkProducts.metadata}->'resourceRef'->>'workspaceKind' in ('execution_workspace', 'project_workspace')`,
+      sql`${issueWorkProducts.metadata}->'resourceRef'->>'relativePath' ~ '[^[:space:]]'`,
+      sql`${issueWorkProducts.metadata}->'resourceRef'->>'displayPath' ~ '[^[:space:]]'`,
+      sql`case
+        when ${issueWorkProducts.metadata}->'resourceRef'->>'workspaceId' ~* ${UUID_SQL_PATTERN}
+        then (
+          (
+            ${issueWorkProducts.metadata}->'resourceRef'->>'workspaceKind' = 'execution_workspace'
+            and exists (
+              select 1
+              from execution_workspaces durable_execution_workspace
+              where durable_execution_workspace.id = (${issueWorkProducts.metadata}->'resourceRef'->>'workspaceId')::uuid
+                and durable_execution_workspace.company_id = ${issueWorkProducts.companyId}
+                and durable_execution_workspace.source_issue_id = ${issueWorkProducts.issueId}
+            )
+          )
+          or (
+            ${issueWorkProducts.metadata}->'resourceRef'->>'workspaceKind' = 'project_workspace'
+            and exists (
+              select 1
+              from project_workspaces durable_project_workspace
+              where durable_project_workspace.id = (${issueWorkProducts.metadata}->'resourceRef'->>'workspaceId')::uuid
+                and durable_project_workspace.company_id = ${issueWorkProducts.companyId}
+            )
+          )
+        )
+        else false
+      end`,
+    )!,
+    sql`case
+      when ${issueWorkProducts.metadata}->>'attachmentId' ~* ${UUID_SQL_PATTERN}
+      then exists (
+        select 1
+        from issue_attachments durable_attachment
+        where durable_attachment.id = (${issueWorkProducts.metadata}->>'attachmentId')::uuid
+          and durable_attachment.company_id = ${issueWorkProducts.companyId}
+          and durable_attachment.issue_id = ${issueWorkProducts.issueId}
+          and ${issueWorkProducts.metadata}->>'contentPath' = '/api/attachments/' || durable_attachment.id::text || '/content'
+          and ${issueWorkProducts.metadata}->>'openPath' = '/api/attachments/' || durable_attachment.id::text || '/content'
+          and ${issueWorkProducts.metadata}->>'downloadPath' = '/api/attachments/' || durable_attachment.id::text || '/content?download=1'
+      )
+      else false
+    end`,
+    sql`case
+      when ${issueWorkProducts.metadata}->>'documentId' ~* ${UUID_SQL_PATTERN}
+      then exists (
+        select 1
+        from issue_documents durable_issue_document
+        inner join documents durable_document
+          on durable_document.id = durable_issue_document.document_id
+        inner join document_revisions durable_revision
+          on durable_revision.id = durable_document.latest_revision_id
+        where durable_document.id = (${issueWorkProducts.metadata}->>'documentId')::uuid
+          and durable_issue_document.company_id = ${issueWorkProducts.companyId}
+          and durable_issue_document.issue_id = ${issueWorkProducts.issueId}
+          and durable_issue_document.key not in (${DONE_GATE_NON_QUALIFYING_DOCUMENT_KEY_SQL_LIST})
+          and (durable_document.source_trust is null or durable_document.source_trust->>'disposition' = 'promoted')
+          and durable_revision.body ~ '[^[:space:]]'
+      )
+      else false
+    end`,
+    sql`exists (
+      select 1
+      from issue_documents durable_issue_document
+      inner join documents durable_document
+        on durable_document.id = durable_issue_document.document_id
+      inner join document_revisions durable_revision
+        on durable_revision.id = durable_document.latest_revision_id
+      where durable_issue_document.company_id = ${issueWorkProducts.companyId}
+        and durable_issue_document.issue_id = ${issueWorkProducts.issueId}
+        and durable_issue_document.key = ${issueWorkProducts.metadata}->>'documentKey'
+        and durable_issue_document.key not in (${DONE_GATE_NON_QUALIFYING_DOCUMENT_KEY_SQL_LIST})
+        and (durable_document.source_trust is null or durable_document.source_trust->>'disposition' = 'promoted')
+        and durable_revision.body ~ '[^[:space:]]'
+    )`,
   )!;
 }
 
@@ -1935,6 +2010,10 @@ const DONE_GATE_NON_QUALIFYING_DOCUMENT_KEYS: readonly string[] = [
   ...SYSTEM_ISSUE_DOCUMENT_KEYS,
   "plan",
 ];
+const DONE_GATE_NON_QUALIFYING_DOCUMENT_KEY_SQL_LIST = sql.join(
+  DONE_GATE_NON_QUALIFYING_DOCUMENT_KEYS.map((key) => sql`${key}`),
+  sql`, `,
+);
 
 /**
  * Does this issue carry a durable artifact that a real run produced? (BLO-19081)
@@ -1943,9 +2022,9 @@ const DONE_GATE_NON_QUALIFYING_DOCUMENT_KEYS: readonly string[] = [
  * hole in the gate. Two qualifying shapes, both requiring run attribution:
  *
  *  - an issue document (excluding plan/system keys) whose latest revision has a
- *    non-empty body and is stamped `createdByRunId`;
- *  - an active, inspectable `artifact`/`document` work product stamped
- *    `createdByRunId`.
+ *    non-empty body, is stamped `createdByRunId`, and is trusted or promoted;
+ *  - an active, trusted-or-promoted, inspectable `artifact`/`document` work
+ *    product stamped `createdByRunId`.
  *
  * `createdByRunId` is written from the authenticated actor's run context in the
  * route layer, never from the request body, so it cannot be forged by a client.
@@ -1964,6 +2043,7 @@ async function fetchDurableArtifactEvidence(dbOrTx: any, issueId: string): Promi
         and(
           eq(issueDocuments.issueId, issueId),
           notInArray(issueDocuments.key, [...DONE_GATE_NON_QUALIFYING_DOCUMENT_KEYS]),
+          hasTrustedOrPromotedSourceTrust(documents.sourceTrust),
           isNotNull(documentRevisions.createdByRunId),
           // Must contain at least one non-whitespace character. A body of
           // spaces, tabs or newlines is as empty as `''` and would otherwise
@@ -1976,7 +2056,8 @@ async function fetchDurableArtifactEvidence(dbOrTx: any, issueId: string): Promi
           sql`${documentRevisions.body} ~ '[^[:space:]]'`,
         ),
       )
-      .limit(1),
+      .limit(1)
+      .for("update"),
     dbOrTx
       .select({ id: issueWorkProducts.id })
       .from(issueWorkProducts)
@@ -1985,11 +2066,13 @@ async function fetchDurableArtifactEvidence(dbOrTx: any, issueId: string): Promi
           eq(issueWorkProducts.issueId, issueId),
           inArray(issueWorkProducts.type, [...DURABLE_ARTIFACT_WORK_PRODUCT_TYPES]),
           eq(issueWorkProducts.status, "active"),
+          hasTrustedOrPromotedSourceTrust(issueWorkProducts.sourceTrust),
           isNotNull(issueWorkProducts.createdByRunId),
-          hasInspectableWorkProductLocator(),
+          hasInspectableWorkProductLocator(issueId),
         ),
       )
-      .limit(1),
+      .limit(1)
+      .for("update"),
   ]);
   return documentRows.length > 0 || workProductRows.length > 0;
 }
@@ -8040,7 +8123,7 @@ export function issueService(db: Db) {
       // only cause us to look harder, never to skip a block.
       let doneTransitionEvidenceVerdict: Awaited<ReturnType<typeof runEvidenceGate>> | null = null;
       let doneGateEvidenceVerdict = existing.lastEvidenceVerdict;
-      let doneGateHasDurableArtifact = false;
+      let doneGateNeedsDurableArtifactCheck = false;
       const doneGateInput = {
         fromStatus: existing.status,
         toStatus: issueData.status,
@@ -8071,36 +8154,14 @@ export function issueService(db: Db) {
             "done-execution gate: evidence refresh failed; preserving block posture",
           );
         }
-        try {
-          doneGateHasDurableArtifact = await fetchDurableArtifactEvidence(dbOrTx, id);
-        } catch (err) {
-          // Fail CLOSED: an artifact lookup we could not complete is not
-          // evidence, so leave the flag false and let the gate block.
-          logger.warn(
-            {
-              issueId: id,
-              err: err instanceof Error ? err.message : String(err),
-            },
-            "done-execution gate: durable-artifact lookup failed; preserving block posture",
-          );
-        }
-      }
-
-      if (
-        experimental.enableDoneExecutionGate &&
-        shouldBlockNarratedDone({
+        doneGateNeedsDurableArtifactCheck = shouldBlockNarratedDone({
           fromStatus: existing.status,
           toStatus: issueData.status,
           existingExecutionRunId: existing.executionRunId,
           lastEvidenceVerdict: doneGateEvidenceVerdict,
           isAgentActor: actorAgentId != null,
-          hasDurableArtifactEvidence: doneGateHasDurableArtifact,
-        })
-      ) {
-        throw unprocessable(
-          "Issue cannot be marked done without execution evidence (no execution run, no pr-link evidence, and no run-attributed durable artifact). Attach a PR link, or write the deliverable to an issue document (PUT /api/issues/:id/documents/:key) before closing — a comment body is not sufficient.",
-          { reason: "no_execution_run_and_no_pr_evidence", issueId: id },
-        );
+          hasDurableArtifactEvidence: false,
+        });
       }
 
       const patch: Partial<typeof issues.$inferInsert> = {
@@ -8311,6 +8372,37 @@ export function issueService(db: Db) {
           projectGoalId: nextProjectGoalId,
           defaultGoalId: defaultCompanyGoal?.id ?? null,
         });
+        if (doneGateNeedsDurableArtifactCheck) {
+          let doneGateHasDurableArtifact = false;
+          try {
+            doneGateHasDurableArtifact = await fetchDurableArtifactEvidence(tx, id);
+          } catch (err) {
+            // Fail CLOSED: an artifact lookup we could not complete is not
+            // evidence, so leave the flag false and let the gate block.
+            logger.warn(
+              {
+                issueId: id,
+                err: err instanceof Error ? err.message : String(err),
+              },
+              "done-execution gate: durable-artifact lookup failed; preserving block posture",
+            );
+          }
+          if (
+            shouldBlockNarratedDone({
+              fromStatus: existing.status,
+              toStatus: issueData.status,
+              existingExecutionRunId: existing.executionRunId,
+              lastEvidenceVerdict: doneGateEvidenceVerdict,
+              isAgentActor: actorAgentId != null,
+              hasDurableArtifactEvidence: doneGateHasDurableArtifact,
+            })
+          ) {
+            throw unprocessable(
+              "Issue cannot be marked done without execution evidence (no execution run, no pr-link evidence, and no run-attributed durable artifact). Attach a PR link, or write the deliverable to an issue document (PUT /api/issues/:id/documents/:key) before closing — a comment body is not sufficient.",
+              { reason: "no_execution_run_and_no_pr_evidence", issueId: id },
+            );
+          }
+        }
         const updated = await tx
           .update(issues)
           .set(patch)
