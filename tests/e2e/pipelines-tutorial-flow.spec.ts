@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { expect, request as pwRequest, test, type APIRequestContext, type APIResponse, type Locator, type Page } from "@playwright/test";
+import { expect, request as pwRequest, test, type APIRequestContext, type APIResponse, type Locator, type Page, type TestInfo } from "@playwright/test";
 import { createLocalAgentJwt } from "../../server/src/agent-auth-jwt";
 
 const PORT = Number(process.env.PAPERCLIP_E2E_PORT ?? 3199);
 const BASE_URL = `http://127.0.0.1:${PORT}`;
+const DRAG_CONFIRMATION_PROBE_TIMEOUT = 10_000;
 
 type Stage = { id: string; key: string; name: string; kind: string; position: number };
 type PipelineDetail = {
@@ -264,11 +265,18 @@ async function dragCardToColumn(page: Page, itemTitle: string, fromColumn: strin
   await page.mouse.up();
 
   try {
-    await expect(page.getByRole("dialog")).toBeVisible({ timeout: 3_000 });
+    await expect(page.getByRole("dialog")).toBeVisible({ timeout: DRAG_CONFIRMATION_PROBE_TIMEOUT });
     return true;
   } catch {
     return false;
   }
+}
+
+function recordDragFallback(testInfo: TestInfo, itemTitle: string, fromColumn: string, toColumn: string) {
+  testInfo.annotations.push({
+    type: "pipeline-drag-api-fallback",
+    description: `Drag confirmation did not appear within ${DRAG_CONFIRMATION_PROBE_TIMEOUT}ms for "${itemTitle}" from ${fromColumn} to ${toColumn}; used API fallback.`,
+  });
 }
 
 function reviewQueueRow(page: Page, title: string): Locator {
@@ -436,7 +444,7 @@ test.describe("Pipelines tutorial UI flow", () => {
     await board.dispose();
   });
 
-  test("walks setup, intake, board moves, item detail, review queue, and learnings", async ({ page }) => {
+  test("walks setup, intake, board moves, item detail, review queue, and learnings", async ({ page }, testInfo) => {
     const board = await pwRequest.newContext({ baseURL: BASE_URL });
     const company = await createCompany(board);
     await createCompanyAgent(board, company.id, {
@@ -469,7 +477,7 @@ test.describe("Pipelines tutorial UI flow", () => {
     const contentTypeVariable = page
       .getByText("{{content_type}}", { exact: true })
       .locator("xpath=ancestor::div[contains(@class, 'p-4')][1]");
-    await expect(contentTypeVariable).toBeVisible();
+    await expect(contentTypeVariable).toBeVisible({ timeout: slowUiTimeout });
     await contentTypeVariable.locator("input").first().fill("Content type");
     await contentTypeVariable.getByRole("combobox").first().click();
     await page.getByRole("option", { name: "select" }).click();
@@ -551,13 +559,13 @@ test.describe("Pipelines tutorial UI flow", () => {
       await row.getByRole("combobox").click();
       await page.getByRole("option", { name: plan.contentType }).click();
     }
-    await expect(page.getByRole("button", { name: "Submit 3 items" })).toBeEnabled();
+    await expect(page.getByRole("button", { name: "Submit 3 items" })).toBeEnabled({ timeout: slowUiTimeout });
     const [batchResponse] = await Promise.all([
       page.waitForResponse(
         (response) =>
           response.request().method() === "POST" &&
           response.url().endsWith(`/api/pipelines/${pipeline.id}/cases/batch`),
-        { timeout: 30_000 },
+        { timeout: slowUiTimeout },
       ),
       page.getByRole("button", { name: "Submit 3 items" }).click(),
     ]);
@@ -582,9 +590,12 @@ test.describe("Pipelines tutorial UI flow", () => {
 
     const blogDragged = await dragCardToColumn(page, "Launch blog post", "Drafting", "Assets");
     if (blogDragged) {
-      await expect(page.getByRole("heading", { name: "Move Launch blog post?" })).toBeVisible();
+      await expect(page.getByRole("heading", { name: "Move Launch blog post?" })).toBeVisible({
+        timeout: slowUiTimeout,
+      });
       await page.getByRole("button", { name: "Move it" }).click();
     } else {
+      recordDragFallback(testInfo, "Launch blog post", "Drafting", "Assets");
       await moveItem(board, blog!.id, assets!.key);
       await page.reload();
     }
@@ -601,11 +612,18 @@ test.describe("Pipelines tutorial UI flow", () => {
     const tweetDragged = await dragCardToColumn(page, "Launch tweet", "Drafting", "Published");
     const overrideReason = "Tweet can skip review because the blog post already covers the announcement.";
     if (tweetDragged) {
-      await expect(page.getByRole("heading", { name: "This skips the normal flow" })).toBeVisible();
-      await page.getByLabel("Reason").fill(overrideReason);
-      await expect(page.getByRole("button", { name: "Override and move" })).toBeEnabled();
+      await expect(page.getByRole("heading", { name: "This skips the normal flow" })).toBeVisible({
+        timeout: slowUiTimeout,
+      });
+      const reasonField = page.getByLabel("Reason");
+      await expect(reasonField).toBeVisible({ timeout: slowUiTimeout });
+      await reasonField.fill(overrideReason);
+      await expect(page.getByRole("button", { name: "Override and move" })).toBeEnabled({
+        timeout: slowUiTimeout,
+      });
       await page.getByRole("button", { name: "Override and move" }).click();
     } else {
+      recordDragFallback(testInfo, "Launch tweet", "Drafting", "Published");
       await moveItem(board, tweet!.id, published!.key, { reason: overrideReason, force: true });
       await page.reload();
     }
