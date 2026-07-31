@@ -148,3 +148,56 @@ export function resolveAcPolicyFilingTarget(
 export function isAcPolicyFilingTargetActionable(target: AcPolicyFilingTarget): boolean {
   return target.kind !== "unroutable";
 }
+
+export type AcPolicyResolvedOwner = {
+  /** Owner the sweep started from, for the dashboard's left-hand column. */
+  label: string;
+  target: AcPolicyFilingTarget;
+};
+
+/**
+ * Render re-routed and unroutable owners for the dashboard comment.
+ *
+ * Routine revision 8 requires the `skipped` chain to be visible: a reader must
+ * be able to see *why* a filing moved off its assignee, not merely that it did.
+ * Owners whose assignee executes are omitted — nothing moved, so there is
+ * nothing to explain.
+ */
+export function formatAcPolicyFilingTargetSections(owners: AcPolicyResolvedOwner[]) {
+  const rerouted = owners.filter(
+    (owner) => owner.target.kind !== "unroutable" && owner.target.skipped.length > 0,
+  );
+  const unroutable = owners.filter((owner) => owner.target.kind === "unroutable");
+
+  const describeSkips = (target: AcPolicyFilingTarget) =>
+    target.skipped.map((entry) => `${entry.name} (${entry.reason})`).join(" → ") || "none";
+
+  const lines: string[] = [`### Re-routed filings (${rerouted.length})`];
+  if (rerouted.length === 0) {
+    lines.push("- None");
+  } else {
+    for (const owner of rerouted) {
+      const target = owner.target;
+      const to =
+        target.kind === "user"
+          ? `user ${target.userId}`
+          : target.kind === "agent"
+            ? `agent ${target.agentId}`
+            : "nobody";
+      lines.push(`- ${owner.label} → ${to} (${target.reason}); skipped: ${describeSkips(target)}`);
+    }
+  }
+
+  lines.push("", `### Unroutable owners — reported, not filed (${unroutable.length})`);
+  if (unroutable.length === 0) {
+    lines.push("- None");
+  } else {
+    for (const owner of unroutable) {
+      lines.push(
+        `- ${owner.label} - ${owner.target.reason}; skipped: ${describeSkips(owner.target)}`,
+      );
+    }
+  }
+
+  return lines.join("\n");
+}

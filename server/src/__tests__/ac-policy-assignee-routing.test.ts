@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatAcPolicyFilingTargetSections,
   isAcPolicyFilingTargetActionable,
   resolveAcPolicyFilingTarget,
   type AcPolicySweepAgent,
@@ -209,5 +210,49 @@ describe("AC-policy sweep filing-target selection", () => {
       expect(picked?.status).not.toBe("terminated");
       expect(picked?.status).not.toBe("pending_approval");
     }
+  });
+});
+
+describe("AC-policy filing-target dashboard rendering", () => {
+  const agents = [CEO, OPERATOR, ENGINEER];
+  const resolve = (assigneeAgentId: string | null, responsibleUserId: string | null = null) =>
+    resolveAcPolicyFilingTarget({ assigneeAgentId, responsibleUserId, agents });
+
+  it("shows why each filing moved, and omits owners that did not move", () => {
+    const rendered = formatAcPolicyFilingTargetSections([
+      { label: "Engineer", target: resolve("engineer") },
+      { label: "Operator (devbox)", target: resolve("operator-devbox", "user-1") },
+    ]);
+
+    expect(rendered).toContain("### Re-routed filings (1)");
+    expect(rendered).toContain(
+      "- Operator (devbox) → user user-1 (responsible_user); skipped: Operator (devbox) (paused)",
+    );
+    // The engineer's filing did not move, so there is nothing to explain.
+    expect(rendered).not.toContain("Engineer →");
+    expect(rendered).toContain("### Unroutable owners — reported, not filed (0)");
+  });
+
+  it("renders the full skipped chain and unroutable reasons", () => {
+    const stuck = resolveAcPolicyFilingTarget({
+      assigneeAgentId: "operator-devbox",
+      responsibleUserId: null,
+      agents: [agent("ceo", "paused", null, "CEO"), OPERATOR],
+    });
+    const rendered = formatAcPolicyFilingTargetSections([{ label: "Operator (devbox)", target: stuck }]);
+
+    expect(rendered).toContain("### Unroutable owners — reported, not filed (1)");
+    expect(rendered).toContain("no_executing_target");
+    expect(rendered).toContain("Operator (devbox) (paused) → CEO (paused)");
+    expect(rendered).toContain("### Re-routed filings (0)");
+  });
+
+  it("renders empty sections rather than nothing when there is no drift", () => {
+    const rendered = formatAcPolicyFilingTargetSections([
+      { label: "Engineer", target: resolve("engineer") },
+    ]);
+
+    expect(rendered).toContain("### Re-routed filings (0)");
+    expect(rendered).toContain("- None");
   });
 });
