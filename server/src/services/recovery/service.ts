@@ -33,7 +33,7 @@ import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
 import { redactSensitiveText } from "../../redaction.js";
-import { logActivity } from "../activity-log.js";
+import { logActivity, type LogActivityInput } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
@@ -94,6 +94,8 @@ export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+type DbOrTransaction = Db | DbTransaction;
 // BLO-18995: how long an issue execution lock may be held by a run that has
 // not yet been claimed (status still `queued`/`scheduled_retry`, startedAt
 // null) before sweepStaleIssueLocks treats it as stale and clears it.
@@ -3692,7 +3694,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
-  }) {
+  }, dbOrTx: DbOrTransaction = db) {
     const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
     const routing = await resolveStrandedRecoveryRouting({
       issue: input.issue,
@@ -3708,7 +3710,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     // Read existing action before upsert so we can compare lastAttemptAt against
     // issue.lastActivityAt and suppress duplicate non-assignee wakes when nothing changed.
-    const existingAction = await recoveryActionsSvc.getActiveForIssue(input.issue.companyId, input.issue.id);
+    const existingAction = await recoveryActionsSvc.getActiveForIssue(input.issue.companyId, input.issue.id, dbOrTx);
     const previousAttemptAt = existingAction?.lastAttemptAt
       ? new Date(existingAction.lastAttemptAt as Date | string)
       : null;
@@ -3784,7 +3786,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         : null,
       maxAttempts: null,
       lastAttemptAt: now,
-    });
+    }, dbOrTx);
 
     return { action, hasNewActivitySinceLastAttempt };
   }
@@ -3881,8 +3883,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     latestRun: LatestIssueRun;
     actionId: string;
     agentId: string;
-  }) {
-    const existing = await db
+  }, dbOrTx: DbOrTransaction = db) {
+    const existing = await dbOrTx
       .select()
       .from(heartbeatRuns)
       .where(and(
@@ -3898,7 +3900,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     const now = new Date();
     const retryAt = readProviderQuotaRetryAt(input.latestRun, now);
-    return db.transaction(async (tx) => {
+    const createMonitor = async (tx: DbOrTransaction) => {
       const wakeup = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -3963,7 +3965,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         })
         .where(eq(issueRecoveryActions.id, input.actionId));
       return scheduledRun;
-    });
+    };
+    if ("transaction" in dbOrTx) {
+      return dbOrTx.transaction((tx) => createMonitor(tx));
+    }
+    return createMonitor(dbOrTx);
   }
 
   function buildRecoveryIssueInPlaceEscalationComment(input: {
@@ -4491,7 +4497,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // The advisory lock is xact-scoped on this tx's connection; once we
     // commit/return, waiting peers wake up and record their next attempt
     // against the same active source-scoped action.
-    return await db.transaction(async (tx) => {
+    const outcome = await db.transaction(async (tx) => {
       await tx.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${input.issue.companyId} || ':' || ${input.issue.id}, 0))`,
       );
@@ -4559,7 +4565,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         recoveryCause,
         recoveryOwnerAgentId: routing.ownerAgentId,
         successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
-      });
+      }, tx);
       const isProviderQuotaWait = recoveryCause === "provider_quota" &&
         !action.ownerAgentId && Boolean(action.returnOwnerAgentId);
       if (isProviderQuotaWait && action.returnOwnerAgentId) {
@@ -4568,17 +4574,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           latestRun: input.latestRun,
           actionId: action.id,
           agentId: action.returnOwnerAgentId,
-        });
+        }, tx);
       }
 
-      await enqueueSourceScopedStrandedRecoveryWake({
+      const pendingWake = {
         action,
         issue: fresh,
         latestRun: input.latestRun,
         recoveryCause,
         hasNewActivitySinceLastAttempt,
-      });
-      if (isProviderQuotaWait) return updated;
+      };
+      if (isProviderQuotaWait) {
+        return { updated, pendingWake, activity: null, humanDecisionEvent: null };
+      }
 
       const prefix = await getCompanyIssuePrefix(fresh.companyId);
       const recoveryOwner = action.ownerAgentId ? await getAgent(action.ownerAgentId) : null;
@@ -4647,7 +4655,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         const escalationCommentMarker = announcesReassignment
           ? reassignmentMarker
           : `Recovery action: \`${action.id}\``;
-        const hasEscalationComment = await db
+        const hasEscalationComment = await tx
           .select({ id: issueComments.id, body: issueComments.body, metadata: issueComments.metadata })
           .from(issueComments)
           .where(and(eq(issueComments.issueId, fresh.id), eq(issueComments.authorType, "system")))
@@ -4666,19 +4674,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               authorType: "system",
               presentation: notice.presentation,
               metadata: notice.metadata,
-            });
+            }, tx);
           } else {
             await issuesSvc.addComment(
               fresh.id,
               `${input.comment ?? "Automatic stranded-work recovery needs manual attention."}${recoveryLine}`,
               {},
               { authorType: "system" },
+              tx,
             );
           }
         }
       }
 
-      await logActivity(db, {
+      const activity: LogActivityInput = {
         companyId: fresh.companyId,
         actorType: "system",
         actorId: "system",
@@ -4713,26 +4722,40 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           returnOwnerAgentId: action.returnOwnerAgentId,
           blockerIssueIds: blockerIds,
         },
-      });
+      };
 
+      let humanDecisionEvent: Parameters<typeof emitNeedsHumanDecisionEscalationEvent>[0] | null = null;
       if (needsHumanDecision) {
         const assigneeAgent = fresh.assigneeAgentId
-          ? await db
+          ? await tx
             .select({ name: agents.name })
             .from(agents)
             .where(and(eq(agents.companyId, fresh.companyId), eq(agents.id, fresh.assigneeAgentId)))
             .limit(1)
             .then((rows) => rows[0] ?? null)
           : null;
-        await emitNeedsHumanDecisionEscalationEvent({
+        humanDecisionEvent = {
           issue: fresh,
           assigneeAgentName: assigneeAgent?.name ?? null,
           blockedByIssueIds: blockerIds,
-        });
+        };
       }
 
-      return updated;
+      return { updated, pendingWake, activity, humanDecisionEvent };
     });
+    if (!outcome) return null;
+
+    if (outcome.pendingWake) {
+      await enqueueSourceScopedStrandedRecoveryWake(outcome.pendingWake);
+    }
+    if (outcome.activity) {
+      await logActivity(db, outcome.activity);
+    }
+    if (outcome.humanDecisionEvent) {
+      await emitNeedsHumanDecisionEscalationEvent(outcome.humanDecisionEvent);
+    }
+
+    return outcome.updated;
   }
 
   function buildZeroTokenStartupFailureComment(input: {

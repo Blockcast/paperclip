@@ -53,6 +53,7 @@ import {
   githubPostIssueComment,
 } from "../services/github-app-auth.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { recordGithubReviewRequestDelivery } from "../services/metrics.js";
 import {
   recordMergedPullRequest,
   enrichAuthoredLocForRow,
@@ -1908,7 +1909,15 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             return false;
           }
 
-          await heartbeat.wakeup(reviewerAgentId, {
+          // BLO-18859: every suppression gate is behind us and a reviewer is
+          // resolved, so this delivery is now committed to producing a wake.
+          // Counting `received` here (rather than at signature verification)
+          // makes `received - queued` a measure of real loss between intent and
+          // durability — deduped/self-echo/no-reviewer deliveries are correct
+          // no-ops and would otherwise swamp that gap in steady state.
+          recordGithubReviewRequestDelivery({ state: "received", reason: context.wakeReason });
+
+          const wakeResult = await heartbeat.wakeup(reviewerAgentId, {
             source: "automation",
             triggerDetail: "system",
             reason: context.wakeReason,
@@ -1951,7 +1960,46 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             // later explicit re-review comment can wake Ally again.
             idempotencyKey,
           });
-          return true;
+          // A truthy result means the durable agent_wakeup_requests row is
+          // committed AND a run was enqueued/coalesced; from here the wake
+          // survives this process dying. Any transient dispatch failure inside
+          // wakeup() has already been retried and counted as `retried` by
+          // wakeupWithDispatchRetry, so this only fires on real durability.
+          //
+          // A `null` result is NOT a success: enqueueWakeup resolves null
+          // (without throwing) when a scheduling gate declines the wake — it
+          // writes a status="skipped" row and no run. Counting that as `queued`
+          // reported a healthy received+queued funnel for a review that never
+          // ran, hiding exactly the BLO-18847 symptom this counter exists to
+          // surface. No reconciler pass re-arms a skipped row, so it is
+          // terminal for this delivery.
+          if (wakeResult) {
+            recordGithubReviewRequestDelivery({ state: "queued", reason: context.wakeReason });
+            return true;
+          }
+          // The terminal `suppressed` increment is NOT emitted here: the wake
+          // path owns it, because only `enqueueWakeup` knows which gate
+          // declined and the suppression metric's `cause` label needs that. The
+          // same applies to an HttpError refusal, which never reaches this line
+          // at all — it propagates to the catch below, and counting it here
+          // would have been impossible (BLO-18859 review follow-up).
+          logger.warn(
+            {
+              agentId: reviewerAgentId,
+              event: eventName,
+              githubDeliveryId: deliveryId,
+              prNumber: context.prNumber,
+              repoFullName: context.repoFullName,
+              wakeReason: context.wakeReason,
+            },
+            "github webhook reviewer wake did not queue a run; a gate declined it "
+              + "(check agent_wakeup_requests for the skipped row's reason) or the "
+              + "provider-capacity gate deferred it to a scheduled_retry run",
+          );
+          // Matches every other suppression gate in this closure, so the 200
+          // response body cannot claim reviewerWakeFired for a wake that did
+          // not produce a run.
+          return false;
         });
       } catch (err) {
         logger.error(

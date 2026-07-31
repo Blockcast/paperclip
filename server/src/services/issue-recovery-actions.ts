@@ -123,8 +123,12 @@ export function issueRecoveryActionService(db: Db) {
     }
   }
 
-  async function getActiveForIssue(companyId: string, sourceIssueId: string): Promise<IssueRecoveryAction | null> {
-    const row = await db
+  async function getActiveForIssue(
+    companyId: string,
+    sourceIssueId: string,
+    dbOrTx: DbOrTransaction = db,
+  ): Promise<IssueRecoveryAction | null> {
+    const row = await dbOrTx
       .select()
       .from(issueRecoveryActions)
       .where(
@@ -163,6 +167,7 @@ export function issueRecoveryActionService(db: Db) {
   async function retryUpsertSourceScoped(
     input: UpsertIssueRecoveryActionInput,
     retryCount: number,
+    dbOrTx: DbOrTransaction,
     error?: unknown,
   ): Promise<IssueRecoveryAction> {
     if (retryCount >= MAX_UPSERT_RETRIES) {
@@ -171,18 +176,19 @@ export function issueRecoveryActionService(db: Db) {
         `Failed to upsert active recovery action for issue ${input.sourceIssueId} after ${MAX_UPSERT_RETRIES} retries`,
       );
     }
-    return upsertSourceScopedUnlocked(input, retryCount + 1);
+    return upsertSourceScopedUnlocked(input, retryCount + 1, dbOrTx);
   }
 
   async function upsertSourceScopedUnlocked(
     input: UpsertIssueRecoveryActionInput,
     retryCount = 0,
+    dbOrTx: DbOrTransaction = db,
   ): Promise<IssueRecoveryAction> {
-    const existing = await getActiveForIssue(input.companyId, input.sourceIssueId);
+    const existing = await getActiveForIssue(input.companyId, input.sourceIssueId, dbOrTx);
     const now = new Date();
     const ownerType = input.ownerType ?? (input.ownerAgentId ? "agent" : "board");
     if (existing) {
-      const [updated] = await db
+      const [updated] = await dbOrTx
         .update(issueRecoveryActions)
         .set({
           recoveryIssueId: input.recoveryIssueId ?? null,
@@ -216,13 +222,13 @@ export function issueRecoveryActionService(db: Db) {
         )
         .returning();
       if (!updated) {
-        return retryUpsertSourceScoped(input, retryCount);
+        return retryUpsertSourceScoped(input, retryCount, dbOrTx);
       }
       return toReadModel(updated!);
     }
 
     try {
-      const [created] = await db
+      const [created] = await dbOrTx
         .insert(issueRecoveryActions)
         .values({
           companyId: input.companyId,
@@ -250,14 +256,15 @@ export function issueRecoveryActionService(db: Db) {
       return toReadModel(created!);
     } catch (error) {
       if (!isUniqueRecoveryActionConflict(error)) throw error;
-      return retryUpsertSourceScoped(input, retryCount, error);
+      return retryUpsertSourceScoped(input, retryCount, dbOrTx, error);
     }
   }
 
   async function upsertSourceScoped(
     input: UpsertIssueRecoveryActionInput,
+    dbOrTx: DbOrTransaction = db,
   ): Promise<IssueRecoveryAction> {
-    return runExclusiveUpsert(input, () => upsertSourceScopedUnlocked(input));
+    return runExclusiveUpsert(input, () => upsertSourceScopedUnlocked(input, 0, dbOrTx));
   }
 
   async function resolveActiveForIssue(
