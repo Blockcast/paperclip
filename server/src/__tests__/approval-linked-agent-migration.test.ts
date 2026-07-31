@@ -27,19 +27,58 @@ describeEmbeddedPostgres("approval linked-agent migration", () => {
     await tempDb?.cleanup();
   });
 
-  it("backfills legacy built-in approvals for approve, reject, and withdraw", async () => {
+  it("backfills every legacy hire row class and neutralises the ones it cannot bind", async () => {
     const connectionString = tempDb!.connectionString;
     const legacyDb = createDb(connectionString);
     const companyId = randomUUID();
-    const cases = [
-      { action: "approve", key: "briefs" },
-      { action: "reject", key: "learning" },
-      { action: "withdraw", key: "reflection-coach" },
-    ].map(({ action, key }) => ({
+
+    // One case per row class the migration has to reason about. `bind` is the
+    // expectation for `linked_agent_id` once the migration has run.
+    const builtIn = ["approve", "reject", "withdraw"].map((action, index) => ({
+      kind: "builtIn" as const,
       action,
+      key: ["briefs", "learning", "reflection-coach"][index]!,
       agentId: randomUUID(),
       approvalId: randomUUID(),
-      key,
+      agentStatus: "pending_approval",
+      bind: true,
+    }));
+    // Backfill #1: the /api/agents and plugin-managed routes record the binding
+    // on the `approval.created` activity instead of a built-in key.
+    const activityLinked = {
+      kind: "activityLinked" as const,
+      agentId: randomUUID(),
+      approvalId: randomUUID(),
+      agentStatus: "pending_approval",
+      bind: true,
+    };
+    // Backfill #3: the generic POST /api/approvals route records neither, so the
+    // payload reference is the only thing left to bind from.
+    const genericPending = {
+      kind: "genericPending" as const,
+      agentId: randomUUID(),
+      approvalId: randomUUID(),
+      agentStatus: "pending_approval",
+      bind: true,
+    };
+    // Unbindable: the referenced agent is no longer a pending hire, so there is
+    // nothing to clean up and the stale reference has to be dropped instead.
+    const genericStale = {
+      kind: "genericStale" as const,
+      agentId: randomUUID(),
+      approvalId: randomUUID(),
+      agentStatus: "idle",
+      bind: false,
+    };
+    // Ambiguous: two undecided approvals claim one pending agent, so neither may
+    // bind it -- a many-to-one binding would let one withdrawal strand the other.
+    const ambiguousAgentId = randomUUID();
+    const ambiguous = ["a", "b"].map(() => ({
+      kind: "ambiguous" as const,
+      agentId: ambiguousAgentId,
+      approvalId: randomUUID(),
+      agentStatus: "pending_approval",
+      bind: false,
     }));
 
     const migration = await fs.promises.readFile(
@@ -54,88 +93,127 @@ describeEmbeddedPostgres("approval linked-agent migration", () => {
 
     await legacyDb.execute(sql`
         INSERT INTO "companies" ("id", "name", "issue_prefix")
-        VALUES (${companyId}, 'Legacy built-in company', 'LBI')
+        VALUES (${companyId}, 'Legacy hire company', 'LHC')
       `);
-    for (const testCase of cases) {
-      const metadata = {
-        paperclipBuiltInAgent: { key: testCase.key, featureKeys: [testCase.key] },
-      };
-      const payload = {
-        name: `Legacy ${testCase.action}`,
-        role: "general",
-        agentId: testCase.agentId,
-        sourceBuiltInAgentKey: testCase.key,
-        metadata,
-      };
+
+    const seedAgent = async (id: string, status: string, metadata: Record<string, unknown> | null) => {
       await legacyDb.execute(sql`
           INSERT INTO "agents" ("id", "company_id", "name", "role", "status", "metadata")
           VALUES (
-            ${testCase.agentId},
+            ${id},
             ${companyId},
-            ${`Legacy ${testCase.action}`},
+            ${`Legacy ${id.slice(0, 8)}`},
             'general',
-            'pending_approval',
-            ${JSON.stringify(metadata)}::jsonb
+            ${status},
+            ${metadata ? JSON.stringify(metadata) : null}::jsonb
           )
+          ON CONFLICT ("id") DO NOTHING
         `);
+    };
+    const seedApproval = async (
+      approvalId: string,
+      payload: Record<string, unknown>,
+      activityDetails: Record<string, unknown>,
+    ) => {
       await legacyDb.execute(sql`
           INSERT INTO "approvals" ("id", "company_id", "type", "status", "payload")
-          VALUES (${testCase.approvalId}, ${companyId}, 'hire_agent', 'pending', ${JSON.stringify(payload)}::jsonb)
+          VALUES (${approvalId}, ${companyId}, 'hire_agent', 'pending', ${JSON.stringify(payload)}::jsonb)
         `);
       await legacyDb.execute(sql`
           INSERT INTO "activity_log" (
-            "company_id",
-            "actor_type",
-            "actor_id",
-            "action",
-            "entity_type",
-            "entity_id",
-            "details"
+            "company_id", "actor_type", "actor_id", "action", "entity_type", "entity_id", "details"
           )
           VALUES (
-            ${companyId},
-            'user',
-            'board-user',
-            'approval.created',
-            'approval',
-            ${testCase.approvalId},
-            ${JSON.stringify({
-              key: testCase.key,
-              status: "pending",
-              approvalId: testCase.approvalId,
-            })}::jsonb
+            ${companyId}, 'user', 'board-user', 'approval.created', 'approval',
+            ${approvalId}, ${JSON.stringify(activityDetails)}::jsonb
           )
         `);
+    };
+
+    for (const testCase of builtIn) {
+      const metadata = { paperclipBuiltInAgent: { key: testCase.key, featureKeys: [testCase.key] } };
+      await seedAgent(testCase.agentId, testCase.agentStatus, metadata);
+      await seedApproval(
+        testCase.approvalId,
+        {
+          name: `Legacy ${testCase.action}`,
+          role: "general",
+          agentId: testCase.agentId,
+          sourceBuiltInAgentKey: testCase.key,
+          metadata,
+        },
+        { key: testCase.key, status: "pending", approvalId: testCase.approvalId },
+      );
+    }
+
+    await seedAgent(activityLinked.agentId, activityLinked.agentStatus, null);
+    await seedApproval(
+      activityLinked.approvalId,
+      { name: "Legacy activity-linked", role: "general", agentId: activityLinked.agentId },
+      { status: "pending", approvalId: activityLinked.approvalId, linkedAgentId: activityLinked.agentId },
+    );
+
+    for (const testCase of [genericPending, genericStale, ...ambiguous]) {
+      await seedAgent(testCase.agentId, testCase.agentStatus, null);
+      await seedApproval(
+        testCase.approvalId,
+        { name: `Legacy ${testCase.kind}`, role: "general", agentId: testCase.agentId },
+        { status: "pending", approvalId: testCase.approvalId },
+      );
     }
 
     await applyPendingMigrations(connectionString);
     const db = createDb(connectionString);
     const migrated = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    const byId = new Map(migrated.map((approval) => [approval.id, approval]));
+
+    const allCases = [...builtIn, activityLinked, genericPending, genericStale, ...ambiguous];
     expect(
-      migrated.map((approval) => ({ id: approval.id, linkedAgentId: approval.linkedAgentId })),
+      allCases.map((testCase) => {
+        const row = byId.get(testCase.approvalId);
+        return {
+          kind: testCase.kind,
+          linkedAgentId: row?.linkedAgentId ?? null,
+          // A row the migration refuses to bind must not keep a reference that
+          // would make it permanently un-withdrawable.
+          payloadAgentId: (row?.payload as Record<string, unknown> | undefined)?.agentId ?? null,
+        };
+      }),
     ).toEqual(
-      expect.arrayContaining(
-        cases.map((testCase) => ({
-          id: testCase.approvalId,
-          linkedAgentId: testCase.agentId,
-        })),
-      ),
+      allCases.map((testCase) => ({
+        kind: testCase.kind,
+        linkedAgentId: testCase.bind ? testCase.agentId : null,
+        payloadAgentId: testCase.bind ? testCase.agentId : null,
+      })),
     );
 
     const svc = approvalService(db);
-    await svc.approve(cases[0]!.approvalId, "board-user", "approved");
-    await svc.reject(cases[1]!.approvalId, "board-user", "rejected");
-    await svc.withdraw(cases[2]!.approvalId, "withdrawn", {
+    const withdrawActor = {
       userId: "board-user",
-      activity: { actorType: "user", actorId: "board-user", agentId: null },
-    });
+      activity: { actorType: "user" as const, actorId: "board-user", agentId: null },
+    };
+    await svc.approve(builtIn[0]!.approvalId, "board-user", "approved");
+    await svc.reject(builtIn[1]!.approvalId, "board-user", "rejected");
+    await svc.withdraw(builtIn[2]!.approvalId, "withdrawn", withdrawActor);
+    // The classes the prior test never exercised: each must reach the same
+    // terminate-on-withdraw behaviour as the built-in rows.
+    await svc.withdraw(activityLinked.approvalId, "withdrawn", withdrawActor);
+    await svc.withdraw(genericPending.approvalId, "withdrawn", withdrawActor);
+    // Unbound rows must withdraw cleanly rather than throwing 409, and must not
+    // terminate the agent they used to point at.
+    await svc.withdraw(genericStale.approvalId, "withdrawn", withdrawActor);
+    await svc.withdraw(ambiguous[0]!.approvalId, "withdrawn", withdrawActor);
 
     const resultingAgents = await db.select().from(agents).where(eq(agents.companyId, companyId));
     expect(resultingAgents).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: cases[0]!.agentId, status: "idle" }),
-        expect.objectContaining({ id: cases[1]!.agentId, status: "terminated" }),
-        expect.objectContaining({ id: cases[2]!.agentId, status: "terminated" }),
+        expect.objectContaining({ id: builtIn[0]!.agentId, status: "idle" }),
+        expect.objectContaining({ id: builtIn[1]!.agentId, status: "terminated" }),
+        expect.objectContaining({ id: builtIn[2]!.agentId, status: "terminated" }),
+        expect.objectContaining({ id: activityLinked.agentId, status: "terminated" }),
+        expect.objectContaining({ id: genericPending.agentId, status: "terminated" }),
+        expect.objectContaining({ id: genericStale.agentId, status: "idle" }),
+        expect.objectContaining({ id: ambiguousAgentId, status: "pending_approval" }),
       ]),
     );
   }, 120_000);

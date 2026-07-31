@@ -42,6 +42,29 @@ export function approvalService(db: Db) {
     return existing;
   }
 
+  // Lenient half of the binding lookup: resolves the bound agent only while it is
+  // still a pending hire in the approval's own company, and reports "nothing to
+  // clean up" as null rather than as an error.
+  async function findBoundPendingAgent(
+    approval: ApprovalRecord,
+    dbOrTx: Db = db,
+  ) {
+    if (!approval.linkedAgentId) return null;
+    return dbOrTx
+      .select({ id: agents.id })
+      .from(agents)
+      .where(
+        and(
+          eq(agents.id, approval.linkedAgentId),
+          eq(agents.companyId, approval.companyId),
+          eq(agents.status, "pending_approval"),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+  }
+
+  // Strict half: withdrawal must refuse rather than silently strand an agent, so
+  // a payload that claims an agent the binding does not corroborate is a 409.
   async function getBoundPendingAgent(
     approval: ApprovalRecord,
     dbOrTx: Db = db,
@@ -54,17 +77,7 @@ export function approvalService(db: Db) {
     if (payloadAgentId !== approval.linkedAgentId) {
       throw conflict("Hire approval is not bound to a pending agent", { approvalId: approval.id });
     }
-    const boundAgent = await dbOrTx
-      .select({ id: agents.id })
-      .from(agents)
-      .where(
-        and(
-          eq(agents.id, approval.linkedAgentId),
-          eq(agents.companyId, approval.companyId),
-          eq(agents.status, "pending_approval"),
-        ),
-      )
-      .then((rows) => rows[0] ?? null);
+    const boundAgent = await findBoundPendingAgent(approval, dbOrTx);
     if (!boundAgent) {
       throw conflict("Hire approval is not bound to a pending agent", { approvalId: approval.id });
     }
@@ -229,9 +242,13 @@ export function approvalService(db: Db) {
       );
 
       if (applied && updated.type === "hire_agent") {
-        if (updated.linkedAgentId) {
-          await agentsSvc.terminate(updated.linkedAgentId);
-        }
+        // Scoped through the same helper withdrawal uses so the two cleanup paths
+        // cannot drift apart again: only ever terminate an agent that is still a
+        // pending hire in this approval's company. This stays on the lenient half
+        // deliberately -- a board rejection must not fail because the agent was
+        // already activated or terminated out of band.
+        const boundPendingAgent = await findBoundPendingAgent(updated);
+        if (boundPendingAgent) await agentsSvc.terminate(boundPendingAgent.id);
       }
 
       return { approval: updated, applied };
