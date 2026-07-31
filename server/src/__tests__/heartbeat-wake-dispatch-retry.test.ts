@@ -1116,6 +1116,104 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         expect(await suppressionCount("scheduled_retry_gate_declined")).toBe(2);
         expect(await deliveryCount("dead_lettered")).toBe(0);
       });
+
+      // Ally review (c13ff527) proposed a narrower race than the two above: a
+      // promoter winning between the coalesce *lookup* and the tally UPDATE,
+      // leaving the delivery counted `deferred` with no matching settlement.
+      // The two tests above park the promoter and let the whole coalesce run
+      // inside that pause, so neither covers this ordering. This one inverts
+      // the nesting -- it parks the *deferring* transaction mid-flight and
+      // starts a real concurrent promoter into the exact window -- and asserts
+      // the delivery still settles. It holds because coalescePendingTaskScopeWake
+      // ends in an `UPDATE ... RETURNING`, so a non-null return means this
+      // transaction owns the row's write lock until it commits; the promoter's
+      // conditional UPDATE blocks rather than interleaving.
+      it("holds the coalescing tally lock against a promoter racing the count update", async () => {
+        const { agentId } = await seedCompanyAndAgent();
+        const capacityDenied = heartbeatWithCapacityDenied();
+
+        expect(
+          await capacityDenied.wakeup(agentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "github_pr_review_submitted",
+            payload: GITHUB_REVIEW_PAYLOAD,
+          }),
+        ).toBeNull();
+        expect(await deliveryCount("deferred")).toBe(1);
+
+        await db
+          .update(heartbeatRuns)
+          .set({ scheduledRetryAt: new Date(Date.now() - 60_000) })
+          .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "scheduled_retry")));
+
+        let signalParked!: () => void;
+        const parked = new Promise<void>((resolve) => {
+          signalParked = resolve;
+        });
+        let releaseTally!: () => void;
+        const tallyGate = new Promise<void>((resolve) => {
+          releaseTally = resolve;
+        });
+        let hookFired = false;
+
+        // Second delivery: coalesces onto the parked run, then stops holding
+        // the row lock, before bumping the tally.
+        const deferring = heartbeatService(db, {
+          skipQueuedRunDispatch: true,
+          penstockAvailabilityGate: {
+            async checkAdapter() {
+              return {
+                allow: false as const,
+                provider: "anthropic" as const,
+                reason: "penstock.model_capacity_unavailable" as const,
+                model: "claude-opus-4-8",
+                resumeAt: null,
+                retryAfterSeconds: 60,
+              };
+            },
+            _resetForTesting() {},
+          },
+          beforeGithubReviewCoalescedTallyUpdateForTest: async () => {
+            if (hookFired) return;
+            hookFired = true;
+            signalParked();
+            await tallyGate;
+          },
+        }).wakeup(agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "github_pr_review_submitted",
+          payload: GITHUB_REVIEW_PAYLOAD,
+        });
+
+        await parked;
+
+        const promoting = heartbeatService(db, { skipQueuedRunDispatch: true }).promoteDueScheduledRetries(
+          new Date(),
+        );
+
+        // The promoter must not be able to consume the pre-bump tally: its
+        // conditional UPDATE is stuck behind the deferring transaction's row
+        // lock. This is the assertion that actually pins the serialization --
+        // without the lock it would race ahead and settle a tally of 1.
+        expect(
+          await Promise.race([
+            promoting.then(() => "settled" as const),
+            new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 500)),
+          ]),
+        ).toBe("blocked");
+
+        releaseTally();
+        expect(await deferring).toBeNull();
+        await promoting;
+
+        expect(hookFired).toBe(true);
+        expect(await deliveryCount("deferred")).toBe(2);
+        expect(await deliveryCount("queued")).toBe(2);
+        expect(await deliveryCount("suppressed")).toBe(0);
+        expect(await deliveryCount("dead_lettered")).toBe(0);
+      });
     });
     describe("dead-letter gauge survives restart and first scrape", () => {
       /**

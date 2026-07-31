@@ -7700,6 +7700,15 @@ export interface HeartbeatServiceOptions {
     run: typeof heartbeatRuns.$inferSelect,
     now: Date,
   ) => Promise<void> | void;
+  /**
+   * Test-only concurrency hook: fired inside the capacity-defer transaction
+   * after coalescePendingTaskScopeWake() has returned a still-deferred run and
+   * immediately before the conditional GitHub delivery-tally UPDATE. Lets a
+   * test wedge a concurrent promotion into that exact window (BLO-18859).
+   */
+  beforeGithubReviewCoalescedTallyUpdateForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -21546,6 +21555,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (githubReviewWakeReason === null) {
             return { run: coalescedRun, coalesced: true, deferred: true };
           }
+          // Ally review (c13ff527) raised a lookup-to-update race here: if a
+          // promoter flips the row to `queued` between the coalesce lookup and
+          // this UPDATE, the zero-row fallback below would return a stale
+          // `deferred: true` for a delivery the promoter can no longer settle.
+          // That window does not exist, and the reason is a lock rather than
+          // the status predicate, so it is worth writing down.
+          //
+          // coalescePendingTaskScopeWake ends in `UPDATE ... WHERE id = ? AND
+          // status IN ('queued','scheduled_retry') RETURNING`, and returns null
+          // -- never a stale row -- when that matches nothing. So a non-null
+          // `coalescedRun` means this transaction already holds the row's
+          // exclusive write lock, and holds it until commit. A promoter's own
+          // conditional UPDATE therefore blocks on us and cannot interleave.
+          // The three orderings, exhaustively:
+          //   - promoter arrives after us: it blocks here, then re-reads under
+          //     READ COMMITTED and settles the tally this bump committed.
+          //   - promoter promoted first: status is `queued`, still coalescible,
+          //     so the merge UPDATE matched and the `queued` branch above
+          //     returned `deferred: false`. Never reaches this line.
+          //   - promoter gate-cancelled first: `cancelled` is not coalescible,
+          //     the merge UPDATE matched nothing, coalesce returned null, and
+          //     we fell through to INSERT a fresh run carrying this delivery.
+          // `?? coalescedRun` is left as a defensive no-op for the impossible
+          // fourth case. Pinned by the concurrency test at
+          // heartbeat-wake-dispatch-retry.test.ts "holds the coalescing tally
+          // lock against a promoter racing the count update".
+          await options.beforeGithubReviewCoalescedTallyUpdateForTest?.(coalescedRun);
           const bumped = await tx
             .update(heartbeatRuns)
             .set({
