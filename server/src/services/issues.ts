@@ -2488,10 +2488,19 @@ async function listIssueBlockerAttentionMap(
   companyId: string,
   issueRows: IssueBlockerAttentionInputNode[],
 ): Promise<Map<string, IssueBlockerAttention>> {
-  const roots = issueRows.filter((row) => row.companyId === companyId && row.status === "blocked");
+  const companyIssueRows = issueRows.filter((row) => row.companyId === companyId);
+  const dependencyReadinessMap = await listIssueDependencyReadinessMap(
+    dbOrTx,
+    companyId,
+    companyIssueRows.map((row) => row.id),
+  );
+  const roots = companyIssueRows.filter((row) =>
+    row.status === "blocked" || (dependencyReadinessMap.get(row.id)?.unresolvedBlockerCount ?? 0) > 0,
+  );
+  const rootIds = new Set(roots.map((root) => root.id));
   const attentionMap = new Map<string, IssueBlockerAttention>();
   for (const row of issueRows) {
-    if (row.status !== "blocked") {
+    if (!rootIds.has(row.id)) {
       attentionMap.set(row.id, createIssueBlockerAttention());
     }
   }
@@ -2540,7 +2549,6 @@ async function listIssueBlockerAttentionMap(
             eq(issueRelations.type, "blocks"),
             inArray(issueRelations.relatedIssueId, chunk),
             eq(issues.companyId, companyId),
-            ne(issues.status, "done"),
           ),
         );
       const childRowsPromise: Promise<IssueBlockerAttentionQueryRow[]> = dbOrTx
@@ -2863,7 +2871,12 @@ async function listIssueBlockerAttentionMap(
   for (const root of roots) {
     const rootNodeIds = nodeIdsByRoot.get(root.id) ?? new Set([root.id]);
     const rootTraversalTruncated = truncatedRootIds.has(root.id);
-    const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
+    const unresolvedBlockerIssueIds = new Set(
+      dependencyReadinessMap.get(root.id)?.unresolvedBlockerIssueIds ?? [],
+    );
+    const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) =>
+      unresolvedBlockerIssueIds.has(edge.blockerIssueId),
+    );
     if (topLevelEdges.length === 0) {
       attentionMap.set(root.id, createIssueBlockerAttention({
         state: "needs_attention",

@@ -309,6 +309,50 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(parent?.blockerAttention?.sampleBlockerIdentifier).not.toBe("PBD-4");
   });
 
+  it("keeps blocker attention and dependency readiness counts in parity across blocker statuses", async () => {
+    const { companyId, agentId } = await createCompany("PBP");
+    const statuses = ["done", "cancelled", "blocked", "todo"] as const;
+    const dependentIds: string[] = [];
+
+    for (const [index, status] of statuses.entries()) {
+      const dependentId = await insertIssue({
+        companyId,
+        identifier: `PBP-${index * 2 + 1}`,
+        title: `${status} blocker dependent`,
+        status: "todo",
+        assigneeAgentId: agentId,
+      });
+      const blockerId = await insertIssue({
+        companyId,
+        identifier: `PBP-${index * 2 + 2}`,
+        title: `${status} blocker`,
+        status,
+        assigneeAgentId: agentId,
+      });
+      await block({ companyId, blockerIssueId: blockerId, blockedIssueId: dependentId });
+      dependentIds.push(dependentId);
+    }
+
+    const rows = (await svc.list(companyId, { status: "todo" })) as IssueListItem[];
+    const readiness = await svc.listDependencyReadiness(companyId, dependentIds);
+
+    for (const [index, dependentId] of dependentIds.entries()) {
+      const expectedCount = statuses[index] === "done" ? 0 : 1;
+      const row = rows.find((issue) => issue.id === dependentId);
+      expect(row?.blockerAttention?.unresolvedBlockerCount).toBe(expectedCount);
+      expect(readiness.get(dependentId)?.unresolvedBlockerCount).toBe(expectedCount);
+      expect(readiness.get(dependentId)?.isDependencyReady).toBe(expectedCount === 0);
+    }
+
+    const cancelledDependent = rows.find((issue) => issue.id === dependentIds[1]);
+    expect(cancelledDependent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 1,
+      attentionBlockerCount: 1,
+    });
+  });
+
   it("covers recursive blocker chains when the downstream leaf has active work", async () => {
     const { companyId, agentId } = await createCompany("PBR");
     const parentId = await insertIssue({ companyId, identifier: "PBR-1", title: "Parent", status: "blocked" });
