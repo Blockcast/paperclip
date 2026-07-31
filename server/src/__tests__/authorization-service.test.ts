@@ -1599,6 +1599,127 @@ describeEmbeddedPostgres("authorization service", () => {
         status: "todo",
       },
     })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // Escalations addressed to a human (`assigneeAgentId: null` +
+    // `assigneeUserId`) are the second denied kind: an agent claiming one
+    // answers the question that was put to the user.
+    const escalationIssue = await createIssue(db, company.id, {
+      title: "Orphaned productivity review escalation",
+      assigneeAgentId: null,
+      originKind: "productivity_review_escalation",
+      originId: manualIssue.id,
+    });
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: escalationIssue.id,
+        assigneeAgentId: null,
+        status: "todo",
+      },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+  });
+
+  it("leaves recovery and liveness shells claimable when they lose their assignee", async () => {
+    // These two kinds confer no downstream grant and exist to unstick stalled
+    // work — an unassigned stranded-recovery row is a normal reachable state
+    // (it inherits a null assignee from its source). Freezing them on assignee
+    // loss would deadlock the mechanism that unfreezes the graph, so they are
+    // deliberately outside AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS.
+    const company = await createCompany(db, "UnassignedRecoveryShellsClaimable");
+    const actor = await createAgent(db, company.id, { role: "engineer" });
+    const authorization = authorizationService(db);
+    const actorContext = { type: "agent", agentId: actor.id, companyId: company.id, source: "agent_key" } as const;
+
+    const sourceIssue = await createIssue(db, company.id, {
+      title: "Stalled source issue",
+      assigneeAgentId: null,
+    });
+
+    for (const originKind of ["stranded_issue_recovery", "harness_liveness_escalation"] as const) {
+      const shell = await createIssue(db, company.id, {
+        title: `Orphaned ${originKind}`,
+        assigneeAgentId: null,
+        originKind,
+        originId: sourceIssue.id,
+      });
+      for (const action of ["issue:comment", "issue:mutate"] as const) {
+        await expect(authorization.decide({
+          actor: actorContext,
+          action,
+          // originKind omitted on purpose: exercises the loadIssue fallback.
+          resource: {
+            type: "issue",
+            companyId: company.id,
+            issueId: shell.id,
+            assigneeAgentId: null,
+            status: "todo",
+          },
+        })).resolves.toMatchObject({ allowed: true, reason: "allow_company_agent" });
+      }
+    }
+  });
+
+  it("still honours an explicit mention grant on an unassigned review shell", async () => {
+    // The claim block suppresses only the generic `allow_company_agent`
+    // default. An agent a board user explicitly invited onto the review keeps
+    // its comment channel — otherwise closing self-appointment would also shut
+    // out the deliberate, auditable way in.
+    const company = await createCompany(db, "UnassignedReviewMentionGrant");
+    const mentionedAgent = await createAgent(db, company.id, { role: "engineer" });
+    const authorization = authorizationService(db);
+
+    const sourceIssue = await createIssue(db, company.id, {
+      title: "Review source",
+      assigneeAgentId: null,
+    });
+    const reviewIssue = await createIssue(db, company.id, {
+      title: "Orphaned review with a board mention",
+      assigneeAgentId: null,
+      originKind: "issue_productivity_review",
+      originId: sourceIssue.id,
+    });
+
+    const boardUserId = `user-${randomUUID()}`;
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: boardUserId,
+      status: "active",
+      membershipRole: "member",
+    });
+    await db.insert(issueComments).values({
+      companyId: company.id,
+      issueId: reviewIssue.id,
+      body: `Board mention [@Mentioned Agent](agent://${mentionedAgent.id})`,
+      authorUserId: boardUserId,
+    });
+
+    const actorContext = { type: "agent", agentId: mentionedAgent.id, companyId: company.id, source: "agent_key" } as const;
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: reviewIssue.id,
+      assigneeAgentId: null,
+      originKind: "issue_productivity_review",
+      status: "todo",
+    } as const;
+
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({ allowed: true, reason: "allow_issue_mention_grant" });
+
+    // The mention grant is comment-only, so the claim suppression still holds
+    // for `issue:mutate` — self-appointment stays closed.
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "issue:mutate",
+      resource,
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
   });
 
   it("keeps the productivity-review grant working when the source assignee is paused or errored", async () => {

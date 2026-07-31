@@ -255,11 +255,25 @@ type IssueAuthorizationRow = {
 // cycle; the two are pinned together by
 // authorization-service.test.ts "productivity-review source-issue grant".
 const PRODUCTIVITY_REVIEW_TERMINAL_STATUSES = ["done", "cancelled"] as const;
+// Origin kinds an agent must not reach through *generic* unassigned-issue
+// access. The bar is deliberately narrow: claiming the shell has to hand the
+// claimer something beyond the shell itself.
+//   - `issueProductivityReview` — owning one grants `issue:mutate` on its
+//     source via `agentHasProductivityReviewGrantOnIssue`, so self-appointing
+//     onto an orphaned review is a privilege escalation.
+//   - `productivityReviewEscalation` — created with `assigneeAgentId: null`
+//     and `assigneeUserId` set (productivity-review.ts), i.e. addressed to a
+//     human on purpose. An agent claiming it answers the question that was
+//     asked of the user.
+// `strandedIssueRecovery` and `issueGraphLivenessEscalation` are deliberately
+// NOT here: neither confers any downstream grant, and both exist to unstick
+// stalled work. An unassigned stranded-recovery row is a normal reachable
+// state (it inherits a null assignee from its source), so denying the claim
+// would freeze the very mechanism that unfreezes the graph. Pinned by
+// "leaves recovery and liveness shells claimable" in authorization-service.test.ts.
 const AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS = new Set<string>([
-  RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation,
   RECOVERY_ORIGIN_KINDS.issueProductivityReview,
   RECOVERY_ORIGIN_KINDS.productivityReviewEscalation,
-  RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
 ]);
 
 function evaluateAuthorizationPolicyForAssignment(
@@ -1570,7 +1584,16 @@ export function authorizationService(db: Db) {
   async function recoveryOrReviewIssueBlocksUnassignedAgentClaim(
     resource: Extract<AuthorizationResource, { type: "issue" }>,
   ) {
-    const originKind = resource.originKind ?? (resource.issueId ? (await loadIssue(resource.issueId))?.originKind : null);
+    // `undefined` means the caller did not look the field up; `null` means it
+    // looked and the issue has no origin kind. Collapsing the two with `??`
+    // would make every ordinary (origin-less) issue reload the full row here —
+    // the common case, and the one this branch exists to serve — while only
+    // issues that already carry an origin kind took the cheap path.
+    const originKind = resource.originKind !== undefined
+      ? resource.originKind
+      : resource.issueId
+        ? (await loadIssue(resource.issueId))?.originKind ?? null
+        : null;
     return AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS.has(originKind ?? "");
   }
 
@@ -2134,19 +2157,24 @@ export function authorizationService(db: Db) {
           explanation: "Allowed because the actor owns the assigned issue.",
         });
       }
+      let unassignedClaimSuppressed = false;
       if (!resource?.assigneeAgentId) {
-        if (resource && await recoveryOrReviewIssueBlocksUnassignedAgentClaim(resource)) {
-          return deny({
+        // Suppress only the generic default; do NOT return here. An explicit
+        // grant below (mention, recovery handoff, productivity review) is a
+        // deliberate, auditable channel onto this specific issue, and denying
+        // it at this point would mean an agent that was actually invited to
+        // act on an orphaned review still could not. What is being closed is
+        // self-appointment through "nobody owns this", not every route in.
+        unassignedClaimSuppressed = Boolean(
+          resource && await recoveryOrReviewIssueBlocksUnassignedAgentClaim(resource),
+        );
+        if (!unassignedClaimSuppressed) {
+          return allow({
             action: input.action,
-            reason: "deny_missing_grant",
-            explanation: "Recovery and review issues cannot be claimed through generic unassigned-issue access.",
+            reason: "allow_company_agent",
+            explanation: "Allowed because the issue has no agent assignee.",
           });
         }
-        return allow({
-          action: input.action,
-          reason: "allow_company_agent",
-          explanation: "Allowed because the issue has no agent assignee.",
-        });
       }
       if (
         input.action === "issue:comment" &&
@@ -2188,6 +2216,13 @@ export function authorizationService(db: Db) {
         })
       ) {
         return allowProductivityReviewGrant(input.action);
+      }
+      if (unassignedClaimSuppressed) {
+        return deny({
+          action: input.action,
+          reason: "deny_missing_grant",
+          explanation: "Review and escalation issues cannot be claimed through generic unassigned-issue access.",
+        });
       }
     }
     if (

@@ -3564,7 +3564,11 @@ export function issueRoutes(
         assigneeAgentId: issue.assigneeAgentId,
         assigneeUserId: issue.assigneeUserId,
         status: issue.status,
-        originKind: issue.originKind ?? null,
+        // Deliberately NOT `?? null`: authorization distinguishes "caller did
+        // not look it up" (undefined -> reload the row) from "row has no
+        // origin kind" (null -> trust it and skip the reload). Collapsing them
+        // here would make every origin-less issue pay an extra SELECT.
+        originKind: issue.originKind,
         originId: issue.originId ?? null,
       },
       scope: {
