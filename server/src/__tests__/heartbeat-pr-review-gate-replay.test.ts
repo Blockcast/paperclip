@@ -17,27 +17,29 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 
-// BLO-17518: integration/replay test for the full BLO-17456 incident chain —
-// GitHub webhook events -> Paperclip heartbeat wake dispatch -> Ally posting a
-// review -> pim-multicast-gateway's `review-gate` GitHub Action reading that
-// review and setting the `review/ally-complete` commit status. Existing
+// BLO-17518: integration/replay test for the BLO-17456 incident chain covered
+// here: GitHub webhook events -> Paperclip reviewer wake enqueue ->
+// retry/dispatch eligibility -> Ally posting a review ->
+// pim-multicast-gateway's `review-gate` GitHub Action reading that review and
+// setting the `review/ally-complete` commit status. Existing
 // coverage (heartbeat-retry-scheduling.test.ts, heartbeat-pr-review-queue-
 // fairness.test.ts, github-webhook.test.ts, and pim-multicast-gateway's own
 // test/require-ally-review-script.test.ts) is unit-level per component; this
 // file replays the exact failure sequence observed on PR
-// Blockcast/pim-multicast-gateway#1656 end to end: a review posted on an old
-// head, a fix pushed to a new head, a fresh review-request event, a backlog of
-// unrelated review wakes ahead of it, a run that leaves no durable evidence,
-// and the exact new-head review that finally flips the gate green.
+// Blockcast/pim-multicast-gateway#1656 across those boundaries: a review posted
+// on an old head, a fix pushed to a new head, a fresh review-request event, a
+// backlog of unrelated review wakes ahead of it, a run that leaves no durable
+// evidence, and the exact new-head review that finally flips the gate green.
 //
 // The chain is driven from a *signed synthetic webhook through the real Express
 // route*, against a real database: the fresh-head reviewer run and wake row are
-// the ones the route actually persisted, and every later stage consumes that
-// persisted row rather than a fixture rebuilt in the test. So this file breaks
-// if the route stops enqueueing the new head/task key, if the durable-evidence
-// retry fix (PR #767, `pr_review_output_missing` on the retry allowlist) is
-// reverted, or if the dispatch-fairness fix
-// (`selectAgedPrReviewRunForFairDispatch`) is reverted.
+// the ones the route actually persisted. Retry and dispatch are asserted at the
+// eligibility boundary against that persisted row rather than by running a live
+// adapter dispatch worker. So this file breaks if the route stops enqueueing
+// the new head/task key, if the durable-evidence retry fix (PR #767,
+// `pr_review_output_missing` on the retry allowlist) is reverted, or if the
+// dispatch-fairness selector (`selectAgedPrReviewRunForFairDispatch`) is
+// reverted.
 
 // Fixture port of Blockcast/pim-multicast-gateway's exact-head review gate
 // (scripts/require-ally-review.mjs @ 12a0f903ec6f396150e0991f09eb96c767ca9f20,
@@ -168,12 +170,12 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
-    `Skipping BLO-17518 webhook->dispatch replay on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+    `Skipping BLO-17518 webhook->retry/dispatch eligibility replay on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
 }
 
 describeEmbeddedPostgres(
-  "BLO-17518: Ally exact-head re-review replay (webhook -> enqueue -> retry -> dispatch -> gate success)",
+  "BLO-17518: Ally exact-head re-review replay (webhook -> enqueue -> retry/dispatch eligibility -> gate success)",
   () => {
     let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
     let db: ReturnType<typeof createDb>;
@@ -217,8 +219,8 @@ describeEmbeddedPostgres(
         heartbeatOptions: {
           penstockAvailabilityGate: allowPenstockGate,
           // Persist the wake + queued run without handing it to a live adapter;
-          // the dispatch half is exercised below through the real fairness
-          // selector against the persisted row.
+          // the dispatch-eligibility half is exercised below through the real
+          // fairness selector against the persisted row.
           skipQueuedRunDispatch: true,
         },
       }));
@@ -390,7 +392,7 @@ describeEmbeddedPostgres(
       ).toBe(true);
     }, 60_000);
 
-    it("step 4b: the persisted run is eventually dispatched, not starved behind older unrelated review wakes (dispatch-fairness)", async () => {
+    it("step 4b: the persisted run becomes dispatch-eligible after older unrelated review wakes drain", async () => {
       const { agentId } = await seedReviewerAgent();
       const { reviewerRun } = await deliverFreshHeadSynchronize(agentId);
 
@@ -431,7 +433,8 @@ describeEmbeddedPostgres(
       );
 
       // Once the older backlog has drained, the persisted fresh-head run is the
-      // one dispatch selects — by its real row id, not a fixture stand-in.
+      // one the dispatch fairness selector would pick by its real row id, not a
+      // fixture stand-in.
       expect(selectAgedPrReviewRunForFairDispatch([reviewerRun], afterIssueWork, now)).toBe(reviewerRun.id);
     }, 60_000);
 
