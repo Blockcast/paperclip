@@ -1902,8 +1902,10 @@ function preserveDurableLandingEvidence<T extends { allDetected?: unknown }>(
  * describe ephemeral infrastructure rather than a reviewable artifact.
  */
 const DURABLE_ARTIFACT_WORK_PRODUCT_TYPES = ["artifact", "document"] as const;
-const UUID_SQL_PATTERN =
-  "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$";
+const UUID_SQL_SOURCE =
+  "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}";
+const UUID_SQL_PATTERN = `^${UUID_SQL_SOURCE}$`;
+const ATTACHMENT_CONTENT_URL_SQL_PATTERN = `^/api/attachments/${UUID_SQL_SOURCE}/content(\\?download=1)?$`;
 
 function hasTrustedOrPromotedSourceTrust(sourceTrustColumn: any): SQL {
   return or(
@@ -1912,9 +1914,32 @@ function hasTrustedOrPromotedSourceTrust(sourceTrustColumn: any): SQL {
   )!;
 }
 
+function hasInspectableWorkProductUrlLocator(): SQL {
+  return or(
+    // External artifact URLs are accepted as reviewer-openable locators. The
+    // server deliberately does not resolve them here because that would create
+    // SSRF surface; internal attachment URLs resolve against same-issue rows.
+    sql`${issueWorkProducts.url} ~* '^https?://[^[:space:]]+$'`,
+    sql`case
+      when ${issueWorkProducts.url} ~* ${ATTACHMENT_CONTENT_URL_SQL_PATTERN}
+      then exists (
+        select 1
+        from issue_attachments durable_url_attachment
+        where durable_url_attachment.company_id = ${issueWorkProducts.companyId}
+          and durable_url_attachment.issue_id = ${issueWorkProducts.issueId}
+          and (
+            ${issueWorkProducts.url} = '/api/attachments/' || durable_url_attachment.id::text || '/content'
+            or ${issueWorkProducts.url} = '/api/attachments/' || durable_url_attachment.id::text || '/content?download=1'
+          )
+      )
+      else false
+    end`,
+  )!;
+}
+
 function hasInspectableWorkProductLocator(issueId: string): SQL {
   return or(
-    sql`${issueWorkProducts.url} ~ '[^[:space:]]'`,
+    hasInspectableWorkProductUrlLocator(),
     and(
       sql`jsonb_typeof(${issueWorkProducts.metadata}->'resourceRef') = 'object'`,
       sql`${issueWorkProducts.metadata}->'resourceRef'->>'kind' = 'workspace_file'`,
@@ -2057,7 +2082,7 @@ async function fetchDurableArtifactEvidence(dbOrTx: any, issueId: string): Promi
         ),
       )
       .limit(1)
-      .for("update"),
+      .for("update", { of: [issueDocuments, documents] }),
     dbOrTx
       .select({ id: issueWorkProducts.id })
       .from(issueWorkProducts)

@@ -11,6 +11,7 @@ import {
   createDb,
   documentRevisions,
   documents,
+  executionWorkspaces,
   heartbeatRuns,
   instanceSettings,
   issueComments,
@@ -18,6 +19,7 @@ import {
   issueDocuments,
   issueWorkProducts,
   issues,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -66,7 +68,9 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
     await db.delete(assets);
     await db.delete(issueComments);
     await db.delete(activityLog);
+    await db.delete(executionWorkspaces);
     await db.delete(issues);
+    await db.delete(projects);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
@@ -251,6 +255,31 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
     return attachmentId;
   }
 
+  async function addExecutionWorkspace(companyId: string, issueId: string) {
+    const projectId = randomUUID();
+    const workspaceId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Done Gate Project",
+      status: "active",
+    });
+    await db.update(issues).set({ projectId }).where(eq(issues.id, issueId));
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId,
+      companyId,
+      projectId,
+      sourceIssueId: issueId,
+      mode: "agent",
+      strategyType: "isolated",
+      name: "Investigation workspace",
+      status: "active",
+      cwd: "/tmp/paperclip-done-gate",
+      providerType: "local_fs",
+    });
+    return workspaceId;
+  }
+
   function quarantinedSourceTrust(issueId: string, runId: string, agentId: string) {
     return {
       preset: LOW_TRUST_REVIEW_PRESET,
@@ -413,6 +442,27 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
     expect(response.status).toBe(200);
   });
 
+  it("does not accept a syntactically non-openable artifact URL", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    await db.insert(issueWorkProducts).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      type: "artifact",
+      provider: "paperclip",
+      title: "Timeout archaeology dump",
+      url: "x",
+      status: "active",
+      createdByRunId: runId,
+    });
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(422);
+    expect(response.body.details).toMatchObject({ reason: "no_execution_run_and_no_pr_evidence" });
+  });
+
   it("does not accept a quarantined low-trust artifact work product", async () => {
     await enableDoneExecutionGate();
     const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
@@ -533,6 +583,95 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
     const response = await patchToDone(agentId, companyId, runId, issueId);
 
     expect(response.status).toBe(200);
+  });
+
+  it("accepts a run-attributed work product that references a real issue document by key", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    await addRunAttributedDocument(companyId, issueId, agentId, null, "findings");
+    await db.insert(issueWorkProducts).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      type: "document",
+      provider: "paperclip",
+      title: "Findings document",
+      status: "active",
+      createdByRunId: runId,
+      metadata: { documentKey: "findings" },
+    });
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(200);
+  });
+
+  it("accepts a run-attributed work product that references a real execution workspace file", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    const workspaceId = await addExecutionWorkspace(companyId, issueId);
+    await db.insert(issueWorkProducts).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      type: "artifact",
+      provider: "paperclip",
+      title: "Workspace findings file",
+      status: "active",
+      createdByRunId: runId,
+      metadata: {
+        resourceRef: {
+          kind: "workspace_file",
+          issueId,
+          workspaceKind: "execution_workspace",
+          workspaceId,
+          relativePath: "findings.md",
+          displayPath: "findings.md",
+        },
+      },
+    });
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(200);
+  });
+
+  it("stamps route-created work products with the authenticated run and rejects forged run ids", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    const app = createApp(agentId, companyId, runId);
+
+    const forged = await request(app).post(`/api/issues/${issueId}/work-products`).send({
+      type: "artifact",
+      provider: "paperclip",
+      title: "Forged artifact",
+      url: "https://paperclip.blockcast.net/BLO/artifacts/forged",
+      createdByRunId: randomUUID(),
+    });
+    expect(forged.status).toBe(403);
+    expect(forged.body.error).toBe("createdByRunId must match the authenticated agent run");
+
+    await request(app).post(`/api/issues/${issueId}/work-products`).send({
+      type: "artifact",
+      provider: "paperclip",
+      title: "Route artifact",
+      url: "https://paperclip.blockcast.net/BLO/artifacts/route-artifact",
+      createdByRunId: runId,
+    }).expect(201);
+
+    const rows = await db
+      .select({
+        title: issueWorkProducts.title,
+        createdByRunId: issueWorkProducts.createdByRunId,
+      })
+      .from(issueWorkProducts)
+      .where(eq(issueWorkProducts.issueId, issueId));
+    expect(rows).toEqual([
+      {
+        title: "Route artifact",
+        createdByRunId: runId,
+      },
+    ]);
   });
 
   it("does not accept a work product that references a dangling document id", async () => {
