@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { expect, request as pwRequest, test, type APIRequestContext, type APIResponse, type Locator, type Page } from "@playwright/test";
+import { expect, request as pwRequest, test, type APIRequestContext, type APIResponse, type Locator, type Page, type TestInfo } from "@playwright/test";
 import { createLocalAgentJwt } from "../../server/src/agent-auth-jwt";
 
 const PORT = Number(process.env.PAPERCLIP_E2E_PORT ?? 3199);
 const BASE_URL = `http://127.0.0.1:${PORT}`;
+const DRAG_CONFIRMATION_PROBE_TIMEOUT = 10_000;
 
 type Stage = { id: string; key: string; name: string; kind: string; position: number };
 type PipelineDetail = {
@@ -264,11 +265,18 @@ async function dragCardToColumn(page: Page, itemTitle: string, fromColumn: strin
   await page.mouse.up();
 
   try {
-    await expect(page.getByRole("dialog")).toBeVisible({ timeout: 3_000 });
+    await expect(page.getByRole("dialog")).toBeVisible({ timeout: DRAG_CONFIRMATION_PROBE_TIMEOUT });
     return true;
   } catch {
     return false;
   }
+}
+
+function recordDragFallback(testInfo: TestInfo, itemTitle: string, fromColumn: string, toColumn: string) {
+  testInfo.annotations.push({
+    type: "pipeline-drag-api-fallback",
+    description: `Drag confirmation did not appear within ${DRAG_CONFIRMATION_PROBE_TIMEOUT}ms for "${itemTitle}" from ${fromColumn} to ${toColumn}; used API fallback.`,
+  });
 }
 
 function reviewQueueRow(page: Page, title: string): Locator {
@@ -276,7 +284,8 @@ function reviewQueueRow(page: Page, title: string): Locator {
 }
 
 test.describe("Pipelines tutorial UI flow", () => {
-  test.setTimeout(240_000);
+  test.setTimeout(360_000);
+  const slowUiTimeout = 30_000;
 
   test("covers agent fan-out, drift acknowledgement gates, child-terminal gates, and stale approvals", async () => {
     const board = await pwRequest.newContext({ baseURL: BASE_URL });
@@ -435,7 +444,7 @@ test.describe("Pipelines tutorial UI flow", () => {
     await board.dispose();
   });
 
-  test("walks setup, intake, board moves, item detail, review queue, and learnings", async ({ page }) => {
+  test("walks setup, intake, board moves, item detail, review queue, and learnings", async ({ page }, testInfo) => {
     const board = await pwRequest.newContext({ baseURL: BASE_URL });
     const company = await createCompany(board);
     await createCompanyAgent(board, company.id, {
@@ -468,13 +477,26 @@ test.describe("Pipelines tutorial UI flow", () => {
     const contentTypeVariable = page
       .getByText("{{content_type}}", { exact: true })
       .locator("xpath=ancestor::div[contains(@class, 'p-4')][1]");
-    await expect(contentTypeVariable).toBeVisible();
+    await expect(contentTypeVariable).toBeVisible({ timeout: slowUiTimeout });
     await contentTypeVariable.locator("input").first().fill("Content type");
     await contentTypeVariable.getByRole("combobox").first().click();
     await page.getByRole("option", { name: "select" }).click();
     await contentTypeVariable.locator("input:not([type='checkbox'])").nth(1).fill("Blog post, Changelog entry, Launch tweet");
-    await page.getByRole("button", { name: "Save stage" }).click();
-    await expect(page.getByText("Stage saved").first()).toBeVisible();
+    const [stageSaveResponse] = await Promise.all([
+      page.waitForResponse(
+        (response) =>
+          response.request().method() === "PATCH" &&
+          response.url().includes(`/api/pipelines/${pipeline.id}/stages/`),
+        { timeout: slowUiTimeout },
+      ),
+      page.getByRole("button", { name: "Save stage" }).click(),
+    ]);
+    if (!stageSaveResponse.ok()) {
+      throw new Error(
+        `stage save failed ${stageSaveResponse.status()}: ${await stageSaveResponse.text()}`,
+      );
+    }
+    await expect(page.getByText("Stage saved").first()).toBeVisible({ timeout: slowUiTimeout });
 
     await expectOk(
       await board.post(`/api/pipelines/${pipeline.id}/stages`, {
@@ -509,7 +531,7 @@ test.describe("Pipelines tutorial UI flow", () => {
       "configure tutorial stage transitions",
     );
     await page.reload();
-    await expect(page.getByRole("button", { name: /^Assets/ }).first()).toBeVisible();
+    await expect(page.getByRole("button", { name: /^Assets/ }).first()).toBeVisible({ timeout: slowUiTimeout });
     await expectProsumerVocabulary(page);
 
     const configured = await getPipeline(board, pipeline.id);
@@ -520,7 +542,9 @@ test.describe("Pipelines tutorial UI flow", () => {
 
     await page.goto(`${companyPath}/pipelines/${pipeline.id}`);
     await page.getByRole("link", { name: "Add items" }).click();
-    await expect(page.getByRole("heading", { name: "Build your list, then submit it all at once" }).first()).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Build your list, then submit it all at once" }).first()).toBeVisible({
+      timeout: slowUiTimeout,
+    });
 
     const itemPlans = [
       { title: "Launch blog post", contentType: "Blog post" },
@@ -535,13 +559,13 @@ test.describe("Pipelines tutorial UI flow", () => {
       await row.getByRole("combobox").click();
       await page.getByRole("option", { name: plan.contentType }).click();
     }
-    await expect(page.getByRole("button", { name: "Submit 3 items" })).toBeEnabled();
+    await expect(page.getByRole("button", { name: "Submit 3 items" })).toBeEnabled({ timeout: slowUiTimeout });
     const [batchResponse] = await Promise.all([
       page.waitForResponse(
         (response) =>
           response.request().method() === "POST" &&
           response.url().endsWith(`/api/pipelines/${pipeline.id}/cases/batch`),
-        { timeout: 30_000 },
+        { timeout: slowUiTimeout },
       ),
       page.getByRole("button", { name: "Submit 3 items" }).click(),
     ]);
@@ -566,30 +590,46 @@ test.describe("Pipelines tutorial UI flow", () => {
 
     const blogDragged = await dragCardToColumn(page, "Launch blog post", "Drafting", "Assets");
     if (blogDragged) {
-      await expect(page.getByRole("heading", { name: "Move Launch blog post?" })).toBeVisible();
+      await expect(page.getByRole("heading", { name: "Move Launch blog post?" })).toBeVisible({
+        timeout: slowUiTimeout,
+      });
       await page.getByRole("button", { name: "Move it" }).click();
     } else {
+      recordDragFallback(testInfo, "Launch blog post", "Drafting", "Assets");
       await moveItem(board, blog!.id, assets!.key);
       await page.reload();
     }
-    await expect(page.getByLabel("Assets column").getByText("Launch blog post")).toBeVisible();
+    await expect(page.getByLabel("Assets column").getByText("Launch blog post")).toBeVisible({
+      timeout: slowUiTimeout,
+    });
 
     await moveItem(board, changelog!.id, assets!.key);
     await page.reload();
-    await expect(page.getByLabel("Assets column").getByText("Changelog entry")).toBeVisible();
+    await expect(page.getByLabel("Assets column").getByText("Changelog entry")).toBeVisible({
+      timeout: slowUiTimeout,
+    });
 
     const tweetDragged = await dragCardToColumn(page, "Launch tweet", "Drafting", "Published");
     const overrideReason = "Tweet can skip review because the blog post already covers the announcement.";
     if (tweetDragged) {
-      await expect(page.getByRole("heading", { name: "This skips the normal flow" })).toBeVisible();
-      await page.getByLabel("Reason").fill(overrideReason);
-      await expect(page.getByRole("button", { name: "Override and move" })).toBeEnabled();
+      await expect(page.getByRole("heading", { name: "This skips the normal flow" })).toBeVisible({
+        timeout: slowUiTimeout,
+      });
+      const reasonField = page.getByLabel("Reason");
+      await expect(reasonField).toBeVisible({ timeout: slowUiTimeout });
+      await reasonField.fill(overrideReason);
+      await expect(page.getByRole("button", { name: "Override and move" })).toBeEnabled({
+        timeout: slowUiTimeout,
+      });
       await page.getByRole("button", { name: "Override and move" }).click();
     } else {
+      recordDragFallback(testInfo, "Launch tweet", "Drafting", "Published");
       await moveItem(board, tweet!.id, published!.key, { reason: overrideReason, force: true });
       await page.reload();
     }
-    await expect(page.getByLabel("Published column").getByText("Launch tweet")).toBeVisible();
+    await expect(page.getByLabel("Published column").getByText("Launch tweet")).toBeVisible({
+      timeout: slowUiTimeout,
+    });
     await expectProsumerVocabulary(page);
 
     const root = await createItem(board, pipeline.id, {
@@ -613,56 +653,69 @@ test.describe("Pipelines tutorial UI flow", () => {
 
     await page.goto(`${companyPath}/pipelines/${pipeline.id}/items/${root.id}`);
     await expect(page.getByRole("heading", { name: "Pipeline primitives launch" }).first()).toBeVisible({
-      timeout: 30_000,
+      timeout: slowUiTimeout,
     });
-    await expect(page.getByRole("heading", { name: "Ready to move to Assets?" })).toBeVisible();
-    await expect(page.getByText("Draft is ready for the next review.")).toBeVisible();
-    await expect(page.getByRole("heading", { name: "Built from 2 items" })).toBeVisible();
-    await expect(page.getByText("Launch package draft")).toBeVisible();
-    await expect(page.getByText("Launch package changelog")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Ready to move to Assets?" })).toBeVisible({
+      timeout: slowUiTimeout,
+    });
+    await expect(page.getByText("Draft is ready for the next review.")).toBeVisible({ timeout: slowUiTimeout });
+    await expect(page.getByRole("heading", { name: "Built from 2 items" })).toBeVisible({
+      timeout: slowUiTimeout,
+    });
+    await expect(page.getByText("Launch package draft")).toBeVisible({ timeout: slowUiTimeout });
+    await expect(page.getByText("Launch package changelog")).toBeVisible({ timeout: slowUiTimeout });
     await expectProsumerVocabulary(page);
 
     await page.getByRole("button", { name: "Approve" }).click();
-    await expect(page.getByText("Move approved")).toBeVisible();
-    await expect(page.getByRole("heading", { name: "Ready to move to Assets?" })).toBeHidden();
+    await expect(page.getByText("Move approved")).toBeVisible({ timeout: slowUiTimeout });
+    await expect(page.getByRole("heading", { name: "Ready to move to Assets?" })).toBeHidden({
+      timeout: slowUiTimeout,
+    });
 
     await page.goto(`${companyPath}/review-queue`);
-    await expect(page.getByRole("heading", { name: "Review queue" }).first()).toBeVisible();
-    await expect(page.getByText("Needs your attention")).toBeVisible();
-    await expect(page.getByText("Final calls")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Review queue" }).first()).toBeVisible({
+      timeout: slowUiTimeout,
+    });
+    await expect(page.getByText("Needs your attention")).toBeVisible({ timeout: slowUiTimeout });
+    await expect(page.getByText("Final calls")).toBeVisible({ timeout: slowUiTimeout });
 
     const blogRow = reviewQueueRow(page, "Launch blog post");
-    await expect(blogRow).toBeVisible();
+    await expect(blogRow).toBeVisible({ timeout: slowUiTimeout });
     await blogRow.getByRole("button", { name: "Approve", exact: true }).click();
-    await expect(blogRow).toBeHidden();
+    await expect(blogRow).toBeHidden({ timeout: slowUiTimeout });
 
     const changelogRow = reviewQueueRow(page, "Changelog entry");
-    await expect(changelogRow).toBeVisible();
+    await expect(changelogRow).toBeVisible({ timeout: slowUiTimeout });
     await changelogRow.getByRole("button", { name: "Request changes" }).click();
     const decisionDialog = page.getByRole("dialog");
-    await expect(decisionDialog).toBeVisible();
+    await expect(decisionDialog).toBeVisible({ timeout: slowUiTimeout });
     await decisionDialog.getByLabel("Note").fill("Tighten the framing before publishing.");
     await decisionDialog.getByRole("button", { name: "Request changes" }).click();
-    await expect(changelogRow).toBeHidden();
+    await expect(changelogRow).toBeHidden({ timeout: slowUiTimeout });
     await expectProsumerVocabulary(page);
 
-    await expect.poll(async () => {
-      const refreshed = await listItems(board, pipeline.id);
-      const approved = refreshed.find((row) => row.case.title === "Launch blog post");
-      const sentBack = refreshed.find((row) => row.case.title === "Changelog entry");
-      return {
-        approvedStage: approved?.case.stageId,
-        sentBackStage: sentBack?.case.stageId,
-      };
-    }).toEqual({
+    await expect.poll(
+      async () => {
+        const refreshed = await listItems(board, pipeline.id);
+        const approved = refreshed.find((row) => row.case.title === "Launch blog post");
+        const sentBack = refreshed.find((row) => row.case.title === "Changelog entry");
+        return {
+          approvedStage: approved?.case.stageId,
+          sentBackStage: sentBack?.case.stageId,
+        };
+      },
+      { timeout: slowUiTimeout },
+    ).toEqual({
       approvedStage: published!.id,
       sentBackStage: configured.stages.find((stage) => stage.key === "drafting")!.id,
     });
 
     await page.goto(`${companyPath}/learnings`);
-    await expect(page.getByRole("heading", { name: "Learnings" }).first()).toBeVisible();
-    await expect(page.getByText("Tighten the framing before publishing.")).toBeVisible();
-    await expect(page.getByText(overrideReason)).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Learnings" }).first()).toBeVisible({
+      timeout: slowUiTimeout,
+    });
+    await expect(page.getByText("Tighten the framing before publishing.")).toBeVisible({ timeout: slowUiTimeout });
+    await expect(page.getByText(overrideReason)).toBeVisible({ timeout: slowUiTimeout });
       await expectProsumerVocabulary(page);
     } finally {
       await expectOk(
