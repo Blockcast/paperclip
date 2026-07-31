@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
 
 const mockIssueService = vi.hoisted(() => ({
@@ -702,6 +703,105 @@ describe.sequential("issue comment reopen routes", () => {
         details: expect.objectContaining({ attemptedAction: "issue:mutate" }),
       }),
     );
+  });
+
+  it("labels low-trust control-plane resume and PATCH denials as untrusted boundary records", async () => {
+    const lowTrustAgentId = "55555555-5555-4555-8555-555555555555";
+    const lowTrustCompanyId = "66666666-6666-4666-8666-666666666666";
+    const lowTrustActor = { ...agentActor(lowTrustAgentId), companyId: lowTrustCompanyId };
+    mockIssueService.getById.mockResolvedValue({
+      ...makeIssue("done"),
+      companyId: lowTrustCompanyId,
+      assigneeAgentId: lowTrustAgentId,
+    });
+    mockAgentService.getById.mockResolvedValue({
+      id: lowTrustAgentId,
+      companyId: lowTrustCompanyId,
+      role: "engineer",
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustBoundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            companyId: lowTrustCompanyId,
+            issueIds: ["11111111-1111-4111-8111-111111111111"],
+          },
+        },
+      },
+    });
+
+    const commentRes = await request(await installActor(createApp(), lowTrustActor))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "resume from low trust", resume: true });
+    const patchRes = await request(await installActor(createApp(), lowTrustActor))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "resume from low trust via patch", resume: true });
+
+    expect(commentRes.status, JSON.stringify(commentRes.body)).toBe(403);
+    expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(403);
+    expect(commentRes.body.error).toBe("Low-trust actors cannot use this control-plane surface");
+    expect(patchRes.body.error).toBe("Low-trust actors cannot use this control-plane surface");
+    const deniedWriteLogs = mockLogActivity.mock.calls
+      .map(([, entry]) => entry as { action?: string; details?: Record<string, unknown> })
+      .filter((entry) => entry.action === "issue_write_denied");
+    expect(deniedWriteLogs).toEqual([
+      expect.objectContaining({
+        details: expect.objectContaining({
+          attemptedAction: "issue:mutate",
+          reason: "deny_low_trust_control_plane",
+          responseStatus: 403,
+          sourceTrust: "untrusted_boundary_denied",
+        }),
+      }),
+      expect.objectContaining({
+        details: expect.objectContaining({
+          attemptedAction: "issue:mutate",
+          reason: "deny_low_trust_control_plane",
+          responseStatus: 403,
+          sourceTrust: "untrusted_boundary_denied",
+        }),
+      }),
+    ]);
+  });
+
+  it("collapses repeated denied-write audit rows for the same actor, issue, action, and reason", async () => {
+    const outsideAgentId = "55555555-5555-4555-8555-555555555555";
+    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: false,
+      action: input.action,
+      reason: "deny_low_trust_boundary",
+      explanation: "Peer agent is outside this low-trust boundary.",
+    }));
+    mockDbSelectLimit
+      .mockImplementationOnce(() => ({
+        then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve([]).then(onFulfilled, onRejected),
+      }))
+      .mockImplementationOnce(() => ({
+        then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve([{ entityId: "11111111-1111-4111-8111-111111111111" }]).then(onFulfilled, onRejected),
+      }));
+
+    const app = await installActor(createApp(), agentActor(outsideAgentId));
+    const first = await request(app)
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "first denied write" });
+    const second = await request(app)
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "second denied write" });
+
+    expect(first.status, JSON.stringify(first.body)).toBe(403);
+    expect(second.status, JSON.stringify(second.body)).toBe(403);
+    const deniedWriteLogs = mockLogActivity.mock.calls
+      .map(([, entry]) => entry as { action?: string; details?: Record<string, unknown> })
+      .filter((entry) => entry.action === "issue_write_denied");
+    expect(deniedWriteLogs).toHaveLength(1);
+    expect(deniedWriteLogs[0]!.details).toEqual(expect.objectContaining({
+      attemptedAction: "issue:mutate",
+      reason: "deny_low_trust_boundary",
+      payload: expect.objectContaining({ comment: "first denied write" }),
+    }));
   });
 
   it("bounds a deeply-nested denied payload instead of passing it through unbounded (BLO-18614 review fix)", async () => {
