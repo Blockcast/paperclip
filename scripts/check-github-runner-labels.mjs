@@ -5,6 +5,7 @@ const workflowsDir = path.resolve(".github/workflows");
 const workflowFiles = (await readdir(workflowsDir))
   .filter((file) => file.endsWith(".yml") || file.endsWith(".yaml"))
   .sort();
+const ALLOWED_RUNNERS = new Set(["default", "arc-light", "arc-dind", "arc-deploy", "arc-e2e"]);
 const violations = [];
 
 for (const file of workflowFiles) {
@@ -14,14 +15,14 @@ for (const file of workflowFiles) {
     const runner = line.match(/^\s*runs-on:\s*(.*?)\s*(?:#.*)?$/)?.[1];
     if (!runner) continue;
 
-    if (/\b(?:ubuntu|windows|macos)-[\w.-]+\b|\bself-hosted\b/i.test(runner)) {
+    if (!ALLOWED_RUNNERS.has(runner)) {
       violations.push(`${file}:${index + 1}: ${line.trim()}`);
     }
   }
 }
 
 if (violations.length > 0) {
-  console.error("GitHub-hosted and legacy self-hosted runner labels are forbidden; use default, arc-light, arc-dind, arc-deploy, or arc-e2e:");
+  console.error(`Runner labels must use one of: ${[...ALLOWED_RUNNERS].join(", ")}:`);
   console.error(violations.join("\n"));
   process.exitCode = 1;
 } else {

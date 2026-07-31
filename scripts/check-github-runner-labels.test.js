@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const script = fileURLToPath(new URL("./check-github-runner-labels.mjs", import.meta.url));
 const repoRoot = path.resolve(path.dirname(script), "..");
+const prE2eRunnerPattern = /\n  e2e:\n(?:(?!\n  [A-Za-z0-9_-]+:)[\s\S])*?\n    runs-on: arc-e2e\n/;
 
 test("runner-label guard accepts only ARC workflows", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-runner-labels-"));
@@ -35,13 +36,34 @@ test("runner-label guard accepts only ARC workflows", async (t) => {
     assert.match(result.stderr, /hosted\.yml:3: runs-on: ubuntu-latest/);
     assert.match(result.stderr, /hosted\.yml:5: runs-on: self-hosted/);
   });
+
+  await t.test("rejects unknown runner labels", async () => {
+    await writeFile(
+      path.join(root, ".github/workflows/unknown.yml"),
+      "jobs:\n  typo:\n    runs-on: arc-e2ee\n",
+    );
+
+    const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /unknown\.yml:3: runs-on: arc-e2ee/);
+  });
 });
 
 test("PR e2e workflow uses the dedicated ARC e2e runner", async () => {
   const workflow = await readFile(path.join(repoRoot, ".github/workflows/pr.yml"), "utf8");
   assert.match(
     workflow,
-    /\n  e2e:\n[\s\S]*?\n    runs-on: arc-e2e\n/,
+    prE2eRunnerPattern,
     "expected the PR e2e job to run on arc-e2e",
+  );
+
+  const driftedWorkflow = `${workflow.replace(
+    "\n    runs-on: arc-e2e\n",
+    "\n    runs-on: default\n",
+  )}\n  later-job:\n    runs-on: arc-e2e\n`;
+  assert.doesNotMatch(
+    driftedWorkflow,
+    prE2eRunnerPattern,
+    "a later job must not satisfy the PR e2e runner assertion",
   );
 });
