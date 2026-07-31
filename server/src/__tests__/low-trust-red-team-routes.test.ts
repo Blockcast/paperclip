@@ -823,6 +823,36 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     expect(res.body.error).toBe("Low-trust boundary root issue scopes do not overlap.");
   });
 
+  it("denies low-trust CEO coordination patches that route an issue outside the trust boundary", async () => {
+    const fixture = await seedLowTrustFixture(db);
+    await db
+      .update(agents)
+      .set({ role: "ceo" })
+      .where(eq(agents.id, fixture.agents.lowTrust.id));
+    await db
+      .update(issues)
+      .set({
+        assigneeAgentId: fixture.agents.standard.id,
+        checkoutRunId: null,
+        executionRunId: null,
+      })
+      .where(eq(issues.id, fixture.issues.assignedReview.id));
+
+    const res = await request(createApp(db, agentActor(fixture)))
+      .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
+      .send({ projectId: fixture.projects.outOfScope.id });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Low-trust actors cannot use this control-plane surface");
+
+    const persisted = await db
+      .select({ projectId: issues.projectId })
+      .from(issues)
+      .where(eq(issues.id, fixture.issues.assignedReview.id))
+      .then((rows) => rows[0] ?? null);
+    expect(persisted?.projectId).toBe(fixture.projects.allowed.id);
+  });
+
   it("restricts low-trust self inspection and redacts standard-agent secrets", async () => {
     const fixture = await seedLowTrustFixture(db);
     await db.insert(companyMemberships).values({

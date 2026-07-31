@@ -5054,6 +5054,21 @@ export function issueService(db: Db) {
     }
   }
 
+  async function lockBlockedByIssueRowsForUpdate(
+    issueId: string,
+    companyId: string,
+    blockedByIssueIds: string[],
+    dbOrTx: any = db,
+  ) {
+    const lockedIssueIds = [issueId, ...new Set(blockedByIssueIds)].sort();
+    await dbOrTx.execute(
+      sql`SELECT ${issues.id} FROM ${issues}
+          WHERE ${and(eq(issues.companyId, companyId), inArray(issues.id, lockedIssueIds))}
+          ORDER BY ${issues.id}
+          FOR UPDATE`,
+    );
+  }
+
   async function syncBlockedByIssueIds(
     issueId: string,
     companyId: string,
@@ -5067,13 +5082,7 @@ export function issueService(db: Db) {
     }
 
     if (deduped.length > 0) {
-      const lockedIssueIds = [issueId, ...deduped].sort();
-      await dbOrTx.execute(
-        sql`SELECT ${issues.id} FROM ${issues}
-            WHERE ${and(eq(issues.companyId, companyId), inArray(issues.id, lockedIssueIds))}
-            ORDER BY ${issues.id}
-            FOR UPDATE`,
-      );
+      await lockBlockedByIssueRowsForUpdate(issueId, companyId, deduped, dbOrTx);
       const relatedIssues = await dbOrTx
         .select({ id: issues.id })
         .from(issues)
@@ -8240,6 +8249,9 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        if (blockedByIssueIds !== undefined) {
+          await lockBlockedByIssueRowsForUpdate(id, existing.companyId, blockedByIssueIds, tx);
+        }
         if (issueData.parentId !== undefined) {
           await lockIssueParentMutationCompany(existing.companyId, tx);
           await assertValidIssueParent(existing.companyId, id, issueData.parentId, tx);

@@ -4205,6 +4205,39 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     ).rejects.toMatchObject({ status: 422 });
   });
 
+  it("returns cycle validation instead of deadlocking concurrent reciprocal blocker updates", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const issueA = randomUUID();
+    const issueB = randomUUID();
+    await db.insert(issues).values([
+      { id: issueA, companyId, title: "Issue A", status: "todo", priority: "medium" },
+      { id: issueB, companyId, title: "Issue B", status: "todo", priority: "medium" },
+    ]);
+
+    const results = await Promise.allSettled([
+      svc.update(issueA, { blockedByIssueIds: [issueB] }),
+      svc.update(issueB, { blockedByIssueIds: [issueA] }),
+    ]);
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.filter((result) => result.status === "rejected");
+
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    const rejection = rejected[0] as PromiseRejectedResult;
+    expect(String(rejection.reason?.message ?? rejection.reason)).not.toMatch(/deadlock/i);
+    expect(rejection.reason).toMatchObject({
+      status: 422,
+      message: "Blocking relations cannot contain cycles",
+    });
+  });
+
   it("only returns dependents once every blocker is done", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();

@@ -8131,6 +8131,7 @@ export function issueRoutes(
         req.body as Record<string, unknown>,
       )
       : false;
+    const coordinationMetadataOnly = isCeoCoordinationMetadataOnlyPatchBody(req.body);
     if (!(await assertAgentIssueMutationAllowed(
       req,
       res,
@@ -8138,7 +8139,7 @@ export function issueRoutes(
       {
         allowBlockedCorrection: true,
         allowScopedRecoveryOwnerSourceMutation,
-        coordinationMetadataOnly: isCeoCoordinationMetadataOnlyPatchBody(req.body),
+        coordinationMetadataOnly,
       },
     ))) return;
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
@@ -8170,10 +8171,17 @@ export function issueRoutes(
       res.status(400).json({ error: "Follow-up intent requires a comment" });
       return;
     }
+    const lowTrustControlPlaneMutationRequested =
+      reopenRequested === true ||
+      resumeRequested === true ||
+      Array.isArray(req.body.blockedByIssueIds) ||
+      req.body.parentId !== undefined ||
+      req.body.projectId !== undefined ||
+      req.body.projectWorkspaceId !== undefined ||
+      req.body.milestoneId !== undefined ||
+      coordinationMetadataOnly;
     if (
-      (reopenRequested === true ||
-        resumeRequested === true ||
-        Array.isArray(req.body.blockedByIssueIds)) &&
+      lowTrustControlPlaneMutationRequested &&
       await assertLowTrustControlPlaneDenied(req, res, existing.companyId, existing)
     ) {
       return;
