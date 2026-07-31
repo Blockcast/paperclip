@@ -675,6 +675,61 @@ describeEmbeddedPostgres("productivity review service", () => {
     );
   });
 
+  // The still-armed branch is the one a manager is most likely to act on: it
+  // attributes the entire episode to gating because no column records when the
+  // monitor was armed. `monitorScheduledBy: null` reaches it without tripping
+  // the deliberate-monitor suppression, so the qualifier itself is pinned —
+  // an unqualified "15h monitor-gated, 0m unattended" would tell the manager a
+  // real stall was fully accounted for.
+  it("marks monitor-gated time as an upper bound while the monitor is still armed", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const armedUntil = new Date(now.getTime() + 30 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 15 * 60 * 60 * 1000),
+      monitorNextCheckAt: armedUntil,
+      monitorScheduledBy: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.monitorScheduledSuppressed).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      `- Elapsed accounting: ≤15h 0m monitor-gated, ≥0m unattended (monitor armed until ${armedUntil.toISOString()}; arm time is not recorded, so monitor-gated time is an upper bound)`,
+    );
+  });
+
+  // A monitor that lapsed before this episode began covers none of it. Without
+  // the clamp the subtraction goes negative, yielding an `unattendedMs` larger
+  // than the episode itself; without the separate branch the prose claims an
+  // in-episode lapse and prints a timestamp from before `startedAt`.
+  it("attributes nothing to gating when the last monitor lapsed before the episode began", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const priorLapseAt = new Date(now.getTime() - 9 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: priorLapseAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      `- Elapsed accounting: 0m monitor-gated, 7h 0m unattended (no monitor armed during this episode; previous monitor lapsed at ${priorLapseAt.toISOString()}, before it began)`,
+    );
+  });
+
   it("does not suppress no-comment productivity reviews for future monitor waits", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
