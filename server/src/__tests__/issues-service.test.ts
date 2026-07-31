@@ -6585,7 +6585,26 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       message: "Project workspace must belong to the selected project",
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    const lockWaitDeadline = Date.now() + 10_000;
+    let staleUpdateWaitingForLock = false;
+    while (Date.now() < lockWaitDeadline) {
+      const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+        select exists (
+          select 1
+          from pg_stat_activity
+          where datname = current_database()
+            and pid <> pg_backend_pid()
+            and wait_event_type = 'Lock'
+            and query ~* 'select .* from .*issues.*for update'
+        ) as waiting
+      `);
+      if (Array.from(waitingRows)[0]?.waiting) {
+        staleUpdateWaitingForLock = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(staleUpdateWaitingForLock).toBe(true);
     releaseReroute.resolve();
 
     await reroute;
@@ -6602,6 +6621,52 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(finalIssue).toEqual({
       projectId: projectBId,
       projectWorkspaceId: workspaceBId,
+    });
+  });
+
+  it("returns cycle validation instead of deadlocking concurrent reciprocal reparent updates", async () => {
+    const companyId = randomUUID();
+    const issueAId = randomUUID();
+    const issueBId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      {
+        id: issueAId,
+        companyId,
+        title: "Issue A",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueBId,
+        companyId,
+        title: "Issue B",
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+
+    const results = await Promise.allSettled([
+      svc.update(issueAId, { parentId: issueBId }),
+      svc.update(issueBId, { parentId: issueAId }),
+    ]);
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.filter((result) => result.status === "rejected");
+
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    const rejection = rejected[0] as PromiseRejectedResult;
+    expect(String(rejection.reason?.message ?? rejection.reason)).not.toMatch(/deadlock/i);
+    expect(rejection.reason).toMatchObject({
+      status: 422,
+      message: "Parent issue would create a cycle",
     });
   });
 

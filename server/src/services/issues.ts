@@ -8161,6 +8161,9 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        if (issueData.parentId !== undefined) {
+          await assertValidIssueParent(existing.companyId, id, issueData.parentId, tx);
+        }
         await tx.execute(
           sql`SELECT ${issues.id} FROM ${issues}
               WHERE ${eq(issues.id, id)}
@@ -8234,9 +8237,6 @@ export function issueService(db: Db) {
             executionWorkspacePreference: nextExecutionWorkspacePreference ?? null,
             executionWorkspaceSettings: issueData.executionWorkspaceSettings,
           });
-        }
-        if (issueData.parentId !== undefined) {
-          await assertValidIssueParent(lockedExisting.companyId, lockedExisting.id, issueData.parentId, tx);
         }
         if (issueData.projectId !== undefined || patch.projectId !== undefined) {
           await assertValidIssueProject(lockedExisting.companyId, nextProjectId, tx);
