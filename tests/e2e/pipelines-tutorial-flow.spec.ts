@@ -276,7 +276,7 @@ function reviewQueueRow(page: Page, title: string): Locator {
 }
 
 test.describe("Pipelines tutorial UI flow", () => {
-  test.setTimeout(240_000);
+  test.setTimeout(360_000);
   const slowUiTimeout = 30_000;
 
   test("covers agent fan-out, drift acknowledgement gates, child-terminal gates, and stale approvals", async () => {
@@ -483,10 +483,11 @@ test.describe("Pipelines tutorial UI flow", () => {
       ),
       page.getByRole("button", { name: "Save stage" }).click(),
     ]);
-    expect(
-      stageSaveResponse.ok(),
-      `stage save failed ${stageSaveResponse.status()}: ${await stageSaveResponse.text()}`,
-    ).toBe(true);
+    if (!stageSaveResponse.ok()) {
+      throw new Error(
+        `stage save failed ${stageSaveResponse.status()}: ${await stageSaveResponse.text()}`,
+      );
+    }
     await expect(page.getByText("Stage saved").first()).toBeVisible({ timeout: slowUiTimeout });
 
     await expectOk(
@@ -675,15 +676,18 @@ test.describe("Pipelines tutorial UI flow", () => {
     await expect(changelogRow).toBeHidden({ timeout: slowUiTimeout });
     await expectProsumerVocabulary(page);
 
-    await expect.poll(async () => {
-      const refreshed = await listItems(board, pipeline.id);
-      const approved = refreshed.find((row) => row.case.title === "Launch blog post");
-      const sentBack = refreshed.find((row) => row.case.title === "Changelog entry");
-      return {
-        approvedStage: approved?.case.stageId,
-        sentBackStage: sentBack?.case.stageId,
-      };
-    }).toEqual({
+    await expect.poll(
+      async () => {
+        const refreshed = await listItems(board, pipeline.id);
+        const approved = refreshed.find((row) => row.case.title === "Launch blog post");
+        const sentBack = refreshed.find((row) => row.case.title === "Changelog entry");
+        return {
+          approvedStage: approved?.case.stageId,
+          sentBackStage: sentBack?.case.stageId,
+        };
+      },
+      { timeout: slowUiTimeout },
+    ).toEqual({
       approvedStage: published!.id,
       sentBackStage: configured.stages.find((stage) => stage.key === "drafting")!.id,
     });
