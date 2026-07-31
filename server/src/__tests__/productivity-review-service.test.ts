@@ -273,6 +273,33 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listRefreshComments(reviews[0]!.id)).toHaveLength(0);
   });
 
+  // BLO-19094: an open review grants its assignee issue:comment/issue:mutate on
+  // the SOURCE issue, and an issue with no agent assignee is mutable by any
+  // company agent (allow_company_agent). An unassigned review would therefore
+  // let any agent self-assign the dangling row and inherit mutation rights on a
+  // source issue it has no relationship to. It was already a dead row — the
+  // assignment wake is gated on the resolved owner — so it is never created.
+  it("does not open an unassigned review when no invokable review owner can be resolved", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // The only candidate (the coder's manager, who is also the sole cto/ceo
+    // role holder) is not invokable, so resolveReviewOwnerAgentId returns null.
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, seeded.managerId));
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
   it("refreshes open productivity reviews only once per interval and caps refresh comments", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
