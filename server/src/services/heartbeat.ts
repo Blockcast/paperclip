@@ -419,6 +419,7 @@ const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
+const STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_DEFAULT_MS = 5_000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
@@ -489,6 +490,16 @@ function readIntegerEnv(name: string, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function strictGitCheckoutProbeTimeoutMs(): number {
+  return Math.max(
+    100,
+    readIntegerEnv(
+      "PAPERCLIP_STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_MS",
+      STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_DEFAULT_MS,
+    ),
+  );
+}
+
 const K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS = Math.max(
   0,
   readIntegerEnv("PAPERCLIP_K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS", 6),
@@ -554,6 +565,17 @@ const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "opencode_local",
   "pi_local",
 ]);
+// BLO-18147: claude_k8s pods bootstrap their own git workspace in-pod by
+// locally `git clone --shared`-ing from the adapter's resolved cwd (confirmed
+// live from a running pod's entrypoint). When no project or session
+// workspace is available, that cwd falls back to the shared, actively-
+// mutated per-agent AGENT_HOME directory on the same storage-sensitive
+// cephfs PVC implicated in BLO-17793; a clone failure there surfaces as
+// git's raw exit 128 and kills the container before `claude` even starts,
+// burning Job backoff budget instead of a recoverable error. Scoped to
+// claude_k8s only — opencode_k8s pods were observed healthy through the same
+// incident window (BLO-18145) and are not known to share this bootstrap path.
+const K8S_GIT_SENSITIVE_ADAPTER_TYPES = new Set(["claude_k8s"]);
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -853,10 +875,20 @@ function isSpawnLikeFailureMessage(value: unknown) {
   return /failed to start command|spawn\b|\bENOENT\b/i.test(value);
 }
 
-function isRetryableInteractionContinuationInfrastructureFailure(
+export function isRetryableInteractionContinuationInfrastructureFailure(
   run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "resultJson">,
 ) {
-  if (run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE || run.errorCode === "process_lost") {
+  if (run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE) {
+    const workspaceValidation = parseObject(parseObject(run.resultJson).workspaceValidation);
+    if (
+      readNonEmptyString(workspaceValidation.reason) ===
+      "k8s_agent_home_git_bootstrap_unsupported"
+    ) {
+      return false;
+    }
+    return true;
+  }
+  if (run.errorCode === "process_lost") {
     return true;
   }
 
@@ -1928,6 +1960,45 @@ async function isGitCheckout(cwd: string | null | undefined) {
     .catch(() => false);
 }
 
+async function pathIsAbsent(cwd: string): Promise<boolean> {
+  try {
+    await fs.lstat(cwd);
+    return false;
+  } catch (error: unknown) {
+    return (error as NodeJS.ErrnoException)?.code === "ENOENT";
+  }
+}
+
+// Unlike isGitCheckout(), this does not fail open: a probe error that isn't
+// positively identifiable as "cwd is not a git checkout" (missing directory,
+// or git's own "not a git repository" fatal) is treated as "could be a
+// checkout". That covers the storage-layer failures (permission denied,
+// stale handle, I/O error, timeout) BLO-18147 exists to guard against —
+// those must reject dispatch, not silently wave it through because the probe
+// itself couldn't complete. Uses try/await rather than .then/.catch because
+// execFile can throw synchronously (e.g. ENOTDIR when cwd is not a
+// directory) before returning a promise to chain onto.
+async function probeGitCheckoutStateStrict(
+  cwd: string,
+): Promise<"checkout" | "not_a_checkout" | "indeterminate"> {
+  try {
+    const result = await execFile("git", ["rev-parse", "--show-toplevel"], {
+      cwd,
+      timeout: strictGitCheckoutProbeTimeoutMs(),
+    });
+    return readNonEmptyString(result.stdout) ? "checkout" : "indeterminate";
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return await pathIsAbsent(cwd) ? "not_a_checkout" : "indeterminate";
+    }
+    const stderr = typeof (error as { stderr?: unknown })?.stderr === "string"
+      ? (error as { stderr: string }).stderr
+      : "";
+    if (/not a git repository/i.test(stderr)) return "not_a_checkout";
+    return "indeterminate";
+  }
+}
+
 function sameResolvedPath(left: string | null | undefined, right: string | null | undefined) {
   const leftPath = readNonEmptyString(left);
   const rightPath = readNonEmptyString(right);
@@ -2060,9 +2131,49 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   executionWorkspace: RealizedExecutionWorkspace;
   persistedExecutionWorkspace: ExecutionWorkspace | null;
   executionTarget: unknown;
+  k8sRunIsolation?: { isolationMode: "shared" | "run" | "workspace" } | null;
   environmentDriver?: string | null;
   leaseMetadata?: unknown;
 }) {
+  const k8sIssue = input.issue;
+  const effectiveCwd = readNonEmptyString(input.executionWorkspace.cwd);
+  const agentFallbackCwd = resolveDefaultAgentWorkspaceDir(input.agentId);
+  // claude_k8s only clones the source checkout for per-run isolation. Key the
+  // invariant on that effective source path, not the resolver label: a missing
+  // project cwd can retain source="project_primary" while falling back here.
+  if (
+    K8S_GIT_SENSITIVE_ADAPTER_TYPES.has(input.adapterType) &&
+    k8sIssue &&
+    input.k8sRunIsolation?.isolationMode === "run" &&
+    !input.resolvedWorkspace.realizationFailure &&
+    effectiveCwd !== null &&
+    path.resolve(effectiveCwd) === path.resolve(agentFallbackCwd)
+  ) {
+    // Deliberately not isGitCheckout(): that helper fails open (any probe
+    // error -> false), which would wave a storage-layer probe failure
+    // straight through to dispatch and reproduce the exact exit-128 this
+    // guard exists to prevent. Reject dispatch unless the probe positively
+    // confirms the fallback cwd is NOT a git checkout.
+    const gitProbeState = await probeGitCheckoutStateStrict(effectiveCwd);
+    if (gitProbeState !== "not_a_checkout") {
+      throw new WorkspaceValidationFailure(
+        `Issue ${k8sIssue.identifier ?? k8sIssue.id} has no usable project or session execution workspace. Refusing to dispatch ${input.adapterType} run isolation from the shared agent-home fallback cwd "${effectiveCwd}" because its in-pod git bootstrap clones locally from this checkout and can exit 128 under storage pressure. Bind a project or execution workspace to this issue before retrying.`,
+        {
+          workspaceValidation: {
+            reason: "k8s_agent_home_git_bootstrap_unsupported",
+            adapterType: input.adapterType,
+            issueId: k8sIssue?.id ?? null,
+            issueIdentifier: k8sIssue?.identifier ?? null,
+            resolvedWorkspaceSource: input.resolvedWorkspace.source,
+            resolvedWorkspaceCwd: effectiveCwd,
+            isolationMode: input.k8sRunIsolation.isolationMode,
+            gitProbeState,
+          },
+        },
+      );
+    }
+  }
+
   if (!GIT_SENSITIVE_LOCAL_ADAPTER_TYPES.has(input.adapterType)) return;
 
   const executionTargetKind = readNonEmptyString((input.executionTarget as { kind?: unknown } | null)?.kind) ?? "local";
@@ -2080,9 +2191,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     readNonEmptyString(leaseMetadata.remoteCwd) ??
     readNonEmptyString(leaseProviderMetadata.remoteCwd);
 
-  const effectiveCwd = readNonEmptyString(input.executionWorkspace.cwd);
   const persistedCwd = readNonEmptyString(input.persistedExecutionWorkspace?.cwd);
-  const agentFallbackCwd = resolveDefaultAgentWorkspaceDir(input.agentId);
   const workspaceExpectation =
     Boolean(issue.projectWorkspaceId) ||
     Boolean(resolvedWorkspace.workspaceId) ||
@@ -18858,6 +18967,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         executionWorkspace,
         persistedExecutionWorkspace,
         executionTarget,
+        k8sRunIsolation,
         environmentDriver: selectedEnvironment.driver,
         leaseMetadata: activeEnvironmentLease.lease.metadata,
       });
