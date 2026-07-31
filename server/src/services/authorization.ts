@@ -85,6 +85,7 @@ export type AuthorizationResource =
       parentIssueId?: string | null;
       assigneeAgentId?: string | null;
       assigneeUserId?: string | null;
+      createdByAgentId?: string | null;
       originKind?: string | null;
       originId?: string | null;
       status?: string | null;
@@ -105,6 +106,7 @@ export type AuthorizationDecision = {
     | "allow_consented_change"
     | "allow_legacy_agent_creator"
     | "allow_issue_mention_grant"
+    | "allow_issue_creator"
     | "allow_recovery_handoff_grant"
     | "allow_self"
     | "allow_company_agent"
@@ -2054,6 +2056,26 @@ export function authorizationService(db: Db) {
           action: input.action,
           reason: "allow_ceo_coordination_metadata",
           explanation: "Allowed because the CEO role may curate coordination metadata (blockers, priority, project, milestone) on any company issue.",
+        });
+      }
+      if (
+        input.action === "issue:comment" &&
+        resource?.createdByAgentId === actorAgentId
+      ) {
+        return allow({
+          action: input.action,
+          reason: "allow_issue_creator",
+          explanation: "Allowed because the actor created this issue.",
+        });
+      }
+      if (
+        input.action === "issue:comment" &&
+        await isManagerOf(companyId, actorAgentId, resource.assigneeAgentId)
+      ) {
+        return allow({
+          action: input.action,
+          reason: "allow_manager_chain",
+          explanation: "Allowed because the actor manages the issue assignee in the reporting chain.",
         });
       }
       if (

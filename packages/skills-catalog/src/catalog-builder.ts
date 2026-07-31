@@ -24,8 +24,11 @@ const CATALOG_SCHEMA_VERSION = 1;
 const SKILL_ENTRYPOINT = "SKILL.md";
 const CATALOG_REFERENCE_FILE = "catalog-ref.json";
 const MAX_CATALOG_FILE_BYTES = 1024 * 1024;
+const GITHUB_FETCH_TIMEOUT_MS = 15_000;
 const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const CATALOG_KINDS = new Set<CatalogSkillKind>(["bundled", "optional"]);
+const SUPPORTED_GITHUB_HOSTNAMES = new Set(["github.com", "www.github.com"]);
+type ReferencedSkillResolution = "fetch" | "reuse-existing";
 
 interface BaseSkillCandidate {
   kind: CatalogSkillKind;
@@ -48,8 +51,32 @@ interface ReferencedGitHubSourceDescriptor {
   path: string;
 }
 
+/**
+ * Values the descriptor pins for the remote content it points at.
+ *
+ * `generated/catalog.json` cannot authenticate itself: the offline reuse path
+ * rebuilds a referenced entry from the manifest, so recomputing `contentHash`
+ * and `trustLevel` from the manifest's own file records only catches
+ * *inconsistent* edits. A coordinated edit — change a `sha256` and refresh the
+ * fields derived from it — stays self-consistent. These pins move the trust
+ * anchor into `catalog-ref.json`, a small hand-written file that shows up in a
+ * review diff and is itself covered by `descriptorSha256`.
+ *
+ * This does not make an offline check able to authenticate remote bytes: an
+ * edit to both the descriptor and the manifest is still self-consistent. It
+ * makes that edit visible in reviewed source instead of only in generated
+ * output.
+ */
+interface PinnedReferencedSkillContent {
+  name: string;
+  description: string;
+  inventorySha256: string;
+}
+
 interface ReferencedSkillDescriptor {
   source: ReferencedGitHubSourceDescriptor;
+  descriptorSha256: string;
+  pinned?: PinnedReferencedSkillContent;
   files?: string[];
   defaultInstall?: boolean;
   recommendedForRoles?: string[];
@@ -66,6 +93,13 @@ interface GitHubTreeEntry {
 interface BuildCatalogManifestOptions {
   packageDir: string;
   generatedAt?: string;
+  referencedSkillResolution?: ReferencedSkillResolution;
+  fetchTimeoutMs?: number;
+}
+
+interface BuildExpectedCatalogManifestOptions {
+  referencedSkillResolution?: ReferencedSkillResolution;
+  fetchTimeoutMs?: number;
 }
 
 interface BuildCatalogManifestResult {
@@ -79,11 +113,14 @@ export function formatCatalogManifest(manifest: CatalogManifest): string {
 
 export async function buildExpectedCatalogManifest(
   packageDir: string,
+  options: BuildExpectedCatalogManifestOptions = {},
 ): Promise<BuildCatalogManifestResult> {
   const existing = await readExistingManifest(packageDir);
   const firstPass = await buildCatalogManifest({
     packageDir,
     generatedAt: existing?.generatedAt ?? new Date().toISOString(),
+    referencedSkillResolution: options.referencedSkillResolution,
+    fetchTimeoutMs: options.fetchTimeoutMs,
   });
 
   if (existing && sameManifestExceptGeneratedAt(existing, firstPass.manifest)) {
@@ -93,6 +130,8 @@ export async function buildExpectedCatalogManifest(
   return buildCatalogManifest({
     packageDir,
     generatedAt: new Date().toISOString(),
+    referencedSkillResolution: options.referencedSkillResolution,
+    fetchTimeoutMs: options.fetchTimeoutMs,
   });
 }
 
@@ -106,6 +145,7 @@ export async function buildCatalogManifest(
   const errors: string[] = [];
   const candidates = await discoverSkillCandidates(packageDir, errors);
   const skills: CatalogSkill[] = [];
+  const fetchTimeoutMs = options.fetchTimeoutMs ?? GITHUB_FETCH_TIMEOUT_MS;
 
   collectCandidateUniquenessErrors(candidates, errors);
 
@@ -115,6 +155,8 @@ export async function buildCatalogManifest(
       candidate,
       errors,
       existingSkillsById.get(skillIdForCandidate(candidate)) ?? null,
+      options.referencedSkillResolution ?? "fetch",
+      fetchTimeoutMs,
     );
     if (skill) skills.push(skill);
   }
@@ -134,8 +176,11 @@ export async function buildCatalogManifest(
   };
 }
 
-export async function validateCatalog(packageDir: string): Promise<BuildCatalogManifestResult> {
-  const expected = await buildExpectedCatalogManifest(packageDir);
+export async function validateCatalog(
+  packageDir: string,
+  options: BuildExpectedCatalogManifestOptions = {},
+): Promise<BuildCatalogManifestResult> {
+  const expected = await buildExpectedCatalogManifest(packageDir, options);
   const generatedPath = path.join(packageDir, "generated", "catalog.json");
   const errors = [...expected.errors];
 
@@ -261,9 +306,11 @@ async function buildCatalogSkill(
   candidate: SkillCandidate,
   errors: string[],
   existingSkill: CatalogSkill | null,
+  referencedSkillResolution: ReferencedSkillResolution,
+  fetchTimeoutMs: number,
 ): Promise<CatalogSkill | null> {
   if (candidate.source === "reference") {
-    return buildReferencedCatalogSkill(packageDir, candidate, errors, existingSkill);
+    return buildReferencedCatalogSkill(packageDir, candidate, errors, existingSkill, referencedSkillResolution, fetchTimeoutMs);
   }
 
   const prefix = relativePackagePath(packageDir, candidate.absolutePath);
@@ -333,7 +380,10 @@ async function buildReferencedCatalogSkill(
   candidate: Extract<SkillCandidate, { source: "reference" }>,
   errors: string[],
   existingSkill: CatalogSkill | null,
+  referencedSkillResolution: ReferencedSkillResolution,
+  fetchTimeoutMs: number,
 ): Promise<CatalogSkill | null> {
+  const errorStart = errors.length;
   const prefix = relativePackagePath(packageDir, candidate.absolutePath);
   validateSlug("category", candidate.category, prefix, errors);
   validateSlug("slug", candidate.slug, prefix, errors);
@@ -343,25 +393,35 @@ async function buildReferencedCatalogSkill(
 
   const id = `paperclipai:${candidate.kind}:${candidate.category}:${candidate.slug}`;
   const key = `paperclipai/${candidate.kind}/${candidate.category}/${candidate.slug}`;
-  const source = buildCatalogSkillSource(descriptor.source, errors, `${prefix}/${CATALOG_REFERENCE_FILE}`);
+  const source = buildCatalogSkillSource(descriptor, errors, `${prefix}/${CATALOG_REFERENCE_FILE}`);
   if (!source) return null;
-  const fallbackSkill = canReuseExistingReferencedSkill(
+  const reusableErrors: string[] = [];
+  const reusableSkill = canReuseExistingReferencedSkill(
     existingSkill,
     candidate,
     source,
     toPosixPath(path.relative(packageDir, candidate.absolutePath)),
   )
-    ? existingSkill
+    ? rebuildReusableReferencedSkill(existingSkill!, candidate, descriptor, source, packageDir, reusableErrors)
     : null;
-  const errorStart = errors.length;
+  const canReuseSkill = reusableSkill !== null && reusableErrors.length === 0;
+  if (referencedSkillResolution === "reuse-existing") {
+    if (canReuseSkill) return reusableSkill;
+    errors.push(...reusableErrors);
+    if (errors.length === errorStart) {
+      errors.push(`${prefix}/${CATALOG_REFERENCE_FILE} changed or is missing from generated/catalog.json. Run pnpm --filter @paperclipai/skills-catalog build:manifest.`);
+    }
+    return null;
+  }
+  const fetchCache = new Map<string, Buffer | null>();
 
-  const files = await collectReferencedSkillFiles(source, descriptor.files ?? [SKILL_ENTRYPOINT], prefix, errors);
-  const skillMarkdown = await readReferencedFileText(source, SKILL_ENTRYPOINT, prefix, errors);
+  const files = await collectReferencedSkillFiles(source, descriptor.files ?? [SKILL_ENTRYPOINT], prefix, errors, fetchCache, fetchTimeoutMs);
+  const skillMarkdown = await readReferencedFileText(source, SKILL_ENTRYPOINT, prefix, errors, fetchCache, fetchTimeoutMs);
   if (!skillMarkdown) {
     const nextErrors = errors.slice(errorStart);
-    if (fallbackSkill && canFallbackToExistingReferencedSkill(nextErrors)) {
+    if (canReuseSkill && canFallbackToExistingReferencedSkill(nextErrors)) {
       errors.splice(errorStart, nextErrors.length);
-      return fallbackSkill;
+      return reusableSkill;
     }
     return null;
   }
@@ -396,18 +456,25 @@ async function buildReferencedCatalogSkill(
   if (!hasSkillEntrypoint) {
     errors.push(`${prefix} referenced inventory does not contain SKILL.md.`);
     const nextErrors = errors.slice(errorStart);
-    if (fallbackSkill && canFallbackToExistingReferencedSkill(nextErrors)) {
+    if (canReuseSkill && canFallbackToExistingReferencedSkill(nextErrors)) {
       errors.splice(errorStart, nextErrors.length);
-      return fallbackSkill;
+      return reusableSkill;
     }
   }
   if (!name || !description) {
     const nextErrors = errors.slice(errorStart);
-    if (fallbackSkill && canFallbackToExistingReferencedSkill(nextErrors)) {
+    if (canReuseSkill && canFallbackToExistingReferencedSkill(nextErrors)) {
       errors.splice(errorStart, nextErrors.length);
-      return fallbackSkill;
+      return reusableSkill;
     }
     return null;
+  }
+
+  // A partial fetch or an unusable tree response yields a partial inventory, so
+  // a pin mismatch there would be a misleading second error on top of the
+  // failure that caused it.
+  if (!errors.slice(errorStart).some((error) => isIncompleteInventoryError(error))) {
+    verifyPinnedReferencedContent(descriptor, prefix, name, description, files, errors);
   }
 
   return {
@@ -448,8 +515,167 @@ function canReuseExistingReferencedSkill(
     existingSource.repo === source.repo &&
     existingSource.ref === source.ref &&
     existingSource.commit === source.commit &&
-    existingSource.path === source.path
+    existingSource.path === source.path &&
+    existingSource.descriptorSha256 === source.descriptorSha256
   );
+}
+
+function rebuildReusableReferencedSkill(
+  existingSkill: CatalogSkill,
+  candidate: Extract<SkillCandidate, { source: "reference" }>,
+  descriptor: ReferencedSkillDescriptor,
+  source: CatalogSkillSource,
+  packageDir: string,
+  errors: string[],
+): CatalogSkill | null {
+  const prefix = relativePackagePath(packageDir, candidate.absolutePath);
+  const files = validateReusableReferencedFiles(existingSkill, descriptor.files ?? [SKILL_ENTRYPOINT], prefix, errors);
+  const name = asString(existingSkill.name);
+  const description = asString(existingSkill.description);
+  if (!name) errors.push(`${prefix} reused generated manifest entry must include a name.`);
+  if (!description) errors.push(`${prefix} reused generated manifest entry must include a description.`);
+  if (!name || !description) return null;
+
+  const trustLevel = deriveTrustLevel(files);
+  const contentHash = buildContentHash(files);
+  if (existingSkill.trustLevel !== trustLevel) {
+    errors.push(`${prefix} reused generated manifest entry has stale trustLevel. Run pnpm --filter @paperclipai/skills-catalog build:manifest.`);
+  }
+  if (existingSkill.contentHash !== contentHash) {
+    errors.push(`${prefix} reused generated manifest entry has stale contentHash. Run pnpm --filter @paperclipai/skills-catalog build:manifest.`);
+  }
+  validateReusedEntryAgainstPins(descriptor, prefix, name, description, files, errors);
+
+  return {
+    id: skillIdForCandidate(candidate),
+    key: `paperclipai/${candidate.kind}/${candidate.category}/${candidate.slug}`,
+    kind: candidate.kind,
+    category: candidate.category,
+    slug: candidate.slug,
+    name,
+    description,
+    path: toPosixPath(path.relative(packageDir, candidate.absolutePath)),
+    entrypoint: SKILL_ENTRYPOINT,
+    trustLevel,
+    compatibility: "compatible",
+    defaultInstall: descriptor.defaultInstall ?? false,
+    recommendedForRoles: descriptor.recommendedForRoles ?? [],
+    requires: descriptor.requires ?? [],
+    tags: descriptor.tags ?? [],
+    files,
+    contentHash,
+    source,
+  };
+}
+
+/**
+ * Reuse-path check: the metadata and inventory taken from the generated
+ * manifest must match what `catalog-ref.json` pins. Without this the offline
+ * rebuild is circular — it validates the manifest against itself.
+ */
+function validateReusedEntryAgainstPins(
+  descriptor: ReferencedSkillDescriptor,
+  prefix: string,
+  name: string,
+  description: string,
+  files: CatalogSkillFile[],
+  errors: string[],
+) {
+  const pinned = descriptor.pinned;
+  if (!pinned) {
+    errors.push(`${prefix}/${CATALOG_REFERENCE_FILE} does not pin name, description, and inventorySha256, so the reused generated manifest entry cannot be verified offline. Run pnpm --filter @paperclipai/skills-catalog build:manifest, which reports the values to add.`);
+    return;
+  }
+  if (pinned.name !== name) {
+    errors.push(`${prefix} reused generated manifest entry name ${JSON.stringify(name)} does not match ${CATALOG_REFERENCE_FILE} pinned.name ${JSON.stringify(pinned.name)}.`);
+  }
+  if (pinned.description !== description) {
+    errors.push(`${prefix} reused generated manifest entry description does not match ${CATALOG_REFERENCE_FILE} pinned.description.`);
+  }
+  const inventorySha256 = buildInventoryDigest(files);
+  if (pinned.inventorySha256 !== inventorySha256) {
+    errors.push(`${prefix} reused generated manifest entry inventory ${inventorySha256} does not match ${CATALOG_REFERENCE_FILE} pinned.inventorySha256 ${pinned.inventorySha256}. Run pnpm --filter @paperclipai/skills-catalog build:manifest.`);
+  }
+}
+
+function validateReusableReferencedFiles(
+  existingSkill: CatalogSkill,
+  includePatterns: string[],
+  prefix: string,
+  errors: string[],
+): CatalogSkillFile[] {
+  const normalizedPatterns = includePatterns.flatMap((pattern) => {
+    const normalized = normalizeReferencedPath(pattern);
+    if (normalized === null) {
+      errors.push(`${prefix} referenced include path is invalid: ${pattern}`);
+      return [];
+    }
+    return normalized ? [normalized] : [];
+  });
+  const seen = new Set<string>();
+  const matchedPatterns = new Set<string>();
+  const files: CatalogSkillFile[] = [];
+
+  for (const file of Array.isArray(existingSkill.files) ? (existingSkill.files as unknown[]) : []) {
+    if (!isPlainRecord(file)) {
+      errors.push(`${prefix} reused generated manifest entry contains a malformed file entry.`);
+      continue;
+    }
+    const relativePath = typeof file.path === "string" ? normalizeReferencedPath(file.path) : null;
+    if (!relativePath) {
+      errors.push(`${prefix} reused generated manifest entry contains an invalid file path.`);
+      continue;
+    }
+    if (seen.has(relativePath)) {
+      errors.push(`${prefix}/${relativePath} appears more than once in the reused generated manifest entry.`);
+      continue;
+    }
+    seen.add(relativePath);
+    let isIncluded = false;
+    for (const pattern of normalizedPatterns) {
+      if (!referencedPathMatches(relativePath, pattern)) continue;
+      matchedPatterns.add(pattern);
+      isIncluded = true;
+    }
+    if (!isIncluded) {
+      errors.push(`${prefix}/${relativePath} is not included by ${CATALOG_REFERENCE_FILE}.`);
+    }
+    const expectedKind = classifyCatalogFile(relativePath);
+    const kind = asString(file.kind);
+    const sizeBytes = typeof file.sizeBytes === "number" ? file.sizeBytes : Number.NaN;
+    const digest = asString(file.sha256) ?? "";
+    if (kind !== expectedKind) {
+      errors.push(`${prefix}/${relativePath} has stale kind ${String(kind)}; expected ${expectedKind}.`);
+    }
+    if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 0 || sizeBytes > MAX_CATALOG_FILE_BYTES) {
+      errors.push(`${prefix}/${relativePath} has invalid sizeBytes.`);
+    }
+    if (!/^[0-9a-f]{64}$/i.test(digest)) {
+      errors.push(`${prefix}/${relativePath} has invalid sha256.`);
+    }
+    files.push({
+      path: relativePath,
+      kind: expectedKind,
+      sizeBytes: Number.isSafeInteger(sizeBytes) && sizeBytes >= 0 ? sizeBytes : 0,
+      sha256: /^[0-9a-f]{64}$/i.test(digest) ? digest.toLowerCase() : "0".repeat(64),
+    });
+  }
+
+  for (const pattern of normalizedPatterns) {
+    if (!pattern.endsWith("/**") && !matchedPatterns.has(pattern)) {
+      errors.push(`${prefix}/${pattern} is missing from the reused generated manifest entry.`);
+    }
+  }
+
+  files.sort((a, b) => {
+    if (a.path === SKILL_ENTRYPOINT) return -1;
+    if (b.path === SKILL_ENTRYPOINT) return 1;
+    return a.path.localeCompare(b.path);
+  });
+  if (!files.some((file) => file.path === SKILL_ENTRYPOINT && file.kind === "skill")) {
+    errors.push(`${prefix} reused generated manifest entry does not contain SKILL.md.`);
+  }
+  return files;
 }
 
 function canFallbackToExistingReferencedSkill(errors: string[]) {
@@ -468,6 +694,20 @@ function isReferencedFetchError(error: string) {
   return error.includes("failed to fetch GitHub tree:") || error.includes("failed to fetch pinned GitHub file:");
 }
 
+/**
+ * Any error that means the fetched inventory is incomplete — a failed download,
+ * or a tree response we could not read in full. Distinct from
+ * `isReferencedFetchError`, which gates falling back to the previous manifest
+ * entry and must stay limited to transient network failures.
+ */
+function isIncompleteInventoryError(error: string) {
+  return (
+    isReferencedFetchError(error) ||
+    error.includes("GitHub tree response") ||
+    error.includes("GitHub tree entry ")
+  );
+}
+
 function isRecoverableReferencedFetchError(error: string) {
   if (!isReferencedFetchError(error)) return false;
   const statusMatch = /HTTP (\d+)/.exec(error);
@@ -482,8 +722,10 @@ async function readReferencedSkillDescriptor(
   errors: string[],
 ): Promise<ReferencedSkillDescriptor | null> {
   let raw: unknown;
+  let rawText: string;
   try {
-    raw = JSON.parse(await fs.readFile(descriptorPath, "utf8"));
+    rawText = await fs.readFile(descriptorPath, "utf8");
+    raw = JSON.parse(rawText);
   } catch (error) {
     errors.push(`${prefix}/${CATALOG_REFERENCE_FILE} is missing or invalid JSON: ${errorMessage(error)}`);
     return null;
@@ -510,6 +752,7 @@ async function readReferencedSkillDescriptor(
   }
 
   const descriptor: ReferencedSkillDescriptor = {
+    descriptorSha256: sha256(Buffer.from(rawText)),
     source: {
       type: "github",
       hostname: asString(sourceRaw.hostname) ?? "github.com",
@@ -519,6 +762,7 @@ async function readReferencedSkillDescriptor(
       commit,
       path: sourcePath,
     },
+    pinned: readPinnedReferencedContent(raw.pinned, prefix, errors),
     defaultInstall: asBoolean(raw.defaultInstall) ?? false,
     files: asStringArray(raw.files ?? undefined) ?? undefined,
     recommendedForRoles: asStringArray(raw.recommendedForRoles ?? undefined) ?? undefined,
@@ -534,30 +778,117 @@ async function readReferencedSkillDescriptor(
   return descriptor;
 }
 
+function readPinnedReferencedContent(
+  raw: unknown,
+  prefix: string,
+  errors: string[],
+): PinnedReferencedSkillContent | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!isPlainRecord(raw)) {
+    errors.push(`${prefix}/${CATALOG_REFERENCE_FILE} pinned must be an object.`);
+    return undefined;
+  }
+  const name = asString(raw.name);
+  const description = asString(raw.description);
+  const rawDigest = asString(raw.inventorySha256);
+  const inventorySha256 = rawDigest && /^sha256:[0-9a-f]{64}$/i.test(rawDigest) ? rawDigest.toLowerCase() : null;
+  if (!name) errors.push(`${prefix}/${CATALOG_REFERENCE_FILE} pinned.name must be a non-empty string.`);
+  if (!description) errors.push(`${prefix}/${CATALOG_REFERENCE_FILE} pinned.description must be a non-empty string.`);
+  if (!inventorySha256) {
+    errors.push(`${prefix}/${CATALOG_REFERENCE_FILE} pinned.inventorySha256 must be "sha256:" followed by 64 hex characters.`);
+  }
+  if (!name || !description || !inventorySha256) return undefined;
+  return { name, description, inventorySha256 };
+}
+
+/**
+ * Digest over the full file inventory — path, kind, size, and content digest.
+ *
+ * Deliberately wider than `contentHash` (path + sha256 only) so a tampered
+ * `sizeBytes` or `kind` in the generated manifest is caught too. Sorted by code
+ * point rather than `localeCompare`, which is locale- and ICU-dependent and so
+ * cannot anchor a digest that has to reproduce on every machine.
+ */
+function buildInventoryDigest(files: CatalogSkillFile[]) {
+  const hashInput = [...files]
+    .map((file) => ({
+      path: file.path,
+      kind: file.kind,
+      sizeBytes: file.sizeBytes,
+      sha256: file.sha256.toLowerCase(),
+    }))
+    .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return `sha256:${sha256(Buffer.from(JSON.stringify(hashInput)))}`;
+}
+
+function formatPinnedSuggestion(name: string, description: string, files: CatalogSkillFile[]) {
+  return JSON.stringify({ name, description, inventorySha256: buildInventoryDigest(files) });
+}
+
+/**
+ * Fetch-path check: the freshly fetched content must agree with what the
+ * descriptor claims. A stale pin left behind after a commit bump would
+ * otherwise only surface later, as an unexplained failure of the offline
+ * freshness check in CI.
+ */
+function verifyPinnedReferencedContent(
+  descriptor: ReferencedSkillDescriptor,
+  prefix: string,
+  name: string,
+  description: string,
+  files: CatalogSkillFile[],
+  errors: string[],
+) {
+  const pinned = descriptor.pinned;
+  if (!pinned) {
+    errors.push(`${prefix}/${CATALOG_REFERENCE_FILE} must include a pinned object so the generated manifest can be verified offline. Add "pinned": ${formatPinnedSuggestion(name, description, files)}`);
+    return;
+  }
+  if (pinned.name !== name) {
+    errors.push(`${prefix}/${CATALOG_REFERENCE_FILE} pinned.name is ${JSON.stringify(pinned.name)} but the pinned commit provides ${JSON.stringify(name)}.`);
+  }
+  if (pinned.description !== description) {
+    errors.push(`${prefix}/${CATALOG_REFERENCE_FILE} pinned.description does not match the description at the pinned commit (${JSON.stringify(description)}).`);
+  }
+  const inventorySha256 = buildInventoryDigest(files);
+  if (pinned.inventorySha256 !== inventorySha256) {
+    errors.push(`${prefix}/${CATALOG_REFERENCE_FILE} pinned.inventorySha256 is stale; the pinned commit yields ${inventorySha256}.`);
+  }
+}
+
 function buildCatalogSkillSource(
-  descriptor: ReferencedGitHubSourceDescriptor,
+  descriptor: ReferencedSkillDescriptor,
   errors: string[],
   prefix: string,
 ): CatalogSkillSource | null {
-  if (!/^[0-9a-f]{40}$/i.test(descriptor.commit)) {
+  const source = descriptor.source;
+  if (!/^[0-9a-f]{40}$/i.test(source.commit)) {
     errors.push(`${prefix} source.commit must be a 40-character Git commit SHA.`);
   }
-  const sourcePath = normalizeReferencedPath(descriptor.path);
+  const sourcePath = normalizeReferencedPath(source.path);
   if (sourcePath === null) {
     errors.push(`${prefix} source.path must be a portable path within the repository.`);
   }
-  const hostname = descriptor.hostname ?? "github.com";
-  const url = `https://${hostname}/${descriptor.owner}/${descriptor.repo}/tree/${descriptor.ref}/${sourcePath ?? ""}`.replace(/\/$/, "");
-  if (!/^[0-9a-f]{40}$/i.test(descriptor.commit) || sourcePath === null) return null;
+  const rawHostname = source.hostname ?? "github.com";
+  const normalizedHostname = rawHostname.toLowerCase();
+  const hostname = normalizedHostname === "www.github.com" ? "github.com" : normalizedHostname;
+  if (!SUPPORTED_GITHUB_HOSTNAMES.has(normalizedHostname)) {
+    errors.push(`${prefix} source.hostname must be github.com.`);
+  }
+  if (!/^[0-9a-f]{40}$/i.test(source.commit) || sourcePath === null || !SUPPORTED_GITHUB_HOSTNAMES.has(normalizedHostname)) {
+    return null;
+  }
+  const url = `https://${hostname}/${source.owner}/${source.repo}/tree/${source.ref}/${sourcePath ?? ""}`.replace(/\/$/, "");
   return {
     type: "github",
     hostname,
-    owner: descriptor.owner,
-    repo: descriptor.repo,
-    ref: descriptor.ref,
-    commit: descriptor.commit,
+    owner: source.owner,
+    repo: source.repo,
+    ref: source.ref,
+    commit: source.commit,
     path: sourcePath ?? "",
     url,
+    descriptorSha256: descriptor.descriptorSha256,
   };
 }
 
@@ -566,8 +897,10 @@ async function collectReferencedSkillFiles(
   includePatterns: string[],
   prefix: string,
   errors: string[],
+  fetchCache: Map<string, Buffer | null>,
+  fetchTimeoutMs: number,
 ): Promise<CatalogSkillFile[]> {
-  const tree = await fetchGitHubTree(source, prefix, errors);
+  const tree = await fetchGitHubTree(source, prefix, errors, fetchTimeoutMs);
   const sourceRoot = source.path ? `${source.path}/` : "";
   const normalizedPatterns: string[] = [];
   for (const pattern of includePatterns) {
@@ -590,7 +923,7 @@ async function collectReferencedSkillFiles(
       continue;
     }
 
-    const bytes = await fetchReferencedFileBytes(source, relativePath, prefix, errors);
+    const bytes = await fetchReferencedFileBytes(source, relativePath, prefix, errors, fetchCache, fetchTimeoutMs);
     if (!bytes) continue;
     files.push({
       path: relativePath,
@@ -612,21 +945,70 @@ async function fetchGitHubTree(
   source: CatalogSkillSource,
   prefix: string,
   errors: string[],
+  fetchTimeoutMs: number,
 ): Promise<GitHubTreeEntry[]> {
   const url = `${githubApiBase(source.hostname)}/repos/${source.owner}/${source.repo}/git/trees/${source.commit}?recursive=1`;
   try {
-    const response = await fetch(url, { headers: { accept: "application/vnd.github+json" } });
+    const { response, body } = await fetchJsonWithTimeout<{ tree?: unknown; truncated?: boolean }>(
+      url,
+      { headers: { accept: "application/vnd.github+json" } },
+      fetchTimeoutMs,
+    );
     if (!response.ok) {
       errors.push(`${prefix} failed to fetch GitHub tree: HTTP ${response.status}.`);
       return [];
     }
-    const body = await response.json() as { tree?: GitHubTreeEntry[]; truncated?: boolean };
-    if (body.truncated) errors.push(`${prefix} GitHub tree response was truncated.`);
-    return Array.isArray(body.tree) ? body.tree : [];
+    if (body?.truncated) errors.push(`${prefix} GitHub tree response was truncated.`);
+    return parseGitHubTreeEntries(body?.tree, prefix, errors);
   } catch (error) {
     errors.push(`${prefix} failed to fetch GitHub tree: ${errorMessage(error)}.`);
     return [];
   }
+}
+
+/**
+ * The tree walk dereferences `entry.type` and `entry.path`, so an untyped
+ * response member (`null`, or a blob whose `path` is not a string) would throw
+ * a TypeError out of manifest generation instead of reporting which entry was
+ * malformed.
+ */
+function parseGitHubTreeEntries(rawTree: unknown, prefix: string, errors: string[]): GitHubTreeEntry[] {
+  if (rawTree === undefined || rawTree === null) {
+    errors.push(`${prefix} GitHub tree response did not include a tree array.`);
+    return [];
+  }
+  if (!Array.isArray(rawTree)) {
+    errors.push(`${prefix} GitHub tree response tree must be an array.`);
+    return [];
+  }
+
+  const entries: GitHubTreeEntry[] = [];
+  rawTree.forEach((raw, index) => {
+    if (!isPlainRecord(raw)) {
+      errors.push(`${prefix} GitHub tree entry ${index} is not an object.`);
+      return;
+    }
+    const entryPath = asString(raw.path);
+    if (!entryPath) {
+      errors.push(`${prefix} GitHub tree entry ${index} is missing a string path.`);
+      return;
+    }
+    const type = asString(raw.type);
+    if (!type) {
+      errors.push(`${prefix} GitHub tree entry ${index} (${entryPath}) is missing a string type.`);
+      return;
+    }
+    if (raw.size !== undefined && raw.size !== null) {
+      if (typeof raw.size !== "number" || !Number.isSafeInteger(raw.size) || raw.size < 0) {
+        errors.push(`${prefix} GitHub tree entry ${index} (${entryPath}) has an invalid size.`);
+        return;
+      }
+      entries.push({ path: entryPath, type, size: raw.size });
+      return;
+    }
+    entries.push({ path: entryPath, type });
+  });
+  return entries;
 }
 
 async function readReferencedFileText(
@@ -634,8 +1016,10 @@ async function readReferencedFileText(
   relativePath: string,
   prefix: string,
   errors: string[],
+  fetchCache: Map<string, Buffer | null>,
+  fetchTimeoutMs: number,
 ) {
-  const bytes = await fetchReferencedFileBytes(source, relativePath, prefix, errors);
+  const bytes = await fetchReferencedFileBytes(source, relativePath, prefix, errors, fetchCache, fetchTimeoutMs);
   return bytes ? bytes.toString("utf8") : null;
 }
 
@@ -644,22 +1028,31 @@ async function fetchReferencedFileBytes(
   relativePath: string,
   prefix: string,
   errors: string[],
+  fetchCache: Map<string, Buffer | null>,
+  fetchTimeoutMs: number,
 ): Promise<Buffer | null> {
   const normalizedPath = normalizeReferencedPath(relativePath);
   if (!normalizedPath) {
     errors.push(`${prefix} referenced file path is invalid: ${relativePath}`);
     return null;
   }
+  if (fetchCache.has(normalizedPath)) {
+    return fetchCache.get(normalizedPath) ?? null;
+  }
   const url = rawGitHubUrl(source, normalizedPath);
   try {
-    const response = await fetch(url);
+    const { response, body } = await fetchArrayBufferWithTimeout(url, {}, fetchTimeoutMs);
     if (!response.ok) {
       errors.push(`${prefix}/${normalizedPath} failed to fetch pinned GitHub file: HTTP ${response.status}.`);
+      fetchCache.set(normalizedPath, null);
       return null;
     }
-    return Buffer.from(await response.arrayBuffer());
+    const bytes = Buffer.from(body ?? new ArrayBuffer(0));
+    fetchCache.set(normalizedPath, bytes);
+    return bytes;
   } catch (error) {
     errors.push(`${prefix}/${normalizedPath} failed to fetch pinned GitHub file: ${errorMessage(error)}.`);
+    fetchCache.set(normalizedPath, null);
     return null;
   }
 }
@@ -849,18 +1242,51 @@ function referencedPathMatches(relativePath: string, pattern: string) {
 
 function githubApiBase(hostname: string) {
   const normalized = hostname.toLowerCase();
-  return normalized === "github.com" || normalized === "www.github.com"
-    ? "https://api.github.com"
-    : `https://${hostname}/api/v3`;
+  if (!SUPPORTED_GITHUB_HOSTNAMES.has(normalized)) {
+    throw new Error(`Unsupported GitHub hostname: ${hostname}`);
+  }
+  return "https://api.github.com";
 }
 
 function rawGitHubUrl(source: CatalogSkillSource, relativePath: string) {
   const fullPath = source.path ? `${source.path}/${relativePath}` : relativePath;
   const encodedPath = fullPath.split("/").map((segment) => encodeURIComponent(segment)).join("/");
   const normalized = source.hostname.toLowerCase();
-  return normalized === "github.com" || normalized === "www.github.com"
-    ? `https://raw.githubusercontent.com/${source.owner}/${source.repo}/${source.commit}/${encodedPath}`
-    : `https://${source.hostname}/raw/${source.owner}/${source.repo}/${source.commit}/${encodedPath}`;
+  if (!SUPPORTED_GITHUB_HOSTNAMES.has(normalized)) {
+    throw new Error(`Unsupported GitHub hostname: ${source.hostname}`);
+  }
+  return `https://raw.githubusercontent.com/${source.owner}/${source.repo}/${source.commit}/${encodedPath}`;
+}
+
+async function fetchJsonWithTimeout<T>(url: string, init: RequestInit = {}, timeoutMs = GITHUB_FETCH_TIMEOUT_MS) {
+  return fetchWithTimeout(url, init, timeoutMs, async (response) => {
+    if (!response.ok) return null;
+    return await response.json() as T;
+  });
+}
+
+async function fetchArrayBufferWithTimeout(url: string, init: RequestInit = {}, timeoutMs = GITHUB_FETCH_TIMEOUT_MS) {
+  return fetchWithTimeout(url, init, timeoutMs, async (response) => {
+    if (!response.ok) return null;
+    return await response.arrayBuffer();
+  });
+}
+
+async function fetchWithTimeout<T>(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  consumeBody: (response: Response) => Promise<T | null>,
+) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    const body = await consumeBody(response);
+    return { response, body };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function isPathInside(parent: string, child: string) {

@@ -1311,6 +1311,78 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await countRefreshComments()).toBe(2);
   });
 
+  it("serializes concurrent refresh attempts — only one refresh comment per 5min window", async () => {
+    // BLO-3737. The throttle above is correct for *sequential* re-scans, but
+    // the check and the append were two separate statements: two reconciles
+    // overlapping in time both read count=0 / lastRefreshAt=old before either
+    // wrote, so both passed the gate and both appended. That is the BLO-3277
+    // shape — 14 refresh comments in 6 minutes from the 30s scheduler
+    // overlapping itself. createOrUpdateReview now holds a transaction-scoped
+    // advisory lock on the review issue across check-then-append, so the
+    // loser blocks until the winner commits and then observes its comment.
+    const seeded = await seedAssignedIssue();
+    const scanNow = new Date();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: scanNow,
+    });
+
+    const created = await productivityReviewService(db).reconcileProductivityReviews({
+      now: scanNow,
+      companyId: seeded.companyId,
+    });
+    expect(created.created).toBe(1);
+
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    const reviewId = reviews[0]!.id;
+
+    async function countRefreshComments() {
+      const rows = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.issueId, reviewId),
+            sql`${issueComments.body} like ${`${PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX}%`}`,
+          ),
+        );
+      return rows.length;
+    }
+
+    expect(await countRefreshComments()).toBe(0);
+
+    // Backdate the review creation so BOTH concurrent scans would otherwise
+    // reach the refresh branch — without the lock this races.
+    await db
+      .update(issues)
+      .set({ createdAt: new Date(Date.now() - PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS - 60 * 1000) })
+      .where(eq(issues.id, reviewId));
+
+    // Separate service instances, as two overlapping scheduler runs would be.
+    const [first, second] = await Promise.all([
+      productivityReviewService(db).reconcileProductivityReviews({
+        now: new Date(),
+        companyId: seeded.companyId,
+        thresholds: { refreshIntervalMs: 1 },
+      }),
+      productivityReviewService(db).reconcileProductivityReviews({
+        now: new Date(),
+        companyId: seeded.companyId,
+        thresholds: { refreshIntervalMs: 1 },
+      }),
+    ]);
+
+    // The whole point: exactly one refresh comment, not two.
+    expect(await countRefreshComments()).toBe(1);
+    expect(first.updated + second.updated).toBe(1);
+    expect(first.existing + second.existing).toBe(1);
+    expect(first.failed + second.failed).toBe(0);
+  });
+
   it("clamps poisoned requestDepth metadata instead of aborting productivity reconciliation", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
