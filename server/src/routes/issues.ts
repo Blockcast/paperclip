@@ -3635,6 +3635,10 @@ export function issueRoutes(
     return decision !== true && decision.reason === "allow_recovery_handoff_grant";
   }
 
+  function isCreatorOrManagerCommentGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    return decision !== true && (decision.reason === "allow_issue_creator" || decision.reason === "allow_manager_chain");
+  }
+
   // The decision reason alone is not a sufficient test for "this caller is a
   // recovery-transferred previous owner". assertAgentIssueCommentAllowed short-
   // circuits with a bare `true` when isCurrentIssueExecutionRun matches (the
@@ -10258,6 +10262,9 @@ export function issueRoutes(
       req.actor.type === "agent" &&
       (isRecoveryHandoffGrantDecision(commentAccessDecision) ||
         await isRecoveryHandoffPreviousOwner(req, issue));
+    const creatorOrManagerGrantedCommentOnly =
+      req.actor.type === "agent" &&
+      isCreatorOrManagerCommentGrantDecision(commentAccessDecision);
     if (recoveryHandoffGrantedCommentOnly && (reopenRequested || resumeRequested)) {
       res.status(403).json({
         error: "Recovery handoff grant is comment-only",
@@ -10486,16 +10493,17 @@ export function issueRoutes(
       const shouldAutoApproveReviewComment =
         currentIssue.status === "in_review" &&
         currentExecutionState?.status === "pending" &&
-        // A recovery-handoff caller is comment-only, so its comment must never
-        // be read as a review decision (BLO-18906). Without this, an approval-
-        // shaped comment from a previous owner who happens to still be named as
-        // the pending stage participant would transition the issue to `done` and
-        // insert an execution decision — a state mutation the grant does not
-        // confer, reached without ever passing an `issue:mutate` check.
+        // Comment-only grants must never be read as review decisions. Without
+        // this, an approval-shaped comment from a previous owner, creator, or
+        // manager-chain actor who happens to still be named as the pending stage
+        // participant would transition the issue to `done` and insert an
+        // execution decision — a state mutation the grant does not confer,
+        // reached without ever passing an `issue:mutate` check.
         // Deliberately NOT extended to `mentionGrantedPeerAgentCommentOnly`: a
         // mentioned non-assignee reviewer approving its own stage is the
         // established path this branch exists to serve.
         !recoveryHandoffGrantedCommentOnly &&
+        !creatorOrManagerGrantedCommentOnly &&
         actorMatchesExecutionParticipant(actor, currentExecutionState.currentParticipant ?? null) &&
         isApprovalReviewComment(req.body.body);
 

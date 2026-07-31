@@ -443,6 +443,37 @@ function useProductionIssueAuthorization(agentRows: Record<string, unknown>[]) {
   });
 }
 
+async function makePendingReviewIssueForAgent(agentId: string, overrides: Record<string, unknown> = {}) {
+  const { normalizeIssueExecutionPolicy } = await vi.importActual<typeof import("../services/issue-execution-policy.js")>(
+    "../services/issue-execution-policy.js",
+  );
+  const policy = normalizeIssueExecutionPolicy({
+    stages: [
+      {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        type: "review",
+        participants: [{ type: "agent", agentId }],
+      },
+    ],
+  })!;
+  return makeIssue({
+    status: "in_review",
+    executionPolicy: policy,
+    executionState: {
+      status: "pending",
+      currentStageId: policy.stages[0].id,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId },
+      returnAssignee: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    },
+    ...overrides,
+  });
+}
+
 describe("agent issue mutation checkout ownership", () => {
   beforeEach(() => {
     vi.resetModules();
@@ -2072,6 +2103,43 @@ describe("agent issue mutation checkout ownership", () => {
     );
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
+
+  const commentOnlyAutoApprovalCases: Array<[string, Record<string, unknown>[], Record<string, unknown>]> = [
+    ["creator", [makeAgent(peerAgentId), makeAgent(ownerAgentId)], { createdByAgentId: peerAgentId }],
+    ["manager-chain", [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })], { createdByAgentId: ownerAgentId }],
+  ];
+
+  it.each(commentOnlyAutoApprovalCases)(
+    "does not let a %s comment grant auto-approve an in_review issue",
+    async (_kind, agentRows, issueOverrides) => {
+      const reviewBody = "## Review: APPROVED";
+      useProductionIssueAuthorization(agentRows);
+      mockIssueService.getById.mockResolvedValue(
+        await makePendingReviewIssueForAgent(peerAgentId, {
+          assigneeAgentId: ownerAgentId,
+          ...issueOverrides,
+        }),
+      );
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-comment-grant-approval",
+        issueId,
+        companyId,
+        body: reviewBody,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        authorAgentId: peerAgentId,
+        authorUserId: null,
+      });
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: reviewBody });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    },
+  );
 
   const commentGrantMutationDenialCases: Array<[string, Record<string, unknown>[], Record<string, unknown>]> = [
     ["creator", [makeAgent(peerAgentId), makeAgent(ownerAgentId)], { createdByAgentId: peerAgentId }],
