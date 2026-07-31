@@ -141,6 +141,28 @@ const ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE = 500;
 export const MAX_CHILD_ISSUES_CREATED_BY_HELPER = 25;
 const MAX_CHILD_COMPLETION_SUMMARIES = 20;
 const CHILD_COMPLETION_SUMMARY_BODY_MAX_CHARS = 500;
+
+function preserveInReviewExecutionStageCheckoutCondition() {
+  return sql`(
+    ${issues.status} = 'in_review'
+    AND ${issues.executionState} ->> 'status' = 'pending'
+    AND coalesce(${issues.executionState} -> 'currentParticipant', 'null'::jsonb) <> 'null'::jsonb
+  )`;
+}
+
+function checkoutStatusForCurrentRow() {
+  return sql<string>`CASE
+    WHEN ${preserveInReviewExecutionStageCheckoutCondition()} THEN 'in_review'
+    ELSE 'in_progress'
+  END`;
+}
+
+function checkoutStartedAtForCurrentRow(now: Date) {
+  return sql<Date | null>`CASE
+    WHEN ${preserveInReviewExecutionStageCheckoutCondition()} THEN ${issues.startedAt}
+    ELSE ${now}
+  END`;
+}
 // Non-human author sentinels that agents post under. These ARE eligible for
 // agent-attribution derivation even though `local-board` is also materialized
 // as a row in the `user` table (it is the implicit board admin). Genuine human
@@ -9029,8 +9051,8 @@ export function issueService(db: Db) {
           assigneeUserId: null,
           checkoutRunId,
           executionRunId: checkoutRunId,
-          status: "in_progress",
-          startedAt: now,
+          status: checkoutStatusForCurrentRow(),
+          startedAt: checkoutStartedAtForCurrentRow(now),
           updatedAt: now,
         })
         .where(
@@ -9155,12 +9177,10 @@ export function issueService(db: Db) {
             executionRunId: checkoutRunId,
             executionAgentNameKey: null,
             executionLockedAt: now,
-            status: "in_progress",
+            status: checkoutStatusForCurrentRow(),
             updatedAt: now,
           };
-          if (current.status !== "in_progress") {
-            adoptionSet.startedAt = now;
-          }
+          adoptionSet.startedAt = checkoutStartedAtForCurrentRow(now);
           const adopted = await db
             .update(issues)
             .set(adoptionSet)
@@ -9209,8 +9229,8 @@ export function issueService(db: Db) {
               assigneeUserId: null,
               checkoutRunId,
               executionRunId: checkoutRunId,
-              status: "in_progress",
-              startedAt: now,
+              status: checkoutStatusForCurrentRow(),
+              startedAt: checkoutStartedAtForCurrentRow(now),
               updatedAt: now,
             })
             .where(
