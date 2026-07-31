@@ -178,6 +178,9 @@ import {
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
+import type { IssueMonitorConvergence } from "../services/issue-execution-policy.js";
+import { monitorConvergenceComment } from "../services/issue-monitor-convergence-message.js";
+import type { IssueUnblockOwner } from "../services/issue-monitor-convergence-message.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import {
@@ -2783,6 +2786,61 @@ export function issueRoutes(
       .catch((err) => {
         logger.warn({ err, issueId: issue.id }, "task watchdog evaluation hook failed");
       });
+  }
+
+  /**
+   * BLO-18294: the unresolved blocker edges that feed the monitor convergence
+   * fingerprint. A readiness-query hiccup must not 500 an otherwise valid
+   * re-arm, but it also must not rewrite the convergence signature as "no
+   * declared blockers"; return null so this PATCH skips scoring entirely.
+   */
+  async function loadUnresolvedBlockerIssueIds(companyId: string, issueId: string): Promise<string[] | null> {
+    try {
+      const readiness = await svc.listDependencyReadiness(companyId, [issueId]);
+      return readiness.get(issueId)?.unresolvedBlockerIssueIds ?? [];
+    } catch (err) {
+      logger.warn({ err, companyId, issueId }, "failed to load blocker edges for monitor convergence guard");
+      return null;
+    }
+  }
+
+  /**
+   * BLO-18294: resolve the blocker issue ids the convergence guard recorded into
+   * named owners for the escalation comment. Best-effort: a rendering failure
+   * must not fail the PATCH that already committed.
+   */
+  async function loadIssueUnblockOwners(
+    companyId: string,
+    blockerIssueIds: readonly string[],
+  ): Promise<IssueUnblockOwner[]> {
+    if (blockerIssueIds.length === 0) return [];
+    try {
+      const rows = await db
+        .select({
+          issueId: issueRows.id,
+          identifier: issueRows.identifier,
+          title: issueRows.title,
+          status: issueRows.status,
+          assigneeAgentId: issueRows.assigneeAgentId,
+          assigneeUserId: issueRows.assigneeUserId,
+          assigneeAgentName: agents.name,
+        })
+        .from(issueRows)
+        .leftJoin(agents, eq(agents.id, issueRows.assigneeAgentId))
+        .where(and(eq(issueRows.companyId, companyId), inArray(issueRows.id, [...blockerIssueIds])));
+      return rows.map((row) => ({
+        issueId: row.issueId,
+        identifier: row.identifier ?? null,
+        title: row.title ?? null,
+        status: row.status,
+        assigneeAgentId: row.assigneeAgentId ?? null,
+        assigneeAgentName: row.assigneeAgentName ?? null,
+        assigneeUserId: row.assigneeUserId ?? null,
+      }));
+    } catch (err) {
+      logger.warn({ err, companyId, blockerIssueIds }, "failed to resolve monitor convergence unblock owners");
+      return [];
+    }
   }
 
   async function hasIssueCommentAddedActivity(input: { issueId: string; commentId: string }) {
@@ -8557,11 +8615,19 @@ export function issueRoutes(
       requestedExecutionStageStatus,
     );
 
+    // BLO-18294: the convergence guard fingerprints the gates this issue is
+    // actually waiting on, so it needs the live blocker edges. Only fetch them
+    // when an arm is on the table — every other PATCH skips the query.
+    const unresolvedBlockerIssueIds = nextExecutionPolicy?.monitor
+      ? await loadUnresolvedBlockerIssueIds(existing.companyId, existing.id)
+      : [];
+
     const transition = applyIssueExecutionPolicyTransition({
       issue: existing,
       policy: nextExecutionPolicy,
       previousPolicy: previousExecutionPolicy,
       requestedStatus: requestedExecutionStageStatus,
+      unresolvedBlockerIssueIds,
       requestedAssigneePatch: {
         assigneeAgentId: normalizedAssigneeAgentId,
         assigneeUserId:
@@ -8727,6 +8793,46 @@ export function issueRoutes(
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;
+    }
+
+    // BLO-18294: the re-arm was refused because N consecutive re-checks reported
+    // the same gate set. The issue is now `blocked`; name who can actually
+    // unblock it so the blocker set becomes routed work rather than a stalled
+    // timer nobody reads.
+    if (transition.monitorConvergence?.converged) {
+      try {
+        const blockerIssueIds = unresolvedBlockerIssueIds ?? [];
+        const unblockOwners = await loadIssueUnblockOwners(existing.companyId, blockerIssueIds);
+        await svc.addComment(issue.id, monitorConvergenceComment({
+          convergence: transition.monitorConvergence,
+          unblockOwners,
+        }), {
+          runId: actor.runId,
+        }, {
+          authorType: "system",
+        });
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.monitor_convergence_stalled",
+          entityType: "issue",
+          entityId: issue.id,
+          issueId: issue.id,
+          details: {
+            gateSource: transition.monitorConvergence.source,
+            convergenceCount: transition.monitorConvergence.count,
+            threshold: transition.monitorConvergence.threshold,
+            unresolvedBlockerIssueIds: blockerIssueIds,
+            unblockOwners,
+          },
+        });
+      } catch (err) {
+        logger.warn({ err, issueId: issue.id }, "failed to record monitor convergence escalation side effects");
+      }
     }
 
     let cancelledStatusRunId: string | null = null;
