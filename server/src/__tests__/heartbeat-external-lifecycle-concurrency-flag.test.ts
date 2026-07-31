@@ -51,6 +51,10 @@ describe("resolveExternalLifecycleConcurrency", () => {
   it("bounds effective concurrency to the operational slot ceiling even when enabled", () => {
     // EXTERNAL_LIFECYCLE_SLOT_CAPACITY is 8; a misconfigured maxConcurrentRuns
     // above that must not exceed the operational ceiling.
+    expect(
+      resolveExternalLifecycleConcurrency({ concurrencyEnabled: true, maxConcurrentRuns: 8 })
+        .effectiveMaxConcurrentRuns,
+    ).toBe(8);
     const result = resolveExternalLifecycleConcurrency({ concurrencyEnabled: true, maxConcurrentRuns: 50 });
     expect(result.effectiveMaxConcurrentRuns).toBe(8);
     expect(result.concurrencyEnabled).toBe(true);
