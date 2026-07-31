@@ -3787,11 +3787,37 @@ export function issueRoutes(
     );
   }
 
+  // A stage decision is a status advance, optionally carrying the reviewer's
+  // rationale. Deliberately mirrors isBlockedCorrectionPatchBody: anything else
+  // in the body (assignee moves, executionPolicy edits, title/description,
+  // relations) is not a stage decision and must stay on the ownership path.
+  // `in_review` is excluded because it does not advance a pending stage —
+  // hasExecutionStageOverrideAuthorization rejects it for the same reason.
+  function isExecutionStageDecisionPatchBody(body: unknown) {
+    if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+    const patch = body as Record<string, unknown>;
+    const allowedKeys = new Set(["status", "comment"]);
+    if (!Object.keys(patch).every((key) => allowedKeys.has(key))) return false;
+    return typeof patch.status === "string" && patch.status !== "in_review";
+  }
+
+  // BLO-19081: the stage's currentParticipant and the issue's assigneeAgentId
+  // can diverge (a reassignment while a review stage is pending), which left the
+  // pinned reviewer unable to decide their own stage — a hard 403 with no actor
+  // able to clear it. This grants the participant exactly that decision and
+  // nothing else. Double-narrowed like isAgentBlockedCorrectionForActiveExecutionStage:
+  // callers must opt in via options.allowExecutionStageDecision (only the
+  // PATCH /issues/:id route does), *and* the body must be a stage decision.
+  // Without both, this grant would reach all 25 assertAgentIssueMutationAllowed
+  // routes — including DELETE /issues/:id and the document/work-product writes
+  // that back the done-gate evidence, letting one actor author closure evidence
+  // and then approve the close.
   function isAgentCurrentExecutionStageParticipant(
     req: Request,
     issue: { status: string; executionState?: unknown },
   ) {
     if (req.actor.type !== "agent" || !req.actor.agentId) return false;
+    if (!isExecutionStageDecisionPatchBody(req.body)) return false;
     if (issue.status !== "in_review") return false;
     const executionState = parseIssueExecutionState(issue.executionState);
     if (executionState?.status !== "pending") return false;
@@ -3818,6 +3844,7 @@ export function issueRoutes(
     },
     options: {
       allowBlockedCorrection?: boolean;
+      allowExecutionStageDecision?: boolean;
       allowScopedRecoveryOwnerSourceMutation?: boolean;
       allowRecoveryActionOwner?: boolean;
     } = {},
@@ -3848,13 +3875,13 @@ export function issueRoutes(
       return false;
     }
     if (await isActiveRecoveryActionOwner()) return true;
-    if (isAgentCurrentExecutionStageParticipant(req, issue)) {
-      return true;
-    }
     if (issue.assigneeAgentId === null) {
       return true;
     }
     if (options.allowBlockedCorrection && isAgentBlockedCorrectionForActiveExecutionStage(req, issue)) {
+      return true;
+    }
+    if (options.allowExecutionStageDecision && isAgentCurrentExecutionStageParticipant(req, issue)) {
       return true;
     }
     if (issue.assigneeAgentId !== actorAgentId) {
@@ -8082,6 +8109,7 @@ export function issueRoutes(
       existing,
       {
         allowBlockedCorrection: true,
+        allowExecutionStageDecision: true,
         allowScopedRecoveryOwnerSourceMutation,
       },
     ))) return;
