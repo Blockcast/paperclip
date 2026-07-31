@@ -1331,6 +1331,32 @@ describe("countDoneWhenBullets — Ally review regressions (BLO-19047)", () => {
     expect(countDoneWhenBullets(description)).toBe(2);
   });
 
+  it("does not double-count duplicate criteria under sibling synonym sections", () => {
+    const description = [
+      "## Acceptance criteria",
+      "- Run the migration",
+      "- Verify the dashboard",
+      "",
+      "## Success criteria",
+      "- run the migration",
+      "- Verify   the dashboard",
+    ].join("\n");
+    expect(countDoneWhenBullets(description)).toBe(2);
+  });
+
+  it("still counts distinct criteria under sibling synonym sections", () => {
+    const description = [
+      "## Acceptance criteria",
+      "- Run the migration",
+      "- Verify the dashboard",
+      "",
+      "## Success criteria",
+      "- Notify support",
+      "- Attach the rollout log",
+    ].join("\n");
+    expect(countDoneWhenBullets(description)).toBe(4);
+  });
+
   it("requires an evidence row per criterion across both sections", () => {
     const description = [
       "## Acceptance criteria",

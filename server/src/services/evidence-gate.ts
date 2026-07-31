@@ -376,6 +376,16 @@ export function hasDoneWhenHeading(description: string): boolean {
   return doneWhenSections(description).length > 0;
 }
 
+function doneWhenBulletKeys(body: string): string[] {
+  return Array.from(
+    body.matchAll(/^[-*]\s+(.*)$/gm),
+    (match, index) => {
+      const normalized = (match[1] ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+      return normalized ? `text:${normalized}` : `empty:${index}`;
+    },
+  );
+}
+
 export function countDoneWhenBullets(description: string): number {
   // SUM every top-level recognized section rather than taking the first one
   // that has bullets. Taking the first non-empty section under-counted a
@@ -389,9 +399,20 @@ export function countDoneWhenBullets(description: string): number {
   // A section with no bullets contributes 0, which is what keeps a pointer
   // section ("## Acceptance criteria / See the Done when list below.") from
   // shadowing the real list — the original reason for the first-non-empty rule.
+  //
+  // Sibling synonym sections can repeat the same checklist under another name
+  // (`## Acceptance criteria` followed by `## Success criteria`). Count each
+  // normalized bullet text once so the synonym does not inflate the required
+  // evidence-row count, while still counting genuinely distinct criteria across
+  // multiple sections.
   let total = 0;
+  const seen = new Set<string>();
   for (const { body } of outermostDoneWhenSections(description)) {
-    total += body.match(/^[-*]\s+/gm)?.length ?? 0;
+    for (const key of doneWhenBulletKeys(body)) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+      total += 1;
+    }
   }
   return total;
 }
