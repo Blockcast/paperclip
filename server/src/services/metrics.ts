@@ -106,6 +106,252 @@ export const PROCESS_LOST_LIVENESS_NULL_METRIC = "paperclip_process_lost_livenes
  * while their pods keep running (the wedged-container leak this reaper closes).
  */
 export const ORPHANED_MANAGED_POD_REAPED_METRIC = "paperclip_orphaned_managed_pod_reaped_total";
+/**
+ * GitHub review-request delivery-state counter (BLO-18859, parent BLO-18848).
+ * One series per (`state`, `reason`) so an operator can read the full delivery
+ * funnel for reviewer wakes driven by the in-tree GitHub receiver
+ * (`routes/github-webhook.ts`) rather than inferring it from logs.
+ *
+ * The four states are deliberately a funnel, not a partition of arrivals:
+ * - `received`: the delivery cleared every suppression gate (signature,
+ *   self-echo, idempotency dedup, reviewer selection) and we are about to
+ *   dispatch a wake. Skipped/deduped deliveries are correct no-ops and are
+ *   NOT counted, so `received` measures intent-to-wake, not raw arrivals.
+ * - `queued`: `heartbeat.wakeup` resolved with an actual run, i.e. a durable
+ *   `agent_wakeup_requests` row is committed and the wake can no longer be
+ *   lost by this process dying. Also emitted when
+ *   `reconcileFailedWakeDispatches` recovers a `dispatch_failed` row, since
+ *   that delivery did reach the queued state — just later than the inline
+ *   path. Never both for one delivery: if the inline dispatch throws, the
+ *   receiver's `queued` line is skipped and only the reconciler can emit it.
+ *   Crucially this is gated on a truthy `enqueueWakeup` result: that function
+ *   resolves `null` (not an error) when a scheduling gate declines the wake,
+ *   and counting those as `queued` reported a healthy funnel for a review that
+ *   never ran.
+ * - `suppressed`: the wake was declined rather than dispatched, and no run will
+ *   ever come of it. Two shapes reach it, both terminal because no reconciler
+ *   pass re-arms them: `enqueueWakeup` resolving `null` after writing a
+ *   `status = "skipped"` row (scheduling suppression, an inactive company, a
+ *   cooldown, and the other `return null` gates), and `enqueueWakeup` throwing
+ *   an `HttpError` business rule — which for `budget.blocked` and
+ *   `agent.not_invokable` also leaves a durable `skipped` row, and for an
+ *   unresolvable agent/responsible-user leaves none. The `HttpError` shape is
+ *   counted at both dispatch sites (inline and reconciler; the reconciler marks
+ *   the row `dispatch_superseded`) — missing it left a delivery with
+ *   `received = 1` and no terminal state forever, breaking the funnel
+ *   invariant below. Distinct from `dead_lettered`, which is a *dispatch*
+ *   failure the retry chain could not absorb; `suppressed` is the fleet
+ *   deliberately declining, which is sometimes correct (a paused company) and
+ *   sometimes an outage (`heartbeat.scheduling_suppressed` left on). Break down
+ *   by {@link GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC}'s `cause` label to tell
+ *   those apart — that is the counter to alert on, not this state as a whole.
+ * - `deferred`: the provider-capacity (penstock/ccrotate) gate declined to
+ *   dispatch *now* and `persistProviderCapacityRetry` committed a
+ *   `heartbeat_runs` row with `status = "scheduled_retry"`, which the scheduler
+ *   re-drives once capacity returns. This is the ONE `return null` out of
+ *   `enqueueWakeup` that is not a durable skip, so it must not be folded into
+ *   `suppressed`: it is late, not lost. Folding it in was doubly wrong — it
+ *   claimed a review had been terminally declined, and because the gate writes
+ *   no `skipped` row the cause fell through to
+ *   {@link UNKNOWN_GITHUB_SUPPRESSION_CAUSE}, which the outage alert pages on.
+ *   A provider rate-limit would have paged as "reviews are being dropped".
+ *   Not terminal, so it is excluded from the funnel invariant below; a
+ *   sustained rate means reviews are arriving slowly, which is a capacity
+ *   signal (see `paperclip_ccrotate_capacity_deferred_total`), not a loss one.
+ * - `retried`: one re-dispatch attempt after a transient (non-HttpError)
+ *   dispatch failure — both the in-process attempts in
+ *   `wakeupWithDispatchRetry` and each later `reconcileFailedWakeDispatches`
+ *   pass. Counted per attempt, so it is a rate of dispatch flakiness.
+ * - `dead_lettered`: the delivery is terminally lost without operator action.
+ *   Two paths reach it: the reconciler marking a row
+ *   `dispatch_failed_exhausted` after `DISPATCH_RETRY_MAX_ATTEMPTS`, and
+ *   `wakeupWithDispatchRetry` failing to persist its durable safety-net row at
+ *   all (agent unresolvable, or the insert itself threw) — the latter is the
+ *   original "lost forever, no record" mode and is the more urgent of the two.
+ *
+ * The invariant an operator reads: every `received` delivery reaches exactly one
+ * terminal state, so `received == queued + suppressed + dead_lettered` once the
+ * retry chains and `deferred` re-drives in flight have settled. In steady state
+ * `received` ≈ `queued`
+ * and both `suppressed` and `dead_lettered` are flat at zero. A non-zero
+ * `dead_lettered` rate means an
+ * `@ally` review request will never produce a run, which is the BLO-18847
+ * symptom this counter exists to make visible.
+ *
+ * Cardinality: `state` is closed at 6 and `reason` is coerced to
+ * {@link KNOWN_GITHUB_WAKE_REASONS} (else "other"), so the series count is
+ * bounded at `6 * (KNOWN_GITHUB_WAKE_REASONS.length + 1)` — independent of
+ * repo, PR number, delivery id, and agent roster. Those high-cardinality
+ * identifiers stay on the structured log lines, matching the guardrail
+ * {@link CONCURRENT_RUN_BLOCKED_METRIC} documents above.
+ */
+export const GITHUB_REVIEW_REQUEST_DELIVERY_METRIC = "paperclip_github_review_request_delivery_total";
+
+/**
+ * The delivery states. Closed set — see
+ * {@link GITHUB_REVIEW_REQUEST_DELIVERY_METRIC} for what each one means and
+ * why `received` counts intent-to-wake rather than raw arrivals.
+ */
+export const KNOWN_GITHUB_DELIVERY_STATES = [
+  "received",
+  "queued",
+  "suppressed",
+  "deferred",
+  "retried",
+  "dead_lettered",
+] as const;
+
+export type GithubReviewRequestDeliveryState = (typeof KNOWN_GITHUB_DELIVERY_STATES)[number];
+
+/**
+ * Bounded `reason` allow-list for {@link GITHUB_REVIEW_REQUEST_DELIVERY_METRIC},
+ * mirroring the `context.wakeReason` values the GitHub receiver mints for
+ * reviewer wakes. Anything outside this set (including a missing reason)
+ * collapses to {@link UNKNOWN_GITHUB_WAKE_REASON} so a future event type cannot
+ * silently inflate cardinality before the allow-list is updated.
+ */
+export const KNOWN_GITHUB_WAKE_REASONS = [
+  "github_pr_opened",
+  "github_pr_ready_for_review",
+  "github_pr_reopened",
+  "github_pr_review_requested",
+  "github_pr_review_submitted",
+  "github_pr_review_feedback",
+  "github_pr_synchronized",
+] as const;
+
+export const UNKNOWN_GITHUB_WAKE_REASON = "other";
+
+const knownGithubWakeReasonSet: ReadonlySet<string> = new Set(KNOWN_GITHUB_WAKE_REASONS);
+
+export function normalizeGithubWakeReason(reason: string | null | undefined): string {
+  return typeof reason === "string" && knownGithubWakeReasonSet.has(reason)
+    ? reason
+    : UNKNOWN_GITHUB_WAKE_REASON;
+}
+
+/**
+ * Why a GitHub review-request delivery ended in the terminal `suppressed`
+ * state (BLO-18859 review follow-up). Split into its own counter rather than a
+ * third label on {@link GITHUB_REVIEW_REQUEST_DELIVERY_METRIC} because a
+ * suppression cause is meaningless for the other four states — carrying it
+ * there would mean a `cause="none"` filler on every `received`/`queued` series
+ * and a labels-only-valid-for-one-value contract that PromQL cannot express.
+ *
+ * The two counters are incremented from a single call site
+ * ({@link recordGithubReviewRequestSuppressed}), so
+ * `sum(paperclip_github_review_request_suppression_total)` and
+ * `sum(paperclip_github_review_request_delivery_total{state="suppressed"})`
+ * are equal by construction and cannot drift.
+ *
+ * This exists because `suppressed` is NOT uniformly a problem: an inactive
+ * company, a wake-on-demand policy that is off, and a cooldown are the fleet
+ * correctly declining, while global scheduling suppression left on strands
+ * every review request in the fleet. Without a cause breakdown an operator can
+ * only alert on all-or-nothing, so the outage case has to stay unalerted to
+ * keep the expected cases from paging — which is how a stuck
+ * `heartbeat.scheduling_suppressed` flag can silently eat every `@ally`
+ * review while the dead-letter alert stays green.
+ *
+ * Cardinality: bounded at `(causes + 1) * (reasons + 1)`, independent of repo,
+ * PR, agent, and delivery id.
+ */
+export const GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC =
+  "paperclip_github_review_request_suppression_total";
+
+/**
+ * Restart-safe gauge of unresolved GitHub review-request dead letters
+ * (BLO-18859 review follow-up). See the gauge's `help` text for why the
+ * `dead_lettered` counter alone leaves two holes — a dead letter recorded
+ * before the first scrape has no baseline for `increase()`, and a pod
+ * replacement retires the series before a pending `for` can elapse.
+ */
+export const GITHUB_REVIEW_REQUEST_DEAD_LETTER_UNRESOLVED_METRIC =
+  "paperclip_github_review_request_dead_letter_unresolved";
+
+/**
+ * Bounded `cause` allow-list. Every entry except
+ * {@link GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED} is a literal skip reason
+ * `enqueueWakeup` writes to `agent_wakeup_requests.reason` on the durable
+ * `status = "skipped"` row, so a cause here can always be joined back to rows
+ * with `select * from agent_wakeup_requests where status = 'skipped' and reason = '<cause>'`.
+ *
+ * Keep in sync with the `writeSkippedRequest` / `writeSkippedHeartbeatRequest`
+ * call sites in `services/heartbeat.ts`. Drift is not silent-but-unbounded: an
+ * unlisted reason collapses to {@link UNKNOWN_GITHUB_SUPPRESSION_CAUSE}, which
+ * the outage alert treats as pageable precisely because an untriaged cause has
+ * not been shown to be expected.
+ */
+export const KNOWN_GITHUB_SUPPRESSION_CAUSES = [
+  "heartbeat.scheduling_suppressed",
+  "company.inactive",
+  "heartbeat.worktree_execution_cutoff",
+  "budget.blocked",
+  "agent.not_invokable",
+  "heartbeat.disabled",
+  "heartbeat.wakeOnDemand.disabled",
+  "heartbeat.cooldown.active",
+  "heartbeat.timer.no_actionable_work",
+  "issue_tree_hold_active",
+  "dispatch_rejected",
+  "scheduled_retry_gate_declined",
+] as const;
+
+/**
+ * The wake was rejected by an `HttpError` business rule that wrote no durable
+ * `skipped` row — an unresolvable agent, an unresolvable responsible user, or
+ * any other 4xx from the dispatch path. Terminal like the rest (nothing
+ * re-arms it) but distinct from a policy decline, and pageable: for a reviewer
+ * wake it means the receiver resolved a reviewer the dispatch path then
+ * refused, which no amount of waiting fixes.
+ */
+export const GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED = "dispatch_rejected";
+
+/**
+ * A delivery that was parked on a `scheduled_retry` run (counted `deferred`)
+ * was cancelled at promotion time by a scheduled-retry gate rather than being
+ * promoted to `queued` (BLO-18859 review follow-up). Terminal: the run is
+ * `cancelled`, so nothing re-drives it.
+ *
+ * Deliberately ONE cause for the whole gate family rather than one per
+ * `errorCode`. Every gate in that family is a policy decline — the issue was
+ * reassigned, cancelled, paused, moved to a terminal status, or its execution
+ * lock changed under the retry; the agent went non-invokable or over budget —
+ * so none of them belong in the outage selector, and collapsing them keeps
+ * this counter's cardinality flat. The specific `errorCode` is not lost: it is
+ * on the run's `error`/`errorCode` columns and on the lifecycle event the same
+ * promotion pass appends.
+ *
+ * Note this is NOT the "pool never recovered" ending. That one exhausts the
+ * capacity retry budget and loses the review for real, so it is counted
+ * `dead_lettered` on the delivery counter and pages via the dead-letter alert.
+ */
+export const GITHUB_SUPPRESSION_CAUSE_SCHEDULED_RETRY_GATE = "scheduled_retry_gate_declined";
+
+export const UNKNOWN_GITHUB_SUPPRESSION_CAUSE = "other";
+
+/**
+ * Causes zero-initialized at process start. Deliberately only the ones the
+ * outage alert selects: for those, absent-vs-zero is the difference between
+ * "nothing suppressed" and "the scrape is broken", so the series must exist
+ * before the first event. The expected policy declines are left to appear
+ * lazily — they are read as a breakdown when something already fired, never
+ * alerted on, so a missing series costs nothing and this keeps the constant
+ * series count at `3 * 8` instead of `12 * 8`.
+ */
+export const ALERTING_GITHUB_SUPPRESSION_CAUSES = [
+  "heartbeat.scheduling_suppressed",
+  GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED,
+  UNKNOWN_GITHUB_SUPPRESSION_CAUSE,
+] as const;
+
+const knownGithubSuppressionCauseSet: ReadonlySet<string> = new Set(KNOWN_GITHUB_SUPPRESSION_CAUSES);
+
+export function normalizeGithubSuppressionCause(cause: string | null | undefined): string {
+  return typeof cause === "string" && knownGithubSuppressionCauseSet.has(cause)
+    ? cause
+    : UNKNOWN_GITHUB_SUPPRESSION_CAUSE;
+}
 
 export const KNOWN_AUTH_OPERATIONS = [
   "oidc_start",
@@ -162,7 +408,7 @@ export function classifyAuthOutcome(statusCode: number): AuthOutcome {
 export function classifyAuthResponse(input: {
   operation: AuthOperation;
   statusCode: number;
-  location?: string | string[] | undefined;
+  location?: string | number | string[] | undefined;
 }): AuthOutcome {
   const statusOutcome = classifyAuthOutcome(input.statusCode);
   if (
@@ -176,7 +422,7 @@ export function classifyAuthResponse(input: {
 
   const locations = Array.isArray(input.location) ? input.location : [input.location];
   for (const location of locations) {
-    if (!location) continue;
+    if (typeof location !== "string" || !location) continue;
     try {
       const error = new URL(location, "http://paperclip.invalid").searchParams.get("error");
       if (error !== null) {
@@ -375,6 +621,9 @@ let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | n
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let processLostLivenessNull: Counter | null = null;
 let orphanedManagedPodReaped: Counter<"adapter"> | null = null;
+let githubReviewRequestDelivery: Counter<"state" | "reason"> | null = null;
+let githubReviewRequestSuppression: Counter<"cause" | "reason"> | null = null;
+let githubReviewRequestDeadLetterUnresolved: Gauge<"reason"> | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 
 function ensureRegistry(): {
@@ -391,6 +640,9 @@ function ensureRegistry(): {
   externalLifecycleRunningRunsGauge: Gauge<"adapter">;
   processLostLivenessNullCounter: Counter;
   orphanedManagedPodReapedCounter: Counter<"adapter">;
+  githubReviewRequestDeliveryCounter: Counter<"state" | "reason">;
+  githubReviewRequestSuppressionCounter: Counter<"cause" | "reason">;
+  githubReviewRequestDeadLetterUnresolvedGauge: Gauge<"reason">;
   authRequestCounter: Counter<"operation" | "outcome">;
 } {
   if (
@@ -407,6 +659,9 @@ function ensureRegistry(): {
     || !externalLifecycleRunningRuns
     || !processLostLivenessNull
     || !orphanedManagedPodReaped
+    || !githubReviewRequestDelivery
+    || !githubReviewRequestSuppression
+    || !githubReviewRequestDeadLetterUnresolved
     || !authRequest
   ) {
     registry = new Registry();
@@ -518,6 +773,84 @@ function ensureRegistry(): {
       labelNames: ["adapter"],
       registers: [registry],
     });
+    githubReviewRequestDelivery = new Counter({
+      name: GITHUB_REVIEW_REQUEST_DELIVERY_METRIC,
+      help:
+        "Count of GitHub review-request reviewer-wake deliveries by funnel state "
+        + "(received/queued/suppressed/deferred/retried/dead_lettered) and bounded wake reason "
+        + "(BLO-18859). 'received' counts deliveries that cleared every suppression gate "
+        + "and are about to dispatch (NOT raw arrivals); 'queued' means a durable "
+        + "agent_wakeup_requests row committed AND a run was actually enqueued; "
+        + "'suppressed' means a scheduling gate declined the wake (skipped row, no run, "
+        + "terminal) — see "
+        + GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC
+        + " for which gate; 'deferred' means the provider-capacity gate parked it as a "
+        + "scheduled_retry run (late, NOT lost, and NOT terminal); 'retried' counts each "
+        + "re-dispatch attempt after a transient "
+        + "failure; 'dead_lettered' means terminally lost without operator action "
+        + "(dispatch_failed_exhausted, or the durable safety-net write itself failing). "
+        + "In steady state received ~= queued and suppressed/deferred/dead_lettered are flat at zero.",
+      labelNames: ["state", "reason"],
+      registers: [registry],
+    });
+    // Zero-initialize the full bounded grid so every series is present from
+    // process start. Without this, prom-client omits a never-incremented series
+    // entirely and a healthy fleet renders as "No data" on the funnel panel —
+    // indistinguishable from a broken scrape. It matters most for
+    // `dead_lettered`, where absent-vs-zero is exactly the difference between
+    // "nothing was lost" and "we cannot tell". 6 states x 8 reasons = 48
+    // constant-zero series, which is negligible next to the roster-scaled
+    // counters above.
+    for (const state of KNOWN_GITHUB_DELIVERY_STATES) {
+      for (const reason of [...KNOWN_GITHUB_WAKE_REASONS, UNKNOWN_GITHUB_WAKE_REASON]) {
+        githubReviewRequestDelivery.inc({ state, reason }, 0);
+      }
+    }
+    githubReviewRequestSuppression = new Counter({
+      name: GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC,
+      help:
+        "Cause breakdown of GitHub review-request reviewer wakes that ended in the terminal "
+        + "'suppressed' state (BLO-18859). Equals "
+        + "paperclip_github_review_request_delivery_total{state=\"suppressed\"} by construction. "
+        + "Every cause but 'dispatch_rejected'/'other' is a literal "
+        + "agent_wakeup_requests.reason on the durable skipped row, so a firing series joins "
+        + "straight back to rows. Alert on outage-like causes only "
+        + "(heartbeat.scheduling_suppressed, dispatch_rejected, other); the rest — an inactive "
+        + "company, a cooldown, wake-on-demand off, a blocked budget, a non-invokable agent — "
+        + "are the fleet correctly declining and must not page.",
+      labelNames: ["cause", "reason"],
+      registers: [registry],
+    });
+    // Only the pageable causes are zero-initialized -- see
+    // ALERTING_GITHUB_SUPPRESSION_CAUSES for why the expected declines are not.
+    for (const cause of ALERTING_GITHUB_SUPPRESSION_CAUSES) {
+      for (const reason of [...KNOWN_GITHUB_WAKE_REASONS, UNKNOWN_GITHUB_WAKE_REASON]) {
+        githubReviewRequestSuppression.inc({ cause, reason }, 0);
+      }
+    }
+    githubReviewRequestDeadLetterUnresolved = new Gauge({
+      name: GITHUB_REVIEW_REQUEST_DEAD_LETTER_UNRESOLVED_METRIC,
+      help:
+        "Current count of GitHub review-request wakes sitting in the durable terminal "
+        + "dispatch_failed_exhausted state within the recency window, re-derived from "
+        + "agent_wakeup_requests on every wake-dispatch reconcile pass (BLO-18859 review "
+        + "follow-up). This is the restart-safe companion to "
+        + "paperclip_github_review_request_delivery_total{state=\"dead_lettered\"}: that "
+        + "counter is process-local, so a dead letter recorded before the first scrape has "
+        + "no baseline to increase() against, and a pod replacement retires the series "
+        + "before a pending `for` can elapse. This gauge is recomputed from committed rows, "
+        + "so it survives both. It does NOT cover the no-row failure path (the safety-net "
+        + "insert itself failing) -- that leaves nothing durable to count and is visible "
+        + "only on the counter, which is why the alert keys on both.",
+      labelNames: ["reason"],
+      registers: [registry],
+    });
+    // Zero-initialize the bounded reason set for the same absent-vs-zero reason
+    // as the funnel counter: on a healthy fleet this gauge is flat zero, and a
+    // missing series would render identically to a stalled reconciler.
+    for (const reason of [...KNOWN_GITHUB_WAKE_REASONS, UNKNOWN_GITHUB_WAKE_REASON]) {
+      githubReviewRequestDeadLetterUnresolved.set({ reason }, 0);
+    }
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
       help:
@@ -549,6 +882,9 @@ function ensureRegistry(): {
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     processLostLivenessNullCounter: processLostLivenessNull,
     orphanedManagedPodReapedCounter: orphanedManagedPodReaped,
+    githubReviewRequestDeliveryCounter: githubReviewRequestDelivery,
+    githubReviewRequestSuppressionCounter: githubReviewRequestSuppression,
+    githubReviewRequestDeadLetterUnresolvedGauge: githubReviewRequestDeadLetterUnresolved,
     authRequestCounter: authRequest,
   };
 }
@@ -784,6 +1120,78 @@ export function recordOrphanedManagedPodReaped(labels?: { adapterType?: string }
   });
 }
 
+/**
+ * Record one GitHub review-request delivery funnel transition (BLO-18859).
+ * `state` is a compile-time-closed union; `reason` is coerced to the bounded
+ * {@link KNOWN_GITHUB_WAKE_REASONS} allow-list so an unrecognized or absent
+ * wake reason lands on "other" instead of minting a new series. Returns the
+ * emitted labels so call sites can echo them on their structured log line.
+ *
+ * `"suppressed"` is excluded from the accepted states on purpose: it must go
+ * through {@link recordGithubReviewRequestSuppressed} so the cause breakdown is
+ * incremented in the same statement and cannot drift from the funnel.
+ */
+export function recordGithubReviewRequestDelivery(input: {
+  state: Exclude<GithubReviewRequestDeliveryState, "suppressed">;
+  reason: string | null | undefined;
+}): { state: string; reason: string } {
+  const labels = {
+    state: input.state,
+    reason: normalizeGithubWakeReason(input.reason),
+  };
+  ensureRegistry().githubReviewRequestDeliveryCounter.inc(labels);
+  return labels;
+}
+
+/**
+ * Record one terminally-suppressed GitHub review-request delivery
+ * (BLO-18859 review follow-up). Increments the funnel counter's `suppressed`
+ * state AND the cause breakdown together — this is the only sanctioned way to
+ * reach `state="suppressed"`, which is what makes
+ * `sum(suppression_total) == sum(delivery_total{state="suppressed"})` hold
+ * without a lockstep test.
+ *
+ * `cause` is normally the `agent_wakeup_requests.reason` written on the durable
+ * `skipped` row; pass {@link GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED} when
+ * an `HttpError` refused the wake without leaving one. Anything unrecognized
+ * collapses to {@link UNKNOWN_GITHUB_SUPPRESSION_CAUSE}, which the outage alert
+ * does page on: an untriaged cause is not a known-expected decline.
+ */
+export function recordGithubReviewRequestSuppressed(input: {
+  reason: string | null | undefined;
+  cause: string | null | undefined;
+}): { state: string; reason: string; cause: string } {
+  const reason = normalizeGithubWakeReason(input.reason);
+  const cause = normalizeGithubSuppressionCause(input.cause);
+  const registry = ensureRegistry();
+  registry.githubReviewRequestDeliveryCounter.inc({ state: "suppressed", reason });
+  registry.githubReviewRequestSuppressionCounter.inc({ cause, reason });
+  return { state: "suppressed", reason, cause };
+}
+
+/**
+ * Publish the current unresolved GitHub review-request dead-letter counts
+ * (BLO-18859 review follow-up). Called once per wake-dispatch reconcile pass
+ * with the full bounded map, so the gauge is a rewrite of durable state rather
+ * than a delta — a restarted process republishes the same value on its first
+ * pass instead of starting from a zero it can never climb back from.
+ *
+ * Every known reason absent from `byReason` is explicitly reset to 0, so a
+ * dead letter that ages out of the recency window drops the gauge instead of
+ * leaving a stale non-zero series alerting forever.
+ */
+export function setGithubReviewRequestDeadLetterUnresolved(byReason: Record<string, number>): void {
+  const gauge = ensureRegistry().githubReviewRequestDeadLetterUnresolvedGauge;
+  const normalized: Record<string, number> = {};
+  for (const [reason, count] of Object.entries(byReason)) {
+    const label = normalizeGithubWakeReason(reason);
+    normalized[label] = (normalized[label] ?? 0) + Math.max(0, count);
+  }
+  for (const reason of [...KNOWN_GITHUB_WAKE_REASONS, UNKNOWN_GITHUB_WAKE_REASON]) {
+    gauge.set({ reason }, normalized[reason] ?? 0);
+  }
+}
+
 export function recordAuthRequest(input: {
   operation: string | null | undefined;
   outcome: string | null | undefined;
@@ -835,6 +1243,9 @@ export function __resetMetricsForTest(): void {
   externalLifecycleRunningRuns = null;
   processLostLivenessNull = null;
   orphanedManagedPodReaped = null;
+  githubReviewRequestDelivery = null;
+  githubReviewRequestSuppression = null;
+  githubReviewRequestDeadLetterUnresolved = null;
   authRequest = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();

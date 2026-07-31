@@ -1072,6 +1072,7 @@ export async function startServer(): Promise<StartedServer> {
   let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{ skipDrain: boolean }>) | null = null;
   let workerHeartbeat: ReturnType<typeof heartbeatService> | null = null;
   let heartbeatSchedulerStopped = false;
+  let heartbeatStartupRecoveryPending = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
@@ -1127,6 +1128,7 @@ export async function startServer(): Promise<StartedServer> {
         "heartbeat scheduling suppressed for this runtime instance",
       );
     } else {
+      heartbeatStartupRecoveryPending = true;
       const startupHeartbeatRecovery = (async () => {
         try {
           const reattachedExternalRuns = await heartbeat.resumeRunningExternalRuntimeRuns();
@@ -1245,9 +1247,10 @@ export async function startServer(): Promise<StartedServer> {
         }
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
+      }).finally(() => {
+        heartbeatStartupRecoveryPending = false;
       });
       trackHeartbeatSchedulerWork(startupHeartbeatRecovery);
-      await startupHeartbeatRecovery;
     }
 
     const setupCleanup = await environmentCustomImages.cleanupExpiredSetupSessions();
@@ -1265,7 +1268,7 @@ export async function startServer(): Promise<StartedServer> {
       // resolver (e.g. worktree run-execution opt-in). The gated work is still
       // wrapped in trackHeartbeatSchedulerWork with its own error handling.
       void (async () => {
-        if (heartbeatSchedulerStopped) return;
+        if (heartbeatSchedulerStopped || heartbeatStartupRecoveryPending) return;
         const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
         if (sweptRuntimeStatuses > 0) {
           logger.info(

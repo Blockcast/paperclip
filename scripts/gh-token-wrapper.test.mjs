@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -311,6 +311,41 @@ test("a token supplied by value overrides a pre-existing GH_TOKEN in the caller'
     assert.equal(result.GH_TOKEN, "ghu_userseat");
     assert.equal(result.GITHUB_TOKEN, "ghu_userseat");
   });
+});
+
+// BLO-18484: the wrapper injects the token into `gh`'s process env only, so the
+// git CLI had no credential of its own. Against a *private* repo every push and
+// fetch failed with "Invalid username or token" — an authentication-absence
+// error that reads like a permissions problem, which is what sent BLO-18481
+// down a spurious access-escalation path. Public repos masked it by cloning
+// anonymously. These two tests pin the halves of the fix: that the wrapper
+// serves the credential-helper invocation, and that the image asks the wrapper
+// (not gh.real) for it.
+test("injects the token when invoked as a git credential helper (BLO-18484)", () => {
+  withTempDir((dir) => {
+    const result = runWrapper(dir, {
+      tokenFileContent: "ghs_credentialhelper\n",
+      args: ["auth", "git-credential", "get"],
+    });
+    assert.equal(result.GH_TOKEN, "ghs_credentialhelper");
+    assert.equal(result.ARGS, "auth git-credential get");
+  });
+});
+
+test("Dockerfile.runtime points git's credential helper at the wrapper, not gh.real (BLO-18484)", () => {
+  const dockerfile = readFileSync(path.join(import.meta.dirname, "..", "Dockerfile.runtime"), "utf8");
+
+  const helper = dockerfile.match(
+    /git config --system credential\.https:\/\/github\.com\.helper\s*\\?\s*'([^']+)'/,
+  );
+  assert.ok(helper, "Dockerfile.runtime must configure a system-level github.com credential helper");
+
+  // The trap this test exists for: `gh auth setup-git` writes a gh.real helper
+  // (gh resolves its own argv[0] after the wrapper exec's it), and gh.real never
+  // reads the token file — so that helper returns nothing and git silently falls
+  // through to prompting for a username.
+  assert.equal(helper[1], "!/usr/bin/gh auth git-credential");
+  assert.doesNotMatch(helper[1], /gh\.real/);
 });
 
 // Pins the isolation the helper above provides, by re-running this whole file

@@ -25,6 +25,7 @@ import {
   __test_buildIssueBackLinkBody,
   __test_buildPrReviewerTaskKey,
   __test_buildPrReviewerWakeIdempotencyKey,
+  __test_buildPrReviewFeedbackComment,
   __test_commentsContainBackLinkMarker,
   __test_extractPaperclipIdentifiers,
   __test_hasActionablePrReviewFeedback,
@@ -47,6 +48,42 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import {
+  GITHUB_REVIEW_REQUEST_DELIVERY_METRIC,
+  GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC,
+  __resetMetricsForTest,
+  getMetricsRegistry,
+} from "../services/metrics.js";
+
+/**
+ * Sum {@link GITHUB_REVIEW_REQUEST_DELIVERY_METRIC} across every `reason`
+ * series for one funnel state (BLO-18859).
+ */
+async function deliveryCount(state: string): Promise<number> {
+  const metric = getMetricsRegistry().getSingleMetric(GITHUB_REVIEW_REQUEST_DELIVERY_METRIC);
+  if (!metric) throw new Error(`${GITHUB_REVIEW_REQUEST_DELIVERY_METRIC} is not registered`);
+  const data = (await metric.get()) as {
+    values: Array<{ labels: Record<string, string>; value: number }>;
+  };
+  return data.values
+    .filter((entry) => entry.labels.state === state)
+    .reduce((sum, entry) => sum + entry.value, 0);
+}
+
+/**
+ * Sum {@link GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC} for one suppression
+ * cause, or across all causes when omitted (BLO-18859 review follow-up).
+ */
+async function suppressionCount(cause?: string): Promise<number> {
+  const metric = getMetricsRegistry().getSingleMetric(GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC);
+  if (!metric) throw new Error(`${GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC} is not registered`);
+  const data = (await metric.get()) as {
+    values: Array<{ labels: Record<string, string>; value: number }>;
+  };
+  return data.values
+    .filter((entry) => cause === undefined || entry.labels.cause === cause)
+    .reduce((sum, entry) => sum + entry.value, 0);
+}
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1100,7 +1137,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     return { companyId, agentId, issueId };
   }
 
-  async function seedCompanyAndAgent(opts?: { agentName?: string }) {
+  async function seedCompanyAndAgent(opts?: { agentName?: string; companyStatus?: string }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     await db.insert(companies).values({
@@ -1109,6 +1146,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       issuePrefix: "BLO",
       defaultResponsibleUserId: "test-board-user",
       requireBoardApprovalForNewAgents: false,
+      ...(opts?.companyStatus ? { status: opts.companyStatus } : {}),
     });
     await db.insert(agents).values({
       id: agentId,
@@ -1577,6 +1615,120 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(heartbeatRuns)
       .where(inArray(heartbeatRuns.agentId, [firstReviewerId, secondReviewerId]));
     expect(runs).toHaveLength(1);
+  });
+
+  it("counts a review-request delivery as received+queued once, and does not count a deduped replay (BLO-18859)", async () => {
+    __resetMetricsForTest();
+    const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+
+    const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+    const payload = {
+      action: "opened",
+      pull_request: {
+        number: 18859,
+        title: "Delivery funnel counters",
+        body: null,
+        head: { ref: "platform/blo-18859-github-delivery-metrics" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const send = () =>
+      request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-18859-funnel")
+        .set("content-type", "application/json")
+        .send(body);
+
+    const first = await send();
+    expect(first.status).toBe(200);
+    expect(first.body.reviewerWakeFired).toBe(true);
+
+    // One delivery that cleared every gate and durably queued: both states move
+    // together, and nothing was retried or lost.
+    expect(await deliveryCount("received")).toBe(1);
+    expect(await deliveryCount("queued")).toBe(1);
+    expect(await deliveryCount("retried")).toBe(0);
+    expect(await deliveryCount("dead_lettered")).toBe(0);
+
+    const replay = await send();
+    expect(replay.status).toBe(200);
+    expect(replay.body.reviewerWakeFired).toBe(false);
+
+    // The replay is suppressed by the idempotency gate, which is a correct
+    // no-op — NOT a received delivery. Counting it would make `received` track
+    // GitHub's redelivery behavior instead of intent-to-wake, and would show a
+    // permanent received/queued gap on a healthy fleet.
+    expect(await deliveryCount("received")).toBe(1);
+    expect(await deliveryCount("queued")).toBe(1);
+  });
+
+  it("counts a scheduling-gate-declined wake as suppressed, not queued, and does not claim reviewerWakeFired (BLO-18859)", async () => {
+    __resetMetricsForTest();
+    // A paused company makes enqueueWakeup take its `company.inactive` branch:
+    // it writes a status="skipped" row and resolves *null* rather than throwing.
+    // The pre-fix code counted that as `queued`, so a review that never ran
+    // rendered as a healthy received+queued delivery — the exact
+    // false-success this test pins down.
+    const { agentId: reviewerId } = await seedCompanyAndAgent({
+      agentName: "Ally",
+      companyStatus: "paused",
+    });
+
+    const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+    const payload = {
+      action: "opened",
+      pull_request: {
+        number: 18860,
+        title: "Suppressed delivery",
+        body: null,
+        head: { ref: "platform/blo-18859-suppressed" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-blo-18859-suppressed")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    // The 200 body must not advertise a wake that produced no run.
+    expect(res.body.reviewerWakeFired).toBe(false);
+
+    // The delivery cleared every receiver-side gate, so `received` still counts
+    // it — the loss happened downstream, which is what makes the
+    // received-vs-queued gap meaningful.
+    expect(await deliveryCount("received")).toBe(1);
+    expect(await deliveryCount("queued")).toBe(0);
+    expect(await deliveryCount("suppressed")).toBe(1);
+    expect(await deliveryCount("retried")).toBe(0);
+    expect(await deliveryCount("dead_lettered")).toBe(0);
+    // End-to-end through the real route: the cause comes from the gate inside
+    // enqueueWakeup, which the route cannot see — so this also pins that the
+    // route no longer emits its own causeless `suppressed` increment (that would
+    // read as 2 here and desync the two counters).
+    expect(await suppressionCount("company.inactive")).toBe(1);
+    expect(await suppressionCount()).toBe(1);
+
+    // Ground the counter against the durable record: a skipped row, no run.
+    const wakeRows = await db
+      .select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, reviewerId));
+    expect(wakeRows).toHaveLength(1);
+    expect(wakeRows[0]!.status).toBe("skipped");
+    expect(wakeRows[0]!.reason).toBe("company.inactive");
+    const runs = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, reviewerId));
+    expect(runs).toHaveLength(0);
   });
 
   it("keeps follow-up PR review wakes with the reviewer already handling that PR", async () => {
@@ -3693,6 +3845,38 @@ describe("hasActionablePrReviewFeedback — reviewer taxonomy", () => {
     expect(__test_hasActionablePrReviewFeedback(body)).toBe(false);
   });
 
+  it("is not actionable when emphasized severity headings only carry zero counts", () => {
+    const body = [
+      "## Ally — Consolidated PR Review",
+      "",
+      "### **Critical Issues** (0)",
+      "None.",
+      "",
+      "### **Important Issues** (0)",
+      "None.",
+      "",
+      "### Recommended Action",
+      "Merge when required CI passes.",
+    ].join("\n");
+    expect(__test_hasActionablePrReviewFeedback(body, "approved")).toBe(false);
+  });
+
+  it("still treats emphasized non-zero severity buckets as actionable", () => {
+    const body = [
+      "## Ally — Consolidated PR Review",
+      "",
+      "### **Critical Issues** (0)",
+      "None.",
+      "",
+      "### **Important Issues** (1)",
+      "- The retry remains stranded.",
+      "",
+      "### Recommended Action",
+      "Fix before merge.",
+    ].join("\n");
+    expect(__test_hasActionablePrReviewFeedback(body, "commented")).toBe(true);
+  });
+
   it("still short-circuits on a formal changes_requested review state", () => {
     expect(__test_hasActionablePrReviewFeedback("looks fine overall", "changes_requested")).toBe(true);
   });
@@ -3712,6 +3896,102 @@ describe("hasActionablePrReviewFeedback — reviewer taxonomy", () => {
   it("still suppresses a negation cue close to the match within the same sentence", () => {
     const body = "Clean pass, no changes requested at this time.";
     expect(__test_hasActionablePrReviewFeedback(body)).toBe(false);
+  });
+
+  // BLO-19067: Ally's APPROVED review on Network-Operator-Portal#591 read
+  // "Looks good. No Critical or Important issues found." The uncounted-heading
+  // branch matched the trailing "Important issues" mid-sentence, classified a
+  // clean approval as actionable, and bounced the PR back to its author.
+  it("does not treat a prose denial of findings as an uncounted findings heading", () => {
+    const body = [
+      "## Ally — Consolidated PR Review",
+      "",
+      "Looks good. No Critical or Important issues found.",
+      "",
+      "### Recommended Action",
+      "1. Merge after required CI completes.",
+    ].join("\n");
+    expect(__test_hasActionablePrReviewFeedback(body, "approved")).toBe(false);
+  });
+
+  it("still matches an uncounted findings heading behind list or emphasis decoration", () => {
+    expect(__test_hasActionablePrReviewFeedback("- Important Issues\n- Auth check bypassed.")).toBe(true);
+    expect(__test_hasActionablePrReviewFeedback("**Critical Issues**\nprobePort mismatch.")).toBe(true);
+  });
+});
+
+describe("PR review feedback comment heading (BLO-19067)", () => {
+  // The heading and the directive beneath it are the highest-salience text in
+  // the wake this comment produces. Hardcoding them to the changes-requested
+  // case told the author of an APPROVED PR to make another implementation
+  // pass; the resulting no-op push invalidates the approval and restarts a
+  // 2.2h CI suite.
+  const reviewPayload = (state: string, body: string) => ({
+    action: "submitted",
+    pull_request: {
+      number: 591,
+      title: "fix(nop): dynamic-service card spacing",
+      head: { ref: "fix/BLO-18833", sha: "1db166824d532cda20e321ebb26c6e4702e0dd32" },
+    },
+    review: {
+      body,
+      state,
+      html_url: "https://github.com/Blockcast/Network-Operator-Portal/pull/591#pullrequestreview-1",
+      user: { login: "allyblockcast" },
+    },
+    repository: { full_name: "Blockcast/Network-Operator-Portal" },
+  });
+
+  const commentFor = (state: string, body = "### Critical Issues (1)\n- probePort mismatch.") => {
+    const ctx = __test_resolveEventContext("pull_request_review", reviewPayload(state, body));
+    expect(ctx).not.toBeNull();
+    return __test_buildPrReviewFeedbackComment(ctx!);
+  };
+
+  it("titles an APPROVED review as approved, with no implementation-pass directive", () => {
+    const comment = commentFor("approved");
+    expect(comment).toContain("## Review Approved");
+    expect(comment).not.toContain("Changes Requested");
+    expect(comment).not.toContain("requires another implementation pass");
+    expect(comment).toContain("- State: approved");
+  });
+
+  it("titles a CHANGES_REQUESTED review as changes requested", () => {
+    const comment = commentFor("changes_requested");
+    expect(comment).toContain("## Changes Requested");
+    expect(comment).toContain("requires another implementation pass");
+    expect(comment).not.toContain("Review Approved");
+  });
+
+  it("distinguishes a COMMENTED review from both other states", () => {
+    const comment = commentFor("commented");
+    expect(comment).toContain("## Review Comments");
+    expect(comment).not.toContain("Changes Requested");
+    expect(comment).not.toContain("Review Approved");
+    expect(comment).not.toContain("requires another implementation pass");
+  });
+
+  it("keeps the changes-requested wording when no review state is present", () => {
+    // Body-heuristic path: an `issue_comment` review carries no formal state
+    // and only reaches this builder when the body already carries findings.
+    const ctx = __test_resolveEventContext("issue_comment", {
+      action: "created",
+      issue: {
+        number: 591,
+        pull_request: { url: "https://api.github.com/repos/Blockcast/Network-Operator-Portal/pulls/591" },
+        user: { login: "codex-bot" },
+      },
+      comment: {
+        id: 1,
+        body: "### Important Issues (1)\n\nI1: wrong route.",
+        html_url: "https://github.com/Blockcast/Network-Operator-Portal/pull/591#issuecomment-1",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/Network-Operator-Portal" },
+    });
+    expect(ctx).not.toBeNull();
+    const comment = __test_buildPrReviewFeedbackComment(ctx!);
+    expect(comment).toContain("## Changes Requested");
   });
 });
 

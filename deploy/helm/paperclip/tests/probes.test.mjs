@@ -28,14 +28,14 @@ function renderTemplate(template, extraArgs = []) {
   );
 }
 
-test("worker StatefulSet uses exec probes because the worker does not serve /healthz", () => {
+test("worker StatefulSet uses HTTP probes so readiness requires a listening server", () => {
   const rendered = renderTemplate("templates/statefulset.yaml");
 
-  assert.match(rendered, /livenessProbe:\n\s+exec:\n\s+command:/);
-  assert.match(rendered, /readinessProbe:\n\s+exec:\n\s+command:/);
-  assert.match(rendered, /startupProbe:\n\s+exec:\n\s+command:/);
-  assert.match(rendered, /grep -qa 'server\/dist\/index\.js' \/proc\/\[0-9\]\*\/cmdline/);
-  assert.doesNotMatch(rendered, /path: \/healthz/);
+  assert.match(rendered, /livenessProbe:[\s\S]*?httpGet:/);
+  assert.match(rendered, /readinessProbe:[\s\S]*?httpGet:/);
+  assert.match(rendered, /startupProbe:[\s\S]*?httpGet:/);
+  assert.match(rendered, /path: \/healthz/);
+  assert.doesNotMatch(rendered, /grep -qa 'server\/dist\/index\.js'/);
 });
 
 test("API deployment keeps HTTP health probes", () => {

@@ -1090,14 +1090,16 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     expect(starvedRun?.status).not.toBe("queued");
   });
 
-  it("dispatches a long-starved issue-less run ahead of a fresh issue-bound run (BLO-18995)", async () => {
+  it("dispatches critical issue work before an aged issue-less run without starving routine issue work (BLO-19337)", async () => {
     // Regression for BLO-18995: dispatchRank returned a flat `10` for any run
     // without an issueId *above* the STARVATION_* aging escalation, so that
     // entire class had no anti-starvation path at all. Every dependency-ready
     // issue-bound run ranks `priorityRank * 2 + statusBonus` ∈ [0,9], so even a
     // `low`-priority `todo` (rank 7) permanently outranked an arbitrarily old
-    // issue-less run. Observed live on Ally: 73 queued runs, the oldest an
-    // unstarted PR-review wake at 5h52m, while newer issue work kept winning.
+    // issue-less run. Rank 0 fixed that starvation but also put the entire aged
+    // webhook backlog ahead of fresh critical issue work. The bounded rank 2
+    // must preserve both sides: critical first, aged issue-less second, routine
+    // medium work third.
     //
     // The starved run here deliberately carries NO `reviewKind`/`taskKey`
     // pr_review markers, so selectAgedPrReviewRunForFairDispatch cannot promote
@@ -1105,6 +1107,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     // rescue this run.
     const companyId = randomUUID();
     const agentId = randomUUID();
+    const criticalIssueId = randomUUID();
     const freshIssueId = randomUUID();
     const issuePrefix = `W${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
@@ -1128,19 +1131,31 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       permissions: {},
     });
 
-    await db.insert(issues).values({
-      // Fresh, dependency-ready, in_progress, medium priority => rank 2*2+0 = 4,
-      // which beats the un-aged issue-less rank of 10 outright.
-      id: freshIssueId,
-      companyId,
-      title: "Fresh medium priority in-progress work",
-      status: "in_progress",
-      priority: "medium",
-      assigneeAgentId: agentId,
-      issueNumber: 1,
-      identifier: `${issuePrefix}-1`,
-      startedAt: new Date(),
-    });
+    await db.insert(issues).values([
+      {
+        // Fresh, dependency-ready, critical todo => rank 1.
+        id: criticalIssueId,
+        companyId,
+        title: "Critical exact-head review",
+        status: "todo",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        // Fresh, dependency-ready, in_progress, medium priority => rank 4.
+        id: freshIssueId,
+        companyId,
+        title: "Fresh medium priority in-progress work",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+        startedAt: new Date(),
+      },
+    ]);
 
     // Well past STARVATION_FULL_ESCALATION_MS (2h).
     const starvedCreatedAt = new Date(Date.now() - 3 * 60 * 60 * 1000);
@@ -1148,6 +1163,8 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
 
     const starvedWakeId = randomUUID();
     const starvedRunId = randomUUID();
+    const criticalWakeId = randomUUID();
+    const criticalRunId = randomUUID();
     const freshWakeId = randomUUID();
     const freshRunId = randomUUID();
 
@@ -1164,6 +1181,19 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
         runId: starvedRunId,
         requestedAt: starvedCreatedAt,
         updatedAt: starvedCreatedAt,
+      },
+      {
+        id: criticalWakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "heartbeat_timer",
+        payload: { issueId: criticalIssueId },
+        status: "queued",
+        runId: criticalRunId,
+        requestedAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
       },
       {
         id: freshWakeId,
@@ -1193,6 +1223,18 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
         contextSnapshot: { wakeReason: "github_pr_ready_for_review" },
         createdAt: starvedCreatedAt,
         updatedAt: starvedCreatedAt,
+      },
+      {
+        id: criticalRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: criticalWakeId,
+        contextSnapshot: { issueId: criticalIssueId, wakeReason: "heartbeat_timer" },
+        createdAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
       },
       {
         id: freshRunId,
@@ -1225,13 +1267,14 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     await heartbeat.resumeQueuedRuns();
     await waitForRunToSettle(heartbeat, starvedRunId);
 
-    // REGRESSION GUARD: order. The starved issue-less run must be claimed
-    // FIRST, ahead of the fresh issue-bound contender that outranks it on the
-    // un-aged formula.
-    expect(dispatchedRunIds[0]).toBe(starvedRunId);
+    // REGRESSION GUARD: critical work keeps the emergency lane, while the aged
+    // issue-less run still advances ahead of routine issue work.
+    expect(dispatchedRunIds[0]).toBe(criticalRunId);
+    const starvedDispatchIdx = dispatchedRunIds.indexOf(starvedRunId);
+    expect(starvedDispatchIdx).toBeGreaterThan(0);
     const freshDispatchIdx = dispatchedRunIds.indexOf(freshRunId);
     if (freshDispatchIdx !== -1) {
-      expect(freshDispatchIdx).toBeGreaterThan(0);
+      expect(freshDispatchIdx).toBeGreaterThan(starvedDispatchIdx);
     }
 
     const starvedRun = await db

@@ -74,6 +74,11 @@ describe("authentication request metrics", () => {
     expect(classifyAuthResponse({
       operation: "oidc_callback",
       statusCode: 302,
+      location: 0,
+    })).toBe("success");
+    expect(classifyAuthResponse({
+      operation: "oidc_callback",
+      statusCode: 302,
       location: "/api/auth/error?error=access_denied&error_description=cancelled",
     })).toBe("client_error");
     expect(classifyAuthResponse({
