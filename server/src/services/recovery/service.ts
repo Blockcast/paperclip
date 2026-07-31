@@ -4099,11 +4099,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return details.code === "missing-evidence";
   }
 
+  type MonitorReviewWaitingParkOutcome = "parked" | "not_applicable" | "missing_evidence";
+
   async function parkReviewWaitingContinuationIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: "in_progress";
     latestRun: LatestIssueRun;
-  }) {
+  }): Promise<MonitorReviewWaitingParkOutcome> {
     return await db.transaction(async (tx) => {
       await tx.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${input.issue.companyId} || ':' || ${input.issue.id}, 0))`,
@@ -4114,10 +4116,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .from(issues)
         .where(eq(issues.id, input.issue.id))
         .limit(1);
-      if (!fresh || fresh.status !== "in_progress" || !hasActiveMonitorPath(fresh)) return null;
+      if (!fresh || fresh.status !== "in_progress" || !hasActiveMonitorPath(fresh)) return "not_applicable";
 
-      const updated = await issuesSvc.update(fresh.id, { status: "in_review" }, tx);
-      if (!updated) return null;
+      let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
+      try {
+        updated = await issuesSvc.update(fresh.id, { status: "in_review" }, tx);
+      } catch (err) {
+        if (!isMissingEvidenceGateRejection(err)) throw err;
+        logger.warn(
+          { err, issueId: fresh.id, identifier: fresh.identifier },
+          "parkReviewWaitingContinuationIssue: evidence gate rejected in_review park; escalating instead",
+        );
+        return "missing_evidence";
+      }
+      if (!updated) return "not_applicable";
 
       const activeRecoveryAction = await recoveryActionsSvc.resolveActiveForIssue({
         companyId: fresh.companyId,
@@ -4149,7 +4161,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         },
       });
 
-      return updated;
+      return "parked";
     });
   }
 
@@ -5624,18 +5636,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
       if (isWaitingOnReviewContinuationRun(latestRun) && hasActiveMonitorPath(issue)) {
-        const updated = await parkReviewWaitingContinuationIssue({
+        const parkOutcome = await parkReviewWaitingContinuationIssue({
           issue,
           previousStatus: "in_progress",
           latestRun,
         });
-        if (updated) {
+        if (parkOutcome === "parked") {
           result.reviewWaitingParked += 1;
           result.issueIds.push(issue.id);
-        } else {
-          result.skipped += 1;
+          continue;
         }
-        continue;
+        if (parkOutcome === "not_applicable") {
+          result.skipped += 1;
+          continue;
+        }
+        // `missing_evidence` means the monitor-backed `in_review` park was
+        // evidence-gate rejected because there is nothing reviewable yet.
+        // Let the same waiting-on-review run fall through to the no-dependency
+        // park and, if that also cannot produce review evidence, the normal
+        // blocked recovery escalation.
       }
       if (isSuccessfulInProgressContinuationRun(latestRun)) {
         const successfulRun = latestRun;

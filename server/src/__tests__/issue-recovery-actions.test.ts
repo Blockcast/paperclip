@@ -13,9 +13,11 @@ import {
   environments,
   heartbeatRuns,
   issueComments,
+  issueLabels,
   issueRecoveryActions,
   issueRelations,
   issues,
+  labels,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -136,6 +138,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   afterEach(async () => {
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
+    await db.delete(issueLabels);
     await db.delete(environmentLeases);
     await db.delete(activityLog);
     await db.delete(heartbeatRuns);
@@ -143,6 +146,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(environments);
     await db.delete(issues);
     await db.delete(agents);
+    await db.delete(labels);
     await db.delete(companies);
   });
 
@@ -2146,6 +2150,63 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
+  });
+
+  it("falls through to blocked recovery when a triggered monitor review park lacks PR evidence", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "automation",
+      status: "cancelled",
+      error: "Continuation parked: issue is waiting on review/approval",
+      errorCode: "issue_continuation_waiting_on_review",
+      contextSnapshot: {
+        issueId: sourceIssueId,
+        retryReason: "issue_continuation_needed",
+      },
+      createdAt: new Date("2026-07-31T00:00:00.000Z"),
+      finishedAt: new Date("2026-07-31T00:05:00.000Z"),
+    });
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt: null,
+        monitorLastTriggeredAt: new Date("2026-07-31T00:06:00.000Z"),
+        monitorAttemptCount: 1,
+        monitorScheduledBy: "assignee",
+        monitorNotes: "Waiting on external PR review.",
+      })
+      .where(eq(issues.id, sourceIssueId));
+    const labelId = randomUUID();
+    await db.insert(labels).values({ id: labelId, companyId, name: "pr", color: "#000000" });
+    await db.insert(issueLabels).values({ issueId: sourceIssueId, labelId, companyId });
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewWaitingParked).toBe(0);
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([sourceIssueId]);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const [escalated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(escalated).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: managerId,
+    });
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, sourceIssueId)));
+    expect(recoveryActions).toHaveLength(1);
+    expect(recoveryActions[0]).toMatchObject({
+      ownerAgentId: managerId,
+      previousOwnerAgentId: coderId,
+    });
   });
 
   // BLO-18860: adopting a stale checkout is a HANDOVER, not a failure.
