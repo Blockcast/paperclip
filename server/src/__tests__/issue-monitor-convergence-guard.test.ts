@@ -32,6 +32,7 @@ type MonitorInput = {
   nextCheckAt: string;
   notes?: string | null;
   scheduledBy?: "assignee" | "board";
+  kind?: "external_service" | null;
   gateSignals?: string[] | null;
 };
 
@@ -70,12 +71,15 @@ function newIssue(): IssueFixture {
 function arm(
   issue: IssueFixture,
   monitor: MonitorInput,
-  options: { blockers?: string[]; threshold?: number } = {},
+  options: { blockers?: string[] | null; threshold?: number } = {},
 ) {
   const policy = normalizeIssueExecutionPolicy({
     stages: [],
     monitor: { scheduledBy: "assignee", ...monitor },
   })!;
+  const unresolvedBlockerIssueIds = Object.prototype.hasOwnProperty.call(options, "blockers")
+    ? options.blockers ?? null
+    : [];
   const result = applyIssueExecutionPolicyTransition({
     issue,
     policy,
@@ -83,7 +87,7 @@ function arm(
     requestedAssigneePatch: {},
     actor: { agentId: assigneeAgentId },
     monitorExplicitlyUpdated: true,
-    unresolvedBlockerIssueIds: options.blockers ?? [],
+    unresolvedBlockerIssueIds,
     monitorConvergenceThreshold: options.threshold ?? null,
   });
   issue.executionPolicy = policy;
@@ -266,6 +270,24 @@ describe("issue monitor convergence guard (BLO-18294)", () => {
       }
     });
 
+    it("exempts external-service monitors even when the assignee scheduled them", () => {
+      const issue = newIssue();
+      const blockers = [BLOCKER_A];
+
+      for (let cycle = 1; cycle <= DEFAULT_ISSUE_MONITOR_CONVERGENCE_THRESHOLD + 3; cycle += 1) {
+        const result = arm(
+          issue,
+          { nextCheckAt: checkAt(cycle), kind: "external_service", gateSignals: ["provider-quota"] },
+          { blockers },
+        );
+
+        expect(result.monitorConvergence).toBeNull();
+        expect(issue.monitorNextCheckAt).toEqual(new Date(checkAt(cycle)));
+        expect(result.patch.status).toBeUndefined();
+        fire(issue, checkAt(cycle));
+      }
+    });
+
     it("ignores transitions that merely carry an existing monitor forward", () => {
       const issue = newIssue();
       const blockers = [BLOCKER_A];
@@ -293,6 +315,61 @@ describe("issue monitor convergence guard (BLO-18294)", () => {
       expect(carried.patch.status).toBeUndefined();
       // The recorded fingerprint from the explicit arm is left untouched.
       expect(monitorState(issue)).toMatchObject({ convergenceCount: 1 });
+    });
+
+    it("skips scoring when blocker readiness is unavailable and preserves the previous gate bookkeeping", () => {
+      const issue = newIssue();
+      const blockers = [BLOCKER_A];
+
+      arm(issue, { nextCheckAt: checkAt(1) }, { blockers });
+      fire(issue, checkAt(1));
+      const previousMonitorState = monitorState(issue);
+
+      const skipped = arm(
+        issue,
+        { nextCheckAt: checkAt(2), gateSignals: ["new-signal"], notes: "changed notes" },
+        { blockers: null },
+      );
+
+      expect(skipped.monitorConvergence).toBeNull();
+      expect(skipped.patch.status).toBeUndefined();
+      expect(monitorState(issue)).toMatchObject({
+        status: "scheduled",
+        gateSignals: previousMonitorState?.gateSignals ?? null,
+        gateFingerprint: previousMonitorState?.gateFingerprint,
+        gateSource: previousMonitorState?.gateSource,
+        convergenceCount: previousMonitorState?.convergenceCount,
+      });
+    });
+
+    it("resets stale convergence bookkeeping after a stalled issue is explicitly moved out of blocked", () => {
+      const issue = newIssue();
+      const blockers = [BLOCKER_A];
+
+      for (let cycle = 1; cycle <= DEFAULT_ISSUE_MONITOR_CONVERGENCE_THRESHOLD; cycle += 1) {
+        arm(issue, { nextCheckAt: checkAt(cycle) }, { blockers });
+        fire(issue, checkAt(cycle));
+      }
+
+      const refused = arm(issue, { nextCheckAt: checkAt(4) }, { blockers });
+      expect(refused.patch.status).toBe("blocked");
+      expect(monitorState(issue)).toMatchObject({
+        status: "cleared",
+        clearReason: "convergence_stalled",
+        convergenceCount: DEFAULT_ISSUE_MONITOR_CONVERGENCE_THRESHOLD + 1,
+      });
+
+      issue.status = "in_progress";
+      const rearmed = arm(issue, { nextCheckAt: checkAt(5) }, { blockers });
+
+      expect(rearmed.monitorConvergence).toMatchObject({ count: 1, converged: false });
+      expect(rearmed.patch.status).toBeUndefined();
+      expect(issue.monitorNextCheckAt).toEqual(new Date(checkAt(5)));
+      expect(monitorState(issue)).toMatchObject({
+        status: "scheduled",
+        clearReason: null,
+        convergenceCount: 1,
+      });
     });
 
     it("falls back to the notes signature when nothing structured is declared", () => {

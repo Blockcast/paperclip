@@ -143,7 +143,16 @@ function monitorConvergenceFields(
   previous: IssueExecutionMonitorState | null | undefined,
   monitor?: IssueExecutionMonitorPolicy | null,
   convergence?: IssueMonitorConvergence | null,
+  options: { preservePrevious?: boolean } = {},
 ) {
+  if (options.preservePrevious) {
+    return {
+      gateSignals: previous?.gateSignals ?? null,
+      gateFingerprint: previous?.gateFingerprint ?? null,
+      gateSource: previous?.gateSource ?? null,
+      convergenceCount: previous?.convergenceCount ?? 0,
+    };
+  }
   return {
     gateSignals: monitor
       ? normalizeIssueMonitorGateSignals(monitor.gateSignals)
@@ -151,6 +160,19 @@ function monitorConvergenceFields(
     gateFingerprint: convergence?.fingerprint ?? previous?.gateFingerprint ?? null,
     gateSource: convergence?.source ?? previous?.gateSource ?? null,
     convergenceCount: convergence?.count ?? previous?.convergenceCount ?? 0,
+  };
+}
+
+function resetMonitorConvergenceFields(
+  state: IssueExecutionMonitorState | null,
+): IssueExecutionMonitorState | null {
+  if (!state) return null;
+  return {
+    ...state,
+    gateSignals: null,
+    gateFingerprint: null,
+    gateSource: null,
+    convergenceCount: 0,
   };
 }
 
@@ -260,6 +282,7 @@ function buildScheduledMonitorState(
   previous: IssueExecutionMonitorState | null,
   monitor: IssueExecutionMonitorPolicy,
   convergence?: IssueMonitorConvergence | null,
+  options: { preserveConvergence?: boolean } = {},
 ): IssueExecutionMonitorState {
   return {
     status: "scheduled",
@@ -269,7 +292,9 @@ function buildScheduledMonitorState(
     notes: monitor.notes ?? null,
     scheduledBy: monitor.scheduledBy,
     ...monitorMetadataFromPolicy(monitor),
-    ...monitorConvergenceFields(previous, monitor, convergence),
+    ...monitorConvergenceFields(previous, monitor, convergence, {
+      preservePrevious: options.preserveConvergence === true,
+    }),
     clearedAt: null,
     clearReason: null,
   };
@@ -414,6 +439,10 @@ export function evaluateIssueMonitorConvergence(input: {
   // has made a deliberate human decision to keep polling; that is not the
   // guaranteed-waste shape this guard exists to stop.
   if (input.monitor.scheduledBy !== "assignee") return null;
+  // Recovery-owned external checks (provider quota, CI, and similar services)
+  // can legitimately re-arm against the same external condition until the
+  // provider window moves. They are bounded by their own recovery policy.
+  if (input.monitor.kind === "external_service") return null;
 
   const threshold = normalizeIssueMonitorConvergenceThreshold(input.threshold);
   const { fingerprint, source } = computeIssueMonitorGateFingerprint({
@@ -1112,6 +1141,16 @@ function applyMonitorTransition(
     : null;
 
   let targetMonitorState = currentMonitorState;
+  const resetConvergenceAfterStalledClear = Boolean(
+    input.monitorExplicitlyUpdated &&
+    input.policy?.monitor &&
+    currentMonitorState?.status === "cleared" &&
+    currentMonitorState.clearReason === "convergence_stalled" &&
+    !invalidReason,
+  );
+  const convergenceBaseMonitorState = resetConvergenceAfterStalledClear
+    ? resetMonitorConvergenceFields(currentMonitorState)
+    : currentMonitorState;
 
   if (input.policy?.monitor) {
     if (invalidReason) {
@@ -1153,10 +1192,11 @@ function applyMonitorTransition(
         // an existing monitor forward (a status-only return, a stage auto-approval)
         // are not re-checks, and those call sites do not supply blocker edges —
         // scoring them would reset the counter against an empty gate set.
-        convergence = input.monitorExplicitlyUpdated
+        const preserveConvergence = input.monitorExplicitlyUpdated && input.unresolvedBlockerIssueIds === null;
+        convergence = input.monitorExplicitlyUpdated && input.unresolvedBlockerIssueIds !== null
           ? evaluateIssueMonitorConvergence({
             monitor: input.policy.monitor,
-            previous: currentMonitorState,
+            previous: convergenceBaseMonitorState,
             unresolvedBlockerIssueIds: input.unresolvedBlockerIssueIds ?? [],
             threshold: input.monitorConvergenceThreshold ?? null,
           })
@@ -1177,7 +1217,12 @@ function applyMonitorTransition(
           patch.monitorWakeRequestedAt = null;
           patch.monitorNotes = input.policy.monitor.notes ?? null;
           patch.monitorScheduledBy = input.policy.monitor.scheduledBy;
-          targetMonitorState = buildScheduledMonitorState(currentMonitorState, input.policy.monitor, convergence);
+          targetMonitorState = buildScheduledMonitorState(
+            convergenceBaseMonitorState,
+            input.policy.monitor,
+            convergence,
+            { preserveConvergence },
+          );
         }
       }
     }

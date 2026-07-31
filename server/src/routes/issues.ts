@@ -2790,18 +2790,17 @@ export function issueRoutes(
 
   /**
    * BLO-18294: the unresolved blocker edges that feed the monitor convergence
-   * fingerprint. Degrades to "no declared blockers" rather than failing the
-   * PATCH — a readiness-query hiccup must not 500 an otherwise valid re-arm.
-   * The guard still counts convergence off the monitor's own `gateSignals` /
-   * notes signature in that case.
+   * fingerprint. A readiness-query hiccup must not 500 an otherwise valid
+   * re-arm, but it also must not rewrite the convergence signature as "no
+   * declared blockers"; return null so this PATCH skips scoring entirely.
    */
-  async function loadUnresolvedBlockerIssueIds(companyId: string, issueId: string): Promise<string[]> {
+  async function loadUnresolvedBlockerIssueIds(companyId: string, issueId: string): Promise<string[] | null> {
     try {
       const readiness = await svc.listDependencyReadiness(companyId, [issueId]);
       return readiness.get(issueId)?.unresolvedBlockerIssueIds ?? [];
     } catch (err) {
       logger.warn({ err, companyId, issueId }, "failed to load blocker edges for monitor convergence guard");
-      return [];
+      return null;
     }
   }
 
@@ -8580,34 +8579,39 @@ export function issueRoutes(
     // unblock it so the blocker set becomes routed work rather than a stalled
     // timer nobody reads.
     if (transition.monitorConvergence?.converged) {
-      const unblockOwners = await loadIssueUnblockOwners(existing.companyId, unresolvedBlockerIssueIds);
-      await db.insert(issueComments).values({
-        companyId: issue.companyId,
-        issueId: issue.id,
-        body: monitorConvergenceComment({
+      try {
+        const blockerIssueIds = unresolvedBlockerIssueIds ?? [];
+        const unblockOwners = await loadIssueUnblockOwners(existing.companyId, blockerIssueIds);
+        await svc.addComment(issue.id, monitorConvergenceComment({
           convergence: transition.monitorConvergence,
           unblockOwners,
-        }),
-      });
-      await logActivity(db, {
-        companyId: issue.companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        agentApiKeyId: actor.agentApiKeyId,
-        action: "issue.monitor_convergence_stalled",
-        entityType: "issue",
-        entityId: issue.id,
-        issueId: issue.id,
-        details: {
-          gateSource: transition.monitorConvergence.source,
-          convergenceCount: transition.monitorConvergence.count,
-          threshold: transition.monitorConvergence.threshold,
-          unresolvedBlockerIssueIds,
-          unblockOwners,
-        },
-      });
+        }), {
+          runId: actor.runId,
+        }, {
+          authorType: "system",
+        });
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.monitor_convergence_stalled",
+          entityType: "issue",
+          entityId: issue.id,
+          issueId: issue.id,
+          details: {
+            gateSource: transition.monitorConvergence.source,
+            convergenceCount: transition.monitorConvergence.count,
+            threshold: transition.monitorConvergence.threshold,
+            unresolvedBlockerIssueIds: blockerIssueIds,
+            unblockOwners,
+          },
+        });
+      } catch (err) {
+        logger.warn({ err, issueId: issue.id }, "failed to record monitor convergence escalation side effects");
+      }
     }
 
     let cancelledStatusRunId: string | null = null;

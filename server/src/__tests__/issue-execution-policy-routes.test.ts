@@ -1539,12 +1539,17 @@ describe("issue execution policy routes", () => {
       };
     }
 
-    it("refuses the re-arm, blocks the issue, and names the unblock owners", async () => {
-      // Three prior re-checks already reported this exact blocker set.
+    function issueWithTriggeredMonitor(input: {
+      blockerIssueIds?: string[];
+      notes?: string;
+      convergenceCount?: number;
+    } = {}) {
+      const blockerIssueIds = input.blockerIssueIds ?? [BLOCKER_ISSUE_ID];
+      const notes = input.notes ?? "still waiting on the donor host drain";
       const { fingerprint, source } = computeIssueMonitorGateFingerprint({
-        unresolvedBlockerIssueIds: [BLOCKER_ISSUE_ID],
+        unresolvedBlockerIssueIds: blockerIssueIds,
       });
-      const issue = {
+      return {
         id: CONVERGED_ISSUE_ID,
         companyId: "company-1",
         status: "in_progress",
@@ -1574,11 +1579,11 @@ describe("issue execution policy routes", () => {
             nextCheckAt: null,
             lastTriggeredAt: "2026-07-23T12:00:00.000Z",
             attemptCount: 3,
-            notes: "still waiting on the donor host drain",
+            notes,
             scheduledBy: "assignee",
             gateFingerprint: fingerprint,
             gateSource: source,
-            convergenceCount: 3,
+            convergenceCount: input.convergenceCount ?? 3,
             clearedAt: null,
             clearReason: null,
           },
@@ -1586,9 +1591,14 @@ describe("issue execution policy routes", () => {
         monitorAttemptCount: 3,
         monitorNextCheckAt: null,
         monitorLastTriggeredAt: new Date("2026-07-23T12:00:00.000Z"),
-        monitorNotes: "still waiting on the donor host drain",
+        monitorNotes: notes,
         monitorScheduledBy: "assignee",
       };
+    }
+
+    it("refuses the re-arm, blocks the issue, and names the unblock owners", async () => {
+      // Three prior re-checks already reported this exact blocker set.
+      const issue = issueWithTriggeredMonitor();
 
       mockIssueService.getById.mockResolvedValue(issue);
       mockIssueService.listDependencyReadiness.mockResolvedValue(
@@ -1626,13 +1636,14 @@ describe("issue execution policy routes", () => {
       expect(patch.status).toBe("blocked");
       expect(patch.monitorNextCheckAt).toBeNull();
 
-      const comment = mockDbInsertValues.mock.calls
-        .map((call) => call[0] as { issueId?: string; body?: string })
-        .find((value) => value?.issueId === CONVERGED_ISSUE_ID && value?.body?.includes("Monitor stopped re-arming"));
-      expect(comment).toBeDefined();
-      expect(comment!.body).toContain("Unblock owners:");
-      expect(comment!.body).toContain("PAP-9001");
-      expect(comment!.body).toContain(`agent://${BLOCKER_OWNER_AGENT_ID}`);
+      const commentCall = mockIssueService.addComment.mock.calls
+        .find((call) => call[0] === CONVERGED_ISSUE_ID && String(call[1]).includes("Monitor stopped re-arming"));
+      expect(commentCall).toBeDefined();
+      expect(commentCall![1]).toContain("Unblock owners:");
+      expect(commentCall![1]).toContain("PAP-9001");
+      expect(commentCall![1]).toContain(`agent://${BLOCKER_OWNER_AGENT_ID}`);
+      expect(commentCall![2]).toEqual({ runId: "run-1" });
+      expect(commentCall![3]).toMatchObject({ authorType: "system" });
 
       const activity = mockLogActivity.mock.calls
         .map((call) => call[1] as { action?: string; details?: Record<string, unknown> })
@@ -1647,54 +1658,10 @@ describe("issue execution policy routes", () => {
     });
 
     it("leaves a re-arm alone while the blocker set is still narrowing", async () => {
-      const { fingerprint, source } = computeIssueMonitorGateFingerprint({
-        unresolvedBlockerIssueIds: [BLOCKER_ISSUE_ID, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"],
+      const issue = issueWithTriggeredMonitor({
+        blockerIssueIds: [BLOCKER_ISSUE_ID, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"],
+        notes: "still waiting",
       });
-      const issue = {
-        id: CONVERGED_ISSUE_ID,
-        companyId: "company-1",
-        status: "in_progress",
-        assigneeAgentId: ACTING_AGENT_ID,
-        assigneeUserId: null,
-        checkoutRunId: "run-1",
-        executionRunId: "run-1",
-        createdByUserId: "local-board",
-        identifier: "PAP-13266",
-        title: "Donor host extraction",
-        executionPolicy: null,
-        executionState: {
-          status: "idle",
-          currentStageId: null,
-          currentStageIndex: null,
-          currentStageType: null,
-          currentParticipant: null,
-          returnAssignee: null,
-          reviewRequest: null,
-          completedStageIds: [],
-          lastDecisionId: null,
-          lastDecisionOutcome: null,
-          monitor: {
-            status: "triggered",
-            nextCheckAt: null,
-            lastTriggeredAt: "2026-07-23T12:00:00.000Z",
-            attemptCount: 3,
-            notes: "still waiting",
-            scheduledBy: "assignee",
-            // Three prior re-checks, but against a WIDER blocker set — one has
-            // since resolved, so this arm is real progress.
-            gateFingerprint: fingerprint,
-            gateSource: source,
-            convergenceCount: 3,
-            clearedAt: null,
-            clearReason: null,
-          },
-        },
-        monitorAttemptCount: 3,
-        monitorNextCheckAt: null,
-        monitorLastTriggeredAt: new Date("2026-07-23T12:00:00.000Z"),
-        monitorNotes: "still waiting",
-        monitorScheduledBy: "assignee",
-      };
 
       mockIssueService.getById.mockResolvedValue(issue);
       mockIssueService.listDependencyReadiness.mockResolvedValue(
@@ -1722,6 +1689,80 @@ describe("issue execution policy routes", () => {
       expect(
         mockLogActivity.mock.calls.some((call) => (call[1] as { action?: string })?.action === "issue.monitor_convergence_stalled"),
       ).toBe(false);
+    });
+
+    it("skips convergence scoring when blocker readiness lookup fails", async () => {
+      const issue = issueWithTriggeredMonitor();
+      const previousMonitor = (issue.executionState.monitor as Record<string, unknown>);
+
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.listDependencyReadiness.mockRejectedValueOnce(new Error("readiness unavailable"));
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: ACTING_AGENT_ID,
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch(`/api/issues/${CONVERGED_ISSUE_ID}`)
+        .send({ executionPolicy: { monitor: armedMonitor("2099-12-01T12:30:00.000Z") } });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+      expect(patch.status).toBeUndefined();
+      expect(patch.monitorNextCheckAt).toEqual(new Date("2099-12-01T12:30:00.000Z"));
+      expect((patch.executionState as { monitor?: Record<string, unknown> }).monitor).toMatchObject({
+        gateFingerprint: previousMonitor.gateFingerprint,
+        gateSource: previousMonitor.gateSource,
+        convergenceCount: previousMonitor.convergenceCount,
+      });
+      expect(
+        mockLogActivity.mock.calls.some((call) => (call[1] as { action?: string })?.action === "issue.monitor_convergence_stalled"),
+      ).toBe(false);
+      expect(
+        mockIssueService.addComment.mock.calls.some(
+          (call) => call[0] === CONVERGED_ISSUE_ID && String(call[1]).includes("Monitor stopped re-arming"),
+        ),
+      ).toBe(false);
+    });
+
+    it("does not fail the PATCH when convergence side-effect comments fail", async () => {
+      const issue = issueWithTriggeredMonitor();
+
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.listDependencyReadiness.mockResolvedValue(
+        new Map([[CONVERGED_ISSUE_ID, { issueId: CONVERGED_ISSUE_ID, unresolvedBlockerIssueIds: [BLOCKER_ISSUE_ID] }]]),
+      );
+      mockIssueService.addComment.mockRejectedValueOnce(new Error("comment write failed"));
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: ACTING_AGENT_ID,
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch(`/api/issues/${CONVERGED_ISSUE_ID}`)
+        .send({ executionPolicy: { monitor: armedMonitor("2099-12-01T12:30:00.000Z") } });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+      expect(patch.status).toBe("blocked");
+      expect(mockIssueService.addComment).toHaveBeenCalledWith(
+        CONVERGED_ISSUE_ID,
+        expect.stringContaining("Monitor stopped re-arming"),
+        { runId: "run-1" },
+        expect.objectContaining({ authorType: "system" }),
+      );
     });
   });
 });
