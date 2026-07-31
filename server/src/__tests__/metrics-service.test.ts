@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   AGENT_NO_USAGE_STREAK_METRIC,
+  AUTH_REQUEST_METRIC,
   CONCURRENT_RUN_BLOCKED_METRIC,
   DEP_BLOCKED_WAKEUP_METRIC,
   HEARTBEAT_RUN_FAILED_METRIC,
@@ -13,12 +14,16 @@ import {
   UNKNOWN_ISOLATION_MODE,
   UNKNOWN_REASON,
   __resetMetricsForTest,
+  classifyAuthOperation,
+  classifyAuthOutcome,
+  classifyAuthResponse,
   normalizeAgentId,
   normalizeInvocationSource,
   normalizeIsolationMode,
   normalizeReason,
   recordConcurrentRunBlocked,
   recordAgentZeroTokenCompletedRunStreak,
+  recordAuthRequest,
   recordHeartbeatRunFailed,
   recordIsolatedRunStarted,
   renderMetrics,
@@ -45,6 +50,51 @@ import {
 
 afterEach(() => {
   __resetMetricsForTest();
+});
+
+describe("authentication request metrics", () => {
+  it("classifies auth paths and response outcomes into bounded labels", () => {
+    expect(classifyAuthOperation("/api/auth/sign-in/oauth2?next=%2F")).toBe("oidc_start");
+    expect(classifyAuthOperation("/api/auth/oauth2/callback/dex?code=redacted")).toBe("oidc_callback");
+    expect(classifyAuthOperation("/api/auth/sign-in/email")).toBe("password_sign_in");
+    expect(classifyAuthOperation("/api/auth/sign-up/email")).toBe("password_sign_up");
+    expect(classifyAuthOperation("/api/auth/sign-out")).toBe("other");
+    expect(classifyAuthOutcome(200)).toBe("success");
+    expect(classifyAuthOutcome(400)).toBe("client_error");
+    expect(classifyAuthOutcome(429)).toBe("rate_limited");
+    expect(classifyAuthOutcome(503)).toBe("server_error");
+  });
+
+  it("classifies successful and failed OIDC callback redirects", () => {
+    expect(classifyAuthResponse({
+      operation: "oidc_callback",
+      statusCode: 302,
+      location: "/",
+    })).toBe("success");
+    expect(classifyAuthResponse({
+      operation: "oidc_callback",
+      statusCode: 302,
+      location: "/api/auth/error?error=access_denied&error_description=cancelled",
+    })).toBe("client_error");
+    expect(classifyAuthResponse({
+      operation: "oidc_callback",
+      statusCode: 302,
+      location: "/api/auth/error?error=oauth_code_verification_failed",
+    })).toBe("server_error");
+  });
+
+  it("exposes and increments the auth counter without unbounded labels", async () => {
+    expect(recordAuthRequest({ operation: "untrusted-path", outcome: "untrusted-outcome" })).toEqual({
+      operation: "other",
+      outcome: "server_error",
+    });
+    recordAuthRequest({ operation: "oidc_callback", outcome: "rate_limited" });
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${AUTH_REQUEST_METRIC} counter`);
+    expect(body).toContain(`${AUTH_REQUEST_METRIC}{operation="other",outcome="server_error"} 1`);
+    expect(body).toContain(`${AUTH_REQUEST_METRIC}{operation="oidc_callback",outcome="rate_limited"} 1`);
+  });
 });
 
 describe("normalizeReason", () => {
