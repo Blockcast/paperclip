@@ -2962,7 +2962,7 @@ describe("agent issue mutation checkout ownership", () => {
     // audit record, not the particular refusal code.
     it("refuses a workspace rebind while another agent holds the issue in_progress", async () => {
       mockIssueService.getById.mockResolvedValue(
-        makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId }),
+        makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId, executionRunId: ownerRunId }),
       );
       mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
 
@@ -2970,7 +2970,7 @@ describe("agent issue mutation checkout ownership", () => {
         .patch(`/api/issues/${issueId}`)
         .send({ projectWorkspaceId: "99999999-9999-4999-8999-999999999999" });
 
-      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.status, JSON.stringify(res.body)).toBeGreaterThanOrEqual(400);
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(mockLogActivity).not.toHaveBeenCalledWith(
         expect.anything(),
@@ -2978,12 +2978,76 @@ describe("agent issue mutation checkout ownership", () => {
       );
     });
 
-    // The rest of the allowlist is deliberately permitted under a live run:
-    // cutting a stale blocker edge is the BLO-18163 use case and cannot
-    // disturb the run, because no allowlisted field terminates it.
-    it("still allows a blocker edit while the issue is in_progress", async () => {
+    it("refuses a workspace rebind while another agent holds the issue in_review", async () => {
       mockIssueService.getById.mockResolvedValue(
-        makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId }),
+        makeIssue({ status: "in_review", assigneeAgentId: ownerAgentId, executionRunId: ownerRunId }),
+      );
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ projectWorkspaceId: "99999999-9999-4999-8999-999999999999" });
+
+      expect(res.status, JSON.stringify(res.body)).toBeGreaterThanOrEqual(400);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.coordination_metadata_updated" }),
+      );
+    });
+
+    it("refuses a project rebind while another agent holds an execution lock", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          status: "in_progress",
+          assigneeAgentId: ownerAgentId,
+          executionRunId: ownerRunId,
+          projectId: "88888888-8888-4888-8888-888888888888",
+        }),
+      );
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ projectId: "99999999-9999-4999-8999-999999999999" });
+
+      expect(res.status, JSON.stringify(res.body)).toBeGreaterThanOrEqual(400);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.coordination_metadata_updated" }),
+      );
+    });
+
+    it("refuses a parent rebind while another agent holds an execution lock", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId, executionRunId: ownerRunId }),
+      );
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ parentId: "99999999-9999-4999-8999-999999999999" });
+
+      expect(res.status, JSON.stringify(res.body)).toBeGreaterThanOrEqual(400);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.coordination_metadata_updated" }),
+      );
+    });
+
+    // Cutting a stale blocker edge is the BLO-18163 use case and cannot
+    // disturb a live run. Adding a new blocker is execution-sensitive because
+    // queued continuations cancel when unresolved blockers are present.
+    it("still allows blocker removal while the issue has an execution lock", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          status: "in_progress",
+          assigneeAgentId: ownerAgentId,
+          executionRunId: ownerRunId,
+          blockedByIssueIds: ["99999999-9999-4999-8999-999999999999"],
+        }),
       );
       mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
 
@@ -2992,6 +3056,29 @@ describe("agent issue mutation checkout ownership", () => {
         .send({ blockedByIssueIds: [] });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
+    });
+
+    it("refuses blocker addition while another agent holds an execution lock", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          status: "in_progress",
+          assigneeAgentId: ownerAgentId,
+          executionRunId: ownerRunId,
+          blockedByIssueIds: [],
+        }),
+      );
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ blockedByIssueIds: ["99999999-9999-4999-8999-999999999999"] });
+
+      expect(res.status, JSON.stringify(res.body)).toBeGreaterThanOrEqual(400);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.coordination_metadata_updated" }),
+      );
     });
 
     // The audit record must describe a write that happened. Emitting it next

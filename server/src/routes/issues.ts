@@ -214,11 +214,23 @@ const COORDINATION_METADATA_FIELDS = new Set([
   "projectWorkspaceId",
 ]);
 
-// Allowlisted fields that rebind where a run executes. Safe to change on a
-// parked issue, corrupting on one a run currently holds — so these are gated
-// on the issue not being checked out, while the rest of the allowlist is
-// deliberately permitted regardless of the execution lock.
-const COORDINATION_METADATA_EXECUTION_SENSITIVE_FIELDS = new Set(["projectWorkspaceId"]);
+// Allowlisted fields that can change where a run executes, or whether it can
+// continue. Safe to change on a parked issue, corrupting on one a run currently
+// holds — so these are gated on the issue not having an execution lock, while
+// the rest of the allowlist is deliberately permitted regardless of the lock.
+const COORDINATION_METADATA_EXECUTION_SENSITIVE_FIELDS = new Set([
+  "parentId",
+  "projectId",
+  "projectWorkspaceId",
+]);
+
+function coordinationBlockerPatchOnlyRemoves(
+  current: readonly string[] | null | undefined,
+  next: readonly string[] | null | undefined,
+): boolean {
+  const currentSet = new Set(current ?? []);
+  return (next ?? []).every((issueId) => currentSet.has(issueId));
+}
 
 // Deliberately NOT allowlisted: `title`, `description`, `comment` (work
 // content), and `status`. Two independent reasons for `status`, either
@@ -3878,6 +3890,8 @@ export function issueRoutes(
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      blockedByIssueIds?: string[] | null;
+      executionRunId?: string | null;
     },
     fields: string[],
   ) {
@@ -3886,11 +3900,20 @@ export function issueRoutes(
     // Self-owned and unassigned issues already have ordinary mutation
     // authority; this path must not become a second, weaker way in.
     if (!issue.assigneeAgentId || issue.assigneeAgentId === req.actor.agentId) return null;
-    // Workspace rebinding under a live checkout would repoint an in-flight
-    // run; refuse the path so the request falls through to the standard 409.
+    // Rebinding execution context or adding blockers under a live execution
+    // lock can silently strand another agent's run; refuse the coordination
+    // path so the request falls through to the standard mutation boundary.
     if (
-      issue.status === "in_progress" &&
-      fields.some((field) => COORDINATION_METADATA_EXECUTION_SENSITIVE_FIELDS.has(field))
+      issue.executionRunId &&
+      fields.some((field) => {
+        if (field === "blockedByIssueIds") {
+          return !coordinationBlockerPatchOnlyRemoves(
+            issue.blockedByIssueIds,
+            req.body.blockedByIssueIds as string[] | null | undefined,
+          );
+        }
+        return COORDINATION_METADATA_EXECUTION_SENSITIVE_FIELDS.has(field);
+      })
     ) {
       return null;
     }
