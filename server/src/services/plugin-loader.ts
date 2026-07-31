@@ -103,6 +103,7 @@ const MONOREPO_NODE_MODULES = path.resolve(__dirname, "../../../node_modules/.pn
  * below npm install's own 120s timeout.
  */
 const SDK_INSTALL_RACE_RETRY_DELAYS_MS = [500, 1500, 3500, 7500, 15500];
+const SDK_STORE_CONSISTENCY_RECHECK_DELAYS_MS = [500, 1500, 3500];
 const SDK_INSTALL_RACE_PACKAGE_MARKER = "@paperclipai/plugin-sdk";
 const SDK_INSTALL_RACE_ERR_MARKER = "ERR_MODULE_NOT_FOUND";
 
@@ -153,52 +154,150 @@ export interface SharedDependencyConsistencyCheck {
   packageName: string;
   lockfileVersion: string | null;
   installedVersion: string | null;
+  lockfileState: "missing" | "ok" | "invalid";
+  installedState: "missing" | "ok" | "invalid";
   consistent: boolean;
+  problem: "metadata_invalid" | "version_mismatch" | null;
+  diagnostic: string | null;
+}
+
+interface SharedDependencyVersionRead {
+  state: "missing" | "ok" | "invalid";
+  version: string | null;
+  diagnostic: string | null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isMissingFileError(err: unknown): boolean {
+  const code = (err as { code?: unknown })?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+function formatReadError(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 async function readInstalledPackageVersion(
   installDir: string,
   packageName: string,
-): Promise<string | null> {
+): Promise<SharedDependencyVersionRead> {
   const pkgJsonPath = path.join(installDir, "node_modules", ...packageName.split("/"), "package.json");
-  if (!existsSync(pkgJsonPath)) return null;
   try {
     const raw = await readFile(pkgJsonPath, "utf-8");
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    return typeof parsed["version"] === "string" ? parsed["version"] : null;
-  } catch {
-    return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) {
+      return {
+        state: "invalid",
+        version: null,
+        diagnostic: `${pkgJsonPath} must contain a JSON object`,
+      };
+    }
+    if (typeof parsed["version"] !== "string" || parsed["version"].trim().length === 0) {
+      return {
+        state: "invalid",
+        version: null,
+        diagnostic: `${pkgJsonPath} is missing a string version field`,
+      };
+    }
+    return { state: "ok", version: parsed["version"], diagnostic: null };
+  } catch (err) {
+    if (isMissingFileError(err)) return { state: "missing", version: null, diagnostic: null };
+    return {
+      state: "invalid",
+      version: null,
+      diagnostic: `Unable to read valid JSON from ${pkgJsonPath}: ${formatReadError(err)}`,
+    };
   }
 }
 
 async function readLockfileVersion(
   installDir: string,
   packageName: string,
-): Promise<string | null> {
+): Promise<SharedDependencyVersionRead> {
   const lockfilePath = path.join(installDir, "package-lock.json");
-  if (!existsSync(lockfilePath)) return null;
   try {
     const raw = await readFile(lockfilePath, "utf-8");
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) {
+      return {
+        state: "invalid",
+        version: null,
+        diagnostic: `${lockfilePath} must contain a JSON object`,
+      };
+    }
 
     // npm lockfileVersion 2/3: keyed by node_modules-relative path.
-    const packagesSection = parsed["packages"] as Record<string, unknown> | undefined;
-    const packagesEntry = packagesSection?.[`node_modules/${packageName}`] as Record<string, unknown> | undefined;
-    if (packagesEntry && typeof packagesEntry["version"] === "string") {
-      return packagesEntry["version"];
+    const packagesSection = parsed["packages"];
+    if (packagesSection !== undefined && packagesSection !== null && !isRecord(packagesSection)) {
+      return {
+        state: "invalid",
+        version: null,
+        diagnostic: `${lockfilePath} packages field must be an object when present`,
+      };
+    }
+    const packagesEntry = isRecord(packagesSection)
+      ? packagesSection[`node_modules/${packageName}`]
+      : undefined;
+    if (packagesEntry !== undefined) {
+      if (!isRecord(packagesEntry)) {
+        return {
+          state: "invalid",
+          version: null,
+          diagnostic: `${lockfilePath} entry for node_modules/${packageName} must be an object`,
+        };
+      }
+      if (typeof packagesEntry["version"] !== "string" || packagesEntry["version"].trim().length === 0) {
+        return {
+          state: "invalid",
+          version: null,
+          diagnostic: `${lockfilePath} entry for node_modules/${packageName} is missing a string version field`,
+        };
+      }
+      return { state: "ok", version: packagesEntry["version"], diagnostic: null };
     }
 
     // npm lockfileVersion 1 (and the back-compat "dependencies" block some
     // v2/v3 lockfiles still carry): keyed by bare package name.
-    const dependenciesSection = parsed["dependencies"] as Record<string, unknown> | undefined;
-    const dependenciesEntry = dependenciesSection?.[packageName] as Record<string, unknown> | undefined;
-    if (dependenciesEntry && typeof dependenciesEntry["version"] === "string") {
-      return dependenciesEntry["version"];
+    const dependenciesSection = parsed["dependencies"];
+    if (dependenciesSection !== undefined && dependenciesSection !== null && !isRecord(dependenciesSection)) {
+      return {
+        state: "invalid",
+        version: null,
+        diagnostic: `${lockfilePath} dependencies field must be an object when present`,
+      };
+    }
+    const dependenciesEntry = isRecord(dependenciesSection)
+      ? dependenciesSection[packageName]
+      : undefined;
+    if (dependenciesEntry !== undefined) {
+      if (!isRecord(dependenciesEntry)) {
+        return {
+          state: "invalid",
+          version: null,
+          diagnostic: `${lockfilePath} dependency entry for ${packageName} must be an object`,
+        };
+      }
+      if (typeof dependenciesEntry["version"] !== "string" || dependenciesEntry["version"].trim().length === 0) {
+        return {
+          state: "invalid",
+          version: null,
+          diagnostic: `${lockfilePath} dependency entry for ${packageName} is missing a string version field`,
+        };
+      }
+      return { state: "ok", version: dependenciesEntry["version"], diagnostic: null };
     }
 
-    return null;
-  } catch {
-    return null;
+    return { state: "missing", version: null, diagnostic: null };
+  } catch (err) {
+    if (isMissingFileError(err)) return { state: "missing", version: null, diagnostic: null };
+    return {
+      state: "invalid",
+      version: null,
+      diagnostic: `Unable to read valid JSON from ${lockfilePath}: ${formatReadError(err)}`,
+    };
   }
 }
 
@@ -209,27 +308,82 @@ async function readLockfileVersion(
  *
  * Absence on either side is NOT treated as a mismatch — a missing lockfile
  * (local dev without one) or a not-yet-installed package makes no claim to
- * disagree with. Only two *present, differing* versions count as torn.
+ * disagree with. Present-but-invalid metadata fails closed, as do two
+ * present, differing versions.
  */
 export async function checkSharedDependencyConsistency(
   installDir: string,
   packageName: string = SDK_INSTALL_RACE_PACKAGE_MARKER,
 ): Promise<SharedDependencyConsistencyCheck> {
-  const [lockfileVersion, installedVersion] = await Promise.all([
+  const [lockfileRead, installedRead] = await Promise.all([
     readLockfileVersion(installDir, packageName),
     readInstalledPackageVersion(installDir, packageName),
   ]);
 
+  const lockfileVersion = lockfileRead.version;
+  const installedVersion = installedRead.version;
+  const metadataInvalid = lockfileRead.state === "invalid" || installedRead.state === "invalid";
+  const versionMismatch =
+    lockfileRead.state === "ok" &&
+    installedRead.state === "ok" &&
+    lockfileVersion !== installedVersion;
   const consistent =
-    lockfileVersion === null ||
-    installedVersion === null ||
-    lockfileVersion === installedVersion;
+    !metadataInvalid &&
+    !versionMismatch;
+  const diagnostics = [lockfileRead.diagnostic, installedRead.diagnostic].filter((detail): detail is string => !!detail);
 
-  return { packageName, lockfileVersion, installedVersion, consistent };
+  return {
+    packageName,
+    lockfileVersion,
+    installedVersion,
+    lockfileState: lockfileRead.state,
+    installedState: installedRead.state,
+    consistent,
+    problem: metadataInvalid ? "metadata_invalid" : versionMismatch ? "version_mismatch" : null,
+    diagnostic: diagnostics.length > 0 ? diagnostics.join("; ") : null,
+  };
 }
 
-function formatTornPackageStoreError(check: SharedDependencyConsistencyCheck, installDir: string): string {
+function sharedDependencyProblemKey(check: SharedDependencyConsistencyCheck): string | null {
+  if (check.consistent) return null;
+  return JSON.stringify({
+    problem: check.problem,
+    lockfileState: check.lockfileState,
+    lockfileVersion: check.lockfileVersion,
+    installedState: check.installedState,
+    installedVersion: check.installedVersion,
+    diagnostic: check.diagnostic,
+  });
+}
+
+async function checkSharedDependencyConsistencyAfterRecheck(
+  installDir: string,
+  packageName: string = SDK_INSTALL_RACE_PACKAGE_MARKER,
+): Promise<SharedDependencyConsistencyCheck> {
+  let check = await checkSharedDependencyConsistency(installDir, packageName);
+  if (!sharedDependencyProblemKey(check)) return check;
+
+  for (const delayMs of SDK_STORE_CONSISTENCY_RECHECK_DELAYS_MS) {
+    await sleep(delayMs);
+    const next = await checkSharedDependencyConsistency(installDir, packageName);
+    const nextProblemKey = sharedDependencyProblemKey(next);
+    if (!nextProblemKey) return next;
+    check = next;
+  }
+
+  return check;
+}
+
+function formatSharedDependencyConsistencyError(check: SharedDependencyConsistencyCheck, installDir: string): string {
   const installedPath = path.join(installDir, "node_modules", ...check.packageName.split("/"));
+  if (check.problem === "metadata_invalid") {
+    return (
+      `Invalid plugin store metadata detected for ${check.packageName}: ${check.diagnostic ?? "unknown metadata error"}. ` +
+      `Refusing to activate to avoid a silent worker initialize timeout. Reconcile the shared plugin store ` +
+      `(e.g. inspect ${path.join(installDir, "package-lock.json")} and ${path.join(installedPath, "package.json")}, ` +
+      `then re-run 'npm install --prefix ${installDir}') before re-enabling this plugin.`
+    );
+  }
   return (
     `Torn plugin store detected: package-lock.json for ${check.packageName} records ` +
     `'${check.lockfileVersion}' but the installed package at ${installedPath} reports ` +
@@ -2352,11 +2506,14 @@ export function pluginLoader(
       // wrong), so it isn't caught by the SDK_INSTALL_RACE retry below —
       // the worker would instead hang on the initialize handshake for the
       // full 60s INITIALIZE_TIMEOUT_MS before failing with an opaque
-      // timeout. This check is read-only and completes in milliseconds.
+      // timeout. This check is read-only and uses bounded rechecks so a live
+      // npm install / workspace SDK re-patch can settle before we mark the
+      // plugin errored, while a persistent mismatch still fails well before
+      // the worker initialize timeout.
       // ------------------------------------------------------------------
-      const sdkConsistency = await checkSharedDependencyConsistency(localPluginDir);
+      const sdkConsistency = await checkSharedDependencyConsistencyAfterRecheck(localPluginDir);
       if (!sdkConsistency.consistent) {
-        throw new Error(formatTornPackageStoreError(sdkConsistency, localPluginDir));
+        throw new Error(formatSharedDependencyConsistencyError(sdkConsistency, localPluginDir));
       }
 
       // ------------------------------------------------------------------
