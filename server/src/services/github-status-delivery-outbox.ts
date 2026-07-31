@@ -360,6 +360,13 @@ export async function enqueueGithubCommitStatusDelivery(
 ): Promise<DeliveryRow> {
   const now = new Date();
   const nowSql = sql`${now.toISOString()}::timestamptz`;
+  const preserveExistingDelivery = sql`${
+    githubCommitStatusDeliveries.status
+  } = 'processing' or (${
+    githubCommitStatusDeliveries.status
+  } in ('delivered', 'skipped') and ${
+    githubCommitStatusDeliveries.sourceRunId
+  } = ${input.sourceRunId})`;
   const values = {
     companyId: input.companyId,
     sourceRunId: input.sourceRunId,
@@ -391,20 +398,21 @@ export async function enqueueGithubCommitStatusDelivery(
         githubCommitStatusDeliveries.context,
       ],
       set: {
-        companyId: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.companyId} else ${input.companyId} end`,
-        sourceRunId: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.sourceRunId} else ${input.sourceRunId} end`,
-        prNumber: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.prNumber} else ${input.prNumber} end`,
-        prUrl: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.prUrl} else ${input.prUrl ?? null} end`,
-        description: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.description} else ${input.description.slice(0, 140)} end`,
-        targetUrl: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.targetUrl} else ${input.targetUrl ?? null} end`,
-        status: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.status} else 'queued' end`,
-        attempts: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.attempts} else 0 end`,
-        nextAttemptAt: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.nextAttemptAt} else ${nowSql} end`,
-        lastError: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.lastError} else null end`,
-        lastErrorKind: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.lastErrorKind} else null end`,
-        lastResult: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.lastResult} else null end`,
-        createdAt: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.createdAt} else ${nowSql} end`,
-        updatedAt: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.updatedAt} else ${nowSql} end`,
+        companyId: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.companyId} else ${input.companyId} end`,
+        sourceRunId: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.sourceRunId} else ${input.sourceRunId} end`,
+        prNumber: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.prNumber} else ${input.prNumber} end`,
+        prUrl: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.prUrl} else ${input.prUrl ?? null} end`,
+        state: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.state} else ${input.state} end`,
+        description: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.description} else ${input.description.slice(0, 140)} end`,
+        targetUrl: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.targetUrl} else ${input.targetUrl ?? null} end`,
+        status: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.status} else 'queued' end`,
+        attempts: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.attempts} else 0 end`,
+        nextAttemptAt: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.nextAttemptAt} else ${nowSql} end`,
+        lastError: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.lastError} else null end`,
+        lastErrorKind: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.lastErrorKind} else null end`,
+        lastResult: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.lastResult} else null end`,
+        createdAt: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.createdAt} else ${nowSql} end`,
+        updatedAt: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.updatedAt} else ${nowSql} end`,
       },
     })
     .returning();

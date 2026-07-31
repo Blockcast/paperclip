@@ -386,6 +386,83 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(true);
   });
 
+  it("re-delivers a terminal same-head status for a new source run", async () => {
+    setCreds();
+    const { companyId, agentId, delivery } = await seedRun();
+    const originalDeliveredAt = new Date(Date.now() - 60_000);
+    await db
+      .update(githubCommitStatusDeliveries)
+      .set({
+        status: "delivered",
+        deliveredAt: originalDeliveredAt,
+        createdAt: originalDeliveredAt,
+        updatedAt: originalDeliveredAt,
+        nextAttemptAt: originalDeliveredAt,
+        lastResult: { posted: { ok: true } },
+      })
+      .where(eq(githubCommitStatusDeliveries.id, delivery.id));
+
+    const secondRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: secondRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      errorCode: "pr_review_output_missing",
+      contextSnapshot: {
+        wakeReason: "github_pr_synchronized",
+        githubRepoFullName: "Blockcast/hang",
+        githubPrNumber: 7,
+        githubHeadSha: HEAD_SHA,
+      },
+    });
+
+    const revived = await enqueueGithubCommitStatusDelivery(db, {
+      companyId,
+      sourceRunId: secondRunId,
+      repoFullName: "Blockcast/hang",
+      sha: HEAD_SHA,
+      context: "review/ally-complete",
+      state: "failure",
+      description: "Paperclip reviewer run exhausted again; no review was posted.",
+      targetUrl: "https://github.com/Blockcast/hang/pull/7?attempt=2",
+      prNumber: 7,
+      prUrl: "https://github.com/Blockcast/hang/pull/7?attempt=2",
+    });
+    const fetchMock = stubGithub({
+      latestStatuses: [
+        {
+          context: "review/ally-complete",
+          state: "failure",
+          created_at: originalDeliveredAt.toISOString(),
+        },
+      ],
+      reviews: [],
+      comments: [],
+    });
+
+    expect(revived).toMatchObject({
+      id: delivery.id,
+      sourceRunId: secondRunId,
+      status: "queued",
+      attempts: 0,
+      description: "Paperclip reviewer run exhausted again; no review was posted.",
+      targetUrl: "https://github.com/Blockcast/hang/pull/7?attempt=2",
+    });
+    expect(revived.createdAt.getTime()).toBeGreaterThan(originalDeliveredAt.getTime());
+
+    await pollGitHubCommitStatusDeliveriesOnce(db);
+
+    expect(await readDelivery(delivery.id)).toMatchObject({
+      status: "delivered",
+      sourceRunId: secondRunId,
+    });
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`)).length).toBe(1);
+    const events = await readRunEvents(secondRunId);
+    expect(events.at(-1)?.message).toContain("Set PR-review gate status review/ally-complete to failure");
+  });
+
   it("skips the failure write when reviewer evidence now exists on GitHub", async () => {
     setCreds();
     const { delivery } = await seedRun();
