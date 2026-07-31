@@ -7691,6 +7691,15 @@ export interface HeartbeatServiceOptions {
    */
   workerBootAt?: Date;
   runtimeEnv?: Record<string, string | undefined>;
+  /**
+   * Test-only concurrency hook: fired after the scheduler has read a due
+   * scheduled_retry row and immediately before the conditional UPDATE that
+   * promotes or cancels it.
+   */
+  beforeScheduledRetryPromotionUpdateForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+    now: Date,
+  ) => Promise<void> | void;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -12316,6 +12325,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const promotionIssueId = readNonEmptyString(contextSnapshot.issueId);
+    await options.beforeScheduledRetryPromotionUpdateForTest?.(dueRun, now);
     const atomicPromotion = await db.transaction(async (tx) => {
       let promotionGate: BlockedScheduledRetryGate | null = null;
 
@@ -12458,9 +12468,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // otherwise never reach a settled state (BLO-18859 review follow-up).
       // The gate family is policy, not outage, so it lands on a cause the
       // suppression-outage alert deliberately does not select.
-      const gateGithubReviewReason = githubPrReviewWakeReasonFromRunSnapshot(contextSnapshot);
+      const gateContextSnapshot = parseObject(atomicPromotion.run.contextSnapshot);
+      const gateGithubReviewReason = githubPrReviewWakeReasonFromRunSnapshot(gateContextSnapshot);
       if (gateGithubReviewReason !== null) {
-        const settledDeliveries = readGithubReviewDeliveryCount(contextSnapshot);
+        const settledDeliveries = readGithubReviewDeliveryCount(gateContextSnapshot);
         for (let i = 0; i < settledDeliveries; i++) {
           recordGithubReviewRequestSuppressed({
             reason: gateGithubReviewReason,
@@ -12509,9 +12520,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // bumped the tally as it was counted `deferred`. Replaying the tally here
     // is what keeps `received = queued + suppressed + dead_lettered + in-flight`
     // closed when N deliveries settle as one run.
-    const promotedGithubReviewReason = githubPrReviewWakeReasonFromRunSnapshot(contextSnapshot);
+    const promotedContextSnapshot = parseObject(promoted.contextSnapshot);
+    const promotedGithubReviewReason = githubPrReviewWakeReasonFromRunSnapshot(promotedContextSnapshot);
     if (promotedGithubReviewReason !== null) {
-      const settledDeliveries = readGithubReviewDeliveryCount(contextSnapshot);
+      const settledDeliveries = readGithubReviewDeliveryCount(promotedContextSnapshot);
       for (let i = 0; i < settledDeliveries; i++) {
         recordGithubReviewRequestDelivery({ state: "queued", reason: promotedGithubReviewReason });
       }
@@ -21543,7 +21555,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 to_jsonb(
                   coalesce(
                     nullif(${heartbeatRuns.contextSnapshot} ->> ${GITHUB_REVIEW_DELIVERY_COUNT_KEY}, '')::int,
-                    1
+                    0
                   ) + 1
                 )
               )`,

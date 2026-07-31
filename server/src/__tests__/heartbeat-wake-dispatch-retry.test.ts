@@ -17,10 +17,11 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns } from "@paperclipai/db";
+import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import {
   CCROTATE_CAPACITY_RETRY_REASON,
   GITHUB_REVIEW_DELIVERY_COUNT_KEY,
+  JOB_FAILED_HEARTBEAT_RETRY_REASON,
   heartbeatService,
 } from "../services/heartbeat.js";
 import {
@@ -29,6 +30,7 @@ import {
   GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC,
   __resetMetricsForTest,
   getMetricsRegistry,
+  recordGithubReviewRequestDelivery,
 } from "../services/metrics.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -747,6 +749,46 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         });
       }
 
+      async function insertDueGithubReviewRetryRun(input: {
+        companyId: string;
+        agentId: string;
+        issueId: string;
+      }) {
+        const runId = randomUUID();
+        const now = new Date();
+        await db.insert(heartbeatRuns).values({
+          id: runId,
+          companyId: input.companyId,
+          agentId: input.agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "scheduled_retry",
+          scheduledRetryAt: new Date(now.getTime() - 60_000),
+          scheduledRetryReason: JOB_FAILED_HEARTBEAT_RETRY_REASON,
+          scheduledRetryAttempt: 0,
+          contextSnapshot: {
+            issueId: input.issueId,
+            taskKey: GITHUB_REVIEW_PAYLOAD.taskKey,
+            wakeReason: "github_pr_review_submitted",
+            githubReviewWakeReason: "github_pr_review_submitted",
+            [GITHUB_REVIEW_DELIVERY_COUNT_KEY]: 1,
+          },
+        });
+        await db.insert(issues).values({
+          id: input.issueId,
+          companyId: input.companyId,
+          title: "Retry target",
+          status: "in_progress",
+          priority: "high",
+          assigneeAgentId: input.agentId,
+          executionRunId: runId,
+          executionAgentNameKey: "ally",
+          executionLockedAt: now,
+        });
+        recordGithubReviewRequestDelivery({ state: "deferred", reason: "github_pr_review_submitted" });
+        return runId;
+      }
+
       it("counts `deferred`, not `suppressed`, and never lands on an alerting cause", async () => {
         const { agentId } = await seedCompanyAndAgent();
 
@@ -830,6 +872,52 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         expect(runs.filter((row) => row.status === "scheduled_retry")).toHaveLength(0);
       });
 
+      it("counts the first GitHub delivery coalesced onto a non-GitHub scheduled retry as one", async () => {
+        const { agentId, companyId } = await seedCompanyAndAgent();
+        const runId = randomUUID();
+        await db.insert(heartbeatRuns).values({
+          id: runId,
+          companyId,
+          agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "scheduled_retry",
+          scheduledRetryAt: new Date(Date.now() + 60_000),
+          scheduledRetryReason: CCROTATE_CAPACITY_RETRY_REASON,
+          scheduledRetryAttempt: 0,
+          contextSnapshot: {
+            taskKey: GITHUB_REVIEW_PAYLOAD.taskKey,
+            wakeReason: "issue_assigned",
+          },
+        });
+
+        expect(
+          await heartbeatWithCapacityDenied().wakeup(agentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "github_pr_review_submitted",
+            payload: GITHUB_REVIEW_PAYLOAD,
+          }),
+        ).toBeNull();
+
+        expect(await deliveryCount("deferred")).toBe(1);
+        const [parked] = await db
+          .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId));
+        expect((parked!.contextSnapshot as Record<string, unknown>)[GITHUB_REVIEW_DELIVERY_COUNT_KEY]).toBe(1);
+
+        await db
+          .update(heartbeatRuns)
+          .set({ scheduledRetryAt: new Date(Date.now() - 60_000) })
+          .where(eq(heartbeatRuns.id, runId));
+        await heartbeatService(db, { skipQueuedRunDispatch: true }).promoteDueScheduledRetries(new Date());
+
+        expect(await deliveryCount("queued")).toBe(1);
+        expect(await deliveryCount("suppressed")).toBe(0);
+        expect(await deliveryCount("dead_lettered")).toBe(0);
+      });
+
       it("settles a deferred delivery as `queued` when its scheduled retry is promoted", async () => {
         const { agentId } = await seedCompanyAndAgent();
 
@@ -866,6 +954,49 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         // Funnel closed, and closed exactly once — no terminal-loss state was
         // reached on the way.
         expect(await deliveryCount("queued")).toBe(1);
+        expect(await deliveryCount("suppressed")).toBe(0);
+        expect(await deliveryCount("dead_lettered")).toBe(0);
+      });
+
+      it("settles a delivery that coalesces after the due-run read when promotion wins", async () => {
+        const { agentId } = await seedCompanyAndAgent();
+        const capacityDenied = heartbeatWithCapacityDenied();
+
+        expect(
+          await capacityDenied.wakeup(agentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "github_pr_review_submitted",
+            payload: GITHUB_REVIEW_PAYLOAD,
+          }),
+        ).toBeNull();
+        expect(await deliveryCount("deferred")).toBe(1);
+
+        await db
+          .update(heartbeatRuns)
+          .set({ scheduledRetryAt: new Date(Date.now() - 60_000) })
+          .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "scheduled_retry")));
+
+        let coalescedDuringPromotion = false;
+        await heartbeatService(db, {
+          skipQueuedRunDispatch: true,
+          beforeScheduledRetryPromotionUpdateForTest: async () => {
+            if (coalescedDuringPromotion) return;
+            coalescedDuringPromotion = true;
+            expect(
+              await capacityDenied.wakeup(agentId, {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "github_pr_review_submitted",
+                payload: GITHUB_REVIEW_PAYLOAD,
+              }),
+            ).toBeNull();
+          },
+        }).promoteDueScheduledRetries(new Date());
+
+        expect(coalescedDuringPromotion).toBe(true);
+        expect(await deliveryCount("deferred")).toBe(2);
+        expect(await deliveryCount("queued")).toBe(2);
         expect(await deliveryCount("suppressed")).toBe(0);
         expect(await deliveryCount("dead_lettered")).toBe(0);
       });
@@ -952,6 +1083,38 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         expect(await suppressionCount("scheduled_retry_gate_declined")).toBe(3);
         expect(await suppressionCount("other")).toBe(0);
         expect(await suppressionCount("dispatch_rejected")).toBe(0);
+      });
+
+      it("settles a delivery that coalesces after the due-run read when the issue gate cancels", async () => {
+        const { agentId, companyId } = await seedCompanyAndAgent();
+        const issueId = randomUUID();
+        await insertDueGithubReviewRetryRun({ companyId, agentId, issueId });
+        expect(await deliveryCount("deferred")).toBe(1);
+
+        let coalescedDuringPromotion = false;
+        await heartbeatService(db, {
+          skipQueuedRunDispatch: true,
+          beforeScheduledRetryPromotionUpdateForTest: async () => {
+            if (coalescedDuringPromotion) return;
+            coalescedDuringPromotion = true;
+            expect(
+              await heartbeatWithCapacityDenied().wakeup(agentId, {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "github_pr_review_submitted",
+                payload: GITHUB_REVIEW_PAYLOAD,
+              }),
+            ).toBeNull();
+            await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+          },
+        }).promoteDueScheduledRetries(new Date());
+
+        expect(coalescedDuringPromotion).toBe(true);
+        expect(await deliveryCount("deferred")).toBe(2);
+        expect(await deliveryCount("queued")).toBe(0);
+        expect(await deliveryCount("suppressed")).toBe(2);
+        expect(await suppressionCount("scheduled_retry_gate_declined")).toBe(2);
+        expect(await deliveryCount("dead_lettered")).toBe(0);
       });
     });
     describe("dead-letter gauge survives restart and first scrape", () => {

@@ -35,11 +35,15 @@
         gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
           --jq '.content' | base64 -d | grep PaperclipGithubReviewRequestDeadLettered
 
-    - NOT YET LIVE as of 2026-07-30T19:40Z. The cluster ConfigMap
-      monitoring/prometheus-config is Argo-tracked
+    - LIVE as of 2026-07-31T01:10Z after manually syncing the monitoring-rules
+      Argo app to onprem-k8s revision 942d8154ebdda34ccdd61255d0ac891becfc5b9d.
+      The live monitoring/prometheus-config ConfigMap and Prometheus /api/v1/rules
+      both include PaperclipGithubReviewRequestDeadLettered and
+      PaperclipGithubReviewRequestSuppressionOutage.
+
+      The cluster ConfigMap monitoring/prometheus-config is still Argo-tracked
       (argocd.argoproj.io/tracking-id: monitoring-rules:/ConfigMap:monitoring/prometheus-config)
       and the `monitoring-rules` app syncs manually, so a merge does not deploy.
-      The live key still carries only the six pre-existing Paperclip alerts.
       That sync gate is a standing repo-wide hazard — it once sat 8 days and
       stranded 15 merged alerts — and is tracked on BLO-19095, not here. Merging
       an alert is not deploying it; confirm the live ConfigMap before treating
