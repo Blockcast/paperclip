@@ -1434,17 +1434,24 @@ describe("agent issue mutation checkout ownership", () => {
     // those only ever proved a message change. It is short-circuited by
     // `hasActiveCheckoutManagementOverride` -> `tasks:manage_active_checkouts`, which is
     // exactly the action `allow_manager_chain` is wired to — and the reported BLO-18996
-    // instance named the assignee's *manager* (the CEO) as recovery owner. So for a manager
-    // owner on a `blocked` source issue with zero unresolved blockers, nothing on the path
-    // was an `issue:mutate` check and the comment grant carried the issue to `todo`.
-    // Pre-fix this reaches `svc.update(id, { status: "todo" })`; post-fix it must 403.
+    // instance named the assignee's *manager* (the CEO) as recovery owner. Manager comments
+    // now receive that production grant before the recovery-owner fallback is considered, so
+    // this case must exercise the creator/manager comment-only guard. The plain-peer case above
+    // remains the end-to-end regression for `allow_source_scoped_recovery_owner`.
     it("does not let a manager recovery owner reopen a blocked source issue to todo", async () => {
       mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
-        const allowed = input.action === "issue:read" || input.action === "tasks:manage_active_checkouts";
+        const allowed =
+          input.action === "issue:read" ||
+          input.action === "issue:comment" ||
+          input.action === "tasks:manage_active_checkouts";
         return {
           allowed,
           action: input.action,
-          reason: allowed ? "allow_manager_chain" : "deny_missing_grant",
+          reason: input.action === "issue:comment" || input.action === "tasks:manage_active_checkouts"
+            ? "allow_manager_chain"
+            : allowed
+              ? "allow_explicit_grant"
+              : "deny_missing_grant",
           explanation: allowed ? "Allowed by test manager override." : "Denied by test.",
         };
       });
@@ -1466,7 +1473,8 @@ describe("agent issue mutation checkout ownership", () => {
         .send({ body: "Reopening this.", reopen: true });
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
-      expect(res.body.error).toBe("Recovery owner grant is comment-only");
+      expect(res.body.error).toBe("Creator/manager comment grant is comment-only");
+      expect(res.body.details?.reason).toBe("allow_manager_chain");
       // The consequence: the source issue must never be carried to `todo` by the grant.
       expect(mockIssueService.update).not.toHaveBeenCalledWith(
         expect.anything(),
