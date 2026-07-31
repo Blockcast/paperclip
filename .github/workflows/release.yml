@@ -208,9 +208,9 @@ jobs:
 
       - name: Push stable tag
         run: |
-          tag="$(git tag --points-at HEAD | grep '^v' | head -1 | sed 's/^v//')"
+          tag="$(git tag --points-at HEAD | grep '^v' | head -1)"
           if [ -z "$tag" ]; then
-            echo "Error: no v* tag points at HEAD after stable release." >&2
+            echo "Error: no stable tag points at HEAD after stable release." >&2
             exit 1
           fi
           git push origin "refs/tags/${tag}"
