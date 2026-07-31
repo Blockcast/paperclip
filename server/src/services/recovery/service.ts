@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, exists, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -36,7 +36,7 @@ import { redactSensitiveText } from "../../redaction.js";
 import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
-import { issueRecoveryActionService } from "../issue-recovery-actions.js";
+import { ACTIVE_RECOVERY_ACTION_STATUSES, issueRecoveryActionService } from "../issue-recovery-actions.js";
 import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
@@ -4176,6 +4176,11 @@ export function recoveryService(
           suppressedNonAssigneeWake: true,
         }, "status_only"),
       });
+      await reassertSourceScopedRecoveryBlockedAfterWake({
+        sourceIssueId: input.issue.id,
+        recoveryActionId: input.action.id,
+        agentId: assigneeAgentId,
+      });
       return;
     }
     // NOTE (BLO-18996): `attemptCount` restarts at 1 whenever the action's owner changes,
@@ -4210,6 +4215,50 @@ export function recoveryService(
         recoveryCause: input.recoveryCause,
       }, "status_only"),
     });
+    await reassertSourceScopedRecoveryBlockedAfterWake({
+      sourceIssueId: input.issue.id,
+      recoveryActionId: input.action.id,
+      agentId: input.action.ownerAgentId,
+    });
+  }
+
+  async function reassertSourceScopedRecoveryBlockedAfterWake(input: {
+    sourceIssueId: string;
+    recoveryActionId: string;
+    agentId: string;
+  }) {
+    await db
+      .update(issues)
+      .set({
+        status: "blocked",
+        checkoutRunId: null,
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(issues.id, input.sourceIssueId),
+          eq(issues.status, "in_progress"),
+          eq(issues.assigneeAgentId, input.agentId),
+          isNull(issues.checkoutRunId),
+          isNull(issues.executionRunId),
+          exists(
+            db
+              .select({ id: issueRecoveryActions.id })
+              .from(issueRecoveryActions)
+              .where(
+                and(
+                  eq(issueRecoveryActions.id, input.recoveryActionId),
+                  eq(issueRecoveryActions.sourceIssueId, issues.id),
+                  eq(issueRecoveryActions.ownerAgentId, input.agentId),
+                  inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+                ),
+              ),
+          ),
+        ),
+      );
   }
 
   function readProviderQuotaRetryAt(latestRun: LatestIssueRun, now: Date) {
