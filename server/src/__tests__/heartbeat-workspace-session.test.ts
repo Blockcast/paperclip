@@ -845,6 +845,32 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
     );
   });
 
+  it("rejects when the git checkout probe stalls past its timeout", async () => {
+    const fakeBin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-stalled-git-"));
+    const previousPath = process.env.PATH;
+    const previousTimeout = process.env.PAPERCLIP_STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_MS;
+    try {
+      await fs.writeFile(path.join(fakeBin, "git"), "#!/bin/sh\nsleep 5\n", { mode: 0o755 });
+      process.env.PATH = `${fakeBin}${path.delimiter}${previousPath ?? ""}`;
+      process.env.PAPERCLIP_STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_MS = "200";
+      await fs.mkdir(fallbackCwd, { recursive: true });
+
+      const startedAt = Date.now();
+      await expectWorkspaceValidationFailure(
+        fallbackInput(),
+        "k8s_agent_home_git_bootstrap_unsupported",
+        "Refusing to dispatch claude_k8s run isolation from the shared agent-home fallback cwd",
+      );
+      expect(Date.now() - startedAt).toBeLessThan(1_500);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousTimeout === undefined) delete process.env.PAPERCLIP_STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_MS;
+      else process.env.PAPERCLIP_STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_MS = previousTimeout;
+      await fs.rm(fakeBin, { recursive: true, force: true });
+    }
+  });
+
   it("allows stateless dispatch without issue context", async () => {
     await fs.mkdir(fallbackCwd, { recursive: true });
     await runGit(fallbackCwd, ["init"]);

@@ -418,6 +418,7 @@ const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
+const STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_DEFAULT_MS = 5_000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
@@ -486,6 +487,16 @@ function readIntegerEnv(name: string, fallback: number): number {
   if (raw == null || raw.trim() === "") return fallback;
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function strictGitCheckoutProbeTimeoutMs(): number {
+  return Math.max(
+    100,
+    readIntegerEnv(
+      "PAPERCLIP_STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_MS",
+      STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_DEFAULT_MS,
+    ),
+  );
 }
 
 const K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS = Math.max(
@@ -1923,7 +1934,10 @@ async function probeGitCheckoutStateStrict(
   cwd: string,
 ): Promise<"checkout" | "not_a_checkout" | "indeterminate"> {
   try {
-    const result = await execFile("git", ["rev-parse", "--show-toplevel"], { cwd });
+    const result = await execFile("git", ["rev-parse", "--show-toplevel"], {
+      cwd,
+      timeout: strictGitCheckoutProbeTimeoutMs(),
+    });
     return readNonEmptyString(result.stdout) ? "checkout" : "indeterminate";
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return "not_a_checkout";
