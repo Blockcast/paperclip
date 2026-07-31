@@ -97,6 +97,42 @@ function statusCreatedAtOrAfterQueueSecond(statusCreatedAt: number, queuedAt: Da
   return statusCreatedAt >= queuedAtSecond;
 }
 
+async function handleFreshCommitStatusIfPresent(db: Db, row: DeliveryRow): Promise<boolean> {
+  const latestStatus = await githubGetLatestCommitStatusForContext({
+    repoFullName: row.repoFullName,
+    sha: row.sha,
+    context: row.context,
+  });
+  if (!latestStatus.ok) {
+    if (latestStatus.retryable) {
+      await retryOrFailDelivery(db, row, latestStatus.reason, latestStatus);
+    } else {
+      await failPermanentDelivery(db, row, latestStatus.reason, latestStatus);
+    }
+    return true;
+  }
+
+  const latestCommitStatus = latestStatus.status;
+  const statusCreatedAt = latestCommitStatus?.createdAt ? Date.parse(latestCommitStatus.createdAt) : NaN;
+  const statusAtOrAfterQueue = statusCreatedAtOrAfterQueueSecond(statusCreatedAt, row.createdAt);
+  if (latestCommitStatus?.state === "success" || statusAtOrAfterQueue) {
+    await markTerminal(
+      db,
+      row,
+      "skipped",
+      "info",
+      `Skipped PR-review gate status failure for ${row.context} on ${row.repoFullName}@${row.sha.slice(0, 7)} because a newer status already exists`,
+      {
+        reason: latestCommitStatus?.state === "success" ? "existing_success_status" : "newer_or_same_second_status_exists",
+        latestStatus: latestCommitStatus,
+      },
+    );
+    return true;
+  }
+
+  return false;
+}
+
 async function appendDeliveryRunEvent(
   db: Db,
   row: DeliveryRow,
@@ -244,36 +280,7 @@ async function failPermanentDelivery(
 }
 
 async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
-  const latestStatus = await githubGetLatestCommitStatusForContext({
-    repoFullName: row.repoFullName,
-    sha: row.sha,
-    context: row.context,
-  });
-  if (!latestStatus.ok) {
-    if (latestStatus.retryable) {
-      await retryOrFailDelivery(db, row, latestStatus.reason, latestStatus);
-    } else {
-      await failPermanentDelivery(db, row, latestStatus.reason, latestStatus);
-    }
-    return;
-  }
-  const latestCommitStatus = latestStatus.status;
-  const statusCreatedAt = latestCommitStatus?.createdAt ? Date.parse(latestCommitStatus.createdAt) : NaN;
-  const statusAtOrAfterQueue = statusCreatedAtOrAfterQueueSecond(statusCreatedAt, row.createdAt);
-  if (latestCommitStatus?.state === "success" || statusAtOrAfterQueue) {
-    await markTerminal(
-      db,
-      row,
-      "skipped",
-      "info",
-      `Skipped PR-review gate status failure for ${row.context} on ${row.repoFullName}@${row.sha.slice(0, 7)} because a newer status already exists`,
-      {
-        reason: latestCommitStatus?.state === "success" ? "existing_success_status" : "newer_or_same_second_status_exists",
-        latestStatus: latestCommitStatus,
-      },
-    );
-    return;
-  }
+  if (await handleFreshCommitStatusIfPresent(db, row)) return;
 
   const evidence = await githubHasReviewerEvidenceForPr({
     repoFullName: row.repoFullName,
@@ -301,7 +308,7 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
     return;
   }
 
-  const fencedRow = await refreshDeliveryClaimBeforeExternalWrite(db, row);
+  let fencedRow = await refreshDeliveryClaimBeforeExternalWrite(db, row);
   if (!fencedRow) {
     logger.info(
       { deliveryId: row.id },
@@ -309,6 +316,17 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
     );
     return;
   }
+  if (await handleFreshCommitStatusIfPresent(db, fencedRow)) return;
+
+  const postingRow = await refreshDeliveryClaimBeforeExternalWrite(db, fencedRow);
+  if (!postingRow) {
+    logger.info(
+      { deliveryId: row.id },
+      "github-status-delivery-outbox: stale delivery claim ignored before external status write",
+    );
+    return;
+  }
+  fencedRow = postingRow;
 
   const posted = await githubPostCommitStatusDetailed({
     repoFullName: fencedRow.repoFullName,

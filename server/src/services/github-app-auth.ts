@@ -92,7 +92,21 @@ function isRetryableGithubHttpStatus(status: number): boolean {
 
 type ClassifiedGithubHttpFailure = { retryable: boolean; reason: string };
 
-function classifyGithubHttpFailure(prefix: string, status: number): ClassifiedGithubHttpFailure {
+async function githubRateLimitSignal(res: Response): Promise<boolean> {
+  const retryAfter = res.headers?.get("retry-after");
+  if (retryAfter && retryAfter.trim().length > 0) return true;
+  if (res.headers?.get("x-ratelimit-remaining") === "0") return true;
+
+  const body = await res.json().catch(() => null) as unknown;
+  const bodyText = JSON.stringify(body ?? "").toLowerCase();
+  return bodyText.includes("rate limit") || bodyText.includes("secondary rate limit") || bodyText.includes("abuse detection");
+}
+
+async function classifyGithubHttpFailure(prefix: string, res: Response): Promise<ClassifiedGithubHttpFailure> {
+  if (res.status === 403 && await githubRateLimitSignal(res)) {
+    return { retryable: true, reason: `${prefix}_rate_limited` };
+  }
+  const status = res.status;
   if (isRetryableGithubHttpStatus(status)) {
     return { retryable: true, reason: `${prefix}_http_${status}` };
   }
@@ -136,7 +150,7 @@ export async function getInstallationTokenResult(nowMs: number = Date.now()): Pr
     return { ok: false, retryable: true, reason: "github_app_token_fetch_failed" };
   }
   if (!res.ok) {
-    const classified = classifyGithubHttpFailure("github_app_token", res.status);
+    const classified = await classifyGithubHttpFailure("github_app_token", res);
     return { ok: false, ...classified, statusCode: res.status };
   }
   const body = (await res.json().catch(() => null)) as { token?: string; expires_at?: string } | null;
@@ -284,7 +298,10 @@ export async function githubHasReviewerEvidenceForPr(input: {
     for (let page = 1; page <= 10; page += 1) {
       const url = `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`;
       const res = await ghFetch(url, { headers });
-      if (!res.ok) return { error: `reviews_http_${res.status}` };
+      if (!res.ok) {
+        const classified = await classifyGithubHttpFailure("reviews", res);
+        return { error: classified.reason };
+      }
       const batch = (await res.json()) as Array<{ user?: { login?: string }; commit_id?: string | null }>;
       for (const review of batch) {
         if (normalizeGithubLogin(review.user?.login ?? "") !== botLogin) continue;
@@ -307,7 +324,10 @@ export async function githubHasReviewerEvidenceForPr(input: {
       for (let page = 1; page <= 10; page += 1) {
         const url = `${apiBase}/repos/${input.repoFullName}/issues/${input.prNumber}/comments?per_page=100&page=${page}`;
         const res = await ghFetch(url, { headers });
-        if (!res.ok) return { error: `comments_http_${res.status}` };
+        if (!res.ok) {
+          const classified = await classifyGithubHttpFailure("comments", res);
+          return { error: classified.reason };
+        }
         const batch = (await res.json()) as Array<{ user?: { login?: string }; body?: string }>;
         for (const comment of batch) {
           if (normalizeGithubLogin(comment.user?.login ?? "") !== botLogin) continue;
@@ -420,32 +440,48 @@ export async function githubGetLatestCommitStatusForContext(input: {
   const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token.token}` };
   const apiBase = gitHubApiBase(GITHUB_HOST);
   try {
-    const url = `${apiBase}/repos/${input.repoFullName}/commits/${input.sha}/statuses?per_page=100`;
-    const res = await ghFetch(url, { headers });
-    if (!res.ok) {
-      const classified = classifyGithubHttpFailure("commit_status_read", res.status);
-      return { ok: false, ...classified, statusCode: res.status };
+    const candidates: Array<{
+      state: GitHubCommitStatusState;
+      context: string;
+      createdAt: string | null;
+      targetUrl: string | null;
+    }> = [];
+    for (let page = 1; page <= 10; page += 1) {
+      const url = `${apiBase}/repos/${input.repoFullName}/commits/${input.sha}/statuses?per_page=100&page=${page}`;
+      const res = await ghFetch(url, { headers });
+      if (!res.ok) {
+        const classified = await classifyGithubHttpFailure("commit_status_read", res);
+        return { ok: false, ...classified, statusCode: res.status };
+      }
+      const body = (await res.json().catch(() => [])) as Array<{
+        context?: string;
+        state?: string;
+        created_at?: string | null;
+        target_url?: string | null;
+      }>;
+      candidates.push(
+        ...body
+          .filter((status) => status.context === input.context)
+          .map((status) => ({
+            state: status.state as GitHubCommitStatusState,
+            context: status.context ?? "",
+            createdAt: typeof status.created_at === "string" ? status.created_at : null,
+            targetUrl: typeof status.target_url === "string" ? status.target_url : null,
+          }))
+          .filter((status) =>
+            status.state === "error" ||
+            status.state === "failure" ||
+            status.state === "pending" ||
+            status.state === "success",
+          ),
+      );
+      if (body.length < 100) break;
     }
-    const body = (await res.json().catch(() => [])) as Array<{
-      context?: string;
-      state?: string;
-      created_at?: string | null;
-      target_url?: string | null;
-    }>;
-    const candidates = body
-      .filter((status) => status.context === input.context)
-      .map((status) => ({
-        state: status.state as GitHubCommitStatusState,
-        context: status.context ?? "",
-        createdAt: typeof status.created_at === "string" ? status.created_at : null,
-        targetUrl: typeof status.target_url === "string" ? status.target_url : null,
-      }))
-      .filter((status) => status.state === "error" || status.state === "failure" || status.state === "pending" || status.state === "success")
-      .sort((left, right) => {
-        const leftTime = left.createdAt ? Date.parse(left.createdAt) : 0;
-        const rightTime = right.createdAt ? Date.parse(right.createdAt) : 0;
-        return rightTime - leftTime;
-      });
+    candidates.sort((left, right) => {
+      const leftTime = left.createdAt ? Date.parse(left.createdAt) : 0;
+      const rightTime = right.createdAt ? Date.parse(right.createdAt) : 0;
+      return rightTime - leftTime;
+    });
     return { ok: true, status: candidates[0] ?? null };
   } catch {
     return { ok: false, retryable: true, reason: "commit_status_read_fetch_failed" };
@@ -488,7 +524,7 @@ export async function githubPostCommitStatusDetailed(input: {
       }),
     });
     if (res.ok) return { ok: true, statusCode: res.status };
-    const classified = classifyGithubHttpFailure("commit_status_write", res.status);
+    const classified = await classifyGithubHttpFailure("commit_status_write", res);
     return { ok: false, ...classified, statusCode: res.status };
   } catch {
     return { ok: false, retryable: true, reason: "commit_status_write_fetch_failed" };

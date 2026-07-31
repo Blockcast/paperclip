@@ -46,8 +46,8 @@ const PRIVATE_KEY_PEM = privateKey.export({ type: "pkcs8", format: "pem" }).toSt
 const FUTURE_ISO = "2999-01-01T00:00:00Z";
 const HEAD_SHA = "45eb633e348a826f43dc68b0c25fe83a96300cea";
 
-function jsonResponse(data: unknown, ok = true, status = 200): Response {
-  return { ok, status, json: async () => data } as unknown as Response;
+function jsonResponse(data: unknown, ok = true, status = 200, headers: Record<string, string> = {}): Response {
+  return { ok, status, headers: new Headers(headers), json: async () => data } as unknown as Response;
 }
 
 function setCreds() {
@@ -146,18 +146,33 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
   function stubGithub(options: {
     latestStatuses?: unknown[];
     reviews?: unknown[];
+    reviewsStatus?: number;
+    reviewsBody?: unknown;
+    reviewsHeaders?: Record<string, string>;
     comments?: unknown[];
     postStatus?: number;
+    postBody?: unknown;
+    postHeaders?: Record<string, string>;
   }) {
     const fetchMock = vi.fn(async (url: string | URL) => {
       const u = String(url);
       if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
       if (/\/commits\/[^/]+\/statuses(?:\?|$)/.test(u)) return jsonResponse(options.latestStatuses ?? []);
-      if (u.includes("/pulls/") && u.includes("/reviews")) return jsonResponse(options.reviews ?? []);
+      if (u.includes("/pulls/") && u.includes("/reviews")) {
+        if (options.reviewsStatus && options.reviewsStatus >= 400) {
+          return jsonResponse(
+            options.reviewsBody ?? [],
+            false,
+            options.reviewsStatus,
+            options.reviewsHeaders,
+          );
+        }
+        return jsonResponse(options.reviews ?? []);
+      }
       if (u.includes("/issues/") && u.includes("/comments")) return jsonResponse(options.comments ?? []);
       if (/\/statuses\/[0-9a-f]{7,40}(?:\?|$)/i.test(u)) {
         const status = options.postStatus ?? 201;
-        return jsonResponse({ id: 1 }, status < 400, status);
+        return jsonResponse(options.postBody ?? { id: 1 }, status < 400, status, options.postHeaders);
       }
       throw new Error(`unexpected url ${u}`);
     });
@@ -337,6 +352,44 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(false);
   });
 
+  it("re-checks commit status after reviewer evidence before posting failure", async () => {
+    setCreds();
+    const { delivery } = await seedRun();
+    let statusReads = 0;
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      if (/\/commits\/[^/]+\/statuses(?:\?|$)/.test(u)) {
+        statusReads += 1;
+        return jsonResponse(
+          statusReads === 1
+            ? []
+            : [
+                {
+                  context: "review/ally-complete",
+                  state: "success",
+                  created_at: "2026-07-31T10:01:00Z",
+                },
+              ],
+        );
+      }
+      if (u.includes("/pulls/") && u.includes("/reviews")) return jsonResponse([]);
+      if (u.includes("/issues/") && u.includes("/comments")) return jsonResponse([]);
+      if (/\/statuses\/[0-9a-f]{7,40}(?:\?|$)/i.test(u)) return jsonResponse({ id: 1 }, true, 201);
+      throw new Error(`unexpected url ${u}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await pollGitHubCommitStatusDeliveriesOnce(db);
+
+    expect(statusReads).toBe(2);
+    expect(await readDelivery(delivery.id)).toMatchObject({
+      status: "skipped",
+      lastResult: { reason: "existing_success_status" },
+    });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(false);
+  });
+
   it("retries a transient status write failure with bounded backoff", async () => {
     setCreds();
     const { runId, delivery } = await seedRun();
@@ -354,6 +407,52 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     expect(updated?.nextAttemptAt.getTime()).toBeGreaterThan(Date.now());
     const events = await readRunEvents(runId);
     expect(events.at(-1)?.message).toContain("will retry");
+  });
+
+  it("retries a GitHub rate-limited 403 status write instead of marking it permanent", async () => {
+    setCreds();
+    const { delivery } = await seedRun();
+    stubGithub({
+      latestStatuses: [],
+      reviews: [],
+      comments: [],
+      postStatus: 403,
+      postBody: { message: "API rate limit exceeded for installation" },
+      postHeaders: { "retry-after": "60" },
+    });
+
+    await pollGitHubCommitStatusDeliveriesOnce(db);
+
+    const updated = await readDelivery(delivery.id);
+    expect(updated).toMatchObject({
+      status: "queued",
+      attempts: 1,
+      lastError: "commit_status_write_rate_limited",
+      lastErrorKind: "transient",
+    });
+    expect(updated?.nextAttemptAt.getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it("retries a GitHub rate-limited 403 reviewer-evidence fetch instead of marking it permanent", async () => {
+    setCreds();
+    const { delivery } = await seedRun();
+    stubGithub({
+      latestStatuses: [],
+      reviewsStatus: 403,
+      reviewsBody: { message: "You have exceeded a secondary rate limit" },
+      reviewsHeaders: { "retry-after": "60" },
+    });
+
+    await pollGitHubCommitStatusDeliveriesOnce(db);
+
+    const updated = await readDelivery(delivery.id);
+    expect(updated).toMatchObject({
+      status: "queued",
+      attempts: 1,
+      lastError: "reviewer_evidence_reviews_rate_limited",
+      lastErrorKind: "transient",
+    });
+    expect(updated?.nextAttemptAt.getTime()).toBeGreaterThan(Date.now());
   });
 
   it("marks permission failures as permanent instead of retrying forever", async () => {
