@@ -167,6 +167,22 @@ describe("checkSharedDependencyConsistency", () => {
     expect(result.diagnostic).toContain("package.json");
   });
 
+  it("fails closed when a path component blocks the installed package directory", async () => {
+    const installDir = await tempInstallDir();
+    await writeLockfileVersion(installDir, SDK_PACKAGE, "2026.513.0");
+    const scopeDir = path.join(installDir, "node_modules", "@paperclipai");
+    await mkdir(scopeDir, { recursive: true });
+    await writeFile(path.join(scopeDir, "plugin-sdk"), "not a directory", "utf8");
+
+    const result = await checkSharedDependencyConsistency(installDir, SDK_PACKAGE);
+
+    expect(result.consistent).toBe(false);
+    expect(result.problem).toBe("metadata_invalid");
+    expect(result.installedState).toBe("invalid");
+    expect(result.diagnostic).toContain("Unable to read valid JSON");
+    expect(result.diagnostic).toContain("package.json");
+  });
+
   it("fails closed when the lockfile exists but is malformed", async () => {
     const installDir = await tempInstallDir();
     await writeFile(path.join(installDir, "package-lock.json"), "{", "utf8");
@@ -325,14 +341,19 @@ describeEmbeddedPostgres("torn plugin store — activation fails closed", () => 
     return plugin;
   }
 
-  it("waits for activation-time shared SDK reconciliation before marking a plugin errored", async () => {
+  it("waits past the first activation-time recheck when shared SDK reconciliation is still changing", async () => {
     const fixture = await createFixturePluginPackage();
     const installDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-plugin-store-"));
     cleanupPaths.add(installDir);
     await writeLockfileVersion(installDir, SDK_PACKAGE, "2026.513.0");
     await writeInstalledPackageVersion(installDir, SDK_PACKAGE, "1.0.0");
 
-    const settleStore = sleep(100).then(() => writeInstalledPackageVersion(installDir, SDK_PACKAGE, "2026.513.0"));
+    const settleStore = (async () => {
+      await sleep(100);
+      await writeInstalledPackageVersion(installDir, SDK_PACKAGE, "2026.400.0");
+      await sleep(700);
+      await writeInstalledPackageVersion(installDir, SDK_PACKAGE, "2026.513.0");
+    })();
     const { runtimeServices, startWorker, markError } = createRuntimeServices();
     const plugin = await insertReadyFixturePlugin(fixture);
 

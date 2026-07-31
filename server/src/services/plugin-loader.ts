@@ -103,7 +103,10 @@ const MONOREPO_NODE_MODULES = path.resolve(__dirname, "../../../node_modules/.pn
  * below npm install's own 120s timeout.
  */
 const SDK_INSTALL_RACE_RETRY_DELAYS_MS = [500, 1500, 3500, 7500, 15500];
-const SDK_STORE_CONSISTENCY_RECHECK_DELAYS_MS = [500, 1500, 3500];
+// Same boot-time store-reconciliation window as the SDK import retry above:
+// static torn-store snapshots fail on the first repeated problem key, while
+// changing snapshots get the full observed install-race budget to settle.
+const SDK_STORE_CONSISTENCY_RECHECK_DELAYS_MS = SDK_INSTALL_RACE_RETRY_DELAYS_MS;
 const SDK_INSTALL_RACE_PACKAGE_MARKER = "@paperclipai/plugin-sdk";
 const SDK_INSTALL_RACE_ERR_MARKER = "ERR_MODULE_NOT_FOUND";
 
@@ -173,7 +176,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isMissingFileError(err: unknown): boolean {
   const code = (err as { code?: unknown })?.code;
-  return code === "ENOENT" || code === "ENOTDIR";
+  return code === "ENOENT";
 }
 
 function formatReadError(err: unknown): string {
@@ -361,14 +364,17 @@ async function checkSharedDependencyConsistencyAfterRecheck(
   packageName: string = SDK_INSTALL_RACE_PACKAGE_MARKER,
 ): Promise<SharedDependencyConsistencyCheck> {
   let check = await checkSharedDependencyConsistency(installDir, packageName);
-  if (!sharedDependencyProblemKey(check)) return check;
+  let previousProblemKey = sharedDependencyProblemKey(check);
+  if (!previousProblemKey) return check;
 
   for (const delayMs of SDK_STORE_CONSISTENCY_RECHECK_DELAYS_MS) {
     await sleep(delayMs);
     const next = await checkSharedDependencyConsistency(installDir, packageName);
     const nextProblemKey = sharedDependencyProblemKey(next);
     if (!nextProblemKey) return next;
+    if (nextProblemKey === previousProblemKey) return next;
     check = next;
+    previousProblemKey = nextProblemKey;
   }
 
   return check;
