@@ -7197,9 +7197,19 @@ export function buildPaperclipTaskMarkdown(input: {
       if (prReview.reviewBody) {
         lines.push("", "Latest review body:", fenceTaskText(prReview.reviewBody));
       }
+      // BLO-19067: the closing instruction must agree with the review state.
+      // It used to unconditionally say "push a follow-up commit addressing
+      // them", so an APPROVED review told the author to make an implementation
+      // pass that has no findings to act on. A no-op push invalidates the
+      // approval it just earned and restarts CI, looping for hours.
+      const normalizedReviewState = prReview.reviewState?.trim().toLowerCase().replace(/-/g, "_") ?? null;
+      const commonClosing =
+        "Do NOT close the PR or self-approve. The PR's status is your responsibility this run; don't bounce to inbox-only mode.";
       lines.push(
         "",
-        "Read the latest review on the PR above (use `gh pr view` / `gh api` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. Do NOT close the PR or self-approve. The PR's status is your responsibility this run; don't bounce to inbox-only mode.",
+        normalizedReviewState === "approved"
+          ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). It APPROVED your PR, so no implementation pass is required: do NOT push a no-op or invented follow-up commit, because any new push invalidates this approval and restarts CI. Act on a note only if it identifies a real defect; otherwise proceed to merge once required checks pass. ${commonClosing}`
+          : `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. ${commonClosing}`,
       );
     } else {
       lines.push(
