@@ -3890,7 +3890,7 @@ export function issueRoutes(
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
-      blockedByIssueIds?: string[] | null;
+      blockedByIssueIds: string[] | null;
       executionRunId?: string | null;
     },
     fields: string[],
@@ -8230,8 +8230,19 @@ export function issueRoutes(
     // on a report's issue; null whenever the body is not exclusively
     // coordination metadata, which leaves the existing boundary untouched.
     const coordinationMetadataFields = coordinationMetadataPatchFields(req.body);
+    let existingRelations: Awaited<ReturnType<typeof svc.getRelationSummaries>> | null = null;
+    if (coordinationMetadataFields?.includes("blockedByIssueIds")) {
+      existingRelations = await svc.getRelationSummaries(existing.id);
+    }
     const coordinationMetadataDecision = coordinationMetadataFields
-      ? await decideCoordinationMetadataPatch(req, existing, coordinationMetadataFields)
+      ? await decideCoordinationMetadataPatch(
+        req,
+        {
+          ...existing,
+          blockedByIssueIds: existingRelations?.blockedBy.map((relation) => relation.id) ?? null,
+        },
+        coordinationMetadataFields,
+      )
       : null;
     if (!(await assertAgentIssueMutationAllowed(
       req,
@@ -8253,10 +8264,9 @@ export function issueRoutes(
       req.body.assigneeAgentId as string | null | undefined,
     );
     const titleOrDescriptionChanged = req.body.title !== undefined || req.body.description !== undefined;
-    const existingRelations =
-      Array.isArray(req.body.blockedByIssueIds)
-        ? await svc.getRelationSummaries(existing.id)
-        : null;
+    if (Array.isArray(req.body.blockedByIssueIds) && !existingRelations) {
+      existingRelations = await svc.getRelationSummaries(existing.id);
+    }
     const {
       comment: commentBody,
       reviewRequest,

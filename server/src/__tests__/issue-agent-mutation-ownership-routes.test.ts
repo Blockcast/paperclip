@@ -3041,14 +3041,18 @@ describe("agent issue mutation checkout ownership", () => {
     // disturb a live run. Adding a new blocker is execution-sensitive because
     // queued continuations cancel when unresolved blockers are present.
     it("still allows blocker removal while the issue has an execution lock", async () => {
+      const blockerId = "99999999-9999-4999-8999-999999999999";
       mockIssueService.getById.mockResolvedValue(
         makeIssue({
           status: "in_progress",
           assigneeAgentId: ownerAgentId,
           executionRunId: ownerRunId,
-          blockedByIssueIds: ["99999999-9999-4999-8999-999999999999"],
         }),
       );
+      mockIssueService.getRelationSummaries.mockResolvedValue({
+        blockedBy: [{ id: blockerId }],
+        blocks: [],
+      });
       mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
 
       const res = await request(await createApp(peerActor()))
@@ -3058,13 +3062,36 @@ describe("agent issue mutation checkout ownership", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(200);
     });
 
+    it("allows partial blocker removal while the issue has an execution lock", async () => {
+      const keptBlockerId = "88888888-8888-4888-8888-888888888888";
+      const removedBlockerId = "99999999-9999-4999-8999-999999999999";
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          status: "in_progress",
+          assigneeAgentId: ownerAgentId,
+          executionRunId: ownerRunId,
+        }),
+      );
+      mockIssueService.getRelationSummaries.mockResolvedValue({
+        blockedBy: [{ id: keptBlockerId }, { id: removedBlockerId }],
+        blocks: [],
+      });
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ blockedByIssueIds: [keptBlockerId] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+    });
+
     it("refuses blocker addition while another agent holds an execution lock", async () => {
       mockIssueService.getById.mockResolvedValue(
         makeIssue({
           status: "in_progress",
           assigneeAgentId: ownerAgentId,
           executionRunId: ownerRunId,
-          blockedByIssueIds: [],
         }),
       );
       mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
