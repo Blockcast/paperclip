@@ -80,7 +80,7 @@ import {
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
-import { runWithTransientDbRetry } from "../lib/db-retry.js";
+import { describeDbError, isDbError, runWithTransientDbRetry } from "../lib/db-retry.js";
 import { publishLiveEvent } from "./live-events.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
@@ -14286,6 +14286,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return trimmed.length > 500 ? `${trimmed.slice(0, 499)}…` : trimmed;
   }
 
+  /**
+   * Last-resort reason for an agent we are about to latch into `error` with
+   * nothing to say about why (BLO-19085).
+   *
+   * `status: error` + `errorReason: null` is the worst state this service can
+   * produce: the agent stops, and the record carries no diagnosis, so nothing
+   * surfaces the cause and no operator can act. OCMBackendEngineer sat that way
+   * for ~15h on 2026-07-30 because the external-runtime reconciler dropped a
+   * reason it was already holding. Callers passing a real reason is the fix;
+   * this is the floor under them, so a future caller that forgets still leaves
+   * a trail back to the run.
+   */
+  function fallbackAgentErrorReason(
+    outcome: "failed" | "timed_out" | string,
+    options?: { errorCode?: string | null; runId?: string | null },
+  ): string {
+    const parts = [`unknown ${outcome} failure: the finalizing path supplied no reason`];
+    if (options?.errorCode) parts.push(`errorCode ${options.errorCode}`);
+    parts.push(options?.runId ? `see run ${options.runId}` : "no run id was supplied either");
+    return parts.join("; ");
+  }
+
   async function finalizeAgentStatus(
     agentId: string,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
@@ -14294,6 +14316,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       keepIdleOnFailure?: boolean;
       errorCode?: string | null;
       retryNotBefore?: Date | null;
+      /** Run that drove this transition, so a fallback reason can point at it. */
+      runId?: string | null;
     },
   ) {
     const existing = await getAgent(agentId);
@@ -14340,7 +14364,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Persist a human-readable reason on the agent record when it enters
         // error so operators see it on the agent page without digging into run
         // events; clear it whenever the agent leaves error.
-        errorReason: nextStatus === "error" ? truncateAgentErrorReason(failureReason) : null,
+        //
+        // BLO-19085: never write `error` with a null reason. If the caller gave
+        // us nothing usable, synthesize one that names the outcome and points at
+        // the run, so the agent page always answers "why did this stop?".
+        errorReason:
+          nextStatus === "error"
+            ? (truncateAgentErrorReason(failureReason) ??
+              truncateAgentErrorReason(
+                fallbackAgentErrorReason(outcome, {
+                  errorCode: options?.errorCode,
+                  runId: options?.runId,
+                }),
+              ))
+            : null,
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
@@ -14871,7 +14908,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         reason: terminalOutcome.errorCode ?? terminalOutcome.status,
       });
     }
-    await finalizeAgentStatus(input.run.agentId, terminalOutcome.status);
+    // BLO-19085: pass the reason we already computed. Omitting it latched the
+    // agent into `error` with `errorReason: null` while the very same
+    // `terminalOutcome` (e.g. "External lifecycle Job is missing while heartbeat
+    // run is still running" / job_missing) sat on the run record one frame away.
+    await finalizeAgentStatus(input.run.agentId, terminalOutcome.status, terminalOutcome.error, {
+      errorCode: terminalOutcome.errorCode,
+      runId: input.run.id,
+    });
     const promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun);
     await handleRunLivenessContinuation(finalizedRun);
     if (finalizationAgent) {
@@ -16127,7 +16171,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         status: finalizedRun.status,
         failureReason: finalizedRun.error ?? undefined,
       });
-      await finalizeAgentStatus(run.agentId, "failed");
+      // BLO-19085: `baseMessage` is the process_lost diagnosis already written
+      // to the run record; pass it through so the agent record carries it too
+      // instead of latching into `error` with a null reason.
+      await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
+        errorCode: "process_lost",
+        runId: run.id,
+      });
 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
       let promotedRunDispatched = false;
@@ -19873,7 +19923,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     } catch (err) {
       const message = redactCurrentUserText(
-        err instanceof Error ? err.message : "Unknown adapter failure",
+        // BLO-19085: a drizzle write failure's `message` is the "Failed query"
+        // wrapper with every bind param inlined — the agent's whole stdout
+        // stream — while the SQLSTATE that actually explains it hangs off
+        // `.cause`. Persisting `err.message` stored 605KB of params and no
+        // diagnosis. describeDbError keeps the cause and drops the params;
+        // non-database errors fall through to their own message unchanged.
+        isDbError(err)
+          ? describeDbError(err, "run finalization db write failed")
+          : err instanceof Error
+            ? err.message
+            : "Unknown adapter failure",
         await getCurrentUserRedactionOptions(),
       );
       const workspaceValidationFailure = isWorkspaceValidationFailure(err) ? err : null;
@@ -20015,7 +20075,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
           // The inner catch did not fire, so we must record the failure here.
           const message = redactCurrentUserText(
-            outerErr instanceof Error ? outerErr.message : "Unknown setup failure",
+            // BLO-19085: same db-write-failure shaping as the inner catch.
+            isDbError(outerErr)
+              ? describeDbError(outerErr, "run setup db write failed")
+              : outerErr instanceof Error
+                ? outerErr.message
+                : "Unknown setup failure",
             await getCurrentUserRedactionOptions(),
           );
           // A missing secret/env binding is a known pre-dispatch configuration gap,
