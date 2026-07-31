@@ -29,6 +29,12 @@ import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
 export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
 export const DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS = 6;
+// How long a linked `pending` approval may suppress the `long_active_duration` trigger.
+// Must stay comfortably above the long-active threshold or the gate would expire before it
+// ever engages. Past this age the gate has itself become the stuck thing: an approval nobody
+// has decided in a day is exactly the condition the detector exists to surface, so the
+// suppression lapses and reviews resume.
+export const DEFAULT_PRODUCTIVITY_REVIEW_APPROVAL_GATE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY = 10;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS = 30;
 export const DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS = 6 * 60 * 60 * 1000;
@@ -64,6 +70,7 @@ type ProductivityReviewTrigger = "no_comment_streak" | "long_active_duration" | 
 type ProductivityReviewThresholds = {
   noCommentStreakRuns: number;
   longActiveMs: number;
+  approvalGateMaxAgeMs: number;
   highChurnHourly: number;
   highChurnSixHours: number;
   resolvedSnoozeMs: number;
@@ -252,11 +259,14 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
       overrides?.longActiveMs ?? DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS * 60 * 60 * 1000,
       DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS * 60 * 60 * 1000,
     ),
+    approvalGateMaxAgeMs: readPositiveInteger(
+      overrides?.approvalGateMaxAgeMs ?? DEFAULT_PRODUCTIVITY_REVIEW_APPROVAL_GATE_MAX_AGE_MS,
+      DEFAULT_PRODUCTIVITY_REVIEW_APPROVAL_GATE_MAX_AGE_MS,
+    ),
     highChurnHourly: readPositiveInteger(
       overrides?.highChurnHourly ?? DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
       DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
-    ),
-    highChurnSixHours: readPositiveInteger(
+    ),    highChurnSixHours: readPositiveInteger(
       overrides?.highChurnSixHours ?? DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS,
       DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS,
     ),
@@ -625,7 +635,16 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .limit(5);
   }
 
-  async function findOpenApprovalGate(companyId: string, issueId: string) {
+  // A gate only suppresses while it is still plausibly live. `deliberateFutureMonitor` gets this
+  // for free (a monitor whose `nextCheckAt` has passed stops suppressing); approvals carry no
+  // expiry column, so the bound is applied here against `createdAt`.
+  async function findOpenApprovalGate(
+    companyId: string,
+    issueId: string,
+    now: Date,
+    maxAgeMs: number,
+  ) {
+    const freshestAllowedCreatedAt = new Date(now.getTime() - maxAgeMs);
     const rows = await db
       .select({
         approvalId: approvals.id,
@@ -639,41 +658,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           eq(issueApprovals.companyId, companyId),
           eq(issueApprovals.issueId, issueId),
           inArray(approvals.status, [...APPROVAL_GATE_SUPPRESSION_STATUSES]),
+          gte(approvals.createdAt, freshestAllowedCreatedAt),
         ),
       )
       .orderBy(asc(approvals.createdAt), asc(approvals.id))
       .limit(1);
     return rows[0] ?? null;
-  }
-
-  async function loadOpenApprovalGatesByIssueId(issueIds: string[]) {
-    const gates = new Map<string, { approvalId: string; approvalStatus: string; approvalType: string }>();
-    if (issueIds.length === 0) return gates;
-    const rows = await db
-      .select({
-        issueId: issueApprovals.issueId,
-        approvalId: approvals.id,
-        approvalStatus: approvals.status,
-        approvalType: approvals.type,
-      })
-      .from(issueApprovals)
-      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
-      .where(
-        and(
-          inArray(issueApprovals.issueId, issueIds),
-          inArray(approvals.status, [...APPROVAL_GATE_SUPPRESSION_STATUSES]),
-        ),
-      )
-      .orderBy(asc(approvals.createdAt), asc(approvals.id));
-    for (const row of rows) {
-      if (gates.has(row.issueId)) continue;
-      gates.set(row.issueId, {
-        approvalId: row.approvalId,
-        approvalStatus: row.approvalStatus,
-        approvalType: row.approvalType,
-      });
-    }
-    return gates;
   }
 
   async function recordApprovalGatedSuppression(suppression: ApprovalGatedSuppression) {
@@ -771,8 +761,6 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     }
 
     let closed = 0;
-    let closedApprovalGated = 0;
-    const approvalGateBySourceId = await loadOpenApprovalGatesByIssueId(sourceIssueIds);
     for (const review of reviewRows) {
       if (!review.originId) continue;
       const trigger = reviewTriggerById.get(review.id);
@@ -780,9 +768,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       const sourceIssue = sourceIssueById.get(review.originId) ?? null;
       if (!sourceIssue) continue;
       if (sourceIssue.companyId !== review.companyId) continue;
-      const approvalGate = approvalGateBySourceId.get(sourceIssue.id) ?? null;
-      const monitor = approvalGate ? null : deliberateFutureMonitor(sourceIssue, now);
-      if (!approvalGate && !monitor) continue;
+      // Deliberately monitor-only. An approval gate suppresses *new* reviews but never closes one
+      // that already fired: the approval that would justify the close is creatable by the very
+      // agent under review (`POST /companies/:companyId/approvals` resolves `requestedByAgentId`
+      // from an agent actor and hard-codes `status: "pending"`), so honouring it here would let a
+      // flagged agent retire its own oversight artifact. A monitor is set by the assignee or the
+      // board through a server-owned column and self-expires, which is why it keeps this path.
+      const monitor = deliberateFutureMonitor(sourceIssue, now);
+      if (!monitor) continue;
 
       await db
         .update(issues)
@@ -796,29 +789,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         entityType: "issue",
         entityId: review.id,
         agentId: review.assigneeAgentId,
-        details: approvalGate
-          ? {
-              source: "productivity_review.reconcile",
-              sourceIssueId: sourceIssue.id,
-              trigger: "long_active_duration",
-              suppressedBy: "approval_pending",
-              approvalId: approvalGate.approvalId,
-              approvalStatus: approvalGate.approvalStatus,
-              approvalType: approvalGate.approvalType,
-            }
-          : {
-              source: "productivity_review.reconcile",
-              sourceIssueId: sourceIssue.id,
-              trigger: "long_active_duration",
-              suppressedBy: "monitor_scheduled",
-              monitorNextCheckAt: monitor!.monitorNextCheckAt.toISOString(),
-              monitorScheduledBy: monitor!.monitorScheduledBy,
-            },
+        details: {
+          source: "productivity_review.reconcile",
+          sourceIssueId: sourceIssue.id,
+          trigger: "long_active_duration",
+          suppressedBy: "monitor_scheduled",
+          monitorNextCheckAt: monitor.monitorNextCheckAt.toISOString(),
+          monitorScheduledBy: monitor.monitorScheduledBy,
+        },
       });
-      if (approvalGate) closedApprovalGated += 1;
-      else closed += 1;
+      closed += 1;
     }
-    return { closedMonitorScheduled: closed, closedApprovalGated };
+    return closed;
   }
 
   async function countIssueRunsSince(companyId: string, agentId: string, issueId: string, since: Date) {
@@ -974,8 +956,19 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // Only `long_active_duration` is suppressible by a human gate. `no_comment_streak` and
     // `high_churn` stay live: an agent burning runs against a gate it cannot clear is exactly
     // the waste worth reviewing, and a gate does not excuse silent runs.
+    //
+    // The suppression is deliberately bounded and forward-only: it lapses once the approval ages
+    // past `approvalGateMaxAgeMs`, and it never closes a review that already fired (see
+    // `closeOpenSuppressedMonitorReviews`). Both limits exist because the reviewed agent can
+    // create the approval itself, so the gate delays oversight at most one window and cannot
+    // erase it.
     if (trigger === "long_active_duration") {
-      const approvalGate = await findOpenApprovalGate(sourceIssue.companyId, sourceIssue.id);
+      const approvalGate = await findOpenApprovalGate(
+        sourceIssue.companyId,
+        sourceIssue.id,
+        now,
+        thresholds.approvalGateMaxAgeMs,
+      );
       if (approvalGate) {
         return {
           trigger,
@@ -1514,7 +1507,6 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       monitorScheduledSuppressed: 0,
       approvalGatedSuppressed: 0,
       closedSuppressedMonitorReviews: 0,
-      closedApprovalGatedReviews: 0,
       creationCapped: 0,
       noActionSuppressed: 0,
       skipped: 0,
@@ -1524,9 +1516,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       failedIssueIds: [] as string[],
     };
 
-    const closedSuppressed = await closeOpenSuppressedMonitorReviews(now, opts?.companyId);
-    result.closedSuppressedMonitorReviews = closedSuppressed.closedMonitorScheduled;
-    result.closedApprovalGatedReviews = closedSuppressed.closedApprovalGated;
+    result.closedSuppressedMonitorReviews = await closeOpenSuppressedMonitorReviews(now, opts?.companyId);
 
     const prefixCache = new Map<string, string>();
     for (const candidate of candidates) {

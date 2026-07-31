@@ -57,7 +57,12 @@ describeEmbeddedPostgres("productivity review service", () => {
     await tempDb?.cleanup();
   }, 60_000);
 
-  async function linkApproval(companyId: string, issueId: string, status: string) {
+  async function linkApproval(
+    companyId: string,
+    issueId: string,
+    status: string,
+    opts?: { createdAt?: Date },
+  ) {
     const approvalId = randomUUID();
     await db.insert(approvals).values({
       id: approvalId,
@@ -65,6 +70,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       type: "request_board_approval",
       status,
       payload: { reason: "human gate" },
+      ...(opts?.createdAt ? { createdAt: opts.createdAt } : {}),
     });
     await db.insert(issueApprovals).values({ companyId, issueId, approvalId });
     return approvalId;
@@ -566,7 +572,9 @@ describeEmbeddedPostgres("productivity review service", () => {
       status: "in_progress",
       startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
     });
-    const approvalId = await linkApproval(seeded.companyId, seeded.issueId, "pending");
+    const approvalId = await linkApproval(seeded.companyId, seeded.issueId, "pending", {
+      createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+    });
 
     const result = await productivityReviewService(db).reconcileProductivityReviews({
       now,
@@ -615,7 +623,50 @@ describeEmbeddedPostgres("productivity review service", () => {
       status: "in_progress",
       startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
     });
-    await linkApproval(seeded.companyId, seeded.issueId, "revision_requested");
+    await linkApproval(seeded.companyId, seeded.issueId, "revision_requested", {
+      createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.approvalGatedSuppressed).toBe(0);
+  });
+
+  it("does not suppress long-active reviews for a rejected approval", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await linkApproval(seeded.companyId, seeded.issueId, "rejected", {
+      createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.approvalGatedSuppressed).toBe(0);
+  });
+
+  // An approval nobody has decided for longer than the gate window is itself the stuck thing.
+  // Without this bound a forgotten `pending` row would disable the long-active detector on that
+  // issue permanently — inverting the case the detector exists for.
+  it("stops suppressing once the pending approval ages past the gate window", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await linkApproval(seeded.companyId, seeded.issueId, "pending", {
+      createdAt: new Date(now.getTime() - 25 * 60 * 60 * 1000),
+    });
 
     const result = await productivityReviewService(db).reconcileProductivityReviews({
       now,
@@ -649,13 +700,19 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
   });
 
-  it("closes open long-active productivity reviews when the source has a pending approval", async () => {
+  // The suppression is forward-only. A pending approval stops the *next* long-active review from
+  // being minted, but must never retire one that already fired: the reviewed agent can create the
+  // approval itself, so honouring it on the close path would let a flagged agent erase its own
+  // oversight artifact. Only a scheduled monitor closes an open review.
+  it("does not close an open long-active review when the source has a pending approval", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
       status: "in_progress",
       startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
     });
-    const approvalId = await linkApproval(seeded.companyId, seeded.issueId, "pending");
+    await linkApproval(seeded.companyId, seeded.issueId, "pending", {
+      createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+    });
     const reviewId = randomUUID();
     await db.insert(issues).values({
       id: reviewId,
@@ -690,21 +747,15 @@ describeEmbeddedPostgres("productivity review service", () => {
       companyId: seeded.companyId,
     });
 
-    expect(result.closedApprovalGatedReviews).toBe(1);
     expect(result.closedSuppressedMonitorReviews).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
-    expect(review?.status).toBe("done");
+    expect(review?.status).toBe("todo");
 
     const closures = await db
       .select()
       .from(activityLog)
       .where(eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed"));
-    expect(closures).toHaveLength(1);
-    expect(closures[0]?.details).toMatchObject({
-      suppressedBy: "approval_pending",
-      approvalId,
-      sourceIssueId: seeded.issueId,
-    });
+    expect(closures).toHaveLength(0);
   });
 
   it("creates a long-active review without enabling a continuation hold", async () => {
