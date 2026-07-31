@@ -83,6 +83,9 @@ jobs:
       - name: Test gh token wrapper
         run: node --test ./scripts/gh-token-wrapper.test.mjs
 
+      - name: Test PR test-coverage gate
+        run: node --test ./.github/scripts/tests/check-pr-test-coverage.test.mjs
+
       - name: Test general-server shard partition
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
 
