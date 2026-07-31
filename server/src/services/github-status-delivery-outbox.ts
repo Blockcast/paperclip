@@ -82,6 +82,15 @@ function deliveryClaimWhere(row: DeliveryRow) {
   );
 }
 
+async function refreshDeliveryClaimBeforeExternalWrite(db: Db, row: DeliveryRow): Promise<DeliveryRow | null> {
+  const [updated] = await db
+    .update(githubCommitStatusDeliveries)
+    .set({ updatedAt: new Date() })
+    .where(deliveryClaimWhere(row))
+    .returning();
+  return updated ?? null;
+}
+
 function statusCreatedAtOrAfterQueueSecond(statusCreatedAt: number, queuedAt: Date): boolean {
   if (!Number.isFinite(statusCreatedAt)) return false;
   const queuedAtSecond = Math.floor(queuedAt.getTime() / 1000) * 1000;
@@ -292,30 +301,39 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
     return;
   }
 
+  const fencedRow = await refreshDeliveryClaimBeforeExternalWrite(db, row);
+  if (!fencedRow) {
+    logger.info(
+      { deliveryId: row.id },
+      "github-status-delivery-outbox: stale delivery claim ignored before external status write",
+    );
+    return;
+  }
+
   const posted = await githubPostCommitStatusDetailed({
-    repoFullName: row.repoFullName,
-    sha: row.sha,
-    context: row.context,
-    state: normalizeCommitStatusState(row.state),
-    description: row.description,
-    targetUrl: row.targetUrl,
+    repoFullName: fencedRow.repoFullName,
+    sha: fencedRow.sha,
+    context: fencedRow.context,
+    state: normalizeCommitStatusState(fencedRow.state),
+    description: fencedRow.description,
+    targetUrl: fencedRow.targetUrl,
   });
   if (posted.ok) {
     await markTerminal(
       db,
-      row,
+      fencedRow,
       "delivered",
       "info",
-      `Set PR-review gate status ${row.context} to ${row.state} on ${row.repoFullName}@${row.sha.slice(0, 7)} after retry exhaustion`,
+      `Set PR-review gate status ${fencedRow.context} to ${fencedRow.state} on ${fencedRow.repoFullName}@${fencedRow.sha.slice(0, 7)} after retry exhaustion`,
       { posted },
     );
     return;
   }
   if (posted.retryable) {
-    await retryOrFailDelivery(db, row, posted.reason, { posted });
+    await retryOrFailDelivery(db, fencedRow, posted.reason, { posted });
     return;
   }
-  await failPermanentDelivery(db, row, posted.reason, { posted });
+  await failPermanentDelivery(db, fencedRow, posted.reason, { posted });
 }
 
 export async function enqueueGithubCommitStatusDelivery(
@@ -354,19 +372,19 @@ export async function enqueueGithubCommitStatusDelivery(
         githubCommitStatusDeliveries.context,
       ],
       set: {
-        companyId: input.companyId,
-        sourceRunId: input.sourceRunId,
-        prNumber: input.prNumber,
-        prUrl: input.prUrl ?? null,
-        description: input.description.slice(0, 140),
-        targetUrl: input.targetUrl ?? null,
-        status: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped') then ${githubCommitStatusDeliveries.status} else 'queued' end`,
-        attempts: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped') then ${githubCommitStatusDeliveries.attempts} else 0 end`,
-        nextAttemptAt: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped') then ${githubCommitStatusDeliveries.nextAttemptAt} else ${nowSql} end`,
-        lastError: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped') then ${githubCommitStatusDeliveries.lastError} else null end`,
-        lastErrorKind: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped') then ${githubCommitStatusDeliveries.lastErrorKind} else null end`,
-        lastResult: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped') then ${githubCommitStatusDeliveries.lastResult} else null end`,
-        updatedAt: now,
+        companyId: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.companyId} else ${input.companyId} end`,
+        sourceRunId: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.sourceRunId} else ${input.sourceRunId} end`,
+        prNumber: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.prNumber} else ${input.prNumber} end`,
+        prUrl: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.prUrl} else ${input.prUrl ?? null} end`,
+        description: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.description} else ${input.description.slice(0, 140)} end`,
+        targetUrl: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.targetUrl} else ${input.targetUrl ?? null} end`,
+        status: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.status} else 'queued' end`,
+        attempts: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.attempts} else 0 end`,
+        nextAttemptAt: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.nextAttemptAt} else ${nowSql} end`,
+        lastError: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.lastError} else null end`,
+        lastErrorKind: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.lastErrorKind} else null end`,
+        lastResult: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.lastResult} else null end`,
+        updatedAt: sql`case when ${githubCommitStatusDeliveries.status} in ('delivered', 'skipped', 'processing') then ${githubCommitStatusDeliveries.updatedAt} else ${nowSql} end`,
       },
     })
     .returning();
@@ -397,12 +415,13 @@ export async function resetStaleGitHubCommitStatusDeliveries(db: Db, now = new D
 }
 
 async function claimDueGitHubCommitStatusDeliveries(db: Db, now: Date): Promise<DeliveryRow[]> {
+  const nowSql = sql`${now.toISOString()}::timestamptz`;
   const claimed = await db.transaction(async (tx) => {
     const lockedRows = Array.from(await tx.execute(sql<{ id: string }>`
       select ${githubCommitStatusDeliveries.id} as "id"
       from ${githubCommitStatusDeliveries}
       where ${githubCommitStatusDeliveries.status} = 'queued'
-        and ${githubCommitStatusDeliveries.nextAttemptAt} <= ${now}
+        and ${githubCommitStatusDeliveries.nextAttemptAt} <= ${nowSql}
       order by ${githubCommitStatusDeliveries.nextAttemptAt} asc, ${githubCommitStatusDeliveries.createdAt} asc
       limit ${CLAIM_BATCH}
       for update skip locked

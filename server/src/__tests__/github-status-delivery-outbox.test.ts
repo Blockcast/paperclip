@@ -29,6 +29,7 @@ import { _resetInstallationTokenCache } from "../services/github-app-auth.js";
 import {
   enqueueGithubCommitStatusDelivery,
   pollGitHubCommitStatusDeliveriesOnce,
+  resetStaleGitHubCommitStatusDeliveries,
 } from "../services/github-status-delivery-outbox.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -206,6 +207,74 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     expect(results.sort()).toEqual([0, 1]);
     expect(await readDelivery(delivery.id)).toMatchObject({ status: "delivered" });
     expect(fetchMock.mock.calls.filter(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`)).length).toBe(1);
+  });
+
+  it("preserves an active processing claim when enqueue races the worker", async () => {
+    const { companyId, runId, delivery } = await seedRun();
+    const claimTime = new Date("2026-07-25T12:34:56.000Z");
+    await db
+      .update(githubCommitStatusDeliveries)
+      .set({
+        status: "processing",
+        attempts: 2,
+        nextAttemptAt: claimTime,
+        updatedAt: claimTime,
+        description: "Claimed worker payload",
+      })
+      .where(eq(githubCommitStatusDeliveries.id, delivery.id));
+
+    await enqueueGithubCommitStatusDelivery(db, {
+      companyId,
+      sourceRunId: runId,
+      repoFullName: "Blockcast/hang",
+      sha: HEAD_SHA,
+      context: "review/ally-complete",
+      state: "failure",
+      description: "Replacement enqueue payload",
+      targetUrl: "https://github.com/Blockcast/hang/pull/7?replacement=1",
+      prNumber: 7,
+      prUrl: "https://github.com/Blockcast/hang/pull/7?replacement=1",
+    });
+
+    expect(await readDelivery(delivery.id)).toMatchObject({
+      status: "processing",
+      attempts: 2,
+      description: "Claimed worker payload",
+      targetUrl: "https://github.com/Blockcast/hang/pull/7",
+      prUrl: "https://github.com/Blockcast/hang/pull/7",
+      updatedAt: claimTime,
+    });
+  });
+
+  it("fences a stale worker before posting when reclamation revokes its claim", async () => {
+    setCreds();
+    const { delivery } = await seedRun();
+    let reclaimed = false;
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      if (/\/commits\/[^/]+\/statuses(?:\?|$)/.test(u)) return jsonResponse([]);
+      if (u.includes("/pulls/") && u.includes("/reviews")) return jsonResponse([]);
+      if (u.includes("/issues/") && u.includes("/comments")) {
+        const staleProcessingAt = new Date(Date.now() - 11 * 60 * 1_000);
+        await db
+          .update(githubCommitStatusDeliveries)
+          .set({ updatedAt: staleProcessingAt })
+          .where(eq(githubCommitStatusDeliveries.id, delivery.id));
+        await expect(resetStaleGitHubCommitStatusDeliveries(db, new Date())).resolves.toBe(1);
+        reclaimed = true;
+        return jsonResponse([]);
+      }
+      if (/\/statuses\/[0-9a-f]{7,40}(?:\?|$)/i.test(u)) return jsonResponse({ id: 1 }, true, 201);
+      throw new Error(`unexpected url ${u}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(pollGitHubCommitStatusDeliveriesOnce(db)).resolves.toBe(1);
+
+    expect(reclaimed).toBe(true);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(false);
+    expect(await readDelivery(delivery.id)).toMatchObject({ status: "queued" });
   });
 
   it("reclaims expired processing rows during normal polling", async () => {
