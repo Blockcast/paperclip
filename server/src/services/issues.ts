@@ -2495,7 +2495,8 @@ async function listIssueBlockerAttentionMap(
     companyIssueRows.map((row) => row.id),
   );
   const roots = companyIssueRows.filter((row) =>
-    row.status === "blocked" || (dependencyReadinessMap.get(row.id)?.unresolvedBlockerCount ?? 0) > 0,
+    !BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES.includes(row.status) &&
+    (row.status === "blocked" || (dependencyReadinessMap.get(row.id)?.unresolvedBlockerCount ?? 0) > 0),
   );
   const rootIds = new Set(roots.map((root) => root.id));
   const attentionMap = new Map<string, IssueBlockerAttention>();
@@ -2549,6 +2550,7 @@ async function listIssueBlockerAttentionMap(
             eq(issueRelations.type, "blocks"),
             inArray(issueRelations.relatedIssueId, chunk),
             eq(issues.companyId, companyId),
+            ne(issues.status, "done"),
           ),
         );
       const childRowsPromise: Promise<IssueBlockerAttentionQueryRow[]> = dbOrTx
@@ -2874,9 +2876,14 @@ async function listIssueBlockerAttentionMap(
     const unresolvedBlockerIssueIds = new Set(
       dependencyReadinessMap.get(root.id)?.unresolvedBlockerIssueIds ?? [],
     );
-    const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) =>
-      unresolvedBlockerIssueIds.has(edge.blockerIssueId),
-    );
+    const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => {
+      if (unresolvedBlockerIssueIds.has(edge.blockerIssueId)) return true;
+      const blockerNode = nodesById.get(edge.blockerIssueId);
+      return (
+        blockerNode?.parentId === root.id &&
+        !BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES.includes(blockerNode.status)
+      );
+    });
     if (topLevelEdges.length === 0) {
       attentionMap.set(root.id, createIssueBlockerAttention({
         state: "needs_attention",
