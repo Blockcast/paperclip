@@ -918,13 +918,23 @@ function buildDependabotAlertIssueBody(input: {
     ...(alert.summary ? ["", alert.summary] : []),
     "",
     "## Acceptance criteria",
-    `- The vulnerable ${alert.packageName ?? "dependency"} in \`${repoFullName}\` is bumped to ${alert.patchedVersion ?? "a patched version"} (or the alert is explicitly dismissed with a documented reason), landed via a merged PR.`,
-    "- The Dependabot alert's state on GitHub moves to `fixed` or `dismissed`.",
+    `- Remediation path: the vulnerable ${alert.packageName ?? "dependency"} in \`${repoFullName}\` is bumped to ${alert.patchedVersion ?? "a patched version"} and lands via a merged PR.`,
+    "- Dismissal path: the Dependabot alert is explicitly dismissed with a documented reason.",
+    "- For the remediation path, the Dependabot alert's state on GitHub moves to `fixed`. GitHub does this on its own once the remediation lands; observing it directly is optional — see **Verifying signal**.",
+    "- For the dismissal path, the Dependabot alert's state on GitHub is `dismissed`, together with the documented dismissal reason.",
     "",
     "## Verifying signal",
-    `- ${alertUrl} shows \`state: fixed\` or \`state: dismissed\`, or the remediation PR merges into the default branch.`,
+    "Any ONE of the following is sufficient and complete evidence. You do not need all of them, and none of them is mandatory on its own:",
+    `1. The remediation PR merges into the default branch of \`${repoFullName}\`, AND the default-branch manifest${alert.manifestPath ? ` \`${alert.manifestPath}\`` : ""} resolves ${alert.packageName ?? "the dependency"} at ${alert.patchedVersion ?? "a patched version"} or newer.`,
+    `2. ${alertUrl} shows \`state: fixed\`.`,
+    `3. ${alertUrl} shows \`state: dismissed\`, together with the documented dismissal reason.`,
     "",
-    "All fields above come directly from the GitHub webhook payload for this delivery — do NOT call the GitHub Dependabot Alerts REST API to re-derive them. Some repositories return `403 Dependabot alerts are disabled for this repository` on that endpoint even though the webhook still fires; treat that 403 as expected and work from this issue instead of chasing the API.",
+    "Branch 1 is fully agent-executable through the repository contents API and is the expected path. Do NOT require a screenshot of the alert page, and do NOT treat an authenticated-UI observation as the only admissible evidence: branches 2 and 3 are alternatives to branch 1, never prerequisites for it.",
+    "",
+    "## Note on the Dependabot Alerts REST API (operational, not evidentiary)",
+    "Every field under **Alert** above comes from this delivery's GitHub webhook payload. Do NOT call the GitHub Dependabot Alerts REST API to re-derive them: some repositories return `403 Dependabot alerts are disabled for this repository` on that endpoint even though the webhook still fires. Treat that 403 as expected and work from this issue instead of chasing the API.",
+    "",
+    "This note is scoped to re-deriving the metadata fields above. It is NOT an evidentiary standard: it does not restrict which **Verifying signal** branch you may use, and it does not forbid the repository contents API or GraphQL.",
   ].join("\n");
 }
 
@@ -2579,6 +2589,7 @@ export const __test_buildPrReviewerWakeIdempotencyKey = buildPrReviewerWakeIdemp
 export const __test_prReviewerWakeIdempotencyScope = prReviewerWakeIdempotencyScope;
 export const __test_idempotentWakeStatuses = idempotentWakeStatuses;
 export const __test_buildPrReviewerTaskKey = buildPrReviewerTaskKey;
+export const __test_buildDependabotAlertIssueBody = buildDependabotAlertIssueBody;
 export const __test_resolveDependabotAlertContext = resolveDependabotAlertContext;
 export const __test_hasActionablePrReviewFeedback = hasActionablePrReviewFeedback;
 export const __test_buildPrReviewFeedbackComment = buildPrReviewFeedbackComment;
