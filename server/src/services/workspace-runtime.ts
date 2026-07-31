@@ -33,6 +33,11 @@ import {
   writeLocalServiceRegistryRecord,
 } from "./local-service-supervisor.js";
 import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
+import {
+  authorizeOwnedGitWorktreeCleanup,
+  lockGitWorktreeForOwner,
+  pruneOwnStaleGitWorktree,
+} from "./git-worktree-ownership.js";
 import { executionWorkspaceService, readExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
@@ -3076,6 +3081,46 @@ async function listLinkedGitWorktreePaths(repoRoot: string): Promise<Set<string>
   return paths;
 }
 
+/**
+ * Shared plumbing for the worktree-ownership guards (BLO-19607). The ownership
+ * module takes git and path-normalization as parameters so it stays unit
+ * testable; this binds it to the runtime's own implementations.
+ */
+function gitWorktreeOwnershipContext(repoRoot: string) {
+  return {
+    git: (args: string[], cwd: string) => runGit(args, cwd),
+    repoRoot,
+    normalizePath: resolvePathForWorktreeComparison,
+  };
+}
+
+/**
+ * Claims a linked worktree for this workspace so that a *different* concurrent
+ * run's cleanup cannot reclaim its registration. Git skips locked worktrees
+ * during `git worktree prune`, which is what makes the claim effective even
+ * against code paths that never learned about ownership.
+ */
+async function stampGitWorktreeOwnership(input: {
+  repoRoot: string;
+  worktreePath: string;
+  branchName: string | null | undefined;
+  executionWorkspaceId?: string | null;
+  runId?: string | null;
+}): Promise<string[]> {
+  const branchName = asString(input.branchName, "").trim();
+  if (!branchName) return [];
+  const result = await lockGitWorktreeForOwner({
+    ...gitWorktreeOwnershipContext(input.repoRoot),
+    worktreePath: input.worktreePath,
+    token: {
+      branchName,
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
+      runId: input.runId ?? null,
+    },
+  });
+  return result.warnings;
+}
+
 export async function inspectManagedGitWorktreeBranch(input: {
   worktreePath: string;
   expectedBranchName: string | null | undefined;
@@ -3653,6 +3698,14 @@ export async function realizeExecutionWorkspace(input: {
         }),
       });
     }
+    // Re-stamp on reuse so a worktree created before ownership tracking (or one
+    // whose lock was dropped) is adopted rather than left collectable.
+    const reuseOwnershipWarnings = await stampGitWorktreeOwnership({
+      repoRoot,
+      worktreePath: reusablePath,
+      branchName: effectiveBranchName,
+      runId: input.heartbeatRunId ?? null,
+    });
     const submoduleWarnings = await ensureGitSubmodulesReady({
       cwd: reusablePath,
       recorder: input.recorder ?? null,
@@ -3675,7 +3728,13 @@ export async function realizeExecutionWorkspace(input: {
       cwd: reusablePath,
       branchName: effectiveBranchName,
       worktreePath: reusablePath,
-      warnings: [...extraWarnings, ...baseRefreshWarnings, ...baseDrift.warnings, ...submoduleWarnings],
+      warnings: [
+        ...extraWarnings,
+        ...baseRefreshWarnings,
+        ...baseDrift.warnings,
+        ...reuseOwnershipWarnings,
+        ...submoduleWarnings,
+      ],
       created: false,
       baseRefSha: refresh.baseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha,
       pendingForwardBranchReconcile,
@@ -3792,6 +3851,14 @@ export async function realizeExecutionWorkspace(input: {
       return await reuseExistingWorktree(reusablePath);
     }
   }
+  // Claim the registration before any long-running provisioning: until the lock
+  // exists, a concurrent run's prune can still collect this worktree.
+  const ownershipWarnings = await stampGitWorktreeOwnership({
+    repoRoot,
+    worktreePath,
+    branchName,
+    runId: input.heartbeatRunId ?? null,
+  });
   const submoduleWarnings = await ensureGitSubmodulesReady({
     cwd: worktreePath,
     recorder: input.recorder ?? null,
@@ -3815,7 +3882,7 @@ export async function realizeExecutionWorkspace(input: {
     cwd: worktreePath,
     branchName,
     worktreePath,
-    warnings: [...baseRefreshWarnings, ...submoduleWarnings],
+    warnings: [...baseRefreshWarnings, ...ownershipWarnings, ...submoduleWarnings],
     created: true,
     baseRefSha: currentBaseRefSha,
   };
@@ -4000,7 +4067,20 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   }
 
   await fs.mkdir(path.dirname(worktreePath), { recursive: true });
-  await runGit(["worktree", "prune"], repoRoot).catch(() => {});
+  // Deliberately NOT `git worktree prune`: that is repo-global and deletes the
+  // administrative files of every registration whose directory git cannot read
+  // right now, including live worktrees belonging to other concurrent runs
+  // (BLO-19607). Only this workspace's own stale entry is cleared, and only
+  // after its ownership lock is confirmed.
+  const stalePrune = await pruneOwnStaleGitWorktree({
+    ...gitWorktreeOwnershipContext(repoRoot),
+    worktreePath,
+    token: {
+      branchName,
+      executionWorkspaceId: input.workspace.id ?? null,
+      runId: input.heartbeatRunId ?? null,
+    },
+  });
   const restoreBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
   const restoreRefreshWarnings = restoreBaseRef ? await refreshRemoteTrackingBaseRef(repoRoot, restoreBaseRef) : [];
   const restoreCurrentBaseRefSha = restoreBaseRef ? await resolveBaseRefSha(repoRoot, restoreBaseRef) : null;
@@ -4052,6 +4132,16 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     created = true;
   }
 
+  // The reattached worktree is a fresh registration, so it needs its ownership
+  // claim restamped before another run's cleanup can observe it.
+  const restoreOwnershipWarnings = await stampGitWorktreeOwnership({
+    repoRoot,
+    worktreePath,
+    branchName,
+    executionWorkspaceId: input.workspace.id ?? null,
+    runId: input.heartbeatRunId ?? null,
+  });
+
   const baseDrift = await inspectExecutionWorkspaceBaseDrift({
     repoRoot,
     worktreePath,
@@ -4080,7 +4170,12 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     ...realized,
     cwd: worktreePath,
     worktreePath,
-    warnings: [...restoreRefreshWarnings, ...baseDrift.warnings],
+    warnings: [
+      ...stalePrune.warnings,
+      ...restoreRefreshWarnings,
+      ...restoreOwnershipWarnings,
+      ...baseDrift.warnings,
+    ],
     created,
     baseRefSha:
       recordedBaseRefSha
@@ -4164,22 +4259,37 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
       if (!repoRoot) {
         warnings.push(`Could not resolve git repo root for "${workspacePath}".`);
       } else {
-        try {
-          await recordGitOperation(input.recorder, {
-            phase: "worktree_cleanup",
-            args: ["worktree", "remove", "--force", workspacePath],
-            cwd: repoRoot,
-            metadata: {
-              workspaceId: input.workspace.id,
-              workspacePath,
-              branchName: input.workspace.branchName,
-              cleanupAction: "worktree_remove",
-            },
-            successMessage: `Removed git worktree ${workspacePath}\n`,
-            failureLabel: `git worktree remove ${workspacePath}`,
-          });
-        } catch (err) {
-          warnings.push(err instanceof Error ? err.message : String(err));
+        // Teardown must prove the registration is this workspace's own before
+        // removing it; an unowned or foreign-owned entry is reported instead of
+        // destroyed (BLO-19607).
+        const authorization = await authorizeOwnedGitWorktreeCleanup({
+          ...gitWorktreeOwnershipContext(repoRoot),
+          worktreePath: workspacePath,
+          token: {
+            branchName: asString(input.workspace.branchName, "").trim(),
+            executionWorkspaceId: input.workspace.id,
+            runId: null,
+          },
+        });
+        warnings.push(...authorization.warnings);
+        if (authorization.authorized) {
+          try {
+            await recordGitOperation(input.recorder, {
+              phase: "worktree_cleanup",
+              args: ["worktree", "remove", "--force", workspacePath],
+              cwd: repoRoot,
+              metadata: {
+                workspaceId: input.workspace.id,
+                workspacePath,
+                branchName: input.workspace.branchName,
+                cleanupAction: "worktree_remove",
+              },
+              successMessage: `Removed git worktree ${workspacePath}\n`,
+              failureLabel: `git worktree remove ${workspacePath}`,
+            });
+          } catch (err) {
+            warnings.push(err instanceof Error ? err.message : String(err));
+          }
         }
       }
     }
