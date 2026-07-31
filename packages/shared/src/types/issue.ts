@@ -886,6 +886,8 @@ export interface IssueComment {
   derivedAuthorAgentId?: string | null;
   derivedCreatedByRunId?: string | null;
   derivedAuthorSource?: IssueCommentDerivedAuthorSource | null;
+  idempotencyKey?: string | null;
+  idempotencyProcessedAt?: Date | null;
   body: string;
   presentation: IssueCommentPresentation | null;
   metadata: IssueCommentMetadata | null;

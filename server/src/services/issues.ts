@@ -4435,6 +4435,16 @@ export function issueService(db: Db) {
     }
   }
 
+  function issueCommentIdempotencyAuthorScope(actor: { agentId?: string | null; userId?: string | null }) {
+    if (actor.agentId) {
+      return and(eq(issueComments.authorAgentId, actor.agentId), isNull(issueComments.authorUserId));
+    }
+    if (actor.userId) {
+      return and(eq(issueComments.authorUserId, actor.userId), isNull(issueComments.authorAgentId));
+    }
+    return and(isNull(issueComments.authorAgentId), isNull(issueComments.authorUserId));
+  }
+
   function redactIssueComment<T extends {
     body: string;
     authorType?: string | null;
@@ -9439,6 +9449,42 @@ export function issueService(db: Db) {
       });
     },
 
+    getCommentByIdempotencyKey: async (
+      issueId: string,
+      idempotencyKey: string,
+      actor: { agentId?: string | null; userId?: string | null },
+      dbOrTx: any = db,
+    ) => {
+      const comment = await dbOrTx
+        .select()
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.idempotencyKey, idempotencyKey),
+          issueCommentIdempotencyAuthorScope(actor),
+          isNull(issueComments.deletedAt),
+        ))
+        .then((rows: Array<typeof issueComments.$inferSelect>) => rows[0] ?? null);
+      if (!comment) return null;
+
+      const currentUserRedactionOptions = {
+        enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+      };
+      return redactIssueComment(comment, currentUserRedactionOptions.enabled);
+    },
+
+    markCommentIdempotencyProcessed: async (commentId: string, dbOrTx: any = db) => {
+      await dbOrTx
+        .update(issueComments)
+        .set({ idempotencyProcessedAt: new Date() })
+        .where(and(
+          eq(issueComments.id, commentId),
+          isNotNull(issueComments.idempotencyKey),
+          isNull(issueComments.idempotencyProcessedAt),
+          isNull(issueComments.deletedAt),
+        ));
+    },
+
     addComment: async (
       issueId: string,
       body: string,
@@ -9447,6 +9493,7 @@ export function issueService(db: Db) {
         authorType?: IssueCommentAuthorType | null;
         presentation?: IssueCommentPresentation | null;
         metadata?: IssueCommentMetadata | null;
+        idempotencyKey?: string | null;
         sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
       },
@@ -9471,7 +9518,7 @@ export function issueService(db: Db) {
       const presentation = issueCommentPresentationSchema.nullable().parse(options?.presentation ?? null);
       const metadata = issueCommentMetadataSchema.nullable().parse(options?.metadata ?? null);
       const createdAt = options?.createdAt ? new Date(options.createdAt) : null;
-      const [comment] = await dbOrTx
+      const [insertedComment] = await dbOrTx
         .insert(issueComments)
         .values({
           companyId: issue.companyId,
@@ -9480,13 +9527,37 @@ export function issueService(db: Db) {
           authorUserId: actor.userId ?? null,
           authorType,
           createdByRunId: actor.runId ?? null,
+          idempotencyKey: options?.idempotencyKey ?? null,
           body: redactedBody,
           presentation,
           metadata,
           sourceTrust: options?.sourceTrust ?? null,
           ...(createdAt && !Number.isNaN(createdAt.getTime()) ? { createdAt } : {}),
         })
+        .onConflictDoNothing()
         .returning();
+
+      const comment = insertedComment ?? (options?.idempotencyKey
+        ? await dbOrTx
+            .select()
+            .from(issueComments)
+            .where(and(
+              eq(issueComments.issueId, issueId),
+              eq(issueComments.idempotencyKey, options.idempotencyKey),
+              issueCommentIdempotencyAuthorScope(actor),
+              isNull(issueComments.deletedAt),
+            ))
+            .then((rows: Array<typeof issueComments.$inferSelect>) => rows[0] ?? null)
+        : null);
+
+      if (!comment) throw conflict("Issue comment idempotency conflict");
+
+      if (!insertedComment) {
+        return {
+          ...redactIssueComment(comment, currentUserRedactionOptions.enabled),
+          deduplicated: true as const,
+        };
+      }
 
       // Update issue's updatedAt so comment activity is reflected in recency sorting
       await dbOrTx

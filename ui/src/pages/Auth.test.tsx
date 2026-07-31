@@ -275,4 +275,27 @@ describe("AuthPage", () => {
       root.unmount();
     });
   });
+
+  it("starts only one SSO request when Google is clicked repeatedly", async () => {
+    signInOAuth2Mock.mockImplementationOnce(() => new Promise(() => {}));
+    const { root } = await mount();
+
+    const googleButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Sign in with Google",
+    );
+    expect(googleButton).not.toBeNull();
+
+    await act(async () => {
+      googleButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      googleButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      googleButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(signInOAuth2Mock).toHaveBeenCalledTimes(1);
+    expect(signInOAuth2Mock).toHaveBeenCalledWith({ providerId: "dex", callbackURL: "/" });
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
 });
