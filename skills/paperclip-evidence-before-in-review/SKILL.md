@@ -3,12 +3,9 @@ name: paperclip-evidence-before-in-review
 required: true
 description: >
   Before moving a Paperclip issue to `in_review`, produce the label-keyed
-  evidence required by the server's artifact-evidence gate. Use on any
-  transition to `in_review` or completion claim; missing evidence records a
-  `block` verdict (warn-only in Phase 1, HTTP 422 in Phase 2). Also covers the
-  separate `done` gate (`no_execution_run_and_no_pr_evidence`) — read the
-  "Closing to `done`" section before closing an issue, especially work that
-  produces no commit.
+  evidence required by the artifact-evidence gate. Also read "Closing to `done`"
+  before closing an issue; non-code work needs a run-attributed document or
+  work product, not prose.
 ---
 
 # Evidence Before in_review
