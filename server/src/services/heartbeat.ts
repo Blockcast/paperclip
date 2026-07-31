@@ -7233,9 +7233,19 @@ export function buildPaperclipTaskMarkdown(input: {
       if (prReview.reviewBody) {
         lines.push("", "Latest review body:", fenceTaskText(prReview.reviewBody));
       }
+      // BLO-19067: the closing instruction must agree with the review state.
+      // It used to unconditionally say "push a follow-up commit addressing
+      // them", so an APPROVED review told the author to make an implementation
+      // pass that has no findings to act on. A no-op push invalidates the
+      // approval it just earned and restarts CI, looping for hours.
+      const normalizedReviewState = prReview.reviewState?.trim().toLowerCase().replace(/-/g, "_") ?? null;
+      const commonClosing =
+        "Do NOT close the PR or self-approve. The PR's status is your responsibility this run; don't bounce to inbox-only mode.";
       lines.push(
         "",
-        "Read the latest review on the PR above (use `gh pr view` / `gh api` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. Do NOT close the PR or self-approve. The PR's status is your responsibility this run; don't bounce to inbox-only mode.",
+        normalizedReviewState === "approved"
+          ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). It APPROVED your PR, so no implementation pass is required: do NOT push a no-op or invented follow-up commit, because any new push invalidates this approval and restarts CI. Act on a note only if it identifies a real defect; otherwise proceed to merge once required checks pass. ${commonClosing}`
+          : `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. ${commonClosing}`,
       );
     } else {
       lines.push(
@@ -15250,14 +15260,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(externalRuntimeReservations)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, externalRuntimeReservations.runId))
       .where(
-        or(
-          eq(externalRuntimeReservations.state, "release_pending"),
-          and(
-            inArray(externalRuntimeReservations.state, ["reserved", "launching"]),
-            isNull(externalRuntimeReservations.expectedJobName),
-            isNull(externalRuntimeReservations.jobName),
-            isNull(externalRuntimeReservations.jobUid),
-            inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+        and(
+          isNull(externalRuntimeReservations.releasedAt),
+          or(
+            eq(externalRuntimeReservations.state, "release_pending"),
+            and(
+              inArray(externalRuntimeReservations.state, ["reserved", "launching"]),
+              isNull(externalRuntimeReservations.expectedJobName),
+              isNull(externalRuntimeReservations.jobName),
+              isNull(externalRuntimeReservations.jobUid),
+              inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+            ),
+            // BLO-18995: an *identified* reservation (a Job name was recorded)
+            // whose run reached a terminal status without the normal
+            // finalize-time release running — the canonical case is
+            // `drainRunningRunsForShutdown` marking a running run
+            // `interrupted` on SIGTERM, which never releases the reservation.
+            // The two branches above cannot see it: it is not
+            // `release_pending`, and it is `launched` with a non-null
+            // `jobName`. The row then keeps `released_at IS NULL` forever and
+            // the partial unique index
+            // `external_runtime_reservations_active_slot_idx (agent_id,
+            // slot_id) WHERE released_at IS NULL` blocks that slot
+            // permanently, so every worker restart with a run in flight
+            // ratchets the agent's effective concurrency down by one. Observed
+            // in production: four agents each stuck a slot for 1-5 days (Ally
+            // 4/5 slots, Release Engineer 1/2).
+            //
+            // Selecting the row here is safe because it does not release it:
+            // the loop below still verifies the recorded Job is genuinely gone
+            // or finished (exact `readAgentJobRunStatusByName` lookup plus
+            // jobUid identity match) and skips any reservation whose Job is
+            // still `active`. A Job that outlives the worker therefore keeps
+            // its slot until it actually terminates.
+            and(
+              inArray(externalRuntimeReservations.state, ["reserved", "launching", "launched"]),
+              or(
+                isNotNull(externalRuntimeReservations.jobName),
+                isNotNull(externalRuntimeReservations.jobUid),
+              ),
+              inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+            ),
           ),
         ),
       );
@@ -16935,7 +16978,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           waitedMs: number,
           isRecoveryWake: boolean,
         ): number => {
-          if (!hasId) return 10;
+          if (!hasId) {
+            // BLO-18995: issue-less runs (every GitHub PR-review wake) used to
+            // return a flat 10 here, *above* the aging escalation below, so the
+            // BLO-16253 anti-starvation floor was unreachable for the entire
+            // class. Every dependency-ready issue-bound run ranks
+            // `priorityRank * 2 + statusBonus` ∈ [0,9], so even a `low`-priority
+            // `todo` (7) permanently outranked an arbitrarily old PR review.
+            // Escalate aged issue-less runs to 2: they outrank routine medium/
+            // low work while preserving ranks 0-1 for explicit critical issue
+            // work. The PR-review fairness promotion above remains the bounded
+            // path for an aged review to jump even critical work.
+            return waitedMs >= STARVATION_FULL_ESCALATION_MS ? 2 : 10;
+          }
+          // NB: the aging escalation below stays *underneath* this `!ready`
+          // check on purpose. A dependency-blocked run must never escalate to
+          // the front of the queue no matter how long it has waited, because it
+          // cannot run yet.
           if (!ready) return 12 + issueRunPriorityRank(issue?.priority);
           const escalationFloorMs = isRecoveryWake
             ? STARVATION_RECOVERY_ESCALATION_MS

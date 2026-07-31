@@ -12,6 +12,8 @@ const mockIssueService = vi.hoisted(() => ({
   update: vi.fn(),
   checkout: vi.fn(),
   addComment: vi.fn(),
+  getCommentByIdempotencyKey: vi.fn(),
+  markCommentIdempotencyProcessed: vi.fn(),
 }));
 
 const mockExecutionWorkspaceService = vi.hoisted(() => ({
@@ -207,6 +209,8 @@ describe.sequential("closed isolated workspace issue routes", () => {
     registerServiceMocks();
     vi.clearAllMocks();
     mockIssueService.getById.mockResolvedValue(makeIssue());
+    mockIssueService.getCommentByIdempotencyKey.mockResolvedValue(null);
+    mockIssueService.markCommentIdempotencyProcessed.mockResolvedValue(undefined);
     mockExecutionWorkspaceService.getById.mockResolvedValue(makeClosedWorkspace());
   });
 
@@ -217,6 +221,33 @@ describe.sequential("closed isolated workspace issue routes", () => {
 
     expect(res.status).toBe(409);
     expect(res.body.error).toContain("closed workspace");
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  it("replays a processed idempotent comment before checking the now-closed workspace", async () => {
+    mockIssueService.getCommentByIdempotencyKey.mockResolvedValue({
+      id: "comment-replayed",
+      issueId,
+      companyId: "company-1",
+      authorType: "user",
+      authorAgentId: null,
+      authorUserId: "local-board",
+      body: "hello",
+      presentation: null,
+      metadata: null,
+      idempotencyKey: "comment:closed-workspace",
+      idempotencyProcessedAt: new Date("2026-07-30T12:00:00.000Z"),
+      createdAt: new Date("2026-07-30T12:00:00.000Z"),
+      updatedAt: new Date("2026-07-30T12:00:00.000Z"),
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "hello", idempotencyKey: "comment:closed-workspace" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ id: "comment-replayed", deduplicated: true });
+    expect(mockExecutionWorkspaceService.getById).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 

@@ -9,9 +9,9 @@ import { queryKeys } from "../lib/queryKeys";
 import { AuthPage } from "./Auth";
 
 const getSessionMock = vi.hoisted(() => vi.fn());
+const getHealthMock = vi.hoisted(() => vi.fn());
 const signInEmailMock = vi.hoisted(() => vi.fn());
 const signUpEmailMock = vi.hoisted(() => vi.fn());
-const signInSocialMock = vi.hoisted(() => vi.fn());
 const signInOAuth2Mock = vi.hoisted(() => vi.fn());
 
 vi.mock("../api/auth", () => ({
@@ -19,8 +19,13 @@ vi.mock("../api/auth", () => ({
     getSession: () => getSessionMock(),
     signInEmail: (input: unknown) => signInEmailMock(input),
     signUpEmail: (input: unknown) => signUpEmailMock(input),
-    signInSocial: (input: unknown) => signInSocialMock(input),
     signInOAuth2: (input: unknown) => signInOAuth2Mock(input),
+  },
+}));
+
+vi.mock("../api/health", () => ({
+  healthApi: {
+    get: () => getHealthMock(),
   },
 }));
 
@@ -89,9 +94,15 @@ describe("AuthPage", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     getSessionMock.mockResolvedValue(null);
+    getHealthMock.mockResolvedValue({
+      status: "ok",
+      auth: {
+        emailPasswordEnabled: true,
+        oidcProviders: ["dex"],
+      },
+    });
     signInEmailMock.mockResolvedValue(undefined);
     signUpEmailMock.mockResolvedValue(undefined);
-    signInSocialMock.mockResolvedValue({ url: "https://login.microsoft.example.test" });
     signInOAuth2Mock.mockResolvedValue({ url: "https://dex.example.test" });
   });
 
@@ -220,11 +231,15 @@ describe("AuthPage", () => {
     });
   });
 
-  it("invalidates anonymous health metadata after sign-in", async () => {
+  it("refreshes anonymous health metadata after sign-in", async () => {
     const { root, queryClient } = await mount();
     queryClient.setQueryData(queryKeys.health, {
       status: "ok",
       deploymentMode: "authenticated",
+      auth: {
+        emailPasswordEnabled: true,
+        oidcProviders: ["dex"],
+      },
     });
 
     const inputValueSetter = Object.getOwnPropertyDescriptor(
@@ -252,14 +267,14 @@ describe("AuthPage", () => {
       email: "jane@example.com",
       password: "supersecret",
     });
-    expect(queryClient.getQueryState(queryKeys.health)?.isInvalidated).toBe(true);
+    expect(getHealthMock).toHaveBeenCalledTimes(2);
 
     await act(async () => {
       root.unmount();
     });
   });
 
-  it("offers Google/Dex sign-in before the Microsoft fallback", async () => {
+  it("offers Google/Dex sign-in without a Microsoft provider", async () => {
     const { root } = await mount();
 
     const buttons = Array.from(container.querySelectorAll("button")).map((button) =>
@@ -267,9 +282,53 @@ describe("AuthPage", () => {
     );
 
     expect(buttons).toContain("Sign In");
-    expect(buttons.indexOf("Sign in with Google")).toBeLessThan(
-      buttons.indexOf("Sign in with Microsoft"),
+    expect(buttons).toContain("Sign in with Google");
+    expect(buttons).not.toContain("Sign in with Microsoft");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("renders only Google Workspace sign-in when password auth is disabled", async () => {
+    getHealthMock.mockResolvedValue({
+      status: "ok",
+      auth: {
+        emailPasswordEnabled: false,
+        oidcProviders: ["dex"],
+      },
+    });
+    const { root } = await mount();
+
+    expect(container.textContent).toContain("Use your Blockcast Google Workspace account.");
+    expect(container.textContent).toContain("Sign in with Google");
+    expect(container.textContent).not.toContain("Sign in with Microsoft");
+    expect(container.querySelector("form")).toBeNull();
+    expect(container.querySelector('input[name="email"]')).toBeNull();
+    expect(container.textContent).not.toContain("Create one");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("starts only one SSO request when Google is clicked repeatedly", async () => {
+    signInOAuth2Mock.mockImplementationOnce(() => new Promise(() => {}));
+    const { root } = await mount();
+
+    const googleButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Sign in with Google",
     );
+    expect(googleButton).not.toBeNull();
+
+    await act(async () => {
+      googleButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      googleButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      googleButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(signInOAuth2Mock).toHaveBeenCalledTimes(1);
+    expect(signInOAuth2Mock).toHaveBeenCalledWith({ providerId: "dex", callbackURL: "/" });
 
     await act(async () => {
       root.unmount();

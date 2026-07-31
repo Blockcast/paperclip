@@ -467,6 +467,168 @@ describe("agent secret redaction on mutating responses", () => {
     expect(res.status).toBe(200);
     expect(JSON.stringify(res.body)).not.toContain("\"value\"");
   });
+
+  // Redaction used to be decided by the key's *name*. Everything below uses
+  // keys that no secret-name regex matches, so each of these leaked plaintext
+  // before the redactor became structural.
+  const ORDINARY_KEY_SECRET = "s3cret-material-not-in-any-key-name";
+
+  it("redacts a nested runtimeConfig model-profile env binding under an ordinary key", async () => {
+    const nestedAgent = {
+      ...baseAgent,
+      runtimeConfig: {
+        modelProfiles: {
+          cheap: {
+            adapterConfig: {
+              model: "openai/gpt-5.6-sol",
+              env: {
+                // Neither key matches SECRET_PAYLOAD_KEY_RE.
+                SIGNING_MATERIAL: { type: "plain", value: ORDINARY_KEY_SECRET },
+                FOO: { type: "plain", value: ORDINARY_KEY_SECRET },
+              },
+            },
+          },
+        },
+      },
+    };
+    mockAgentService.getById.mockResolvedValue(nestedAgent);
+    mockAgentService.update.mockResolvedValue({ ...nestedAgent, budgetMonthlyCents: 42 });
+
+    const app = createApp(boardActor);
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 42 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.budgetMonthlyCents).toBe(42);
+    const profile = res.body.runtimeConfig.modelProfiles.cheap.adapterConfig;
+    // Non-credential config stays readable; only the bindings are masked.
+    expect(profile.model).toBe("openai/gpt-5.6-sol");
+    expect(profile.env).toEqual({
+      SIGNING_MATERIAL: { type: "plain", value: "***REDACTED***" },
+      FOO: { type: "plain", value: "***REDACTED***" },
+    });
+    expect(JSON.stringify(res.body)).not.toContain(ORDINARY_KEY_SECRET);
+  });
+
+  it("redacts a legacy bare-string env value under an ordinary key at any depth", async () => {
+    const nestedAgent = {
+      ...baseAgent,
+      runtimeConfig: {
+        modelProfiles: {
+          cheap: { adapterConfig: { env: { FOO: ORDINARY_KEY_SECRET } } },
+        },
+      },
+    };
+    mockAgentService.getById.mockResolvedValue(nestedAgent);
+    mockAgentService.update.mockResolvedValue(nestedAgent);
+
+    const app = createApp(boardActor);
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 1 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.runtimeConfig.modelProfiles.cheap.adapterConfig.env).toEqual({
+      FOO: "***REDACTED***",
+    });
+  });
+
+  it("redacts a plain binding under an ordinary key outside env", async () => {
+    const nestedAgent = {
+      ...baseAgent,
+      adapterConfig: {
+        cwd: "/workspace",
+        // Not under `env`, not a secret-shaped key name.
+        signingMaterial: { type: "plain", value: ORDINARY_KEY_SECRET },
+      },
+    };
+    mockAgentService.getById.mockResolvedValue(nestedAgent);
+    mockAgentService.update.mockResolvedValue(nestedAgent);
+
+    const app = createApp(boardActor);
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 1 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig.cwd).toBe("/workspace");
+    expect(res.body.adapterConfig.signingMaterial).toEqual({ type: "plain", value: "***REDACTED***" });
+    expect(JSON.stringify(res.body)).not.toContain(ORDINARY_KEY_SECRET);
+  });
+
+  it("strips a resolved value smuggled onto a secret_ref binding", async () => {
+    // envBindingSecretRefSchema has no `value` field, so its presence can only
+    // mean a resolved secret rode along — projectionClass must not matter.
+    const refAgent = {
+      ...baseAgent,
+      runtimeConfig: {
+        modelProfiles: {
+          cheap: {
+            adapterConfig: {
+              env: {
+                FOO: {
+                  type: "secret_ref",
+                  secretId: "44444444-4444-4444-8444-444444444444",
+                  projectionClass: "unclassified",
+                  value: ORDINARY_KEY_SECRET,
+                },
+              },
+            },
+          },
+        },
+      },
+    };
+    mockAgentService.getById.mockResolvedValue(refAgent);
+    mockAgentService.update.mockResolvedValue(refAgent);
+
+    const app = createApp(boardActor);
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 1 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.runtimeConfig.modelProfiles.cheap.adapterConfig.env.FOO).toEqual({
+      type: "secret_ref",
+      secretId: "44444444-4444-4444-8444-444444444444",
+      projectionClass: "unclassified",
+    });
+    expect(JSON.stringify(res.body)).not.toContain(ORDINARY_KEY_SECRET);
+  });
+
+  it("restores recursive runtimeConfig sentinels before persisting PATCH updates", async () => {
+    const runtimeSecretAgent = {
+      ...baseAgent,
+      runtimeConfig: {
+        credentials: { type: "plain", value: ORDINARY_KEY_SECRET },
+        mode: "production",
+      },
+    };
+    mockAgentService.getById.mockResolvedValue(runtimeSecretAgent);
+    mockAgentService.update.mockImplementation(async (_id, patch) => ({
+      ...runtimeSecretAgent,
+      ...(patch as Record<string, unknown>),
+    }));
+
+    const app = createApp(boardActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({
+        runtimeConfig: {
+          credentials: { type: "plain", value: "***REDACTED***" },
+          mode: "maintenance",
+        },
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalledWith(
+      agentId,
+      expect.objectContaining({
+        runtimeConfig: {
+          credentials: { type: "plain", value: ORDINARY_KEY_SECRET },
+          mode: "maintenance",
+        },
+      }),
+      expect.anything(),
+    );
+    expect(res.body.runtimeConfig.credentials).toEqual({
+      type: "plain",
+      value: "***REDACTED***",
+    });
+    expect(JSON.stringify(res.body)).not.toContain(ORDINARY_KEY_SECRET);
+  });
 });
 
 describe("stripRedactedEnvBindingsFromAdapterConfig — round-trip guard", () => {
@@ -606,6 +768,17 @@ describe("stripRedactedEnvBindingsFromAdapterConfig — round-trip guard", () =>
     };
 
     expect(stripRedactedEnvBindingsFromAdapterConfig(incoming, existing)).toEqual(existing);
+  });
+
+  it("drops nested plain binding sentinels that have no existing value", () => {
+    const incoming = {
+      credentials: { type: "plain", value: "***REDACTED***" },
+      model: "openai/gpt-5.6-sol",
+    };
+
+    expect(stripRedactedEnvBindingsFromAdapterConfig(incoming, null)).toEqual({
+      model: "openai/gpt-5.6-sol",
+    });
   });
 
   it("drops recursive redaction sentinels that have no existing value", () => {

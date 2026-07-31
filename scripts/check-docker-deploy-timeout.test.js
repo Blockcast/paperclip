@@ -8,11 +8,13 @@ const imageHelper = readFileSync(
   "utf8",
 );
 
-function getDeployJobBlock() {
+function getDeployJobBlock(source = workflow) {
   const marker = "\n  deploy:\n";
-  const start = workflow.indexOf(marker);
+  const start = source.indexOf(marker);
   assert.notEqual(start, -1, "docker.yml must define a deploy job");
-  return workflow.slice(start + marker.length);
+  const remainder = source.slice(start + marker.length);
+  const nextJob = remainder.search(/^  [A-Za-z0-9_-]+:\s*$/m);
+  return nextJob === -1 ? remainder : remainder.slice(0, nextJob);
 }
 
 function getBuildJobBlock() {
@@ -53,6 +55,19 @@ test("manual Docker deploys carry one full immutable SHA between jobs", () => {
   assert.match(deployJob, /\[ "\$\{full\}" != "\$\{expected\}" \]/);
 });
 
+test("master pushes cannot cancel protected manual deploy builds", () => {
+  const buildJob = getBuildJobBlock();
+
+  assert.match(
+    buildJob,
+    /group: docker-\$\{\{ github\.ref \}\}-\$\{\{ github\.event_name == 'workflow_dispatch' && 'deploy' \|\| 'publish' \}\}/,
+  );
+  assert.match(
+    buildJob,
+    /cancel-in-progress: \$\{\{ github\.event_name != 'workflow_dispatch' \}\}/,
+  );
+});
+
 test("Docker deploy job provisions Buildx before inspecting the artifact", () => {
   const deployJob = getDeployJobBlock();
   const setup = deployJob.indexOf("uses: docker/setup-buildx-action@v4");
@@ -63,18 +78,22 @@ test("Docker deploy job provisions Buildx before inspecting the artifact", () =>
   assert.ok(setup < inspect, "deploy job must provision Buildx before artifact inspection");
 });
 
-test("scheduled deploy gate recognizes a recent digest-pinned tip", () => {
-  const deployJob = getDeployJobBlock();
-  const gateStart = deployJob.indexOf("- name: Deploy gate (6h debounce on push)");
-  const gateEnd = deployJob.indexOf("\n      - name:", gateStart + 1);
-  assert.notEqual(gateStart, -1, "deploy job must define the debounce gate");
-  assert.notEqual(gateEnd, -1, "debounce gate must be followed by another step");
-  const gate = deployJob.slice(gateStart, gateEnd);
+test("deploy job assertions cannot match a later job", () => {
+  const deployJob = getDeployJobBlock(`${workflow}\n  later-job:\n    name: later-job-only\n`);
 
-  assert.match(gate, /docker buildx imagetools inspect "\$\{image\}"/);
-  assert.match(gate, /EXPECTED_IMG="harbor\.blockcast\.net\/paperclip\/paperclip@\$\{digest\}"/);
-  assert.match(gate, /\[ "\$RUNNING_IMG" = "\$EXPECTED_IMG" \]/);
-  assert.doesNotMatch(gate, /grep -qF "sha-\$\{TIP_SHORT\}"/);
+  assert.doesNotMatch(deployJob, /later-job-only/);
+});
+
+test("production deploy is manual-only and environment-protected", () => {
+  const deployJob = getDeployJobBlock();
+  const conditionMatch = deployJob.match(/^    if:\s*\$\{\{\s*(.*?)\s*\}\}\s*$/m);
+  assert.ok(conditionMatch, "deploy job must declare an if condition");
+  assert.equal(
+    conditionMatch[1].replace(/\s+/g, " "),
+    "github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success'",
+  );
+  assert.match(deployJob, /environment:\n\s+name: paperclip-production/);
+  assert.doesNotMatch(workflow, /^  schedule:/m);
 });
 
 test("Docker deploy binds Helm to the digest built for the approved SHA", () => {
@@ -84,8 +103,8 @@ test("Docker deploy binds Helm to the digest built for the approved SHA", () => 
   assert.match(buildJob, /image_digest: \$\{\{ steps\.build\.outputs\.digest \}\}/);
   assert.match(deployJob, /BUILD_RESULT: \$\{\{ needs\.build-and-push\.result \}\}/);
   assert.match(deployJob, /EXPECTED_DIGEST: \$\{\{ needs\.build-and-push\.outputs\.image_digest \}\}/);
-  assert.match(deployJob, /success\)[\s\S]*EXPECTED_DIGEST[\s\S]*\^sha256:/);
-  assert.match(deployJob, /skipped\)[\s\S]*github\.event_name[\s\S]*schedule/);
+  assert.match(deployJob, /BUILD_RESULT[^]*!= "success"/);
+  assert.match(deployJob, /EXPECTED_DIGEST[^]*\^sha256:/);
   assert.match(deployJob, /\[ "\$\{digest\}" != "\$\{EXPECTED_DIGEST\}" \]/);
   assert.match(deployJob, /DIGEST: \$\{\{ steps\.artifact\.outputs\.digest \}\}/);
   const render = deployJob.indexOf('rendered=$(helm template');

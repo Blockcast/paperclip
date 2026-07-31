@@ -25,6 +25,7 @@ import {
   __test_buildIssueBackLinkBody,
   __test_buildPrReviewerTaskKey,
   __test_buildPrReviewerWakeIdempotencyKey,
+  __test_buildPrReviewFeedbackComment,
   __test_commentsContainBackLinkMarker,
   __test_extractPaperclipIdentifiers,
   __test_hasActionablePrReviewFeedback,
@@ -34,6 +35,8 @@ import {
   __test_hasPrReviewerAgentRequestMarker,
   __test_hasAllyConsolidatedReviewHeading,
   __test_hasAllyConsolidatedReviewHeader,
+  __test_idempotentWakeStatuses,
+  __test_prReviewerWakeIdempotencyScope,
   __test_resolveDependabotAlertContext,
   __test_resolveEventContext,
   __test_shouldFirePrReviewerWake,
@@ -207,6 +210,54 @@ describe("github-webhook pure helpers", () => {
     expect(__test_buildPrReviewerWakeIdempotencyKey(ctx2, "delivery-push-3")).toBe(
       "pr_review:Blockcast/paperclip:318:github_pr_synchronized:delivery:delivery-push-3",
     );
+  });
+
+  it("scopes terminal-status idempotency to request-scoped keys only (BLO-18953)", () => {
+    const requestScoped = (action: string, reason: string) => {
+      const ctx = __test_resolveEventContext("pull_request", {
+        action,
+        pull_request: {
+          number: 991,
+          title: "Fix BLO-3182 webflow blog",
+          body: null,
+          draft: false,
+          html_url: "https://github.com/Blockcast/magma/pull/991",
+          head: { ref: "fix/BLO-3182-webflow-blog", sha: "readysha" },
+        },
+        repository: { full_name: "Blockcast/magma" },
+      });
+      expect(ctx?.wakeReason).toBe(reason);
+      return ctx as NonNullable<typeof ctx>;
+    };
+
+    // Delivery-scoped: the key can only recur as a redelivery, so a terminal
+    // completed/cancelled row must dedup it.
+    for (const [action, reason] of [
+      ["ready_for_review", "github_pr_ready_for_review"],
+      ["synchronize", "github_pr_synchronized"],
+    ] as const) {
+      const ctx = requestScoped(action, reason);
+      expect(__test_prReviewerWakeIdempotencyScope(ctx, "delivery-1")).toBe("request");
+    }
+
+    // Stable PR+reason keys keep the original exclusion: a NEW event reuses the
+    // key, so terminal statuses must not block it.
+    const opened = requestScoped("opened", "github_pr_opened");
+    expect(__test_prReviewerWakeIdempotencyScope(opened, "delivery-1")).toBe("stable");
+
+    // A suffix with no per-event identity at all cannot distinguish two
+    // distinct events, so it must NOT get the terminal-dedup rule.
+    const noIdentity = requestScoped("ready_for_review", "github_pr_ready_for_review");
+    expect(__test_prReviewerWakeIdempotencyScope(noIdentity, null)).toBe("stable");
+
+    expect(__test_idempotentWakeStatuses("stable")).not.toContain("completed");
+    expect(__test_idempotentWakeStatuses("stable")).not.toContain("cancelled");
+    expect(__test_idempotentWakeStatuses("request")).toEqual(
+      expect.arrayContaining(["completed", "cancelled", "queued", "running", "coalesced"]),
+    );
+    // A wake that never produced a review still deserves a fresh attempt.
+    expect(__test_idempotentWakeStatuses("request")).not.toContain("failed");
+    expect(__test_idempotentWakeStatuses("request")).not.toContain("dispatch_failed_exhausted");
   });
 
   it("does not build reviewer debounce keys for malformed PR contexts without a PR number", () => {
@@ -1864,6 +1915,90 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(new Set(wakes.map((wake) => wake.agentId))).toEqual(
       new Set([runs[0]?.agentId]),
     );
+  });
+
+  it("ignores a GitHub redelivery of a ready_for_review event whose wake already completed (BLO-18953)", async () => {
+    const { companyId } = await seedIssueWithIdentifier("BLO-3182");
+    const reviewerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+    const readyPayload = {
+      action: "ready_for_review",
+      pull_request: {
+        number: 991,
+        title: "Fix BLO-3182 webflow blog",
+        body: null,
+        draft: false,
+        html_url: "https://github.com/Blockcast/magma/pull/991",
+        head: { ref: "fix/BLO-3182-webflow-blog", sha: "readysha" },
+      },
+      repository: { full_name: "Blockcast/magma" },
+    };
+    const deliver = async () => {
+      const signed = signedRequest(readyPayload);
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signed.signature)
+        // GitHub reuses the delivery id when it retries or an operator replays.
+        .set("x-github-delivery", "delivery-ready-replay")
+        .set("content-type", "application/json")
+        .send(signed.body);
+    };
+
+    const firstRes = await deliver();
+    expect(firstRes.status).toBe(200);
+
+    const idempotencyKey =
+      "pr_review:Blockcast/magma:991:github_pr_ready_for_review:delivery:delivery-ready-replay";
+
+    const reviewerWakes = async () =>
+      db
+        .select({ status: agentWakeupRequests.status, idempotencyKey: agentWakeupRequests.idempotencyKey })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, reviewerAgentId));
+
+    expect(await reviewerWakes()).toEqual([{ status: "queued", idempotencyKey }]);
+
+    // The run consumed the wake and finished. Before BLO-18953's second pass,
+    // `completed` was excluded from the precheck for EVERY reason, so replaying
+    // this delivery enqueued the already-consumed request all over again.
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "completed", finishedAt: new Date() })
+      .where(eq(agentWakeupRequests.idempotencyKey, idempotencyKey));
+
+    const replayRes = await deliver();
+    expect(replayRes.status).toBe(200);
+    expect(await reviewerWakes()).toEqual([{ status: "completed", idempotencyKey }]);
+
+    // Same rule for a request retired by pull_request.converted_to_draft: a late
+    // replay must not resurrect reviewer work on a PR that is a draft again.
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "cancelled" })
+      .where(eq(agentWakeupRequests.idempotencyKey, idempotencyKey));
+
+    const replayAfterCancel = await deliver();
+    expect(replayAfterCancel.status).toBe(200);
+    expect(await reviewerWakes()).toEqual([{ status: "cancelled", idempotencyKey }]);
+
+    const reviewerRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, reviewerAgentId));
+    expect(reviewerRuns).toHaveLength(1);
   });
 
   it("dedupes rapid pull_request.synchronize pushes and suppresses only synchronize author wakes", async () => {
@@ -3710,6 +3845,38 @@ describe("hasActionablePrReviewFeedback — reviewer taxonomy", () => {
     expect(__test_hasActionablePrReviewFeedback(body)).toBe(false);
   });
 
+  it("is not actionable when emphasized severity headings only carry zero counts", () => {
+    const body = [
+      "## Ally — Consolidated PR Review",
+      "",
+      "### **Critical Issues** (0)",
+      "None.",
+      "",
+      "### **Important Issues** (0)",
+      "None.",
+      "",
+      "### Recommended Action",
+      "Merge when required CI passes.",
+    ].join("\n");
+    expect(__test_hasActionablePrReviewFeedback(body, "approved")).toBe(false);
+  });
+
+  it("still treats emphasized non-zero severity buckets as actionable", () => {
+    const body = [
+      "## Ally — Consolidated PR Review",
+      "",
+      "### **Critical Issues** (0)",
+      "None.",
+      "",
+      "### **Important Issues** (1)",
+      "- The retry remains stranded.",
+      "",
+      "### Recommended Action",
+      "Fix before merge.",
+    ].join("\n");
+    expect(__test_hasActionablePrReviewFeedback(body, "commented")).toBe(true);
+  });
+
   it("still short-circuits on a formal changes_requested review state", () => {
     expect(__test_hasActionablePrReviewFeedback("looks fine overall", "changes_requested")).toBe(true);
   });
@@ -3729,6 +3896,102 @@ describe("hasActionablePrReviewFeedback — reviewer taxonomy", () => {
   it("still suppresses a negation cue close to the match within the same sentence", () => {
     const body = "Clean pass, no changes requested at this time.";
     expect(__test_hasActionablePrReviewFeedback(body)).toBe(false);
+  });
+
+  // BLO-19067: Ally's APPROVED review on Network-Operator-Portal#591 read
+  // "Looks good. No Critical or Important issues found." The uncounted-heading
+  // branch matched the trailing "Important issues" mid-sentence, classified a
+  // clean approval as actionable, and bounced the PR back to its author.
+  it("does not treat a prose denial of findings as an uncounted findings heading", () => {
+    const body = [
+      "## Ally — Consolidated PR Review",
+      "",
+      "Looks good. No Critical or Important issues found.",
+      "",
+      "### Recommended Action",
+      "1. Merge after required CI completes.",
+    ].join("\n");
+    expect(__test_hasActionablePrReviewFeedback(body, "approved")).toBe(false);
+  });
+
+  it("still matches an uncounted findings heading behind list or emphasis decoration", () => {
+    expect(__test_hasActionablePrReviewFeedback("- Important Issues\n- Auth check bypassed.")).toBe(true);
+    expect(__test_hasActionablePrReviewFeedback("**Critical Issues**\nprobePort mismatch.")).toBe(true);
+  });
+});
+
+describe("PR review feedback comment heading (BLO-19067)", () => {
+  // The heading and the directive beneath it are the highest-salience text in
+  // the wake this comment produces. Hardcoding them to the changes-requested
+  // case told the author of an APPROVED PR to make another implementation
+  // pass; the resulting no-op push invalidates the approval and restarts a
+  // 2.2h CI suite.
+  const reviewPayload = (state: string, body: string) => ({
+    action: "submitted",
+    pull_request: {
+      number: 591,
+      title: "fix(nop): dynamic-service card spacing",
+      head: { ref: "fix/BLO-18833", sha: "1db166824d532cda20e321ebb26c6e4702e0dd32" },
+    },
+    review: {
+      body,
+      state,
+      html_url: "https://github.com/Blockcast/Network-Operator-Portal/pull/591#pullrequestreview-1",
+      user: { login: "allyblockcast" },
+    },
+    repository: { full_name: "Blockcast/Network-Operator-Portal" },
+  });
+
+  const commentFor = (state: string, body = "### Critical Issues (1)\n- probePort mismatch.") => {
+    const ctx = __test_resolveEventContext("pull_request_review", reviewPayload(state, body));
+    expect(ctx).not.toBeNull();
+    return __test_buildPrReviewFeedbackComment(ctx!);
+  };
+
+  it("titles an APPROVED review as approved, with no implementation-pass directive", () => {
+    const comment = commentFor("approved");
+    expect(comment).toContain("## Review Approved");
+    expect(comment).not.toContain("Changes Requested");
+    expect(comment).not.toContain("requires another implementation pass");
+    expect(comment).toContain("- State: approved");
+  });
+
+  it("titles a CHANGES_REQUESTED review as changes requested", () => {
+    const comment = commentFor("changes_requested");
+    expect(comment).toContain("## Changes Requested");
+    expect(comment).toContain("requires another implementation pass");
+    expect(comment).not.toContain("Review Approved");
+  });
+
+  it("distinguishes a COMMENTED review from both other states", () => {
+    const comment = commentFor("commented");
+    expect(comment).toContain("## Review Comments");
+    expect(comment).not.toContain("Changes Requested");
+    expect(comment).not.toContain("Review Approved");
+    expect(comment).not.toContain("requires another implementation pass");
+  });
+
+  it("keeps the changes-requested wording when no review state is present", () => {
+    // Body-heuristic path: an `issue_comment` review carries no formal state
+    // and only reaches this builder when the body already carries findings.
+    const ctx = __test_resolveEventContext("issue_comment", {
+      action: "created",
+      issue: {
+        number: 591,
+        pull_request: { url: "https://api.github.com/repos/Blockcast/Network-Operator-Portal/pulls/591" },
+        user: { login: "codex-bot" },
+      },
+      comment: {
+        id: 1,
+        body: "### Important Issues (1)\n\nI1: wrong route.",
+        html_url: "https://github.com/Blockcast/Network-Operator-Portal/pull/591#issuecomment-1",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/Network-Operator-Portal" },
+    });
+    expect(ctx).not.toBeNull();
+    const comment = __test_buildPrReviewFeedbackComment(ctx!);
+    expect(comment).toContain("## Changes Requested");
   });
 });
 

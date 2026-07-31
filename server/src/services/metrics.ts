@@ -28,6 +28,7 @@ import {
 } from "./blocker-resolved-wake-metrics.js";
 
 export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_total";
+export const AUTH_REQUEST_METRIC = "paperclip_auth_request_total";
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
 /**
@@ -352,6 +353,89 @@ export function normalizeGithubSuppressionCause(cause: string | null | undefined
     : UNKNOWN_GITHUB_SUPPRESSION_CAUSE;
 }
 
+export const KNOWN_AUTH_OPERATIONS = [
+  "oidc_start",
+  "oidc_callback",
+  "password_sign_in",
+  "password_sign_up",
+  "other",
+] as const;
+export const KNOWN_AUTH_OUTCOMES = [
+  "success",
+  "rate_limited",
+  "client_error",
+  "server_error",
+] as const;
+export type AuthOperation = (typeof KNOWN_AUTH_OPERATIONS)[number];
+export type AuthOutcome = (typeof KNOWN_AUTH_OUTCOMES)[number];
+
+const knownAuthOperationSet: ReadonlySet<string> = new Set(KNOWN_AUTH_OPERATIONS);
+const knownAuthOutcomeSet: ReadonlySet<string> = new Set(KNOWN_AUTH_OUTCOMES);
+const oidcServerErrorRedirectCodes: ReadonlySet<string> = new Set([
+  "internal_server_error",
+  "oauth_code_verification_failed",
+  "user_info_is_missing",
+]);
+
+export function normalizeAuthOperation(operation: string | null | undefined): AuthOperation {
+  return typeof operation === "string" && knownAuthOperationSet.has(operation)
+    ? operation as AuthOperation
+    : "other";
+}
+
+export function normalizeAuthOutcome(outcome: string | null | undefined): AuthOutcome {
+  return typeof outcome === "string" && knownAuthOutcomeSet.has(outcome)
+    ? outcome as AuthOutcome
+    : "server_error";
+}
+
+export function classifyAuthOperation(requestUrl: string): AuthOperation {
+  const pathname = requestUrl.split("?", 1)[0]?.replace(/\/+$/, "") ?? "";
+  if (pathname.endsWith("/sign-in/oauth2")) return "oidc_start";
+  if (/\/(?:oauth2\/callback|callback)\/[^/]+$/.test(pathname)) return "oidc_callback";
+  if (pathname.endsWith("/sign-in/email")) return "password_sign_in";
+  if (pathname.endsWith("/sign-up/email")) return "password_sign_up";
+  return "other";
+}
+
+export function classifyAuthOutcome(statusCode: number): AuthOutcome {
+  if (statusCode === 429) return "rate_limited";
+  if (statusCode >= 500) return "server_error";
+  if (statusCode >= 400) return "client_error";
+  return "success";
+}
+
+export function classifyAuthResponse(input: {
+  operation: AuthOperation;
+  statusCode: number;
+  location?: string | number | string[] | undefined;
+}): AuthOutcome {
+  const statusOutcome = classifyAuthOutcome(input.statusCode);
+  if (
+    statusOutcome !== "success" ||
+    input.operation !== "oidc_callback" ||
+    input.statusCode < 300 ||
+    input.statusCode >= 400
+  ) {
+    return statusOutcome;
+  }
+
+  const locations = Array.isArray(input.location) ? input.location : [input.location];
+  for (const location of locations) {
+    if (typeof location !== "string" || !location) continue;
+    try {
+      const error = new URL(location, "http://paperclip.invalid").searchParams.get("error");
+      if (error !== null) {
+        return oidcServerErrorRedirectCodes.has(error) ? "server_error" : "client_error";
+      }
+    } catch {
+      // A malformed Location header is not an OAuth error redirect signal.
+    }
+  }
+
+  return "success";
+}
+
 /**
  * Bounded `reason` allow-list (mirrors the adapter-lane reasons defined in
  * BLO-4296). Anything outside this set collapses to {@link UNKNOWN_REASON} so a
@@ -540,6 +624,7 @@ let orphanedManagedPodReaped: Counter<"adapter"> | null = null;
 let githubReviewRequestDelivery: Counter<"state" | "reason"> | null = null;
 let githubReviewRequestSuppression: Counter<"cause" | "reason"> | null = null;
 let githubReviewRequestDeadLetterUnresolved: Gauge<"reason"> | null = null;
+let authRequest: Counter<"operation" | "outcome"> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -558,6 +643,7 @@ function ensureRegistry(): {
   githubReviewRequestDeliveryCounter: Counter<"state" | "reason">;
   githubReviewRequestSuppressionCounter: Counter<"cause" | "reason">;
   githubReviewRequestDeadLetterUnresolvedGauge: Gauge<"reason">;
+  authRequestCounter: Counter<"operation" | "outcome">;
 } {
   if (
     !registry
@@ -576,6 +662,7 @@ function ensureRegistry(): {
     || !githubReviewRequestDelivery
     || !githubReviewRequestSuppression
     || !githubReviewRequestDeadLetterUnresolved
+    || !authRequest
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -764,6 +851,19 @@ function ensureRegistry(): {
     for (const reason of [...KNOWN_GITHUB_WAKE_REASONS, UNKNOWN_GITHUB_WAKE_REASON]) {
       githubReviewRequestDeadLetterUnresolved.set({ reason }, 0);
     }
+    authRequest = new Counter({
+      name: AUTH_REQUEST_METRIC,
+      help:
+        "Count of Better Auth requests labeled by bounded operation and outcome. "
+        + "No user, provider, IP address, callback state, or token is exposed.",
+      labelNames: ["operation", "outcome"],
+      registers: [registry],
+    });
+    for (const operation of KNOWN_AUTH_OPERATIONS) {
+      for (const outcome of KNOWN_AUTH_OUTCOMES) {
+        authRequest.inc({ operation, outcome }, 0);
+      }
+    }
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -785,6 +885,7 @@ function ensureRegistry(): {
     githubReviewRequestDeliveryCounter: githubReviewRequestDelivery,
     githubReviewRequestSuppressionCounter: githubReviewRequestSuppression,
     githubReviewRequestDeadLetterUnresolvedGauge: githubReviewRequestDeadLetterUnresolved,
+    authRequestCounter: authRequest,
   };
 }
 
@@ -1091,7 +1192,20 @@ export function setGithubReviewRequestDeadLetterUnresolved(byReason: Record<stri
   }
 }
 
-export async function renderMetrics(): Promise<{ contentType: string; body: string }> {  const reg = getMetricsRegistry();
+export function recordAuthRequest(input: {
+  operation: string | null | undefined;
+  outcome: string | null | undefined;
+}): { operation: AuthOperation; outcome: AuthOutcome } {
+  const labels = {
+    operation: normalizeAuthOperation(input.operation),
+    outcome: normalizeAuthOutcome(input.outcome),
+  };
+  ensureRegistry().authRequestCounter.inc(labels);
+  return labels;
+}
+
+export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
+  const reg = getMetricsRegistry();
   const depBlockedSnapshot = snapshotDepBlockedMetrics();
   const depBlockedBody = [
     `# HELP ${DEP_BLOCKED_WAKEUP_METRIC} Count of dependency-blocked wakeup coalescer outcomes, labeled by outcome.`,
@@ -1131,6 +1245,8 @@ export function __resetMetricsForTest(): void {
   orphanedManagedPodReaped = null;
   githubReviewRequestDelivery = null;
   githubReviewRequestSuppression = null;
+  githubReviewRequestDeadLetterUnresolved = null;
+  authRequest = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
 }
