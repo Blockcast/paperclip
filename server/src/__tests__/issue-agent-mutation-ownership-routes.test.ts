@@ -1330,7 +1330,7 @@ describe("agent issue mutation checkout ownership", () => {
       .send({ blockedByIssueIds: [], title: "Rewritten by the CEO" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (grant)");
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
