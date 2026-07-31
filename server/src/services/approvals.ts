@@ -1,6 +1,6 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { approvalComments, approvals } from "@paperclipai/db";
+import { activityLog, agents, approvalComments, approvals } from "@paperclipai/db";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
@@ -302,9 +302,35 @@ export function approvalService(db: Db) {
         if (updated.type === "hire_agent") {
           const payload = updated.payload as Record<string, unknown>;
           const payloadAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
-          if (payloadAgentId) {
-            await agentService(txDb).terminate(payloadAgentId);
+          const boundPendingAgent = payloadAgentId
+            ? await txDb
+                .select({ id: agents.id })
+                .from(agents)
+                .innerJoin(
+                  activityLog,
+                  and(
+                    eq(activityLog.companyId, agents.companyId),
+                    eq(activityLog.action, "approval.created"),
+                    eq(activityLog.entityType, "approval"),
+                    eq(activityLog.entityId, updated.id),
+                    sql`${activityLog.details} ->> 'linkedAgentId' = ${agents.id}::text`,
+                  ),
+                )
+                .where(
+                  and(
+                    eq(agents.id, payloadAgentId),
+                    eq(agents.companyId, updated.companyId),
+                    eq(agents.status, "pending_approval"),
+                  ),
+                )
+                .then((rows) => rows[0] ?? null)
+            : null;
+          if (!boundPendingAgent) {
+            throw conflict("Hire approval is not bound to a pending agent", {
+              approvalId: updated.id,
+            });
           }
+          await agentService(txDb).terminate(boundPendingAgent.id);
         }
 
         await logActivity(txDb, {

@@ -1,5 +1,12 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
+import { agents, approvals, companies, createDb } from "@paperclipai/db";
 import { approvalService } from "../services/approvals.js";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
 
 const mockAgentService = vi.hoisted(() => ({
   activatePendingApproval: vi.fn(),
@@ -42,10 +49,11 @@ function createApproval(status: string): ApprovalRecord {
   };
 }
 
-function createDbStub(selectResults: ApprovalRecord[][], updateResults: ApprovalRecord[]) {
+function createDbStub(selectResults: Array<Array<Record<string, unknown>>>, updateResults: ApprovalRecord[]) {
   const pendingSelectResults = [...selectResults];
   const selectWhere = vi.fn(async () => pendingSelectResults.shift() ?? []);
-  const from = vi.fn(() => ({ where: selectWhere }));
+  const innerJoin = vi.fn(() => ({ where: selectWhere }));
+  const from = vi.fn(() => ({ where: selectWhere, innerJoin }));
   const select = vi.fn(() => ({ from }));
 
   const returning = vi.fn(async () => updateResults);
@@ -247,7 +255,10 @@ describe("approvalService.withdraw", () => {
 
   it("terminates the pending agent when a hire_agent approval is withdrawn", async () => {
     // Otherwise the agent is stranded in pending_approval with no approval left to decide it.
-    const dbStub = createDbStub([[createApproval("pending")]], [createApproval("withdrawn")]);
+    const dbStub = createDbStub(
+      [[createApproval("pending")], [{ id: "agent-1" }]],
+      [createApproval("withdrawn")],
+    );
 
     const svc = approvalService(dbStub.db as any);
     await svc.withdraw("approval-1", "hire no longer needed", withdrawalActor);
@@ -266,7 +277,10 @@ describe("approvalService.withdraw", () => {
   });
 
   it("rolls back the withdrawal when pending-agent termination fails", async () => {
-    const dbStub = createDbStub([[createApproval("pending")]], [createApproval("withdrawn")]);
+    const dbStub = createDbStub(
+      [[createApproval("pending")], [{ id: "agent-1" }]],
+      [createApproval("withdrawn")],
+    );
     mockAgentService.terminate.mockRejectedValue(new Error("api-key revocation failed"));
 
     const svc = approvalService(dbStub.db as any);
@@ -279,7 +293,10 @@ describe("approvalService.withdraw", () => {
   });
 
   it("rolls back the withdrawal and agent cleanup when audit persistence fails", async () => {
-    const dbStub = createDbStub([[createApproval("pending")]], [createApproval("withdrawn")]);
+    const dbStub = createDbStub(
+      [[createApproval("pending")], [{ id: "agent-1" }]],
+      [createApproval("withdrawn")],
+    );
     mockLogActivity.mockRejectedValue(new Error("activity insert failed"));
 
     const svc = approvalService(dbStub.db as any);
@@ -289,5 +306,94 @@ describe("approvalService.withdraw", () => {
 
     expect(dbStub.transaction).toHaveBeenCalledTimes(1);
     expect(mockAgentService.terminate).toHaveBeenCalledWith("agent-1");
+  });
+});
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
+
+describeEmbeddedPostgres("approvalService.withdraw adversarial hire targets", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-approval-withdraw-");
+    db = createDb(tempDb.connectionString);
+  }, 120_000);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedCompany(name: string) {
+    const id = randomUUID();
+    await db.insert(companies).values({
+      id,
+      name,
+      issuePrefix: `T${id.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    return id;
+  }
+
+  async function seedCraftedApproval(companyId: string, targetAgentId: string) {
+    const id = randomUUID();
+    await db.insert(approvals).values({
+      id,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      payload: { agentId: targetAgentId },
+    });
+    return id;
+  }
+
+  async function expectRejectedWithoutMutation(approvalId: string, targetAgentId: string) {
+    await expect(
+      approvalService(db).withdraw(approvalId, "crafted target", withdrawalActor),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: "Hire approval is not bound to a pending agent",
+    });
+
+    const [approval] = await db.select().from(approvals).where(eq(approvals.id, approvalId));
+    const [agent] = await db.select().from(agents).where(eq(agents.id, targetAgentId));
+    expect(approval.status).toBe("pending");
+    expect(agent.status).not.toBe("terminated");
+    expect(mockAgentService.terminate).not.toHaveBeenCalled();
+  }
+
+  it("does not terminate a crafted active-agent target", async () => {
+    const companyId = await seedCompany("Active target company");
+    const targetAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: targetAgentId,
+      companyId,
+      name: "Active target",
+      role: "engineer",
+      status: "idle",
+    });
+    const approvalId = await seedCraftedApproval(companyId, targetAgentId);
+
+    await expectRejectedWithoutMutation(approvalId, targetAgentId);
+  });
+
+  it("does not terminate or reveal a crafted cross-company target", async () => {
+    const approvalCompanyId = await seedCompany("Approval company");
+    const targetCompanyId = await seedCompany("Target company");
+    const targetAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: targetAgentId,
+      companyId: targetCompanyId,
+      name: "Cross-company target",
+      role: "engineer",
+      status: "pending_approval",
+    });
+    const approvalId = await seedCraftedApproval(approvalCompanyId, targetAgentId);
+
+    await expectRejectedWithoutMutation(approvalId, targetAgentId);
   });
 });
