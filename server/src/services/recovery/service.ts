@@ -1215,9 +1215,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { consecutive, latestFinishedAt };
   }
 
-  async function hasActiveExecutionPath(companyId: string, issueId: string, agentId?: string | null) {
+  // `dbOrTx` lets a caller re-ask this question *inside* the same transaction that
+  // holds the issue's advisory lock. The sweep's top-of-loop check is necessarily
+  // lock-free and therefore stale by the time a park/escalation transaction opens;
+  // re-running it under the lock is what makes "this issue has no live execution
+  // path" authoritative at the moment of the write.
+  async function hasActiveExecutionPath(
+    companyId: string,
+    issueId: string,
+    agentId?: string | null,
+    dbOrTx: any = db,
+  ) {
     const [run, deferredWake] = await Promise.all([
-      db
+      dbOrTx
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
         .where(
@@ -1229,8 +1239,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           ),
         )
         .limit(1)
-        .then((rows) => rows[0] ?? null),
-      db
+        .then((rows: Array<{ id: string }>) => rows[0] ?? null),
+      dbOrTx
         .select({ id: agentWakeupRequests.id })
         .from(agentWakeupRequests)
         .where(
@@ -1242,7 +1252,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           ),
         )
         .limit(1)
-        .then((rows) => rows[0] ?? null),
+        .then((rows: Array<{ id: string }>) => rows[0] ?? null),
     ]);
 
     return Boolean(run || deferredWake);
@@ -3765,86 +3775,77 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { action, hasNewActivitySinceLastAttempt };
   }
 
-  async function queueSourceScopedStrandedRecoveryRun(
-    tx: any,
-    companyId: string,
-    agentId: string,
-    opts: RecoveryWakeupOptions,
-  ) {
-    const now = new Date();
-    const source = opts.source ?? "assignment";
-    const triggerDetail = opts.triggerDetail ?? "system";
-    const wakeupRequest = await tx
-      .insert(agentWakeupRequests)
-      .values({
-        companyId,
-        agentId,
-        source,
-        triggerDetail,
-        reason: opts.reason ?? null,
-        payload: opts.payload ?? null,
-        status: "queued",
-        requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
-        updatedAt: now,
-      })
-      .returning()
-      .then((rows: Array<typeof agentWakeupRequests.$inferSelect>) => rows[0]);
+  type PlannedRecoveryWake = { agentId: string; opts: RecoveryWakeupOptions };
 
-    const queuedRun = await tx
-      .insert(heartbeatRuns)
-      .values({
-        companyId,
-        agentId,
-        invocationSource: source,
-        triggerDetail,
-        status: "queued",
-        wakeupRequestId: wakeupRequest.id,
-        contextSnapshot: opts.contextSnapshot ?? {},
-        updatedAt: now,
-      })
-      .returning()
-      .then((rows: Array<typeof heartbeatRuns.$inferSelect>) => rows[0]);
-
-    await tx
-      .update(agentWakeupRequests)
-      .set({ runId: queuedRun.id, updatedAt: now })
-      .where(eq(agentWakeupRequests.id, wakeupRequest.id));
-
-    return queuedRun;
-  }
-
-  async function enqueueSourceScopedStrandedRecoveryWake(input: {
+  // Pure decision — no IO. Callers that need the escalation's DB writes to be
+  // transactional plan the wake inside the transaction and dispatch it through
+  // `deps.enqueueWakeup` only after that transaction commits.
+  //
+  // BLO-18829: the wake must not escape when the escalation rolls back or its
+  // expected-status CAS loses the race. Planning-then-dispatching gives that
+  // without inlining a stripped-down row insert: `deps.enqueueWakeup` carries
+  // agent validation, wake-context enrichment, idempotency and suppression
+  // policy that a raw `agent_wakeup_requests` + `heartbeat_runs` insert silently
+  // drops.
+  function planSourceScopedStrandedRecoveryWake(input: {
     action: Awaited<ReturnType<typeof recoveryActionsSvc.upsertSourceScoped>>;
     issue: typeof issues.$inferSelect;
     latestRun: LatestIssueRun;
     recoveryCause: StrandedRecoveryCause;
     hasNewActivitySinceLastAttempt: boolean;
-  }, dbOrTx?: any) {
-    const enqueueWakeup = (agentId: string, opts: RecoveryWakeupOptions) =>
-      dbOrTx
-        ? queueSourceScopedStrandedRecoveryRun(dbOrTx, input.issue.companyId, agentId, opts)
-        : deps.enqueueWakeup(agentId, opts);
-    if (input.recoveryCause === "provider_quota" && !input.action.ownerAgentId) return;
-    if (input.recoveryCause === "workspace_validation_failed" || input.recoveryCause === "configuration_incomplete") return;
-    if (!input.action.ownerAgentId) return;
+  }): PlannedRecoveryWake | null {
+    if (input.recoveryCause === "provider_quota" && !input.action.ownerAgentId) return null;
+    if (input.recoveryCause === "workspace_validation_failed" || input.recoveryCause === "configuration_incomplete") return null;
+    if (!input.action.ownerAgentId) return null;
     const ownerIsNonAssignee = input.action.ownerAgentId !== input.issue.assigneeAgentId;
     if (!input.hasNewActivitySinceLastAttempt && ownerIsNonAssignee && input.action.attemptCount > 1) {
       const assigneeAgentId = input.issue.assigneeAgentId;
-      if (!assigneeAgentId) return;
-      await enqueueWakeup(assigneeAgentId, {
+      if (!assigneeAgentId) return null;
+      return {
+        agentId: assigneeAgentId,
+        opts: {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "source_scoped_recovery_action",
+          idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}:assignee_fallback`,
+          payload: withRecoveryModelProfileHint({
+            issueId: input.issue.id,
+            sourceIssueId: input.issue.id,
+            recoveryActionId: input.action.id,
+            strandedRunId: input.latestRun?.id ?? null,
+            recoveryCause: input.recoveryCause,
+            suppressedNonAssigneeWake: true,
+          }, "status_only"),
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          contextSnapshot: withRecoveryModelProfileHint({
+            issueId: input.issue.id,
+            taskId: input.issue.id,
+            wakeReason: "source_scoped_recovery_action",
+            skipIssueComment: true,
+            source: "issue_recovery_action",
+            recoveryActionId: input.action.id,
+            sourceIssueId: input.issue.id,
+            strandedRunId: input.latestRun?.id ?? null,
+            recoveryCause: input.recoveryCause,
+            suppressedNonAssigneeWake: true,
+          }, "status_only"),
+        },
+      };
+    }
+    return {
+      agentId: input.action.ownerAgentId,
+      opts: {
         source: "assignment",
         triggerDetail: "system",
         reason: "source_scoped_recovery_action",
-        idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}:assignee_fallback`,
+        idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}`,
         payload: withRecoveryModelProfileHint({
           issueId: input.issue.id,
           sourceIssueId: input.issue.id,
           recoveryActionId: input.action.id,
           strandedRunId: input.latestRun?.id ?? null,
           recoveryCause: input.recoveryCause,
-          suppressedNonAssigneeWake: true,
         }, "status_only"),
         requestedByActorType: "system",
         requestedByActorId: null,
@@ -3858,37 +3859,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           sourceIssueId: input.issue.id,
           strandedRunId: input.latestRun?.id ?? null,
           recoveryCause: input.recoveryCause,
-          suppressedNonAssigneeWake: true,
         }, "status_only"),
-      });
-      return;
-    }
-    await enqueueWakeup(input.action.ownerAgentId, {
-      source: "assignment",
-      triggerDetail: "system",
-      reason: "source_scoped_recovery_action",
-      idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}`,
-      payload: withRecoveryModelProfileHint({
-        issueId: input.issue.id,
-        sourceIssueId: input.issue.id,
-        recoveryActionId: input.action.id,
-        strandedRunId: input.latestRun?.id ?? null,
-        recoveryCause: input.recoveryCause,
-      }, "status_only"),
-      requestedByActorType: "system",
-      requestedByActorId: null,
-      contextSnapshot: withRecoveryModelProfileHint({
-        issueId: input.issue.id,
-        taskId: input.issue.id,
-        wakeReason: "source_scoped_recovery_action",
-        skipIssueComment: true,
-        source: "issue_recovery_action",
-        recoveryActionId: input.action.id,
-        sourceIssueId: input.issue.id,
-        strandedRunId: input.latestRun?.id ?? null,
-        recoveryCause: input.recoveryCause,
-      }, "status_only"),
-    });
+      },
+    };
+  }
+
+  async function dispatchPlannedRecoveryWake(planned: PlannedRecoveryWake | null) {
+    if (!planned) return;
+    await deps.enqueueWakeup(planned.agentId, planned.opts);
   }
 
   function readProviderQuotaRetryAt(latestRun: LatestIssueRun, now: Date) {
@@ -4165,7 +4143,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     });
   }
 
-  type ReviewWaitingParkOutcome = "parked" | "already_parked" | "failed";
+  type ReviewWaitingParkOutcome = "parked" | "already_parked" | "failed" | "execution_resumed";
 
   async function parkNoDependencyReviewWaitingIssue(input: {
     issue: typeof issues.$inferSelect;
@@ -4195,6 +4173,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (!fresh) return "failed";
       if (fresh.status === "in_review") return "already_parked";
       if (fresh.status !== "in_progress") return "failed";
+
+      // Revalidate under the lock. The sweep's top-of-loop `hasActiveExecutionPath`
+      // check ran before any of this iteration's transactions, and the monitor-park
+      // fall-through adds a further commit boundary ahead of this one. A continuation
+      // wake queued in either gap leaves `status` at `in_progress`, so the status
+      // guards above cannot see it — only re-asking the execution-path question here
+      // stops a now-live issue from being parked as if its execution were lost.
+      if (await hasActiveExecutionPath(fresh.companyId, fresh.id, null, tx)) {
+        return "execution_resumed";
+      }
 
       // The in_review transition runs an evidence gate (issues.ts) that throws
       // `unprocessable` when the issue has no reviewable evidence yet (analysis-only
@@ -4513,6 +4501,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    // Opt-in: re-ask `hasActiveExecutionPath` under this function's own advisory
+    // lock before writing. Set by call sites reached through an extra commit
+    // boundary — today, the monitor-park `missing_evidence` fall-through — where
+    // the sweep's top-of-loop check is provably staler than usual. Off by default
+    // so the ordinary escalation branches keep their existing behaviour.
+    revalidateExecutionPath?: boolean;
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
@@ -4528,7 +4522,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // The advisory lock is xact-scoped on this tx's connection; once we
     // commit/return, waiting peers wake up and record their next attempt
     // against the same active source-scoped action.
-    return await db.transaction(async (tx) => {
+    let plannedWake: PlannedRecoveryWake | null = null;
+    const escalated = await db.transaction(async (tx) => {
       await tx.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${input.issue.companyId} || ':' || ${input.issue.id}, 0))`,
       );
@@ -4562,6 +4557,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         if (!existingAction) return null;
       }
 
+      // A continuation queued after the sweep's lock-free top-of-loop check leaves
+      // `status` at `in_progress`, so the guard above cannot see it. Escalating then
+      // would move a live issue to `blocked` and clear its execution fields. Only the
+      // opted-in fall-through call sites pay for this extra read.
+      if (
+        input.revalidateExecutionPath &&
+        await hasActiveExecutionPath(fresh.companyId, fresh.id, null, tx)
+      ) {
+        return null;
+      }
+
       const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
       const { action, hasNewActivitySinceLastAttempt } = await ensureSourceScopedStrandedRecoveryAction({
         issue: fresh,
@@ -4593,13 +4599,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }, tx);
       if (!updated) return null;
 
-      await enqueueSourceScopedStrandedRecoveryWake({
+      // Decide the wake here, under the lock and with the committed action in
+      // hand, but do not dispatch it until this transaction commits — see
+      // planSourceScopedStrandedRecoveryWake.
+      plannedWake = planSourceScopedStrandedRecoveryWake({
         action,
         issue: fresh,
         latestRun: input.latestRun,
         recoveryCause,
         hasNewActivitySinceLastAttempt,
-      }, tx);
+      });
 
       if (isProviderQuotaWait) return updated;
 
@@ -4757,6 +4766,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
       return updated;
     });
+
+    // Post-commit: the escalation's rows are durable, so waking the recovery
+    // owner can no longer leave a wake behind for an escalation that rolled
+    // back or lost its expected-status CAS. `escalated === null` means exactly
+    // that, and `plannedWake` is only assigned on the path that returns a row.
+    if (escalated) await dispatchPlannedRecoveryWake(plannedWake);
+    return escalated;
   }
 
   function buildZeroTokenStartupFailureComment(input: {
@@ -5108,6 +5124,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // cleaned up" from "this issue genuinely has no run history at all" —
       // the no-run/no-lock guard below must skip only the latter.
       let adoptionHandoverLostSuccessor = false;
+      // Set when the monitor-backed review park bailed with `missing_evidence` and
+      // this iteration continued on to the fallback park/escalation. Those run in
+      // fresh transactions, so they must revalidate the execution path under their
+      // own locks rather than trust the top-of-loop check.
+      let reviewWaitingParkFellThrough = false;
       // BLO-18860: never judge an issue on a checkout-adoption cancellation.
       // The adopting run is by construction the assignee's own *live* run, so
       // this issue has continuity, not a lost execution path — but the
@@ -5655,6 +5676,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         // Let the same waiting-on-review run fall through to the no-dependency
         // park and, if that also cannot produce review evidence, the normal
         // blocked recovery escalation.
+        //
+        // That fall-through crosses a commit boundary: the park transaction has
+        // released its advisory lock, and both fallbacks reacquire it later. Flag
+        // the iteration so each fallback re-asks `hasActiveExecutionPath` under its
+        // own lock — otherwise a continuation queued in the gap would be parked or
+        // escalated as if its execution were lost.
+        reviewWaitingParkFellThrough = true;
       }
       if (isSuccessfulInProgressContinuationRun(latestRun)) {
         const successfulRun = latestRun;
@@ -5768,6 +5796,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           previousStatus: "in_progress",
           latestRun,
           comment: buildNonRetryableEscalationComment({ status: "in_progress", latestRun }),
+          revalidateExecutionPath: reviewWaitingParkFellThrough,
         });
         if (updated) {
           result.escalated += 1;
@@ -5852,6 +5881,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               result.skipped += 1;
               continue;
             }
+            if (parkOutcome === "execution_resumed") {
+              // A continuation went live while this iteration was between
+              // transactions. The issue is not stranded; leave it alone.
+              result.skipped += 1;
+              continue;
+            }
             // `failed` is a genuine park failure (evidence-gate rejection
             // because there's nothing reviewable yet, or a transient update
             // failure). Fall through to the normal blocked recovery path.
@@ -5868,6 +5903,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               "Paperclip detected a non-retryable failure on this issue's continuation run " +
               `(\`${classification.errorCode}\`). Skipping automatic retries and moving it to \`blocked\` ` +
               `so it is visible for intervention.${failureSummary ?? ""}`,
+            revalidateExecutionPath: reviewWaitingParkFellThrough,
           });
           if (updated) {
             result.escalated += 1;
@@ -5903,6 +5939,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
                 "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
                 `execution disappeared, but it still has no live execution path${attemptCopy}.${causeCopy}${failureSummary ?? ""} ` +
                 "Moving it to `blocked` so it is visible for intervention.",
+              revalidateExecutionPath: reviewWaitingParkFellThrough,
             });
             if (updated) {
               result.escalated += 1;

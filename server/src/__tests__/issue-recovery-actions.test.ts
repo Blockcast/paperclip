@@ -2191,7 +2191,14 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(result.reviewWaitingParked).toBe(0);
     expect(result.escalated).toBe(1);
     expect(result.issueIds).toEqual([sourceIssueId]);
-    expect(enqueueWakeup).not.toHaveBeenCalled();
+    // The escalation wakes the recovery owner through the injected wakeup, which is
+    // the same path production uses -- agent validation, wake-context enrichment,
+    // idempotency and suppression policy all live there.
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    expect(enqueueWakeup).toHaveBeenCalledWith(
+      managerId,
+      expect.objectContaining({ reason: "source_scoped_recovery_action" }),
+    );
 
     const [escalated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
     expect(escalated).toMatchObject({
@@ -2207,6 +2214,109 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       ownerAgentId: managerId,
       previousOwnerAgentId: coderId,
     });
+  });
+
+  // The monitor-park `missing_evidence` fall-through crosses a commit boundary: the
+  // park transaction releases its advisory lock before the no-dependency park and the
+  // blocked escalation reacquire it. A continuation wake queued in that gap leaves the
+  // issue at `in_progress`, so the fallbacks' status guards cannot see it -- only the
+  // execution-path revalidation under their own locks stops them from parking or
+  // escalating an issue whose execution has already resumed.
+  it("does not park or escalate when a continuation goes live in the monitor-park fall-through gap", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "automation",
+      status: "cancelled",
+      error: "Continuation parked: issue is waiting on review/approval",
+      errorCode: "issue_continuation_waiting_on_review",
+      contextSnapshot: {
+        issueId: sourceIssueId,
+        retryReason: "issue_continuation_needed",
+      },
+      createdAt: new Date("2026-07-31T00:00:00.000Z"),
+      finishedAt: new Date("2026-07-31T00:05:00.000Z"),
+    });
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt: null,
+        monitorLastTriggeredAt: new Date("2026-07-31T00:06:00.000Z"),
+        monitorAttemptCount: 1,
+        monitorScheduledBy: "assignee",
+        monitorNotes: "Waiting on external PR review.",
+      })
+      .where(eq(issues.id, sourceIssueId));
+    // A `pr` label makes the issue evidence-gated, so the monitor park is rejected
+    // with `missing-evidence` and the sweep falls through -- same setup as the test
+    // above, which is the path this barrier guards.
+    const labelId = randomUUID();
+    await db.insert(labels).values({ id: labelId, companyId, name: "pr", color: "#000000" });
+    await db.insert(issueLabels).values({ issueId: sourceIssueId, labelId, companyId });
+
+    // Barrier: land a queued continuation run in the gap after the monitor park's
+    // transaction commits. The sweep's lock-free top-of-loop `hasActiveExecutionPath`
+    // check has already run by then, so only a revalidation under the fallback locks
+    // can observe it.
+    const originalTransaction = db.transaction.bind(db);
+    let committedTransactions = 0;
+    let injectedContinuationRunId: string | null = null;
+    const transactionSpy = vi
+      .spyOn(db, "transaction")
+      .mockImplementation(async (...args: Parameters<typeof db.transaction>) => {
+        const outcome = await (originalTransaction as any)(...args);
+        committedTransactions += 1;
+        if (committedTransactions === 1 && !injectedContinuationRunId) {
+          const [stillInProgress] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+          // Guard the guard: if the first committed transaction were something other
+          // than the rejected park, this assertion fails loudly instead of letting the
+          // test pass for the wrong reason.
+          expect(stillInProgress?.status).toBe("in_progress");
+          injectedContinuationRunId = randomUUID();
+          await db.insert(heartbeatRuns).values({
+            id: injectedContinuationRunId,
+            companyId,
+            agentId: coderId,
+            invocationSource: "assignment",
+            triggerDetail: "system",
+            status: "queued",
+            contextSnapshot: { issueId: sourceIssueId },
+          });
+        }
+        return outcome;
+      });
+
+    try {
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const result = await recovery.reconcileStrandedAssignedIssues();
+
+      expect(injectedContinuationRunId).not.toBeNull();
+      expect(result.reviewWaitingParked).toBe(0);
+      expect(result.escalated).toBe(0);
+      expect(result.issueIds).toEqual([]);
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+    } finally {
+      transactionSpy.mockRestore();
+    }
+
+    // The issue keeps its live execution path: still `in_progress`, still owned by the
+    // assignee, with no recovery action opened against it.
+    const [untouched] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(untouched).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: coderId,
+    });
+    const recoveryActionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.companyId, companyId),
+        eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+      ));
+    expect(recoveryActionRows).toHaveLength(0);
   });
 
   // BLO-18860: adopting a stale checkout is a HANDOVER, not a failure.
