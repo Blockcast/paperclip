@@ -3575,15 +3575,249 @@ export function issueRoutes(
     });
   }
 
+  // BLO-19087: an @-mention wakes the mentioned agent (`issue_comment_mentioned`,
+  // fired below) but does not by itself authorize it to reply. The wake path
+  // applies no gate on who wrote the mention; the grant path
+  // (`agentHasMentionGrantOnIssue`) only grants `issue:comment` when the
+  // mentioning comment's author is that issue's own assignee, or a board user.
+  // A mention written by anyone else therefore wakes an agent onto a thread it
+  // provably cannot post to. That author gate is deliberate — it stops mention
+  // grants chaining agent-to-agent — so the fix is not to widen it but to stop
+  // the invitation being silent about its own terms.
+  //
+  // This names the one action that actually clears the denial. BLO-18152 got as
+  // far as labelling the boundary "grant" and its own note suggests "retry with
+  // a mention", which is a trap: the mention has to come from a *specific*
+  // author, and a mention from anyone else leaves the agent looping.
+  function issueCommentGrantRemediation(input: {
+    actorAgentId: string;
+    assigneeAgentId: string | null;
+    reason: Awaited<ReturnType<typeof decideIssueAccess>>["reason"];
+  }): string | null {
+    if (input.reason !== "deny_missing_grant") return null;
+    if (!input.assigneeAgentId) return null;
+    if (input.assigneeAgentId === input.actorAgentId) return null;
+    return (
+      `Being @-mentioned here does not grant you comment access. Only this issue's assignee ` +
+      `(agent://${input.assigneeAgentId}) or a board user can grant it, by posting a comment on ` +
+      `this issue containing agent://${input.actorAgentId}. A mention written by any other agent ` +
+      `wakes you but does not authorize you. Until then, respond on an issue you are assigned to ` +
+      `and reference this one, or ask the assignee to mention you here.`
+    );
+  }
+
+  function readAgentRunId(req: Request) {
+    return req.actor.type === "agent" ? req.actor.runId?.trim() || null : null;
+  }
+
+  type IssueCommentAuthorizationIssue = {
+    id: string;
+    companyId: string;
+    projectId: string | null;
+    parentId: string | null;
+    status: string;
+    assigneeAgentId: string | null;
+    assigneeUserId: string | null;
+    createdByAgentId?: string | null;
+    checkoutRunId?: string | null;
+    executionRunId?: string | null;
+  };
+
+  type IssueCommentAuthorizationResult =
+    | { allowed: true; decision: true | Awaited<ReturnType<typeof decideIssueAccess>>; reason: string }
+    | { allowed: false; kind: "agent_auth_required"; status: 403; error: string; reason: "deny_agent_auth_required" }
+    | {
+        allowed: false;
+        kind: "watchdog_denied";
+        status: 403 | 409;
+        error: string;
+        reason: "deny_task_watchdog_scope";
+        boundary: "watchdog";
+        details: Record<string, unknown>;
+      }
+    | {
+        allowed: false;
+        kind: "boundary_denied";
+        status: 403;
+        decision: Awaited<ReturnType<typeof decideIssueAccess>>;
+        reason: Awaited<ReturnType<typeof decideIssueAccess>>["reason"];
+        boundary: string;
+        remediation: string | null;
+      }
+    | {
+        allowed: false;
+        kind: "missing_run_id";
+        status: 401;
+        error: "Agent run id required";
+        reason: "deny_missing_run_id";
+        boundary: "run";
+        remediation: string;
+      };
+
+  async function evaluateFreshTaskWatchdogSourceMutation(
+    scope: Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
+    issue: { id: string },
+  ) {
+    if (scope.kind !== "watchdog") return { allowed: true as const };
+    if (scope.watchdogIssueId && issue.id === scope.watchdogIssueId) return { allowed: true as const };
+
+    const revalidated = await taskWatchdogsSvc.revalidateMutationScope(scope);
+    if (revalidated.allowed) return { allowed: true as const };
+    return {
+      allowed: false as const,
+      status: 409 as const,
+      error: revalidated.reason,
+      details: {
+        watchedIssueId: scope.watchedIssueId,
+        watchdogId: scope.watchdogId,
+        runStopFingerprint: scope.stopFingerprint,
+        currentState: revalidated.classification?.state ?? null,
+        currentStopFingerprint:
+          revalidated.classification && "stopFingerprint" in revalidated.classification
+            ? revalidated.classification.stopFingerprint
+            : null,
+      },
+    };
+  }
+
+  async function evaluateTaskWatchdogScopedIssueCommentAuthorization(
+    req: Request,
+    issue: IssueCommentAuthorizationIssue,
+  ): Promise<IssueCommentAuthorizationResult | null> {
+    if (req.actor.type !== "agent") return null;
+    const scope = await resolveTaskWatchdogMutationScope(db, req.actor);
+    if (scope.kind === "none") return null;
+    const result = await taskWatchdogScopeAllowsIssueMutation(db, scope, issue);
+    if (result.kind === "invalid") {
+      return {
+        allowed: false,
+        kind: "watchdog_denied",
+        status: 403,
+        error: result.detail,
+        reason: "deny_task_watchdog_scope",
+        boundary: "watchdog",
+        details: {
+          issueId: issue.id,
+          securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+        },
+      };
+    }
+    const fresh = await evaluateFreshTaskWatchdogSourceMutation(scope, issue);
+    if (!fresh.allowed) {
+      return {
+        allowed: false,
+        kind: "watchdog_denied",
+        status: fresh.status,
+        error: fresh.error,
+        reason: "deny_task_watchdog_scope",
+        boundary: "watchdog",
+        details: fresh.details,
+      };
+    }
+    return { allowed: true, decision: true, reason: "allow_task_watchdog_scope" };
+  }
+
+  async function evaluateAgentIssueCommentAuthorization(
+    req: Request,
+    issue: IssueCommentAuthorizationIssue,
+  ): Promise<IssueCommentAuthorizationResult> {
+    if (req.actor.type !== "agent") return { allowed: true, decision: true, reason: "allow_non_agent" };
+    const actorAgentId = req.actor.agentId;
+    if (!actorAgentId) {
+      return {
+        allowed: false,
+        kind: "agent_auth_required",
+        status: 403,
+        error: "Agent authentication required",
+        reason: "deny_agent_auth_required",
+      };
+    }
+
+    const watchdogDecision = await evaluateTaskWatchdogScopedIssueCommentAuthorization(req, issue);
+    if (watchdogDecision) return watchdogDecision;
+
+    if (isCurrentIssueExecutionRun(req, issue)) {
+      if (issue.status === "in_progress" && issue.assigneeAgentId === actorAgentId && !readAgentRunId(req)) {
+        return missingAgentRunIdCommentAuthorization();
+      }
+      return { allowed: true, decision: true, reason: "allow_current_issue_execution_run" };
+    }
+
+    const boundaryDecision = await decideIssueAccess(req, issue, "issue:comment");
+    if (!boundaryDecision.allowed) {
+      const remediation = issueCommentGrantRemediation({
+        actorAgentId,
+        assigneeAgentId: issue.assigneeAgentId,
+        reason: boundaryDecision.reason,
+      });
+      return {
+        allowed: false,
+        kind: "boundary_denied",
+        status: 403,
+        decision: boundaryDecision,
+        reason: boundaryDecision.reason,
+        boundary: authorizationBoundaryLabel(boundaryDecision.reason),
+        remediation,
+      };
+    }
+
+    if (issue.status === "in_progress" && issue.assigneeAgentId === actorAgentId && !readAgentRunId(req)) {
+      return missingAgentRunIdCommentAuthorization();
+    }
+    return { allowed: true, decision: boundaryDecision, reason: boundaryDecision.reason };
+  }
+
+  function missingAgentRunIdCommentAuthorization(): IssueCommentAuthorizationResult {
+    return {
+      allowed: false,
+      kind: "missing_run_id",
+      status: 401,
+      error: "Agent run id required",
+      reason: "deny_missing_run_id",
+      boundary: "run",
+      remediation:
+        "This in-progress issue is assigned to you, so comment writes require the active agent run id. Retry with the run id attached to this heartbeat.",
+    };
+  }
+
+  // BLO-19087: the read-side counterpart of the denial above. Reports whether
+  // this actor could actually post to the thread it was just woken onto, using
+  // the same side-effect-free evaluator the comment route enforces with, so the
+  // advertised verdict cannot drift from the enforced one.
+  async function resolveHeartbeatReplyAuthorization(
+    req: Request,
+    issue: IssueCommentAuthorizationIssue,
+  ) {
+    if (req.actor.type !== "agent") return null;
+    const authorization = await evaluateAgentIssueCommentAuthorization(req, issue);
+    if (authorization.allowed) {
+      return { canComment: true as const, reason: authorization.reason, remediation: null };
+    }
+    if (authorization.kind === "agent_auth_required") return null;
+    return {
+      canComment: false as const,
+      reason: authorization.reason,
+      boundary: authorization.boundary,
+      remediation: "remediation" in authorization ? authorization.remediation : null,
+    };
+  }
+
   // BLO-18152: every "Issue is outside this actor's authorization boundary"
   // response (issue:read, issue:comment, issue:mutate) renders through this
   // one function so the message always names which boundary fired instead of
   // leaving the caller to guess whether it was a scope, trust-boundary,
   // membership, or company-mismatch rejection.
-  function respondIssueBoundaryDenied(res: Response, decision: Awaited<ReturnType<typeof decideIssueAccess>>) {
+  function respondIssueBoundaryDenied(
+    res: Response,
+    decision: Awaited<ReturnType<typeof decideIssueAccess>>,
+    remediation?: string | null,
+  ) {
     res.status(403).json({
       error: `Issue is outside this actor's authorization boundary (${authorizationBoundaryLabel(decision.reason)})`,
-      details: authorizationDeniedDetails(decision),
+      details: {
+        ...authorizationDeniedDetails(decision),
+        ...(remediation ? { remediation } : {}),
+      },
     });
   }
 
@@ -3597,50 +3831,20 @@ export function issueRoutes(
   async function assertAgentIssueCommentAllowed(
     req: Request,
     res: Response,
-    issue: {
-      id: string;
-      companyId: string;
-      projectId: string | null;
-      parentId: string | null;
-      status: string;
-      assigneeAgentId: string | null;
-      assigneeUserId: string | null;
-      createdByAgentId?: string | null;
-      checkoutRunId?: string | null;
-      executionRunId?: string | null;
-    },
+    issue: IssueCommentAuthorizationIssue,
   ) {
-    if (req.actor.type !== "agent") return true;
-    const actorAgentId = req.actor.agentId;
-    if (!actorAgentId) {
-      res.status(403).json({ error: "Agent authentication required" });
+    const authorization = await evaluateAgentIssueCommentAuthorization(req, issue);
+    if (authorization.allowed) return authorization.decision;
+    if (authorization.kind === "agent_auth_required" || authorization.kind === "missing_run_id") {
+      res.status(authorization.status).json({ error: authorization.error });
       return false;
     }
-    const watchdogDecision = await assertTaskWatchdogScopedIssueMutationAllowed(req, res, issue);
-    if (watchdogDecision !== null) return watchdogDecision;
-    // BLO-18152: parity with assertAgentIssueMutationAllowed below — an agent
-    // whose run currently holds this issue's checkout/execution lock may
-    // always write to it, regardless of a narrower per-request trust
-    // boundary (e.g. a source_scoped_recovery_action wake) that
-    // decideIssueAccess would otherwise apply. Before this fix, only the
-    // PATCH mutate path granted this bypass, so the same actor+issue+run
-    // could get a 200 from PATCH {comment} and a 403 from this endpoint
-    // seconds apart.
-    if (isCurrentIssueExecutionRun(req, issue)) {
-      if (issue.status === "in_progress" && issue.assigneeAgentId === actorAgentId) {
-        if (!requireAgentRunId(req, res)) return false;
-      }
-      return true;
-    }
-    const boundaryDecision = await decideIssueAccess(req, issue, "issue:comment");
-    if (!boundaryDecision.allowed) {
-      respondIssueBoundaryDenied(res, boundaryDecision);
+    if (authorization.kind === "watchdog_denied") {
+      res.status(authorization.status).json({ error: authorization.error, details: authorization.details });
       return false;
     }
-    if (issue.status === "in_progress" && issue.assigneeAgentId === actorAgentId) {
-      if (!requireAgentRunId(req, res)) return false;
-    }
-    return boundaryDecision;
+    respondIssueBoundaryDenied(res, authorization.decision, authorization.remediation);
+    return false;
   }
 
   function isIssueMentionGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
@@ -3722,7 +3926,7 @@ export function issueRoutes(
 
   function requireAgentRunId(req: Request, res: Response) {
     if (req.actor.type !== "agent") return null;
-    const runId = req.actor.runId?.trim();
+    const runId = readAgentRunId(req);
     if (runId) return runId;
     res.status(401).json({ error: "Agent run id required" });
     return null;
@@ -5531,7 +5735,16 @@ export function issueRoutes(
       includeForIssueComment: wakeCommentId !== null,
     });
 
+    // BLO-19087: a mention wake tells an agent to go read this thread, and the
+    // heartbeat procedure tells it to "respond in comments if useful" — but on
+    // an issue assigned to someone else that reply is usually a 403. Resolve
+    // the same decision the comment route enforces (never a re-derived copy of
+    // the rule, which is how the wake/grant split arose in the first place) so
+    // the agent knows before it writes, and knows where to go instead.
+    const replyAuthorization = await resolveHeartbeatReplyAuthorization(req, issue);
+
     res.json({
+      replyAuthorization,
       issue: {
         id: issue.id,
         identifier: issue.identifier,
