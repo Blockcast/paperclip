@@ -10265,21 +10265,35 @@ export function issueRoutes(
     const creatorOrManagerGrantedCommentOnly =
       req.actor.type === "agent" &&
       isCreatorOrManagerCommentGrantDecision(commentAccessDecision);
-    if (recoveryHandoffGrantedCommentOnly && (reopenRequested || resumeRequested)) {
+    if (
+      (recoveryHandoffGrantedCommentOnly || creatorOrManagerGrantedCommentOnly) &&
+      (reopenRequested || resumeRequested)
+    ) {
+      const commentOnlyReason = recoveryHandoffGrantedCommentOnly
+        ? "allow_recovery_handoff_grant"
+        : commentAccessDecision !== true && isCreatorOrManagerCommentGrantDecision(commentAccessDecision)
+        ? commentAccessDecision.reason
+        : "allow_comment_only_grant";
       res.status(403).json({
-        error: "Recovery handoff grant is comment-only",
+        error: recoveryHandoffGrantedCommentOnly
+          ? "Recovery handoff grant is comment-only"
+          : "Creator/manager comment grant is comment-only",
         details: {
           issueId: issue.id,
           assigneeAgentId: issue.assigneeAgentId,
           actorAgentId: req.actor.agentId,
-          reason: "allow_recovery_handoff_grant",
-          hint: "Post the handoff evidence as a plain comment; the recovery owner controls status.",
+          reason: commentOnlyReason,
+          hint: recoveryHandoffGrantedCommentOnly
+            ? "Post the handoff evidence as a plain comment; the recovery owner controls status."
+            : "Post the delegated-issue guidance as a plain comment; the assignee or normal mutation owner controls status.",
         },
       });
       return;
     }
     const commentOnlyGrantedPeerAgent =
-      mentionGrantedPeerAgentCommentOnly || recoveryHandoffGrantedCommentOnly;
+      mentionGrantedPeerAgentCommentOnly ||
+      recoveryHandoffGrantedCommentOnly ||
+      creatorOrManagerGrantedCommentOnly;
     const effectiveReopenRequested = commentOnlyGrantedPeerAgent ? false : reopenRequested;
     const effectiveResumeRequested = commentOnlyGrantedPeerAgent ? false : resumeRequested;
     if (

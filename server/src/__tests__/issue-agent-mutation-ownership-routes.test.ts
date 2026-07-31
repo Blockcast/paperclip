@@ -2141,6 +2141,100 @@ describe("agent issue mutation checkout ownership", () => {
     },
   );
 
+  const commentOnlyTransitionCases: Array<[
+    string,
+    Record<string, unknown>[],
+    Record<string, unknown>,
+    "done" | "blocked",
+    Record<string, boolean>,
+    string,
+  ]> = [
+    [
+      "creator",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId)],
+      { createdByAgentId: peerAgentId },
+      "done",
+      { reopen: true },
+      "allow_issue_creator",
+    ],
+    [
+      "creator",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId)],
+      { createdByAgentId: peerAgentId },
+      "done",
+      { resume: true },
+      "allow_issue_creator",
+    ],
+    [
+      "creator",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId)],
+      { createdByAgentId: peerAgentId },
+      "blocked",
+      { reopen: true },
+      "allow_issue_creator",
+    ],
+    [
+      "creator",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId)],
+      { createdByAgentId: peerAgentId },
+      "blocked",
+      { resume: true },
+      "allow_issue_creator",
+    ],
+    [
+      "manager-chain",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })],
+      { createdByAgentId: ownerAgentId },
+      "done",
+      { reopen: true },
+      "allow_manager_chain",
+    ],
+    [
+      "manager-chain",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })],
+      { createdByAgentId: ownerAgentId },
+      "done",
+      { resume: true },
+      "allow_manager_chain",
+    ],
+    [
+      "manager-chain",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })],
+      { createdByAgentId: ownerAgentId },
+      "blocked",
+      { reopen: true },
+      "allow_manager_chain",
+    ],
+    [
+      "manager-chain",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })],
+      { createdByAgentId: ownerAgentId },
+      "blocked",
+      { resume: true },
+      "allow_manager_chain",
+    ],
+  ];
+
+  it.each(commentOnlyTransitionCases)(
+    "refuses %s comment grants with %s transition flags on %s issues",
+    async (_kind, agentRows, issueOverrides, status, transition, expectedReason) => {
+      useProductionIssueAuthorization(agentRows);
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status, assigneeAgentId: ownerAgentId, ...issueOverrides }),
+      );
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Delegated guidance plus an attempted status transition.", ...transition });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Creator/manager comment grant is comment-only");
+      expect(res.body.details).toMatchObject({ reason: expectedReason });
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    },
+  );
+
   const commentGrantMutationDenialCases: Array<[string, Record<string, unknown>[], Record<string, unknown>]> = [
     ["creator", [makeAgent(peerAgentId), makeAgent(ownerAgentId)], { createdByAgentId: peerAgentId }],
     ["manager-chain", [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })], { createdByAgentId: ownerAgentId }],
