@@ -362,7 +362,7 @@ function sharedDependencyProblemKey(check: SharedDependencyConsistencyCheck): st
   });
 }
 
-async function checkSharedDependencyConsistencyAfterRecheck(
+export async function checkSharedDependencyConsistencyAfterRecheck(
   installDir: string,
   packageName: string = SDK_INSTALL_RACE_PACKAGE_MARKER,
 ): Promise<SharedDependencyConsistencyCheck> {

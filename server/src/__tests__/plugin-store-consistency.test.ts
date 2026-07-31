@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { createDb, plugins } from "@paperclipai/db";
 import {
   checkSharedDependencyConsistency,
+  checkSharedDependencyConsistencyAfterRecheck,
   pluginLoader,
   type PluginRuntimeServices,
 } from "../services/plugin-loader.js";
@@ -98,6 +99,24 @@ describe("checkSharedDependencyConsistency", () => {
     const result = await checkSharedDependencyConsistency(installDir, SDK_PACKAGE);
     expect(result.consistent).toBe(true);
   });
+
+  it("waits past the first recheck when a static mismatch settles", async () => {
+    const installDir = await tempInstallDir();
+    await writeLockfileVersion(installDir, SDK_PACKAGE, "2026.513.0");
+    await writeInstalledPackageVersion(installDir, SDK_PACKAGE, "1.0.0");
+
+    const settleStore = (async () => {
+      await sleep(800);
+      await writeInstalledPackageVersion(installDir, SDK_PACKAGE, "2026.513.0");
+    })();
+
+    const result = await checkSharedDependencyConsistencyAfterRecheck(installDir, SDK_PACKAGE);
+    await settleStore;
+
+    expect(result.consistent).toBe(true);
+    expect(result.lockfileVersion).toBe("2026.513.0");
+    expect(result.installedVersion).toBe("2026.513.0");
+  }, 10_000);
 
   it("does not flag a mismatch when there is no lockfile at all (local dev)", async () => {
     const installDir = await tempInstallDir();
