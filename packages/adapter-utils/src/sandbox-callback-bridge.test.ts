@@ -328,10 +328,25 @@ describe("sandbox callback bridge", () => {
     const queueDir = path.posix.join(rootDir, "queue");
     const directories = sandboxCallbackBridgeDirectories(queueDir);
     const processed: string[] = [];
+    const baseClient = createFileSystemSandboxCallbackBridgeQueueClient();
+    let resolveIdlePoll: () => void = () => undefined;
+    const idlePoll = new Promise<void>((resolve) => {
+      resolveIdlePoll = resolve;
+    });
 
     const worker = await startSandboxCallbackBridgeWorker({
-      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      client: {
+        ...baseClient,
+        listJsonFiles: async (remotePath) => {
+          const files = await baseClient.listJsonFiles(remotePath);
+          if (remotePath === directories.requestsDir && files.length === 0) {
+            resolveIdlePoll();
+          }
+          return files;
+        },
+      },
       queueDir,
+      pollIntervalMs: 60_000,
       authorizeRequest: async () => null,
       handleRequest: async (request) => {
         processed.push(request.id);
@@ -342,6 +357,7 @@ describe("sandbox callback bridge", () => {
         };
       },
     });
+    await idlePoll;
 
     await writeFile(
       path.posix.join(directories.requestsDir, "req-a.json"),

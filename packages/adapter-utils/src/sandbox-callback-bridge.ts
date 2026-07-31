@@ -648,6 +648,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
   let settled = false;
   let stopDeadline = Number.POSITIVE_INFINITY;
   let settleResolve: (() => void) | null = null;
+  let wakePoll: (() => void) | null = null;
   const settledPromise = new Promise<void>((resolve) => {
     settleResolve = resolve;
   });
@@ -655,6 +656,23 @@ export async function startSandboxCallbackBridgeWorker(input: {
     ((request: SandboxCallbackBridgeRequest) => authorizeSandboxCallbackBridgeRequestWithRoutes(request));
   const buildWorkerFailureMessage = (error: unknown) =>
     `Sandbox callback bridge worker failed: ${error instanceof Error ? error.message : String(error)}`;
+  const waitForNextPoll = async () => {
+    await new Promise<void>((resolve) => {
+      let timeout: NodeJS.Timeout | null = null;
+      const done = () => {
+        if (timeout) {
+          clearTimeout(timeout);
+          timeout = null;
+        }
+        if (wakePoll === done) {
+          wakePoll = null;
+        }
+        resolve();
+      };
+      wakePoll = done;
+      timeout = setTimeout(done, pollIntervalMs);
+    });
+  };
 
   const processRequestFile = async (fileName: string) => {
     const requestPath = path.posix.join(directories.requestsDir, fileName);
@@ -757,7 +775,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
           if (stopping) {
             break;
           }
-          await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+          await waitForNextPoll();
           continue;
         }
         for (const fileName of fileNames) {
@@ -798,6 +816,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       stopping = true;
       const drainMs = normalizeTimeoutMs(options.drainTimeoutMs, DEFAULT_BRIDGE_STOP_TIMEOUT_MS);
       stopDeadline = Date.now() + drainMs;
+      wakePoll?.();
       if (!settled) {
         await Promise.race([
           settledPromise,
