@@ -7,6 +7,7 @@ import {
   buildBetterAuthRateLimitOptions,
   deriveAuthCookiePrefix,
   deriveAuthTrustedOrigins,
+  normalizeAuthResponseLocationHeader,
   shouldDisableSecureAuthCookies,
 } from "../auth/better-auth.js";
 import {
@@ -46,6 +47,15 @@ afterEach(() => {
 });
 
 describe("Better Auth cookie scoping", () => {
+  it("normalizes numeric Location header values before auth metrics classification", () => {
+    expect(normalizeAuthResponseLocationHeader(302)).toBe("302");
+    expect(normalizeAuthResponseLocationHeader("/api/auth/error?error=access_denied")).toBe(
+      "/api/auth/error?error=access_denied",
+    );
+    expect(normalizeAuthResponseLocationHeader(["/one", "/two"])).toEqual(["/one", "/two"]);
+    expect(normalizeAuthResponseLocationHeader(undefined)).toBeUndefined();
+  });
+
   it("derives an instance-scoped cookie prefix", () => {
     expect(deriveAuthCookiePrefix("default")).toBe("paperclip-default");
     expect(deriveAuthCookiePrefix("PAP-1601-worktree")).toBe("paperclip-PAP-1601-worktree");
