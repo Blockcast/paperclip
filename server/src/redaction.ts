@@ -1,4 +1,5 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
+import { envBindingSecretRefSchema, envBindingUserSecretRefSchema } from "@paperclipai/shared";
 
 const SECRET_FIELD_NAME_PATTERN =
   String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring|base[-_]?url)[A-Za-z0-9_-]*`;
@@ -58,6 +59,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
+function isSecretPointerCandidate(value: unknown): value is Record<string, unknown> & { type: "secret_ref" | "user_secret_ref" } {
+  return isPlainObject(value) && (value.type === "secret_ref" || value.type === "user_secret_ref");
+}
+
 /**
  * `agentConfig` switches on the structural rules described on
  * {@link redactAgentConfigPayload}. Off (the default) keeps the generic
@@ -70,24 +75,30 @@ type SanitizeOptions = { agentConfig?: boolean };
  * schema-owned pointer fields; a `value` or any other unknown field can only be
  * resolved plaintext or untrusted baggage riding along with it.
  */
-function sanitizeSecretRefPointer(binding: Record<string, unknown>): Record<string, unknown> {
+function sanitizeSecretRefPointer(binding: Record<string, unknown>): Record<string, unknown> | null {
+  const parsed = envBindingSecretRefSchema.safeParse(binding);
+  if (!parsed.success) return null;
+  const data = parsed.data;
   const pointer: Record<string, unknown> = {
-    type: "secret_ref",
-    secretId: binding.secretId,
+    type: data.type,
+    secretId: data.secretId,
   };
   for (const key of ["version", "projectionClass", "projectionAllowlistKey"] as const) {
-    if (key in binding) pointer[key] = binding[key];
+    if (key in binding && data[key] !== undefined) pointer[key] = data[key];
   }
   return pointer;
 }
 
-function sanitizeUserSecretRefPointer(binding: Record<string, unknown>): Record<string, unknown> {
+function sanitizeUserSecretRefPointer(binding: Record<string, unknown>): Record<string, unknown> | null {
+  const parsed = envBindingUserSecretRefSchema.safeParse(binding);
+  if (!parsed.success) return null;
+  const data = parsed.data;
   const pointer: Record<string, unknown> = {
-    type: "user_secret_ref",
-    key: binding.key,
+    type: data.type,
+    key: data.key,
   };
   for (const key of ["version", "required", "allowMissingOverride"] as const) {
-    if (key in binding) pointer[key] = binding[key];
+    if (key in binding && data[key] !== undefined) pointer[key] = data[key];
   }
   return pointer;
 }
@@ -95,11 +106,15 @@ function sanitizeUserSecretRefPointer(binding: Record<string, unknown>): Record<
 function sanitizeValue(value: unknown, options?: SanitizeOptions): unknown {
   if (value === null || value === undefined) return value;
   if (Array.isArray(value)) return value.map((entry) => sanitizeValue(entry, options));
+  if (options?.agentConfig && isSecretPointerCandidate(value)) {
+    return (
+      value.type === "secret_ref"
+        ? sanitizeSecretRefPointer(value)
+        : sanitizeUserSecretRefPointer(value)
+    ) ?? REDACTED_EVENT_VALUE;
+  }
   if (isSecretRefBinding(value) || isUserSecretRefBinding(value)) {
-    if (!options?.agentConfig) return value;
-    return isSecretRefBinding(value)
-      ? sanitizeSecretRefPointer(value)
-      : sanitizeUserSecretRefPointer(value);
+    return value;
   }
   if (isPlainBinding(value)) {
     // In an agent config a plain binding IS credential material, by
@@ -122,11 +137,11 @@ function sanitizeAgentEnvRecord(record: Record<string, unknown>): Record<string,
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
     if (isSecretRefBinding(value)) {
-      redacted[key] = sanitizeSecretRefPointer(value);
+      redacted[key] = sanitizeSecretRefPointer(value) ?? REDACTED_EVENT_VALUE;
       continue;
     }
     if (isUserSecretRefBinding(value)) {
-      redacted[key] = sanitizeUserSecretRefPointer(value);
+      redacted[key] = sanitizeUserSecretRefPointer(value) ?? REDACTED_EVENT_VALUE;
       continue;
     }
     if (isPlainBinding(value)) {
@@ -153,14 +168,14 @@ function isPlainBinding(value: unknown): value is { type: "plain"; value: unknow
   return value.type === "plain" && "value" in value;
 }
 
-function sanitizeCommandArgs(args: unknown[]): unknown[] {
+function sanitizeCommandArgs(args: unknown[], options?: SanitizeOptions): unknown[] {
   let redactNext = false;
   return args.map((arg) => {
     if (redactNext) {
       redactNext = false;
       return REDACTED_EVENT_VALUE;
     }
-    if (typeof arg !== "string") return sanitizeValue(arg);
+    if (typeof arg !== "string") return sanitizeValue(arg, options);
     if (CLI_SECRET_FLAG_RE.test(arg.trim())) {
       redactNext = true;
       return arg;
@@ -172,12 +187,12 @@ function sanitizeCommandArgs(args: unknown[]): unknown[] {
 export function sanitizeRecord(record: Record<string, unknown>, options?: SanitizeOptions): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
-    if (options?.agentConfig && key === "env" && isPlainObject(value)) {
-      redacted[key] = sanitizeAgentEnvRecord(value);
+    if (options?.agentConfig && key === "env") {
+      redacted[key] = isPlainObject(value) ? sanitizeAgentEnvRecord(value) : REDACTED_EVENT_VALUE;
       continue;
     }
     if (COMMAND_ARGS_PAYLOAD_KEY_RE.test(key) && Array.isArray(value)) {
-      redacted[key] = sanitizeCommandArgs(value);
+      redacted[key] = sanitizeCommandArgs(value, options);
       continue;
     }
     if (COMMAND_PAYLOAD_KEY_RE.test(key) && typeof value === "string") {

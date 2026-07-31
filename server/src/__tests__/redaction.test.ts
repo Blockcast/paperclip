@@ -242,6 +242,18 @@ describe("redactAgentConfigPayload", () => {
               value: SECRET,
               extra: "ignored",
             },
+            BAD_SECRET_REF: {
+              type: "secret_ref",
+              secretId: "not-a-uuid",
+              version: { value: SECRET },
+              projectionClass: "unclassified",
+            },
+            BAD_USER_SECRET_REF: {
+              type: "user_secret_ref",
+              key: "github_token",
+              required: { value: SECRET },
+              allowMissingOverride: "yes",
+            },
           },
         },
       },
@@ -259,9 +271,47 @@ describe("redactAgentConfigPayload", () => {
               required: false,
               allowMissingOverride: true,
             },
+            BAD_SECRET_REF: REDACTED_EVENT_VALUE,
+            BAD_USER_SECRET_REF: REDACTED_EVENT_VALUE,
           },
         },
       },
+    });
+  });
+
+  it("masks malformed env containers wholesale in agent config mode", () => {
+    expect(redactAgentConfigPayload({
+      runtimeConfig: {
+        scalar: { env: SECRET },
+        array: { env: [SECRET] },
+        missing: { env: null },
+      },
+    })).toEqual({
+      runtimeConfig: {
+        scalar: { env: REDACTED_EVENT_VALUE },
+        array: { env: REDACTED_EVENT_VALUE },
+        missing: { env: REDACTED_EVENT_VALUE },
+      },
+    });
+  });
+
+  it("propagates structural redaction through non-string command args", () => {
+    expect(redactAgentConfigPayload({
+      commandArgs: [
+        "--safe",
+        { type: "plain", value: SECRET },
+        { nested: { type: "plain", value: SECRET } },
+        { type: "secret_ref", version: { value: SECRET } },
+      ],
+      argv: [{ type: "plain", value: SECRET }],
+    })).toEqual({
+      commandArgs: [
+        "--safe",
+        { type: "plain", value: REDACTED_EVENT_VALUE },
+        { nested: { type: "plain", value: REDACTED_EVENT_VALUE } },
+        REDACTED_EVENT_VALUE,
+      ],
+      argv: [{ type: "plain", value: REDACTED_EVENT_VALUE }],
     });
   });
 
