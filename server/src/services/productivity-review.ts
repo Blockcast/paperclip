@@ -386,22 +386,6 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .then((rows) => rows[0] ?? null);
   }
 
-  async function findLatestRefreshCommentAt(companyId: string, reviewIssueId: string) {
-    return db
-      .select({ createdAt: issueComments.createdAt })
-      .from(issueComments)
-      .where(
-        and(
-          eq(issueComments.companyId, companyId),
-          eq(issueComments.issueId, reviewIssueId),
-          sql`${issueComments.body} like ${`${PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX}%`}`,
-        ),
-      )
-      .orderBy(desc(issueComments.createdAt))
-      .limit(1)
-      .then((rows) => rows[0]?.createdAt ?? null);
-  }
-
   async function findRecentResolvedProductivityReview(
     companyId: string,
     sourceIssueId: string,
