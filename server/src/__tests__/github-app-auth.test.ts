@@ -204,14 +204,46 @@ describe("githubHasReviewerEvidenceForPr", () => {
     });
   });
 
-  it("rejects an exact-head review from the same-slug user seat", async () => {
+  it("rejects same-slug user-seat reviews without approved consolidated attestation", async () => {
     setCreds();
     stubGithub({
-      reviews: [{ user: { login: "allyblockcast" }, commit_id: headSha }],
+      reviews: [
+        {
+          user: { login: "allyblockcast" },
+          commit_id: headSha,
+          state: "COMMENTED",
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha}\n\nNo findings.`,
+        },
+        {
+          user: { login: "allyblockcast" },
+          commit_id: headSha,
+          state: "APPROVED",
+          body: "Looks good.",
+        },
+      ],
       comments: [],
     });
     await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
       found: false,
+    });
+  });
+
+  it("accepts an approved same-slug user-seat review with exact-head consolidated attestation", async () => {
+    setCreds();
+    stubGithub({
+      reviews: [
+        {
+          user: { login: "allyblockcast" },
+          commit_id: headSha,
+          state: "APPROVED",
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha}\n\nNo findings.`,
+        },
+      ],
+      comments: [],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: true,
+      via: "review",
     });
   });
 

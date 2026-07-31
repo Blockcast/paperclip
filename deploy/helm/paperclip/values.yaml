@@ -159,7 +159,8 @@ secret:
 # -- GitHub App creds for server-side installation-token minting. Lets the API
 # authoritatively verify (via the GitHub API) that a PR-review run actually left
 # a review/comment before completing it (BLO-10448). Deployments that run the PR
-# reviewer must enable this; missing credentials fail review completion closed.
+# reviewer must enable this; missing credentials warn at API startup and fail
+# review completion closed.
 # Disabled by default for deployments that do not use the reviewer workflow.
 githubApp:
   # -- Mount the GitHub App creds into the API env and enable GitHub-verified PR-review evidence.

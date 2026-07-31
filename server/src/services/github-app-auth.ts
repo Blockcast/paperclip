@@ -83,6 +83,12 @@ export function githubReviewerIdentityMatches(login: string, configuredLogin: st
   return candidate === `${appSlug}[bot]` || candidate === `app/${appSlug}`;
 }
 
+function githubReviewerApprovalSeatMatches(login: string, configuredLogin: string): boolean {
+  const candidate = exactGithubLogin(login);
+  const appSlug = githubReviewerAppSlug(configuredLogin);
+  return Boolean(candidate && appSlug && candidate === appSlug);
+}
+
 /**
  * Mint an RS256 GitHub App JWT (valid ~9 min). Returns null when the App id or
  * private key is unconfigured.
@@ -229,6 +235,9 @@ function consolidatedReviewHead(body: string): string | null {
  * Found when either:
  *  - a review authored by the bot has `commit_id === headSha` (precise: reviewed
  *    this exact head), or
+ *  - an APPROVED review authored by the same-slug user seat has the canonical
+ *    consolidated-review body and exactly one standalone full-SHA `Reviewed head:`
+ *    attestation (covers GitHub's App-self-review restriction), or
  *  - an issue comment authored by the bot has the canonical consolidated-review
  *    heading and exactly one standalone full-SHA `Reviewed head:` attestation
  *    (covers comment-mode reviews on bot-authored PRs, which carry no commit_id).
@@ -280,13 +289,29 @@ export async function githubHasReviewerEvidenceForPr(input: {
       const url = `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`;
       const res = await ghFetch(url, { headers });
       if (!res.ok) return { error: `reviews_http_${res.status}` };
-      const batch = (await res.json()) as Array<{ user?: { login?: string }; commit_id?: string | null }>;
+      const batch = (await res.json()) as Array<{
+        user?: { login?: string };
+        commit_id?: string | null;
+        state?: string | null;
+        body?: string | null;
+      }>;
       for (const review of batch) {
-        if (!githubReviewerIdentityMatches(review.user?.login ?? "", botLogin)) continue;
-        if (!headSha) return { found: true, via: "review" };
+        const authorLogin = review.user?.login ?? "";
         const commitId = headShaHex(review.commit_id);
-        if (commitId === headSha) return { found: true, via: "review" };
-        if (commitId) reviewCandidates.push(commitId);
+        if (githubReviewerIdentityMatches(authorLogin, botLogin)) {
+          if (!headSha) return { found: true, via: "review" };
+          if (commitId === headSha) return { found: true, via: "review" };
+          if (commitId) reviewCandidates.push(commitId);
+          continue;
+        }
+        if (githubReviewerApprovalSeatMatches(authorLogin, botLogin)) {
+          if ((review.state ?? "").toUpperCase() !== "APPROVED") continue;
+          const reviewedHead = consolidatedReviewHead(review.body ?? "");
+          if (!reviewedHead) continue;
+          if (!headSha) return { found: true, via: "review" };
+          if (reviewedHead === headSha) return { found: true, via: "review" };
+          reviewCandidates.push(reviewedHead);
+        }
       }
       if (batch.length < 100) break;
     }

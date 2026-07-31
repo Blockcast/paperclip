@@ -141,6 +141,10 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
     storageS3Endpoint: undefined,
     storageS3Prefix: "",
     storageS3ForcePathStyle: false,
+    githubAppId: "3966421",
+    githubAppInstallationId: "12345678",
+    githubAppPrivateKey: "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----",
+    prReviewerBotLogin: "allyblockcast[bot]",
     feedbackExportBackendUrl: "https://telemetry.example.com",
     feedbackExportBackendToken: "telemetry-token",
     heartbeatSchedulerEnabled: false,
@@ -289,6 +293,7 @@ vi.mock("../auth/better-auth.js", () => ({
 }));
 
 import { startServer } from "../index.js";
+import { logger } from "../middleware/logger.js";
 
 describe("startServer feedback export wiring", () => {
   beforeEach(() => {
@@ -314,6 +319,25 @@ describe("startServer feedback export wiring", () => {
       storageService: { id: "storage-service" },
       serverPort: 3210,
     });
+  });
+
+  it("warns when PR-reviewer App identity is configured without GitHub App credentials", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      githubAppId: "",
+      githubAppInstallationId: "",
+      githubAppPrivateKey: "",
+      prReviewerBotLogin: "allyblockcast[bot]",
+    }));
+
+    await startServer();
+
+    expect(logger.warn).toHaveBeenCalledWith(
+      {
+        configuredLogin: "allyblockcast[bot]",
+        missingCredentials: ["GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY"],
+      },
+      "GitHub App credentials are required to verify PR-review evidence; missing credentials will fail reviewer completion closed",
+    );
   });
 
   it("keeps routine ticks and setup cleanup active when heartbeat scheduling is suppressed", async () => {

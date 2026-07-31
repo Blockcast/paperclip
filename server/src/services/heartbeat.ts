@@ -14933,7 +14933,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             status: "missing",
             errorCode: "pr_review_output_missing",
             errorMessage:
-              "PR reviewer run claimed a posted review, but GitHub has no exact-head review from the configured App identity",
+              "PR reviewer run claimed a posted review, but GitHub has no exact-head review from a trusted reviewer identity",
           };
         }
       }
@@ -19737,7 +19737,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             status: "missing",
             errorCode: "pr_review_output_missing",
             errorMessage:
-              "PR reviewer run claimed a posted review, but GitHub has no exact-head review from the configured App identity",
+              "PR reviewer run claimed a posted review, but GitHub has no exact-head review from a trusted reviewer identity",
           };
         }
       }
