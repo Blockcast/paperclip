@@ -20,6 +20,11 @@
     "scripts/store.py",
     "scripts/watchlist.py"
   ],
+  "pinned": {
+    "name": "last30days",
+    "description": "Research what people actually say about any topic in the last 30 days. Pulls posts and engagement from Reddit, X, YouTube, TikTok, Hacker News, Polymarket, GitHub, and the web.",
+    "inventorySha256": "sha256:4401be10699f1e4186108bd2dc48172296170c6b23ed2b3550e60fa54be57fce"
+  },
   "defaultInstall": false,
   "recommendedForRoles": [
     "researcher",

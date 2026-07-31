@@ -611,6 +611,7 @@ export interface CatalogSkillGitHubSource {
   commit: string;
   path: string;
   url: string;
+  descriptorSha256?: string;
 }
 
 export type CatalogSkillSource = CatalogSkillGitHubSource;

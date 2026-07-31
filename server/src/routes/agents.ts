@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
-import { REDACTED_EVENT_VALUE, redactEventPayload } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, redactAgentConfigPayload, redactEventPayload } from "../redaction.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, asc, desc, eq, gte, inArray, not, or, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -90,6 +90,8 @@ import {
   isTruthyRuntimeEnvValue,
   resolveWorktreeRunExecutionActivationState,
 } from "../services/instance-settings.js";
+import { isIssueHeldByForeignRun } from "../services/issue-run-holding.js";
+import { logger } from "../middleware/logger.js";
 import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
 import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/adapter-codex-local";
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
@@ -145,6 +147,15 @@ function containsRedactedAdapterValue(value: unknown): boolean {
 
 function restoreRedactedAdapterValue(incoming: unknown, existing: unknown): unknown {
   if (incoming === REDACTED_EVENT_VALUE) {
+    return existing === undefined ? OMIT_REDACTED_ADAPTER_VALUE : existing;
+  }
+  if (
+    incoming
+    && typeof incoming === "object"
+    && !Array.isArray(incoming)
+    && (incoming as { type?: unknown; value?: unknown }).type === "plain"
+    && (incoming as { type?: unknown; value?: unknown }).value === REDACTED_EVENT_VALUE
+  ) {
     return existing === undefined ? OMIT_REDACTED_ADAPTER_VALUE : existing;
   }
   if (Array.isArray(incoming)) {
@@ -813,7 +824,7 @@ export function agentRoutes(
     ]);
 
     return {
-      ...(options?.restricted ? redactForRestrictedAgentView(agent) : agent),
+      ...(options?.restricted ? redactForRestrictedAgentView(agent) : redactAgentSecrets(agent)),
       chainOfCommand,
       access: accessState,
     };
@@ -1286,6 +1297,52 @@ export function agentRoutes(
       mergedRuntimeConfig.heartbeat = { ...existingHeartbeat, ...requestedHeartbeat };
     }
     return mergedRuntimeConfig;
+  }
+
+  function restoreRedactedRuntimeConfigValues(
+    existingRuntimeConfig: unknown,
+    requestedRuntimeConfig: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const existingRecord = asRecord(existingRuntimeConfig) ?? {};
+    const restoredRuntimeConfig = containsRedactedAdapterValue(requestedRuntimeConfig)
+      ? (restoreRedactedAdapterValue(requestedRuntimeConfig, existingRecord) as Record<string, unknown>)
+      : requestedRuntimeConfig;
+    return restoreRedactedRuntimeConfigAdapterConfigs(existingRuntimeConfig, restoredRuntimeConfig);
+  }
+
+  /**
+   * `runtimeConfig.modelProfiles.*.adapterConfig` is a real adapter config —
+   * it holds env bindings and is normalized for persistence like any other —
+   * so a response redacts it and a naive save posts the sentinel back.
+   * `normalizeEnvConfig` would reject the short env sentinel with a 422; restore
+   * it against the stored config instead, exactly as the top-level adapterConfig
+   * does.
+   */
+  function restoreRedactedRuntimeConfigAdapterConfigs(
+    existingRuntimeConfig: unknown,
+    requestedRuntimeConfig: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const entries = listRuntimeModelProfileAdapterConfigs(requestedRuntimeConfig);
+    if (entries.length === 0) return requestedRuntimeConfig;
+
+    const existingModelProfiles = asRecord(asRecord(existingRuntimeConfig)?.modelProfiles) ?? {};
+    const restored = { ...requestedRuntimeConfig };
+    const modelProfiles = { ...(asRecord(requestedRuntimeConfig.modelProfiles) ?? {}) };
+    restored.modelProfiles = modelProfiles;
+
+    for (const entry of entries) {
+      const existingProfileAdapterConfig = asRecord(
+        asRecord(existingModelProfiles[entry.profileKey])?.adapterConfig,
+      );
+      modelProfiles[entry.profileKey] = {
+        ...entry.profile,
+        adapterConfig: stripRedactedEnvBindingsFromAdapterConfig(
+          entry.adapterConfig,
+          existingProfileAdapterConfig,
+        ),
+      };
+    }
+    return restored;
   }
 
   function listRuntimeModelProfileAdapterConfigs(runtimeConfig: unknown): Array<{
@@ -1806,13 +1863,37 @@ export function agentRoutes(
     };
   }
 
+  /**
+   * Strip credential material out of an agent row before it goes on the wire.
+   *
+   * `adapterConfig` holds live secrets — `{type:"plain",value}` env bindings and
+   * literal `Bearer …` values in `mcpServers.*.headers`. This used to be applied
+   * only on the read paths, so a budget-only `PATCH /api/agents/:id` handed the
+   * caller the agent's entire credential set, and it landed verbatim in agent
+   * transcripts and run logs, which are read far more widely than the secret
+   * store (BLO-18969).
+   *
+   * `secret_ref` / `user_secret_ref` bindings are pointers, not plaintext, so
+   * they survive — minus any resolved `value`, which the schema has no field
+   * for and which only ever means a secret leaked in.
+   *
+   * Redaction is structural, not key-name based: `redactAgentConfigPayload`
+   * masks every plain binding and every `env` value at any depth, so a nested
+   * `runtimeConfig.modelProfiles.*.adapterConfig.env` entry is covered too.
+   *
+   * Every response that serializes an agent MUST go through here,
+   * `redactForRestrictedAgentView`, or `redactAgentConfiguration`. Adding an
+   * agent-serializing route without one of them reopens this hole.
+   */
   function redactAgentSecrets<T extends { adapterConfig?: unknown; runtimeConfig?: unknown }>(agent: T): T {
     let result = { ...agent };
     const config = asRecord(agent.adapterConfig);
     if (config) {
-      const redactedConfig = redactEventPayload(config) ?? {};
+      const redactedConfig = redactAgentConfigPayload(config) ?? {};
       const env = asRecord(config.env);
       if (env) {
+        // The top-level env keeps the shorter `***` sentinel the UI and
+        // `stripRedactedEnvBindingsFromAdapterConfig` have always round-tripped.
         const redactedEnv: Record<string, string> = {};
         for (const key of Object.keys(env)) {
           redactedEnv[key] = REDACTED_ENV_SENTINEL;
@@ -1824,7 +1905,7 @@ export function agentRoutes(
     }
     const rtConfig = asRecord(agent.runtimeConfig);
     if (rtConfig) {
-      result.runtimeConfig = redactEventPayload(rtConfig) as T["runtimeConfig"];
+      result.runtimeConfig = redactAgentConfigPayload(rtConfig) as T["runtimeConfig"];
     }
     return result;
   }
@@ -1841,8 +1922,8 @@ export function agentRoutes(
       status: agent.status,
       reportsTo: agent.reportsTo,
       adapterType: agent.adapterType,
-      adapterConfig: redactEventPayload(agent.adapterConfig),
-      runtimeConfig: redactEventPayload(agent.runtimeConfig),
+      adapterConfig: redactAgentConfigPayload(agent.adapterConfig),
+      runtimeConfig: redactAgentConfigPayload(agent.runtimeConfig),
       permissions: agent.permissions,
       updatedAt: agent.updatedAt,
     };
@@ -1853,19 +1934,19 @@ export function agentRoutes(
     const record = snapshot as Record<string, unknown>;
     return {
       ...record,
-      adapterConfig: redactEventPayload(
+      adapterConfig: redactAgentConfigPayload(
         typeof record.adapterConfig === "object" && record.adapterConfig !== null
           ? (record.adapterConfig as Record<string, unknown>)
           : {},
       ),
-      runtimeConfig: redactEventPayload(
+      runtimeConfig: redactAgentConfigPayload(
         typeof record.runtimeConfig === "object" && record.runtimeConfig !== null
           ? (record.runtimeConfig as Record<string, unknown>)
           : {},
       ),
       metadata:
         typeof record.metadata === "object" && record.metadata !== null
-          ? redactEventPayload(record.metadata as Record<string, unknown>)
+          ? redactAgentConfigPayload(record.metadata as Record<string, unknown>)
           : record.metadata ?? null,
     };
   }
@@ -2317,7 +2398,7 @@ export function agentRoutes(
       });
       return;
     }
-    res.json(redactAgentSecrets(await buildAgentDetail(agent)));
+    res.json(await buildAgentDetail(agent));
   });
 
   router.get("/agents/me/inbox-lite", async (req, res) => {
@@ -2349,8 +2430,43 @@ export function agentRoutes(
       recoveryActionsSvc.listActiveForIssues(req.actor.companyId, issueIds),
     ]);
 
+    // BLO-19001: never offer an issue that a *different* live run already holds.
+    //
+    // Dispatch enforces one-live-run-per-issue only for runs that already carry
+    // an issueId. An autonomous heartbeat run carries none, so it is dispatched
+    // freely and then self-selects here — landing on an issue a sibling run of
+    // this same agent is mid-way through. Under a shared worktree both runs then
+    // edit one tree, and a routine `rm -rf node_modules` in one destroys the
+    // other's state.
+    //
+    // Suppressed rather than flagged: a flag only works if every agent honours
+    // it, and in the observed incident an in-thread warning did not stop the
+    // next run from selecting the same issue 8 minutes later.
+    const callerRunId = req.actor.runId ?? null;
+    const nowMs = Date.now();
+    const offeredRows = eligibleRows.filter((issue) => {
+      const held = isIssueHeldByForeignRun({
+        activeRun: issue.activeRun,
+        callerRunId,
+        nowMs,
+      });
+      if (held) {
+        logger.info(
+          {
+            agentId: req.actor.agentId,
+            issueId: issue.id,
+            identifier: issue.identifier,
+            callerRunId,
+            holdingRunId: issue.activeRun?.id ?? null,
+          },
+          "inbox-lite: withheld issue already held by another live run of this agent",
+        );
+      }
+      return !held;
+    });
+
     res.json(
-      eligibleRows.map((issue) => ({
+      offeredRows.map((issue) => ({
         id: issue.id,
         identifier: issue.identifier,
         title: issue.title,
@@ -2412,7 +2528,7 @@ export function agentRoutes(
       res.json(await buildAgentDetail(agent, { restricted: true }));
       return;
     }
-    res.json(redactAgentSecrets(await buildAgentDetail(agent)));
+    res.json(await buildAgentDetail(agent));
   });
 
   router.get("/agents/:id/configuration", async (req, res) => {
@@ -2485,7 +2601,7 @@ export function agentRoutes(
       details: { revisionId },
     });
 
-    res.json(updated);
+    res.json(redactAgentSecrets(updated));
   });
 
   router.get("/agents/:id/runtime-state", async (req, res) => {
@@ -2622,6 +2738,13 @@ export function agentRoutes(
 
     if (requiresApproval) {
       const requestedAdapterType = normalizedHireInput.adapterType ?? agent.adapterType;
+      // Deliberately the generic redactor, matching what is already stored:
+      // this snapshot is replayed verbatim over the agent row on approval
+      // (`activatePendingApproval`), which is what stops a pending agent from
+      // tampering with its own config before the board sees it. Redacting it
+      // harder would write masks back over live credentials. The snapshot is
+      // kept safe on the way *out* instead — every response that serializes an
+      // approval payload goes through `redactAgentConfigPayload`. BLO-18969.
       const requestedAdapterConfig =
         redactEventPayload(
           (agent.adapterConfig ?? normalizedHireInput.adapterConfig) as Record<string, unknown>,
@@ -2723,7 +2846,15 @@ export function agentRoutes(
       });
     }
 
-    res.status(201).json({ agent, approval });
+    // The hire approval payload embeds the requested adapterConfig (twice —
+    // also under requestedConfigurationSnapshot), so redacting only `agent`
+    // would leave the same credentials on the wire one key over. BLO-18969.
+    res.status(201).json({
+      agent: redactAgentSecrets(agent),
+      approval: approval
+        ? { ...approval, payload: redactAgentConfigPayload(asRecord(approval.payload) ?? null) }
+        : approval,
+    });
   });
 
   router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {
@@ -2847,7 +2978,7 @@ export function agentRoutes(
       );
     }
 
-    res.status(201).json(agent);
+    res.status(201).json(redactAgentSecrets(agent));
   });
 
   router.patch("/agents/:id/permissions", validate(updateAgentPermissionsSchema), async (req, res) => {
@@ -3180,7 +3311,10 @@ export function agentRoutes(
         res.status(422).json({ error: "runtimeConfig must be an object" });
         return;
       }
-      requestedRuntimeConfig = mergeRuntimeConfigPatchForAgentUpdate(existing.runtimeConfig, runtimeConfig);
+      requestedRuntimeConfig = restoreRedactedRuntimeConfigValues(
+        existing.runtimeConfig,
+        mergeRuntimeConfigPatchForAgentUpdate(existing.runtimeConfig, runtimeConfig),
+      );
       assertNoAgentRuntimeConfigAdapterConfigMutation(req, requestedRuntimeConfig);
     }
     const touchesAdapterConfiguration =
@@ -3342,7 +3476,7 @@ export function agentRoutes(
       details: summarizeAgentUpdateDetails(patchData),
     });
 
-    res.json(agent);
+    res.json(redactAgentSecrets(agent));
   });
 
   router.post("/agents/:id/pause", async (req, res) => {
@@ -3368,7 +3502,7 @@ export function agentRoutes(
       entityId: agent.id,
     });
 
-    res.json(agent);
+    res.json(redactAgentSecrets(agent));
   });
 
   router.post("/agents/:id/resume", async (req, res) => {
@@ -3399,7 +3533,7 @@ export function agentRoutes(
       entityId: agent.id,
     });
 
-    res.json(agent);
+    res.json(redactAgentSecrets(agent));
   });
 
   router.post("/agents/:id/clear-error", async (req, res) => {
@@ -3431,7 +3565,7 @@ export function agentRoutes(
       entityId: agent.id,
     });
 
-    res.json(agent);
+    res.json(redactAgentSecrets(agent));
   });
 
   router.post("/agents/:id/approve", async (req, res) => {
@@ -3485,7 +3619,7 @@ export function agentRoutes(
       details: { source: "agent_detail", approvalId: openApproval?.id ?? null },
     });
 
-    res.json(agent);
+    res.json(redactAgentSecrets(agent));
   });
 
   router.post("/agents/:id/terminate", async (req, res) => {
@@ -3555,7 +3689,7 @@ export function agentRoutes(
       },
     });
 
-    res.json(agent);
+    res.json(redactAgentSecrets(agent));
   });
 
   router.delete("/agents/:id", async (req, res) => {

@@ -332,6 +332,7 @@ describe("sandbox callback bridge", () => {
     const worker = await startSandboxCallbackBridgeWorker({
       client: createFileSystemSandboxCallbackBridgeQueueClient(),
       queueDir,
+      pollIntervalMs: 1,
       authorizeRequest: async () => null,
       handleRequest: async (request) => {
         processed.push(request.id);
@@ -426,7 +427,7 @@ describe("sandbox callback bridge", () => {
       "utf8",
     );
 
-    for (let attempt = 0; attempt < 50 && processed.length === 0; attempt += 1) {
+    for (let attempt = 0; attempt < 200 && processed.length === 0; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 
@@ -1016,5 +1017,41 @@ describe("sandbox callback bridge", () => {
         PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge",
       },
     }));
+  });
+
+  it("publishes command-managed JSON writes only after staging them outside the visible queue", async () => {
+    const runner = {
+      execute: vi.fn(async (_input: {
+        command: string;
+        args?: string[];
+        cwd?: string;
+        env?: Record<string, string>;
+        stdin?: string;
+        timeoutMs?: number;
+      }): Promise<RunProcessResult> => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+        pid: null,
+        startedAt: new Date().toISOString(),
+      })),
+    };
+
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({
+      runner,
+      remoteCwd: "/workspace",
+      timeoutMs: 30_000,
+    });
+
+    await client.writeTextFile("/workspace/queue/000000000001.json", "{\"ok\":true}\n");
+
+    const scripts = runner.execute.mock.calls
+      .map(([input]) => input.args?.join("\n") ?? "")
+      .join("\n---\n");
+    expect(scripts).toContain("/workspace/queue/000000000001.json.paperclip-upload.tmp");
+    expect(scripts).toContain("mv -f '/workspace/queue/000000000001.json.paperclip-upload.tmp' '/workspace/queue/000000000001.json'");
+    expect(scripts).not.toContain("> '/workspace/queue/000000000001.json'");
   });
 });

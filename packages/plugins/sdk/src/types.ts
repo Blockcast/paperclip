@@ -1645,8 +1645,19 @@ export interface PluginAgentsClient {
   pause(agentId: string, companyId: string): Promise<Agent>;
   /** Resume a paused agent (sets status to idle). Throws if terminated, pending_approval, or not found. Requires `agents.resume`. */
   resume(agentId: string, companyId: string): Promise<Agent>;
-  /** Invoke (wake up) an agent with a prompt payload. Throws if paused, terminated, pending_approval, or not found. Requires `agents.invoke`. */
-  invoke(agentId: string, companyId: string, opts: { prompt: string; reason?: string }): Promise<{ runId: string }>;
+  /**
+   * Invoke (wake up) an agent with a prompt payload. Throws if paused, terminated, pending_approval, or not found. Requires `agents.invoke`.
+   *
+   * Pass `taskKey` whenever concurrent invokes represent *different* units of
+   * work (e.g. `pr_review:<repo>:<number>`). Invokes that omit it are treated
+   * as independent and are never coalesced with each other. Pass
+   * `idempotencyKey` (e.g. a webhook delivery id) to make redelivery safe.
+   */
+  invoke(
+    agentId: string,
+    companyId: string,
+    opts: { prompt: string; reason?: string; taskKey?: string; idempotencyKey?: string },
+  ): Promise<{ runId: string; deduplicated?: boolean }>;
   /**
    * Set or clear a company agent's adapter override. The override is overlaid on
    * the agent's base adapter config (e.g. to repoint traffic at a different

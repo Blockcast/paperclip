@@ -7,6 +7,7 @@ import {
   heartbeatRuns,
   instanceUserRoles,
   issueComments,
+  issueRecoveryActions,
   issues,
   principalPermissionGrants,
   projects,
@@ -27,6 +28,7 @@ import {
   resolveCoreTrustPreset,
   type TrustPresetResolution,
 } from "./trust-preset-resolver.js";
+import { ACTIVE_RECOVERY_ACTION_STATUSES } from "./issue-recovery-actions.js";
 import { logger } from "../middleware/logger.js";
 
 export type AuthorizationActor =
@@ -83,6 +85,7 @@ export type AuthorizationResource =
       parentIssueId?: string | null;
       assigneeAgentId?: string | null;
       assigneeUserId?: string | null;
+      createdByAgentId?: string | null;
       originKind?: string | null;
       originId?: string | null;
       status?: string | null;
@@ -103,6 +106,8 @@ export type AuthorizationDecision = {
     | "allow_consented_change"
     | "allow_legacy_agent_creator"
     | "allow_issue_mention_grant"
+    | "allow_issue_creator"
+    | "allow_recovery_handoff_grant"
     | "allow_self"
     | "allow_company_agent"
     | "allow_company_member"
@@ -1369,6 +1374,103 @@ export function authorizationService(db: Db) {
     });
   }
 
+  // Recovery escalation moves `assigneeAgentId` to the recovery owner, which
+  // costs the previous owner `allow_self` mid-run — so the agent holding the
+  // freshest diagnosis loses the ability to write it down on the issue it was
+  // just taken off, and the new owner starts cold (BLO-18906).
+  //
+  // This opens a comment-only channel back to that agent, and nothing more:
+  //   * comment-only  — the caller gates on `issue:comment`, exactly as the
+  //     mention grant does. `issue:mutate` is never reachable from here, so no
+  //     status change, no re-assignment, no delete.
+  //   * issue-scoped  — keyed on `sourceIssueId`; the partial unique index
+  //     `issue_recovery_actions_active_source_uq` means at most one active row
+  //     per (company, issue).
+  //   * agent-scoped  — keyed on `previousOwnerAgentId`, the single agent the
+  //     transfer took the issue from. Managers, creators and peers get nothing.
+  //   * state-bounded — only while the recovery action is active/escalated.
+  //     Resolving or cancelling it lapses the grant, and a resolved row can
+  //     never be revived (`upsertSourceScoped` only ever updates an active row).
+  //   * owner-bound   — the row's `ownerAgentId` must still be the issue's
+  //     `assigneeAgentId`. A second reassignment away from the recovery owner
+  //     lapses the grant too, so the channel only ever exists between the agent
+  //     the issue was taken from and the agent currently holding it.
+  //
+  // `previousOwnerAgentId` is written server-side from `issues.assigneeAgentId`
+  // under an advisory lock (`recovery/service.ts` ensureSourceScopedStranded-
+  // RecoveryAction) and appears on no request schema, so it cannot be supplied
+  // by a caller. Known limitation, deliberately not papered over: an agent can
+  // self-assign any *unassigned* company issue (`allow_company_agent`), let the
+  // run strand, and be transferred away — retaining this comment channel for
+  // the life of the recovery action. That precondition is the pre-existing
+  // unassigned-issue grant, which is strictly wider (it confers full
+  // `issue:mutate`); this path adds persistence, not reach.
+  async function agentHasRecoveryHandoffGrantOnIssue(input: {
+    action: AuthorizationAction;
+    companyId: string;
+    issueId: string;
+    actorAgentId: string;
+  }) {
+    const [row] = await db
+      .select({
+        id: issueRecoveryActions.id,
+        kind: issueRecoveryActions.kind,
+        cause: issueRecoveryActions.cause,
+        ownerAgentId: issueRecoveryActions.ownerAgentId,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issueRecoveryActions)
+      // Join authoritative issue state rather than trusting the recovery row
+      // alone: the row records who the transfer handed the issue to at the time
+      // it fired, which is not the same claim as "that agent still holds it".
+      .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
+      .where(and(
+        eq(issueRecoveryActions.companyId, input.companyId),
+        eq(issueRecoveryActions.sourceIssueId, input.issueId),
+        eq(issueRecoveryActions.previousOwnerAgentId, input.actorAgentId),
+        inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+        // The transfer target must STILL be the assignee. Without this, a second
+        // reassignment (owner → some third agent) while the action stays active
+        // would leave the original previous owner holding a comment channel onto
+        // an issue neither of them owns any more; and an action kind that names
+        // an owner without itself moving `assigneeAgentId` would become a grant
+        // retroactively as soon as anything else reassigned the issue.
+        // NULL `ownerAgentId` also fails this comparison (SQL `NULL = x` is not
+        // true), which is the wanted outcome for board/system-owned rows.
+        eq(issues.assigneeAgentId, issueRecoveryActions.ownerAgentId),
+      ))
+      .limit(1);
+    if (!row) return false;
+    // Only a transfer *away* from the actor opens the channel. Board- and
+    // system-owned actions (null `ownerAgentId`) leave the assignee in place,
+    // so the previous owner is still the assignee and `allow_self` already
+    // covered it before we got here — such rows must not widen anything.
+    // Belt-and-braces after the join predicate above, which already excludes
+    // both shapes; keep it so the invariant survives a query rewrite.
+    if (!row.ownerAgentId || row.ownerAgentId === input.actorAgentId) return false;
+    if (row.assigneeAgentId !== row.ownerAgentId) return false;
+    logger.info({
+      actorAgentId: input.actorAgentId,
+      issueId: input.issueId,
+      companyId: input.companyId,
+      recoveryActionId: row.id,
+      recoveryActionKind: row.kind,
+      recoveryActionCause: row.cause,
+      recoveryOwnerAgentId: row.ownerAgentId,
+      grantedAction: input.action,
+      grant: "recovery_handoff_comment",
+    }, "authorized recovery handoff comment grant");
+    return true;
+  }
+
+  function allowRecoveryHandoffGrant(action: AuthorizationAction): AuthorizationDecision {
+    return allow({
+      action,
+      reason: "allow_recovery_handoff_grant",
+      explanation: "Allowed by a recovery-handoff issue comment grant for the reassigned previous owner.",
+    });
+  }
+
   async function decideBase(input: {
     actor: AuthorizationActor;
     action: AuthorizationAction;
@@ -1938,6 +2040,26 @@ export function authorizationService(db: Db) {
       }
       if (
         input.action === "issue:comment" &&
+        resource?.createdByAgentId === actorAgentId
+      ) {
+        return allow({
+          action: input.action,
+          reason: "allow_issue_creator",
+          explanation: "Allowed because the actor created this issue.",
+        });
+      }
+      if (
+        input.action === "issue:comment" &&
+        await isManagerOf(companyId, actorAgentId, resource.assigneeAgentId)
+      ) {
+        return allow({
+          action: input.action,
+          reason: "allow_manager_chain",
+          explanation: "Allowed because the actor manages the issue assignee in the reporting chain.",
+        });
+      }
+      if (
+        input.action === "issue:comment" &&
         resource?.issueId &&
         await agentHasMentionGrantOnIssue({
           action: input.action,
@@ -1948,6 +2070,18 @@ export function authorizationService(db: Db) {
         })
       ) {
         return allowIssueMentionGrant(input.action);
+      }
+      if (
+        input.action === "issue:comment" &&
+        resource?.issueId &&
+        await agentHasRecoveryHandoffGrantOnIssue({
+          action: input.action,
+          companyId,
+          issueId: resource.issueId,
+          actorAgentId,
+        })
+      ) {
+        return allowRecoveryHandoffGrant(input.action);
       }
     }
     if (

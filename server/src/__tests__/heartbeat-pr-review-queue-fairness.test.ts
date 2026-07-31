@@ -337,7 +337,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
             wakeReason: "github_pr_synchronized",
             githubHeadSha: "aef0402c0eb1bd2d302a4b549390b48672b5e080",
           },
-          idempotencyKey: `${taskKey}:github_pr_synchronized`,
+          idempotencyKey: `${taskKey}:github_pr_synchronized:delivery:delivery-${index}`,
         })
       ),
     );
@@ -358,7 +358,11 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
     expect(wakeups.filter((wake) => wake.status === "coalesced")).toHaveLength(11);
   });
 
-  it("coalesces when a same-task run starts while enqueue waits for the agent lock", async () => {
+  // BLO-18953: a synchronize push refreshes reviewer expectations for the
+  // current head. A review run that becomes running while this enqueue waits
+  // for the agent lock has already snapshotted an older head, so the push
+  // needs its own queued follow-up.
+  it("queues a synchronize follow-up when a same-task run starts while enqueue waits for the agent lock", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runningRunId = randomUUID();
@@ -423,55 +427,192 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
     const enqueue = heartbeat.wakeup(agentId, {
       source: "automation",
       triggerDetail: "system",
-      reason: "github_pr_review_requested",
-      payload: { taskKey, deliveryId: "review-request-delivery" },
+      reason: "github_pr_synchronized",
+      payload: { taskKey, deliveryId: "push-delivery" },
       contextSnapshot: {
         taskKey,
         reviewKind: "pr_review",
-        wakeReason: "github_pr_review_requested",
+        prRole: "reviewer",
+        wakeReason: "github_pr_synchronized",
         githubRepoFullName: "Blockcast/penstock-llm-proxy-core",
         githubPrNumber: 691,
       },
-      idempotencyKey: `${taskKey}:github_pr_review_requested`,
+      idempotencyKey: `${taskKey}:github_pr_synchronized:delivery:push-delivery`,
     });
 
-    const lockWaitDeadline = Date.now() + 10_000;
-    let enqueueIsWaitingForLock = false;
-    while (Date.now() < lockWaitDeadline) {
-      const waitingRows = await db.execute(sql<{ waiting: boolean }>`
-        select exists (
-          select 1
-          from pg_stat_activity
-          where datname = current_database()
-            and pid <> pg_backend_pid()
-            and wait_event_type = 'Lock'
-            and query ~* 'select id from agents.*for update'
-        ) as waiting
-      `);
-      if (Array.from(waitingRows)[0]?.waiting) {
-        enqueueIsWaitingForLock = true;
-        break;
+    let result: Awaited<typeof enqueue> | undefined;
+    try {
+      const lockWaitDeadline = Date.now() + 10_000;
+      let enqueueIsWaitingForLock = false;
+      while (Date.now() < lockWaitDeadline) {
+        const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+              and query ~* 'select id from agents.*for update'
+          ) as waiting
+        `);
+        if (Array.from(waitingRows)[0]?.waiting) {
+          enqueueIsWaitingForLock = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
       }
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(enqueueIsWaitingForLock).toBe(true);
+    } finally {
+      releaseRunLock();
+      await inFlightRun;
+      result = await enqueue;
     }
-    expect(enqueueIsWaitingForLock).toBe(true);
-
-    releaseRunLock();
-    await inFlightRun;
-    const result = await enqueue;
 
     const runs = await db
       .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId));
-    expect(runs).toEqual([{ id: runningRunId, status: "running" }]);
-    expect(result?.id).toBe(runningRunId);
+    expect(runs).toHaveLength(2);
+    expect(runs.find((run) => run.id === runningRunId)?.status).toBe("running");
+    expect(result?.id).not.toBe(runningRunId);
+    expect(runs.find((run) => run.id === result?.id)?.status).toBe("queued");
 
     const wakeups = await db
       .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId));
-    expect(wakeups).toEqual([{ status: "coalesced", runId: runningRunId }]);
+    expect(wakeups).toEqual([{ status: "queued", runId: result?.id }]);
+  });
+
+  // BLO-18953: the lossy half of the same race. A review already in flight
+  // against an older head never re-reads head, so absorbing an explicit review
+  // request into it drops the request rather than deferring it. Observed live
+  // on Blockcast/pim-multicast-gateway#1888 and Blockcast/paperclip#822.
+  it("gives an explicit review request its own run when a same-task run starts while enqueue waits for the agent lock", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runningRunId = randomUUID();
+    const taskKey = "pr_review:Blockcast/pim-multicast-gateway:1888";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Review Request Race Co",
+      status: "active",
+      issuePrefix: "RRQ",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Ally",
+      role: "reviewer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    let announceRunLock!: () => void;
+    let releaseRunLock!: () => void;
+    const runLockHeld = new Promise<void>((resolve) => {
+      announceRunLock = resolve;
+    });
+    const runMayCommit = new Promise<void>((resolve) => {
+      releaseRunLock = resolve;
+    });
+
+    const inFlightRun = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select id from agents where id = ${agentId} and company_id = ${companyId} for update`,
+      );
+      announceRunLock();
+      await runMayCommit;
+
+      await tx.insert(heartbeatRuns).values({
+        id: runningRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "running",
+        startedAt: new Date(),
+        contextSnapshot: {
+          taskKey,
+          reviewKind: "pr_review",
+          prRole: "reviewer",
+          wakeReason: "github_pr_review_requested",
+          githubRepoFullName: "Blockcast/pim-multicast-gateway",
+          githubPrNumber: 1888,
+          githubHeadSha: "403b3d73eb9b",
+        },
+      });
+    });
+
+    await runLockHeld;
+    const heartbeat = heartbeatService(peerDb, { skipQueuedRunDispatch: true });
+    const enqueue = heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "github_pr_review_requested",
+      payload: { taskKey, deliveryId: "review-request-delivery" },
+      contextSnapshot: {
+        taskKey,
+        reviewKind: "pr_review",
+        prRole: "reviewer",
+        wakeReason: "github_pr_review_requested",
+        githubRepoFullName: "Blockcast/pim-multicast-gateway",
+        githubPrNumber: 1888,
+        githubHeadSha: "73bdc7303847",
+      },
+      idempotencyKey: `${taskKey}:github_pr_review_requested:comment:1`,
+    });
+
+    let result: Awaited<typeof enqueue> | undefined;
+    try {
+      const lockWaitDeadline = Date.now() + 10_000;
+      let enqueueIsWaitingForLock = false;
+      while (Date.now() < lockWaitDeadline) {
+        const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+              and query ~* 'select id from agents.*for update'
+          ) as waiting
+        `);
+        if (Array.from(waitingRows)[0]?.waiting) {
+          enqueueIsWaitingForLock = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(enqueueIsWaitingForLock).toBe(true);
+    } finally {
+      releaseRunLock();
+      await inFlightRun;
+      result = await enqueue;
+    }
+
+    const runs = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    // The in-flight run survives untouched; the request gets its own queued run
+    // that will read the newer head when it starts.
+    expect(runs).toHaveLength(2);
+    expect(runs.find((run) => run.id === runningRunId)?.status).toBe("running");
+    expect(result?.id).not.toBe(runningRunId);
+    expect(runs.find((run) => run.id === result?.id)?.status).toBe("queued");
+
+    const wakeups = await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups).toEqual([{ status: "queued", runId: result?.id }]);
   });
 
   it("coalesces with a scheduled retry created while the enqueue waits for the agent lock", async () => {

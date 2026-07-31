@@ -259,6 +259,7 @@ function makeAgent(id: string, overrides: Record<string, unknown> = {}) {
     id,
     companyId,
     role: "engineer",
+    status: "active",
     reportsTo: null,
     permissions: { canCreateAgents: false },
     ...overrides,
@@ -410,6 +411,67 @@ function allowStandardAgentRootIssueCreation() {
     reason: "allow_test_default",
     explanation: "Allowed by test default.",
   }));
+}
+
+function createAuthorizationDecisionDb(input: { actor?: { agentId?: string | null } }, agentRows: Record<string, unknown>[]) {
+  const rowsForSelection = (selection: Record<string, unknown>) => {
+    const keys = Object.keys(selection);
+    if (keys.includes("contextSnapshot")) return [];
+    if (keys.includes("reportsTo") && keys.length <= 2) return agentRows;
+    if (keys.includes("role") && keys.includes("permissions")) {
+      return agentRows.filter((agent) => agent.id === input.actor?.agentId);
+    }
+    return [];
+  };
+  return {
+    select: vi.fn((selection: Record<string, unknown> = {}) => ({
+      from: vi.fn(() => ({
+        where: vi.fn(() => ({
+          then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+            Promise.resolve(rowsForSelection(selection)).then(onFulfilled, onRejected),
+        })),
+      })),
+    })),
+  };
+}
+
+function useProductionIssueAuthorization(agentRows: Record<string, unknown>[]) {
+  mockAccessService.decide.mockImplementation(async (input: { actor?: { agentId?: string | null }; action: string }) => {
+    const { authorizationService } =
+      await vi.importActual<typeof import("../services/authorization.js")>("../services/authorization.js");
+    return authorizationService(createAuthorizationDecisionDb(input, agentRows) as never).decide(input as never);
+  });
+}
+
+async function makePendingReviewIssueForAgent(agentId: string, overrides: Record<string, unknown> = {}) {
+  const { normalizeIssueExecutionPolicy } = await vi.importActual<typeof import("../services/issue-execution-policy.js")>(
+    "../services/issue-execution-policy.js",
+  );
+  const policy = normalizeIssueExecutionPolicy({
+    stages: [
+      {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        type: "review",
+        participants: [{ type: "agent", agentId }],
+      },
+    ],
+  })!;
+  return makeIssue({
+    status: "in_review",
+    executionPolicy: policy,
+    executionState: {
+      status: "pending",
+      currentStageId: policy.stages[0].id,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId },
+      returnAssignee: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    },
+    ...overrides,
+  });
 }
 
 describe("agent issue mutation checkout ownership", () => {
@@ -942,6 +1004,209 @@ describe("agent issue mutation checkout ownership", () => {
       expect.any(Object),
       expect.any(Object),
     );
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // BLO-18906: recovery escalation reassigns the issue away from the previous
+  // owner, which costs it allow_self mid-run. The handoff grant restores exactly
+  // one capability — posting a comment — and nothing that changes issue state.
+  const recoveryHandoffDecide = async (input: { action: string }) => ({
+    allowed: input.action === "issue:comment",
+    action: input.action,
+    reason: input.action === "issue:comment" ? "allow_recovery_handoff_grant" : "deny_missing_grant",
+    explanation:
+      input.action === "issue:comment"
+        ? "Allowed by a recovery-handoff issue comment grant for the reassigned previous owner."
+        : "Missing permission.",
+  });
+
+  it("lets a recovery-transferred previous owner post its handoff comment", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+
+    const res = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Handoff: root cause is X, next step is Y." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "Handoff: root cause is X, next step is Y.",
+      expect.any(Object),
+      expect.any(Object),
+    );
+    // The comment must not drag the blocked issue back to todo.
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses reopen/resume from a recovery handoff grant instead of transitioning a blocked issue", async () => {
+    for (const transition of [{ reopen: true }, { resume: true }]) {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+      mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+
+      const res = await request(await createApp(ownerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Handoff plus a status grab.", ...transition });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Recovery handoff grant is comment-only");
+      expect(res.body.details).toMatchObject({ reason: "allow_recovery_handoff_grant" });
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    }
+  });
+
+  it("keeps mutation and deletion denied for a recovery handoff grant holder", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+
+    const patchRes = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo" });
+    expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(403);
+    expect(patchRes.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+
+    const deleteRes = await request(await createApp(ownerActor()))
+      .delete(`/api/issues/${issueId}`);
+    expect(deleteRes.status, JSON.stringify(deleteRes.body)).toBe(403);
+    expect(mockIssueService.remove).not.toHaveBeenCalled();
+  });
+
+  // The comment route's current-execution-run short-circuit returns a bare
+  // `true`, discarding the decision reason. A previous owner whose stale
+  // execution lock still matches therefore reaches the route WITHOUT an
+  // allow_recovery_handoff_grant decision to key off, so the comment-only
+  // contract has to be resolved from the recovery row instead.
+  it("keeps the handoff comment-only when a stale execution lock bypasses the boundary decision", async () => {
+    const staleLockIssue = () => makeIssue({
+      status: "blocked",
+      assigneeAgentId: peerAgentId,
+      // Recovery moved the assignee to peerAgentId, but this run id is the
+      // previous owner's — the shape the current-run bypass matches on.
+      executionRunId: ownerRunId,
+      checkoutRunId: ownerRunId,
+    });
+    // Deny every boundary action: the ONLY way through is the current-run bypass.
+    const denyEverything = async (input: { action: string }) => ({
+      allowed: false,
+      action: input.action,
+      reason: "deny_missing_grant",
+      explanation: "Missing permission.",
+    });
+
+    mockIssueService.getById.mockResolvedValue(staleLockIssue());
+    mockAccessService.decide.mockImplementation(denyEverything);
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction() as never);
+
+    const commentRes = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Handoff evidence from the run that just lost the issue." });
+    expect(commentRes.status, JSON.stringify(commentRes.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    for (const transition of [{ reopen: true }, { resume: true }]) {
+      mockIssueService.addComment.mockClear();
+      mockIssueService.update.mockClear();
+      mockIssueService.getById.mockResolvedValue(staleLockIssue());
+      mockAccessService.decide.mockImplementation(denyEverything);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction() as never);
+
+      const res = await request(await createApp(ownerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Handoff plus a status grab.", ...transition });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Recovery handoff grant is comment-only");
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    }
+  });
+
+  // A comment-only grant must not become a review decision by another route:
+  // the in_review auto-approval branch transitions the issue to `done` and
+  // records an execution decision without ever consulting issue:mutate.
+  it("does not let a recovery handoff comment auto-approve an in_review issue", async () => {
+    const { normalizeIssueExecutionPolicy } = await import("../services/issue-execution-policy.js");
+    // The stage still names the previous owner as its reviewer, so the actor
+    // matches currentParticipant even though recovery moved the assignee away.
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          type: "review",
+          participants: [{ type: "agent", agentId: ownerAgentId }],
+        },
+      ],
+    })!;
+    const inReviewIssue = makeIssue({
+      status: "in_review",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: policy.stages[0].id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: ownerAgentId },
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+    const reviewBody = "## Review: APPROVED";
+    mockIssueService.getById.mockResolvedValue(inReviewIssue);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-recovery-handoff-approval",
+      issueId,
+      companyId,
+      body: reviewBody,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      authorAgentId: ownerAgentId,
+      authorUserId: null,
+    });
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction() as never);
+
+    const res = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: reviewBody });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+    // The comment lands; the state transition does not.
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // A transient lookup failure must not become a way to keep the transition:
+  // the comment still lands, the state change does not.
+  it("fails closed on a recovery-action lookup error, keeping the comment but refusing reopen", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+    mockIssueRecoveryActionService.getActiveForIssue.mockRejectedValue(new Error("database timeout"));
+
+    const commentRes = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Handoff evidence." });
+    expect(commentRes.status, JSON.stringify(commentRes.body)).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    mockIssueService.addComment.mockClear();
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+    mockAccessService.decide.mockImplementation(recoveryHandoffDecide);
+    mockIssueRecoveryActionService.getActiveForIssue.mockRejectedValue(new Error("database timeout"));
+
+    const reopenRes = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Handoff plus a status grab.", reopen: true });
+    expect(reopenRes.status, JSON.stringify(reopenRes.body)).toBe(403);
+    expect(reopenRes.body.error).toBe("Recovery handoff grant is comment-only");
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
@@ -1795,6 +2060,206 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status).toBe(200);
     expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
     expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("allows the creator of a delegated child issue to post comments through production authorization (BLO-18113)", async () => {
+    useProductionIssueAuthorization([
+      makeAgent(peerAgentId),
+      makeAgent(ownerAgentId),
+    ]);
+    mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId, createdByAgentId: peerAgentId }));
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Correction from the delegating creator" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "Correction from the delegating creator",
+      expect.any(Object),
+      expect.any(Object),
+    );
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("allows a manager-chain agent to post comments through production authorization (BLO-18113)", async () => {
+    useProductionIssueAuthorization([
+      makeAgent(peerAgentId),
+      makeAgent(ownerAgentId, { reportsTo: peerAgentId }),
+    ]);
+    mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId, createdByAgentId: ownerAgentId }));
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Manager guidance for the delegated issue" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "Manager guidance for the delegated issue",
+      expect.any(Object),
+      expect.any(Object),
+    );
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  const commentOnlyAutoApprovalCases: Array<[string, Record<string, unknown>[], Record<string, unknown>]> = [
+    ["creator", [makeAgent(peerAgentId), makeAgent(ownerAgentId)], { createdByAgentId: peerAgentId }],
+    ["manager-chain", [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })], { createdByAgentId: ownerAgentId }],
+  ];
+
+  it.each(commentOnlyAutoApprovalCases)(
+    "does not let a %s comment grant auto-approve an in_review issue",
+    async (_kind, agentRows, issueOverrides) => {
+      const reviewBody = "## Review: APPROVED";
+      useProductionIssueAuthorization(agentRows);
+      mockIssueService.getById.mockResolvedValue(
+        await makePendingReviewIssueForAgent(peerAgentId, {
+          assigneeAgentId: ownerAgentId,
+          ...issueOverrides,
+        }),
+      );
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-comment-grant-approval",
+        issueId,
+        companyId,
+        body: reviewBody,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        authorAgentId: peerAgentId,
+        authorUserId: null,
+      });
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: reviewBody });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    },
+  );
+
+  const commentOnlyTransitionCases: Array<[
+    string,
+    Record<string, unknown>[],
+    Record<string, unknown>,
+    "done" | "blocked",
+    Record<string, boolean>,
+    string,
+  ]> = [
+    [
+      "creator",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId)],
+      { createdByAgentId: peerAgentId },
+      "done",
+      { reopen: true },
+      "allow_issue_creator",
+    ],
+    [
+      "creator",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId)],
+      { createdByAgentId: peerAgentId },
+      "done",
+      { resume: true },
+      "allow_issue_creator",
+    ],
+    [
+      "creator",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId)],
+      { createdByAgentId: peerAgentId },
+      "blocked",
+      { reopen: true },
+      "allow_issue_creator",
+    ],
+    [
+      "creator",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId)],
+      { createdByAgentId: peerAgentId },
+      "blocked",
+      { resume: true },
+      "allow_issue_creator",
+    ],
+    [
+      "manager-chain",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })],
+      { createdByAgentId: ownerAgentId },
+      "done",
+      { reopen: true },
+      "allow_manager_chain",
+    ],
+    [
+      "manager-chain",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })],
+      { createdByAgentId: ownerAgentId },
+      "done",
+      { resume: true },
+      "allow_manager_chain",
+    ],
+    [
+      "manager-chain",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })],
+      { createdByAgentId: ownerAgentId },
+      "blocked",
+      { reopen: true },
+      "allow_manager_chain",
+    ],
+    [
+      "manager-chain",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })],
+      { createdByAgentId: ownerAgentId },
+      "blocked",
+      { resume: true },
+      "allow_manager_chain",
+    ],
+  ];
+
+  it.each(commentOnlyTransitionCases)(
+    "refuses %s comment grants with %s transition flags on %s issues",
+    async (_kind, agentRows, issueOverrides, status, transition, expectedReason) => {
+      useProductionIssueAuthorization(agentRows);
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status, assigneeAgentId: ownerAgentId, ...issueOverrides }),
+      );
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Delegated guidance plus an attempted status transition.", ...transition });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Creator/manager comment grant is comment-only");
+      expect(res.body.details).toMatchObject({ reason: expectedReason });
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    },
+  );
+
+  const commentGrantMutationDenialCases: Array<[string, Record<string, unknown>[], Record<string, unknown>]> = [
+    ["creator", [makeAgent(peerAgentId), makeAgent(ownerAgentId)], { createdByAgentId: peerAgentId }],
+    ["manager-chain", [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })], { createdByAgentId: ownerAgentId }],
+  ];
+
+  it.each(commentGrantMutationDenialCases)("keeps generic issue mutations denied for a %s comment grant holder", async (_kind, agentRows, issueOverrides) => {
+    useProductionIssueAuthorization(agentRows);
+    mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId, ...issueOverrides }));
+
+    const patchRes = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Not just a comment" });
+
+    expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(403);
+    expect(patchRes.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId, ...issueOverrides }));
+
+    const deleteRes = await request(await createApp(peerActor()))
+      .delete(`/api/issues/${issueId}`);
+
+    expect(deleteRes.status, JSON.stringify(deleteRes.body)).toBe(403);
+    expect(deleteRes.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+    expect(mockIssueService.remove).not.toHaveBeenCalled();
   });
 
   it.each([

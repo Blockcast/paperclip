@@ -25,6 +25,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { issueService } from "../services/issues.js";
 import { recoveryService } from "../services/recovery/service.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -2145,5 +2146,276 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
+  });
+
+  // BLO-18860: adopting a stale checkout is a HANDOVER, not a failure.
+  // Reproduces the live BLO-18237 sequence: the assignee PATCHes an issue whose
+  // checkout is held by its own dead run, the PATCH adopts the checkout and
+  // cancels the issue's queued context run with `issue_checkout_adopted`, and
+  // the recovery sweep then read that cancellation as evidence the issue was
+  // stranded — reassigning it up the org chart and taking the annotating
+  // agent's write access with it.
+  describe("checkout adoption is not stranding evidence", () => {
+    // The adopting run is deliberately scoped to a DIFFERENT issue: that is the
+    // hazardous shape (an agent touching a stale issue from a run dispatched
+    // for other work), and it is invisible to `hasActiveExecutionPath`, which
+    // matches on `contextSnapshot ->> 'issueId'`.
+    async function seedAdoptedCheckout(input: { adoptingRunStatus: string }) {
+      const seeded = await seedCompany();
+      const deadCheckoutRunId = randomUUID();
+      const queuedContextRunId = randomUUID();
+      const adoptingRunId = randomUUID();
+      const otherIssueId = randomUUID();
+
+      await db.insert(heartbeatRuns).values([
+        {
+          id: deadCheckoutRunId,
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          invocationSource: "automation",
+          status: "failed",
+          errorCode: "process_lost",
+          contextSnapshot: { issueId: seeded.sourceIssueId },
+          createdAt: new Date("2026-07-29T10:00:00.000Z"),
+          finishedAt: new Date("2026-07-29T10:05:00.000Z"),
+        },
+        {
+          id: queuedContextRunId,
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          invocationSource: "automation",
+          status: "queued",
+          // The sweep's own continuation retry — this is what makes the
+          // pre-fix path escalate rather than re-dispatch: the cancellation
+          // counts as a spent continuation attempt (maxAttempts 1).
+          contextSnapshot: {
+            issueId: seeded.sourceIssueId,
+            retryReason: "issue_continuation_needed",
+          },
+          createdAt: new Date("2026-07-29T11:00:00.000Z"),
+        },
+        {
+          id: adoptingRunId,
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          invocationSource: "timer",
+          status: input.adoptingRunStatus,
+          contextSnapshot: { issueId: otherIssueId },
+          createdAt: new Date("2026-07-29T12:00:00.000Z"),
+          startedAt: new Date("2026-07-29T12:00:00.000Z"),
+        },
+      ]);
+      await db
+        .update(issues)
+        .set({
+          checkoutRunId: deadCheckoutRunId,
+          executionRunId: deadCheckoutRunId,
+          executionAgentNameKey: "coder",
+          executionLockedAt: new Date("2026-07-29T10:00:00.000Z"),
+        })
+        .where(eq(issues.id, seeded.sourceIssueId));
+
+      return { ...seeded, deadCheckoutRunId, queuedContextRunId, adoptingRunId };
+    }
+
+    function agentActor(companyId: string, agentId: string, runId: string) {
+      return { type: "agent", agentId, companyId, runId, source: "agent_jwt" } as const;
+    }
+
+    it("keeps the assignee after its own PATCH adopts a dead same-agent checkout", async () => {
+      const { companyId, coderId, sourceIssueId, queuedContextRunId, adoptingRunId } =
+        await seedAdoptedCheckout({ adoptingRunStatus: "running" });
+
+      const res = await request(createApp(agentActor(companyId, coderId, adoptingRunId)))
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send({ title: "Annotated while stalled" });
+
+      // (a)+(b): the assignee's write on its own stale issue succeeds and
+      // adopts the checkout, cancelling the older context run.
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const [adoptedContextRun] = await db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, queuedContextRunId));
+      expect(adoptedContextRun).toEqual({
+        status: "cancelled",
+        errorCode: "issue_checkout_adopted",
+      });
+      const [afterPatch] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(afterPatch).toMatchObject({
+        executionRunId: adoptingRunId,
+        checkoutRunId: adoptingRunId,
+        assigneeAgentId: coderId,
+      });
+
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const result = await recovery.reconcileStrandedAssignedIssues();
+
+      // (c): the handover produces no recovery action, no reassignment, and no
+      // status change — the live same-assignee run is continuity.
+      expect(result).toMatchObject({ escalated: 0, continuationRequeued: 0 });
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+      const [reconciled] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(reconciled).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: coderId,
+      });
+    });
+
+    it("re-dispatches to the assignee instead of escalating when the adopting run also died", async () => {
+      const { companyId, coderId, sourceIssueId, adoptingRunId } = await seedAdoptedCheckout({
+        adoptingRunStatus: "running",
+      });
+
+      const res = await request(createApp(agentActor(companyId, coderId, adoptingRunId)))
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send({ title: "Annotated while stalled" });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      // The adopting run then dies without clearing the lock, so the handover
+      // marker is still the newest run scoped to this issue. Recovery must judge
+      // the issue on the adopting run's own outcome — which here is a plain
+      // failure with no spent continuation budget, so the assignee gets another
+      // run rather than losing the issue to its manager.
+      await db
+        .update(heartbeatRuns)
+        .set({
+          status: "failed",
+          error: "adopting run died",
+          finishedAt: new Date("2026-07-29T12:30:00.000Z"),
+        })
+        .where(eq(heartbeatRuns.id, adoptingRunId));
+
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const result = await recovery.reconcileStrandedAssignedIssues();
+
+      expect(result.escalated).toBe(0);
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+      // The assignee is woken for another continuation attempt instead of
+      // losing the issue to its manager on the strength of the handover marker.
+      expect(enqueueWakeup).toHaveBeenCalledWith(
+        coderId,
+        expect.objectContaining({
+          reason: "issue_continuation_needed",
+          payload: expect.objectContaining({ issueId: sourceIssueId }),
+        }),
+      );
+      const [reconciled] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(reconciled).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: coderId,
+      });
+    });
+
+    // Ally's review of PR #824: the sibling test above deliberately leaves the
+    // dead adopter holding the lock, so it never exercises what production
+    // actually does next. `clearCheckoutRunIfTerminal` nulls BOTH lock columns
+    // once the adopter is terminal (services/issues.ts) — after which
+    // `getCheckoutAdoptingRun` has no run id to resolve and returns null. The
+    // handover marker is still the newest run scoped to this issue and always
+    // will be, so without the successor-less branch every later sweep walks the
+    // same path and the no-run/no-lock guard skips the issue forever: a genuine
+    // strand that never gets recovered.
+    it("recovers the adopted issue after the adopter terminates and production cleanup clears the lock", async () => {
+      const { companyId, coderId, sourceIssueId, adoptingRunId } = await seedAdoptedCheckout({
+        adoptingRunStatus: "running",
+      });
+
+      const res = await request(createApp(agentActor(companyId, coderId, adoptingRunId)))
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send({ title: "Annotated while stalled" });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      // The adopter finishes NORMALLY — not the "died holding the lock" shape.
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date("2026-07-29T12:30:00.000Z") })
+        .where(eq(heartbeatRuns.id, adoptingRunId));
+
+      // Drive the real cleanup helper rather than nulling the columns by hand,
+      // so the test fails if that helper's clearing behaviour ever changes.
+      await expect(issueService(db).clearCheckoutRunIfTerminal(sourceIssueId)).resolves.toBe(true);
+      const [afterCleanup] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(afterCleanup).toMatchObject({ checkoutRunId: null, executionRunId: null });
+
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const result = await recovery.reconcileStrandedAssignedIssues();
+
+      // Recovered, not skipped: the assignee is woken to continue its own
+      // issue. The wake call is the signal rather than `continuationRequeued`,
+      // because the mocked `enqueueWakeup` returns null and the counter only
+      // moves on a truthy queue result.
+      expect(result).toMatchObject({ escalated: 0 });
+      expect(enqueueWakeup).toHaveBeenCalledWith(
+        coderId,
+        expect.objectContaining({
+          reason: "issue_continuation_needed",
+          payload: expect.objectContaining({ issueId: sourceIssueId }),
+        }),
+      );
+      // And still no escalation citing the handover marker as the cause.
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+      const [afterSweep] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(afterSweep).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: coderId,
+      });
+    });
+
+    it("still escalates a genuinely stranded issue after a spent continuation retry", async () => {
+      const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+      const failedRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: failedRunId,
+        companyId,
+        agentId: coderId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "worker crashed before reporting a disposition",
+        errorCode: "run_crashed",
+        contextSnapshot: {
+          issueId: sourceIssueId,
+          retryReason: "issue_continuation_needed",
+        },
+        createdAt: new Date("2026-07-29T11:00:00.000Z"),
+        finishedAt: new Date("2026-07-29T11:05:00.000Z"),
+      });
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      const result = await recovery.reconcileStrandedAssignedIssues();
+
+      expect(result.escalated).toBe(1);
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(action).toMatchObject({
+        kind: "stranded_assigned_issue",
+        ownerAgentId: managerId,
+        previousOwnerAgentId: coderId,
+      });
+      // The dashboard invariant: a real escalation cites the real failure, never
+      // the checkout-handover marker.
+      expect(action?.evidence).toMatchObject({ latestRunErrorCode: "run_crashed" });
+      const [escalated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(escalated).toMatchObject({ status: "blocked", assigneeAgentId: managerId });
+      // The transfer is legible in the issue history, not only in
+      // `activeRecoveryAction`: the comment names the action, the cause, and who
+      // the issue was taken from.
+      const comments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, sourceIssueId));
+      const escalationComment = comments.find((row) =>
+        (row.body ?? "").includes(`Reassigned by recovery action \`${action!.id}\``),
+      );
+      expect(escalationComment?.body).toContain("cause `stranded_assigned_issue`");
+      expect(escalationComment?.body).toContain(`to owner \`${managerId}\``);
+    });
   });
 });
