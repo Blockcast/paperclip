@@ -2690,7 +2690,14 @@ function buildNonInteractiveGitEnv(): NodeJS.ProcessEnv {
  * `inspectGitSubmoduleReadiness`.
  */
 type GitSubmoduleInspection =
-  | { ok: true; entries: GitSubmoduleReadinessEntry[]; partial?: boolean }
+  | {
+      ok: true;
+      entries: GitSubmoduleReadinessEntry[];
+      partial?: boolean;
+      attempts?: number;
+      timeoutReason?: string;
+      processGroupAliveAfterTimeout?: boolean;
+    }
   | { ok: false; reason: string; attempts: number };
 
 /**
@@ -2751,7 +2758,14 @@ async function inspectGitSubmoduleReadiness(
         // fails closed / repairs. Note the converse does NOT hold: an empty
         // `salvaged` is not evidence of health (buffering or an early kill can
         // yield no output at all), so that case falls through to retry/degrade.
-        return { ok: true, entries: salvaged, partial: true };
+        return {
+          ok: true,
+          entries: salvaged,
+          partial: true,
+          attempts: attempt,
+          timeoutReason: error.message,
+          processGroupAliveAfterTimeout: error.processGroupAliveAfterTimeout,
+        };
       }
 
       if (error.processGroupAliveAfterTimeout) {
@@ -2879,6 +2893,24 @@ async function ensureGitSubmodulesReady(input: {
     .filter((entry) => entry.state === "uninitialized")
     .map((entry) => entry.path);
   if (missingPaths.length === 0) return [];
+
+  if (inspection.partial && inspection.processGroupAliveAfterTimeout) {
+    const reason =
+      `${inspection.timeoutReason ?? "git submodule status --recursive timed out"}; ` +
+      "previous timed-out git process group remained alive after SIGKILL, " +
+      "so automatic submodule repair was skipped to avoid overlapping repair commands against the same checkout";
+    await recordSubmoduleInspectionDegradation(input.recorder, {
+      cwd: input.cwd,
+      reason,
+      attempts: inspection.attempts ?? 1,
+      stage: "initial",
+    });
+    return [
+      `Could not safely initialize git submodules for execution workspace "${input.cwd}" (${missingPaths.join(", ")}): ` +
+        `${reason}. Continuing without automatic submodule repair -- the partial probe found uninitialized ` +
+        "submodules, but starting a recursive repair over a still-live git process group could amplify the checkout stall.",
+    ];
+  }
 
   const metadata = {
     cwd: input.cwd,

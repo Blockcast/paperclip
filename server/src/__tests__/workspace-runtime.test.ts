@@ -3696,6 +3696,96 @@ describe("realizeExecutionWorkspace", () => {
     }
   }, 30_000);
 
+  it("does not repair salvaged missing submodules while the timed-out process group remains alive", async () => {
+    const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: false });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+    const statusCounterPath = path.join(shimDir, "status-calls");
+    const repairCounterPath = path.join(shimDir, "repair-calls");
+    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+    const shimPath = path.join(shimDir, "git");
+    await fs.writeFile(
+      shimPath,
+      [
+        "#!/bin/sh",
+        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+        `  calls=$(cat ${JSON.stringify(statusCounterPath)} 2>/dev/null || echo 0)`,
+        "  calls=$((calls + 1))",
+        `  printf '%s' "$calls" > ${JSON.stringify(statusCounterPath)}`,
+        `  echo '-1111111111111111111111111111111111111111 ${submodulePath}'`,
+        "  exec sleep 30",
+        "fi",
+        `if [ "$1" = "submodule" ] && [ "$2" = "sync" ]; then`,
+        `  calls=$(cat ${JSON.stringify(repairCounterPath)} 2>/dev/null || echo 0)`,
+        "  calls=$((calls + 1))",
+        `  printf '%s' "$calls" > ${JSON.stringify(repairCounterPath)}`,
+        "fi",
+        `if [ "$1" = "-c" ] && [ "$3" = "submodule" ] && [ "$4" = "update" ]; then`,
+        `  calls=$(cat ${JSON.stringify(repairCounterPath)} 2>/dev/null || echo 0)`,
+        "  calls=$((calls + 1))",
+        `  printf '%s' "$calls" > ${JSON.stringify(repairCounterPath)}`,
+        "fi",
+        `exec ${JSON.stringify(realGit)} "$@"`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(shimPath, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+    setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 3, retryDelayMs: 1 });
+    setProcessGroupLivenessProbeForTests(() => true);
+
+    try {
+      const realized = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-partial-fault-live-group",
+          workspaceId: "workspace-submodule-partial-fault-live-group",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-partial-fault-live-group",
+          identifier: "PAP-SUBMODULE-PARTIAL-FAULT-LIVE-GROUP",
+          title: "Do not repair over a live timed-out process group",
+        },
+        agent: {
+          id: "agent-submodule-partial-fault-live-group",
+          name: "Codex Coder",
+          companyId: "company-submodule-partial-fault-live-group",
+        },
+        recorder,
+      });
+
+      expect(realized.cwd).toBe(repoRoot);
+      const warning = realized.warnings.find((candidate) =>
+        candidate.includes("automatic submodule repair was skipped"),
+      );
+      expect(warning).toBeDefined();
+      expect(warning).toContain(submodulePath);
+      expect(warning).toContain("process group remained alive after SIGKILL");
+      expect(await fs.readFile(statusCounterPath, "utf8")).toBe("1");
+      expect(await fs.readFile(repairCounterPath, "utf8").catch(() => "0")).toBe("0");
+
+      const degraded = operations.find(
+        (operation) => operation.metadata?.action === "submodule_inspection_degraded",
+      );
+      expect(degraded?.metadata).toMatchObject({
+        attempts: 1,
+        reason: expect.stringContaining("automatic submodule repair was skipped"),
+      });
+    } finally {
+      setSubmoduleInspectSettingsForTests(null);
+      setProcessGroupLivenessProbeForTests(null);
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await fs.rm(shimDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("reports both the repair and the degradation when the post-repair re-check stalls", async () => {
     // The other timeout tests all stall the *initial* probe. This covers the
     // second inspection site, which has a different obligation: the repair
