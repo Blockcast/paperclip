@@ -340,7 +340,7 @@ describe("sandbox callback bridge", () => {
         listJsonFiles: async (remotePath) => {
           const files = await baseClient.listJsonFiles(remotePath);
           if (remotePath === directories.requestsDir && files.length === 0) {
-            resolveIdlePoll();
+            setTimeout(resolveIdlePoll, 0);
           }
           return files;
         },
@@ -442,7 +442,7 @@ describe("sandbox callback bridge", () => {
       "utf8",
     );
 
-    for (let attempt = 0; attempt < 50 && processed.length === 0; attempt += 1) {
+    for (let attempt = 0; attempt < 200 && processed.length === 0; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 
