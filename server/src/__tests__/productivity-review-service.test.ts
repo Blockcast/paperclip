@@ -4,10 +4,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
   agents,
+  approvals,
   companies,
   companyMemberships,
   createDb,
   heartbeatRuns,
+  issueApprovals,
   issueComments,
   issueRelations,
   issues,
@@ -54,6 +56,19 @@ describeEmbeddedPostgres("productivity review service", () => {
   afterAll(async () => {
     await tempDb?.cleanup();
   }, 60_000);
+
+  async function linkApproval(companyId: string, issueId: string, status: string) {
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      status,
+      payload: { reason: "human gate" },
+    });
+    await db.insert(issueApprovals).values({ companyId, issueId, approvalId });
+    return approvalId;
+  }
 
   async function seedAssignedIssue(opts?: {
     status?: "todo" | "in_progress";
@@ -543,6 +558,153 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(1);
     expect(result.creationCapped).toBe(0);
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(4);
+  });
+
+  it("suppresses long-active productivity reviews when a linked board approval is pending", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const approvalId = await linkApproval(seeded.companyId, seeded.issueId, "pending");
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.approvalGatedSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed"));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]?.entityId).toBe(seeded.issueId);
+    expect(activities[0]?.details).toMatchObject({
+      trigger: "long_active_duration",
+      suppressedBy: "approval_pending",
+      approvalId,
+      approvalStatus: "pending",
+      approvalType: "request_board_approval",
+    });
+  });
+
+  it("creates long-active productivity reviews once the linked approval is decided", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await linkApproval(seeded.companyId, seeded.issueId, "approved");
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.approvalGatedSuppressed).toBe(0);
+  });
+
+  it("does not suppress long-active reviews for a revision_requested approval (ball is back with the agent)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await linkApproval(seeded.companyId, seeded.issueId, "revision_requested");
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.approvalGatedSuppressed).toBe(0);
+  });
+
+  it("does not suppress no-comment productivity reviews when an approval is pending", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "in_progress" });
+    await linkApproval(seeded.companyId, seeded.issueId, "pending");
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.approvalGatedSuppressed).toBe(0);
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+  });
+
+  it("closes open long-active productivity reviews when the source has a pending approval", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const approvalId = await linkApproval(seeded.companyId, seeded.issueId, "pending");
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: {
+        trigger: "long_active_duration",
+        sourceIssueId: seeded.issueId,
+      },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedApprovalGatedReviews).toBe(1);
+    expect(result.closedSuppressedMonitorReviews).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("done");
+
+    const closures = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed"));
+    expect(closures).toHaveLength(1);
+    expect(closures[0]?.details).toMatchObject({
+      suppressedBy: "approval_pending",
+      approvalId,
+      sourceIssueId: seeded.issueId,
+    });
   });
 
   it("creates a long-active review without enabling a continuation hold", async () => {

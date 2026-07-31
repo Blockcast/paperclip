@@ -4,10 +4,12 @@ import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
   activityLog,
   agents,
+  approvals,
   companies,
   companyMemberships,
   costEvents,
   heartbeatRuns,
+  issueApprovals,
   issueComments,
   issueRelations,
   issues,
@@ -111,6 +113,17 @@ type MonitorScheduledSuppression = {
   generatedAt: Date;
 };
 
+type ApprovalGatedSuppression = {
+  trigger: "long_active_duration";
+  triggerReasons: string[];
+  sourceIssue: IssueRow;
+  sourceAgent: AgentRow;
+  elapsedMs: number | null;
+  approvalGate: { approvalId: string; approvalStatus: string; approvalType: string };
+  thresholds: ProductivityReviewThresholds;
+  generatedAt: Date;
+};
+
 type EnqueueWakeup = (
   agentId: string,
   opts?: {
@@ -125,6 +138,11 @@ type EnqueueWakeup = (
 ) => Promise<unknown | null>;
 
 const MONITOR_SCHEDULED_SUPPRESSION_ACTORS = new Set(["assignee", "board"]);
+
+// A linked approval in one of these statuses means the issue's next move belongs to a human.
+// Deliberately `pending` only: `revision_requested` hands the ball back to the *agent*, so a
+// long-active review there is legitimate and should still fire.
+const APPROVAL_GATE_SUPPRESSION_STATUSES = ["pending"] as const;
 
 type ProductivityReviewServiceDeps = {
   enqueueWakeup?: EnqueueWakeup;
@@ -207,9 +225,15 @@ function deliberateFutureMonitor(issue: IssueRow, now: Date) {
 }
 
 function isMonitorScheduledSuppression(
-  value: ProductivityReviewEvidence | MonitorScheduledSuppression,
+  value: ProductivityReviewEvidence | MonitorScheduledSuppression | ApprovalGatedSuppression,
 ): value is MonitorScheduledSuppression {
   return "monitorNextCheckAt" in value;
+}
+
+function isApprovalGatedSuppression(
+  value: ProductivityReviewEvidence | MonitorScheduledSuppression | ApprovalGatedSuppression,
+): value is ApprovalGatedSuppression {
+  return "approvalGate" in value;
 }
 
 function isRoutineOriginRun(run: HeartbeatRunRow): boolean {
@@ -601,6 +625,81 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .limit(5);
   }
 
+  async function findOpenApprovalGate(companyId: string, issueId: string) {
+    const rows = await db
+      .select({
+        approvalId: approvals.id,
+        approvalStatus: approvals.status,
+        approvalType: approvals.type,
+      })
+      .from(issueApprovals)
+      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+      .where(
+        and(
+          eq(issueApprovals.companyId, companyId),
+          eq(issueApprovals.issueId, issueId),
+          inArray(approvals.status, [...APPROVAL_GATE_SUPPRESSION_STATUSES]),
+        ),
+      )
+      .orderBy(asc(approvals.createdAt), asc(approvals.id))
+      .limit(1);
+    return rows[0] ?? null;
+  }
+
+  async function loadOpenApprovalGatesByIssueId(issueIds: string[]) {
+    const gates = new Map<string, { approvalId: string; approvalStatus: string; approvalType: string }>();
+    if (issueIds.length === 0) return gates;
+    const rows = await db
+      .select({
+        issueId: issueApprovals.issueId,
+        approvalId: approvals.id,
+        approvalStatus: approvals.status,
+        approvalType: approvals.type,
+      })
+      .from(issueApprovals)
+      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+      .where(
+        and(
+          inArray(issueApprovals.issueId, issueIds),
+          inArray(approvals.status, [...APPROVAL_GATE_SUPPRESSION_STATUSES]),
+        ),
+      )
+      .orderBy(asc(approvals.createdAt), asc(approvals.id));
+    for (const row of rows) {
+      if (gates.has(row.issueId)) continue;
+      gates.set(row.issueId, {
+        approvalId: row.approvalId,
+        approvalStatus: row.approvalStatus,
+        approvalType: row.approvalType,
+      });
+    }
+    return gates;
+  }
+
+  async function recordApprovalGatedSuppression(suppression: ApprovalGatedSuppression) {
+    const details = {
+      source: "productivity_review.reconcile",
+      sourceIssueId: suppression.sourceIssue.id,
+      trigger: suppression.trigger,
+      suppressedBy: "approval_pending",
+      approvalId: suppression.approvalGate.approvalId,
+      approvalStatus: suppression.approvalGate.approvalStatus,
+      approvalType: suppression.approvalGate.approvalType,
+      elapsedMs: suppression.elapsedMs,
+    };
+    await logActivity(db, {
+      companyId: suppression.sourceIssue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: suppression.sourceIssue.assigneeAgentId,
+      action: "issue.productivity_review_suppressed",
+      entityType: "issue",
+      entityId: suppression.sourceIssue.id,
+      details,
+    });
+    logger.info(details, "productivity review long_active_duration suppressed by pending approval gate");
+  }
+
   async function recordMonitorScheduledSuppression(suppression: MonitorScheduledSuppression) {
     const details = {
       source: "productivity_review.reconcile",
@@ -672,6 +771,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     }
 
     let closed = 0;
+    let closedApprovalGated = 0;
+    const approvalGateBySourceId = await loadOpenApprovalGatesByIssueId(sourceIssueIds);
     for (const review of reviewRows) {
       if (!review.originId) continue;
       const trigger = reviewTriggerById.get(review.id);
@@ -679,8 +780,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       const sourceIssue = sourceIssueById.get(review.originId) ?? null;
       if (!sourceIssue) continue;
       if (sourceIssue.companyId !== review.companyId) continue;
-      const monitor = deliberateFutureMonitor(sourceIssue, now);
-      if (!monitor) continue;
+      const approvalGate = approvalGateBySourceId.get(sourceIssue.id) ?? null;
+      const monitor = approvalGate ? null : deliberateFutureMonitor(sourceIssue, now);
+      if (!approvalGate && !monitor) continue;
 
       await db
         .update(issues)
@@ -694,18 +796,29 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         entityType: "issue",
         entityId: review.id,
         agentId: review.assigneeAgentId,
-        details: {
-          source: "productivity_review.reconcile",
-          sourceIssueId: sourceIssue.id,
-          trigger: "long_active_duration",
-          suppressedBy: "monitor_scheduled",
-          monitorNextCheckAt: monitor.monitorNextCheckAt.toISOString(),
-          monitorScheduledBy: monitor.monitorScheduledBy,
-        },
+        details: approvalGate
+          ? {
+              source: "productivity_review.reconcile",
+              sourceIssueId: sourceIssue.id,
+              trigger: "long_active_duration",
+              suppressedBy: "approval_pending",
+              approvalId: approvalGate.approvalId,
+              approvalStatus: approvalGate.approvalStatus,
+              approvalType: approvalGate.approvalType,
+            }
+          : {
+              source: "productivity_review.reconcile",
+              sourceIssueId: sourceIssue.id,
+              trigger: "long_active_duration",
+              suppressedBy: "monitor_scheduled",
+              monitorNextCheckAt: monitor!.monitorNextCheckAt.toISOString(),
+              monitorScheduledBy: monitor!.monitorScheduledBy,
+            },
       });
-      closed += 1;
+      if (approvalGate) closedApprovalGated += 1;
+      else closed += 1;
     }
-    return closed;
+    return { closedMonitorScheduled: closed, closedApprovalGated };
   }
 
   async function countIssueRunsSince(companyId: string, agentId: string, issueId: string, since: Date) {
@@ -747,7 +860,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     sourceAgent: AgentRow,
     thresholds: ProductivityReviewThresholds,
     now: Date,
-  ): Promise<ProductivityReviewEvidence | MonitorScheduledSuppression | null> {
+  ): Promise<ProductivityReviewEvidence | MonitorScheduledSuppression | ApprovalGatedSuppression | null> {
     const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
     const sixHoursAgo = new Date(now.getTime() - 6 * 60 * 60 * 1000);
 
@@ -857,6 +970,25 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     }
 
     const routineOnlySamplingWindow = latestRuns.length > 0 && latestRuns.every(isRoutineOriginRun);
+
+    // Only `long_active_duration` is suppressible by a human gate. `no_comment_streak` and
+    // `high_churn` stay live: an agent burning runs against a gate it cannot clear is exactly
+    // the waste worth reviewing, and a gate does not excuse silent runs.
+    if (trigger === "long_active_duration") {
+      const approvalGate = await findOpenApprovalGate(sourceIssue.companyId, sourceIssue.id);
+      if (approvalGate) {
+        return {
+          trigger,
+          triggerReasons,
+          sourceIssue,
+          sourceAgent,
+          elapsedMs,
+          approvalGate,
+          thresholds,
+          generatedAt: now,
+        };
+      }
+    }
 
     const monitor = deliberateFutureMonitor(sourceIssue, now);
     if (trigger === "long_active_duration" && monitor) {
@@ -1380,7 +1512,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       escalated: 0,
       optedOut: 0,
       monitorScheduledSuppressed: 0,
+      approvalGatedSuppressed: 0,
       closedSuppressedMonitorReviews: 0,
+      closedApprovalGatedReviews: 0,
       creationCapped: 0,
       noActionSuppressed: 0,
       skipped: 0,
@@ -1390,7 +1524,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       failedIssueIds: [] as string[],
     };
 
-    result.closedSuppressedMonitorReviews = await closeOpenSuppressedMonitorReviews(now, opts?.companyId);
+    const closedSuppressed = await closeOpenSuppressedMonitorReviews(now, opts?.companyId);
+    result.closedSuppressedMonitorReviews = closedSuppressed.closedMonitorScheduled;
+    result.closedApprovalGatedReviews = closedSuppressed.closedApprovalGated;
 
     const prefixCache = new Map<string, string>();
     for (const candidate of candidates) {
@@ -1414,6 +1550,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       const evidence = await collectEvidence(candidate, sourceAgent, thresholds, now);
       if (!evidence) {
         result.skipped += 1;
+        continue;
+      }
+      if (isApprovalGatedSuppression(evidence)) {
+        await recordApprovalGatedSuppression(evidence);
+        result.approvalGatedSuppressed += 1;
         continue;
       }
       if (isMonitorScheduledSuppression(evidence)) {
@@ -1493,7 +1634,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     if (!sourceIssue || !sourceAgent || !openReview) return { held: false as const };
     if (sourceAgent.companyId !== input.companyId) return { held: false as const };
     const evidence = await collectEvidence(sourceIssue, sourceAgent, thresholds, now);
-    if (!evidence || isMonitorScheduledSuppression(evidence)) {
+    if (!evidence || isMonitorScheduledSuppression(evidence) || isApprovalGatedSuppression(evidence)) {
       return { held: false as const };
     }
     if (!isSoftStopTrigger(evidence.trigger) || evidence.routineOnlySamplingWindow) {
