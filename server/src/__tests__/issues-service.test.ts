@@ -6508,6 +6508,103 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(updated?.projectWorkspaceId).toBe(projectWorkspaceId);
   });
 
+  it("rejects a stale workspace-only update after a concurrent project reroute commits", async () => {
+    const companyId = randomUUID();
+    const projectAId = randomUUID();
+    const projectBId = randomUUID();
+    const workspaceAId = randomUUID();
+    const workspaceBId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(projects).values([
+      {
+        id: projectAId,
+        companyId,
+        name: "Workspace project A",
+        status: "in_progress",
+      },
+      {
+        id: projectBId,
+        companyId,
+        name: "Workspace project B",
+        status: "in_progress",
+      },
+    ]);
+
+    await db.insert(projectWorkspaces).values([
+      {
+        id: workspaceAId,
+        companyId,
+        projectId: projectAId,
+        name: "Primary workspace A",
+        isPrimary: true,
+      },
+      {
+        id: workspaceBId,
+        companyId,
+        projectId: projectBId,
+        name: "Primary workspace B",
+        isPrimary: true,
+      },
+    ]);
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId: projectAId,
+      projectWorkspaceId: workspaceAId,
+      title: "Rerouted issue",
+      status: "todo",
+      priority: "medium",
+    });
+
+    const rerouteApplied = deferred<void>();
+    const releaseReroute = deferred<void>();
+    const reroute = db.transaction(async (tx) => {
+      await svc.update(issueId, {
+        projectId: projectBId,
+        projectWorkspaceId: workspaceBId,
+      }, tx);
+      rerouteApplied.resolve();
+      await releaseReroute.promise;
+    });
+
+    await rerouteApplied.promise;
+    const staleWorkspaceUpdate = svc.update(issueId, {
+      projectWorkspaceId: workspaceAId,
+    });
+    const staleWorkspaceExpectation = expect(staleWorkspaceUpdate).rejects.toMatchObject({
+      status: 422,
+      message: "Project workspace must belong to the selected project",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    releaseReroute.resolve();
+
+    await reroute;
+    await staleWorkspaceExpectation;
+
+    const finalIssue = await db
+      .select({
+        projectId: issues.projectId,
+        projectWorkspaceId: issues.projectWorkspaceId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(finalIssue).toEqual({
+      projectId: projectBId,
+      projectWorkspaceId: workspaceBId,
+    });
+  });
+
   it("rejects updates that pin a projectless issue to an isolated git worktree", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
