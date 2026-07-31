@@ -3833,8 +3833,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     agentId: string;
     sourceIssueId: string;
     recoveryActionId: string;
+    // Status the issue held before this escalation moved it to `blocked`. Only
+    // read on the undelivered-wake path, which hands the issue back to a status
+    // the stranded sweep actually selects. See dispatchPlannedRecoveryWake.
+    previousStatus: StrandedPreviousStatus;
+    attemptCount: number;
     opts: RecoveryWakeupOptions;
   };
+
+  // An escalated issue is `blocked`, and reconcileStrandedAssignedIssues only
+  // selects `todo` / `in_progress` / `in_review` — so nothing re-sweeps it. The
+  // recovery-owner wake is therefore the *only* thing that keeps an escalated
+  // issue live, and a wake that was never delivered strands it permanently.
+  // Hand the issue back to a swept status so the next sweep retries, but bound
+  // the retries: an owner that is durably non-invokable would otherwise
+  // escalate-and-revert on every tick. Past the cap the issue stays `blocked`
+  // with its recovery action still active — visible in the recovery ledger for
+  // a human, which is a worse outcome than a delivered wake but a much better
+  // one than a silent permanent strand.
+  const UNDELIVERED_RECOVERY_WAKE_MAX_RETRIES = 3;
 
   // Pure decision — no IO. Callers that need the escalation's DB writes to be
   // transactional plan the wake inside the transaction and dispatch it through
@@ -3852,6 +3869,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     latestRun: LatestIssueRun;
     recoveryCause: StrandedRecoveryCause;
     hasNewActivitySinceLastAttempt: boolean;
+    previousStatus: StrandedPreviousStatus;
   }): PlannedRecoveryWake | null {
     if (input.recoveryCause === "provider_quota" && !input.action.ownerAgentId) return null;
     if (input.recoveryCause === "workspace_validation_failed" || input.recoveryCause === "configuration_incomplete") return null;
@@ -3864,6 +3882,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         agentId: assigneeAgentId,
         sourceIssueId: input.issue.id,
         recoveryActionId: input.action.id,
+        previousStatus: input.previousStatus,
+        attemptCount: input.action.attemptCount,
         opts: {
           source: "assignment",
           triggerDetail: "system",
@@ -3898,6 +3918,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       agentId: input.action.ownerAgentId,
       sourceIssueId: input.issue.id,
       recoveryActionId: input.action.id,
+      previousStatus: input.previousStatus,
+      attemptCount: input.action.attemptCount,
       opts: {
         source: "assignment",
         triggerDetail: "system",
@@ -3929,22 +3951,52 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
   async function dispatchPlannedRecoveryWake(planned: PlannedRecoveryWake | null) {
     if (!planned) return;
-    await deps.enqueueWakeup(planned.agentId, planned.opts);
+    // `deps.enqueueWakeup` resolves to the started run, or to `null` on any of
+    // its non-delivery paths (agent not invokable, company inactive, budget
+    // exhausted, suppression, idempotency collision, ...). A non-throwing call
+    // is therefore NOT evidence that anyone was woken, and treating it as such
+    // is what turns this issue's benign over-wake into a permanent strand.
+    const run = await deps.enqueueWakeup(planned.agentId, planned.opts);
+    if (run) return;
+
+    if (planned.attemptCount > UNDELIVERED_RECOVERY_WAKE_MAX_RETRIES) {
+      logger.error(
+        {
+          issueId: planned.sourceIssueId,
+          agentId: planned.agentId,
+          recoveryActionId: planned.recoveryActionId,
+          attemptCount: planned.attemptCount,
+        },
+        "recovery owner wake was not delivered and the retry budget is spent; issue stays blocked with an active recovery action",
+      );
+      return;
+    }
+
+    logger.warn(
+      {
+        issueId: planned.sourceIssueId,
+        agentId: planned.agentId,
+        recoveryActionId: planned.recoveryActionId,
+        attemptCount: planned.attemptCount,
+        revertingTo: planned.previousStatus,
+      },
+      "recovery owner wake was not delivered; handing the issue back to the stranded sweep to retry",
+    );
+
+    // Hand the issue back to a swept status so the next reconcile pass retries
+    // the escalation (and the wake) instead of leaving it `blocked` forever.
+    // Guarded so this can only ever undo *our own* just-committed escalation:
+    // it requires the issue to still be `blocked` with no execution path and
+    // our recovery action still active. If anything else has since claimed the
+    // issue — including a run that started between the wake and this write —
+    // the predicate misses and we leave that owner alone.
     await db
       .update(issues)
-      .set({
-        status: "blocked",
-        checkoutRunId: null,
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        updatedAt: new Date(),
-      })
+      .set({ status: planned.previousStatus, updatedAt: new Date() })
       .where(
         and(
           eq(issues.id, planned.sourceIssueId),
-          eq(issues.status, "in_progress"),
-          eq(issues.assigneeAgentId, planned.agentId),
+          eq(issues.status, "blocked"),
           isNull(issues.checkoutRunId),
           isNull(issues.executionRunId),
           exists(
@@ -3955,7 +4007,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
                 and(
                   eq(issueRecoveryActions.id, planned.recoveryActionId),
                   eq(issueRecoveryActions.sourceIssueId, issues.id),
-                  eq(issueRecoveryActions.ownerAgentId, planned.agentId),
                   inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
                 ),
               ),
@@ -4175,7 +4226,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return details.code === "missing-evidence";
   }
 
-  type MonitorReviewWaitingParkOutcome = "parked" | "not_applicable" | "missing_evidence";
+  type MonitorReviewWaitingParkOutcome = "parked" | "not_applicable" | "missing_evidence" | "failed";
 
   async function parkReviewWaitingContinuationIssue(input: {
     issue: typeof issues.$inferSelect;
@@ -4198,7 +4249,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       try {
         updated = await issuesSvc.update(fresh.id, { status: "in_review" }, tx);
       } catch (err) {
-        if (!isMissingEvidenceGateRejection(err)) throw err;
+        if (!isMissingEvidenceGateRejection(err)) {
+          // Classify, but do not widen the blast radius: the enclosing
+          // `for (const issue of candidates)` sweep has no per-iteration guard,
+          // so rethrowing here would abandon every remaining candidate over one
+          // bad issue. Report it and fall through to the normal blocked-recovery
+          // path, which is what this catch did before the classification split.
+          logger.error(
+            { err, issueId: fresh.id, identifier: fresh.identifier },
+            "parkReviewWaitingContinuationIssue: unexpected error during in_review park; escalating instead",
+          );
+          return "failed";
+        }
         logger.warn(
           { err, issueId: fresh.id, identifier: fresh.identifier },
           "parkReviewWaitingContinuationIssue: evidence gate rejected in_review park; escalating instead",
@@ -4292,7 +4354,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       try {
         updated = await issuesSvc.update(fresh.id, { status: "in_review" }, tx);
       } catch (err) {
-        if (!isMissingEvidenceGateRejection(err)) throw err;
+        if (!isMissingEvidenceGateRejection(err)) {
+          // Honour the "degrades the same safe way" contract above. The enclosing
+          // `for (const issue of candidates)` sweep has no per-iteration guard, so
+          // rethrowing an unexpected error here would abandon every remaining
+          // candidate; report it and let this one issue fall through to the normal
+          // blocked-recovery path instead.
+          logger.error(
+            { err, issueId: fresh.id, identifier: fresh.identifier },
+            "parkNoDependencyReviewWaitingIssue: unexpected error during in_review park; escalating instead",
+          );
+          return "failed";
+        }
         logger.warn(
           { err, issueId: fresh.id, identifier: fresh.identifier },
           "parkNoDependencyReviewWaitingIssue: evidence gate rejected in_review park; escalating instead",
@@ -4706,6 +4779,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         latestRun: input.latestRun,
         recoveryCause,
         hasNewActivitySinceLastAttempt,
+        previousStatus: input.previousStatus,
       });
 
       if (isProviderQuotaWait) return updated;
@@ -5773,10 +5847,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
         // `missing_evidence` means the monitor-backed `in_review` park was
-        // evidence-gate rejected because there is nothing reviewable yet.
-        // Let the same waiting-on-review run fall through to the no-dependency
-        // park and, if that also cannot produce review evidence, the normal
-        // blocked recovery escalation.
+        // evidence-gate rejected because there is nothing reviewable yet;
+        // `failed` means it hit an unexpected error. Either way, let the same
+        // waiting-on-review run fall through to the no-dependency park and, if
+        // that also cannot produce review evidence, the normal blocked recovery
+        // escalation — one bad issue must not abandon the rest of the sweep.
         //
         // That fall-through crosses a commit boundary: the park transaction has
         // released its advisory lock, and both fallbacks reacquire it later. Flag

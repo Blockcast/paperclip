@@ -126,11 +126,14 @@ export async function withShallowGitWorkspaceClone<T>(
   },
   fn: (cloneDir: string) => Promise<T>,
 ): Promise<T> {
-  const cloneDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-workspace-"));
-  const tempRef = `refs/paperclip/git-sync/import/${randomUUID()}`;
+  // Validate before acquiring anything: this only reads the snapshot, and
+  // throwing after `mkdtemp` would leak the clone directory, which is created
+  // outside the `try` whose `finally` removes it.
   if (!isValidGitObjectId(input.snapshot.headCommit)) {
     throw new Error("Cannot sync git workspace with an invalid HEAD commit.");
   }
+  const cloneDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-workspace-"));
+  const tempRef = `refs/paperclip/git-sync/import/${randomUUID()}`;
   try {
     await runLocalGit(input.localDir, ["update-ref", tempRef, input.snapshot.headCommit], {
       timeout: 10_000,
