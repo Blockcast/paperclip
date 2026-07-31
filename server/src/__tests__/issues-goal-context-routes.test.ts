@@ -455,8 +455,8 @@ describe.sequential("issue goal context routes", () => {
     const mentionedAgentId = "99999999-9999-4999-8999-999999999999";
     const assigneeAgentId = "33333333-3333-4333-8333-333333333333";
 
-    function agentActor(agentId: string) {
-      return { type: "agent", agentId, companyId: "company-1", source: "agent_key", runId: "run-1" };
+    function agentActor(agentId: string, runId: string | null = "run-1") {
+      return { type: "agent", agentId, companyId: "company-1", source: "agent_key", runId };
     }
 
     it("warns a woken non-assignee agent that it cannot reply, and where to go", async () => {
@@ -498,6 +498,59 @@ describe.sequential("issue goal context routes", () => {
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(res.body.replyAuthorization).toMatchObject({ canComment: true, remediation: null });
+    });
+
+    it("reports canComment for the current execution run without a comment grant", async () => {
+      mockIssueService.getById.mockResolvedValue({
+        ...legacyProjectLinkedIssue,
+        status: "in_progress",
+        assigneeAgentId,
+        checkoutRunId: "run-1",
+      });
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action === "issue:read",
+        action: input.action,
+        reason: input.action === "issue:read" ? "allow_test" : "deny_missing_grant",
+        explanation: "Test.",
+      }));
+
+      const res = await request(createApp(agentActor(assigneeAgentId))).get(
+        "/api/issues/11111111-1111-4111-8111-111111111111/heartbeat-context",
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.replyAuthorization).toMatchObject({
+        canComment: true,
+        reason: "allow_current_issue_execution_run",
+        remediation: null,
+      });
+      expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({ action: "issue:comment" }));
+    });
+
+    it("reports the same missing run id denial enforced by comment writes", async () => {
+      mockIssueService.getById.mockResolvedValue({
+        ...legacyProjectLinkedIssue,
+        status: "in_progress",
+        assigneeAgentId,
+      });
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: true,
+        action: input.action,
+        reason: input.action === "issue:comment" ? "allow_explicit_grant" : "allow_test",
+        explanation: "Test.",
+      }));
+
+      const res = await request(createApp(agentActor(assigneeAgentId, null))).get(
+        "/api/issues/11111111-1111-4111-8111-111111111111/heartbeat-context",
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.replyAuthorization).toMatchObject({
+        canComment: false,
+        reason: "deny_missing_run_id",
+        boundary: "run",
+      });
+      expect(res.body.replyAuthorization.remediation).toContain("active agent run id");
     });
 
     it("omits replyAuthorization for board actors, who are not wake targets", async () => {
