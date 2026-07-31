@@ -11,6 +11,7 @@ import type {
 
 export const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
+const SOURCE_SCOPED_WAKE_HORIZON_EVIDENCE_KEY = "sourceScopedWakeHorizonAt";
 
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -48,6 +49,33 @@ export type ResolveIssueRecoveryActionInput = {
   outcome: IssueRecoveryActionOutcome;
   resolutionNote?: string | null;
 };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function toValidDate(value: unknown): Date | null {
+  if (value instanceof Date) return Number.isFinite(value.getTime()) ? value : null;
+  if (typeof value !== "string" && typeof value !== "number") return null;
+  const parsed = new Date(value);
+  return Number.isFinite(parsed.getTime()) ? parsed : null;
+}
+
+function readSourceScopedWakeHorizonAt(evidence: unknown): Date | null {
+  if (!isRecord(evidence)) return null;
+  return toValidDate(evidence[SOURCE_SCOPED_WAKE_HORIZON_EVIDENCE_KEY]);
+}
+
+function withSourceScopedWakeHorizonEvidence(
+  evidence: unknown,
+  wakeHorizonAt: Date | null,
+): Record<string, unknown> {
+  const next = isRecord(evidence) ? { ...evidence } : {};
+  if (wakeHorizonAt) {
+    next[SOURCE_SCOPED_WAKE_HORIZON_EVIDENCE_KEY] = wakeHorizonAt.toISOString();
+  }
+  return next;
+}
 
 function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
   return {
@@ -201,9 +229,10 @@ export function issueRecoveryActionService(db: Db) {
       // Computed in the same UPDATE as the owner write, so no sweep can observe a new owner
       // carrying an old counter.
       const isNewOwnerSequence = (input.ownerAgentId ?? null) !== existing.ownerAgentId;
-      const existingTimeoutAt = existing.timeoutAt
-        ? (existing.timeoutAt instanceof Date ? existing.timeoutAt : new Date(existing.timeoutAt))
-        : null;
+      const existingTimeoutAt = toValidDate(existing.timeoutAt);
+      const inputMaxAttempts = input.maxAttempts ?? null;
+      const existingWakeHorizonAt = readSourceScopedWakeHorizonAt(existing.evidence);
+      const carriedWakeHorizonAt = existingWakeHorizonAt ?? (existing.maxAttempts !== null ? existingTimeoutAt : null);
       // BLO-18996 (review follow-up): the row is long-lived and can gain a budget it did not
       // have when its `timeoutAt` was written, so "preserve the horizon" has to start
       // counting from the sweep that STARTS the bound, not from whatever wrote the column
@@ -212,8 +241,15 @@ export function issueRecoveryActionService(db: Db) {
       // `retryAt`) and is typically already in the past by the time ownership arrives.
       // Inheriting it would make `strandedRecoveryWakeAttemptsExhausted` true on the new
       // owner's FIRST wake and reinstate the exact deadlock this ticket fixes.
-      const isNewlyBoundedSequence = existing.maxAttempts === null &&
-        (input.maxAttempts ?? null) !== null;
+      //
+      // A later review found the inverse edge: after a bounded row temporarily loses every
+      // invokable owner, a sweep writes `maxAttempts: null` onto the same active row. That must
+      // not make the next owned sweep look newly bounded again. Persist the first wake horizon
+      // in evidence so "has ever been bounded" survives bounded -> ownerless -> bounded flaps.
+      const isNewlyBoundedSequence = carriedWakeHorizonAt === null && inputMaxAttempts !== null;
+      const wakeHorizonAt = isNewlyBoundedSequence
+        ? (input.timeoutAt ?? null)
+        : carriedWakeHorizonAt;
       const [updated] = await db
         .update(issueRecoveryActions)
         .set({
@@ -227,12 +263,12 @@ export function issueRecoveryActionService(db: Db) {
           returnOwnerAgentId: input.returnOwnerAgentId ?? existing.returnOwnerAgentId,
           cause: input.cause,
           fingerprint: input.fingerprint,
-          evidence: input.evidence ?? existing.evidence,
+          evidence: withSourceScopedWakeHorizonEvidence(input.evidence ?? existing.evidence, wakeHorizonAt),
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
           monitorPolicy: input.monitorPolicy ?? null,
           attemptCount: isNewOwnerSequence ? 1 : existing.attemptCount + 1,
-          maxAttempts: input.maxAttempts ?? null,
+          maxAttempts: inputMaxAttempts,
           // BLO-18996: PRESERVE the existing horizon, once the row is actually bounded.
           // `timeoutAt` is the one bound on this row that owner churn cannot reset, and it
           // only has that property because the sweep does not rewrite it — every sweep
@@ -254,8 +290,8 @@ export function issueRecoveryActionService(db: Db) {
           // unbounded -> bounded, adopt the fresh wake horizon; thereafter never rewrite it.
           // Staying unbounded still preserves, which keeps the quota `retryAt` intact and the
           // `pr_review_non_convergence` caller (also `maxAttempts: null`) unaffected.
-          timeoutAt: isNewlyBoundedSequence
-            ? (input.timeoutAt ?? null)
+          timeoutAt: inputMaxAttempts !== null
+            ? (wakeHorizonAt ?? input.timeoutAt ?? null)
             : (existingTimeoutAt ?? input.timeoutAt ?? null),
           lastAttemptAt: input.lastAttemptAt ?? now,
           outcome: null,
@@ -292,7 +328,10 @@ export function issueRecoveryActionService(db: Db) {
           returnOwnerAgentId: input.returnOwnerAgentId ?? null,
           cause: input.cause,
           fingerprint: input.fingerprint,
-          evidence: input.evidence ?? {},
+          evidence: withSourceScopedWakeHorizonEvidence(
+            input.evidence ?? {},
+            (input.maxAttempts ?? null) !== null ? (input.timeoutAt ?? null) : null,
+          ),
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
           monitorPolicy: input.monitorPolicy ?? null,

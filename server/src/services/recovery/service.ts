@@ -4011,12 +4011,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       return;
     }
     // NOTE (BLO-18996): `attemptCount` restarts at 1 whenever the action's owner changes,
-    // so this key is unique per (action, owner sequence, attempt) — NOT globally unique per
-    // (action, attempt). That is safe today because nothing dedupes this path on
-    // `idempotencyKey`: `enqueueWakeup` coalesces on (companyId, agentId, taskKey), and the
-    // replacement owner is a different agent. If you ever add idempotency-key dedup here,
-    // put the owner in the key first — otherwise a reassigned owner's first wake collides
-    // with the previous owner's and gets swallowed, which is the deadlock this ticket fixed.
+    // and refunds decrement it when no wake was delivered. This key can therefore repeat
+    // within one owner sequence after refunded attempts, and across owner sequences after
+    // reassignment. That is safe today because nothing dedupes this path on `idempotencyKey`:
+    // `enqueueWakeup` coalesces on (companyId, agentId, taskKey). If you ever add
+    // idempotency-key dedup here, include the owner and a non-refunded delivery sequence first.
     await enqueueOrRefundAttempt(input.action.ownerAgentId, {
       source: "assignment",
       triggerDetail: "system",

@@ -150,6 +150,94 @@ describe("issueRecoveryActionService", () => {
     expect(fakeDb.update).toHaveBeenCalledTimes(1);
     expect(fakeDb.insert).toHaveBeenCalledTimes(1);
   });
+
+  it("preserves a bounded wake horizon across ownerless upsert flaps", async () => {
+    const originalHorizon = new Date("2026-05-09T23:30:00.000Z");
+    const freshHorizon = new Date("2026-05-10T05:30:00.000Z");
+    let row = makeRecoveryActionRow({
+      id: "existing-action",
+      maxAttempts: 5,
+      timeoutAt: originalHorizon,
+      attemptCount: 2,
+      evidence: { latestRunId: "run-1" },
+    });
+    const updates: Record<string, unknown>[] = [];
+
+    const makeSelectQuery = () => ({
+      from() {
+        return this;
+      },
+      where() {
+        return this;
+      },
+      orderBy() {
+        return this;
+      },
+      limit() {
+        return Promise.resolve(row ? [row] : []);
+      },
+    });
+
+    const fakeDb = {
+      select: vi.fn(() => makeSelectQuery()),
+      update: vi.fn(() => ({
+        set: vi.fn((patch: Record<string, unknown>) => ({
+          where: vi.fn(() => ({
+            returning: vi.fn(async () => {
+              updates.push(patch);
+              row = { ...row, ...patch };
+              return [row];
+            }),
+          })),
+        })),
+      })),
+      insert: vi.fn(),
+    };
+    const svc = issueRecoveryActionService(fakeDb as never);
+
+    const ownerless = await svc.upsertSourceScoped({
+      companyId: "company-1",
+      sourceIssueId: "source-1",
+      kind: "stranded_assigned_issue",
+      ownerType: "board",
+      ownerAgentId: null,
+      cause: "stranded_assigned_issue",
+      fingerprint: "source-scoped:fingerprint:ownerless",
+      evidence: { latestRunId: "run-2" },
+      nextAction: "Wait for a recovery owner.",
+      maxAttempts: null,
+      timeoutAt: null,
+    });
+
+    expect(ownerless).toMatchObject({ ownerAgentId: null, maxAttempts: null });
+    expect(new Date(ownerless.timeoutAt as unknown as string).getTime()).toBe(originalHorizon.getTime());
+    expect(ownerless.evidence).toMatchObject({
+      latestRunId: "run-2",
+      sourceScopedWakeHorizonAt: originalHorizon.toISOString(),
+    });
+
+    const rebound = await svc.upsertSourceScoped({
+      companyId: "company-1",
+      sourceIssueId: "source-1",
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: "agent-1",
+      cause: "stranded_assigned_issue",
+      fingerprint: "source-scoped:fingerprint:bounded",
+      evidence: { latestRunId: "run-3" },
+      nextAction: "Wake the recovery owner.",
+      maxAttempts: 5,
+      timeoutAt: freshHorizon,
+    });
+
+    expect(rebound).toMatchObject({ ownerAgentId: "agent-1", maxAttempts: 5 });
+    expect(new Date(rebound.timeoutAt as unknown as string).getTime()).toBe(originalHorizon.getTime());
+    expect(rebound.evidence).toMatchObject({
+      latestRunId: "run-3",
+      sourceScopedWakeHorizonAt: originalHorizon.toISOString(),
+    });
+    expect(updates.at(-1)).toMatchObject({ timeoutAt: originalHorizon });
+  });
 });
 
 if (!embeddedPostgresSupport.supported) {
@@ -1569,6 +1657,90 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, ownerless!.id));
     expect(new Date(afterAnotherSweep!.timeoutAt as unknown as string).getTime()).toBe(anchored);
+  }, 120_000);
+
+  it("does not refresh the wake horizon after a bounded action temporarily loses its owner", async () => {
+    const { managerId, coderId, sourceIssueId } = await seedCompany();
+    const enqueueWakeup = vi.fn<(agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>>(
+      async () => ({ id: randomUUID() }),
+    );
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const baseRun = {
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+    const sweep = async () => {
+      const [fresh] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      await recovery.escalateStrandedAssignedIssue({
+        issue: fresh!,
+        previousStatus: "in_progress",
+        latestRun: { ...baseRun, id: randomUUID(), createdAt: new Date() },
+        comment: "Automatic continuation recovery failed.",
+      });
+    };
+    const wakesToManager = () => enqueueWakeup.mock.calls.filter((call) => call[0] === managerId).length;
+
+    await sweep();
+    const [bounded] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+    expect(bounded).toMatchObject({
+      ownerAgentId: managerId,
+      maxAttempts: STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
+    });
+    expect(wakesToManager()).toBe(1);
+    const originalHorizonMs = new Date(bounded!.timeoutAt as unknown as string).getTime();
+    expect(Number.isFinite(originalHorizonMs)).toBe(true);
+
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, managerId));
+    await sweep();
+    const [ownerless] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, bounded!.id));
+    expect(ownerless).toMatchObject({ ownerAgentId: null, maxAttempts: null });
+    expect(new Date(ownerless!.timeoutAt as unknown as string).getTime()).toBe(originalHorizonMs);
+    expect(wakesToManager()).toBe(1);
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date(originalHorizonMs + 1_000));
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, managerId));
+      await sweep();
+    } finally {
+      vi.useRealTimers();
+    }
+
+    const [rebounded] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, bounded!.id));
+    expect(rebounded).toMatchObject({
+      ownerAgentId: managerId,
+      maxAttempts: STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
+    });
+    expect(new Date(rebounded!.timeoutAt as unknown as string).getTime()).toBe(originalHorizonMs);
+    expect(wakesToManager()).toBe(1);
+    expect(strandedRecoveryWakeAttemptsExhausted(rebounded!, new Date(originalHorizonMs + 1_000))).toBe(true);
+
+    const horizonNotices = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssueId))
+      .then((rows) =>
+        rows.filter((row) =>
+          (row.body ?? "").includes(`Recovery wake horizon reached for action \`${bounded!.id}\``)
+        )
+      );
+    expect(horizonNotices).toHaveLength(1);
   }, 120_000);
 
   it("does not spend the wake budget on enqueue failures that woke nobody", async () => {
