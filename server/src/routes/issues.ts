@@ -3828,6 +3828,7 @@ export function issueRoutes(
       allowBlockedCorrection?: boolean;
       allowScopedRecoveryOwnerSourceMutation?: boolean;
       allowRecoveryActionOwner?: boolean;
+      allowProductivityReviewOwner?: boolean;
     } = {},
   ) {
     if (req.actor.type !== "agent") return true;
@@ -3864,6 +3865,49 @@ export function issueRoutes(
     }
     if (issue.assigneeAgentId !== actorAgentId) {
       if (await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)) {
+        return true;
+      }
+      // The actor owns an open productivity review OF this issue (BLO-19094).
+      // Every remedy such a review can order is a mutation here, so without
+      // this the reviewer bounces off the 409/403 below and the review can
+      // detect but never fix — including the case it exists for, an issue
+      // pinned open by a paused or errored assignee that will never run to
+      // release it.
+      //
+      // Deliberately placed INSIDE this branch and next to the checkout
+      // override rather than at the top of the function: an early return above
+      // would also skip the run-ownership checks below, which is the bypass
+      // that sank an earlier attempt at a related widening (PR #814). It is
+      // also opt-in per route — only `PATCH /issues/:id` passes the flag, so
+      // destructive routes sharing this helper (`DELETE /issues/:id`,
+      // attachment and comment deletion) stay closed to a reviewer.
+      //
+      // `boundaryDecision` is reused rather than re-queried so the grant
+      // predicate lives in exactly one place (authorization.ts). If some other
+      // allow-path matched first the reason differs and the override does not
+      // fire — fail-closed, and the actor was authorized by that other path
+      // anyway.
+      if (
+        options.allowProductivityReviewOwner &&
+        boundaryDecision.reason === "allow_productivity_review_grant"
+      ) {
+        const reviewActor = getActorInfo(req);
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: reviewActor.actorType,
+          actorId: reviewActor.actorId,
+          agentId: actorAgentId,
+          runId: reviewActor.runId,
+          agentApiKeyId: reviewActor.agentApiKeyId,
+          action: "issue.productivity_review_source_mutation",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            reviewerAgentId: actorAgentId,
+            previousAssigneeAgentId: issue.assigneeAgentId,
+            issueStatus: issue.status,
+          },
+        });
         return true;
       }
       if (issue.status === "in_progress") {
@@ -8088,6 +8132,7 @@ export function issueRoutes(
       {
         allowBlockedCorrection: true,
         allowScopedRecoveryOwnerSourceMutation,
+        allowProductivityReviewOwner: true,
       },
     ))) return;
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;

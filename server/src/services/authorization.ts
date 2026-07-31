@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -29,6 +29,7 @@ import {
   type TrustPresetResolution,
 } from "./trust-preset-resolver.js";
 import { ACTIVE_RECOVERY_ACTION_STATUSES } from "./issue-recovery-actions.js";
+import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 import { logger } from "../middleware/logger.js";
 
 export type AuthorizationActor =
@@ -106,6 +107,7 @@ export type AuthorizationDecision = {
     | "allow_legacy_agent_creator"
     | "allow_issue_mention_grant"
     | "allow_recovery_handoff_grant"
+    | "allow_productivity_review_grant"
     | "allow_self"
     | "allow_company_agent"
     | "allow_company_member"
@@ -247,6 +249,12 @@ type IssueAuthorizationRow = {
   originKind: string | null;
   originId: string | null;
 };
+
+// Mirrors PRODUCTIVITY_REVIEW_TERMINAL_STATUSES in services/issues.ts. Kept
+// local rather than imported to avoid an authorization -> issues service import
+// cycle; the two are pinned together by
+// authorization-service.test.ts "productivity-review source-issue grant".
+const PRODUCTIVITY_REVIEW_TERMINAL_STATUSES = ["done", "cancelled"] as const;
 
 function evaluateAuthorizationPolicyForAssignment(
   policy: Record<string, unknown> | null | undefined,
@@ -1469,6 +1477,88 @@ export function authorizationService(db: Db) {
     });
   }
 
+  // A productivity review is assigned to a *reviewer*, but every remedy it can
+  // order — block, cancel, reassign, snooze — is a state change on the SOURCE
+  // issue, which the reviewer has no grant on. The mechanism could therefore
+  // detect and never remedy: the only verdict physically executable was prose
+  // in the review shell (BLO-19094).
+  //
+  // This is NOT covered by the manager-chain/creator allow-paths, and adding
+  // them would not cover it. `resolveReviewOwnerAgentId`
+  // (`productivity-review.ts`) picks the reviewer from, in order: the source
+  // assignee's `reportsTo`, the source issue's `createdByAgentId`, the
+  // project's `leadAgentId`, then any CTO, then any CEO. The last three are
+  // routinely neither manager nor creator of the source assignee, so an
+  // identity-shaped rule leaves the common fallback reviewer denied. The
+  // relation that actually matters is the review→source link itself, so that
+  // is what this grants on.
+  //
+  // Scope, deliberately narrow:
+  //   * relation-scoped — keyed on the review row's own `originKind` +
+  //     `originId`, the typed link the harness writes when it opens the
+  //     review. Not ancestry, not authorship, not org position.
+  //   * agent-scoped   — only the review's current `assigneeAgentId`. Peers,
+  //     managers and the source assignee's reports get nothing from here.
+  //   * state-bounded  — only while the review is open. Closing it (`done` /
+  //     `cancelled`) lapses the grant, so a finished review is not a standing
+  //     backdoor onto the issue it reviewed.
+  //   * company-scoped — both rows must sit in the acting company.
+  //
+  // Not self-grantable: `originKind` and `originId` appear on no request
+  // schema (`packages/shared/src/validators/issue.ts` is `.strict()` and omits
+  // both), so they are server-stamped only. An agent cannot mint itself a
+  // review row pointed at an arbitrary issue — which is precisely the
+  // difference between this and a creator-shaped allow-path, where the actor
+  // supplies the linking field.
+  //
+  // This clears the authorization boundary only. The route layer still applies
+  // its own another-agent's-issue gate on top, and only `PATCH /issues/:id`
+  // opts into honouring this grant there — destructive routes behind the same
+  // helper (notably `DELETE /issues/:id`) do not.
+  async function agentHasProductivityReviewGrantOnIssue(input: {
+    action: AuthorizationAction;
+    companyId: string;
+    issueId: string;
+    actorAgentId: string;
+  }) {
+    const [row] = await db
+      .select({
+        id: issues.id,
+        status: issues.status,
+      })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, input.companyId),
+        eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueProductivityReview),
+        eq(issues.originId, input.issueId),
+        eq(issues.assigneeAgentId, input.actorAgentId),
+        notInArray(issues.status, [...PRODUCTIVITY_REVIEW_TERMINAL_STATUSES]),
+      ))
+      .limit(1);
+    if (!row) return false;
+    // A review is never its own source. Defensive: `originId` is server-written
+    // from `sourceIssue.id`, but a self-referential row would otherwise hand an
+    // agent an unbounded self-grant on the review it already owns.
+    if (row.id === input.issueId) return false;
+    logger.info({
+      actorAgentId: input.actorAgentId,
+      issueId: input.issueId,
+      companyId: input.companyId,
+      reviewIssueId: row.id,
+      grantedAction: input.action,
+      grant: "productivity_review_source",
+    }, "authorized productivity-review source-issue grant");
+    return true;
+  }
+
+  function allowProductivityReviewGrant(action: AuthorizationAction): AuthorizationDecision {
+    return allow({
+      action,
+      reason: "allow_productivity_review_grant",
+      explanation: "Allowed by an open productivity review the actor owns for this issue.",
+    });
+  }
+
   async function decideBase(input: {
     actor: AuthorizationActor;
     action: AuthorizationAction;
@@ -2060,6 +2150,22 @@ export function authorizationService(db: Db) {
         })
       ) {
         return allowRecoveryHandoffGrant(input.action);
+      }
+      // Unlike the two grants above this covers `issue:mutate` as well as
+      // `issue:comment`: a productivity review's entire remedy set (block,
+      // cancel, reassign, snooze) is a mutation of the source issue, so a
+      // comment-only grant would leave the mechanism exactly as unable to act
+      // as it was before (BLO-19094).
+      if (
+        resource?.issueId &&
+        await agentHasProductivityReviewGrantOnIssue({
+          action: input.action,
+          companyId,
+          issueId: resource.issueId,
+          actorAgentId,
+        })
+      ) {
+        return allowProductivityReviewGrant(input.action);
       }
     }
     if (
