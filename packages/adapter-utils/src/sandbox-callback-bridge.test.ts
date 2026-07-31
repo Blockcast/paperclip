@@ -332,6 +332,7 @@ describe("sandbox callback bridge", () => {
     const worker = await startSandboxCallbackBridgeWorker({
       client: createFileSystemSandboxCallbackBridgeQueueClient(),
       queueDir,
+      pollIntervalMs: 1,
       authorizeRequest: async () => null,
       handleRequest: async (request) => {
         processed.push(request.id);
@@ -426,7 +427,7 @@ describe("sandbox callback bridge", () => {
       "utf8",
     );
 
-    for (let attempt = 0; attempt < 50 && processed.length === 0; attempt += 1) {
+    for (let attempt = 0; attempt < 200 && processed.length === 0; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 

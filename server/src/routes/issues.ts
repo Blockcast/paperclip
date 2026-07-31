@@ -3546,6 +3546,7 @@ export function issueRoutes(
       parentId: string | null;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      createdByAgentId?: string | null;
       status: string;
     },
     action: "issue:comment" | "issue:read" | "issue:mutate",
@@ -3561,6 +3562,7 @@ export function issueRoutes(
         parentIssueId: issue.parentId,
         assigneeAgentId: issue.assigneeAgentId,
         assigneeUserId: issue.assigneeUserId,
+        createdByAgentId: issue.createdByAgentId ?? null,
         status: issue.status,
       },
       scope: {
@@ -3603,6 +3605,7 @@ export function issueRoutes(
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      createdByAgentId?: string | null;
       checkoutRunId?: string | null;
       executionRunId?: string | null;
     },
@@ -3715,13 +3718,16 @@ export function issueRoutes(
     };
   }
 
+  function isIssueMentionGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    return decision !== true && decision.reason === "allow_issue_mention_grant";
+  }
+
   // Both grants admit a non-assignee agent for the narrow purpose of *saying something*
   // on someone else's issue. Neither carries the authority to reopen or resume closed
   // work — the recovery owner's legitimate restore path is the PATCH allow-list in
   // `isScopedRecoveryOwnerRestorePatch`, which is separately scoped and audited.
   function isCommentOnlyPeerGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
-    return decision !== true &&
-      (decision.reason === "allow_issue_mention_grant" || decision.reason === "allow_source_scoped_recovery_owner");
+    return isIssueMentionGrantDecision(decision) || isSourceScopedRecoveryOwnerDecision(decision);
   }
 
   // True only when the source-scoped recovery-owner grant (BLO-18996) is what admitted
@@ -3740,6 +3746,10 @@ export function issueRoutes(
   // `blocked`, and on a blocked issue `reopen: true` would move it to `todo`.
   function isRecoveryHandoffGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
     return decision !== true && decision.reason === "allow_recovery_handoff_grant";
+  }
+
+  function isCreatorOrManagerCommentGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    return decision !== true && (decision.reason === "allow_issue_creator" || decision.reason === "allow_manager_chain");
   }
 
   // The decision reason alone is not a sufficient test for "this caller is a
@@ -3908,6 +3918,7 @@ export function issueRoutes(
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      createdByAgentId?: string | null;
       checkoutRunId?: string | null;
       executionRunId?: string | null;
       executionState?: unknown;
@@ -5835,6 +5846,7 @@ export function issueRoutes(
       activeRecoveryAction,
       linkedCases,
       inboxArchiveFields,
+      activeRun,
     ] = await Promise.all([
       resolveIssueProjectAndGoal(issue),
       svc.getAncestors(issue.id),
@@ -5849,6 +5861,13 @@ export function issueRoutes(
       recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
       listIssueLinkedCases(db, issue.companyId, issue.id),
       inboxArchiveFieldsPromise,
+      // BLO-19001: agents compare their own $PAPERCLIP_RUN_ID against the run
+      // holding this issue before touching a shared worktree. `executionRunId`
+      // alone cannot answer that — it can point at a run that already finished
+      // — so ship the run's lifecycle status with it. Same shape `inbox-lite`
+      // returns, and null (no run, or the recorded run is terminal) means the
+      // issue is not held.
+      svc.getActiveRun(issue),
     ]);
     const recoveryActionsByRelationIssue = await relationRecoveryActionMap(
       recoveryActionsSvc,
@@ -5877,6 +5896,7 @@ export function issueRoutes(
       ...inboxArchiveFields,
       goalId: goal?.id ?? issue.goalId,
       ancestors,
+      activeRun,
       ...(blockerAttention ? { blockerAttention } : {}),
       productivityReview,
       successfulRunHandoff: successfulRunHandoffStates.get(issue.id) ?? null,
@@ -10358,20 +10378,17 @@ export function issueRoutes(
     const interruptRequested = req.body.interrupt === true;
     const isClosed = isClosedIssueStatus(issue.status);
     const isBlocked = issue.status === "blocked";
-    // Closed-issue neutering for the *mention*-granted peer. This deliberately no longer
-    // speaks for the recovery-action owner: `isCommentOnlyPeerGrantDecision` still matches
-    // that owner's reason, but because this branch and its `assertAgentIssueMutationAllowed`
-    // re-check are both `isClosed`-gated they only ever covered `done`/`cancelled`, and
-    // recovery leaves its source issue `blocked`. The owner is now refused on every status
-    // by `recoveryOwnerGrantedCommentOnly` below, which runs before this is consumed.
-    const closedCommentGrantPeerAgentCommentOnly =
+    // Closed-issue neutering for the *mention*-granted peer. Recovery-action owners
+    // are handled by `recoveryOwnerGrantedCommentOnly` below because recovery leaves
+    // its source issue `blocked`, not `done`/`cancelled`.
+    const mentionGrantedPeerAgentCommentOnly =
       isClosed &&
       req.actor.type === "agent" &&
       issue.assigneeAgentId !== null &&
       issue.assigneeAgentId !== req.actor.agentId &&
       !reopenRequested &&
       !resumeRequested &&
-      isCommentOnlyPeerGrantDecision(commentAccessDecision);
+      isIssueMentionGrantDecision(commentAccessDecision);
     // Comment-only on every status, not just closed ones: recovery leaves the
     // issue `blocked`, where an un-neutered `reopen` would transition it to
     // `todo` — a status change the handoff grant must not confer (BLO-18906).
@@ -10389,23 +10406,38 @@ export function issueRoutes(
       req.actor.type === "agent" &&
       (isRecoveryHandoffGrantDecision(commentAccessDecision) ||
         await isRecoveryHandoffPreviousOwner(req, issue));
-    if (recoveryHandoffGrantedCommentOnly && (reopenRequested || resumeRequested)) {
+    const creatorOrManagerGrantedCommentOnly =
+      req.actor.type === "agent" &&
+      isCreatorOrManagerCommentGrantDecision(commentAccessDecision);
+    if (
+      (recoveryHandoffGrantedCommentOnly || creatorOrManagerGrantedCommentOnly) &&
+      (reopenRequested || resumeRequested)
+    ) {
+      const commentOnlyReason = recoveryHandoffGrantedCommentOnly
+        ? "allow_recovery_handoff_grant"
+        : commentAccessDecision !== true && isCreatorOrManagerCommentGrantDecision(commentAccessDecision)
+        ? commentAccessDecision.reason
+        : "allow_comment_only_grant";
       res.status(403).json({
-        error: "Recovery handoff grant is comment-only",
+        error: recoveryHandoffGrantedCommentOnly
+          ? "Recovery handoff grant is comment-only"
+          : "Creator/manager comment grant is comment-only",
         details: {
           issueId: issue.id,
           assigneeAgentId: issue.assigneeAgentId,
           actorAgentId: req.actor.agentId,
-          reason: "allow_recovery_handoff_grant",
-          hint: "Post the handoff evidence as a plain comment; the recovery owner controls status.",
+          reason: commentOnlyReason,
+          hint: recoveryHandoffGrantedCommentOnly
+            ? "Post the handoff evidence as a plain comment; the recovery owner controls status."
+            : "Post the delegated-issue guidance as a plain comment; the assignee or normal mutation owner controls status.",
         },
       });
       return;
     }
     // The source-scoped recovery-owner grant (BLO-18996) is comment-only on EVERY status,
-    // for the same reason the handoff grant above is. `closedCommentGrantPeerAgentCommentOnly`
-    // and its `assertAgentIssueMutationAllowed` re-check below are both gated on `isClosed`,
-    // which is `done | cancelled` — but a source-scoped recovery action normally leaves its
+    // for the same reason the handoff grant above is. The mention-grant neutering
+    // and its `assertAgentIssueMutationAllowed` re-check below are both gated on
+    // `isClosed`, which is `done | cancelled` — but a source-scoped recovery action normally leaves its
     // source issue `blocked`, and `isExplicitResumeCapableStatus` accepts `blocked`. Neutering
     // only on closed statuses therefore left the grant conferring `blocked` -> `todo` with no
     // `issue:mutate` check anywhere on the path, in the one status recovery actually produces:
@@ -10430,25 +10462,21 @@ export function issueRoutes(
       return;
     }
     const commentOnlyGrantedPeerAgent =
-      closedCommentGrantPeerAgentCommentOnly ||
+      mentionGrantedPeerAgentCommentOnly ||
       recoveryHandoffGrantedCommentOnly ||
+      creatorOrManagerGrantedCommentOnly ||
       recoveryOwnerGrantedCommentOnly;
     const effectiveReopenRequested = commentOnlyGrantedPeerAgent ? false : reopenRequested;
     const effectiveResumeRequested = commentOnlyGrantedPeerAgent ? false : resumeRequested;
-    // Reachable only for the MENTION-GRANT arm of `isCommentOnlyPeerGrantDecision`.
-    // The recovery-owner arm cannot get here: any recovery-owner request carrying
+    // Reachable only for the mention-grant path. Recovery-owner requests carrying
     // `reopen`/`resume` already returned 403 at the comment-only refusal above, so
-    // this re-check never routes a recovery owner through
-    // `assertAgentIssueMutationAllowed`. The predicate is left wide rather than
-    // narrowed back to the mention grant so that this stays correct by construction
-    // if that refusal is ever relaxed — the reachability is the thing that changed,
-    // not the policy this branch encodes.
+    // this re-check never routes a recovery owner through `assertAgentIssueMutationAllowed`.
     if (
       isClosed &&
       req.actor.type === "agent" &&
       issue.assigneeAgentId !== null &&
       issue.assigneeAgentId !== req.actor.agentId &&
-      isCommentOnlyPeerGrantDecision(commentAccessDecision) &&
+      isIssueMentionGrantDecision(commentAccessDecision) &&
       (reopenRequested || resumeRequested)
     ) {
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
@@ -10660,26 +10688,18 @@ export function issueRoutes(
       const shouldAutoApproveReviewComment =
         currentIssue.status === "in_review" &&
         currentExecutionState?.status === "pending" &&
-        // A recovery-handoff caller is comment-only, so its comment must never
-        // be read as a review decision (BLO-18906). Without this, an approval-
-        // shaped comment from a previous owner who happens to still be named as
-        // the pending stage participant would transition the issue to `done` and
-        // insert an execution decision — a state mutation the grant does not
-        // confer, reached without ever passing an `issue:mutate` check.
-        //
-        // BLO-18996 extends the same exclusion to the source-scoped recovery OWNER
-        // grant, for the identical reason: it is admitted comment-only, so it must not
-        // reach a `done` transition either. Scoped to the case where that grant is the
-        // *only* thing that let the caller in — an owner who is also the assignee is
-        // admitted by `allow_self` and is unaffected, and an owner holding this issue's
-        // execution run short-circuits earlier with a bare `true` (a stronger,
-        // pre-existing admission).
-        //
-        // Still deliberately NOT extended to the mention grant / closed comment-grant
-        // peer path: a mentioned non-assignee reviewer approving its own stage is the
+        // Comment-only grants must never be read as review decisions. Without
+        // this, an approval-shaped comment from a previous owner, creator,
+        // manager-chain actor, or source-scoped recovery owner who happens to
+        // still be named as the pending stage participant would transition the
+        // issue to `done` and insert an execution decision — a state mutation the
+        // grant does not confer, reached without ever passing an `issue:mutate`
+        // check. Deliberately NOT extended to `mentionGrantedPeerAgentCommentOnly`:
+        // a mentioned non-assignee reviewer approving its own stage is the
         // established path this branch exists to serve.
         !recoveryHandoffGrantedCommentOnly &&
-        !isSourceScopedRecoveryOwnerDecision(commentAccessDecision) &&
+        !creatorOrManagerGrantedCommentOnly &&
+        !recoveryOwnerGrantedCommentOnly &&
         actorMatchesExecutionParticipant(actor, currentExecutionState.currentParticipant ?? null) &&
         isApprovalReviewComment(req.body.body);
 

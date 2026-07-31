@@ -29,6 +29,7 @@ import {
   ensurePersistedExecutionWorkspaceAvailable,
   ensureServerWorkspaceLinksCurrent,
   ensureRuntimeServicesForRun,
+  executeProcessForTests,
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
   reconcilePersistedRuntimeServicesOnStartup,
@@ -38,9 +39,12 @@ import {
   resolveWorkspaceRuntimeReadinessTimeoutSec,
   resolveShell,
   sanitizeRuntimeServiceBaseEnv,
+  setProcessGroupLivenessProbeForTests,
+  setSubmoduleInspectSettingsForTests,
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
   type RealizedExecutionWorkspace,
+  WorkspaceGitSubmoduleError,
   WorkspaceRepoMismatchError,
 } from "../services/workspace-runtime.ts";
 import {
@@ -372,6 +376,13 @@ afterEach(async () => {
       leasedRunIds.delete(runId);
     }),
   );
+  // Backstop for the tests that set this locally. Those restore it in their own
+  // `finally`, but a test that is itself killed by the suite timeout can run
+  // that block late -- after a later test has already read the override -- so a
+  // process-global left dirty here would leak a 1ms git budget into unrelated
+  // cases. Clearing unconditionally is idempotent.
+  setSubmoduleInspectSettingsForTests(null);
+  setProcessGroupLivenessProbeForTests(null);
   delete process.env.PAPERCLIP_CONFIG;
   delete process.env.PAPERCLIP_HOME;
   delete process.env.PAPERCLIP_INSTANCE_ID;
@@ -3239,6 +3250,784 @@ describe("realizeExecutionWorkspace", () => {
     })).toBe(true);
   }, 120_000);
 
+  it("degrades to a warning instead of failing the run when submodule inspection times out", async () => {
+    // BLO-18784: `git submodule status --recursive` is ~96% filesystem latency on
+    // a shared CephFS checkout, so a single slow probe used to raise a fatal
+    // WorkspaceGitSubmoduleError and strand a healthy in_progress issue at
+    // `blocked`. A timeout means the inspection was inconclusive, not that the
+    // submodules are broken, so the run must survive it.
+    const { repoRoot, submodulePath } = await createTempRepoWithSubmodule();
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    // 1ms budget guarantees every attempt times out; short backoff keeps the test
+    // fast. Driven through the test-only seam, not the env overrides: a 1ms
+    // timeout is deliberately below what an operator can configure
+    // (WORKSPACE_SUBMODULE_INSPECT_MIN_TIMEOUT_MS), because a budget that small
+    // disables the check on every workspace rather than tuning it.
+    setSubmoduleInspectSettingsForTests({ timeoutMs: 1, attempts: 2, retryDelayMs: 1 });
+
+    try {
+      const realized = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-inspect-timeout",
+          workspaceId: "workspace-submodule-inspect-timeout",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-inspect-timeout",
+          identifier: "PAP-SUBMODULE-INSPECT-TIMEOUT",
+          title: "Survive submodule inspection timeout",
+        },
+        agent: {
+          id: "agent-submodule-inspect-timeout",
+          name: "Codex Coder",
+          companyId: "company-submodule-inspect-timeout",
+        },
+        recorder,
+      });
+
+      // The run is realized, not aborted.
+      expect(realized.strategy).toBe("project_primary");
+      expect(realized.cwd).toBe(repoRoot);
+
+      const degraded = realized.warnings.find((warning) => warning.includes("Could not inspect git submodules"));
+      expect(degraded).toBeDefined();
+      expect(degraded).toContain("after 2 attempt(s)");
+      expect(degraded).toContain("timed out after 1ms");
+      expect(degraded).toContain("inconclusive");
+      // It must not have silently claimed the submodule was repaired.
+      expect(realized.warnings).not.toContain(
+        `Initialized git submodules before starting: ${submodulePath}`,
+      );
+
+      // The degradation must leave a structured, countable record -- not just a
+      // run-log line. This change removes the recovery action that used to make
+      // these stalls visible, so without this row "no recovery actions" could
+      // not be distinguished from "we stopped reporting".
+      const degradedOp = operations.find(
+        (operation) => operation.metadata?.action === "submodule_inspection_degraded",
+      );
+      expect(degradedOp).toBeDefined();
+      expect(degradedOp?.phase).toBe("worktree_prepare");
+      expect(degradedOp?.result.status).toBe("skipped");
+      expect(degradedOp?.metadata).toMatchObject({
+        stage: "initial",
+        attempts: 2,
+        timeoutMs: 1,
+      });
+      expect(String(degradedOp?.metadata?.reason)).toContain("timed out after 1ms");
+    } finally {
+      setSubmoduleInspectSettingsForTests(null);
+    }
+  }, 20_000);
+
+  it("still fails the run when the initial submodule inspection exits non-zero", async () => {
+    // BLO-18784 follow-up: the timeout degrade must not widen into a general
+    // fail-open. A malformed `.gitmodules` is a deterministic failure -- the
+    // checkout really is unusable -- so it must stay fatal rather than starting
+    // an agent with no valid preflight.
+    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    // `git submodule status --recursive` exits 128 ("bad config line") on this.
+    await fs.writeFile(path.join(repoRoot, ".gitmodules"), "this is not valid config [[[\n", "utf8");
+
+    await expect(
+      realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-inspect-broken",
+          workspaceId: "workspace-submodule-inspect-broken",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-inspect-broken",
+          identifier: "PAP-SUBMODULE-INSPECT-BROKEN",
+          title: "Fail loudly on a corrupt .gitmodules",
+        },
+        agent: {
+          id: "agent-submodule-inspect-broken",
+          name: "Codex Coder",
+          companyId: "company-submodule-inspect-broken",
+        },
+        recorder,
+      }),
+    ).rejects.toThrow(WorkspaceGitSubmoduleError);
+
+    // It must not have been reported as an inconclusive stall.
+    expect(
+      operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+    ).toBe(false);
+  }, 20_000);
+
+  it("still fails the run when the post-repair submodule verification exits non-zero", async () => {
+    // The post-repair re-check has its own consumer, so it needs its own guard:
+    // otherwise a definitive verification failure could be reported as
+    // "Initialized git submodules before starting" -- claiming success over a
+    // workspace we know is broken.
+    //
+    // A fixture alone cannot isolate this branch: any corruption that breaks
+    // `submodule status --recursive` also breaks the `submodule update
+    // --recursive` repair, which throws earlier. So shim `git` on PATH and fail
+    // only the *second* `submodule status --recursive` -- the verification call.
+    const { repoRoot, submodulePath } = await createTempRepoWithSubmodule();
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+    const counterPath = path.join(shimDir, "status-calls");
+    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+    const shimPath = path.join(shimDir, "git");
+    await fs.writeFile(
+      shimPath,
+      [
+        "#!/bin/sh",
+        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+        `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
+        "  calls=$((calls + 1))",
+        `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
+        '  if [ "$calls" -ge 2 ]; then',
+        "    echo 'fatal: simulated deterministic submodule status failure' >&2",
+        "    exit 128",
+        "  fi",
+        "fi",
+        `exec ${JSON.stringify(realGit)} "$@"`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(shimPath, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+
+    try {
+      await expect(
+        realizeExecutionWorkspace({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-submodule-verify-broken",
+            workspaceId: "workspace-submodule-verify-broken",
+            repoUrl: null,
+            repoRef: "main",
+          },
+          config: {},
+          issue: {
+            id: "issue-submodule-verify-broken",
+            identifier: "PAP-SUBMODULE-VERIFY-BROKEN",
+            title: "Fail loudly when post-repair verification is definitive",
+          },
+          agent: {
+            id: "agent-submodule-verify-broken",
+            name: "Codex Coder",
+            companyId: "company-submodule-verify-broken",
+          },
+          recorder,
+        }),
+      ).rejects.toThrow(WorkspaceGitSubmoduleError);
+
+      // Prove the failure came from the verification call, not the initial one:
+      // the repair must have run, and the shim must have seen two status calls.
+      expect(
+        operations.some(
+          (operation) => operation.metadata?.action === "repair_uninitialized_submodules",
+        ),
+      ).toBe(true);
+      expect(await fs.readFile(counterPath, "utf8")).toBe("2");
+      expect(
+        operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+      ).toBe(false);
+      expect(await fs.stat(path.join(repoRoot, submodulePath, "codec.txt"))).toBeTruthy();
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await fs.rm(shimDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("still fails the run when a stalled probe already reported a conflicted submodule", async () => {
+    // BLO-18784 follow-up: `git submodule status --recursive` flushes each entry
+    // as it walks, so a stall can arrive with a definitive fault already in hand
+    // -- a `U` record for an earlier submodule, then a hang on a later one.
+    // `runGit` used to discard the partial stdout when it threw
+    // GitCommandTimeoutError, so that evidence was lost and the run degraded as
+    // though the probe had produced nothing. Measured against a real
+    // 120-submodule checkout: the `-`/`U` lines land ~130ms into a multi-second
+    // walk, well before the budget expires, so this is reachable in production.
+    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+    const counterPath = path.join(shimDir, "status-calls");
+    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+    const shimPath = path.join(shimDir, "git");
+    // Emit a conflicted record, then hang. `exec sleep` replaces the shell so the
+    // SIGTERM from executeProcess lands on the stalling process directly.
+    await fs.writeFile(
+      shimPath,
+      [
+        "#!/bin/sh",
+        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+        `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
+        "  calls=$((calls + 1))",
+        `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
+        "  echo 'U1111111111111111111111111111111111111111 vendor/conflicted-dep'",
+        "  exec sleep 30",
+        "fi",
+        `exec ${JSON.stringify(realGit)} "$@"`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(shimPath, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+    // attempts: 3 so that acting on the salvaged evidence is observable -- a
+    // correct implementation stops after the first stall because it already has
+    // a conclusive answer, rather than spending two more budgets on it.
+    setSubmoduleInspectSettingsForTests({ timeoutMs: 500, attempts: 3, retryDelayMs: 1 });
+
+    try {
+      await expect(
+        realizeExecutionWorkspace({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-submodule-partial-fault",
+            workspaceId: "workspace-submodule-partial-fault",
+            repoUrl: null,
+            repoRef: "main",
+          },
+          config: {},
+          issue: {
+            id: "issue-submodule-partial-fault",
+            identifier: "PAP-SUBMODULE-PARTIAL-FAULT",
+            title: "Do not discard a fault a stalled probe already found",
+          },
+          agent: {
+            id: "agent-submodule-partial-fault",
+            name: "Codex Coder",
+            companyId: "company-submodule-partial-fault",
+          },
+          recorder,
+        }),
+      ).rejects.toThrow(/vendor\/conflicted-dep/);
+
+      // The fault must be fatal, not degraded away.
+      expect(
+        operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+      ).toBe(false);
+      // Evidence was conclusive on the first stall, so it must not have retried.
+      expect(await fs.readFile(counterPath, "utf8")).toBe("1");
+    } finally {
+      setSubmoduleInspectSettingsForTests(null);
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await fs.rm(shimDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("still degrades when a stalled probe produced no fault record", async () => {
+    // The converse of the test above, and the property that keeps this from
+    // becoming a fail-*closed* regression: an empty or fault-free partial output
+    // is NOT evidence of health (an early kill or stdio buffering can yield zero
+    // bytes for a checkout that is in fact broken), so absence of a fault record
+    // must still degrade rather than being read as "clean" or as a fault.
+    //
+    // The shim also emits the three shapes that must NOT be mistaken for faults,
+    // because the captured stream is unreliable at both ends -- it keeps only the
+    // last N bytes (chopping the head and prepending a banner) and a kill can cut
+    // the tail mid-line:
+    //   1. the capture layer's `[output truncated ...]` banner,
+    //   2. a head-chopped line that lost its status character and sha prefix,
+    //   3. a tail fragment whose path is truncated (would name the wrong module).
+    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+    const shimPath = path.join(shimDir, "git");
+    await fs.writeFile(
+      shimPath,
+      [
+        "#!/bin/sh",
+        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+        "  echo '[output truncated to last 512 bytes; total 9000 bytes]'",
+        "  echo '9cd3ad27f42c565e05964ab4 vendor/head-fragment'",
+        "  echo ' 2222222222222222222222222222222222222222 vendor/healthy-dep (heads/main)'",
+        "  printf -- '-3333333333333333333333333333333333333333 vendor/trunc'",
+        "  exec sleep 30",
+        "fi",
+        `exec ${JSON.stringify(realGit)} "$@"`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(shimPath, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+    setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 2, retryDelayMs: 1 });
+
+    try {
+      const realized = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-partial-clean",
+          workspaceId: "workspace-submodule-partial-clean",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-partial-clean",
+          identifier: "PAP-SUBMODULE-PARTIAL-CLEAN",
+          title: "Degrade when a stall carries no fault record",
+        },
+        agent: {
+          id: "agent-submodule-partial-clean",
+          name: "Codex Coder",
+          companyId: "company-submodule-partial-clean",
+        },
+        recorder,
+      });
+
+      expect(realized.cwd).toBe(repoRoot);
+      expect(
+        realized.warnings.some((warning) => warning.includes("Could not inspect git submodules")),
+      ).toBe(true);
+      expect(
+        operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+      ).toBe(true);
+      // None of the three non-fault shapes may have been read as a broken module.
+      const allText = realized.warnings.join("\n");
+      expect(allText).not.toContain("vendor/trunc");
+      expect(allText).not.toContain("vendor/head-fragment");
+      expect(allText).not.toContain("vendor/healthy-dep");
+    } finally {
+      setSubmoduleInspectSettingsForTests(null);
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await fs.rm(shimDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("does not start a retry while the previous timed-out process group remains alive", async () => {
+    // In the CephFS-stall case this change exists for, SIGKILL can be issued
+    // while the task remains stuck in uninterruptible IO. Retrying immediately
+    // would overlap the next Git tree with the old one against the same checkout,
+    // amplifying the metadata pressure. Simulate that liveness result directly:
+    // the subprocess is killable in the test environment, but the retry policy
+    // must key off the bounded liveness probe result, not off a best-effort
+    // signal send.
+    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+    const counterPath = path.join(shimDir, "status-calls");
+    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+    const shimPath = path.join(shimDir, "git");
+    await fs.writeFile(
+      shimPath,
+      [
+        "#!/bin/sh",
+        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+        `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
+        "  calls=$((calls + 1))",
+        `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
+        "  exec sleep 30",
+        "fi",
+        `exec ${JSON.stringify(realGit)} "$@"`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(shimPath, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+    setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 3, retryDelayMs: 1 });
+    setProcessGroupLivenessProbeForTests(() => true);
+
+    try {
+      const realized = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-timeout-live-group",
+          workspaceId: "workspace-submodule-timeout-live-group",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-timeout-live-group",
+          identifier: "PAP-SUBMODULE-TIMEOUT-LIVE-GROUP",
+          title: "Do not retry over a live timed-out process group",
+        },
+        agent: {
+          id: "agent-submodule-timeout-live-group",
+          name: "Codex Coder",
+          companyId: "company-submodule-timeout-live-group",
+        },
+        recorder,
+      });
+
+      expect(realized.cwd).toBe(repoRoot);
+      const warning = realized.warnings.find((candidate) => candidate.includes("Could not inspect git submodules"));
+      expect(warning).toBeDefined();
+      expect(warning).toContain("after 1 attempt(s)");
+      expect(warning).toContain("process group remained alive after SIGKILL");
+      expect(warning).toContain("retry was skipped");
+      expect(await fs.readFile(counterPath, "utf8")).toBe("1");
+
+      const degraded = operations.find(
+        (operation) => operation.metadata?.action === "submodule_inspection_degraded",
+      );
+      expect(degraded?.metadata).toMatchObject({
+        attempts: 1,
+        reason: expect.stringContaining("retry was skipped"),
+      });
+    } finally {
+      setSubmoduleInspectSettingsForTests(null);
+      setProcessGroupLivenessProbeForTests(null);
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await fs.rm(shimDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("does not repair salvaged missing submodules while the timed-out process group remains alive", async () => {
+    const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: false });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+    const statusCounterPath = path.join(shimDir, "status-calls");
+    const repairCounterPath = path.join(shimDir, "repair-calls");
+    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+    const shimPath = path.join(shimDir, "git");
+    await fs.writeFile(
+      shimPath,
+      [
+        "#!/bin/sh",
+        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+        `  calls=$(cat ${JSON.stringify(statusCounterPath)} 2>/dev/null || echo 0)`,
+        "  calls=$((calls + 1))",
+        `  printf '%s' "$calls" > ${JSON.stringify(statusCounterPath)}`,
+        `  echo '-1111111111111111111111111111111111111111 ${submodulePath}'`,
+        "  exec sleep 30",
+        "fi",
+        `if [ "$1" = "submodule" ] && [ "$2" = "sync" ]; then`,
+        `  calls=$(cat ${JSON.stringify(repairCounterPath)} 2>/dev/null || echo 0)`,
+        "  calls=$((calls + 1))",
+        `  printf '%s' "$calls" > ${JSON.stringify(repairCounterPath)}`,
+        "fi",
+        `if [ "$1" = "-c" ] && [ "$3" = "submodule" ] && [ "$4" = "update" ]; then`,
+        `  calls=$(cat ${JSON.stringify(repairCounterPath)} 2>/dev/null || echo 0)`,
+        "  calls=$((calls + 1))",
+        `  printf '%s' "$calls" > ${JSON.stringify(repairCounterPath)}`,
+        "fi",
+        `exec ${JSON.stringify(realGit)} "$@"`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(shimPath, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+    setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 3, retryDelayMs: 1 });
+    setProcessGroupLivenessProbeForTests(() => true);
+
+    try {
+      const realized = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-partial-fault-live-group",
+          workspaceId: "workspace-submodule-partial-fault-live-group",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-partial-fault-live-group",
+          identifier: "PAP-SUBMODULE-PARTIAL-FAULT-LIVE-GROUP",
+          title: "Do not repair over a live timed-out process group",
+        },
+        agent: {
+          id: "agent-submodule-partial-fault-live-group",
+          name: "Codex Coder",
+          companyId: "company-submodule-partial-fault-live-group",
+        },
+        recorder,
+      });
+
+      expect(realized.cwd).toBe(repoRoot);
+      const warning = realized.warnings.find((candidate) =>
+        candidate.includes("automatic submodule repair was skipped"),
+      );
+      expect(warning).toBeDefined();
+      expect(warning).toContain(submodulePath);
+      expect(warning).toContain("process group remained alive after SIGKILL");
+      expect(await fs.readFile(statusCounterPath, "utf8")).toBe("1");
+      expect(await fs.readFile(repairCounterPath, "utf8").catch(() => "0")).toBe("0");
+
+      const degraded = operations.find(
+        (operation) => operation.metadata?.action === "submodule_inspection_degraded",
+      );
+      expect(degraded?.metadata).toMatchObject({
+        attempts: 1,
+        reason: expect.stringContaining("automatic submodule repair was skipped"),
+      });
+    } finally {
+      setSubmoduleInspectSettingsForTests(null);
+      setProcessGroupLivenessProbeForTests(null);
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await fs.rm(shimDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("reports both the repair and the degradation when the post-repair re-check stalls", async () => {
+    // The other timeout tests all stall the *initial* probe. This covers the
+    // second inspection site, which has a different obligation: the repair
+    // commands really did succeed, so the run must report that alongside the
+    // inconclusive verification rather than discarding either -- and the
+    // degradation operation has to be attributed to `post_repair`, otherwise an
+    // operator reading it goes looking for a stall that never happened at the
+    // start of the run.
+    const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: true });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+    const counterPath = path.join(shimDir, "status-calls");
+    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+    const shimPath = path.join(shimDir, "git");
+    // Call 1 (initial probe) reports the submodule uninitialized so the repair
+    // path runs for real; call 2 (the post-repair verification) hangs. `exec`
+    // replaces the shell so the SIGTERM lands on the stalling process directly.
+    await fs.writeFile(
+      shimPath,
+      [
+        "#!/bin/sh",
+        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+        `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
+        "  calls=$((calls + 1))",
+        `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
+        '  if [ "$calls" = "1" ]; then',
+        `    echo '-1111111111111111111111111111111111111111 ${submodulePath}'`,
+        "    exit 0",
+        "  fi",
+        "  exec sleep 30",
+        "fi",
+        `exec ${JSON.stringify(realGit)} "$@"`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(shimPath, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+    setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 2, retryDelayMs: 1 });
+
+    try {
+      const realized = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-post-repair-timeout",
+          workspaceId: "workspace-submodule-post-repair-timeout",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-post-repair-timeout",
+          identifier: "PAP-SUBMODULE-POST-REPAIR-TIMEOUT",
+          title: "Survive a stalled post-repair verification",
+        },
+        agent: {
+          id: "agent-submodule-post-repair-timeout",
+          name: "Codex Coder",
+          companyId: "company-submodule-post-repair-timeout",
+        },
+        recorder,
+      });
+
+      // The run survives, and neither half of the story is dropped.
+      expect(realized.strategy).toBe("project_primary");
+      expect(realized.warnings).toHaveLength(2);
+      expect(realized.warnings[0]).toBe(
+        `Initialized git submodules before starting: ${submodulePath}`,
+      );
+      expect(realized.warnings[1]).toContain("Continuing without the submodule readiness check");
+      expect(realized.warnings[1]).toContain("2 attempt(s)");
+
+      // The repair actually ran, and the verification stalled after it.
+      expect(
+        operations.some(
+          (operation) => operation.metadata?.action === "repair_uninitialized_submodules",
+        ),
+      ).toBe(true);
+      const degraded = operations.filter(
+        (operation) => operation.metadata?.action === "submodule_inspection_degraded",
+      );
+      expect(degraded).toHaveLength(1);
+      expect(degraded[0]?.metadata?.stage).toBe("post_repair");
+      expect(degraded[0]?.metadata?.attempts).toBe(2);
+    } finally {
+      setSubmoduleInspectSettingsForTests(null);
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await fs.rm(shimDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("ignores a non-integer submodule inspection override instead of truncating it to zero", async () => {
+    // `Math.trunc(0.5)` is 0, which does not fall back: 0 attempts skips the
+    // retry loop (degrading a healthy workspace) and a 0ms timeout disables
+    // `executeProcess`'s timer entirely. Both fail open silently, so a
+    // non-integer override must be rejected outright.
+    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const previousAttempts = process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS;
+    process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS = "0.5";
+
+    try {
+      const realized = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-bad-override",
+          workspaceId: "workspace-submodule-bad-override",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-bad-override",
+          identifier: "PAP-SUBMODULE-BAD-OVERRIDE",
+          title: "Reject a fractional attempts override",
+        },
+        agent: {
+          id: "agent-submodule-bad-override",
+          name: "Codex Coder",
+          companyId: "company-submodule-bad-override",
+        },
+        recorder,
+      });
+
+      // The healthy checkout is inspected normally: no degradation at all.
+      expect(
+        realized.warnings.filter((warning) => warning.includes("Could not inspect git submodules")),
+      ).toEqual([]);
+      expect(
+        operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+      ).toBe(false);
+    } finally {
+      if (previousAttempts === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS;
+      else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS = previousAttempts;
+    }
+  }, 20_000);
+
+  it("ignores an oversized submodule inspection timeout instead of letting Node clamp it to 1ms", async () => {
+    // Node clamps any `setTimeout` delay above `2^31 - 1` ms to *1ms* with a
+    // `TimeoutOverflowWarning`. A plausible-looking large override (an extra
+    // digit, or seconds/ms confusion) would therefore make every probe time out
+    // immediately and degrade a perfectly healthy checkout -- the same
+    // silent-fail-open class as the fractional-value bug above, arrived at from
+    // the opposite end of the range.
+    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const previousTimeout = process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
+    // 2^31, the first value Node cannot represent.
+    process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = "2147483648";
+
+    try {
+      const realized = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-huge-override",
+          workspaceId: "workspace-submodule-huge-override",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-huge-override",
+          identifier: "PAP-SUBMODULE-HUGE-OVERRIDE",
+          title: "Reject an oversized timeout override",
+        },
+        agent: {
+          id: "agent-submodule-huge-override",
+          name: "Codex Coder",
+          companyId: "company-submodule-huge-override",
+        },
+        recorder,
+      });
+
+      // Falls back to the 60s default, so the healthy checkout is inspected
+      // normally rather than degrading on a 1ms timer.
+      expect(
+        realized.warnings.filter((warning) => warning.includes("Could not inspect git submodules")),
+      ).toEqual([]);
+      expect(
+        operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+      ).toBe(false);
+    } finally {
+      if (previousTimeout === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
+      else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = previousTimeout;
+    }
+  }, 20_000);
+
+  it("ignores an undersized submodule inspection timeout instead of turning the knob into a fail-open switch", async () => {
+    // A budget too small to ever complete fails open exactly like the oversized
+    // case above: every probe times out, so every workspace takes the degrade
+    // path and the submodule check stops running at all. `=60` -- meaning the
+    // documented 60s, in a field that takes milliseconds -- is the likeliest way
+    // to reach that state, so it must fall back rather than be honoured.
+    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const previousTimeout = process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
+    // Seconds-vs-milliseconds slip: the operator means 60s, the field takes ms.
+    process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = "60";
+
+    try {
+      const realized = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-tiny-override",
+          workspaceId: "workspace-submodule-tiny-override",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-tiny-override",
+          identifier: "PAP-SUBMODULE-TINY-OVERRIDE",
+          title: "Reject an undersized timeout override",
+        },
+        agent: {
+          id: "agent-submodule-tiny-override",
+          name: "Codex Coder",
+          companyId: "company-submodule-tiny-override",
+        },
+        recorder,
+      });
+
+      // Falls back to the 60s default, so the healthy checkout is inspected
+      // normally rather than degrading on a 60ms timer.
+      expect(
+        realized.warnings.filter((warning) => warning.includes("Could not inspect git submodules")),
+      ).toEqual([]);
+      expect(
+        operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+      ).toBe(false);
+    } finally {
+      if (previousTimeout === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
+      else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = previousTimeout;
+    }
+  }, 20_000);
+
   it("repairs worktree submodules before running provision commands", async () => {
     const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: false });
     const scriptsDir = path.join(repoRoot, "scripts");
@@ -4400,6 +5189,181 @@ describe("resolveWorkspaceRuntimeReadinessTimeoutSec", () => {
       }),
     ).toBe(30);
   });
+});
+
+describe("executeProcess (timeout classification)", () => {
+  // BLO-18784 follow-up. `close` fires only once every writer on the inherited
+  // pipes is done, which can be long after the command itself exited: `git
+  // submodule status --recursive` forks per submodule, so one straggler is
+  // enough. Clearing the budget on `close` therefore let the timer fire against
+  // a command that had already returned a definitive status, and `runGit` --
+  // which checks `timedOut` before the exit code -- turned git's exit 128 into a
+  // retryable stall that degrades to a non-fatal warning. A broken checkout
+  // would have failed open.
+  it("keeps a nonzero exit definitive when a descendant holds stdio past the budget", async () => {
+    // Exits 128 immediately while a backgrounded grandchild keeps stdout open
+    // for 5s -- well past both the 300ms budget and the 2s drain grace.
+    const started = Date.now();
+    const result = await executeProcessForTests({
+      command: "sh",
+      args: ["-c", "sh -c 'sleep 5' & exit 128"],
+      cwd: os.tmpdir(),
+      timeoutMs: 300,
+    });
+
+    expect(result.code).toBe(128);
+    expect(result.timedOut).toBe(false);
+    // Settled on the drain bound rather than waiting out the straggler.
+    expect(Date.now() - started).toBeLessThan(4_000);
+  }, 15_000);
+
+  it("still reports a timeout, and reaps the tree, when the command itself stalls", async () => {
+    // Nothing exits on its own here: the budget has to kill it. Signalling only
+    // the direct child leaves the descendant running -- against the same
+    // checkout we have already given up waiting for, which is how one stalled
+    // probe makes the *next* one slower. The marker file is the observable
+    // proof: it is only ever written if the grandchild outlived the timeout.
+    const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reap-"));
+    const markerPath = path.join(markerDir, "survived");
+    const started = Date.now();
+
+    try {
+      const result = await executeProcessForTests({
+        command: "sh",
+        args: ["-c", `sh -c 'sleep 2; : > ${JSON.stringify(markerPath)}' & wait`],
+        cwd: os.tmpdir(),
+        timeoutMs: 300,
+      });
+
+      expect(result.timedOut).toBe(true);
+      expect(result.code).not.toBe(0);
+      // Settled on the timeout rather than hanging until the descendant finished.
+      expect(Date.now() - started).toBeLessThan(5_000);
+
+      // Outlive the grandchild's own sleep, then confirm it never got there.
+      await new Promise((resolve) => setTimeout(resolve, 2_500));
+      await expect(fs.stat(markerPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await fs.rm(markerDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("reaps a TERM-resistant descendant before the caller can start its next attempt", async () => {
+    // The timeout path sends SIGTERM, then escalates to SIGKILL. If the group
+    // leader exits on SIGTERM but a descendant ignores it, that descendant must
+    // be dead by the time this call resolves -- `inspectGitSubmoduleReadiness`
+    // retries after a backoff (WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS, 1s)
+    // that is shorter than the remaining kill grace, so leaving the SIGKILL
+    // merely *scheduled* would overlap attempt N+1 with a straggler still
+    // walking the same checkout.
+    const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reap-ignore-term-"));
+    const markerPath = path.join(markerDir, "survived");
+    const pidPath = path.join(markerDir, "descendant.pid");
+    const started = Date.now();
+
+    try {
+      const result = await executeProcessForTests({
+        command: "sh",
+        args: [
+          "-c",
+          [
+            `sh -c 'trap "" TERM; echo $$ > ${JSON.stringify(pidPath)}; sleep 7; : > ${JSON.stringify(markerPath)}' &`,
+            `trap "exit 0" TERM`,
+            "wait",
+          ].join("\n"),
+        ],
+        cwd: os.tmpdir(),
+        timeoutMs: 300,
+      });
+
+      expect(result.timedOut).toBe(true);
+      expect(Date.now() - started).toBeLessThan(5_000);
+
+      const descendantPid = Number((await fs.readFile(pidPath, "utf8")).trim());
+      expect(Number.isInteger(descendantPid)).toBe(true);
+
+      // SIGKILL is issued before we resolve, but reaping is the kernel's to
+      // schedule -- poll rather than asserting on the same tick. The bound is
+      // well inside the 1s retry backoff, and far short of the ~2.7s the
+      // descendant survived when the escalation was left on the clock.
+      const deadline = Date.now() + 750;
+      let alive = true;
+      while (Date.now() < deadline) {
+        try {
+          process.kill(descendantPid, 0);
+        } catch {
+          alive = false;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(alive).toBe(false);
+
+      // Belt and braces: the descendant never reached its own post-sleep write.
+      await new Promise((resolve) => setTimeout(resolve, 7_500));
+      await expect(fs.stat(markerPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await fs.rm(markerDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("destroys captured stdio when drain grace expires after a clean exit", async () => {
+    // A command can exit 0 while a descendant still owns the inherited pipes.
+    // Drain grace must resolve the call, but it also has to close our captured
+    // stream handles; otherwise the pipe, listeners, and output accumulators live
+    // until the descendant eventually exits.
+    const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-stdio-drain-"));
+    const markerPath = path.join(markerDir, "write-after-drain");
+    const writerScript = `
+      const fs = require("node:fs");
+      setTimeout(() => {
+        fs.writeSync(1, "late output after drain\\n");
+        fs.writeFileSync(${JSON.stringify(markerPath)}, "survived");
+      }, 3500);
+    `;
+    const launcherScript = `
+      const { spawn } = require("node:child_process");
+      const child = spawn(process.execPath, ["-e", ${JSON.stringify(writerScript)}], {
+        stdio: ["ignore", "inherit", "inherit"],
+      });
+      child.unref();
+      process.exit(0);
+    `;
+    const started = Date.now();
+
+    try {
+      const result = await executeProcessForTests({
+        command: process.execPath,
+        args: ["-e", launcherScript],
+        cwd: os.tmpdir(),
+        timeoutMs: 10_000,
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.timedOut).toBe(false);
+      expect(Date.now() - started).toBeLessThan(3_500);
+
+      // Without destroying the captured streams, the descendant keeps stdout open,
+      // writes successfully, and leaves the marker after this call has returned.
+      await new Promise((resolve) => setTimeout(resolve, 2_500));
+      await expect(fs.stat(markerPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await fs.rm(markerDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("reports a clean exit unchanged", async () => {
+    const result = await executeProcessForTests({
+      command: "sh",
+      args: ["-c", "printf 'ok\\n'"],
+      cwd: os.tmpdir(),
+      timeoutMs: 10_000,
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.timedOut).toBe(false);
+    expect(result.stdout).toBe("ok\n");
+  }, 15_000);
 });
 
 describe("resolveShell (shell fallback)", () => {
