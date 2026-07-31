@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -1089,15 +1089,41 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
-  it("keeps the source issue blocked when source-scoped wakeup is claimed synchronously", async () => {
+  // BLO-18829: this used to assert "`blocked` is the last word" -- that after a
+  // source-scoped wakeup claimed the issue, escalation forced it back to
+  // `blocked`. That was a proxy for the invariant we actually care about, and
+  // the proxy was the wrong one: when a wakeup synchronously claims the issue a
+  // run has genuinely taken it, so `in_progress` is true and `blocked` would be
+  // a false statement about the world. What must not happen is the issue coming
+  // to rest with neither a live execution path NOR a visible recovery action.
+  // So the guard is kept and re-pointed at all three parts of that invariant.
+  it("keeps the recovery action active and visible when a source-scoped wakeup is claimed synchronously", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, managerId));
+    // Model a real synchronous claim: enqueueWakeup starts a run that takes the
+    // issue, and returns that run. Returning `null` here would mean "nobody was
+    // woken", which is the opposite condition and is asserted separately.
     const enqueueWakeup = vi.fn(async () => {
+      // A fresh run per call: this stub is invoked once per escalation.
+      const claimingRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: claimingRunId,
+        companyId,
+        agentId: coderId,
+        invocationSource: "automation",
+        status: "running",
+        startedAt: new Date(),
+        contextSnapshot: { issueId: sourceIssue.id },
+      });
       await db
         .update(issues)
         .set({ status: "in_progress" })
         .where(eq(issues.id, sourceIssue.id));
-      return null;
+      return await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, claimingRunId))
+        .then((rows) => rows[0] ?? null);
     });
     const recovery = recoveryService(db, { enqueueWakeup });
     const firstLatestRun = {
@@ -1121,8 +1147,21 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
 
     const [afterFirst] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
-    expect(afterFirst?.status).toBe("blocked");
+    // (1) the claim stands -- the run that took the issue owns its status.
+    expect(afterFirst?.status).toBe("in_progress");
     expect(afterFirst?.assigneeAgentId).toBe(coderId);
+    // (2) + (3) the recovery action is still active, and still visible to
+    // anything that reads the ledger by active status -- so the issue has not
+    // come to rest without a recovery action attached to it.
+    const ledgerAfterFirst = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.sourceIssueId, sourceIssue.id),
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      ));
+    expect(ledgerAfterFirst).toHaveLength(1);
+    expect(ledgerAfterFirst[0]).toMatchObject({ status: "active", cause: "stranded_assigned_issue" });
 
     const secondLatestRun = {
       ...firstLatestRun,
@@ -1150,15 +1189,109 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       attemptCount: 2,
     });
     const [afterSecond] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
-    expect(afterSecond?.status).toBe("blocked");
+    // Same invariant after a re-escalation: the second wakeup claimed the issue
+    // again, so `in_progress` is the truthful status, and the single active
+    // action above is what keeps it visible in the recovery ledger.
+    expect(afterSecond?.status).toBe("in_progress");
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id));
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("Recovery action:");
   });
 
-  it("does not create nested recovery artifacts when issue-backed fallback work itself fails", async () => {
-    const { companyId, managerId, sourceIssueId, prefix } = await seedCompany();
+  // BLO-18829 / Ally review of 5e7054d4: dispatchPlannedRecoveryWake used to carry
+  // a post-commit UPDATE that nulled the execution-lock columns. It could never
+  // fire (it required `in_progress`, but the escalation transaction commits
+  // `blocked` first), and it was redundant: issueService.update already clears
+  // those columns for any status write that is not `in_progress`. This pins that
+  // clearing to the in-transaction write, so removing the dead block stays safe
+  // and nobody reintroduces it to "fix" a stale lock.
+  it("clears the execution lock on the escalating transaction, not after it", async () => {
+    const { companyId, coderId, sourceIssue } = await seedCompany();
+    const staleRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: staleRunId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "automation",
+      status: "failed",
+      startedAt: new Date(),
+    });
+    await db
+      .update(issues)
+      .set({ executionAgentNameKey: "coder", executionLockedAt: new Date() })
+      .where(eq(issues.id, sourceIssue.id));
+
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: {
+        id: staleRunId,
+        agentId: coderId,
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      } as const,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [escalated] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(escalated?.status).toBe("blocked");
+    expect(escalated?.executionAgentNameKey).toBeNull();
+    expect(escalated?.executionLockedAt).toBeNull();
+    expect(escalated?.checkoutRunId).toBeNull();
+    expect(escalated?.executionRunId).toBeNull();
+  });
+
+  // BLO-18829 condition B: enqueueWakeup returns the started run, or `null` on
+  // any of its non-delivery paths. A `null` must not be read as "delivered".
+  // Today the escalation still stands and the recovery action stays active and
+  // visible, which is what keeps the issue recoverable by an operator -- see the
+  // KNOWN GAP note in dispatchPlannedRecoveryWake for why it is not yet
+  // automatically retried.
+  it("leaves the recovery action active and visible when the owner wake is not delivered", async () => {
+    const { companyId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      } as const,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    const ledger = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.companyId, companyId),
+        eq(issueRecoveryActions.sourceIssueId, sourceIssue.id),
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      ));
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0]).toMatchObject({ status: "active" });
+  });
+
+  it("does not create nested recovery artifacts when issue-backed fallback work itself fails", async () => {    const { companyId, managerId, sourceIssueId, prefix } = await seedCompany();
     const recoveryIssueId = randomUUID();
     await db.insert(issues).values({
       id: recoveryIssueId,

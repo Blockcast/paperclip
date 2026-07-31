@@ -3843,15 +3843,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
   // An escalated issue is `blocked`, and reconcileStrandedAssignedIssues only
   // selects `todo` / `in_progress` / `in_review` — so nothing re-sweeps it. The
-  // recovery-owner wake is therefore the *only* thing that keeps an escalated
-  // issue live, and a wake that was never delivered strands it permanently.
-  // Hand the issue back to a swept status so the next sweep retries, but bound
-  // the retries: an owner that is durably non-invokable would otherwise
-  // escalate-and-revert on every tick. Past the cap the issue stays `blocked`
-  // with its recovery action still active — visible in the recovery ledger for
-  // a human, which is a worse outcome than a delivered wake but a much better
-  // one than a silent permanent strand.
-  const UNDELIVERED_RECOVERY_WAKE_MAX_RETRIES = 3;
+  // recovery-owner wake is therefore the only thing that keeps an escalated
+  // issue live. dispatchPlannedRecoveryWake carries the detail of what happens
+  // when that wake is not delivered.
 
   // Pure decision — no IO. Callers that need the escalation's DB writes to be
   // transactional plan the wake inside the transaction and dispatch it through
@@ -3954,65 +3948,40 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // `deps.enqueueWakeup` resolves to the started run, or to `null` on any of
     // its non-delivery paths (agent not invokable, company inactive, budget
     // exhausted, suppression, idempotency collision, ...). A non-throwing call
-    // is therefore NOT evidence that anyone was woken, and treating it as such
-    // is what turns this issue's benign over-wake into a permanent strand.
+    // is therefore NOT evidence that anyone was woken, so do not report success
+    // off one. See BLO-18829 and
+    // gbrain paperclip/gotchas/enqueuewakeup-null-means-nobody-was-woken.
     const run = await deps.enqueueWakeup(planned.agentId, planned.opts);
     if (run) return;
 
-    if (planned.attemptCount > UNDELIVERED_RECOVERY_WAKE_MAX_RETRIES) {
-      logger.error(
-        {
-          issueId: planned.sourceIssueId,
-          agentId: planned.agentId,
-          recoveryActionId: planned.recoveryActionId,
-          attemptCount: planned.attemptCount,
-        },
-        "recovery owner wake was not delivered and the retry budget is spent; issue stays blocked with an active recovery action",
-      );
-      return;
-    }
-
-    logger.warn(
+    // KNOWN GAP (AC-3), deliberately not papered over here. The issue is now
+    // `blocked`, and reconcileStrandedAssignedIssues only selects
+    // todo/in_progress/in_review, so nothing re-sweeps it: an undelivered wake
+    // strands it until a human reads the recovery ledger.
+    //
+    // Automatically handing the issue back to a swept status was tried and
+    // rejected: `null` does not distinguish "nobody was woken" from "a wake
+    // already exists" (idempotency collision) or "delivery was deliberately
+    // suppressed", so reverting would undo correct escalations, and it would
+    // make `in_progress` mean either "a run claimed this" or "the wake failed"
+    // -- opposite conditions behind one status. Closing this properly needs a
+    // durable per-wake delivery record (the outbox table the original design
+    // called for, or a delivered-at column on the recovery action) so the sweep
+    // can select undelivered wakes specifically.
+    //
+    // Until then the recovery action stays `active` and therefore visible in
+    // the operator recovery ledger, and this logs at error so an undelivered
+    // wake is greppable rather than silent.
+    logger.error(
       {
         issueId: planned.sourceIssueId,
         agentId: planned.agentId,
         recoveryActionId: planned.recoveryActionId,
         attemptCount: planned.attemptCount,
-        revertingTo: planned.previousStatus,
+        previousStatus: planned.previousStatus,
       },
-      "recovery owner wake was not delivered; handing the issue back to the stranded sweep to retry",
+      "recovery owner wake was not delivered; issue stays blocked with an active recovery action and will not be re-swept",
     );
-
-    // Hand the issue back to a swept status so the next reconcile pass retries
-    // the escalation (and the wake) instead of leaving it `blocked` forever.
-    // Guarded so this can only ever undo *our own* just-committed escalation:
-    // it requires the issue to still be `blocked` with no execution path and
-    // our recovery action still active. If anything else has since claimed the
-    // issue — including a run that started between the wake and this write —
-    // the predicate misses and we leave that owner alone.
-    await db
-      .update(issues)
-      .set({ status: planned.previousStatus, updatedAt: new Date() })
-      .where(
-        and(
-          eq(issues.id, planned.sourceIssueId),
-          eq(issues.status, "blocked"),
-          isNull(issues.checkoutRunId),
-          isNull(issues.executionRunId),
-          exists(
-            db
-              .select({ id: issueRecoveryActions.id })
-              .from(issueRecoveryActions)
-              .where(
-                and(
-                  eq(issueRecoveryActions.id, planned.recoveryActionId),
-                  eq(issueRecoveryActions.sourceIssueId, issues.id),
-                  inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
-                ),
-              ),
-          ),
-        ),
-      );
   }
 
   function readProviderQuotaRetryAt(latestRun: LatestIssueRun, now: Date) {
