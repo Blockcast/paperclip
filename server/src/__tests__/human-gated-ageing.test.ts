@@ -119,6 +119,10 @@ describe("the escalation clock ignores agent-movable timestamps", () => {
 
     const report = selectAgedHumanGatedIssues([untouched], { now: NOW, escalateAfterDaysByPriority: flat(30) });
     expect(report.escalated[0]!.neverTouchedByHuman).toBe(true);
+    expect(report.neverTouchedByHumanCount).toBe(1);
+    expect(formatHumanGatedAgeingSections(report)).toContain(
+      "Human-touch fallback: 1 of 1 scanned issues have no human touch timestamp.",
+    );
   });
 
   it("never lets the clock predate issue creation", () => {
@@ -187,6 +191,29 @@ describe("priority-weighted thresholds", () => {
     expect(report.totalOverThreshold).toBe(0);
   });
 
+  it("renders null and unrecognised priorities instead of dropping them from the digest", () => {
+    const report = selectAgedHumanGatedIssues(
+      [
+        issue({ id: "unknown-priority", priority: "urgent-ish", lastHumanTouchAt: daysAgo(120) }),
+        issue({ id: "unset-priority", priority: null, lastHumanTouchAt: daysAgo(90) }),
+        issue({ id: "known-medium", priority: "medium", lastHumanTouchAt: daysAgo(60) }),
+      ],
+      { now: NOW, escalateAfterDaysByPriority: DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY },
+    );
+
+    expect(report.totalOverThreshold).toBe(3);
+    expect(report.countsByPriority).toEqual({ "urgent-ish": 1, unset: 1, medium: 1 });
+
+    const rendered = formatHumanGatedAgeingSections(report);
+    expect(rendered).toContain("unset >45d");
+    expect(rendered).toContain("**medium**");
+    expect(rendered).toContain("**unset**");
+    expect(rendered).toContain("**urgent-ish**");
+    expect(rendered).toContain("UNKNOWN-PRIORITY");
+    expect(rendered).toContain("UNSET-PRIORITY");
+    expect(rendered).toContain("KNOWN-MEDIUM");
+  });
+
   it("ships a default attention budget so an unbounded list cannot be published", () => {
     expect(DEFAULT_MAX_ESCALATED).toBeLessThanOrEqual(20);
     expect(DEFAULT_MAX_ESCALATED).toBeGreaterThan(0);
@@ -233,6 +260,51 @@ describe("threshold and reporting", () => {
     // The cap keeps the oldest, not an arbitrary slice.
     expect(report.escalated[0]!.id).toBe("aged-00");
     expect(report.escalated[9]!.id).toBe("aged-09");
+    expect(formatHumanGatedAgeingSections(report)).toContain("15 further issues");
+  });
+
+  it("treats snake_case human-touch input as malformed instead of falling back to createdAt", () => {
+    const snakeCaseRow = {
+      ...issue({
+        id: "snake-case",
+        createdAt: daysAgo(400),
+      }),
+      last_human_touch_at: daysAgo(2),
+    } as HumanGatedIssue & { last_human_touch_at: string };
+    delete (snakeCaseRow as { lastHumanTouchAt?: string | null }).lastHumanTouchAt;
+
+    const report = selectAgedHumanGatedIssues([snakeCaseRow], {
+      now: NOW,
+      escalateAfterDaysByPriority: flat(30),
+    });
+
+    expect(report.totalOverThreshold).toBe(0);
+    expect(report.escalated).toEqual([]);
+    expect(report.malformed).toHaveLength(1);
+    expect(report.malformed[0]?.reason).toContain("missing lastHumanTouchAt");
+
+    const rendered = formatHumanGatedAgeingSections(report);
+    expect(rendered).toContain("Skipped 1 malformed human-gated row");
+    expect(rendered).toContain("SNAKE-CASE");
+  });
+
+  it("skips malformed rows without losing valid overdue rows", () => {
+    const report = selectAgedHumanGatedIssues(
+      [
+        issue({ id: "valid", lastHumanTouchAt: daysAgo(80) }),
+        issue({ id: "bad-created", createdAt: "not-a-date", lastHumanTouchAt: null }),
+      ],
+      { now: NOW, escalateAfterDaysByPriority: flat(30) },
+    );
+
+    expect(report.escalated.map((row) => row.id)).toEqual(["valid"]);
+    expect(report.malformed).toHaveLength(1);
+    expect(report.malformed[0]?.issue.id).toBe("bad-created");
+
+    const rendered = formatHumanGatedAgeingSections(report);
+    expect(rendered).toContain("VALID");
+    expect(rendered).toContain("BAD-CREATED");
+    expect(rendered).toContain("missing or unparseable createdAt");
   });
 
   it("separates waiting-on-review from waiting-to-start", () => {
