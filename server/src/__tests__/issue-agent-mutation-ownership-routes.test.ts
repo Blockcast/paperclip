@@ -434,6 +434,7 @@ function createAuthorizationDecisionDb(input: { actor?: { agentId?: string | nul
     select: vi.fn((selection: Record<string, unknown> = {}) => ({
       from: vi.fn(() => ({
         where: vi.fn(() => ({
+          limit: vi.fn(() => ({ then: async (resolve: (rows: unknown[]) => unknown) => resolve([]) })),
           then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
             Promise.resolve(rowsForSelection(selection)).then(onFulfilled, onRejected),
         })),
