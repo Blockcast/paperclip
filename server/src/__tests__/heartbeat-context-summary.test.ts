@@ -137,7 +137,8 @@ describe("buildPaperclipTaskMarkdown", () => {
     expect(authorMarkdown).toContain("ally just submitted a review on YOUR pull request (state: COMMENTED).");
     expect(authorMarkdown).toContain('- PR URL: "https://github.com/Blockcast/magma/pull/953"');
     expect(authorMarkdown).toContain('- GitHub event URL: "https://github.com/Blockcast/magma/pull/953#pullrequestreview-123"');
-    expect(authorMarkdown).toContain('- Head SHA: "abc123"');
+    expect(authorMarkdown).toContain('- Head SHA at wake time: "abc123"');
+    expect(authorMarkdown).toContain("may be superseded");
     // Review body fence-block injected inline so the author doesn't need
     // to shell out to `gh pr view` just to read the findings.
     expect(authorMarkdown).toContain("Latest review body:");
@@ -912,6 +913,145 @@ describe("mergeCoalescedContextSnapshot", () => {
       selectedOptionIds: ["file-b"],
       selectedOptions: [{ id: "file-b", label: "b.txt", description: "Generated build output" }],
     });
+  });
+
+  // BLO-19118. Two PRs whose bodies both reference the same BLO- ref resolve to
+  // the same issue, so their author wakes share a coalescing task key and get
+  // merged. Reproduces the 2026-07-30 incident verbatim: a ready_for_review for
+  // #837 (which carries no review fields of its own) merged onto a pending
+  // review_submitted for #824 and inherited #824's review body.
+  it("drops the inherited GitHub block when the incoming wake names a different PR", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-18829",
+        wakeReason: "github_pr_review_submitted",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 824,
+        githubPrTitle: "fix(recovery): treat checkout adoption as continuity",
+        githubPrUrl: "https://github.com/Blockcast/paperclip/pull/824",
+        githubHeadSha: "bfc470e81a12a3f52ac030b45a5e68949e119bc1",
+        githubPrReviewBody: "Reviewed head: bfc470e8. getCheckoutAdoptingRun ignores the CAS result.",
+        githubPrReviewState: "commented",
+        githubPrReviewAuthorLogin: "ally",
+        githubReviewFeedbackActionable: true,
+        prRole: "author",
+      },
+      {
+        issueId: "issue-18829",
+        wakeReason: "github_pr_ready_for_review",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 837,
+        githubPrTitle: "fix(recovery): let a recovery owner comment",
+        githubPrUrl: "https://github.com/Blockcast/paperclip/pull/837",
+        githubHeadSha: "2120c77c8633e98b186c592d0ddd0204cc6a8760",
+        prRole: "author",
+      },
+    );
+
+    // Identity is the incoming PR's, wholesale.
+    expect(merged.githubPrNumber).toBe(837);
+    expect(merged.githubHeadSha).toBe("2120c77c8633e98b186c592d0ddd0204cc6a8760");
+    expect(merged.githubPrTitle).toBe("fix(recovery): let a recovery owner comment");
+
+    // The other PR's review must not ride along — this is the whole bug.
+    expect(merged.githubPrReviewBody).toBeUndefined();
+    expect(merged.githubPrReviewState).toBeUndefined();
+    expect(merged.githubPrReviewAuthorLogin).toBeUndefined();
+    expect(merged.githubReviewFeedbackActionable).toBeUndefined();
+
+    // Task identity still survives the clear.
+    expect(merged.issueId).toBe("issue-18829");
+  });
+
+  it("keeps review context when both wakes are about the same PR", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-18829",
+        wakeReason: "github_pr_review_submitted",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 837,
+        githubHeadSha: "2120c77c8633e98b186c592d0ddd0204cc6a8760",
+        githubPrReviewBody: "Nit: rename the helper.",
+        githubPrReviewAuthorLogin: "ally",
+        prRole: "author",
+      },
+      {
+        issueId: "issue-18829",
+        wakeReason: "github_pr_synchronized",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 837,
+        githubHeadSha: "8555702b54179d291f3283a449eaead3c4b08bc9",
+        prRole: "author",
+      },
+    );
+
+    expect(merged.githubPrNumber).toBe(837);
+    expect(merged.githubHeadSha).toBe("8555702b54179d291f3283a449eaead3c4b08bc9");
+    expect(merged.githubPrReviewBody).toBe("Nit: rename the helper.");
+    expect(merged.githubPrReviewAuthorLogin).toBe("ally");
+  });
+
+  // Same PR number, different repository — the identity key is (repo, number),
+  // not the number alone.
+  it("treats the same PR number in a different repo as a different PR", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-1",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 42,
+        githubPrReviewBody: "Findings on paperclip#42.",
+      },
+      {
+        issueId: "issue-1",
+        githubRepoFullName: "Blockcast/frr",
+        githubPrNumber: 42,
+        githubHeadSha: "deadbeef",
+      },
+    );
+
+    expect(merged.githubRepoFullName).toBe("Blockcast/frr");
+    expect(merged.githubPrReviewBody).toBeUndefined();
+  });
+
+  it("leaves the GitHub block alone when the incoming wake is not PR-shaped", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-1",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 824,
+        githubPrReviewBody: "Findings on #824.",
+        prRole: "author",
+      },
+      {
+        issueId: "issue-1",
+        wakeReason: "issue_commented",
+        commentId: "comment-1",
+      },
+    );
+
+    expect(merged.githubPrNumber).toBe(824);
+    expect(merged.githubPrReviewBody).toBe("Findings on #824.");
+  });
+
+  // parseObject returns its argument by reference when that argument is already
+  // an object, so a clear implemented against `existing` would corrupt the
+  // caller's persisted snapshot.
+  it("does not mutate the caller's existing snapshot", () => {
+    const existing = {
+      issueId: "issue-1",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 824,
+      githubPrReviewBody: "Findings on #824.",
+    };
+
+    mergeCoalescedContextSnapshot(existing, {
+      issueId: "issue-1",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 837,
+    });
+
+    expect(existing.githubPrNumber).toBe(824);
+    expect(existing.githubPrReviewBody).toBe("Findings on #824.");
   });
 });
 

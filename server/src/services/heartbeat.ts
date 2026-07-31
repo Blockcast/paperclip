@@ -5803,6 +5803,55 @@ function normalizeInteractionContinuationWakeContext(
   clearInteractionContinuationWakeContext(contextSnapshot);
 }
 
+// BLO-19118: the GitHub PR block describes ONE pull request. It is not a bag of
+// independent fields — `githubPrReviewBody` only means anything alongside the
+// `githubPrNumber`/`githubHeadSha` it arrived with. Coalescing merges snapshots
+// field-by-field, so any key the incoming wake does not re-supply survives from
+// the previous one; for two wakes about *different* PRs that silently welds one
+// PR's review onto another PR's identity.
+//
+// That is not hypothetical: a wake is routed to an issue by the BLO- refs in the
+// PR body, so two PRs that both mention BLO-x resolve to the same issue, hence
+// the same coalescing task key. Observed 2026-07-30 — a `ready_for_review` for
+// #837 inherited #824's review body (head bfc470e, a different branch entirely)
+// because `ready_for_review` carries no review fields of its own. The agent is
+// then told "the findings are on YOUR pull request" about a review of someone
+// else's diff.
+const GITHUB_PR_CONTEXT_KEYS = [
+  "githubPrNumber",
+  "githubRepoFullName",
+  "githubPrTitle",
+  "githubPrUrl",
+  "githubEventUrl",
+  "githubHeadSha",
+  "githubEvent",
+  "githubDeliveryId",
+  "githubCommentUrl",
+  "githubReviewUrl",
+  "githubPrAuthorLogin",
+  "githubPaperclipIdentifiers",
+  "githubPrReviewBody",
+  "githubPrReviewState",
+  "githubPrReviewAuthorLogin",
+  "githubPrReviewRequestBody",
+  "githubPrReviewRequestAuthorLogin",
+  "githubReviewFeedbackActionable",
+  "prRole",
+  "reviewKind",
+] as const;
+
+function readGithubPrIdentity(contextSnapshot: Record<string, unknown>) {
+  const raw = contextSnapshot.githubPrNumber;
+  const prNumber =
+    typeof raw === "number" && Number.isFinite(raw)
+      ? raw
+      : typeof raw === "string" && raw.trim().length > 0 && Number.isFinite(Number(raw))
+        ? Number(raw)
+        : null;
+  if (prNumber === null) return null;
+  return `${readNonEmptyString(contextSnapshot.githubRepoFullName) ?? "unknown-repo"}#${prNumber}`;
+}
+
 type AcceptedPlanWakeRoutingDecision = {
   otherActiveClaimIssueId: string;
   otherActiveClaimIdentifier: string | null;
@@ -5865,6 +5914,25 @@ export function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
+  // BLO-19118: when the incoming wake names a different pull request, every
+  // inherited GitHub field describes the wrong artifact. Drop the block as a
+  // unit instead of letting the spread above carry over whichever keys the
+  // incoming wake happens not to re-supply. Keys the incoming wake DID supply
+  // are its own and stay. Same PR — or a non-PR wake, which leaves the block
+  // untouched — keeps the previous behaviour.
+  // NOTE: `parseObject` returns `existingRaw` itself when it is already an
+  // object, so this must edit `merged` (freshly created) and never `existing`.
+  const incomingPrIdentity = readGithubPrIdentity(incoming);
+  const existingPrIdentity = readGithubPrIdentity(existing);
+  if (
+    incomingPrIdentity !== null &&
+    existingPrIdentity !== null &&
+    incomingPrIdentity !== existingPrIdentity
+  ) {
+    for (const key of GITHUB_PR_CONTEXT_KEYS) {
+      if (!(key in incoming)) delete merged[key];
+    }
+  }
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
   }
@@ -7182,7 +7250,13 @@ export function buildPaperclipTaskMarkdown(input: {
     if (prReview.eventUrl && prReview.eventUrl !== prReview.prUrl) {
       lines.push(`- GitHub event URL: ${quoteTaskScalar(prReview.eventUrl)}`);
     }
-    if (prReview.headSha) lines.push(`- Head SHA: ${quoteTaskScalar(prReview.headSha)}`);
+    // BLO-19118: this is the head GitHub reported when the webhook fired, not
+    // the head now. A wake can sit queued for tens of minutes (observed: 30+),
+    // and the author may push in that window — trusting it verbatim makes the
+    // agent diff a superseded commit. Say so, so the run re-resolves.
+    if (prReview.headSha) {
+      lines.push(`- Head SHA at wake time: ${quoteTaskScalar(prReview.headSha)} (may be superseded — confirm the current head before diffing or checking out)`);
+    }
     if (prReview.event) lines.push(`- GitHub event: ${quoteTaskScalar(prReview.event)}`);
     if (prReview.prRole === "author") {
       const reviewerLabel = prReview.reviewAuthorLogin ?? "A reviewer";
