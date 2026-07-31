@@ -3787,6 +3787,20 @@ export function issueRoutes(
     );
   }
 
+  function isAgentCurrentExecutionStageParticipant(
+    req: Request,
+    issue: { status: string; executionState?: unknown },
+  ) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return false;
+    if (issue.status !== "in_review") return false;
+    const executionState = parseIssueExecutionState(issue.executionState);
+    if (executionState?.status !== "pending") return false;
+    return actorMatchesExecutionParticipant(
+      { actorType: "agent", actorId: req.actor.agentId },
+      executionState.currentParticipant,
+    );
+  }
+
   async function assertAgentIssueMutationAllowed(
     req: Request,
     res: Response,
@@ -3834,6 +3848,9 @@ export function issueRoutes(
       return false;
     }
     if (await isActiveRecoveryActionOwner()) return true;
+    if (isAgentCurrentExecutionStageParticipant(req, issue)) {
+      return true;
+    }
     if (issue.assigneeAgentId === null) {
       return true;
     }
