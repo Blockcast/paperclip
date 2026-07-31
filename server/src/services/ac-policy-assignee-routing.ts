@@ -162,8 +162,14 @@ export type AcPolicyResolvedOwner = {
  * be able to see *why* a filing moved off its assignee, not merely that it did.
  * Owners whose assignee executes are omitted — nothing moved, so there is
  * nothing to explain.
+ *
+ * Pass `agentNames` so re-route destinations render as names; a bare agent UUID
+ * is technically complete and useless to the human reading the dashboard.
  */
-export function formatAcPolicyFilingTargetSections(owners: AcPolicyResolvedOwner[]) {
+export function formatAcPolicyFilingTargetSections(
+  owners: AcPolicyResolvedOwner[],
+  agentNames: ReadonlyMap<string, string> = new Map(),
+) {
   const rerouted = owners.filter(
     (owner) => owner.target.kind !== "unroutable" && owner.target.skipped.length > 0,
   );
@@ -171,6 +177,7 @@ export function formatAcPolicyFilingTargetSections(owners: AcPolicyResolvedOwner
 
   const describeSkips = (target: AcPolicyFilingTarget) =>
     target.skipped.map((entry) => `${entry.name} (${entry.reason})`).join(" → ") || "none";
+  const namedAgent = (agentId: string) => `agent ${agentNames.get(agentId) ?? agentId}`;
 
   const lines: string[] = [`### Re-routed filings (${rerouted.length})`];
   if (rerouted.length === 0) {
@@ -182,7 +189,7 @@ export function formatAcPolicyFilingTargetSections(owners: AcPolicyResolvedOwner
         target.kind === "user"
           ? `user ${target.userId}`
           : target.kind === "agent"
-            ? `agent ${target.agentId}`
+            ? namedAgent(target.agentId)
             : "nobody";
       lines.push(`- ${owner.label} → ${to} (${target.reason}); skipped: ${describeSkips(target)}`);
     }

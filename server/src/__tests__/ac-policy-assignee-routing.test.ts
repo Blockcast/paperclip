@@ -255,4 +255,14 @@ describe("AC-policy filing-target dashboard rendering", () => {
     expect(rendered).toContain("### Re-routed filings (0)");
     expect(rendered).toContain("- None");
   });
+
+  it("renders the destination by name when a name map is supplied, id otherwise", () => {
+    const owners = [{ label: "Operator (devbox)", target: resolve("operator-devbox") }];
+
+    // A bare UUID is complete but unreadable; the map is what makes it useful.
+    expect(formatAcPolicyFilingTargetSections(owners)).toContain("→ agent ceo (");
+    expect(
+      formatAcPolicyFilingTargetSections(owners, new Map([["ceo", "CEO"]])),
+    ).toContain("→ agent CEO (");
+  });
 });
