@@ -16843,15 +16843,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // BLO-16253 anti-starvation floor was unreachable for the entire
             // class. Every dependency-ready issue-bound run ranks
             // `priorityRank * 2 + statusBonus` ∈ [0,9], so even a `low`-priority
-            // `todo` (7) permanently outranked an arbitrarily old *critical* PR
-            // review. The only relief was selectAgedPrReviewRunForFairDispatch,
-            // which promotes at most one run per dispatch call and self-disables
-            // when the previous start was itself a review — so it bounds
-            // nothing. Observed in production: Ally's oldest queued review run
-            // sat 5h52m behind newer issue work. Apply the same escalation floor
-            // so no class can be starved indefinitely; once escalated they tie-
-            // break on createdAt, i.e. FIFO among the starved set.
-            return waitedMs >= STARVATION_FULL_ESCALATION_MS ? 0 : 10;
+            // `todo` (7) permanently outranked an arbitrarily old PR review.
+            // Escalate aged issue-less runs to 2: they outrank routine medium/
+            // low work while preserving ranks 0-1 for explicit critical issue
+            // work. The PR-review fairness promotion above remains the bounded
+            // path for an aged review to jump even critical work.
+            return waitedMs >= STARVATION_FULL_ESCALATION_MS ? 2 : 10;
           }
           // NB: the aging escalation below stays *underneath* this `!ready`
           // check on purpose. A dependency-blocked run must never escalate to
