@@ -5829,6 +5829,7 @@ const GITHUB_PR_CONTEXT_KEYS = [
   "githubCommentId",
   "githubCommentUrl",
   "githubReviewUrl",
+  "githubReviewFeedbackCommentId",
   "githubPrAuthorLogin",
   "githubPaperclipIdentifiers",
   "githubPrReviewBody",
@@ -5851,6 +5852,38 @@ function readGithubPrIdentity(contextSnapshot: Record<string, unknown>) {
         : null;
   if (prNumber === null) return null;
   return `${readNonEmptyString(contextSnapshot.githubRepoFullName) ?? "unknown-repo"}#${prNumber}`;
+}
+
+function readGithubPrScopedWakeCommentIds(contextSnapshot: Record<string, unknown>) {
+  const ids = new Set<string>();
+  const githubCommentId = readNonEmptyString(contextSnapshot.githubCommentId);
+  if (githubCommentId) ids.add(githubCommentId);
+  const reviewFeedbackCommentId = readNonEmptyString(contextSnapshot.githubReviewFeedbackCommentId);
+  if (reviewFeedbackCommentId) ids.add(reviewFeedbackCommentId);
+
+  const paperclipWake = parseObject(contextSnapshot[PAPERCLIP_WAKE_PAYLOAD_KEY]);
+  const comments = Array.isArray(paperclipWake.comments) ? paperclipWake.comments : [];
+  const identity = readGithubPrIdentity(contextSnapshot);
+  for (const rawComment of comments) {
+    const comment = parseObject(rawComment);
+    const metadata = parseObject(comment.metadata);
+    if (readNonEmptyString(metadata.kind) !== "github_pr_review_feedback") continue;
+    const metadataIdentity = readGithubPrIdentity({
+      githubRepoFullName: metadata.repoFullName,
+      githubPrNumber: metadata.prNumber,
+    });
+    if (identity !== null && metadataIdentity !== null && metadataIdentity !== identity) continue;
+    const commentId = readNonEmptyString(comment.id);
+    if (commentId) ids.add(commentId);
+  }
+
+  return ids;
+}
+
+function preserveNonGithubPrWakeCommentIds(contextSnapshot: Record<string, unknown>) {
+  const githubPrScopedCommentIds = readGithubPrScopedWakeCommentIds(contextSnapshot);
+  if (githubPrScopedCommentIds.size === 0) return extractWakeCommentIds(contextSnapshot);
+  return extractWakeCommentIds(contextSnapshot).filter((commentId) => !githubPrScopedCommentIds.has(commentId));
 }
 
 type AcceptedPlanWakeRoutingDecision = {
@@ -5942,7 +5975,7 @@ export function mergeCoalescedContextSnapshot(
     merged[key] = readNonEmptyString(incoming[key]) ?? readNonEmptyString(existing[key]) ?? merged[key];
   }
   const mergedCommentIds = isDifferentGithubPr
-    ? mergeWakeCommentIds(incoming)
+    ? mergeWakeCommentIds(preserveNonGithubPrWakeCommentIds(existing), incoming)
     : mergeWakeCommentIds(existing, incoming);
   if (mergedCommentIds.length > 0) {
     const latestCommentId = mergedCommentIds[mergedCommentIds.length - 1];

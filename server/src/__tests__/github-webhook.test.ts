@@ -3134,6 +3134,17 @@ describeEmbeddedPostgres("github-webhook route", () => {
       }),
     });
 
+    const runs = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.contextSnapshot).toMatchObject({
+      commentId: comments[0]!.id,
+      wakeCommentId: comments[0]!.id,
+      githubReviewFeedbackCommentId: comments[0]!.id,
+    });
+
     const duplicateRes = await request(app)
       .post("/api/webhooks/github")
       .set("x-github-event", "issue_comment")

@@ -2503,6 +2503,9 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             githubRepoFullName: context.repoFullName,
             ...(wakeCommentId ? { wakeCommentId, commentId: wakeCommentId } : {}),
             ...githubContextMetadata(context),
+            ...(actionableReviewFeedback && wakeCommentId
+              ? { githubReviewFeedbackCommentId: wakeCommentId }
+              : {}),
             ...(isPrWake ? { prRole: "author" as const } : {}),
             ...(reviewBody ? { githubPrReviewBody: reviewBody } : {}),
             ...(context.reviewState ? { githubPrReviewState: context.reviewState } : {}),

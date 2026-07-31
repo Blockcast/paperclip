@@ -1013,6 +1013,56 @@ describe("mergeCoalescedContextSnapshot", () => {
     expect(merged.paperclipWake).toBeUndefined();
   });
 
+  it("preserves inherited non-PR comment ids when the incoming wake names a different PR", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-18829",
+        wakeReason: "github_pr_review_feedback",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 824,
+        githubHeadSha: "bfc470e81a12a3f52ac030b45a5e68949e119bc1",
+        githubPrReviewBody: "Findings on #824.",
+        githubReviewFeedbackActionable: true,
+        githubReviewFeedbackCommentId: "pr-feedback-comment-824",
+        commentId: "pr-feedback-comment-824",
+        wakeCommentId: "pr-feedback-comment-824",
+        wakeCommentIds: ["human-comment-1", "pr-feedback-comment-824"],
+        paperclipWake: {
+          comments: [
+            { id: "human-comment-1", body: "Can someone check this part?" },
+            {
+              id: "pr-feedback-comment-824",
+              body: "Findings on #824.",
+              metadata: {
+                kind: "github_pr_review_feedback",
+                repoFullName: "Blockcast/paperclip",
+                prNumber: 824,
+              },
+            },
+          ],
+        },
+      },
+      {
+        issueId: "issue-18829",
+        wakeReason: "github_pr_ready_for_review",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 837,
+        githubHeadSha: "2120c77c8633e98b186c592d0ddd0204cc6a8760",
+        prRole: "author",
+      },
+    );
+
+    expect(merged.githubPrNumber).toBe(837);
+    expect(merged.githubHeadSha).toBe("2120c77c8633e98b186c592d0ddd0204cc6a8760");
+    expect(merged.githubPrReviewBody).toBeUndefined();
+    expect(merged.githubReviewFeedbackActionable).toBeUndefined();
+    expect(merged.githubReviewFeedbackCommentId).toBeUndefined();
+    expect(merged.commentId).toBe("human-comment-1");
+    expect(merged.wakeCommentId).toBe("human-comment-1");
+    expect(merged.wakeCommentIds).toEqual(["human-comment-1"]);
+    expect(merged.paperclipWake).toBeUndefined();
+  });
+
   it("keeps review context when both wakes are about the same PR", () => {
     const merged = mergeCoalescedContextSnapshot(
       {
