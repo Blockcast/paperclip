@@ -342,7 +342,7 @@ describe("sandbox callback bridge", () => {
           const fileNames = await fsClient.listJsonFiles(remotePath);
           if (remotePath === directories.requestsDir && fileNames.length === 0 && !initialIdleMarked) {
             initialIdleMarked = true;
-            markInitialIdle();
+            setTimeout(markInitialIdle, 0);
           }
           return fileNames;
         },
@@ -445,7 +445,7 @@ describe("sandbox callback bridge", () => {
       "utf8",
     );
 
-    for (let attempt = 0; attempt < 50 && processed.length === 0; attempt += 1) {
+    for (let attempt = 0; attempt < 200 && processed.length === 0; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 

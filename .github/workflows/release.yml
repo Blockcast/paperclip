@@ -33,15 +33,17 @@ env:
 
 jobs:
   verify_canary:
-    if: github.event_name == 'push'
+    # Only upstream publishes npm canaries. Fork PR workflows provide merge
+    # confidence; Docker is Blockcast's independent deploy path.
+    if: github.event_name == 'push' && github.repository == 'paperclipai/paperclip'
     uses: ./.github/workflows/release-verify.yml
     with:
       ref: ${{ github.sha }}
 
   publish_canary:
     # Only upstream owns the @paperclipai npm trusted-publisher identity.
-    # Blockcast still runs verify_canary, while Docker workflows publish the
-    # fork's deployable artifacts to Harbor.
+    # Forks skip verify_canary; Blockcast's Docker workflows publish deployable
+    # artifacts to Harbor instead.
     if: github.event_name == 'push' && github.repository == 'paperclipai/paperclip'
     needs: verify_canary
     runs-on: arc-deploy

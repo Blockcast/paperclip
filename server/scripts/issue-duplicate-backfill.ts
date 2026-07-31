@@ -22,6 +22,7 @@
  *   --dump-corpus <path>  write the fetched window to JSON (test-fixture capture)
  */
 import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { and, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import { createDb, issues } from "@paperclipai/db";
 import { loadConfig } from "../src/config.js";
@@ -31,22 +32,88 @@ import {
   type IssueDuplicateDocument,
 } from "@paperclipai/shared/issue-duplicate-matcher";
 
-function parseFlag(name: string): string | null {
-  const index = process.argv.indexOf(name);
-  if (index < 0) return null;
-  const value = process.argv[index + 1];
-  return value && !value.startsWith("--") ? value : null;
+/**
+ * Flags fail loudly rather than degrading: a calibration run whose `--company`
+ * silently widened to every company, or whose `--distinctive 0` quietly
+ * disabled the evidence floor, reports numbers that look real and are not
+ * reproducible from the command line that produced them.
+ */
+const DUPLICATE_BACKFILL_FLAGS = new Set([
+  "--company",
+  "--project",
+  "--days",
+  "--origin",
+  "--score",
+  "--distinctive",
+  "--show",
+  "--dump-corpus",
+]);
+
+export function validateDuplicateBackfillFlags(args: readonly string[]): void {
+  const startIndex = args[0]?.startsWith("--") ? 0 : 2;
+  for (let index = startIndex; index < args.length; index += 1) {
+    const arg = args[index];
+    if (!arg?.startsWith("--")) continue;
+    if (!DUPLICATE_BACKFILL_FLAGS.has(arg)) {
+      throw new Error(`Unknown flag ${arg}`);
+    }
+    const value = args[index + 1];
+    if (value !== undefined && !value.startsWith("--")) {
+      index += 1;
+    }
+  }
 }
 
-function parseNumberFlag(name: string, fallback: number): number {
-  const raw = parseFlag(name);
+export function parseDuplicateBackfillFlag(args: readonly string[], name: string): string | null {
+  const index = args.indexOf(name);
+  if (index < 0) return null;
+  const value = args[index + 1];
+  if (value === undefined || value.startsWith("--")) {
+    throw new Error(`${name} requires a value (got ${value === undefined ? "end of arguments" : value})`);
+  }
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error(`${name} requires a non-empty value`);
+  return trimmed;
+}
+
+function parseFlag(name: string): string | null {
+  return parseDuplicateBackfillFlag(process.argv, name);
+}
+
+interface NumberFlagRange {
+  min?: number;
+  max?: number;
+  integer?: boolean;
+}
+
+export function parseDuplicateBackfillNumberFlag(
+  args: readonly string[],
+  name: string,
+  fallback: number,
+  range: NumberFlagRange = {},
+): number {
+  const raw = parseDuplicateBackfillFlag(args, name);
   if (raw === null) return fallback;
   const parsed = Number(raw);
   if (!Number.isFinite(parsed)) throw new Error(`${name} must be a number, got ${raw}`);
+  if (range.integer && !Number.isInteger(parsed)) {
+    throw new Error(`${name} must be an integer, got ${raw}`);
+  }
+  if (range.min !== undefined && parsed < range.min) {
+    throw new Error(`${name} must be >= ${range.min}, got ${raw}`);
+  }
+  if (range.max !== undefined && parsed > range.max) {
+    throw new Error(`${name} must be <= ${range.max}, got ${raw}`);
+  }
   return parsed;
 }
 
+function parseNumberFlag(name: string, fallback: number, range: NumberFlagRange = {}): number {
+  return parseDuplicateBackfillNumberFlag(process.argv, name, fallback, range);
+}
+
 async function main() {
+  validateDuplicateBackfillFlags(process.argv);
   const config = loadConfig();
   const dbUrl =
     process.env.DATABASE_URL?.trim()
@@ -56,15 +123,19 @@ async function main() {
 
   const companyId = parseFlag("--company");
   const projectId = parseFlag("--project");
-  const days = parseNumberFlag("--days", 30);
-  const show = parseNumberFlag("--show", 10);
+  const days = parseNumberFlag("--days", 30, { min: 1 });
+  const show = parseNumberFlag("--show", 10, { min: 0, integer: true });
   const dumpCorpus = parseFlag("--dump-corpus");
   const originKinds = parseFlag("--origin")?.split(",").map((kind) => kind.trim()).filter(Boolean) ?? null;
   const options = {
-    scoreThreshold: parseNumberFlag("--score", ISSUE_DUPLICATE_MATCHER_DEFAULTS.scoreThreshold),
+    scoreThreshold: parseNumberFlag("--score", ISSUE_DUPLICATE_MATCHER_DEFAULTS.scoreThreshold, {
+      min: 0,
+      max: 1,
+    }),
     minSharedDistinctiveFeatures: parseNumberFlag(
       "--distinctive",
       ISSUE_DUPLICATE_MATCHER_DEFAULTS.minSharedDistinctiveFeatures,
+      { min: 1, integer: true },
     ),
   };
 
@@ -158,10 +229,12 @@ async function main() {
   }
 }
 
-main().then(
-  () => process.exit(0),
-  (error) => {
-    console.error(error);
-    process.exit(1);
-  },
-);
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().then(
+    () => process.exit(0),
+    (error) => {
+      console.error(error);
+      process.exit(1);
+    },
+  );
+}

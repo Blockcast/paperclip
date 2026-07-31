@@ -23,6 +23,10 @@ function shellQuote(value: string) {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
+function isValidGitObjectId(value: string): boolean {
+  return /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(value);
+}
+
 export async function runLocalGit(
   localDir: string,
   args: string[],
@@ -63,11 +67,16 @@ export async function readGitWorkspaceSnapshot(localDir: string): Promise<GitWor
       return null;
     }
 
-    const [headCommitResult, branchResult, overlayDiffResult, untrackedResult, deletedResult, ignoredResult] = await Promise.all([
-      runLocalGit(localDir, ["rev-parse", "HEAD"], {
-        timeout: 10_000,
-        maxBuffer: 16 * 1024,
-      }),
+    const headCommitResult = await runLocalGit(localDir, ["rev-parse", "--verify", "HEAD^{commit}"], {
+      timeout: 10_000,
+      maxBuffer: 16 * 1024,
+    });
+    const headCommit = headCommitResult.stdout.trim();
+    if (!isValidGitObjectId(headCommit)) {
+      return null;
+    }
+
+    const [branchResult, overlayDiffResult, untrackedResult, deletedResult, ignoredResult] = await Promise.all([
       runLocalGit(localDir, ["rev-parse", "--abbrev-ref", "HEAD"], {
         timeout: 10_000,
         maxBuffer: 16 * 1024,
@@ -93,7 +102,7 @@ export async function readGitWorkspaceSnapshot(localDir: string): Promise<GitWor
     const branchName = branchResult.stdout.trim();
     const splitNul = (value: string) => value.split("\0").map((entry) => entry.trim()).filter(Boolean);
     return {
-      headCommit: headCommitResult.stdout.trim(),
+      headCommit,
       branchName: branchName && branchName !== "HEAD" ? branchName : null,
       overlayPaths: [...new Set([...splitNul(overlayDiffResult.stdout), ...splitNul(untrackedResult.stdout)])]
         .sort((left, right) => left.localeCompare(right)),
@@ -119,6 +128,9 @@ export async function withShallowGitWorkspaceClone<T>(
 ): Promise<T> {
   const cloneDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-workspace-"));
   const tempRef = `refs/paperclip/git-sync/import/${randomUUID()}`;
+  if (!isValidGitObjectId(input.snapshot.headCommit)) {
+    throw new Error("Cannot sync git workspace with an invalid HEAD commit.");
+  }
   try {
     await runLocalGit(input.localDir, ["update-ref", tempRef, input.snapshot.headCommit], {
       timeout: 10_000,

@@ -60,6 +60,10 @@ vi.mock("./components/OnboardingWizardVariant", () => ({
   OnboardingWizardVariant: () => null,
 }));
 
+// The auth-expired regression below exercises data flow, not auth-page chrome.
+vi.mock("./components/ThemeToggle", () => ({ ThemeToggle: () => null }));
+vi.mock("./components/AsciiArtAnimation", () => ({ AsciiArtAnimation: () => null }));
+
 // Sentinel pages so we can assert *which* route resolved.
 vi.mock("./pages/Cases", () => ({ Cases: () => <div>CASES_LIST_PAGE</div> }));
 vi.mock("./pages/CaseDetail", () => ({ CaseDetail: () => <div>CASE_DETAIL_PAGE</div> }));
@@ -180,5 +184,33 @@ describe("App Cases routing (PAP-13002)", () => {
     root = await renderAppAt(container, "/cases/PAP-C5");
     await waitForText(container, "CASE_DETAIL_PAGE");
     expect(container.textContent).not.toContain("No company matches prefix");
+  }, 20000);
+
+  it("keeps the public auth health query alive after an auth-expired event", async () => {
+    let resolveHealth!: (health: {
+      status: "ok";
+      deploymentMode: "authenticated";
+      deploymentExposure: "private";
+      bootstrapStatus: "ready";
+      auth: { emailPasswordEnabled: false; oidcProviders: ["dex"] };
+    }) => void;
+    mockHealthApi.get.mockReturnValue(new Promise((resolve) => {
+      resolveHealth = resolve;
+    }));
+    mockAuthApi.getSession.mockResolvedValue(null);
+
+    root = await renderAppAt(container, "/auth");
+    await flushReact();
+    window.dispatchEvent(new Event("paperclip:auth-expired"));
+    resolveHealth({
+      status: "ok",
+      deploymentMode: "authenticated",
+      deploymentExposure: "private",
+      bootstrapStatus: "ready",
+      auth: { emailPasswordEnabled: false, oidcProviders: ["dex"] },
+    });
+
+    await waitForText(container, "Sign in with Google");
+    expect(container.textContent).not.toContain("Authentication configuration is unavailable");
   }, 20000);
 });

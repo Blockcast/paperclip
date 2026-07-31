@@ -668,6 +668,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
         if (done) return;
         done = true;
         clearTimeout(timeout);
+        // A stale waiter must not clear a newer waiter registered after it was woken.
         if (wakePoll === finish) {
           wakePoll = null;
         }
@@ -822,10 +823,19 @@ export async function startSandboxCallbackBridgeWorker(input: {
       stopDeadline = Date.now() + drainMs;
       wakeWorker();
       if (!settled) {
-        await Promise.race([
-          settledPromise,
-          new Promise<void>((resolve) => setTimeout(resolve, drainMs)),
-        ]);
+        let drainTimer: NodeJS.Timeout | null = null;
+        try {
+          await Promise.race([
+            settledPromise,
+            new Promise<void>((resolve) => {
+              drainTimer = setTimeout(resolve, drainMs);
+            }),
+          ]);
+        } finally {
+          if (drainTimer) {
+            clearTimeout(drainTimer);
+          }
+        }
       }
       await failPendingRequests("Bridge worker stopped before request could be handled.");
     },
