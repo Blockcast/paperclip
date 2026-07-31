@@ -604,6 +604,88 @@ describe("github-webhook pure helpers", () => {
     expect(fromHumanRequest).not.toHaveProperty("agentReviewRequest");
   });
 
+  it("reports a markerless reviewer-bot @ally request instead of dropping it silently (BLO-18273)", () => {
+    // The markerless drop is the failure mode BLO-18273 was filed for: the
+    // request is recognized as one, suppressed by the author guard, and leaves
+    // NO trace -- so the requesting agent ends its run believing it handed off
+    // and the PR waits forever. resolveEventContext still returns null (the
+    // #583 loop must stay closed); it now reports the drop on the way out.
+    const resolve = (body: string, login: string) => {
+      const suppressed: unknown[] = [];
+      const context = __test_resolveEventContext(
+        "issue_comment",
+        {
+          action: "created",
+          issue: {
+            number: 1659,
+            title: "BLO-18157 platform-sre backup RBAC",
+            pull_request: { url: "https://api.github.com/repos/Blockcast/onprem-k8s/pulls/1659" },
+          },
+          comment: {
+            id: 7001,
+            body,
+            user: { login },
+            html_url: "https://github.com/Blockcast/onprem-k8s/pull/1659#issuecomment-7001",
+          },
+          repository: { full_name: "Blockcast/onprem-k8s" },
+        },
+        {
+          prReviewerBotLogin: "allyblockcast[bot]",
+          onSuppressedReviewRequest: (info) => suppressed.push(info),
+        },
+      );
+      return { context, suppressed };
+    };
+
+    // The lost handoff: bot login, real ask, no marker.
+    const dropped = resolve("@ally please review the RBAC scoping", "allyblockcast[bot]");
+    expect(dropped.context).toBeNull();
+    expect(dropped.suppressed).toHaveLength(1);
+    expect(dropped.suppressed[0]).toMatchObject({
+      repoFullName: "Blockcast/onprem-k8s",
+      prNumber: 1659,
+      commentId: 7001,
+      commentAuthorLogin: "allyblockcast[bot]",
+      commentUrl: "https://github.com/Blockcast/onprem-k8s/pull/1659#issuecomment-7001",
+    });
+
+    // With the marker it is a real request, so there is nothing to report.
+    const honoured = resolve(
+      "<!-- paperclip:review-request -->\n@ally please review the RBAC scoping",
+      "allyblockcast[bot]",
+    );
+    expect(honoured.context).toMatchObject({ wakeReason: "github_pr_review_requested" });
+    expect(honoured.suppressed).toHaveLength(0);
+
+    // Ally's OWN output mentioning the alias is a correct suppression, not a
+    // lost handoff. Reporting it would bury the real signal in #583-shaped
+    // noise on every review Ally posts, so it must stay quiet.
+    const selfEcho = resolve(
+      "## Ally — Consolidated PR Review\n\nNo blocking findings; @ally ran 3 lenses.",
+      "allyblockcast[bot]",
+    );
+    expect(selfEcho.context).toBeNull();
+    expect(selfEcho.suppressed).toHaveLength(0);
+
+    // The commitperclip template gate greets the bot by its LOGIN, not the
+    // alias, and does so repeatedly on the same PR (a 2026-07-31 sweep found 7
+    // on Blockcast/paperclip#812, 3 on #820). This is the original #583 body:
+    // suppressing it is correct, so it must not be reported or the real signal
+    // drowns. This is the case that decides bare-alias vs general mention.
+    const gateNudge = resolve(
+      "Hey @allyblockcast[bot]! Before this PR can be reviewed, a few things need attention:\n\n" +
+        "**Missing or incomplete:**\n- [ ] Missing section: **## Thinking Path**\n",
+      "allyblockcast[bot]",
+    );
+    expect(gateNudge.context).toBeNull();
+    expect(gateNudge.suppressed).toHaveLength(0);
+
+    // A human's markerless @ally was never suppressed, so it is not reported.
+    const human = resolve("@ally please review the RBAC scoping", "kkroo");
+    expect(human.context).toMatchObject({ wakeReason: "github_pr_review_requested" });
+    expect(human.suppressed).toHaveLength(0);
+  });
+
   it("keeps the #583 self-refire loop closed: a quoted or reviewer-output marker is not a request (BLO-18865)", () => {
     const botComment = (id: number, body: string) =>
       __test_resolveEventContext("issue_comment", {

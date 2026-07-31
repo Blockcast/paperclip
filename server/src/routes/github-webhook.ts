@@ -167,6 +167,24 @@ function hasPrReviewerRequestMention(body: string | null | undefined): boolean {
   return typeof body === "string" && PR_REVIEWER_COMMENT_MENTION_PATTERN.test(body);
 }
 
+// A DELIBERATE request addresses the reviewer by the bare `@ally` alias — the
+// form the agent instructions tell agents to write. The pattern above also
+// matches `@allyblockcast[bot]`, which is how the commitperclip template gate
+// greets the bot account ("Hey @allyblockcast[bot]! Before this PR can be
+// reviewed...") — the very body that drove the #583 loop. Those are correct
+// suppressions, not lost handoffs, and they repeat: a sweep on 2026-07-31
+// found 7 on Blockcast/paperclip#812 and 3 on #820. Reporting them would bury
+// the real signal, so the drop report (BLO-18273) keys on the bare alias only.
+//
+// `(?![-\w])` is what excludes the longer login: for `@allyblockcast[bot]` the
+// character after `@ally` is `b`, a word char, so this cannot match — whereas
+// the pattern above backtracks to its `allyblockcast` alternative and does.
+const PR_REVIEWER_BARE_ALIAS_MENTION_PATTERN = /(^|[^\w])@ally(?![-\w])/i;
+
+function hasPrReviewerBareAliasMention(body: string | null | undefined): boolean {
+  return typeof body === "string" && PR_REVIEWER_BARE_ALIAS_MENTION_PATTERN.test(body);
+}
+
 const DEFAULT_PR_REVIEWER_BOT_LOGIN = "allyblockcast[bot]";
 
 function normalizeGithubLogin(login: string): string {
@@ -494,7 +512,20 @@ function clampReviewBody(value: string | null | undefined): string | null {
 function resolveEventContext(
   eventName: string,
   payload: Record<string, unknown>,
-  options: { prReviewerBotLogin?: string | null } = {},
+  options: {
+    prReviewerBotLogin?: string | null;
+    // Invoked when a review request was RECOGNIZED as one but deliberately
+    // dropped, so the caller can make the suppression observable (BLO-18273).
+    // A callback rather than a logger call inline keeps this function pure and
+    // lets the suppression be asserted directly in tests.
+    onSuppressedReviewRequest?: (info: {
+      repoFullName: string | null;
+      prNumber: number | null;
+      commentId: number | null;
+      commentAuthorLogin: string | null;
+      commentUrl: string | null;
+    }) => void;
+  } = {},
 ): ResolvedEventContext | null {
   const repository = payload.repository as Record<string, unknown> | undefined;
   const repoFullName = (repository?.full_name as string | undefined) ?? null;
@@ -661,6 +692,35 @@ function resolveEventContext(
         commentAuthorLogin,
         options.prReviewerBotLogin,
       );
+      // BLO-18273: the drop above is the one failure mode in this file that is
+      // completely invisible. A markerless agent request matches the @ally
+      // mention, fails the author guard, is not review feedback either, and
+      // falls out of here as `null` — no context, no wake, and (until this
+      // callback) not one log line. The requesting agent believes it handed
+      // off and ends its run, so the PR waits forever. Report it instead.
+      //
+      // Scoped narrowly so it stays a signal rather than noise: only a
+      // reviewer-bot-authored body that addresses Ally by the BARE `@ally`
+      // alias, carries no valid marker, and is NOT the reviewer's own
+      // consolidated review output. See PR_REVIEWER_BARE_ALIAS_MENTION_PATTERN
+      // for why the bare alias (and not the general mention pattern) is the
+      // discriminator: the general one also matches the commitperclip gate's
+      // `@allyblockcast[bot]` nudge, whose suppression is correct.
+      if (
+        !reviewerRequest &&
+        !reviewFeedback &&
+        commentAuthorIsReviewerBot &&
+        hasPrReviewerBareAliasMention(commentBody) &&
+        !hasAllyConsolidatedReviewHeading(commentBody)
+      ) {
+        options.onSuppressedReviewRequest?.({
+          repoFullName,
+          prNumber: (issue.number as number | undefined) ?? null,
+          commentId: (comment?.id as number | undefined) ?? null,
+          commentAuthorLogin,
+          commentUrl: readStringField(comment, "html_url"),
+        });
+      }
       if (!reviewerRequest && !reviewFeedback) return null;
       // BLO-9293: on a PR's issue_comment payload, `issue.user.login` is the PR
       // author (the comment author is `comment.user.login`, captured separately).
@@ -1672,6 +1732,27 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     const payload = (req.body ?? {}) as Record<string, unknown>;
     const context = resolveEventContext(eventName, payload, {
       prReviewerBotLogin: config.prReviewerBotLogin,
+      // BLO-18273: surface the one silent drop in this handler. An agent that
+      // asks for review without the `<!-- paperclip:review-request -->` marker
+      // gets no wake and no error; this is the only trace it ever leaves, so
+      // it names the fix in the message rather than just the symptom.
+      onSuppressedReviewRequest: (info) => {
+        logger.warn(
+          {
+            event: eventName,
+            deliveryId,
+            repoFullName: info.repoFullName,
+            prNumber: info.prNumber,
+            commentId: info.commentId,
+            commentAuthorLogin: info.commentAuthorLogin,
+            commentUrl: info.commentUrl,
+            suppressionReason: "reviewer_bot_authored_request_missing_marker",
+          },
+          "github webhook reviewer wake skipped: @ally request authored by the reviewer bot login carries no " +
+            "start-of-body <!-- paperclip:review-request --> marker, so it is indistinguishable from the " +
+            "reviewer's own output (BLO-18865/BLO-18273); no review was requested",
+        );
+      },
     });
 
     // A closed or newly-drafted PR cannot produce useful reviewer work. Retire
