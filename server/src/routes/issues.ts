@@ -3547,6 +3547,8 @@ export function issueRoutes(
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
       status: string;
+      originKind?: string | null;
+      originId?: string | null;
     },
     action: "issue:comment" | "issue:read" | "issue:mutate",
   ) {
@@ -3562,6 +3564,8 @@ export function issueRoutes(
         assigneeAgentId: issue.assigneeAgentId,
         assigneeUserId: issue.assigneeUserId,
         status: issue.status,
+        originKind: issue.originKind ?? null,
+        originId: issue.originId ?? null,
       },
       scope: {
         issueId: issue.id,
@@ -3569,6 +3573,8 @@ export function issueRoutes(
         parentIssueId: issue.parentId,
         assigneeAgentId: issue.assigneeAgentId,
         assigneeUserId: issue.assigneeUserId,
+        originKind: issue.originKind ?? null,
+        originId: issue.originId ?? null,
       },
     });
   }
@@ -3829,6 +3835,11 @@ export function issueRoutes(
       allowScopedRecoveryOwnerSourceMutation?: boolean;
       allowRecoveryActionOwner?: boolean;
       allowProductivityReviewOwner?: boolean;
+      onProductivityReviewOwnerMutationAllowed?: (input: {
+        reviewerAgentId: string;
+        previousAssigneeAgentId: string | null;
+        issueStatus: string;
+      }) => void;
     } = {},
   ) {
     if (req.actor.type !== "agent") return true;
@@ -3891,22 +3902,10 @@ export function issueRoutes(
         options.allowProductivityReviewOwner &&
         boundaryDecision.reason === "allow_productivity_review_grant"
       ) {
-        const reviewActor = getActorInfo(req);
-        await logActivity(db, {
-          companyId: issue.companyId,
-          actorType: reviewActor.actorType,
-          actorId: reviewActor.actorId,
-          agentId: actorAgentId,
-          runId: reviewActor.runId,
-          agentApiKeyId: reviewActor.agentApiKeyId,
-          action: "issue.productivity_review_source_mutation",
-          entityType: "issue",
-          entityId: issue.id,
-          details: {
-            reviewerAgentId: actorAgentId,
-            previousAssigneeAgentId: issue.assigneeAgentId,
-            issueStatus: issue.status,
-          },
+        options.onProductivityReviewOwnerMutationAllowed?.({
+          reviewerAgentId: actorAgentId,
+          previousAssigneeAgentId: issue.assigneeAgentId,
+          issueStatus: issue.status,
         });
         return true;
       }
@@ -8125,6 +8124,13 @@ export function issueRoutes(
         req.body as Record<string, unknown>,
       )
       : false;
+    const productivityReviewSourceMutationAudit: {
+      current: {
+        reviewerAgentId: string;
+        previousAssigneeAgentId: string | null;
+        issueStatus: string;
+      } | null;
+    } = { current: null };
     if (!(await assertAgentIssueMutationAllowed(
       req,
       res,
@@ -8133,6 +8139,9 @@ export function issueRoutes(
         allowBlockedCorrection: true,
         allowScopedRecoveryOwnerSourceMutation,
         allowProductivityReviewOwner: true,
+        onProductivityReviewOwnerMutationAllowed: (audit) => {
+          productivityReviewSourceMutationAudit.current = audit;
+        },
       },
     ))) return;
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
@@ -8716,6 +8725,28 @@ export function issueRoutes(
         ),
       },
     });
+
+    const productivityReviewAudit = productivityReviewSourceMutationAudit.current;
+    if (productivityReviewAudit && hasFieldChanges) {
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.productivity_review_source_mutation",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          reviewerAgentId: productivityReviewAudit.reviewerAgentId,
+          previousAssigneeAgentId: productivityReviewAudit.previousAssigneeAgentId,
+          issueStatus: productivityReviewAudit.issueStatus,
+          changedFields: Object.keys(previous),
+        },
+      });
+    }
 
     const explicitlyRecordedSuccessfulRunDisposition =
       actor.actorType === "user" && req.body.status !== undefined && issue.status !== "in_progress";

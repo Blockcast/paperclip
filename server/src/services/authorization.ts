@@ -255,6 +255,12 @@ type IssueAuthorizationRow = {
 // cycle; the two are pinned together by
 // authorization-service.test.ts "productivity-review source-issue grant".
 const PRODUCTIVITY_REVIEW_TERMINAL_STATUSES = ["done", "cancelled"] as const;
+const AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS = new Set<string>([
+  RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation,
+  RECOVERY_ORIGIN_KINDS.issueProductivityReview,
+  RECOVERY_ORIGIN_KINDS.productivityReviewEscalation,
+  RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
+]);
 
 function evaluateAuthorizationPolicyForAssignment(
   policy: Record<string, unknown> | null | undefined,
@@ -1532,6 +1538,8 @@ export function authorizationService(db: Db) {
         eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueProductivityReview),
         eq(issues.originId, input.issueId),
         eq(issues.assigneeAgentId, input.actorAgentId),
+        isNull(issues.hiddenAt),
+        isNull(issues.harnessKind),
         notInArray(issues.status, [...PRODUCTIVITY_REVIEW_TERMINAL_STATUSES]),
       ))
       .limit(1);
@@ -1557,6 +1565,13 @@ export function authorizationService(db: Db) {
       reason: "allow_productivity_review_grant",
       explanation: "Allowed by an open productivity review the actor owns for this issue.",
     });
+  }
+
+  async function recoveryOrReviewIssueBlocksUnassignedAgentClaim(
+    resource: Extract<AuthorizationResource, { type: "issue" }>,
+  ) {
+    const originKind = resource.originKind ?? (resource.issueId ? (await loadIssue(resource.issueId))?.originKind : null);
+    return AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS.has(originKind ?? "");
   }
 
   async function decideBase(input: {
@@ -2120,6 +2135,13 @@ export function authorizationService(db: Db) {
         });
       }
       if (!resource?.assigneeAgentId) {
+        if (resource && await recoveryOrReviewIssueBlocksUnassignedAgentClaim(resource)) {
+          return deny({
+            action: input.action,
+            reason: "deny_missing_grant",
+            explanation: "Recovery and review issues cannot be claimed through generic unassigned-issue access.",
+          });
+        }
         return allow({
           action: input.action,
           reason: "allow_company_agent",

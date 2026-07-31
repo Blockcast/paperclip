@@ -1534,6 +1534,71 @@ describeEmbeddedPostgres("authorization service", () => {
         resource,
       })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
     }
+
+    // (f) visibility-bounded: a hidden or harnessed review is not an open board
+    // review for authorization purposes, even when its status is non-terminal.
+    await db
+      .update(issues)
+      .set({ status: "todo", hiddenAt: new Date("2026-07-31T12:00:00.000Z") })
+      .where(eq(issues.id, reviewIssue.id));
+    await expect(authorization.decide({
+      actor: actorFor(reviewer.id),
+      action: "issue:mutate",
+      resource,
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    await db
+      .update(issues)
+      .set({ hiddenAt: null, harnessKind: "eval_harness" })
+      .where(eq(issues.id, reviewIssue.id));
+    await expect(authorization.decide({
+      actor: actorFor(reviewer.id),
+      action: "issue:mutate",
+      resource,
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+  });
+
+  it("does not let generic unassigned-agent access claim recovery or review shells", async () => {
+    const company = await createCompany(db, "UnassignedRecoveryReviewShells");
+    const actor = await createAgent(db, company.id, { role: "engineer" });
+    const authorization = authorizationService(db);
+    const actorContext = { type: "agent", agentId: actor.id, companyId: company.id, source: "agent_key" } as const;
+
+    const manualIssue = await createIssue(db, company.id, {
+      title: "Unassigned manual issue",
+      assigneeAgentId: null,
+      originKind: "manual",
+    });
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: manualIssue.id,
+        assigneeAgentId: null,
+        originKind: "manual",
+        status: "todo",
+      },
+    })).resolves.toMatchObject({ allowed: true, reason: "allow_company_agent" });
+
+    const reviewIssue = await createIssue(db, company.id, {
+      title: "Orphaned productivity review",
+      assigneeAgentId: null,
+      originKind: "issue_productivity_review",
+      originId: manualIssue.id,
+    });
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: reviewIssue.id,
+        assigneeAgentId: null,
+        status: "todo",
+      },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
   });
 
   it("keeps the productivity-review grant working when the source assignee is paused or errored", async () => {
