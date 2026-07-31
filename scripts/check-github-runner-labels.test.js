@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -7,6 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const script = fileURLToPath(new URL("./check-github-runner-labels.mjs", import.meta.url));
+const repoRoot = path.resolve(path.dirname(script), "..");
 
 test("runner-label guard accepts only ARC workflows", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-runner-labels-"));
@@ -16,7 +17,7 @@ test("runner-label guard accepts only ARC workflows", async (t) => {
     await mkdir(path.join(root, ".github/workflows"), { recursive: true });
     await writeFile(
       path.join(root, ".github/workflows/arc.yml"),
-      "jobs:\n  check:\n    runs-on: default\n  aggregate:\n    runs-on: arc-light\n  image:\n    runs-on: arc-dind\n  release:\n    runs-on: arc-deploy\n",
+      "jobs:\n  check:\n    runs-on: default\n  aggregate:\n    runs-on: arc-light\n  image:\n    runs-on: arc-dind\n  release:\n    runs-on: arc-deploy\n  browser:\n    runs-on: arc-e2e\n",
     );
 
     const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
@@ -34,4 +35,13 @@ test("runner-label guard accepts only ARC workflows", async (t) => {
     assert.match(result.stderr, /hosted\.yml:3: runs-on: ubuntu-latest/);
     assert.match(result.stderr, /hosted\.yml:5: runs-on: self-hosted/);
   });
+});
+
+test("PR e2e workflow uses the dedicated ARC e2e runner", async () => {
+  const workflow = await readFile(path.join(repoRoot, ".github/workflows/pr.yml"), "utf8");
+  assert.match(
+    workflow,
+    /\n  e2e:\n[\s\S]*?\n    runs-on: arc-e2e\n/,
+    "expected the PR e2e job to run on arc-e2e",
+  );
 });
