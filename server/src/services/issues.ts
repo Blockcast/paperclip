@@ -36,6 +36,7 @@ import {
   issues,
   labels,
   linearIssueLinks,
+  milestones,
   projectWorkspaces,
   projects,
   workspaceOperations,
@@ -122,6 +123,7 @@ import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalizatio
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const OPEN_ROUTINE_EXECUTION_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
+const ISSUE_PARENT_ANCESTRY_VALIDATION_MAX_DEPTH = 256;
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
 export const ISSUE_LIST_MAX_LIMIT = 1000;
