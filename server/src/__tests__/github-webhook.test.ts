@@ -2805,6 +2805,8 @@ describeEmbeddedPostgres("github-webhook route", () => {
         .select({ status: agentWakeupRequests.status, idempotencyKey: agentWakeupRequests.idempotencyKey })
         .from(agentWakeupRequests)
         .where(eq(agentWakeupRequests.agentId, agentId));
+    const authorHeartbeatRuns = async () =>
+      db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
     const keyForComment = (commentId: number) =>
       expect.stringContaining(
         `:Blockcast/paperclip:846:github_pr_review_requested:comment:${commentId}`,
@@ -2852,9 +2854,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       { status: "cancelled", idempotencyKey: keyForComment(4900000021) },
     ]);
 
-    expect(
-      await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)),
-    ).toHaveLength(1);
+    expect(await authorHeartbeatRuns()).toHaveLength(1);
 
     // The other half of the scope rule: terminal dedup must stay confined to
     // the redelivered event. A genuinely NEW @ally comment carries a new
@@ -2874,12 +2874,15 @@ describeEmbeddedPostgres("github-webhook route", () => {
       issueIdentifier: "BLO-9002",
       reason: "duplicate_pr_author_wake",
     });
-    expect(await authorWakes()).toEqual(
+    const wakesAfterLaterComment = await authorWakes();
+    expect(wakesAfterLaterComment).toHaveLength(2);
+    expect(wakesAfterLaterComment).toEqual(
       expect.arrayContaining([
         { status: "cancelled", idempotencyKey: keyForComment(4900000021) },
         { status: "coalesced", idempotencyKey: keyForComment(4900000022) },
       ]),
     );
+    expect(await authorHeartbeatRuns()).toHaveLength(1);
   });
 
   it("drives the reviewer wake AND preserves the author wake for a marker-prefixed agent review request (BLO-18865)", async () => {
