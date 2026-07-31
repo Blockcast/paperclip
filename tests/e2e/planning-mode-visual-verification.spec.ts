@@ -122,7 +122,7 @@ test("captures planning mode UI for desktop and mobile", async ({ page, baseURL 
   await setMode("planning");
 
   await page.goto(issuePath);
-  await expect(page.getByText("Plan mode").first()).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText(/^(Planning|Plan mode)$/).first()).toBeVisible({ timeout: 30_000 });
   await expect(page.getByTestId("issue-chat-composer")).toHaveAttribute("data-pending-work-mode", "planning");
   const desktopPlanningToggle = page.getByTestId("issue-chat-composer-work-mode-toggle");
   await expect(desktopPlanningToggle).toBeVisible();
@@ -136,7 +136,7 @@ test("captures planning mode UI for desktop and mobile", async ({ page, baseURL 
   await page.goto(`/${companyPrefix}/issues`);
   const issueListLink = page.locator(issueLinkSelector);
   await expect(issueListLink).toBeVisible({ timeout: 30_000 });
-  await expect(issueListLink).not.toContainText("Plan mode");
+  await expect(issueListLink).not.toContainText(/Planning|Plan mode/);
   await page.screenshot({
     path: `${screenshotDir}/desktop-planning-row-${timestamp}.png`,
     fullPage: true,
@@ -159,7 +159,7 @@ test("captures planning mode UI for desktop and mobile", async ({ page, baseURL 
   await setMode("planning");
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(issuePath);
-  await expect(page.getByText("Plan mode").first()).toBeVisible();
+  await expect(page.getByText(/^(Planning|Plan mode)$/).first()).toBeVisible();
   const mobilePlanningToggle = page.getByTestId("issue-chat-composer-work-mode-toggle");
   await expect(mobilePlanningToggle).toBeVisible();
   await expect(mobilePlanningToggle).toHaveAttribute("data-pending-work-mode", "planning");
@@ -170,7 +170,7 @@ test("captures planning mode UI for desktop and mobile", async ({ page, baseURL 
 
   await page.goto(`/${companyPrefix}/issues`);
   await expect(issueListLink).toBeVisible({ timeout: 30_000 });
-  await expect(issueListLink).not.toContainText("Plan mode");
+  await expect(issueListLink).not.toContainText(/Planning|Plan mode/);
   await page.screenshot({
     path: `${screenshotDir}/mobile-planning-row-${timestamp}.png`,
     fullPage: true,
