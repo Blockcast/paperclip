@@ -161,7 +161,157 @@ const runtimeServicesById = new Map<string, RuntimeServiceRecord>();
 const runtimeServicesByReuseKey = new Map<string, string>();
 const runtimeServiceLeasesByRun = new Map<string, string[]>();
 const DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES = 256 * 1024;
+/**
+ * How long to keep draining stdio after the spawned command has already exited.
+ *
+ * `close` waits for every writer on the inherited pipes, so a descendant that
+ * outlives the command can hold it open long after the command's own status is
+ * known. Settling on a bound rather than on `close` keeps that from turning into
+ * an unbounded wait. Healthy commands emit `close` within a tick of `exit`, so
+ * this only elapses in the pathological case.
+ */
+const PROCESS_STDIO_DRAIN_GRACE_MS = 2_000;
+const PROCESS_TIMEOUT_GROUP_LIVENESS_GRACE_MS = 750;
+const PROCESS_TIMEOUT_GROUP_LIVENESS_POLL_MS = 25;
 const WORKSPACE_SUBMODULE_REPAIR_TIMEOUT_MS = 5 * 60 * 1000;
+
+// `git submodule status --recursive` is ~96% filesystem latency, not CPU: on the
+// shared pim-multicast-gateway checkout only ~50ms of a 1160ms run is git work,
+// the rest is metadata round-trips across 9 sequential submodule--helper walks on
+// CephFS. Measured on that workspace (BLO-18784): warm p50 1163ms / p99 1356ms
+// (n=20), cold worst case 5903ms (5.1x), and 2.3x further amplification under
+// induced metadata load. 60s = 44x warm p99 = 10.2x cold worst case, and clears
+// the composed cold-x-load amplification (~13.6s) by 4.4x.
+//
+// The budget is deliberately a backstop, NOT the safety mechanism. Because the
+// cost tracks an unbounded-variance quantity, no constant makes a single attempt
+// safe -- that is what the retry + non-fatal degrade below are for.
+const WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = 60_000;
+const WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS = 3;
+const WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS = 1_000;
+
+// Upper bounds for the env overrides below. Deliberately *operational* limits
+// rather than Node's `2^31 - 1` timer ceiling: clamping an oversized timeout to
+// the ceiling would mean ~24.8 days, which does not bound the preflight at all
+// -- it just trades fail-open for hang-forever. These keep the worst case an
+// operator can configure bounded at 5 x 300s + backoff ~= 30 minutes, while
+// staying far enough below the timer ceiling that no product of them can
+// overflow it.
+//
+// 300s is 50x the measured cold worst case (5903ms) and matches
+// `WORKSPACE_SUBMODULE_REPAIR_TIMEOUT_MS`. Past 5 attempts a checkout is broken,
+// not slow -- that is the deterministic-failure path, which throws.
+const WORKSPACE_SUBMODULE_INSPECT_MAX_TIMEOUT_MS = 300_000;
+const WORKSPACE_SUBMODULE_INSPECT_MAX_ATTEMPTS = 5;
+const WORKSPACE_SUBMODULE_INSPECT_MAX_RETRY_DELAY_MS = 30_000;
+
+// Lower bound on the *timeout* override specifically. An oversized value and an
+// undersized one fail open identically -- every probe times out, so every
+// workspace takes the degrade path and the check stops running fleet-wide -- but
+// only the oversized end was guarded. A seconds-vs-milliseconds slip
+// (`...TIMEOUT_MS=60`, meaning the documented 60s) is the likeliest way to reach
+// that state, and it is indistinguishable from a deliberate tightening without a
+// floor.
+//
+// 15s is the smallest floor that keeps the floor itself outside the hazard it
+// exists to exclude. The bound has to be a budget under which a *healthy*
+// checkout still completes, and the slowest healthy inspection measured on the
+// shared CephFS tree is the composed cold-x-load case, ~13.6s (5.1x cold cache
+// x 2.3x induced metadata load, see above) -- so anything at or below that lets
+// an operator sit exactly at the minimum and still degrade every cold first
+// touch, which is the fail-open this floor is for. 15s clears it, and is 2.5x
+// the cold worst case (5903ms) and 11x warm p99 (1356ms).
+//
+// It is deliberately not tighter. A floor between warm p99 and the cold worst
+// case would look like it permits tightening during an incident, but the values
+// it permits are exactly the ones that stop the check from running.
+//
+// No floor on `attempts` or `retryDelayMs`: the minimum each can reach is 1, and
+// neither disables the check. `attempts=1` is a coherent "do not retry" choice
+// (the pre-BLO-18784 behaviour), and a 1ms backoff only retries sooner.
+const WORKSPACE_SUBMODULE_INSPECT_MIN_TIMEOUT_MS = 15_000;
+
+/**
+ * Env overrides for the submodule-inspection budget. Read at call time so they
+ * can be tuned on a running server without a deploy.
+ *
+ * Out-of-range values fall back to the default rather than clamping to the
+ * nearest bound: a value outside the operational range is a typo, and silently
+ * honouring "some other number than the one you typed" is the same class of
+ * surprise as the two truncation bugs called out below.
+ */
+function readBoundedIntEnv(
+  name: string,
+  fallback: number,
+  bounds: { min?: number; max: number },
+): number {
+  const { min = 1, max } = bounds;
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  // Require an exact positive integer rather than truncating. A fractional value
+  // like "0.5" satisfies a bare `> 0` check and then truncates to 0, which does
+  // not fall back -- it disables `executeProcess`'s timeout (0 is not `> 0`
+  // there) or skips the retry loop entirely. Both fail open silently, which is
+  // the opposite of what an operator tuning this value would expect.
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return fallback;
+  // Reject undersized values: a budget too small to ever complete makes every
+  // probe time out and takes the degrade path on a healthy checkout, which is
+  // the same fail-open as the oversized case below reached from the other end.
+  if (parsed < min) return fallback;
+  // Reject oversized values for the same reason. Every one of these settings
+  // feeds a `setTimeout`, and Node clamps any delay above `2^31 - 1` ms to *1ms*
+  // with a `TimeoutOverflowWarning`. So a plausible-looking large override (an
+  // extra digit, or seconds/ms confusion) would make every probe time out
+  // immediately and take the fail-open degradation path on a healthy checkout.
+  if (parsed > max) return fallback;
+  return parsed;
+}
+
+type SubmoduleInspectSettings = { timeoutMs: number; attempts: number; retryDelayMs: number };
+
+let submoduleInspectSettingsOverrideForTests: Partial<SubmoduleInspectSettings> | null = null;
+let processGroupLivenessProbeForTests: ((processGroupId: number) => boolean) | null = null;
+
+/**
+ * Test-only seam for the inspection budget. Tests need a timeout small enough to
+ * guarantee a stall, which is deliberately below what the env override accepts
+ * (see `WORKSPACE_SUBMODULE_INSPECT_MIN_TIMEOUT_MS`) -- so forcing a timeout must
+ * not go through the operator-facing path. Same convention as
+ * `resetRuntimeServicesForTests`: not reachable from configuration, which is the
+ * whole point of keeping it separate from the env overrides. Pass `null` to clear.
+ */
+export function setSubmoduleInspectSettingsForTests(override: Partial<SubmoduleInspectSettings> | null) {
+  submoduleInspectSettingsOverrideForTests = override;
+}
+
+export function setProcessGroupLivenessProbeForTests(override: ((processGroupId: number) => boolean) | null) {
+  processGroupLivenessProbeForTests = override;
+}
+
+function readSubmoduleInspectSettings(): SubmoduleInspectSettings {
+  return {
+    timeoutMs: readBoundedIntEnv(
+      "PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS",
+      WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS,
+      {
+        min: WORKSPACE_SUBMODULE_INSPECT_MIN_TIMEOUT_MS,
+        max: WORKSPACE_SUBMODULE_INSPECT_MAX_TIMEOUT_MS,
+      },
+    ),
+    attempts: readBoundedIntEnv(
+      "PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS",
+      WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS,
+      { max: WORKSPACE_SUBMODULE_INSPECT_MAX_ATTEMPTS },
+    ),
+    retryDelayMs: readBoundedIntEnv(
+      "PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS",
+      WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS,
+      { max: WORKSPACE_SUBMODULE_INSPECT_MAX_RETRY_DELAY_MS },
+    ),
+    ...(submoduleInspectSettingsOverrideForTests ?? {}),
+  };
+}
 
 type ProcessOutputCapture = {
   text: string;
@@ -529,6 +679,31 @@ function createProcessOutputCapture(maxBytes: number): ProcessOutputAccumulator 
   };
 }
 
+function isProcessGroupAlive(processGroupId: number): boolean {
+  if (process.platform === "win32") return false;
+  if (processGroupLivenessProbeForTests) return processGroupLivenessProbeForTests(processGroupId);
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForProcessGroupExitAfterKill(child: ChildProcess): Promise<boolean> {
+  if (!child.pid || process.platform === "win32") return false;
+  const processGroupId = child.pid;
+  const deadline = Date.now() + PROCESS_TIMEOUT_GROUP_LIVENESS_GRACE_MS;
+
+  while (isProcessGroupAlive(processGroupId)) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return true;
+    await delay(Math.min(PROCESS_TIMEOUT_GROUP_LIVENESS_POLL_MS, remainingMs));
+  }
+
+  return false;
+}
+
 async function executeProcess(input: {
   command: string;
   args: string[];
@@ -542,6 +717,7 @@ async function executeProcess(input: {
   stderr: string;
   code: number | null;
   timedOut: boolean;
+  processGroupAliveAfterTimeout: boolean;
   stdoutTruncated: boolean;
   stderrTruncated: boolean;
   stdoutBytes: number;
@@ -552,44 +728,142 @@ async function executeProcess(input: {
     stderr: ProcessOutputAccumulator;
     code: number | null;
     timedOut: boolean;
+    processGroupAliveAfterTimeout: boolean;
   }>((resolve, reject) => {
     let timedOut = false;
+    let settled = false;
+    let timeoutTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
     let killTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+    let drainTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+    const stdout = createProcessOutputCapture(input.maxStdoutBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
+    const stderr = createProcessOutputCapture(input.maxStderrBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
+    const onStdoutData = (chunk: Buffer | string) => {
+      stdout.append(String(chunk));
+    };
+    const onStderrData = (chunk: Buffer | string) => {
+      stderr.append(String(chunk));
+    };
     const child = spawn(input.command, input.args, {
       cwd: input.cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: input.env ?? process.env,
+      // Lead a process group so a timeout can reap the whole tree. `git
+      // submodule status --recursive` forks per submodule; signalling only the
+      // command we spawned leaves those children running against the same
+      // checkout -- still doing IO we have given up waiting for, and still
+      // holding the stdio pipes that `close` waits on. Platform-guarded to match
+      // the runtime-service spawn: on Windows `detached` means a new console,
+      // not a process group, and `terminateChildProcess` falls back there anyway.
+      detached: process.platform !== "win32",
     });
+
+    const clearTimers = () => {
+      if (timeoutTimer) globalThis.clearTimeout(timeoutTimer);
+      if (killTimer) globalThis.clearTimeout(killTimer);
+      if (drainTimer) globalThis.clearTimeout(drainTimer);
+      timeoutTimer = null;
+      killTimer = null;
+      drainTimer = null;
+    };
+    /**
+     * Finish the SIGTERM -> SIGKILL escalation now instead of leaving it on the
+     * clock.
+     *
+     * A timed-out call must not hand control back while the group-wide SIGKILL is
+     * still only *scheduled*: the caller retries after a backoff shorter than the
+     * remaining kill grace, so a descendant that ignored SIGTERM would still be
+     * walking the same checkout when attempt N+1 spawns against it -- overlapping
+     * git trees and extra metadata load during exactly the stall this is meant to
+     * contain. Escalating here keeps "settled as timed out" coupled to "the tree
+     * has been killed".
+     *
+     * SIGKILL is followed by a bounded liveness check rather than an unbounded
+     * wait. A process wedged in uninterruptible IO on a stalled mount dies only
+     * once that IO returns; if the group is still alive after the bound, callers
+     * must treat the timeout as unresolved and avoid starting another tree
+     * against the same checkout.
+     */
+    const escalateTermination = async () => {
+      if (killTimer) {
+        globalThis.clearTimeout(killTimer);
+        killTimer = null;
+      }
+      terminateChildProcess(child, "SIGKILL");
+      return await waitForProcessGroupExitAfterKill(child);
+    };
+    const cleanupCapturedStreams = (destroy: boolean) => {
+      child.stdout?.off("data", onStdoutData);
+      child.stderr?.off("data", onStderrData);
+      if (destroy) {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      }
+    };
+    const settle = (code: number | null, options?: { destroyStreams?: boolean }) => {
+      if (settled) return;
+      settled = true;
+      cleanupCapturedStreams(options?.destroyStreams ?? false);
+      void (async () => {
+        const processGroupAliveAfterTimeout = timedOut ? await escalateTermination() : false;
+        clearTimers();
+        resolve({ stdout, stderr, code, timedOut, processGroupAliveAfterTimeout });
+      })();
+    };
+
     const timeoutMs =
       typeof input.timeoutMs === "number" && Number.isFinite(input.timeoutMs) && input.timeoutMs > 0
         ? Math.trunc(input.timeoutMs)
         : null;
-    const timeoutTimer = timeoutMs
-      ? globalThis.setTimeout(() => {
-          timedOut = true;
-          child.kill("SIGTERM");
-          killTimer = globalThis.setTimeout(() => {
-            child.kill("SIGKILL");
-          }, 5_000);
-        }, timeoutMs)
-      : null;
-    const stdout = createProcessOutputCapture(input.maxStdoutBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
-    const stderr = createProcessOutputCapture(input.maxStderrBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
-    child.stdout?.on("data", (chunk) => {
-      stdout.append(String(chunk));
-    });
-    child.stderr?.on("data", (chunk) => {
-      stderr.append(String(chunk));
-    });
+    if (timeoutMs) {
+      timeoutTimer = globalThis.setTimeout(() => {
+        timedOut = true;
+        terminateChildProcess(child, "SIGTERM");
+        killTimer = globalThis.setTimeout(() => {
+          killTimer = null;
+          terminateChildProcess(child, "SIGKILL");
+        }, 5_000);
+        killTimer.unref?.();
+      }, timeoutMs);
+    }
+    child.stdout?.on("data", onStdoutData);
+    child.stderr?.on("data", onStderrData);
     child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      cleanupCapturedStreams(true);
+      void (async () => {
+        await (timedOut ? escalateTermination() : Promise.resolve(false));
+        clearTimers();
+        reject(error);
+      })();
+    });
+    // `exit` fires when the command itself terminates; `close` additionally
+    // waits for every writer on the inherited pipes, which can include
+    // descendants that outlive it. Stopping the budget here is what keeps the
+    // two apart: once the command has exited, its status is definitive, so a
+    // descendant holding a pipe open must not be allowed to let the timer fire
+    // and relabel a deterministic failure (e.g. git's exit 128) as a timeout.
+    child.on("exit", (code) => {
+      // `error` can settle (and reject) without an `exit`, but the reverse
+      // ordering is possible too; arming the drain after we have settled would
+      // leave a timer nothing clears, holding the event loop open for its full
+      // grace period to call a no-op.
+      if (settled) return;
       if (timeoutTimer) globalThis.clearTimeout(timeoutTimer);
-      if (killTimer) globalThis.clearTimeout(killTimer);
-      reject(error);
+      timeoutTimer = null;
+      // No kill-timer bookkeeping here: `killTimer` only exists once `timedOut`
+      // is set, and `settle` owns finishing that escalation.
+      // Bound the wait for the remaining stdio. Without this a lingering
+      // descendant means `close` never arrives and the promise never settles --
+      // the timeout budget stops being enforced at all, which is a worse
+      // failure than the one it was meant to catch.
+      drainTimer ??= globalThis.setTimeout(
+        () => settle(code, { destroyStreams: true }),
+        PROCESS_STDIO_DRAIN_GRACE_MS,
+      );
     });
     child.on("close", (code) => {
-      if (timeoutTimer) globalThis.clearTimeout(timeoutTimer);
-      if (killTimer) globalThis.clearTimeout(killTimer);
-      resolve({ stdout, stderr, code, timedOut });
+      settle(code);
     });
   });
   const stdout = proc.stdout.finish();
@@ -599,11 +873,90 @@ async function executeProcess(input: {
     stderr: stderr.text,
     code: proc.code,
     timedOut: proc.timedOut,
+    processGroupAliveAfterTimeout: proc.processGroupAliveAfterTimeout,
     stdoutTruncated: stdout.truncated,
     stderrTruncated: stderr.truncated,
     stdoutBytes: stdout.totalBytes,
     stderrBytes: stderr.totalBytes,
   };
+}
+
+/**
+ * Test seam for `executeProcess`.
+ *
+ * The exit-vs-close distinction it now draws is only observable here: proving it
+ * needs a command that returns a definitive status while a descendant still
+ * holds the inherited pipes, which no real `git` invocation can be made to do on
+ * demand. Not reachable from configuration, same rationale as
+ * `setSubmoduleInspectSettingsForTests`.
+ */
+export const executeProcessForTests = executeProcess;
+
+/**
+ * Raised when a git subprocess exceeded its wall-clock budget. Distinguished from
+ * a non-zero exit so callers can retry a transient stall without also retrying a
+ * deterministic failure (e.g. "not a git repository"). The message is unchanged
+ * from the historical string so existing `gitErrorIncludes` matching still works.
+ */
+class GitCommandTimeoutError extends Error {
+  /**
+   * Whatever the command had already written to stdout before it was killed,
+   * raw and untrimmed.
+   *
+   * Kept because a stalled command can still have emitted *conclusive* output:
+   * `git submodule status --recursive` flushes each entry as it walks, so it can
+   * print a definitive `U`/`-` record for one submodule and then stall on a
+   * later one. Discarding this would throw away evidence the probe already
+   * produced and let a known-broken checkout through the degrade path.
+   *
+   * Two properties callers must respect (both measured against a real
+   * multi-submodule checkout, see BLO-18784):
+   * - The captured text can be unreliable at *both* ends: a stream killed
+   *   mid-write ends in a partial line, and a byte-capped stream keeps only the
+   *   last N bytes (so it is chopped at its head and carries a truncation
+   *   banner). `salvageGitSubmoduleFaults` handles both.
+   * - Absence of a fault record here is NOT evidence of health: an early kill
+   *   or buffering can yield zero bytes for a checkout that is in fact broken.
+   *   Presence may be acted on; absence must still degrade.
+   */
+  readonly stdout: string;
+  readonly stdoutEndsWithNewline: boolean;
+  readonly processGroupAliveAfterTimeout: boolean;
+
+  constructor(message: string, partial?: { stdout: string; processGroupAliveAfterTimeout?: boolean }) {
+    super(message);
+    this.name = "GitCommandTimeoutError";
+    this.stdout = partial?.stdout ?? "";
+    this.stdoutEndsWithNewline = this.stdout.endsWith("\n");
+    this.processGroupAliveAfterTimeout = partial?.processGroupAliveAfterTimeout ?? false;
+  }
+}
+
+/**
+ * `git submodule status` line shape: a status character, the full object id,
+ * then the path. Anchored deliberately -- it is the guard that makes salvaging a
+ * *partial* stream safe, because neither a head-chopped fragment (which has lost
+ * its status character and part of its object id) nor the capture layer's
+ * `[output truncated ...]` banner can match it. Only `-` (uninitialized) and `U`
+ * (conflicted) are of interest; ` ` and `+` are healthy states.
+ */
+const GIT_SUBMODULE_FAULT_LINE = /^[-U][0-9a-f]{40,64} \S/;
+
+/**
+ * Recover submodule faults a stalled probe had already reported.
+ *
+ * Safe in one direction only: a fault found here is real (git printed it), so it
+ * may be acted on, but finding none is NOT evidence of health -- see
+ * `GitCommandTimeoutError.stdout`.
+ */
+function salvageGitSubmoduleFaults(error: GitCommandTimeoutError): GitSubmoduleReadinessEntry[] {
+  if (!error.stdout) return [];
+  const lines = error.stdout.split("\n");
+  // A stream killed mid-write ends in a partial line. That fragment can still
+  // match the shape above while carrying a *truncated path*, which would name
+  // the wrong submodule, so drop it outright rather than filtering it.
+  if (!error.stdoutEndsWithNewline) lines.pop();
+  return parseGitSubmoduleReadiness(lines.filter((line) => GIT_SUBMODULE_FAULT_LINE.test(line)).join("\n"));
 }
 
 async function runGit(
@@ -620,8 +973,17 @@ async function runGit(
     maxStdoutBytes: options.maxStdoutBytes,
     maxStderrBytes: options.maxStderrBytes,
   });
+  // Timeout first, and only sound because `executeProcess` stops the budget the
+  // moment git itself exits: `timedOut` therefore means the timer fired while
+  // git was still running, never that a descendant held the pipes open past a
+  // status git had already returned. Without that invariant this ordering would
+  // relabel a deterministic exit 128 as a retryable stall and let a broken
+  // checkout through the degrade path.
   if (proc.timedOut) {
-    throw new Error(`git ${args.join(" ")} timed out after ${options.timeoutMs}ms`);
+    throw new GitCommandTimeoutError(`git ${args.join(" ")} timed out after ${options.timeoutMs}ms`, {
+      stdout: proc.stdout,
+      processGroupAliveAfterTimeout: proc.processGroupAliveAfterTimeout,
+    });
   }
   if (proc.code !== 0) {
     throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
@@ -2310,14 +2672,180 @@ function buildNonInteractiveGitEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-async function readGitSubmoduleReadiness(cwd: string, env: NodeJS.ProcessEnv): Promise<GitSubmoduleReadinessEntry[]> {
-  const output = await runGit(["submodule", "status", "--recursive"], cwd, {
-    env,
-    timeoutMs: 30_000,
-    maxStdoutBytes: 256 * 1024,
-    maxStderrBytes: 64 * 1024,
-  });
-  return parseGitSubmoduleReadiness(output);
+/**
+ * Result of probing submodule readiness.
+ *
+ * `ok: false` means the probe *stalled* -- we could not determine the state,
+ * which is NOT evidence that submodules are broken. Callers must not strand a
+ * live issue on an inconclusive probe -- see `ensureGitSubmodulesReady`.
+ *
+ * `partial: true` accompanies `ok: true` when the entries were recovered from a
+ * *timed-out* probe's partial output. The list is a subset -- the walk did not
+ * finish -- but each entry in it is a fault git actually reported, so callers
+ * treat it exactly like a completed probe: fail closed on conflicted, repair
+ * uninitialized. Only the absence of faults is unknowable from partial output,
+ * and that case degrades instead (`ok: false`).
+ *
+ * Deterministic failures never reach this type: they throw. See
+ * `inspectGitSubmoduleReadiness`.
+ */
+type GitSubmoduleInspection =
+  | {
+      ok: true;
+      entries: GitSubmoduleReadinessEntry[];
+      partial?: boolean;
+      attempts?: number;
+      timeoutReason?: string;
+      processGroupAliveAfterTimeout?: boolean;
+    }
+  | { ok: false; reason: string; attempts: number };
+
+/**
+ * Probe submodule readiness, retrying stalls.
+ *
+ * Two failure modes, deliberately handled differently:
+ *
+ * - **Stall** (`GitCommandTimeoutError`): inconclusive *unless* the partial output
+ *   already names a broken submodule. `git submodule status --recursive` flushes
+ *   entries as it walks, so a stall can arrive with a definitive `U`/`-` record
+ *   for an earlier submodule in hand. When it does, that evidence is returned
+ *   (`partial: true`) and the caller fails closed / repairs as usual -- retrying
+ *   would spend another full budget to reach a conclusion we already have.
+ *   Otherwise the stall is retried only after the timed-out process group has
+ *   disappeared. If the bounded post-kill liveness check says the group is still
+ *   alive, the probe degrades immediately instead of overlapping the next Git
+ *   tree with the previous one. Exhausted retries are then reported as
+ *   `ok: false` so the caller can degrade to a warning. This is the BLO-18784
+ *   fix.
+ * - **Any other failure** (non-zero exit, missing git binary, malformed
+ *   `.gitmodules`, corrupt checkout, permission error): deterministic evidence
+ *   that the checkout is unusable. Throws `WorkspaceGitSubmoduleError`, as it did
+ *   before BLO-18784. Retrying would burn every budget to reach the same answer,
+ *   and degrading past it would start an agent in a workspace we already know is
+ *   broken -- the timeout fix must not widen into a general fail-open.
+ */
+async function inspectGitSubmoduleReadiness(
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  stage: "initial" | "post_repair",
+): Promise<GitSubmoduleInspection> {
+  const settings = readSubmoduleInspectSettings();
+  let lastTimeoutReason: string | null = null;
+
+  for (let attempt = 1; attempt <= settings.attempts; attempt += 1) {
+    try {
+      const output = await runGit(["submodule", "status", "--recursive"], cwd, {
+        env,
+        timeoutMs: settings.timeoutMs,
+        maxStdoutBytes: 256 * 1024,
+        maxStderrBytes: 64 * 1024,
+      });
+      return { ok: true, entries: parseGitSubmoduleReadiness(output) };
+    } catch (error) {
+      if (!(error instanceof GitCommandTimeoutError)) {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new WorkspaceGitSubmoduleError(
+          `Could not inspect git submodules for execution workspace "${cwd}" ` +
+            `(${stage === "post_repair" ? "verification after repair" : "initial check"}): ${reason}`,
+        );
+      }
+      lastTimeoutReason = error.message;
+
+      // The stall may still have produced conclusive evidence before it hung.
+      const salvaged = salvageGitSubmoduleFaults(error);
+      if (salvaged.length > 0) {
+        // Faults git actually reported. Return them as conclusive so the caller
+        // fails closed / repairs. Note the converse does NOT hold: an empty
+        // `salvaged` is not evidence of health (buffering or an early kill can
+        // yield no output at all), so that case falls through to retry/degrade.
+        return {
+          ok: true,
+          entries: salvaged,
+          partial: true,
+          attempts: attempt,
+          timeoutReason: error.message,
+          processGroupAliveAfterTimeout: error.processGroupAliveAfterTimeout,
+        };
+      }
+
+      if (error.processGroupAliveAfterTimeout) {
+        return {
+          ok: false,
+          reason:
+            `${error.message}; previous timed-out git process group remained alive after SIGKILL, ` +
+            "so retry was skipped to avoid overlapping probes against the same checkout",
+          attempts: attempt,
+        };
+      }
+
+      if (attempt < settings.attempts) {
+        // Cap the linear backoff as well: the delay is a *product*, so bounding
+        // only the configured value would leave the effective delay unbounded
+        // if the caps above are ever raised.
+        await delay(Math.min(settings.retryDelayMs * attempt, WORKSPACE_SUBMODULE_INSPECT_MAX_RETRY_DELAY_MS));
+      }
+    }
+  }
+
+  return {
+    ok: false,
+    reason: lastTimeoutReason ?? "git submodule status --recursive did not complete",
+    attempts: settings.attempts,
+  };
+}
+
+function describeSubmoduleInspectionDegradation(cwd: string, inspection: { reason: string; attempts: number }): string {
+  return (
+    `Could not inspect git submodules for execution workspace "${cwd}" after ${inspection.attempts} attempt(s): ` +
+    `${inspection.reason}. Continuing without the submodule readiness check -- the probe stalled, so the ` +
+    `inspection is inconclusive rather than a detected fault. If a submodule really is missing, the agent's own ` +
+    `build/test step will fail with a specific error.`
+  );
+}
+
+/**
+ * Record a degraded (skipped) submodule readiness check as a structured
+ * workspace operation.
+ *
+ * Without this the degradation is only a line in the run log. That matters
+ * because this change converts a loud failure (`workspace_git_submodule_
+ * unavailable`, which raised a recovery action) into a soft warning: absence of
+ * recovery actions would then be indistinguishable between "the stalls stopped"
+ * and "we stopped reporting the stalls". A `skipped` operation row keeps the
+ * occurrence countable, so a chronically slow checkout is still visible.
+ *
+ * Best-effort: bookkeeping must not defeat the point of degrading. If the
+ * recorder itself fails we swallow it and still let the run proceed -- the
+ * human-readable warning is returned to the caller either way.
+ */
+async function recordSubmoduleInspectionDegradation(
+  recorder: WorkspaceOperationRecorder | null | undefined,
+  input: { cwd: string; reason: string; attempts: number; stage: "initial" | "post_repair" },
+): Promise<void> {
+  if (!recorder) return;
+  const settings = readSubmoduleInspectSettings();
+  try {
+    await recorder.recordOperation({
+      phase: "worktree_prepare",
+      command: formatCommandForDisplay("git", ["submodule", "status", "--recursive"]),
+      cwd: input.cwd,
+      metadata: {
+        cwd: input.cwd,
+        action: "submodule_inspection_degraded",
+        stage: input.stage,
+        attempts: input.attempts,
+        timeoutMs: settings.timeoutMs,
+        reason: input.reason,
+      },
+      run: async () => ({
+        status: "skipped",
+        exitCode: null,
+        system: `${describeSubmoduleInspectionDegradation(input.cwd, input)}\n`,
+      }),
+    });
+  } catch {
+    // Intentionally ignored -- see doc comment.
+  }
 }
 
 async function ensureGitSubmodulesReady(input: {
@@ -2330,20 +2858,34 @@ async function ensureGitSubmodulesReady(input: {
   if (!gitmodulesExists) return [];
 
   const env = buildNonInteractiveGitEnv();
-  let entries: GitSubmoduleReadinessEntry[];
-  try {
-    entries = await readGitSubmoduleReadiness(input.cwd, env);
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    throw new WorkspaceGitSubmoduleError(
-      `Could not inspect git submodules for execution workspace "${input.cwd}": ${reason}`,
-    );
+  const inspection = await inspectGitSubmoduleReadiness(input.cwd, env, "initial");
+  if (!inspection.ok) {
+    // The probe stalled (deterministic failures threw above). Degrade to a
+    // warning rather than throwing: stranding an in-progress issue because a
+    // read-only probe on a network filesystem was slow is strictly worse than
+    // letting the run proceed. See BLO-18784.
+    const warning = describeSubmoduleInspectionDegradation(input.cwd, inspection);
+    await recordSubmoduleInspectionDegradation(input.recorder, {
+      cwd: input.cwd,
+      reason: inspection.reason,
+      attempts: inspection.attempts,
+      stage: "initial",
+    });
+    return [warning];
   }
+
+  const entries = inspection.entries;
+  // When the evidence came from a stalled probe, say so: the fault is real but
+  // the list is a subset, so an operator reading the error should not treat it
+  // as the complete set of broken submodules.
+  const partialSuffix = inspection.partial
+    ? " (detected in the partial output of a probe that then stalled, so there may be more)"
+    : "";
 
   const conflicted = entries.filter((entry) => entry.state === "conflicted");
   if (conflicted.length > 0) {
     throw new WorkspaceGitSubmoduleError(
-      `Execution workspace "${input.cwd}" has conflicted git submodules that need manual resolution before an agent can run: ${conflicted.map((entry) => entry.path).join(", ")}`,
+      `Execution workspace "${input.cwd}" has conflicted git submodules that need manual resolution before an agent can run: ${conflicted.map((entry) => entry.path).join(", ")}${partialSuffix}`,
     );
   }
 
@@ -2351,6 +2893,24 @@ async function ensureGitSubmodulesReady(input: {
     .filter((entry) => entry.state === "uninitialized")
     .map((entry) => entry.path);
   if (missingPaths.length === 0) return [];
+
+  if (inspection.partial && inspection.processGroupAliveAfterTimeout) {
+    const reason =
+      `${inspection.timeoutReason ?? "git submodule status --recursive timed out"}; ` +
+      "previous timed-out git process group remained alive after SIGKILL, " +
+      "so automatic submodule repair was skipped to avoid overlapping repair commands against the same checkout";
+    await recordSubmoduleInspectionDegradation(input.recorder, {
+      cwd: input.cwd,
+      reason,
+      attempts: inspection.attempts ?? 1,
+      stage: "initial",
+    });
+    return [
+      `Could not safely initialize git submodules for execution workspace "${input.cwd}" (${missingPaths.join(", ")}): ` +
+        `${reason}. Continuing without automatic submodule repair -- the partial probe found uninitialized ` +
+        "submodules, but starting a recursive repair over a still-live git process group could amplify the checkout stall.",
+    ];
+  }
 
   const metadata = {
     cwd: input.cwd,
@@ -2408,10 +2968,39 @@ async function ensureGitSubmodulesReady(input: {
     );
   }
 
-  const remaining = await readGitSubmoduleReadiness(input.cwd, env);
-  if (remaining.length > 0) {
+  const verification = await inspectGitSubmoduleReadiness(input.cwd, env, "post_repair");
+  if (!verification.ok) {
+    // The repair commands themselves succeeded and only the re-check stalled (a
+    // definitive verification failure threw above, so success is never claimed
+    // over one). Report both rather than discarding the successful repair.
+    await recordSubmoduleInspectionDegradation(input.recorder, {
+      cwd: input.cwd,
+      reason: verification.reason,
+      attempts: verification.attempts,
+      stage: "post_repair",
+    });
+    return [
+      `Initialized git submodules before starting: ${missingPaths.join(", ")}`,
+      describeSubmoduleInspectionDegradation(input.cwd, verification),
+    ];
+  }
+  if (verification.entries.length > 0) {
+    const stillMissing = verification.entries.map((entry) => entry.path);
+    // Only the paths we actually attempted can be described as unfixed by the
+    // repair. A partial initial probe returns a subset, so anything outside
+    // `missingPaths` was never attempted -- calling that "still unavailable
+    // after repair" would send an operator looking for a repair failure that
+    // never happened. The workspace is still unusable either way, so this stays
+    // fatal; only the attribution changes.
+    const unattempted = stillMissing.filter((candidate) => !missingPaths.includes(candidate));
     throw new WorkspaceGitSubmoduleError(
-      `Execution workspace "${input.cwd}" still has unavailable git submodules after repair: ${remaining.map((entry) => entry.path).join(", ")}`,
+      `Execution workspace "${input.cwd}" still has unavailable git submodules after repair: ${stillMissing.join(", ")}` +
+        (unattempted.length > 0
+          ? `. Not attempted by this repair (the initial probe stalled before reporting them): ${unattempted.join(", ")}`
+          : "") +
+        (verification.partial
+          ? " (verification itself stalled, so this list may be incomplete)"
+          : ""),
     );
   }
 
@@ -2610,18 +3199,28 @@ export function formatManagedGitWorktreeBranchInspection(input: ManagedGitWorktr
   };
 }
 
-function terminateChildProcess(child: ChildProcess) {
+/**
+ * Signal a child and, where the platform allows it, everything it spawned.
+ *
+ * The negative pid targets the process group, which is why callers that may need
+ * this must spawn `detached` (a non-detached child shares *our* group, so the
+ * negative pid would either miss or, worse, hit us). Falls back to the direct
+ * child when the group is already gone or the platform has no groups.
+ */
+function terminateChildProcess(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM") {
   if (!child.pid) return;
   if (process.platform !== "win32") {
     try {
-      process.kill(-child.pid, "SIGTERM");
+      process.kill(-child.pid, signal);
       return;
     } catch {
       // Fall through to the direct child kill.
     }
   }
-  if (!child.killed) {
-    child.kill("SIGTERM");
+  try {
+    child.kill(signal);
+  } catch {
+    // Already reaped; nothing left to signal.
   }
 }
 
