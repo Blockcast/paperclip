@@ -1145,6 +1145,67 @@ function shouldFirePrReviewerWake(context: ResolvedEventContext | null): context
   ]).has(context.wakeReason);
 }
 
+// A wake idempotency key is either REQUEST-scoped or STABLE, and the two want
+// opposite treatment of terminal statuses (see idempotentWakeStatuses):
+//
+//   request — the suffix carries a per-event identity (GitHub comment id or
+//     delivery id). The key can only recur if GitHub redelivers THAT event, so
+//     a terminal success/cancellation must dedup: replaying it would redo work
+//     that already happened.
+//   stable  — the suffix is just repo+pr+reason, so a genuinely NEW event
+//     reuses the key. A terminal status must NOT dedup, or the first completed
+//     wake would block every later event of that reason on that PR forever.
+type WakeIdempotencyScope = "request" | "stable";
+
+// Computes the key suffix and its scope together so the two can never drift —
+// getting `scope` wrong while the suffix stays right is exactly the bug that
+// makes terminal-status dedup either too aggressive or useless. The reviewer
+// and PR-author paths delivery-scope different reason sets, so each passes its
+// own; `github_pr_review_requested` is comment-scoped on both.
+//
+// A suffix that had to fall back to `unknown` (no comment id AND no delivery
+// id) is reported as `stable`, not `request`: two DISTINCT events would then
+// collide on one key, and terminal dedup would drop the second for good. Only
+// a suffix that actually carries per-event identity earns the request rule.
+function wakeIdempotencySuffix(
+  context: ResolvedEventContext,
+  deliveryId: string | null,
+  deliveryScopedReasons: ReadonlySet<string>,
+): { suffix: string; scope: WakeIdempotencyScope } {
+  const scopeFor = (identity: string | number | null): WakeIdempotencyScope =>
+    identity === null || identity === "" ? "stable" : "request";
+  if (context.wakeReason === "github_pr_review_requested") {
+    const identity = context.commentId ?? deliveryId ?? null;
+    return {
+      suffix: `${context.wakeReason}:comment:${identity ?? "unknown"}`,
+      scope: scopeFor(identity),
+    };
+  }
+  if (context.wakeReason && deliveryScopedReasons.has(context.wakeReason)) {
+    return {
+      suffix: `${context.wakeReason}:delivery:${deliveryId ?? "unknown"}`,
+      scope: scopeFor(deliveryId),
+    };
+  }
+  return { suffix: context.wakeReason ?? "unknown", scope: "stable" };
+}
+
+const REVIEWER_DELIVERY_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set([
+  "github_pr_ready_for_review",
+  "github_pr_synchronized",
+]);
+
+// The PR-author wake keeps repo+pr+reason keys for everything except the
+// comment-scoped @ally request; widening it is a separate behavior change.
+const AUTHOR_DELIVERY_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set();
+
+function prReviewerWakeIdempotencyScope(
+  context: ResolvedEventContext,
+  deliveryId: string | null,
+): WakeIdempotencyScope {
+  return wakeIdempotencySuffix(context, deliveryId, REVIEWER_DELIVERY_SCOPED_WAKE_REASONS).scope;
+}
+
 function buildPrReviewerWakeIdempotencyKey(
   context: ResolvedEventContext & { prNumber: number },
   deliveryId: string | null,
@@ -1179,25 +1240,19 @@ function buildPrReviewerWakeIdempotencyKey(
   //
   // Every other reason keys on repo+prNumber+reason alone. This deliberately
   // omits head sha and delivery id so the idempotency precheck can skip
-  // duplicate in-flight wake requests for the same PR+reason. Note:
-  // `completed` is intentionally NOT an idempotent status (see
+  // duplicate in-flight wake requests for the same PR+reason. For those STABLE
+  // keys `completed` is intentionally NOT an idempotent status (see
   // IDEMPOTENT_REVIEWER_WAKE_STATUSES), so a fixup pushed AFTER a review
   // finishes still enqueues a fresh reviewer wake rather than being blocked by
-  // the earlier completed review. Active run coalescing is controlled by
+  // the earlier completed review. Request-scoped keys get the opposite rule via
+  // idempotentWakeStatuses. Active run coalescing is controlled by
   // buildPrReviewerTaskKey plus enqueueWakeup's same-task-scope logic.
-  const requestScopedSuffix = (() => {
-    if (context.wakeReason === "github_pr_review_requested") {
-      return `${context.wakeReason}:comment:${context.commentId ?? deliveryId ?? "unknown"}`;
-    }
-    if (
-      context.wakeReason === "github_pr_ready_for_review" ||
-      context.wakeReason === "github_pr_synchronized"
-    ) {
-      return `${context.wakeReason}:delivery:${deliveryId ?? "unknown"}`;
-    }
-    return context.wakeReason;
-  })();
-  return `pr_review:${repo}:${context.prNumber}:${requestScopedSuffix}`;
+  const { suffix } = wakeIdempotencySuffix(
+    context,
+    deliveryId,
+    REVIEWER_DELIVERY_SCOPED_WAKE_REASONS,
+  );
+  return `pr_review:${repo}:${context.prNumber}:${suffix}`;
 }
 
 // Deliberately PR-scoped, with no head sha: this key also scopes the reviewer
@@ -1543,6 +1598,27 @@ const IDEMPOTENT_REVIEWER_WAKE_STATUSES = [
   "dispatch_superseded",
 ];
 
+// Terminal outcomes that mean "this exact request was already consumed or
+// deliberately retired". They dedup ONLY for request-scoped keys, where the key
+// cannot recur except as a GitHub redelivery of the same event (BLO-18953).
+//
+// Without this, replaying one `x-github-delivery` after its wake finished
+// enqueued the work a second time — the `completed` exclusion above was written
+// for stable PR+reason keys and silently defeated delivery scoping. Worse for
+// `cancelled`: pull_request.converted_to_draft retires pending reviewer runs via
+// cancelPendingRunsForTask, so a late replay of the earlier `ready_for_review`
+// delivery resurrected reviewer work on a PR that is a draft again.
+//
+// `failed` and `dispatch_failed_exhausted` stay excluded on purpose: those never
+// produced a review, so a redelivery is a legitimate second chance.
+const TERMINAL_REQUEST_SCOPED_IDEMPOTENT_STATUSES = ["completed", "cancelled"];
+
+function idempotentWakeStatuses(scope: WakeIdempotencyScope): string[] {
+  return scope === "request"
+    ? [...IDEMPOTENT_REVIEWER_WAKE_STATUSES, ...TERMINAL_REQUEST_SCOPED_IDEMPOTENT_STATUSES]
+    : IDEMPOTENT_REVIEWER_WAKE_STATUSES;
+}
+
 function githubContextMetadata(context: ResolvedEventContext) {
   return {
     ...(context.prTitle ? { githubPrTitle: context.prTitle } : {}),
@@ -1718,6 +1794,12 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         // taskKey scopes active-run coalescing; idempotencyKey scopes duplicate
         // request rows for the same PR+reason before enqueueing.
         const idempotencyKey = buildPrReviewerWakeIdempotencyKey(context, deliveryId);
+        // Request-scoped keys also dedup terminal completed/cancelled rows, so a
+        // GitHub redelivery of one event cannot re-run work that already ran or
+        // was retired by converted_to_draft (BLO-18953).
+        const idempotentStatuses = idempotentWakeStatuses(
+          prReviewerWakeIdempotencyScope(context, deliveryId),
+        );
         return await withPrReviewerTaskLock(db, reviewerTaskKey, async (tx) => {
           // The wake insert commits through heartbeat's own transaction. Keep
           // this transaction-scoped lock held until that commit is visible so
@@ -1730,7 +1812,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               and(
                 inArray(agentWakeupRequests.agentId, reviewerAgentIds),
                 eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
-                inArray(agentWakeupRequests.status, IDEMPOTENT_REVIEWER_WAKE_STATUSES),
+                inArray(agentWakeupRequests.status, idempotentStatuses),
               ),
             )
             .limit(1)
@@ -2305,10 +2387,11 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       if (isPrWake && !authorWakeIdempotencyKey) {
         const prNumber = context.prNumber as number;
         const repo = context.repoFullName ?? "unknown";
-        const suffix =
-          context.wakeReason === "github_pr_review_requested"
-            ? `${context.wakeReason}:comment:${context.commentId ?? deliveryId ?? "unknown"}`
-            : context.wakeReason;
+        const { suffix, scope } = wakeIdempotencySuffix(
+          context,
+          deliveryId,
+          AUTHOR_DELIVERY_SCOPED_WAKE_REASONS,
+        );
         authorWakeIdempotencyKey = `pr_review_author:${issue.id}:${repo}:${prNumber}:${suffix}`;
         const existingPrAuthorWake = await db
           .select({ id: agentWakeupRequests.id })
@@ -2317,7 +2400,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             and(
               eq(agentWakeupRequests.agentId, effectiveAssigneeAgentId),
               eq(agentWakeupRequests.idempotencyKey, authorWakeIdempotencyKey),
-              inArray(agentWakeupRequests.status, IDEMPOTENT_REVIEWER_WAKE_STATUSES),
+              inArray(agentWakeupRequests.status, idempotentWakeStatuses(scope)),
             ),
           )
           .limit(1)
@@ -2435,6 +2518,8 @@ export const __test_resolveEventContext = resolveEventContext;
 export const __test_shouldFirePrReviewerWake = shouldFirePrReviewerWake;
 export const __test_isReviewerSelfEchoReview = isReviewerSelfEchoReview;
 export const __test_buildPrReviewerWakeIdempotencyKey = buildPrReviewerWakeIdempotencyKey;
+export const __test_prReviewerWakeIdempotencyScope = prReviewerWakeIdempotencyScope;
+export const __test_idempotentWakeStatuses = idempotentWakeStatuses;
 export const __test_buildPrReviewerTaskKey = buildPrReviewerTaskKey;
 export const __test_resolveDependabotAlertContext = resolveDependabotAlertContext;
 export const __test_hasActionablePrReviewFeedback = hasActionablePrReviewFeedback;

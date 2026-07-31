@@ -34,6 +34,8 @@ import {
   __test_hasPrReviewerAgentRequestMarker,
   __test_hasAllyConsolidatedReviewHeading,
   __test_hasAllyConsolidatedReviewHeader,
+  __test_idempotentWakeStatuses,
+  __test_prReviewerWakeIdempotencyScope,
   __test_resolveDependabotAlertContext,
   __test_resolveEventContext,
   __test_shouldFirePrReviewerWake,
@@ -171,6 +173,54 @@ describe("github-webhook pure helpers", () => {
     expect(__test_buildPrReviewerWakeIdempotencyKey(ctx2, "delivery-push-3")).toBe(
       "pr_review:Blockcast/paperclip:318:github_pr_synchronized:delivery:delivery-push-3",
     );
+  });
+
+  it("scopes terminal-status idempotency to request-scoped keys only (BLO-18953)", () => {
+    const requestScoped = (action: string, reason: string) => {
+      const ctx = __test_resolveEventContext("pull_request", {
+        action,
+        pull_request: {
+          number: 991,
+          title: "Fix BLO-3182 webflow blog",
+          body: null,
+          draft: false,
+          html_url: "https://github.com/Blockcast/magma/pull/991",
+          head: { ref: "fix/BLO-3182-webflow-blog", sha: "readysha" },
+        },
+        repository: { full_name: "Blockcast/magma" },
+      });
+      expect(ctx?.wakeReason).toBe(reason);
+      return ctx as NonNullable<typeof ctx>;
+    };
+
+    // Delivery-scoped: the key can only recur as a redelivery, so a terminal
+    // completed/cancelled row must dedup it.
+    for (const [action, reason] of [
+      ["ready_for_review", "github_pr_ready_for_review"],
+      ["synchronize", "github_pr_synchronized"],
+    ] as const) {
+      const ctx = requestScoped(action, reason);
+      expect(__test_prReviewerWakeIdempotencyScope(ctx, "delivery-1")).toBe("request");
+    }
+
+    // Stable PR+reason keys keep the original exclusion: a NEW event reuses the
+    // key, so terminal statuses must not block it.
+    const opened = requestScoped("opened", "github_pr_opened");
+    expect(__test_prReviewerWakeIdempotencyScope(opened, "delivery-1")).toBe("stable");
+
+    // A suffix with no per-event identity at all cannot distinguish two
+    // distinct events, so it must NOT get the terminal-dedup rule.
+    const noIdentity = requestScoped("ready_for_review", "github_pr_ready_for_review");
+    expect(__test_prReviewerWakeIdempotencyScope(noIdentity, null)).toBe("stable");
+
+    expect(__test_idempotentWakeStatuses("stable")).not.toContain("completed");
+    expect(__test_idempotentWakeStatuses("stable")).not.toContain("cancelled");
+    expect(__test_idempotentWakeStatuses("request")).toEqual(
+      expect.arrayContaining(["completed", "cancelled", "queued", "running", "coalesced"]),
+    );
+    // A wake that never produced a review still deserves a fresh attempt.
+    expect(__test_idempotentWakeStatuses("request")).not.toContain("failed");
+    expect(__test_idempotentWakeStatuses("request")).not.toContain("dispatch_failed_exhausted");
   });
 
   it("does not build reviewer debounce keys for malformed PR contexts without a PR number", () => {
@@ -1713,6 +1763,90 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(new Set(wakes.map((wake) => wake.agentId))).toEqual(
       new Set([runs[0]?.agentId]),
     );
+  });
+
+  it("ignores a GitHub redelivery of a ready_for_review event whose wake already completed (BLO-18953)", async () => {
+    const { companyId } = await seedIssueWithIdentifier("BLO-3182");
+    const reviewerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+    const readyPayload = {
+      action: "ready_for_review",
+      pull_request: {
+        number: 991,
+        title: "Fix BLO-3182 webflow blog",
+        body: null,
+        draft: false,
+        html_url: "https://github.com/Blockcast/magma/pull/991",
+        head: { ref: "fix/BLO-3182-webflow-blog", sha: "readysha" },
+      },
+      repository: { full_name: "Blockcast/magma" },
+    };
+    const deliver = async () => {
+      const signed = signedRequest(readyPayload);
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signed.signature)
+        // GitHub reuses the delivery id when it retries or an operator replays.
+        .set("x-github-delivery", "delivery-ready-replay")
+        .set("content-type", "application/json")
+        .send(signed.body);
+    };
+
+    const firstRes = await deliver();
+    expect(firstRes.status).toBe(200);
+
+    const idempotencyKey =
+      "pr_review:Blockcast/magma:991:github_pr_ready_for_review:delivery:delivery-ready-replay";
+
+    const reviewerWakes = async () =>
+      db
+        .select({ status: agentWakeupRequests.status, idempotencyKey: agentWakeupRequests.idempotencyKey })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, reviewerAgentId));
+
+    expect(await reviewerWakes()).toEqual([{ status: "queued", idempotencyKey }]);
+
+    // The run consumed the wake and finished. Before BLO-18953's second pass,
+    // `completed` was excluded from the precheck for EVERY reason, so replaying
+    // this delivery enqueued the already-consumed request all over again.
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "completed", finishedAt: new Date() })
+      .where(eq(agentWakeupRequests.idempotencyKey, idempotencyKey));
+
+    const replayRes = await deliver();
+    expect(replayRes.status).toBe(200);
+    expect(await reviewerWakes()).toEqual([{ status: "completed", idempotencyKey }]);
+
+    // Same rule for a request retired by pull_request.converted_to_draft: a late
+    // replay must not resurrect reviewer work on a PR that is a draft again.
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "cancelled" })
+      .where(eq(agentWakeupRequests.idempotencyKey, idempotencyKey));
+
+    const replayAfterCancel = await deliver();
+    expect(replayAfterCancel.status).toBe(200);
+    expect(await reviewerWakes()).toEqual([{ status: "cancelled", idempotencyKey }]);
+
+    const reviewerRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, reviewerAgentId));
+    expect(reviewerRuns).toHaveLength(1);
   });
 
   it("dedupes rapid pull_request.synchronize pushes and suppresses only synchronize author wakes", async () => {

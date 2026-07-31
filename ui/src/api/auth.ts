@@ -165,20 +165,7 @@ export const authApi = {
     await authPost("/sign-up/email", input);
   },
 
-  // Better-auth's social-sign-in endpoint returns { url, redirect: true } —
-  // the caller navigates to `url`, which begins the provider's OAuth flow.
-  // Throws AuthApiError when the provider isn't configured server-side
-  // (e.g. MICROSOFT_CLIENT_ID unset) so the UI can show a useful message.
-  signInSocial: async (input: { provider: "microsoft"; callbackURL: string }): Promise<{ url: string }> => {
-    const payload = (await authPost("/sign-in/social", input)) as { url?: unknown } | null;
-    const url = typeof payload?.url === "string" ? payload.url : null;
-    if (!url) {
-      throw new AuthApiError("Social sign-in did not return a redirect URL.", 502, payload);
-    }
-    return { url };
-  },
-
-  signInOAuth2: async (input: { providerId: "dex"; callbackURL: string }): Promise<{ url: string }> => {
+  signInOAuth2: async (input: { providerId: string; callbackURL: string }): Promise<{ url: string }> => {
     const payload = (await authPost("/sign-in/oauth2", input)) as { url?: unknown } | null;
     const url = typeof payload?.url === "string" ? payload.url : null;
     if (!url) {
