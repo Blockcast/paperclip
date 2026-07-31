@@ -1239,7 +1239,7 @@ function applyMonitorTransition(
             clearReason: "convergence_stalled",
             clearedAt: new Date(),
             convergence,
-            assigneeAgentId,
+            assigneeAgentId: input.actor.agentId ?? assigneeAgentId,
           });
         } else {
           patch.monitorNextCheckAt = new Date(input.policy.monitor.nextCheckAt);

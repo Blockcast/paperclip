@@ -433,6 +433,37 @@ describe("issue monitor convergence guard (BLO-18294)", () => {
       ).toThrow(/must be re-armed by a non-assignee actor/);
     });
 
+    it("does not let the stalled assignee reset budget by naming a new assignee in the stalling patch", () => {
+      const successorAgentId = "22222222-2222-4222-8222-222222222222";
+      const issue = newIssue();
+      const blockers = [BLOCKER_A];
+
+      for (let cycle = 1; cycle <= DEFAULT_ISSUE_MONITOR_CONVERGENCE_THRESHOLD; cycle += 1) {
+        arm(issue, { nextCheckAt: checkAt(cycle) }, { blockers });
+        fire(issue, checkAt(cycle));
+      }
+
+      const refused = arm(issue, { nextCheckAt: checkAt(4) }, {
+        blockers,
+        requestedAssigneePatch: { assigneeAgentId: successorAgentId },
+      });
+      expect(refused.patch.status).toBe("blocked");
+      expect(monitorState(issue)).toMatchObject({
+        status: "cleared",
+        clearReason: "convergence_stalled",
+        convergenceStalledAssigneeAgentId: assigneeAgentId,
+      });
+
+      issue.status = "in_progress";
+      issue.assigneeAgentId = successorAgentId;
+      expect(() =>
+        arm(issue, { nextCheckAt: checkAt(5) }, {
+          blockers,
+          requestedAssigneePatch: { assigneeAgentId },
+        })
+      ).toThrow(/must be re-armed by a non-assignee actor/);
+    });
+
     it("falls back to the notes signature when nothing structured is declared", () => {
       const issue = newIssue();
 
