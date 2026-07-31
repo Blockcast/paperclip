@@ -70,8 +70,58 @@ export function isTransientDbError(error: unknown): boolean {
 
 /** Max characters of SQL text kept when describing a failed query. */
 const DB_ERROR_SQL_EXCERPT_CHARS = 240;
+/** Max characters kept from individual PostgreSQL error fields. */
+const DB_ERROR_FIELD_CHARS = 160;
 /** Max characters kept from a non-drizzle error message. */
 const DB_ERROR_MESSAGE_CHARS = 400;
+/** Hard cap for the persisted database-error description. */
+const DB_ERROR_DESCRIPTION_CHARS = 900;
+
+const POSTGRES_SQLSTATE_CLASSES = new Set([
+  "00",
+  "01",
+  "02",
+  "03",
+  "08",
+  "09",
+  "0A",
+  "0B",
+  "0F",
+  "0L",
+  "0P",
+  "0Z",
+  "20",
+  "21",
+  "22",
+  "23",
+  "24",
+  "25",
+  "26",
+  "27",
+  "28",
+  "2B",
+  "2D",
+  "2F",
+  "34",
+  "38",
+  "39",
+  "3B",
+  "3D",
+  "3F",
+  "40",
+  "42",
+  "44",
+  "53",
+  "54",
+  "55",
+  "57",
+  "58",
+  "72",
+  "F0",
+  "HV",
+  "P0",
+  "XX",
+]);
 
 interface PgErrorFields {
   code: string;
@@ -84,7 +134,19 @@ interface PgErrorFields {
 
 function readString(record: Record<string, unknown>, key: string): string | undefined {
   const value = record[key];
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+  if (typeof value !== "string") return undefined;
+  const normalized = compactErrorText(value, DB_ERROR_FIELD_CHARS);
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function compactErrorText(value: string, maxChars: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length > maxChars ? `${normalized.slice(0, maxChars)}…` : normalized;
+}
+
+function isPostgresSqlState(code: string): boolean {
+  const normalized = code.toUpperCase();
+  return /^[0-9A-Z]{5}$/.test(normalized) && POSTGRES_SQLSTATE_CLASSES.has(normalized.slice(0, 2));
 }
 
 /**
@@ -97,12 +159,13 @@ export function findPgError(error: unknown): PgErrorFields | null {
     if (!current || typeof current !== "object") return null;
     const record = current as Record<string, unknown>;
     const code = record.code;
-    // PostgreSQL SQLSTATEs are exactly five alphanumeric characters. Node's own
-    // errors also use `code`, but as strings like "ECONNRESET" — the shape test
-    // keeps those from being mistaken for a SQLSTATE.
-    if (typeof code === "string" && /^[0-9A-Za-z]{5}$/.test(code)) {
+    // PostgreSQL SQLSTATEs are exactly five alphanumeric characters, but Node's
+    // own syscall codes also use this field (`EPIPE`, `EPERM`). Require a
+    // recognized PostgreSQL class prefix so adapter/process failures are not
+    // relabeled as database writes.
+    if (typeof code === "string" && isPostgresSqlState(code)) {
       return {
-        code,
+        code: code.toUpperCase(),
         detail: readString(record, "detail"),
         constraint: readString(record, "constraint"),
         table: readString(record, "table"),
@@ -151,18 +214,16 @@ export function describeDbError(error: unknown, context?: string): string {
   // is the part that turns an error string into hundreds of kilobytes.
   const failedQuery = /^Failed query:\s*([\s\S]*?)(?:\n\s*params:|$)/.exec(raw);
   if (failedQuery) {
-    const sql = failedQuery[1].replace(/\s+/g, " ").trim();
-    const excerpt =
-      sql.length > DB_ERROR_SQL_EXCERPT_CHARS ? `${sql.slice(0, DB_ERROR_SQL_EXCERPT_CHARS)}…` : sql;
-    parts.push(`query: ${excerpt}`);
+    parts.push(`query: ${compactErrorText(failedQuery[1], DB_ERROR_SQL_EXCERPT_CHARS)}`);
     parts.push("(bind params omitted)");
   } else if (!pg && raw) {
-    parts.push(
-      raw.length > DB_ERROR_MESSAGE_CHARS ? `${raw.slice(0, DB_ERROR_MESSAGE_CHARS)}…` : raw,
-    );
+    parts.push(compactErrorText(raw, DB_ERROR_MESSAGE_CHARS));
   }
 
-  return `${prefix}${parts.length ? parts.join(" | ") : "unknown database error"}`;
+  return compactErrorText(
+    `${prefix}${parts.length ? parts.join(" | ") : "unknown database error"}`,
+    DB_ERROR_DESCRIPTION_CHARS,
+  );
 }
 
 export interface TransientDbRetryOptions {

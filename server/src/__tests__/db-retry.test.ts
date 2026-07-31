@@ -162,6 +162,28 @@ describe("describeDbError", () => {
     expect(described).toContain("relation: heartbeat_runs.id");
   });
 
+  it("normalizes and bounds oversized PostgreSQL fields", () => {
+    const described = describeDbError(
+      drizzleWrapper(
+        Object.assign(new Error("duplicate\nkey value violates\nunique constraint"), {
+          code: "23505",
+          detail: `Key (result_json)=(${("stdout-line\n").repeat(2_000)}) already exists.`,
+          constraint: `heartbeat_runs_${"constraint_".repeat(200)}pkey`,
+          table: "heartbeat_runs",
+          column: "result_json",
+        }),
+      ),
+      "run finalization db write failed",
+    );
+
+    expect(described).toContain("SQLSTATE 23505");
+    expect(described).toContain("detail: Key (result_json)=");
+    expect(described).toContain("constraint: heartbeat_runs_constraint_");
+    expect(described).toContain("relation: heartbeat_runs.result_json");
+    expect(described).not.toContain("\n");
+    expect(described.length).toBeLessThan(1_000);
+  });
+
   it("still truncates a Failed query wrapper that has no attached cause", () => {
     const described = describeDbError(drizzleWrapper());
     expect(described).not.toContain("xxxxx");
@@ -191,9 +213,12 @@ describe("isDbError", () => {
   });
 
   it("does not mistake a Node syscall error code for a SQLSTATE", () => {
-    // `code` is the same field name; only the five-char SQLSTATE shape separates them.
+    // `code` is the same field name; require a PostgreSQL SQLSTATE class so
+    // five-character syscall codes are not relabeled as database writes.
     expect(isDbError(Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }))).toBe(
       false,
     );
+    expect(isDbError(Object.assign(new Error("broken pipe"), { code: "EPIPE" }))).toBe(false);
+    expect(isDbError(Object.assign(new Error("permission denied"), { code: "EPERM" }))).toBe(false);
   });
 });
