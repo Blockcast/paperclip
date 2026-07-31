@@ -67,6 +67,8 @@ Write tools:
 - `paperclipSuggestTasks`
 - `paperclipAskUserQuestions`
 - `paperclipRequestConfirmation`
+- `paperclipRequestCheckboxConfirmation`
+- `paperclipWithdrawInteraction`
 - `paperclipUpsertIssueDocument`
 - `paperclipRestoreIssueDocumentRevision`
 - `paperclipControlIssueWorkspaceServices`
