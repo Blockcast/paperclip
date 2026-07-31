@@ -8,6 +8,7 @@ const mockAgentService = vi.hoisted(() => ({
 }));
 
 const mockNotifyHireApproved = vi.hoisted(() => vi.fn());
+const mockLogActivity = vi.hoisted(() => vi.fn());
 
 vi.mock("../services/agents.js", () => ({
   agentService: vi.fn(() => mockAgentService),
@@ -15,6 +16,10 @@ vi.mock("../services/agents.js", () => ({
 
 vi.mock("../services/hire-hook.js", () => ({
   notifyHireApproved: mockNotifyHireApproved,
+}));
+
+vi.mock("../services/activity-log.js", () => ({
+  logActivity: mockLogActivity,
 }));
 
 type ApprovalRecord = {
@@ -48,12 +53,26 @@ function createDbStub(selectResults: ApprovalRecord[][], updateResults: Approval
   const set = vi.fn(() => ({ where: updateWhere }));
   const update = vi.fn(() => ({ set }));
 
+  const db = { select, update } as Record<string, unknown>;
+  const transaction = vi.fn(async (callback: (tx: unknown) => unknown) => callback(db));
+  db.transaction = transaction;
+
   return {
-    db: { select, update },
+    db,
     selectWhere,
     returning,
+    transaction,
   };
 }
+
+const withdrawalActor = {
+  userId: null,
+  activity: {
+    actorType: "agent" as const,
+    actorId: "requester-1",
+    agentId: "requester-1",
+  },
+};
 
 describe("approvalService resolution idempotency", () => {
   beforeEach(() => {
@@ -61,6 +80,7 @@ describe("approvalService resolution idempotency", () => {
     mockAgentService.activatePendingApproval.mockResolvedValue({ agent: { id: "agent-1" }, activated: true });
     mockAgentService.create.mockResolvedValue({ id: "agent-1" });
     mockAgentService.terminate.mockResolvedValue(undefined);
+    mockLogActivity.mockResolvedValue(undefined);
     mockNotifyHireApproved.mockResolvedValue(undefined);
   });
 
@@ -183,7 +203,7 @@ describe("approvalService.withdraw", () => {
     const dbStub = createDbStub([[createApproval("pending")]], [withdrawn]);
 
     const svc = approvalService(dbStub.db as any);
-    const result = await svc.withdraw("approval-1", "cap already raised past the ask");
+    const result = await svc.withdraw("approval-1", "cap already raised past the ask", withdrawalActor);
 
     expect(result.status).toBe("withdrawn");
     expect(result.decisionNote).toBe("cap already raised past the ask");
@@ -194,7 +214,7 @@ describe("approvalService.withdraw", () => {
     const dbStub = createDbStub([[createApproval("pending")]], [withdrawn]);
 
     const svc = approvalService(dbStub.db as any);
-    const result = await svc.withdraw("approval-1", "moot");
+    const result = await svc.withdraw("approval-1", "moot", withdrawalActor);
 
     expect(result.status).toBe("withdrawn");
     expect(result.status).not.toBe("rejected");
@@ -204,7 +224,7 @@ describe("approvalService.withdraw", () => {
     const dbStub = createDbStub([[createApproval("approved")]], []);
 
     const svc = approvalService(dbStub.db as any);
-    await expect(svc.withdraw("approval-1", "too late")).rejects.toMatchObject({
+    await expect(svc.withdraw("approval-1", "too late", withdrawalActor)).rejects.toMatchObject({
       status: 409,
     });
     // Guard runs before any UPDATE is issued.
@@ -220,7 +240,7 @@ describe("approvalService.withdraw", () => {
     );
 
     const svc = approvalService(dbStub.db as any);
-    await expect(svc.withdraw("approval-1", "racing")).rejects.toMatchObject({
+    await expect(svc.withdraw("approval-1", "racing", withdrawalActor)).rejects.toMatchObject({
       status: 409,
     });
   });
@@ -230,7 +250,7 @@ describe("approvalService.withdraw", () => {
     const dbStub = createDbStub([[createApproval("pending")]], [createApproval("withdrawn")]);
 
     const svc = approvalService(dbStub.db as any);
-    await svc.withdraw("approval-1", "hire no longer needed");
+    await svc.withdraw("approval-1", "hire no longer needed", withdrawalActor);
 
     expect(mockAgentService.terminate).toHaveBeenCalledWith("agent-1");
   });
@@ -240,8 +260,34 @@ describe("approvalService.withdraw", () => {
     const dbStub = createDbStub([[createApproval("pending")]], [withdrawn]);
 
     const svc = approvalService(dbStub.db as any);
-    await svc.withdraw("approval-1", "moot");
+    await svc.withdraw("approval-1", "moot", withdrawalActor);
 
     expect(mockAgentService.terminate).not.toHaveBeenCalled();
+  });
+
+  it("rolls back the withdrawal when pending-agent termination fails", async () => {
+    const dbStub = createDbStub([[createApproval("pending")]], [createApproval("withdrawn")]);
+    mockAgentService.terminate.mockRejectedValue(new Error("api-key revocation failed"));
+
+    const svc = approvalService(dbStub.db as any);
+    await expect(svc.withdraw("approval-1", "hire no longer needed", withdrawalActor)).rejects.toThrow(
+      "api-key revocation failed",
+    );
+
+    expect(dbStub.transaction).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("rolls back the withdrawal and agent cleanup when audit persistence fails", async () => {
+    const dbStub = createDbStub([[createApproval("pending")]], [createApproval("withdrawn")]);
+    mockLogActivity.mockRejectedValue(new Error("activity insert failed"));
+
+    const svc = approvalService(dbStub.db as any);
+    await expect(svc.withdraw("approval-1", "hire no longer needed", withdrawalActor)).rejects.toThrow(
+      "activity insert failed",
+    );
+
+    expect(dbStub.transaction).toHaveBeenCalledTimes(1);
+    expect(mockAgentService.terminate).toHaveBeenCalledWith("agent-1");
   });
 });

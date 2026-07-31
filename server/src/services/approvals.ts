@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { approvalComments, approvals } from "@paperclipai/db";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
+import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
@@ -31,8 +32,8 @@ export function approvalService(db: Db) {
     await builtInAgentService(db).ensure(companyId, sourceBuiltInAgentKey);
   }
 
-  async function getExistingApproval(id: string) {
-    const existing = await db
+  async function getExistingApproval(id: string, dbOrTx: Db = db) {
+    const existing = await dbOrTx
       .select()
       .from(approvals)
       .where(eq(approvals.id, id))
@@ -256,52 +257,67 @@ export function approvalService(db: Db) {
     withdraw: async (
       id: string,
       reason: string,
-      actor: { userId?: string | null } = {},
+      actor: {
+        userId?: string | null;
+        activity: Pick<LogActivityInput, "actorType" | "actorId" | "agentId">;
+      },
     ) => {
-      const existing = await getExistingApproval(id);
-      if (existing.status !== "pending") {
-        throw conflict("Only pending approvals can be withdrawn", {
-          approvalId: id,
-          status: existing.status,
-        });
-      }
-
-      const now = new Date();
-      // Status-guarded so a concurrent board decision wins rather than being
-      // silently overwritten by a withdrawal racing it.
-      const updated = await db
-        .update(approvals)
-        .set({
-          status: "withdrawn",
-          decisionNote: reason,
-          decidedByUserId: actor.userId ?? null,
-          decidedAt: now,
-          updatedAt: now,
-        })
-        .where(and(eq(approvals.id, id), eq(approvals.status, "pending")))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-
-      if (!updated) {
-        const latest = await getExistingApproval(id);
-        throw conflict("Only pending approvals can be withdrawn", {
-          approvalId: id,
-          status: latest.status,
-        });
-      }
-
-      // A hire_agent approval parks its agent in `pending_approval`. Rejecting
-      // terminates it; withdrawing must too, or the agent is stranded frozen
-      // with no remaining approval to decide it.
-      if (updated.type === "hire_agent") {
-        const payload = updated.payload as Record<string, unknown>;
-        const payloadAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
-        if (payloadAgentId) {
-          await agentsSvc.terminate(payloadAgentId);
+      return db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const existing = await getExistingApproval(id, txDb);
+        if (existing.status !== "pending") {
+          throw conflict("Only pending approvals can be withdrawn", {
+            approvalId: id,
+            status: existing.status,
+          });
         }
-      }
 
-      return updated;
+        const now = new Date();
+        // Status-guarded so a concurrent board decision wins rather than being
+        // silently overwritten by a withdrawal racing it.
+        const updated = await txDb
+          .update(approvals)
+          .set({
+            status: "withdrawn",
+            decisionNote: reason,
+            decidedByUserId: actor.userId ?? null,
+            decidedAt: now,
+            updatedAt: now,
+          })
+          .where(and(eq(approvals.id, id), eq(approvals.status, "pending")))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+
+        if (!updated) {
+          const latest = await getExistingApproval(id, txDb);
+          throw conflict("Only pending approvals can be withdrawn", {
+            approvalId: id,
+            status: latest.status,
+          });
+        }
+
+        // A hire_agent approval parks its agent in `pending_approval`. Rejecting
+        // terminates it; withdrawing must too, or the agent is stranded frozen
+        // with no remaining approval to decide it.
+        if (updated.type === "hire_agent") {
+          const payload = updated.payload as Record<string, unknown>;
+          const payloadAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
+          if (payloadAgentId) {
+            await agentService(txDb).terminate(payloadAgentId);
+          }
+        }
+
+        await logActivity(txDb, {
+          companyId: updated.companyId,
+          ...actor.activity,
+          action: "approval.withdrawn",
+          entityType: "approval",
+          entityId: updated.id,
+          details: { type: updated.type, reason },
+        });
+
+        return updated;
+      });
     },
 
     listComments: async (approvalId: string) => {

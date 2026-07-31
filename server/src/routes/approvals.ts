@@ -348,17 +348,11 @@ export function approvalRoutes(
     const reason = req.body.reason as string;
     const approval = await svc.withdraw(id, reason, {
       userId: actor.actorType === "user" ? actor.actorId : null,
-    });
-
-    await logActivity(db, {
-      companyId: approval.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      action: "approval.withdrawn",
-      entityType: "approval",
-      entityId: approval.id,
-      details: { type: approval.type, reason },
+      activity: {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+      },
     });
 
     res.json(redactApprovalPayload(approval));

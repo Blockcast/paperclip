@@ -138,7 +138,14 @@ describe("POST /approvals/:id/withdraw", () => {
     expect(mockApprovalService.withdraw).toHaveBeenCalledWith(
       "approval-1",
       "cap already raised past the ask",
-      { userId: null },
+      {
+        userId: null,
+        activity: {
+          actorType: "agent",
+          actorId: REQUESTER_AGENT_ID,
+          agentId: REQUESTER_AGENT_ID,
+        },
+      },
     );
   }, 15000);
 
@@ -168,6 +175,11 @@ describe("POST /approvals/:id/withdraw", () => {
     expect(res.status).toBe(200);
     expect(mockApprovalService.withdraw).toHaveBeenCalledWith("approval-1", "superseded", {
       userId: "user-1",
+      activity: {
+        actorType: "user",
+        actorId: "user-1",
+        agentId: null,
+      },
     });
   }, 15000);
 
@@ -199,21 +211,18 @@ describe("POST /approvals/:id/withdraw", () => {
       .post("/api/approvals/approval-1/withdraw")
       .send({ reason: "obsolete ask" });
 
-    expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
+    expect(mockApprovalService.withdraw).toHaveBeenCalledWith(
+      "approval-1",
+      "obsolete ask",
       expect.objectContaining({
-        companyId: "company-1",
-        action: "approval.withdrawn",
-        entityType: "approval",
-        entityId: "approval-1",
-        actorType: "agent",
-        agentId: REQUESTER_AGENT_ID,
-        details: expect.objectContaining({
-          type: "budget_override_required",
-          reason: "obsolete ask",
-        }),
+        activity: {
+          actorType: "agent",
+          actorId: REQUESTER_AGENT_ID,
+          agentId: REQUESTER_AGENT_ID,
+        },
       }),
     );
+    expect(mockLogActivity).not.toHaveBeenCalled();
   }, 15000);
 
   it("requires a non-empty reason", async () => {
@@ -244,7 +253,14 @@ describe("POST /approvals/:id/withdraw", () => {
     expect(mockApprovalService.withdraw).toHaveBeenCalledWith(
       "approval-1",
       "superseded by BLO-18967",
-      { userId: null },
+      {
+        userId: null,
+        activity: {
+          actorType: "agent",
+          actorId: REQUESTER_AGENT_ID,
+          agentId: REQUESTER_AGENT_ID,
+        },
+      },
     );
   }, 15000);
 
