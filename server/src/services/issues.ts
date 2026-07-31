@@ -1902,6 +1902,25 @@ function preserveDurableLandingEvidence<T extends { allDetected?: unknown }>(
  * describe ephemeral infrastructure rather than a reviewable artifact.
  */
 const DURABLE_ARTIFACT_WORK_PRODUCT_TYPES = ["artifact", "document"] as const;
+const DURABLE_ARTIFACT_WORK_PRODUCT_METADATA_LOCATOR_KEYS = [
+  "attachmentId",
+  "contentPath",
+  "openPath",
+  "downloadPath",
+  "documentId",
+  "documentKey",
+] as const;
+
+function hasInspectableWorkProductLocator(): SQL {
+  return or(
+    sql`${issueWorkProducts.url} ~ '[^[:space:]]'`,
+    sql`${issueWorkProducts.externalId} ~ '[^[:space:]]'`,
+    sql`jsonb_typeof(${issueWorkProducts.metadata}->'resourceRef') = 'object'`,
+    ...DURABLE_ARTIFACT_WORK_PRODUCT_METADATA_LOCATOR_KEYS.map(
+      (key) => sql`${issueWorkProducts.metadata}->>${key} ~ '[^[:space:]]'`,
+    ),
+  )!;
+}
 
 /**
  * Document keys that must NOT satisfy the done gate.
@@ -1923,9 +1942,10 @@ const DONE_GATE_NON_QUALIFYING_DOCUMENT_KEYS: readonly string[] = [
  * See the docblock in `done-gate.ts` for why this exists and why it is not a
  * hole in the gate. Two qualifying shapes, both requiring run attribution:
  *
- *  - an issue document (excluding plan/system keys) with a non-empty body and
- *    at least one revision stamped `createdByRunId`;
- *  - an `artifact`/`document` work product stamped `createdByRunId`.
+ *  - an issue document (excluding plan/system keys) whose latest revision has a
+ *    non-empty body and is stamped `createdByRunId`;
+ *  - an active, inspectable `artifact`/`document` work product stamped
+ *    `createdByRunId`.
  *
  * `createdByRunId` is written from the authenticated actor's run context in the
  * route layer, never from the request body, so it cannot be forged by a client.
@@ -1939,7 +1959,7 @@ async function fetchDurableArtifactEvidence(dbOrTx: any, issueId: string): Promi
       .select({ key: issueDocuments.key })
       .from(issueDocuments)
       .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
-      .innerJoin(documentRevisions, eq(documentRevisions.documentId, documents.id))
+      .innerJoin(documentRevisions, eq(documentRevisions.id, documents.latestRevisionId))
       .where(
         and(
           eq(issueDocuments.issueId, issueId),
@@ -1953,7 +1973,7 @@ async function fetchDurableArtifactEvidence(dbOrTx: any, issueId: string): Promi
           // not a minimum length beyond blank either: an arbitrary threshold
           // invites padding, and the substantive check is a reviewer opening
           // the artifact.
-          sql`${documents.latestBody} ~ '[^[:space:]]'`,
+          sql`${documentRevisions.body} ~ '[^[:space:]]'`,
         ),
       )
       .limit(1),
@@ -1964,7 +1984,9 @@ async function fetchDurableArtifactEvidence(dbOrTx: any, issueId: string): Promi
         and(
           eq(issueWorkProducts.issueId, issueId),
           inArray(issueWorkProducts.type, [...DURABLE_ARTIFACT_WORK_PRODUCT_TYPES]),
+          eq(issueWorkProducts.status, "active"),
           isNotNull(issueWorkProducts.createdByRunId),
+          hasInspectableWorkProductLocator(),
         ),
       )
       .limit(1),

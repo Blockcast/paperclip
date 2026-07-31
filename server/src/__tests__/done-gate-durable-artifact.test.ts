@@ -261,6 +261,37 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
     expect(persisted.executionRunId).toBeNull();
   });
 
+  it("does not accept an old run-attributed document revision when the latest revision is runless", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    const { documentId } = await addRunAttributedDocument(companyId, issueId, agentId, runId);
+    const latestRevisionId = randomUUID();
+    await db.insert(documentRevisions).values({
+      id: latestRevisionId,
+      companyId,
+      documentId,
+      revisionNumber: 2,
+      title: "Findings",
+      format: "markdown",
+      body: "## Findings\nA board-side edit replaced the run-authored version.",
+      createdByAgentId: agentId,
+      createdByRunId: null,
+    });
+    await db
+      .update(documents)
+      .set({
+        latestBody: "## Findings\nA board-side edit replaced the run-authored version.",
+        latestRevisionId,
+        latestRevisionNumber: 2,
+      })
+      .where(eq(documents.id, documentId));
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(422);
+    expect(response.body.details).toMatchObject({ reason: "no_execution_run_and_no_pr_evidence" });
+  });
+
   // (c) Regression guard for the original gate behaviour.
   it("accepts a close when an execution run is still held, with no artifact and no pr-link", async () => {
     await enableDoneExecutionGate();
@@ -284,8 +315,37 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
       type: "artifact",
       provider: "paperclip",
       title: "Timeout archaeology dump",
+      url: "https://paperclip.blockcast.net/BLO/artifacts/timeout-archaeology",
       status: "active",
       createdByRunId: runId,
+    });
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(200);
+  });
+
+  it("accepts a close backed by an attachment-backed artifact work product", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    const attachmentId = randomUUID();
+    await db.insert(issueWorkProducts).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      type: "artifact",
+      provider: "paperclip",
+      title: "Timeout archaeology dump",
+      status: "active",
+      createdByRunId: runId,
+      metadata: {
+        attachmentId,
+        contentType: "text/markdown",
+        byteSize: 128,
+        contentPath: `/api/attachments/${attachmentId}/content`,
+        openPath: `/api/attachments/${attachmentId}/content`,
+        downloadPath: `/api/attachments/${attachmentId}/content?download=1`,
+      },
     });
 
     const response = await patchToDone(agentId, companyId, runId, issueId);
@@ -349,8 +409,50 @@ describeEmbeddedPostgres("PATCH /issues/:id done-execution gate — durable arti
     // nothing. Must be indistinguishable from empty.
     await enableDoneExecutionGate();
     const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
-    const { documentId } = await addRunAttributedDocument(companyId, issueId, agentId, runId);
+    const { documentId, revisionId } = await addRunAttributedDocument(companyId, issueId, agentId, runId);
     await db.update(documents).set({ latestBody: "   \n\t  \n" }).where(eq(documents.id, documentId));
+    await db.update(documentRevisions).set({ body: "   \n\t  \n" }).where(eq(documentRevisions.id, revisionId));
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(422);
+    expect(response.body.details).toMatchObject({ reason: "no_execution_run_and_no_pr_evidence" });
+  });
+
+  it("does not accept an active title-only artifact work product", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    await db.insert(issueWorkProducts).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      type: "artifact",
+      provider: "paperclip",
+      title: "Timeout archaeology dump",
+      status: "active",
+      createdByRunId: runId,
+    });
+
+    const response = await patchToDone(agentId, companyId, runId, issueId);
+
+    expect(response.status).toBe(422);
+    expect(response.body.details).toMatchObject({ reason: "no_execution_run_and_no_pr_evidence" });
+  });
+
+  it("does not accept an inactive artifact work product, even with an inspectable locator", async () => {
+    await enableDoneExecutionGate();
+    const { companyId, issueId, agentId, runId } = await seedInReviewIssue();
+    await db.insert(issueWorkProducts).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      type: "artifact",
+      provider: "paperclip",
+      title: "Timeout archaeology dump",
+      url: "https://paperclip.blockcast.net/BLO/artifacts/timeout-archaeology",
+      status: "archived",
+      createdByRunId: runId,
+    });
 
     const response = await patchToDone(agentId, companyId, runId, issueId);
 
