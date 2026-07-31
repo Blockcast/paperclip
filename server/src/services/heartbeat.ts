@@ -621,6 +621,11 @@ function readHeartbeatRunErrorFamily(
   if (run.errorCode === "codex_transient_upstream" || run.errorCode === "claude_transient_upstream") {
     return "transient_upstream";
   }
+  // BLO-18285: the server-side classification of a hint-less provider 503/529
+  // on the k8s adapters, which never run the local adapters' transient parser.
+  if (run.errorCode === "provider_transient_upstream") {
+    return "transient_upstream";
+  }
   if (run.errorCode === "k8s_concurrent_run_blocked") {
     return "capacity_blocked";
   }
@@ -2964,6 +2969,70 @@ export function isRateLimitExhausted(
 
 function looksLikeRetryableDeadlineExceeded(value: unknown): boolean {
   return typeof value === "string" && /(?:deadline[_\s-]*exceeded|upstream request timeout|gateway timeout|504\b)/i.test(value);
+}
+
+// BLO-18285: a transient provider fault that carries NO reset hint — gateway
+// 503 / "Service temporarily unavailable" / `server_error` / 529 overloaded.
+// There is no retry-after or capacity-reset horizon to honor, so the fix is
+// the retry horizon itself: the in-process SDK burns all 10 attempts in ~4
+// minutes, which is far short of a real gateway brownout (tens of minutes to
+// hours). Untagged, such a run finalizes as a plain `adapter_failed` with a
+// null errorFamily, so readTransientRecoveryContractFromRun returns null,
+// shouldScheduleAutomaticRunRetry returns false, no `scheduled_retry` row is
+// written, `hasActiveExecutionPath` finds nothing on the next sweep, and the
+// issue is escalated to `stranded_assigned_issue` and flipped to `blocked`.
+// (Live proof: BLO-18138 run 05d8c03e — 10/10 retries, error_status 503,
+// error "server_error", no hint, permanent strand.)
+//
+// The local adapters already classify this shape (claude-local's
+// CLAUDE_TRANSIENT_UPSTREAM_RE, codex-local's CODEX_TRANSIENT_UPSTREAM_RE),
+// but the k8s adapters do not run that parser server-side, so on claude_k8s /
+// opencode_k8s the fault reaches heartbeat finalization untagged. Recognizing
+// it here tags it `transient_upstream`, which routes it into the bounded
+// exponential curve (2m/10m/30m/2h ≈ 2h42m) and parks the issue in an explicit
+// `scheduled_retry` waiting posture that the strand sweep skips.
+//
+// Deliberately narrower than the adapter regexes: rate-limit / 429 / quota text
+// is excluded because isRateLimitExhausted already owns that family, and its
+// flat 90s curve is the correct schedule there (the ccrotate gate, not backoff,
+// decides when a closed account window reopens). Only no-hint server-fault
+// shapes land here.
+const TRANSIENT_UPSTREAM_STATUS_CODES = new Set(["503", "529"]);
+const TRANSIENT_UPSTREAM_TEXT_PATTERNS = [
+  /API Error:\s*(?:503|529)\b/i,
+  /service\s+(?:is\s+)?(?:temporarily\s+)?unavailable/i,
+  /temporarily\s+unavailable/i,
+  /server\s+overloaded/i,
+  /overloaded_error/i,
+  /\bserver_error\b/i,
+];
+
+function looksLikeTransientUpstreamText(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  return TRANSIENT_UPSTREAM_TEXT_PATTERNS.some((re) => re.test(value));
+}
+
+export function isHintlessTransientUpstreamFault(
+  resultJson: Record<string, unknown> | null | undefined,
+  opts?: { errorMessage?: string | null },
+): boolean {
+  // Two status surfaces: the Claude SDK's final result event uses
+  // `api_error_status`, while the per-attempt `api_retry` events that precede
+  // an exhausted retry budget use `error_status` — the latter is the field the
+  // BLO-18138 run actually carried, so matching only the former misses it.
+  for (const key of ["api_error_status", "error_status"] as const) {
+    const status = resultJson?.[key];
+    if (status == null) continue;
+    if (TRANSIENT_UPSTREAM_STATUS_CODES.has(String(status))) return true;
+  }
+
+  if (resultJson) {
+    for (const key of ["result", "message", "error", "summary"] as const) {
+      if (looksLikeTransientUpstreamText(resultJson[key])) return true;
+    }
+  }
+
+  return looksLikeTransientUpstreamText(opts?.errorMessage);
 }
 
 function retryNotBeforeDelayMs(value: unknown, now = Date.now()): number | null {
@@ -19481,6 +19550,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       } else if (outcome === "failed" && looksRateLimited) {
         rateLimitExhaustedOverride = true;
       }
+      // BLO-18285: hint-less provider 503/529. Only ever downgrades an already
+      // -failed run — unlike the rate-limit overrides above it never flips
+      // `succeeded` to `failed`, because a run that finished its work while a
+      // 503 merely appeared in tool output did do the work and must not be
+      // re-dispatched. Yields to the rate-limit families (429 owns its own flat
+      // curve) and to any adapter that already tagged a family itself, so the
+      // local adapters' richer verdict always wins.
+      const transientUpstreamOverride =
+        outcome === "failed" &&
+        !rateLimitExhaustedOverride &&
+        !providerThrottledNoProgressOverride &&
+        !adapterResult.errorFamily &&
+        isHintlessTransientUpstreamFault(adapterResult.resultJson, {
+          errorMessage: adapterResult.errorMessage,
+        });
       let prReviewCompletionEvidence = outcome === "succeeded"
         ? evaluatePrReviewCompletionEvidence(context, {
           resultJson: adapterResult.resultJson ?? null,
@@ -19590,6 +19674,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? "provider_throttled_no_progress"
           : prReviewIncompleteOverride
             ? prReviewIncompleteOverride.errorCode
+            // BLO-18285: name the fault only where the code would otherwise be
+            // the anonymous "adapter_failed" fallback. A specific adapter code
+            // (or a silent-failure verdict) is the more precise diagnosis and
+            // is left intact — the errorFamily tag below is what actually
+            // drives the retry, so the schedule is unaffected either way.
+            : transientUpstreamOverride && !adapterResult.errorCode && !silentFailureMessage
+              ? "provider_transient_upstream"
             : outcome === "timed_out"
           ? "timeout"
           : outcome === "cancelled"
@@ -19691,8 +19782,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               // right schedule curve. rate_limit_exhausted -> flat 90s retry
               // (gate decides if pool has capacity); generic adapter-reported
               // transient_upstream -> exponential backoff.
+              // BLO-18285: a hint-less provider 503/529 on a k8s adapter also
+              // gets transient_upstream, so it takes the exponential curve
+              // (2m/10m/30m/2h) instead of finalizing untagged and stranding.
               errorFamily: rateLimitExhaustedOverride || providerThrottledNoProgressOverride
                 ? "rate_limit_exhausted"
+                : transientUpstreamOverride
+                  ? "transient_upstream"
                 : (adapterResult.errorFamily ?? null),
               retryNotBefore: adapterResult.retryNotBefore ?? null,
               ...(providerThrottledNoProgressOverride ? { providerThrottleNoProgress: true } : {}),
