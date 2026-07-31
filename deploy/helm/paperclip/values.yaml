@@ -158,9 +158,9 @@ secret:
 
 # -- GitHub App creds for server-side installation-token minting. Lets the API
 # authoritatively verify (via the GitHub API) that a PR-review run actually left
-# a review/comment before flagging it `pr_review_output_missing` (BLO-10448).
-# Disabled by default — the verification is inert without it and runs fall back
-# to the text heuristic. Enable on deployments where the referenced secret exists.
+# a review/comment before completing it (BLO-10448). Deployments that run the PR
+# reviewer must enable this; missing credentials fail review completion closed.
+# Disabled by default for deployments that do not use the reviewer workflow.
 githubApp:
   # -- Mount the GitHub App creds into the API env and enable GitHub-verified PR-review evidence.
   enabled: false
@@ -170,7 +170,7 @@ githubApp:
   appIdKey: app_id
   installationIdKey: installation_id
   privateKeyKey: private_key.pem
-  # -- GitHub login of the reviewer bot used to filter reviews/comments. Empty -> server default ("allyblockcast[bot]").
+  # -- GitHub App login used to filter reviews/comments. Must be `<slug>[bot]` or `app/<slug>`; bare user logins are rejected. Empty -> server default ("allyblockcast[bot]").
   reviewerBotLogin: ""
 
 # -- Pod spec knobs.

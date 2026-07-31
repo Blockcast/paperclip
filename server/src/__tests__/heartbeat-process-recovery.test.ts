@@ -1640,7 +1640,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .update(heartbeatRuns)
       .set({
         resultJson: {
-          summary: "No locally recorded review outcome is available.",
+          summary: `Posted the consolidated Ally review on #1648 at ${headSha}.`,
         },
       })
       .where(eq(heartbeatRuns.id, runId));
@@ -1733,13 +1733,66 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(await heartbeat.getRun(runId)).toMatchObject({
       status: "failed",
-      errorCode: "job_missing",
+      errorCode: "pr_review_output_missing",
     });
     const retries = await db
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.retryOfRunId, runId));
     expect(retries).toHaveLength(1);
+  });
+
+  async function recoverClaimedReviewWithUnavailableVerification(kind: "result" | "throw") {
+    const jobName = `agent-opencode-review-verification-${kind}`;
+    const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+        githubRepoFullName: "Blockcast/onprem-k8s",
+        githubPrNumber: 1648,
+        githubHeadSha: headSha,
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    await db
+      .update(heartbeatRuns)
+      .set({ resultJson: { summary: `Posted the consolidated Ally review on #1648 at ${headSha}.` } })
+      .where(eq(heartbeatRuns.id, runId));
+    if (kind === "throw") {
+      mockGithubHasReviewerEvidenceForPr.mockRejectedValueOnce(new Error("GitHub unavailable"));
+    } else {
+      mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ error: "reviews_http_503" });
+    }
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    return heartbeat.getRun(runId);
+  }
+
+  it("keeps a missing-Job review claim fail-closed when GitHub returns an error", async () => {
+    await expect(recoverClaimedReviewWithUnavailableVerification("result")).resolves.toMatchObject({
+      status: "failed",
+      errorCode: "pr_review_verification_unavailable",
+      error: expect.stringContaining("reviews_http_503"),
+    });
+  });
+
+  it("keeps a missing-Job review claim fail-closed when GitHub verification throws", async () => {
+    await expect(recoverClaimedReviewWithUnavailableVerification("throw")).resolves.toMatchObject({
+      status: "failed",
+      errorCode: "pr_review_verification_unavailable",
+      error: expect.stringContaining("verification_threw"),
+    });
   });
 
   it("fails and retries once when a PR-review request comment is not outcome evidence", async () => {
@@ -1782,7 +1835,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledTimes(1);
     expect(await heartbeat.getRun(runId)).toMatchObject({
       status: "failed",
-      errorCode: "job_missing",
+      errorCode: "pr_review_output_missing",
     });
     const retries = await db
       .select()
@@ -2994,7 +3047,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(settledRun?.stdoutExcerpt ?? "").not.toContain("[paperclip] keepalive");
   });
 
-  it("fails a completed PR-review run whose local claim has no trusted-App evidence", async () => {
+  async function settleClaimedPrReview(
+    verification:
+      | { kind: "result"; value: { found: true; via: "review" | "comment" } | { found: false } | { error: string } }
+      | { kind: "throw" },
+  ) {
     const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
     const summary = `Posted the consolidated Ally review on #1648 at ${headSha}.`;
     mockAdapterExecute.mockResolvedValueOnce({
@@ -3007,7 +3064,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       provider: "test",
       model: "test-model",
     });
-    mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ found: false });
+    if (verification.kind === "throw") {
+      mockGithubHasReviewerEvidenceForPr.mockRejectedValueOnce(new Error("GitHub unavailable"));
+    } else {
+      mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce(verification.value);
+    }
     const { runId } = await seedQueuedIssueRunFixture();
     await db
       .update(heartbeatRuns)
@@ -3025,6 +3086,32 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await heartbeat.resumeQueuedRuns();
     const settledRun = await waitForRunToSettle(heartbeat, runId);
 
+    return { headSha, runId, settledRun };
+  }
+
+  it("completes a claimed PR review only after trusted exact-head App evidence is found", async () => {
+    const { headSha, settledRun } = await settleClaimedPrReview({
+      kind: "result",
+      value: { found: true, via: "comment" },
+    });
+
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledWith({
+      repoFullName: "Blockcast/onprem-k8s",
+      prNumber: 1648,
+      headSha,
+    });
+    expect(settledRun).toMatchObject({
+      status: "succeeded",
+      errorCode: null,
+    });
+  });
+
+  it("fails a completed PR-review run whose local claim has no trusted-App evidence", async () => {
+    const { headSha, settledRun } = await settleClaimedPrReview({
+      kind: "result",
+      value: { found: false },
+    });
+
     expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledWith({
       repoFullName: "Blockcast/onprem-k8s",
       prNumber: 1648,
@@ -3033,6 +3120,29 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(settledRun).toMatchObject({
       status: "failed",
       errorCode: "pr_review_output_missing",
+    });
+  });
+
+  it("classifies a GitHub evidence API error separately from missing review output", async () => {
+    const { settledRun } = await settleClaimedPrReview({
+      kind: "result",
+      value: { error: "reviews_http_503" },
+    });
+
+    expect(settledRun).toMatchObject({
+      status: "failed",
+      errorCode: "pr_review_verification_unavailable",
+      error: expect.stringContaining("reviews_http_503"),
+    });
+  });
+
+  it("classifies a thrown GitHub evidence check separately from missing review output", async () => {
+    const { settledRun } = await settleClaimedPrReview({ kind: "throw" });
+
+    expect(settledRun).toMatchObject({
+      status: "failed",
+      errorCode: "pr_review_verification_unavailable",
+      error: expect.stringContaining("verification_threw"),
     });
   });
 

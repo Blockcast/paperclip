@@ -18,6 +18,7 @@ import {
   mintAppJwt,
   getInstallationToken,
   githubHasReviewerEvidenceForPr,
+  githubReviewerAppSlug,
   githubReviewerIdentityMatches,
   normalizeGithubLogin,
   _resetInstallationTokenCache,
@@ -70,6 +71,13 @@ describe("normalizeGithubLogin", () => {
 });
 
 describe("githubReviewerIdentityMatches", () => {
+  it("extracts only unambiguous App-form reviewer configuration", () => {
+    expect(githubReviewerAppSlug("allyblockcast[bot]")).toBe("allyblockcast");
+    expect(githubReviewerAppSlug("app/AllyBlockcast")).toBe("allyblockcast");
+    expect(githubReviewerAppSlug("allyblockcast")).toBeNull();
+    expect(githubReviewerAppSlug("")).toBeNull();
+  });
+
   it("accepts the App API variants but rejects the same-slug user seat", () => {
     expect(githubReviewerIdentityMatches("allyblockcast[bot]", "allyblockcast[bot]")).toBe(true);
     expect(githubReviewerIdentityMatches("app/AllyBlockcast", "allyblockcast[bot]")).toBe(true);
@@ -173,6 +181,18 @@ describe("githubHasReviewerEvidenceForPr", () => {
     await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
       error: "no_token",
     });
+  });
+
+  it("rejects a bare-user reviewer configuration before querying GitHub", async () => {
+    setCreds();
+    h.cfg.prReviewerBotLogin = "allyblockcast";
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      error: "bot_login_not_app_form",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("finds a bot review at the exact head commit", async () => {

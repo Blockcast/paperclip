@@ -13,9 +13,9 @@
  * tokens** from the GitHub App creds (`paperclip-github-app-creds`, surfaced via
  * GITHUB_APP_ID / GITHUB_APP_INSTALLATION_ID / GITHUB_APP_PRIVATE_KEY). Uses only
  * node:crypto for the RS256 App JWT — no extra dependency. When creds are absent
- * every entrypoint degrades to null/`{error}`, so callers fall back to the
- * pre-existing heuristic result (the feature is purely additive and can only
- * rescue a false `missing`, never downgrade a success).
+ * every entrypoint degrades to null/`{error}`. Callers distinguish an
+ * unavailable verification service from a definitive missing-evidence result,
+ * but neither outcome can authorize a locally claimed review.
  */
 import { createSign } from "node:crypto";
 
@@ -55,6 +55,18 @@ function exactGithubLogin(login: string): string {
   return login.trim().toLowerCase().replace(/^@/, "");
 }
 
+/** Return the slug from an unambiguous GitHub App login, or null for a user login. */
+export function githubReviewerAppSlug(configuredLogin: string): string | null {
+  const configured = exactGithubLogin(configuredLogin);
+  if (configured.startsWith("app/")) {
+    return configured.slice("app/".length) || null;
+  }
+  if (configured.endsWith("[bot]")) {
+    return configured.slice(0, -"[bot]".length) || null;
+  }
+  return null;
+}
+
 /**
  * Match only the configured GitHub App identity. GitHub can expose that App as
  * either `<slug>[bot]` or `app/<slug>` depending on the API surface, but the
@@ -63,19 +75,11 @@ function exactGithubLogin(login: string): string {
  */
 export function githubReviewerIdentityMatches(login: string, configuredLogin: string): boolean {
   const candidate = exactGithubLogin(login);
-  const configured = exactGithubLogin(configuredLogin);
-  if (!candidate || !configured) return false;
+  const appSlug = githubReviewerAppSlug(configuredLogin);
+  if (!candidate || !appSlug) return false;
 
-  let appSlug: string;
-  if (configured.startsWith("app/")) {
-    appSlug = configured.slice("app/".length);
-  } else if (configured.endsWith("[bot]")) {
-    appSlug = configured.slice(0, -"[bot]".length);
-  } else {
-    return false;
-  }
-  if (!appSlug) return false;
-
+  // GitHub usernames cannot contain `[`/`]` or `/`, so a user account cannot
+  // register either accepted App representation and collide with this match.
   return candidate === `${appSlug}[bot]` || candidate === `app/${appSlug}`;
 }
 
@@ -237,10 +241,10 @@ function consolidatedReviewHead(body: string): string | null {
  * of (or "identical" to) the wake head; "behind"/"diverged" are rejected, so a
  * genuinely-unreviewed newer head still flags. Bounded by MAX_AT_OR_NEWER_COMPARES.
  *
- * Returns `{error}` on missing creds / token / any non-OK or failed reviews/
- * comments fetch so the caller can fall back to the heuristic verdict. (A failed
- * `compare` only skips that candidate — the second pass is purely additive and can
- * never downgrade a verdict.)
+ * Returns `{error}` on invalid configuration, missing creds/token, or any non-OK
+ * or failed reviews/comments fetch. Callers fail completion closed with a
+ * retryable verification-unavailable error. A failed `compare` only skips that
+ * candidate because the second pass is additive and cannot downgrade a verdict.
  */
 export async function githubHasReviewerEvidenceForPr(input: {
   repoFullName: string;
@@ -250,6 +254,7 @@ export async function githubHasReviewerEvidenceForPr(input: {
   const cfg = loadConfig();
   const botLogin = cfg.prReviewerBotLogin.trim();
   if (!botLogin) return { error: "no_bot_login" };
+  if (!githubReviewerAppSlug(botLogin)) return { error: "bot_login_not_app_form" };
 
   const token = await getInstallationToken();
   if (!token) return { error: "no_token" };
