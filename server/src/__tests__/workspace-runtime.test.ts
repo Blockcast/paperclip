@@ -5073,13 +5073,17 @@ describe("executeProcess (timeout classification)", () => {
     }
   }, 15_000);
 
-  it("keeps SIGKILL armed when the group leader exits after timeout but a descendant ignores SIGTERM", async () => {
-    // The timeout path first sends SIGTERM, then escalates to SIGKILL. If the
-    // direct child exits after SIGTERM, that must not cancel the pending SIGKILL:
-    // a descendant may have ignored SIGTERM and still be running against the
-    // workspace after the drain-grace fallback resolves this call.
+  it("reaps a TERM-resistant descendant before the caller can start its next attempt", async () => {
+    // The timeout path sends SIGTERM, then escalates to SIGKILL. If the group
+    // leader exits on SIGTERM but a descendant ignores it, that descendant must
+    // be dead by the time this call resolves -- `inspectGitSubmoduleReadiness`
+    // retries after a backoff (WORKSPACE_SUBMODULE_INSPECT_RETRY_DELAY_MS, 1s)
+    // that is shorter than the remaining kill grace, so leaving the SIGKILL
+    // merely *scheduled* would overlap attempt N+1 with a straggler still
+    // walking the same checkout.
     const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reap-ignore-term-"));
     const markerPath = path.join(markerDir, "survived");
+    const pidPath = path.join(markerDir, "descendant.pid");
     const started = Date.now();
 
     try {
@@ -5088,7 +5092,7 @@ describe("executeProcess (timeout classification)", () => {
         args: [
           "-c",
           [
-            `sh -c 'trap "" TERM; sleep 7; : > ${JSON.stringify(markerPath)}' &`,
+            `sh -c 'trap "" TERM; echo $$ > ${JSON.stringify(pidPath)}; sleep 7; : > ${JSON.stringify(markerPath)}' &`,
             `trap "exit 0" TERM`,
             "wait",
           ].join("\n"),
@@ -5100,8 +5104,27 @@ describe("executeProcess (timeout classification)", () => {
       expect(result.timedOut).toBe(true);
       expect(Date.now() - started).toBeLessThan(5_000);
 
-      // Wait beyond the descendant's marker delay. The marker appears only if the
-      // SIGKILL escalation was canceled after the group leader exited.
+      const descendantPid = Number((await fs.readFile(pidPath, "utf8")).trim());
+      expect(Number.isInteger(descendantPid)).toBe(true);
+
+      // SIGKILL is issued before we resolve, but reaping is the kernel's to
+      // schedule -- poll rather than asserting on the same tick. The bound is
+      // well inside the 1s retry backoff, and far short of the ~2.7s the
+      // descendant survived when the escalation was left on the clock.
+      const deadline = Date.now() + 750;
+      let alive = true;
+      while (Date.now() < deadline) {
+        try {
+          process.kill(descendantPid, 0);
+        } catch {
+          alive = false;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(alive).toBe(false);
+
+      // Belt and braces: the descendant never reached its own post-sleep write.
       await new Promise((resolve) => setTimeout(resolve, 7_500));
       await expect(fs.stat(markerPath)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {

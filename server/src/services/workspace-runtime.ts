@@ -731,11 +731,28 @@ async function executeProcess(input: {
       killTimer = null;
       drainTimer = null;
     };
-    const clearNonKillTimers = () => {
-      if (timeoutTimer) globalThis.clearTimeout(timeoutTimer);
-      if (drainTimer) globalThis.clearTimeout(drainTimer);
-      timeoutTimer = null;
-      drainTimer = null;
+    /**
+     * Finish the SIGTERM -> SIGKILL escalation now instead of leaving it on the
+     * clock.
+     *
+     * A timed-out call must not hand control back while the group-wide SIGKILL is
+     * still only *scheduled*: the caller retries after a backoff shorter than the
+     * remaining kill grace, so a descendant that ignored SIGTERM would still be
+     * walking the same checkout when attempt N+1 spawns against it -- overlapping
+     * git trees and extra metadata load during exactly the stall this is meant to
+     * contain. Escalating here keeps "settled as timed out" coupled to "the tree
+     * has been killed".
+     *
+     * SIGKILL is *issued*, not awaited: a process wedged in uninterruptible IO on
+     * a stalled mount dies only once that IO returns, and waiting on it would
+     * reintroduce the unbounded hang this whole path exists to bound.
+     */
+    const escalateTermination = () => {
+      if (killTimer) {
+        globalThis.clearTimeout(killTimer);
+        killTimer = null;
+      }
+      terminateChildProcess(child, "SIGKILL");
     };
     const cleanupCapturedStreams = (destroy: boolean) => {
       child.stdout?.off("data", onStdoutData);
@@ -745,15 +762,12 @@ async function executeProcess(input: {
         child.stderr?.destroy();
       }
     };
-    const settle = (code: number | null, options?: { destroyStreams?: boolean; keepKillTimer?: boolean }) => {
+    const settle = (code: number | null, options?: { destroyStreams?: boolean }) => {
       if (settled) return;
       settled = true;
+      if (timedOut) escalateTermination();
       cleanupCapturedStreams(options?.destroyStreams ?? false);
-      if (options?.keepKillTimer) {
-        clearNonKillTimers();
-      } else {
-        clearTimers();
-      }
+      clearTimers();
       resolve({ stdout, stderr, code, timedOut });
     };
 
@@ -777,6 +791,7 @@ async function executeProcess(input: {
     child.on("error", (error) => {
       if (settled) return;
       settled = true;
+      if (timedOut) escalateTermination();
       cleanupCapturedStreams(true);
       clearTimers();
       reject(error);
@@ -795,21 +810,19 @@ async function executeProcess(input: {
       if (settled) return;
       if (timeoutTimer) globalThis.clearTimeout(timeoutTimer);
       timeoutTimer = null;
-      if (!timedOut && killTimer) {
-        globalThis.clearTimeout(killTimer);
-        killTimer = null;
-      }
+      // No kill-timer bookkeeping here: `killTimer` only exists once `timedOut`
+      // is set, and `settle` owns finishing that escalation.
       // Bound the wait for the remaining stdio. Without this a lingering
       // descendant means `close` never arrives and the promise never settles --
       // the timeout budget stops being enforced at all, which is a worse
       // failure than the one it was meant to catch.
       drainTimer ??= globalThis.setTimeout(
-        () => settle(code, { destroyStreams: true, keepKillTimer: timedOut }),
+        () => settle(code, { destroyStreams: true }),
         PROCESS_STDIO_DRAIN_GRACE_MS,
       );
     });
     child.on("close", (code) => {
-      settle(code, { keepKillTimer: timedOut });
+      settle(code);
     });
   });
   const stdout = proc.stdout.finish();
