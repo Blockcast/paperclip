@@ -39,6 +39,7 @@ import {
   resolveWorkspaceRuntimeReadinessTimeoutSec,
   resolveShell,
   sanitizeRuntimeServiceBaseEnv,
+  setProcessGroupLivenessProbeForTests,
   setSubmoduleInspectSettingsForTests,
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
@@ -381,6 +382,7 @@ afterEach(async () => {
   // process-global left dirty here would leak a 1ms git budget into unrelated
   // cases. Clearing unconditionally is idempotent.
   setSubmoduleInspectSettingsForTests(null);
+  setProcessGroupLivenessProbeForTests(null);
   delete process.env.PAPERCLIP_CONFIG;
   delete process.env.PAPERCLIP_HOME;
   delete process.env.PAPERCLIP_INSTANCE_ID;
@@ -3605,6 +3607,89 @@ describe("realizeExecutionWorkspace", () => {
       expect(allText).not.toContain("vendor/healthy-dep");
     } finally {
       setSubmoduleInspectSettingsForTests(null);
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await fs.rm(shimDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("does not start a retry while the previous timed-out process group remains alive", async () => {
+    // In the CephFS-stall case this change exists for, SIGKILL can be issued
+    // while the task remains stuck in uninterruptible IO. Retrying immediately
+    // would overlap the next Git tree with the old one against the same checkout,
+    // amplifying the metadata pressure. Simulate that liveness result directly:
+    // the subprocess is killable in the test environment, but the retry policy
+    // must key off the bounded liveness probe result, not off a best-effort
+    // signal send.
+    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+    const counterPath = path.join(shimDir, "status-calls");
+    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+    const shimPath = path.join(shimDir, "git");
+    await fs.writeFile(
+      shimPath,
+      [
+        "#!/bin/sh",
+        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+        `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
+        "  calls=$((calls + 1))",
+        `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
+        "  exec sleep 30",
+        "fi",
+        `exec ${JSON.stringify(realGit)} "$@"`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(shimPath, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+    setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 3, retryDelayMs: 1 });
+    setProcessGroupLivenessProbeForTests(() => true);
+
+    try {
+      const realized = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-submodule-timeout-live-group",
+          workspaceId: "workspace-submodule-timeout-live-group",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {},
+        issue: {
+          id: "issue-submodule-timeout-live-group",
+          identifier: "PAP-SUBMODULE-TIMEOUT-LIVE-GROUP",
+          title: "Do not retry over a live timed-out process group",
+        },
+        agent: {
+          id: "agent-submodule-timeout-live-group",
+          name: "Codex Coder",
+          companyId: "company-submodule-timeout-live-group",
+        },
+        recorder,
+      });
+
+      expect(realized.cwd).toBe(repoRoot);
+      const warning = realized.warnings.find((candidate) => candidate.includes("Could not inspect git submodules"));
+      expect(warning).toBeDefined();
+      expect(warning).toContain("after 1 attempt(s)");
+      expect(warning).toContain("process group remained alive after SIGKILL");
+      expect(warning).toContain("retry was skipped");
+      expect(await fs.readFile(counterPath, "utf8")).toBe("1");
+
+      const degraded = operations.find(
+        (operation) => operation.metadata?.action === "submodule_inspection_degraded",
+      );
+      expect(degraded?.metadata).toMatchObject({
+        attempts: 1,
+        reason: expect.stringContaining("retry was skipped"),
+      });
+    } finally {
+      setSubmoduleInspectSettingsForTests(null);
+      setProcessGroupLivenessProbeForTests(null);
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
       await fs.rm(shimDir, { recursive: true, force: true });

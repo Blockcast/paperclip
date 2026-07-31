@@ -171,6 +171,8 @@ const DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES = 256 * 1024;
  * this only elapses in the pathological case.
  */
 const PROCESS_STDIO_DRAIN_GRACE_MS = 2_000;
+const PROCESS_TIMEOUT_GROUP_LIVENESS_GRACE_MS = 750;
+const PROCESS_TIMEOUT_GROUP_LIVENESS_POLL_MS = 25;
 const WORKSPACE_SUBMODULE_REPAIR_TIMEOUT_MS = 5 * 60 * 1000;
 
 // `git submodule status --recursive` is ~96% filesystem latency, not CPU: on the
@@ -269,6 +271,7 @@ function readBoundedIntEnv(
 type SubmoduleInspectSettings = { timeoutMs: number; attempts: number; retryDelayMs: number };
 
 let submoduleInspectSettingsOverrideForTests: Partial<SubmoduleInspectSettings> | null = null;
+let processGroupLivenessProbeForTests: ((processGroupId: number) => boolean) | null = null;
 
 /**
  * Test-only seam for the inspection budget. Tests need a timeout small enough to
@@ -280,6 +283,10 @@ let submoduleInspectSettingsOverrideForTests: Partial<SubmoduleInspectSettings> 
  */
 export function setSubmoduleInspectSettingsForTests(override: Partial<SubmoduleInspectSettings> | null) {
   submoduleInspectSettingsOverrideForTests = override;
+}
+
+export function setProcessGroupLivenessProbeForTests(override: ((processGroupId: number) => boolean) | null) {
+  processGroupLivenessProbeForTests = override;
 }
 
 function readSubmoduleInspectSettings(): SubmoduleInspectSettings {
@@ -672,6 +679,31 @@ function createProcessOutputCapture(maxBytes: number): ProcessOutputAccumulator 
   };
 }
 
+function isProcessGroupAlive(processGroupId: number): boolean {
+  if (process.platform === "win32") return false;
+  if (processGroupLivenessProbeForTests) return processGroupLivenessProbeForTests(processGroupId);
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForProcessGroupExitAfterKill(child: ChildProcess): Promise<boolean> {
+  if (!child.pid || process.platform === "win32") return false;
+  const processGroupId = child.pid;
+  const deadline = Date.now() + PROCESS_TIMEOUT_GROUP_LIVENESS_GRACE_MS;
+
+  while (isProcessGroupAlive(processGroupId)) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return true;
+    await delay(Math.min(PROCESS_TIMEOUT_GROUP_LIVENESS_POLL_MS, remainingMs));
+  }
+
+  return false;
+}
+
 async function executeProcess(input: {
   command: string;
   args: string[];
@@ -685,6 +717,7 @@ async function executeProcess(input: {
   stderr: string;
   code: number | null;
   timedOut: boolean;
+  processGroupAliveAfterTimeout: boolean;
   stdoutTruncated: boolean;
   stderrTruncated: boolean;
   stdoutBytes: number;
@@ -695,6 +728,7 @@ async function executeProcess(input: {
     stderr: ProcessOutputAccumulator;
     code: number | null;
     timedOut: boolean;
+    processGroupAliveAfterTimeout: boolean;
   }>((resolve, reject) => {
     let timedOut = false;
     let settled = false;
@@ -743,16 +777,19 @@ async function executeProcess(input: {
      * contain. Escalating here keeps "settled as timed out" coupled to "the tree
      * has been killed".
      *
-     * SIGKILL is *issued*, not awaited: a process wedged in uninterruptible IO on
-     * a stalled mount dies only once that IO returns, and waiting on it would
-     * reintroduce the unbounded hang this whole path exists to bound.
+     * SIGKILL is followed by a bounded liveness check rather than an unbounded
+     * wait. A process wedged in uninterruptible IO on a stalled mount dies only
+     * once that IO returns; if the group is still alive after the bound, callers
+     * must treat the timeout as unresolved and avoid starting another tree
+     * against the same checkout.
      */
-    const escalateTermination = () => {
+    const escalateTermination = async () => {
       if (killTimer) {
         globalThis.clearTimeout(killTimer);
         killTimer = null;
       }
       terminateChildProcess(child, "SIGKILL");
+      return await waitForProcessGroupExitAfterKill(child);
     };
     const cleanupCapturedStreams = (destroy: boolean) => {
       child.stdout?.off("data", onStdoutData);
@@ -765,10 +802,12 @@ async function executeProcess(input: {
     const settle = (code: number | null, options?: { destroyStreams?: boolean }) => {
       if (settled) return;
       settled = true;
-      if (timedOut) escalateTermination();
       cleanupCapturedStreams(options?.destroyStreams ?? false);
-      clearTimers();
-      resolve({ stdout, stderr, code, timedOut });
+      void (async () => {
+        const processGroupAliveAfterTimeout = timedOut ? await escalateTermination() : false;
+        clearTimers();
+        resolve({ stdout, stderr, code, timedOut, processGroupAliveAfterTimeout });
+      })();
     };
 
     const timeoutMs =
@@ -791,10 +830,12 @@ async function executeProcess(input: {
     child.on("error", (error) => {
       if (settled) return;
       settled = true;
-      if (timedOut) escalateTermination();
       cleanupCapturedStreams(true);
-      clearTimers();
-      reject(error);
+      void (async () => {
+        await (timedOut ? escalateTermination() : Promise.resolve(false));
+        clearTimers();
+        reject(error);
+      })();
     });
     // `exit` fires when the command itself terminates; `close` additionally
     // waits for every writer on the inherited pipes, which can include
@@ -832,6 +873,7 @@ async function executeProcess(input: {
     stderr: stderr.text,
     code: proc.code,
     timedOut: proc.timedOut,
+    processGroupAliveAfterTimeout: proc.processGroupAliveAfterTimeout,
     stdoutTruncated: stdout.truncated,
     stderrTruncated: stderr.truncated,
     stdoutBytes: stdout.totalBytes,
@@ -879,12 +921,14 @@ class GitCommandTimeoutError extends Error {
    */
   readonly stdout: string;
   readonly stdoutEndsWithNewline: boolean;
+  readonly processGroupAliveAfterTimeout: boolean;
 
-  constructor(message: string, partial?: { stdout: string }) {
+  constructor(message: string, partial?: { stdout: string; processGroupAliveAfterTimeout?: boolean }) {
     super(message);
     this.name = "GitCommandTimeoutError";
     this.stdout = partial?.stdout ?? "";
     this.stdoutEndsWithNewline = this.stdout.endsWith("\n");
+    this.processGroupAliveAfterTimeout = partial?.processGroupAliveAfterTimeout ?? false;
   }
 }
 
@@ -938,6 +982,7 @@ async function runGit(
   if (proc.timedOut) {
     throw new GitCommandTimeoutError(`git ${args.join(" ")} timed out after ${options.timeoutMs}ms`, {
       stdout: proc.stdout,
+      processGroupAliveAfterTimeout: proc.processGroupAliveAfterTimeout,
     });
   }
   if (proc.code !== 0) {
@@ -2659,8 +2704,12 @@ type GitSubmoduleInspection =
  *   for an earlier submodule in hand. When it does, that evidence is returned
  *   (`partial: true`) and the caller fails closed / repairs as usual -- retrying
  *   would spend another full budget to reach a conclusion we already have.
- *   Otherwise the stall is retried, then reported as `ok: false` so the caller
- *   can degrade to a warning. This is the BLO-18784 fix.
+ *   Otherwise the stall is retried only after the timed-out process group has
+ *   disappeared. If the bounded post-kill liveness check says the group is still
+ *   alive, the probe degrades immediately instead of overlapping the next Git
+ *   tree with the previous one. Exhausted retries are then reported as
+ *   `ok: false` so the caller can degrade to a warning. This is the BLO-18784
+ *   fix.
  * - **Any other failure** (non-zero exit, missing git binary, malformed
  *   `.gitmodules`, corrupt checkout, permission error): deterministic evidence
  *   that the checkout is unusable. Throws `WorkspaceGitSubmoduleError`, as it did
@@ -2703,6 +2752,16 @@ async function inspectGitSubmoduleReadiness(
         // `salvaged` is not evidence of health (buffering or an early kill can
         // yield no output at all), so that case falls through to retry/degrade.
         return { ok: true, entries: salvaged, partial: true };
+      }
+
+      if (error.processGroupAliveAfterTimeout) {
+        return {
+          ok: false,
+          reason:
+            `${error.message}; previous timed-out git process group remained alive after SIGKILL, ` +
+            "so retry was skipped to avoid overlapping probes against the same checkout",
+          attempts: attempt,
+        };
       }
 
       if (attempt < settings.attempts) {
