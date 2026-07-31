@@ -8173,8 +8173,11 @@ export function issueService(db: Db) {
       // already-in_review issue refreshes the recorded verdict but never
       // rejects the patch, so unrelated edits (labels, description, assignee)
       // to an in_review issue cannot start failing with a 422.
-      if (issueData.status === "in_review") {
-        const isInReviewTransition = existing.status !== "in_review";
+      const shouldRunInReviewEvidenceGate =
+        issueData.status === "in_review" ||
+        (nextLabelIds !== undefined && existing.status === "in_review");
+      if (shouldRunInReviewEvidenceGate) {
+        const isInReviewTransition = issueData.status === "in_review" && existing.status !== "in_review";
         let inReviewVerdict: Awaited<ReturnType<typeof runEvidenceGate>> | null = null;
         try {
           const verdict = await runEvidenceGate(

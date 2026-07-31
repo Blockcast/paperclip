@@ -383,6 +383,41 @@ describeEmbeddedPostgres("PATCH /issues/:id evidence gate", () => {
       );
     });
 
+    it("re-evaluates when labels are applied after an issue already entered in_review", async () => {
+      const { companyId, issueId, agentId, labelId } = await seedUnlabeledIssue();
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        body: CHECKLIST_ONLY_EVIDENCE,
+        authorAgentId: agentId,
+        authorUserId: null,
+        createdAt: new Date(),
+      });
+
+      const inReview = await request(createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review" });
+      expect(inReview.status, JSON.stringify(inReview.body)).toBe(200);
+      expect(inReview.body.lastEvidenceVerdict).toMatchObject({
+        verdict: "pass",
+        unlabeledFallback: true,
+      });
+
+      const labeled = await request(createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ labelIds: [labelId] });
+
+      expect(labeled.status, JSON.stringify(labeled.body)).toBe(200);
+      expect(labeled.body.labelIds).toEqual([labelId]);
+      expect(labeled.body.lastEvidenceVerdict).toMatchObject({
+        verdict: "block",
+        unlabeledFallback: false,
+      });
+      expect(labeled.body.lastEvidenceVerdict.missing).toEqual(
+        expect.arrayContaining(["screenshot:1440x900", "screenshot:390x844"]),
+      );
+    });
+
     it("uses the unlabeled fallback when the patch REMOVES every label", async () => {
       const { companyId, issueId, agentId } = await seedFrontendIssue();
       await db.insert(issueComments).values({
