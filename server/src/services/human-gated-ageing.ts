@@ -124,6 +124,11 @@ export type AgedHumanGatedIssue = HumanGatedIssue & {
   neverTouchedByHuman: boolean;
 };
 
+export type MalformedHumanGatedIssue = {
+  issue: HumanGatedIssue;
+  reason: string;
+};
+
 export function classifyHumanGatedWait(status: string): HumanGatedWaitKind {
   if (status === "in_review") return "waiting_on_review";
   if (status === "todo" || status === "backlog") return "waiting_to_start";
@@ -189,11 +194,14 @@ export type SelectAgedHumanGatedOptions = {
 export type HumanGatedAgeingReport = {
   /** Every open human-gated issue considered, oldest human-touch first. */
   scanned: AgedHumanGatedIssue[];
+  /** Open human-gated rows skipped because the prompt/input shape is not trustworthy. */
+  malformed: MalformedHumanGatedIssue[];
   /** Issues past their priority's threshold, oldest first, truncated to `maxEscalated`. */
   escalated: AgedHumanGatedIssue[];
   /** How many issues were past threshold but dropped by `maxEscalated`. */
   escalatedOmitted: number;
   totalOverThreshold: number;
+  neverTouchedByHumanCount: number;
   escalateAfterDaysByPriority: Readonly<Record<string, number>>;
   countsByWaitKind: Record<HumanGatedWaitKind, number>;
   countsByPriority: Record<string, number>;
@@ -223,6 +231,22 @@ export function escalateAfterDaysFor(
   return Math.max(...configured);
 }
 
+function validateHumanGatedIssueClockInput(issue: HumanGatedIssue): string | null {
+  if (!parseTimestamp(issue.createdAt)) {
+    return "missing or unparseable createdAt";
+  }
+  if (!Object.prototype.hasOwnProperty.call(issue, "lastHumanTouchAt")) {
+    return "missing lastHumanTouchAt; prompt input may be using last_human_touch_at";
+  }
+  if (issue.lastHumanTouchAt === undefined) {
+    return "lastHumanTouchAt must be an ISO timestamp or null";
+  }
+  if (issue.lastHumanTouchAt !== null && !parseTimestamp(issue.lastHumanTouchAt)) {
+    return "unparseable lastHumanTouchAt";
+  }
+  return null;
+}
+
 /**
  * Select and rank open human-gated issues whose human clock has been silent
  * past their priority's threshold.
@@ -237,25 +261,31 @@ export function selectAgedHumanGatedIssues(
 ): HumanGatedAgeingReport {
   const { now, escalateAfterDaysByPriority, maxEscalated } = options;
 
-  const scanned = issues
-    .filter(isHumanGatedOpenIssue)
-    .map((issue): AgedHumanGatedIssue => {
-      const clock = humanClockAt(issue);
-      return {
-        ...issue,
-        waitKind: classifyHumanGatedWait(issue.status),
-        humanClockAt: clock,
-        humanSilenceDays: (now.getTime() - clock.getTime()) / 86_400_000,
-        neverTouchedByHuman: !issue.lastHumanTouchAt,
-      };
-    })
-    .sort((a, b) => {
-      const byClock = a.humanClockAt.getTime() - b.humanClockAt.getTime();
-      if (byClock !== 0) return byClock;
-      const byPriority = comparePriority(a.priority, b.priority);
-      if (byPriority !== 0) return byPriority;
-      return (a.identifier ?? a.id).localeCompare(b.identifier ?? b.id);
+  const malformed: MalformedHumanGatedIssue[] = [];
+  const scanned: AgedHumanGatedIssue[] = [];
+  for (const issue of issues.filter(isHumanGatedOpenIssue)) {
+    const malformedReason = validateHumanGatedIssueClockInput(issue);
+    if (malformedReason) {
+      malformed.push({ issue, reason: malformedReason });
+      continue;
+    }
+    const clock = humanClockAt(issue);
+    scanned.push({
+      ...issue,
+      waitKind: classifyHumanGatedWait(issue.status),
+      humanClockAt: clock,
+      humanSilenceDays: (now.getTime() - clock.getTime()) / 86_400_000,
+      neverTouchedByHuman: issue.lastHumanTouchAt === null,
     });
+  }
+
+  scanned.sort((a, b) => {
+    const byClock = a.humanClockAt.getTime() - b.humanClockAt.getTime();
+    if (byClock !== 0) return byClock;
+    const byPriority = comparePriority(a.priority, b.priority);
+    if (byPriority !== 0) return byPriority;
+    return (a.identifier ?? a.id).localeCompare(b.identifier ?? b.id);
+  });
 
   const overThreshold = scanned.filter(
     (issue) =>
@@ -279,9 +309,11 @@ export function selectAgedHumanGatedIssues(
 
   return {
     scanned,
+    malformed,
     escalated,
     escalatedOmitted: overThreshold.length - escalated.length,
     totalOverThreshold: overThreshold.length,
+    neverTouchedByHumanCount: scanned.filter((issue) => issue.neverTouchedByHuman).length,
     escalateAfterDaysByPriority,
     countsByWaitKind,
     countsByPriority,
@@ -327,14 +359,24 @@ function formatIssueRef(issue: AgedHumanGatedIssue): string {
   return issue.identifier ?? issue.id;
 }
 
+function formatMalformedIssueRef(issue: HumanGatedIssue): string {
+  return issue.identifier ?? issue.id;
+}
+
+function orderedPriorityKeys(keys: Iterable<string>): string[] {
+  const present = new Set(keys);
+  return [
+    ...HUMAN_GATED_PRIORITY_ORDER.filter((priority) => present.has(priority)),
+    ...[...present].filter((priority) => !HUMAN_GATED_PRIORITY_ORDER.includes(priority as never)).sort(),
+  ];
+}
+
 /**
  * Render the escalation section, split by what each issue is waiting for and
  * grouped by priority within each split.
  */
 export function formatHumanGatedAgeingSections(report: HumanGatedAgeingReport): string {
-  const thresholds = HUMAN_GATED_PRIORITY_ORDER.filter(
-    (priority) => typeof report.escalateAfterDaysByPriority[priority] === "number",
-  )
+  const thresholds = orderedPriorityKeys(Object.keys(report.escalateAfterDaysByPriority))
     .map((priority) => `${priority} >${report.escalateAfterDaysByPriority[priority]}d`)
     .join(", ");
 
@@ -342,7 +384,21 @@ export function formatHumanGatedAgeingSections(report: HumanGatedAgeingReport): 
     `### Human-gated work past its human-silence threshold (${report.totalOverThreshold})`,
     "",
     `Thresholds: ${thresholds}. Clock is last human touch, not \`updatedAt\`.`,
+    `Human-touch fallback: ${report.neverTouchedByHumanCount} of ${report.scanned.length} scanned issues have no human touch timestamp.`,
   ];
+
+  if (report.malformed.length > 0) {
+    lines.push(
+      "",
+      `Skipped ${report.malformed.length} malformed human-gated row${report.malformed.length === 1 ? "" : "s"}; fix the input mapping before trusting this digest.`,
+    );
+    for (const entry of report.malformed.slice(0, 10)) {
+      lines.push(`- ${formatMalformedIssueRef(entry.issue)} — ${entry.reason}`);
+    }
+    if (report.malformed.length > 10) {
+      lines.push(`- ... ${report.malformed.length - 10} further malformed rows omitted.`);
+    }
+  }
 
   if (report.totalOverThreshold === 0) {
     lines.push("", "- None.");
@@ -366,7 +422,7 @@ export function formatHumanGatedAgeingSections(report: HumanGatedAgeingReport): 
 
     lines.push("", `#### ${WAIT_KIND_HEADINGS[waitKind]} — ${report.countsByWaitKind[waitKind]}`);
 
-    for (const priority of HUMAN_GATED_PRIORITY_ORDER) {
+    for (const priority of orderedPriorityKeys(Object.keys(report.countsByPriority))) {
       const inPriority = inKind.filter((issue) => (issue.priority ?? "unset") === priority);
       if (inPriority.length === 0) continue;
 
