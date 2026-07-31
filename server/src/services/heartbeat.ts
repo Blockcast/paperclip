@@ -5826,6 +5826,7 @@ const GITHUB_PR_CONTEXT_KEYS = [
   "githubHeadSha",
   "githubEvent",
   "githubDeliveryId",
+  "githubCommentId",
   "githubCommentUrl",
   "githubReviewUrl",
   "githubPrAuthorLogin",
@@ -5924,11 +5925,11 @@ export function mergeCoalescedContextSnapshot(
   // object, so this must edit `merged` (freshly created) and never `existing`.
   const incomingPrIdentity = readGithubPrIdentity(incoming);
   const existingPrIdentity = readGithubPrIdentity(existing);
-  if (
+  const isDifferentGithubPr =
     incomingPrIdentity !== null &&
     existingPrIdentity !== null &&
-    incomingPrIdentity !== existingPrIdentity
-  ) {
+    incomingPrIdentity !== existingPrIdentity;
+  if (isDifferentGithubPr) {
     for (const key of GITHUB_PR_CONTEXT_KEYS) {
       if (!(key in incoming)) delete merged[key];
     }
@@ -5940,7 +5941,9 @@ export function mergeCoalescedContextSnapshot(
   for (const key of ["issueId", "taskId", "taskKey"] as const) {
     merged[key] = readNonEmptyString(incoming[key]) ?? readNonEmptyString(existing[key]) ?? merged[key];
   }
-  const mergedCommentIds = mergeWakeCommentIds(existing, incoming);
+  const mergedCommentIds = isDifferentGithubPr
+    ? mergeWakeCommentIds(incoming)
+    : mergeWakeCommentIds(existing, incoming);
   if (mergedCommentIds.length > 0) {
     const latestCommentId = mergedCommentIds[mergedCommentIds.length - 1];
     merged[WAKE_COMMENT_IDS_KEY] = mergedCommentIds;
@@ -5948,6 +5951,11 @@ export function mergeCoalescedContextSnapshot(
     merged.wakeCommentId = latestCommentId;
     // The merged context should carry canonical comment ids; the next wake will
     // regenerate any structured payload from those ids.
+    delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
+  } else if (isDifferentGithubPr) {
+    delete merged[WAKE_COMMENT_IDS_KEY];
+    delete merged.commentId;
+    delete merged.wakeCommentId;
     delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
   }
   if (!hasInteractionContinuationWakeContext(incoming)) {

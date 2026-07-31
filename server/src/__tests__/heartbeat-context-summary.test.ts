@@ -930,10 +930,18 @@ describe("mergeCoalescedContextSnapshot", () => {
         githubPrTitle: "fix(recovery): treat checkout adoption as continuity",
         githubPrUrl: "https://github.com/Blockcast/paperclip/pull/824",
         githubHeadSha: "bfc470e81a12a3f52ac030b45a5e68949e119bc1",
+        githubCommentId: "review-comment-824",
+        githubCommentUrl: "https://github.com/Blockcast/paperclip/pull/824#discussion_r824",
         githubPrReviewBody: "Reviewed head: bfc470e8. getCheckoutAdoptingRun ignores the CAS result.",
         githubPrReviewState: "commented",
         githubPrReviewAuthorLogin: "ally",
         githubReviewFeedbackActionable: true,
+        commentId: "review-comment-824",
+        wakeCommentId: "review-comment-824",
+        wakeCommentIds: ["review-comment-824"],
+        paperclipWake: {
+          comments: [{ id: "review-comment-824", body: "Findings on #824." }],
+        },
         prRole: "author",
       },
       {
@@ -958,9 +966,51 @@ describe("mergeCoalescedContextSnapshot", () => {
     expect(merged.githubPrReviewState).toBeUndefined();
     expect(merged.githubPrReviewAuthorLogin).toBeUndefined();
     expect(merged.githubReviewFeedbackActionable).toBeUndefined();
+    expect(merged.githubCommentId).toBeUndefined();
+    expect(merged.githubCommentUrl).toBeUndefined();
+    expect(merged.commentId).toBeUndefined();
+    expect(merged.wakeCommentId).toBeUndefined();
+    expect(merged.wakeCommentIds).toBeUndefined();
+    expect(merged.paperclipWake).toBeUndefined();
 
     // Task identity still survives the clear.
     expect(merged.issueId).toBe("issue-18829");
+  });
+
+  it("keeps only incoming comment ids when the incoming wake names a different PR", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-18829",
+        wakeReason: "github_pr_review_submitted",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 824,
+        githubHeadSha: "bfc470e81a12a3f52ac030b45a5e68949e119bc1",
+        githubCommentId: "review-comment-824",
+        commentId: "review-comment-824",
+        wakeCommentId: "review-comment-824",
+        wakeCommentIds: ["review-comment-824"],
+        paperclipWake: {
+          comments: [{ id: "review-comment-824", body: "Findings on #824." }],
+        },
+      },
+      {
+        issueId: "issue-18829",
+        wakeReason: "github_pr_comment",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 837,
+        githubHeadSha: "2120c77c8633e98b186c592d0ddd0204cc6a8760",
+        githubCommentId: "review-comment-837",
+        commentId: "review-comment-837",
+      },
+    );
+
+    expect(merged.githubPrNumber).toBe(837);
+    expect(merged.githubHeadSha).toBe("2120c77c8633e98b186c592d0ddd0204cc6a8760");
+    expect(merged.githubCommentId).toBe("review-comment-837");
+    expect(merged.commentId).toBe("review-comment-837");
+    expect(merged.wakeCommentId).toBe("review-comment-837");
+    expect(merged.wakeCommentIds).toEqual(["review-comment-837"]);
+    expect(merged.paperclipWake).toBeUndefined();
   });
 
   it("keeps review context when both wakes are about the same PR", () => {
