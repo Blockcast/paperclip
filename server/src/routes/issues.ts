@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -3738,7 +3738,7 @@ export function issueRoutes(
         eq(activityLog.action, "issue_write_denied"),
         eq(activityLog.entityType, "issue"),
         eq(activityLog.entityId, input.issue.id),
-        sql`${activityLog.createdAt} >= ${windowStart}`,
+        gte(activityLog.createdAt, windowStart),
         sql`${activityLog.details} ->> 'attemptedAction' = ${input.action}`,
         sql`${activityLog.details} ->> 'reason' = ${input.reason}`,
       ))
