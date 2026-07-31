@@ -160,6 +160,7 @@ function checkoutStatusForCurrentRow() {
 function checkoutStartedAtForCurrentRow(now: Date) {
   return sql<Date | null>`CASE
     WHEN ${preserveInReviewExecutionStageCheckoutCondition()} THEN ${issues.startedAt}
+    WHEN ${issues.status} = 'in_progress' THEN ${issues.startedAt}
     ELSE ${now}
   END`;
 }
@@ -9161,7 +9162,7 @@ export function issueService(db: Db) {
 
       // Adopt stale executionRunId — if the execution lock points to a terminal/missing run, clear it and proceed.
       // Only adopts when the caller's expectedStatuses guard still holds; preserves any existing assigneeUserId
-      // and preserves the original startedAt when the issue is already in_progress.
+      // and preserves startedAt for rows that were already in progress or in a pending review stage.
       if (
         checkoutRunId &&
         current.executionRunId &&
@@ -9238,6 +9239,7 @@ export function issueService(db: Db) {
                 eq(issues.id, id),
                 inArray(issues.status, expectedStatuses),
                 isNull(issues.executionRunId),
+                or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
               ),
             )
             .returning()
