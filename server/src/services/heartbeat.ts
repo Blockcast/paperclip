@@ -16871,7 +16871,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // once the mint is committed (so a failed/aborted setRunStatus never
       // over-counts). Split by adapter + error-string bucket + the durable
       // classification, all bounded.
-      let finalizedRun = await setRunStatus(run.id, "failed", {
+      const finalizedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
         finishedAt: now,
@@ -16894,12 +16894,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : result;
         })(),
       });
+      if (!finalizedRunWrite.updated || !finalizedRunWrite.run) {
+        // Another reap invocation won the terminal transition for this run.
+        // Do not duplicate process_lost metrics, retries, wakeup finalization,
+        // run events, or issue-promotion side effects.
+        if (finalizedRunWrite.run?.status !== "running") {
+          runningProcesses.delete(run.id);
+          activeRunExecutions.delete(run.id);
+        }
+        continue;
+      }
+      let finalizedRun = finalizedRunWrite.run;
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
       });
-      if (!finalizedRun) finalizedRun = await getRun(run.id);
-      if (!finalizedRun) continue;
       // BLO-16184: the process_lost mint is now committed for this run -- count it
       // (bounded adapter + error-string bucket + durable classification).
       recordProcessLost({

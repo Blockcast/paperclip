@@ -347,6 +347,16 @@ async function waitForValue<T>(
   return latest ?? null;
 }
 
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 async function waitForHeartbeatIdle(
   db: ReturnType<typeof createDb>,
   timeoutMs = 3_000,
@@ -1477,6 +1487,57 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(agentWakeupRequests.id, wakeupRequestId))
       .then((rows) => rows[0] ?? null);
     expect(wakeup?.status).toBe("claimed");
+  });
+
+  it("deduplicates concurrent process_lost reaps of the same local run", async () => {
+    const { runId, wakeupRequestId } = await seedRunFixture({
+      processPid: 999_999_999,
+      includeIssue: false,
+    });
+    const jobStatusGate = createDeferred<null>();
+    let jobStatusCalls = 0;
+    mockListAgentJobRunStatuses
+      .mockImplementationOnce(async () => {
+        jobStatusCalls += 1;
+        return jobStatusGate.promise;
+      })
+      .mockImplementationOnce(async () => {
+        jobStatusCalls += 1;
+        return jobStatusGate.promise;
+      });
+
+    const firstReap = heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    const secondReap = heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(await waitForValue(async () => jobStatusCalls >= 2 ? jobStatusCalls : null)).toBe(2);
+    jobStatusGate.resolve(null);
+
+    const results = await Promise.all([firstReap, secondReap]);
+    expect(results.reduce((sum, result) => sum + result.reaped, 0)).toBe(1);
+    expect(results.flatMap((result) => result.runIds)).toEqual([runId]);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("failed");
+
+    const runEvents = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId));
+    expect(
+      runEvents.filter((event) =>
+        event.eventType === "lifecycle" &&
+        event.level === "error" &&
+        event.message.includes("Process lost"),
+      ),
+    ).toHaveLength(1);
   });
 
   it("skips generic timer wakes without invoking an adapter when no assigned work is actionable", async () => {
