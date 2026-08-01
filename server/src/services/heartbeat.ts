@@ -3145,6 +3145,7 @@ function looksLikeRetryableDeadlineExceeded(value: unknown): boolean {
 // decides when a closed account window reopens). Only no-hint server-fault
 // shapes land here.
 const TRANSIENT_UPSTREAM_STATUS_CODES = new Set(["503", "529"]);
+const TRANSIENT_UPSTREAM_TEXT_KEYS = ["result", "message", "error", "summary"] as const;
 const TRANSIENT_UPSTREAM_TEXT_PATTERNS = [
   /API Error:\s*(?:503|529)\b/i,
   /service\s+(?:is\s+)?(?:temporarily\s+)?unavailable/i,
@@ -3153,6 +3154,33 @@ const TRANSIENT_UPSTREAM_TEXT_PATTERNS = [
   /overloaded_error/i,
   /\bserver_error\b/i,
 ];
+
+// BLO-19879: the penstock gateway answers `400 {"code":"allocation_missing"}`
+// when it routes a request to a BYOS vault node that does not serve the
+// requested provider. Despite the 4xx status this is a *gateway-side routing*
+// fault, not a malformed request: the same payload succeeds as soon as a
+// provider-capable node is back in the active set. On 2026-07-31, while the
+// only anthropic-capable node (`blockcast-omar`, replicas: 1) was unavailable
+// 16:50–17:20Z, provider-blind failover sent anthropic traffic to
+// `blockcast-sfo12` (PENSTOCK_VAULT_PROVIDERS=openai,codex) and stranded 80
+// runs as terminal `adapter_failed` — 70.5% of all failed runs in the burst.
+//
+// This MUST be tested before the authoritative-status short-circuit in
+// isHintlessTransientUpstreamFault: these runs carry api_error_status=400, so
+// a TRANSIENT_UPSTREAM_TEXT_PATTERNS entry alone would never be reached and
+// would be a silent no-op.
+//
+// Matched on the machine-readable `code`, not the prose, so a reworded gateway
+// message cannot silently drop it back to terminal. Scoped to this one code
+// rather than 400s generally — a genuine bad request must still fail fast
+// instead of burning the full 2m/10m/30m/2h retry curve.
+const GATEWAY_ALLOCATION_FAULT_PATTERN = /^\s*(?:API Error:\s*400\b[^{]*)?\{[\s\S]*"code"\s*:\s*"allocation_missing"/i;
+const GATEWAY_ALLOCATION_FAULT_TEXT_KEYS = ["result", "error"] as const;
+
+function looksLikeGatewayAllocationFault(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  return GATEWAY_ALLOCATION_FAULT_PATTERN.test(value);
+}
 
 function looksLikeTransientUpstreamText(value: unknown): boolean {
   if (typeof value !== "string") return false;
@@ -3170,10 +3198,35 @@ function normalizeHttpStatusCode(value: unknown): string | null {
   return String(parsed);
 }
 
+function allocationFaultStatusGate(resultJson: Record<string, unknown> | null | undefined): "allow" | "deny" {
+  if (!resultJson) return "allow";
+  let hasAuthoritativeStatus = false;
+  for (const key of ["api_error_status", "error_status"] as const) {
+    const status = normalizeHttpStatusCode(resultJson[key]);
+    if (status == null) continue;
+    if (status === "400") return "allow";
+    hasAuthoritativeStatus = true;
+  }
+  return hasAuthoritativeStatus ? "deny" : "allow";
+}
+
 export function isHintlessTransientUpstreamFault(
   resultJson: Record<string, unknown> | null | undefined,
   opts?: { errorMessage?: string | null },
 ): boolean {
+  // BLO-19879: checked first, above the authoritative-status short-circuit
+  // below, because the gateway allocation fault carries a 400 and would
+  // otherwise be rejected before any text matching runs. Still require an
+  // actual 400 when resultJson carries an authoritative status, and match only
+  // gateway-shaped payload text so agent-authored prose that merely quotes the
+  // literal cannot turn terminal 401/403/etc. failures into scheduled retries.
+  if (allocationFaultStatusGate(resultJson) === "allow" && resultJson) {
+    for (const key of GATEWAY_ALLOCATION_FAULT_TEXT_KEYS) {
+      if (looksLikeGatewayAllocationFault(resultJson[key])) return true;
+    }
+  }
+  if (looksLikeGatewayAllocationFault(opts?.errorMessage)) return true;
+
   // Two status surfaces: the Claude SDK's final result event uses
   // `api_error_status`, while the per-attempt `api_retry` events that precede
   // an exhausted retry budget use `error_status` — the latter is the field the
@@ -3188,7 +3241,7 @@ export function isHintlessTransientUpstreamFault(
   if (hasAuthoritativeStatus) return false;
 
   if (resultJson) {
-    for (const key of ["result", "message", "error", "summary"] as const) {
+    for (const key of TRANSIENT_UPSTREAM_TEXT_KEYS) {
       if (looksLikeTransientUpstreamText(resultJson[key])) return true;
     }
   }
