@@ -94,17 +94,23 @@ export function resolveAcPolicyFilingTarget(
   input: AcPolicyFilingTargetInput,
 ): AcPolicyFilingTarget {
   const { assigneeAgentId = null, responsibleUserId = null, agents } = input;
-  const byId = new Map(agents.map((agent) => [agent.id, agent]));
-  const assignee = assigneeAgentId ? (byId.get(assigneeAgentId) ?? null) : null;
+  const allAgentsById = new Map(agents.map((agent) => [agent.id, agent]));
+  const assignee = assigneeAgentId ? (allAgentsById.get(assigneeAgentId) ?? null) : null;
+  const assigneeCompanyAgents = assignee
+    ? agents.filter((agent) => agent.companyId === assignee.companyId)
+    : agents;
+  const assigneeCompanyAgentsById = new Map(
+    assigneeCompanyAgents.map((agent) => [agent.id, agent]),
+  );
 
-  if (assignee && isAgentInvokable({ agent: assignee, agents })) {
+  if (assignee && isAgentInvokable({ agent: assignee, agents: assigneeCompanyAgents })) {
     return { kind: "agent", agentId: assignee.id, reason: "assignee_executes", skipped: [] };
   }
 
   const skipped: AcPolicySkippedAgent[] = [];
   const seen = new Set<string>();
   if (assignee) {
-    skipped.push(describeSkipped(assignee, agents));
+    skipped.push(describeSkipped(assignee, assigneeCompanyAgents));
     seen.add(assignee.id);
   }
 
@@ -113,15 +119,17 @@ export function resolveAcPolicyFilingTarget(
   }
 
   if (assignee) {
-    // `fullChain` is self-first then ancestors by increasing depth, and is
-    // cycle-safe. Agents inside a cycle fail `isAgentInvokable` on org-chain
-    // health, so a broken chain is never selected as a target.
-    for (const entry of getAgentOrgChainHealth({ agent: assignee, agents }).fullChain) {
+    // `fullChain` is self-first then ancestors by increasing depth. Cycles are
+    // excluded by `seen`; cross-company `reportsTo` values are absent from the
+    // assignee-company lookup, so a foreign manager cannot become a target.
+    for (const entry of getAgentOrgChainHealth({ agent: assignee, agents: assigneeCompanyAgents })
+      .fullChain) {
       if (entry.relation !== "ancestor") continue;
-      const manager = byId.get(entry.id);
-      // Synthetic `missing` / `cycle` placeholders have no agent record.
-      if (!manager || seen.has(manager.id)) continue;
-      if (isAgentInvokable({ agent: manager, agents })) {
+      const manager = assigneeCompanyAgentsById.get(entry.id);
+      // Synthetic `missing` placeholders and cross-company managers have no
+      // assignee-company agent record; cycle entries point at already-seen ids.
+      if (!manager || manager.companyId !== assignee.companyId || seen.has(manager.id)) continue;
+      if (isAgentInvokable({ agent: manager, agents: assigneeCompanyAgents })) {
         return {
           kind: "agent",
           agentId: manager.id,
@@ -129,7 +137,7 @@ export function resolveAcPolicyFilingTarget(
           skipped,
         };
       }
-      skipped.push(describeSkipped(manager, agents));
+      skipped.push(describeSkipped(manager, assigneeCompanyAgents));
       seen.add(manager.id);
     }
   }

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { isAgentInvokable } from "@paperclipai/shared";
 import {
   formatAcPolicyFilingTargetSections,
   isAcPolicyFilingTargetActionable,
@@ -13,8 +14,9 @@ function agent(
   status: string,
   reportsTo: string | null = null,
   name = id,
+  companyId = COMPANY,
 ): AcPolicySweepAgent {
-  return { id, companyId: COMPANY, name, status, reportsTo };
+  return { id, companyId, name, status, reportsTo };
 }
 
 // Mirrors the real org shape from BLO-19598: a paused attribution agent
@@ -155,6 +157,27 @@ describe("AC-policy sweep filing-target selection", () => {
     ]);
   });
 
+  it("does not route to a cross-company reportsTo target", () => {
+    const foreignCeo = agent("foreign-ceo", "running", null, "Foreign CEO", "foreign-company");
+    const orphanedOperator = agent("operator-devbox", "idle", "foreign-ceo", "Operator (devbox)");
+
+    const target = resolveAcPolicyFilingTarget({
+      assigneeAgentId: "operator-devbox",
+      responsibleUserId: null,
+      agents: [orphanedOperator, foreignCeo],
+    });
+
+    expect(target).toMatchObject({ kind: "unroutable", reason: "no_executing_target" });
+    expect(target.skipped).toEqual([
+      {
+        id: "operator-devbox",
+        name: "Operator (devbox)",
+        status: "idle",
+        reason: "invalid_org_chain",
+      },
+    ]);
+  });
+
   it("falls back to responsibleUserId when the assignee agent is unknown", () => {
     const target = resolveAcPolicyFilingTarget({
       assigneeAgentId: "ghost",
@@ -196,6 +219,8 @@ describe("AC-policy sweep filing-target selection", () => {
       ENGINEER,
       agent("terminated-ic", "terminated", "ceo"),
       agent("pending-ic", "pending_approval", "ceo"),
+      agent("cross-company-ic", "idle", "foreign-ceo"),
+      agent("foreign-ceo", "running", null, "Foreign CEO", "foreign-company"),
     ];
 
     for (const candidate of agents) {
@@ -206,6 +231,8 @@ describe("AC-policy sweep filing-target selection", () => {
       });
       if (target.kind !== "agent") continue;
       const picked = agents.find((entry) => entry.id === target.agentId);
+      expect(picked).toBeDefined();
+      expect(isAgentInvokable({ agent: picked!, agents })).toBe(true);
       expect(picked?.status).not.toBe("paused");
       expect(picked?.status).not.toBe("terminated");
       expect(picked?.status).not.toBe("pending_approval");
