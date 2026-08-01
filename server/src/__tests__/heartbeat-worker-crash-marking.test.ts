@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   agentWakeupRequests,
   agents,
@@ -558,6 +558,78 @@ describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
       // Several passes may legitimately report the run and adopt the same retry
       // (they raced the marker), but between them they created exactly one.
       expect([...new Set(passes.flatMap((pass) => pass.retryRunIds))]).toEqual([retries[0]!.id]);
+    });
+
+    it("leaves the completion marker unset when a required cleanup step fails", async () => {
+      const heartbeat = heartbeatService(db);
+      // The marker means "every required step ran", so it must not be written
+      // when one of them threw. Each step is individually caught so a single
+      // failure cannot strand the rest of the batch — but stamping regardless
+      // turned a transient failure into a durable lie: the run is terminal, so
+      // the orphan reaper can never see it, and this pass is the only thing
+      // that could still queue its retry or release its issue lock. Stamping
+      // erases it from that pass permanently.
+      //
+      // Injection: a context issueId that is not a UUID. The lock-release path
+      // compares it against issues.id (uuid), so PostgreSQL raises 22P02 —
+      // deterministic, and a faithful stand-in for the transient DB failure
+      // this guard exists for.
+      const { runId } = await seedClaimedButUnrecovered();
+      await db
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: { issueId: "not-a-uuid" } })
+        .where(eq(heartbeatRuns.id, runId));
+
+      const first = await heartbeat.reconcileWorkerCrashedRuns();
+      expect(first.reconciledRunIds).toEqual([runId]);
+
+      // The load-bearing assertion: cleanup failed, so the run is NOT recorded
+      // as recovered.
+      const [attempted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(attempted!.crashRecoveryCompletedAt).toBeNull();
+
+      // ...and therefore it is still a candidate on the next pass, rather than
+      // silently dropped work. Pre-fix this returned [].
+      const second = await heartbeat.reconcileWorkerCrashedRuns();
+      expect(second.reconciledRunIds).toEqual([runId]);
+    });
+
+    it("skips the pass entirely while another replica holds the reconcile lock", async () => {
+      const heartbeat = heartbeatService(db);
+      // Serializing only the retry insertion left every other side effect
+      // racing: each replica could still cancel the wakeup, release the issue
+      // lock, append a parent lifecycle event and finalize the same agent, then
+      // all stamp completion. `nextRunEventSeq` is itself a check-then-insert,
+      // so the duplicated events also race for a sequence number. One
+      // pass-level lock is what actually makes recovery exclusive.
+      const { runId } = await seedClaimedButUnrecovered();
+
+      await db.transaction(async (tx) => {
+        // Stand in for a peer replica mid-pass. Holding the same key means a
+        // pass starting now must decline rather than duplicate the work.
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended('heartbeat-worker-crash-reconcile', 0))`,
+        );
+
+        const blocked = await heartbeat.reconcileWorkerCrashedRuns();
+        expect(blocked.reconciledRunIds).toEqual([]);
+        expect(blocked.retryRunIds).toEqual([]);
+      });
+
+      // Nothing was touched while the lock was held...
+      const [untouched] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(untouched!.crashRecoveryCompletedAt).toBeNull();
+      const skippedRetries = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.retryOfRunId, runId));
+      expect(skippedRetries).toHaveLength(0);
+
+      // ...and declining is a deferral, not an abandonment: once the lock is
+      // free the next pass recovers the run normally.
+      const after = await heartbeat.reconcileWorkerCrashedRuns();
+      expect(after.reconciledRunIds).toEqual([runId]);
+      expect(after.retryRunIds).toHaveLength(1);
     });
   });
 });

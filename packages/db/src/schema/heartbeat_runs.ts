@@ -122,14 +122,9 @@ export const heartbeatRuns = pgTable(
       table.companyId,
       table.createdAt.desc(),
     ),
-    // BLO-19722: serves the startup crash-recovery candidate scan, which is
-    // bounded by batch size and ordered oldest-first rather than by wall time.
-    // The partial predicate keeps this index near-empty in steady state — only
-    // crash-marked runs whose recovery has not completed are members, and every
-    // recovered run leaves the index — so the common "nothing to reconcile"
-    // start is an empty index probe. See migration 0208.
-    crashRecoveryPendingIdx: index("heartbeat_runs_crash_recovery_pending_idx")
-      .on(table.finishedAt, table.id)
-      .where(sql`${table.errorCode} = 'worker_crashed' and ${table.crashRecoveryCompletedAt} is null`),
+    // BLO-19722 deliberately adds no index for the startup crash-recovery
+    // candidate scan: it runs once per worker boot under a LIMIT, so a plain
+    // scan of this table is cheaper than the index it would need. See the
+    // reasoning in migration 0208.
   }),
 );
