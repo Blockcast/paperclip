@@ -3046,6 +3046,761 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  it("BLO-18760: defaults projectId to the assignee's sole led project when no other workspace signal is present", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Board-filed issue with no project",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    expect(issue.projectId).toBe(projectId);
+  });
+
+  it("BLO-18760: leaves projectId null when the assignee leads no project", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "IC",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Board-filed issue, no project anywhere",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    expect(issue.projectId).toBeNull();
+  });
+
+  it("BLO-18760: leaves projectId null when the assignee leads more than one project (ambiguous)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values([
+      { id: randomUUID(), companyId, name: "Project A", status: "in_progress", leadAgentId: agentId },
+      { id: randomUUID(), companyId, name: "Project B", status: "in_progress", leadAgentId: agentId },
+    ]);
+
+    const issue = await svc.create(companyId, {
+      title: "Board-filed issue, ambiguous lead project",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    expect(issue.projectId).toBeNull();
+  });
+
+  it("BLO-18760: does not override an explicitly-provided projectId", async () => {
+    const companyId = randomUUID();
+    const ledProjectId = randomUUID();
+    const explicitProjectId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values([
+      { id: ledProjectId, companyId, name: "Led project", status: "in_progress", leadAgentId: agentId },
+      { id: explicitProjectId, companyId, name: "Explicit project", status: "in_progress" },
+    ]);
+
+    const issue = await svc.create(companyId, {
+      title: "Explicitly-bound issue",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      projectId: explicitProjectId,
+    });
+
+    expect(issue.projectId).toBe(explicitProjectId);
+  });
+
+  it("BLO-18760: derives projectId from an explicit projectWorkspaceId before led-project inference", async () => {
+    const companyId = randomUUID();
+    const ledProjectId = randomUUID();
+    const pinnedProjectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values([
+      { id: ledProjectId, companyId, name: "Led project", status: "in_progress", leadAgentId: agentId },
+      { id: pinnedProjectId, companyId, name: "Pinned workspace project", status: "in_progress" },
+    ]);
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId: pinnedProjectId,
+      name: "Pinned workspace",
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Issue pinned to a specific project workspace",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      projectWorkspaceId,
+    });
+
+    expect(issue.projectId).toBe(pinnedProjectId);
+    expect(issue.projectWorkspaceId).toBe(projectWorkspaceId);
+  });
+
+  // Ally review (PR #811): the `== null` check treats an explicit `projectId: null`
+  // identically to omitting the field. That is the intended contract, and it is the case
+  // that actually matters -- the board/UI create path posts an explicit null, so if this
+  // inferred nothing the BLO-18760 fix would never fire in production.
+  it("BLO-18760: infers the led project when projectId is explicitly null (same as omitted)", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Board-filed issue posting an explicit null projectId",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      projectId: null,
+    });
+
+    expect(issue.projectId).toBe(projectId);
+  });
+
+  // Ally review (PR #811): API clients may serialize nullable workspace fields as null.
+  // Those nulls do not carry workspace intent and must not suppress the same root-create
+  // project inference that `projectId: null` uses.
+  it("BLO-18760: infers the led project when nullable workspace override fields are explicitly null", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Board-filed issue posting explicit null workspace fields",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      projectId: null,
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+      executionWorkspaceSettings: null,
+    });
+
+    expect(issue.projectId).toBe(projectId);
+  });
+
+  // Ally review (PR #811) asked for explicit-null workspace fields to stop suppressing
+  // sole-led-project inference. Applying that to the SHARED override predicate also
+  // changed the two workspace-*inheritance* guards, which read the same three fields for
+  // the opposite purpose: recovery/service.ts creates a liveness escalation parented to
+  // the recovery issue and passes all three as null precisely so the escalation does NOT
+  // adopt the blocker's checkout. Under the merged predicate the nulls stopped counting,
+  // inheritance fired, and the escalation came out pinned to the parent's workspace with
+  // preference "reuse_existing" (caught by heartbeat-issue-liveness-escalation.test.ts).
+  // The two questions are now separate predicates; this pins the inheritance half so
+  // they cannot be re-merged silently.
+  it("BLO-18760: explicit null workspace fields still opt out of inheriting the parent's workspace", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const parentIssueId = randomUUID();
+
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace project",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "operator_branch",
+      strategyType: "git_worktree",
+      name: "Operator branch",
+      status: "active",
+      providerType: "git_worktree",
+    });
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Recovery issue holding a workspace",
+      status: "todo",
+      priority: "medium",
+      executionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: { mode: "operator_branch" },
+    });
+
+    // Same field set the recovery escalation sends on its no-reuse branch.
+    const escalation = await svc.create(companyId, {
+      title: "Unblock liveness incident",
+      status: "todo",
+      priority: "high",
+      parentId: parentIssueId,
+      projectId,
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+      executionWorkspaceSettings: null,
+    });
+
+    expect(escalation.parentId).toBe(parentIssueId);
+    expect(escalation.executionWorkspaceId).toBeNull();
+    expect(escalation.executionWorkspacePreference).toBeNull();
+  });
+
+  // Ally review (PR #811): archival is the only exclusion, so an archived led project
+  // must not be inferred even though it is the agent's sole lead.
+  it("BLO-18760: excludes archived led projects from inference", async () => {
+    const companyId = randomUUID();
+    const archivedProjectId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: archivedProjectId,
+      companyId,
+      name: "Archived project",
+      status: "in_progress",
+      leadAgentId: agentId,
+      archivedAt: new Date(),
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Issue whose assignee only leads an archived project",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    expect(issue.projectId).toBeNull();
+  });
+
+  // Ally review (PR #811): documents the deliberate other half of that policy -- project
+  // status describes the work, not the repo, so a completed/paused project's checkout is
+  // still a valid thing to inherit. Guards against someone "tightening" this to
+  // status === "in_progress" and silently reopening the strand for finished projects.
+  it("BLO-18760: still infers a completed (non-archived) led project", async () => {
+    const companyId = randomUUID();
+    const completedProjectId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: completedProjectId,
+      companyId,
+      name: "Completed project",
+      status: "completed",
+      leadAgentId: agentId,
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Issue whose assignee leads a completed project",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    expect(issue.projectId).toBe(completedProjectId);
+  });
+
+  // Ally review (PR #811, Important): the inference is scoped to ROOT creates. A child of
+  // an intentionally-projectless parent must stay projectless -- inferring would split
+  // parent and child across project, default goal, workspace policy, and repository, so
+  // the child would quietly work against a different repo than the parent it reports into.
+  // Both of the next two tests are needed: `parentId` and `workspaceInheritanceIssueId`
+  // are independent signals, and the guard has to hold when only one of them is present.
+  it("BLO-18760: leaves a child of a projectless parent projectless even when its assignee leads exactly one project", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    // Unassigned, so the root-create inference does not fire and the parent stays
+    // genuinely projectless -- the precondition this test needs.
+    const parent = await svc.create(companyId, {
+      title: "Intentionally projectless parent",
+      status: "todo",
+    });
+    expect(parent.projectId).toBeNull();
+
+    const child = await svc.create(companyId, {
+      parentId: parent.id,
+      title: "Child of a projectless parent",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+
+    expect(child.projectId).toBeNull();
+  });
+
+  // The `parentId == null` half of the guard is load-bearing on its own:
+  // `skipExecutionWorkspaceInheritance` nulls `workspaceInheritanceIssueId` while a parent
+  // still exists, which is exactly what the `inheritStrategyOnly` sub-issue path passes.
+  // Guarding only on `workspaceInheritanceIssueId` (the literal review suggestion) would
+  // let this case through.
+  it("BLO-18760: leaves a child projectless when workspace inheritance is skipped but a parent exists", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    const parent = await svc.create(companyId, {
+      title: "Intentionally projectless parent (skip-inheritance)",
+      status: "todo",
+    });
+    expect(parent.projectId).toBeNull();
+
+    const child = await svc.create(companyId, {
+      parentId: parent.id,
+      title: "Child with inheritance skipped",
+      status: "todo",
+      assigneeAgentId: agentId,
+      skipExecutionWorkspaceInheritance: true,
+    });
+
+    expect(child.projectId).toBeNull();
+  });
+
+  // The mirror case: no parent, but an explicit inheritance source. `parentId == null`
+  // alone would let this through, so the `workspaceInheritanceIssueId` half is load-bearing
+  // too.
+  it("BLO-18760: leaves projectId null when inheriting from an explicit projectless source issue", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    const source = await svc.create(companyId, {
+      title: "Projectless workspace source",
+      status: "todo",
+    });
+    expect(source.projectId).toBeNull();
+
+    const issue = await svc.create(companyId, {
+      title: "Issue inheriting from a projectless source",
+      status: "todo",
+      assigneeAgentId: agentId,
+      inheritExecutionWorkspaceFromIssueId: source.id,
+    });
+
+    expect(issue.projectId).toBeNull();
+  });
+
+  // Ally review (PR #811): unlike a workspace *id* (whose project_id is NOT NULL, so the
+  // blocks above always resolve a project from it), `executionWorkspacePreference` and
+  // `executionWorkspaceSettings` express workspace intent without carrying a project --
+  // they can reach the inference block with projectId still null. Inferring under them
+  // would pull in the led project's default goal, project workspace and repository behind
+  // the caller's back, and in the isolated_workspace case would turn a deliberate
+  // WORKSPACE_WORKTREE_REQUIRES_PROJECT rejection into a silent success.
+  //
+  // Both cases need enableIsolatedWorkspaces: when the flag is off, create() deletes these
+  // three fields outright, so hasExplicitExecutionWorkspaceOverride is already false and
+  // the guard is inert by construction -- which is correct, since the same flag also gates
+  // assertExplicitPinnedWorktreeIssueRunnable, so there is no rejection to preserve.
+  it("BLO-18760: does not infer a led project when the caller pins executionWorkspaceSettings", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Pinned shared workspace, deliberately projectless",
+      status: "todo",
+      assigneeAgentId: agentId,
+      executionWorkspaceSettings: { mode: "shared_workspace" },
+    });
+
+    expect(issue.projectId).toBeNull();
+  });
+
+  // The case with teeth: the assigned-agent variant of "rejects explicitly pinned isolated
+  // git worktrees without a project or reusable workspace" below. Pre-guard, inference
+  // supplied a projectId and this create SUCCEEDED, silently binding an explicitly
+  // projectless worktree request to whichever project the assignee happened to lead.
+  it("BLO-18760: still rejects a projectless isolated_workspace create for an assignee who leads one project", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    await expect(
+      svc.create(companyId, {
+        title: "Projectless worktree request",
+        status: "todo",
+        assigneeAgentId: agentId,
+        executionWorkspaceSettings: {
+          mode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree" },
+        },
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      message: WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
+      details: {
+        code: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
+        remediation: WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
+      },
+    });
+  });
+
+  it("BLO-18760: does not infer a led project when the caller pins executionWorkspacePreference", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "in_progress",
+      leadAgentId: agentId,
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Pinned workspace preference, deliberately projectless",
+      status: "todo",
+      assigneeAgentId: agentId,
+      executionWorkspacePreference: "agent_default",
+    });
+
+    expect(issue.projectId).toBeNull();
+  });
+
   it("inherits responsible user for agent-created child issues", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -8283,4 +9038,201 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     });
   });
 
+});
+
+// BLO-18797 review follow-up #2 (Ally, PR #814). The delegate-recovery PATCH is
+// authorized *because* the row reads `blocked` — i.e. nobody is actively
+// running it. The route loads that snapshot well before issueService.update
+// re-reads and writes by id, and under READ COMMITTED a concurrent assignee
+// checkout can commit in the gap. Without a write-time precondition the
+// recovery would clear the blockers and stamp `todo` over a live run, which is
+// precisely the active-run protection the narrow patch shape exists to
+// preserve. These exercise the guard against a real row whose status changes
+// underneath, rather than a mocked service.
+describeEmbeddedPostgres("issueService.update expectedCurrentStatus (BLO-18797)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-expected-status-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  });
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(heartbeatRuns);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(goals);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedBlockedIssue() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "MulticastEngineer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // issues.execution_run_id carries an FK to heartbeat_runs, so the stand-in
+    // checkout below needs a real run row to point at.
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Delegate recovery target",
+      status: "blocked",
+      priority: "critical",
+      assigneeAgentId: agentId,
+    });
+
+    return { companyId, agentId, issueId, runId };
+  }
+
+  it("applies the update when the row still carries the expected status", async () => {
+    const { issueId } = await seedBlockedIssue();
+
+    const updated = await svc.update(issueId, {
+      status: "todo",
+      blockedByIssueIds: [],
+      expectedCurrentStatus: "blocked",
+    });
+
+    expect(updated?.status).toBe("todo");
+  });
+
+  it("rejects with 409 when the row left the expected status before the write", async () => {
+    const { issueId, runId } = await seedBlockedIssue();
+
+    // Stand in for the concurrent assignee checkout that lands between the
+    // route's authorization snapshot and this write.
+    await db
+      .update(issues)
+      .set({ status: "in_progress", executionRunId: runId, executionAgentNameKey: "multicastengineer" })
+      .where(eq(issues.id, issueId));
+
+    await expect(
+      svc.update(issueId, {
+        status: "todo",
+        blockedByIssueIds: [],
+        expectedCurrentStatus: "blocked",
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+
+    // The live run must survive untouched — a 409 that still clobbered the row
+    // would defeat the whole point of the guard.
+    const row = await db
+      .select({ status: issues.status, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("in_progress");
+    expect(row?.executionRunId).toBe(runId);
+  });
+
+  it("rejects with 409 when the row is reassigned before the write, leaving blockers intact", async () => {
+    const { companyId, issueId, agentId } = await seedBlockedIssue();
+
+    const blockerId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: "Upstream blocker",
+      status: "todo",
+      priority: "high",
+    });
+    await db.insert(issueRelations).values({
+      id: randomUUID(),
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    // allow_manager_chain was granted because the assignee was a report of the
+    // actor. Hand the row to an unrelated agent while it stays `blocked`: an
+    // id+status predicate alone would still match, and the manager would clear
+    // a stranger's blockers under a grant that no longer holds.
+    const unrelatedAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: unrelatedAgentId,
+      companyId,
+      name: "UnrelatedEngineer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(issues).set({ assigneeAgentId: unrelatedAgentId }).where(eq(issues.id, issueId));
+
+    await expect(
+      svc.update(issueId, {
+        status: "todo",
+        blockedByIssueIds: [],
+        expectedCurrentStatus: "blocked",
+        expectedCurrentAssigneeAgentId: agentId,
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+
+    const row = await db
+      .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("blocked");
+    expect(row?.assigneeAgentId).toBe(unrelatedAgentId);
+
+    const remainingBlockers = await db
+      .select({ issueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, issueId));
+    expect(remainingBlockers.map((relation) => relation.issueId)).toEqual([blockerId]);
+  });
+
+  it("leaves ordinary updates unguarded when no expected status is supplied", async () => {    const { issueId } = await seedBlockedIssue();
+
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+
+    const updated = await svc.update(issueId, { title: "Renamed without a precondition" });
+
+    expect(updated?.title).toBe("Renamed without a precondition");
+    expect(updated?.status).toBe("in_progress");
+  });
 });

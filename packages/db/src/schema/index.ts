@@ -154,6 +154,7 @@ export { pluginJobs, pluginJobRuns } from "./plugin_jobs.js";
 export { pluginWebhookDeliveries } from "./plugin_webhooks.js";
 export { pluginLogs } from "./plugin_logs.js";
 export { pluginEventOutbox } from "./plugin_event_outbox.js";
+export { githubCommitStatusDeliveries } from "./github_commit_status_deliveries.js";
 export { syntheticSshProbeResults } from "./synthetic_ssh_probe_results.js";
 export { linearIssueLinks } from "./linear_issue_links.js";
 

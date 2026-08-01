@@ -18,10 +18,9 @@
  *
  * BLO-16554: extends the escalation-floor coverage below to the
  * effectiveMaxConcurrentRuns = 1 external-lifecycle case (BLO-15959
- * concurrencyEnabled default-off) -- a long-starved queued run must beat a
- * fresher, better-un-aged-rank contender for the agent's single slot the
- * instant that slot frees, not just dispatch because it was the only
- * candidate in the queue.
+ * concurrencyEnabled default-off) -- a long-starved queued run must advance
+ * as soon as critical work releases the agent's single slot, not just dispatch
+ * because it was the only candidate in the queue.
  */
 import { randomUUID } from "node:crypto";
 import { eq, inArray } from "drizzle-orm";
@@ -900,7 +899,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     expect(recoveryRun?.status).not.toBe("queued");
   });
 
-  it("dispatches a long-starved queued run ahead of a fresher critical-priority contender once the single external-lifecycle slot frees (BLO-16554)", async () => {
+  it("keeps critical work ahead of a long-starved non-critical run without stranding the aged run (BLO-16554, BLO-19337)", async () => {
     // Regression for BLO-16554: MulticastEngineer (opencode_k8s, external
     // lifecycle) had a queued retry sit `startedAt: null` for ~9.5h despite
     // being far past STARVATION_FULL_ESCALATION_MS (2h) and the agent's
@@ -910,14 +909,10 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     // false).
     //
     // This pins the "one non-stale running run holds the only slot" shape
-    // AND genuinely exercises the rank-0 escalation floor + createdAt
-    // tie-break for that shape: a second, fresher queued run at
+    // AND exercises the bounded aging floor: a second, fresher queued run at
     // critical priority (the best possible un-aged rank, 0) is queued
-    // alongside the starved run. Without the escalation floor the starved
-    // run (medium priority, un-aged rank 4) would lose outright to the
-    // fresh critical run. With the floor it ties the fresh run at rank 0
-    // and must win the createdAt-ascending tie-break as the older run --
-    // proving this isn't just "the only candidate gets the free slot".
+    // alongside the starved run. The critical run must retain the emergency
+    // lane, then the aged run must dispatch as soon as that slot frees.
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runningIssueId = randomUUID();
@@ -969,10 +964,9 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
         identifier: `${issuePrefix}-2`,
         startedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
       },
-      // Fresh contender: critical priority (un-aged rank 0, the best
-      // possible score) and just queued -- would beat the starved run
-      // outright on priority alone if the escalation floor didn't force
-      // the starved run's rank to 0 too and let it win on createdAt.
+      // Fresh contender: critical priority (un-aged rank 0, the best possible
+      // score) and just queued. Aging non-critical work must not erase this
+      // explicit emergency lane.
       {
         id: freshIssueId,
         companyId,
@@ -1067,20 +1061,15 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
       .where(eq(heartbeatRuns.id, runningRunId));
 
-    // Next slot-available tick: the long-starved run must win the single
-    // slot over the fresher critical-priority contender, not the other
-    // way around. (The mock adapter resolves instantly, so the fresh
-    // contender may also get dispatched once the starved run's slot frees
-    // again during drain -- the regression guard is ORDER, matching the
-    // BLO-12990 test above: the starved run must be claimed FIRST.)
+    // Next slot-available tick: critical work must win first. The mock adapter
+    // resolves instantly, so the aged run must then consume the next slot
+    // during queue drain rather than being stranded again.
     await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, freshRunId);
     await waitForRunToSettle(heartbeat, starvedRunId);
 
-    expect(dispatchedRunIds[0]).toBe(starvedRunId);
-    const freshDispatchIdx = dispatchedRunIds.indexOf(freshRunId);
-    if (freshDispatchIdx !== -1) {
-      expect(freshDispatchIdx).toBeGreaterThan(0);
-    }
+    expect(dispatchedRunIds[0]).toBe(freshRunId);
+    expect(dispatchedRunIds.indexOf(starvedRunId)).toBeGreaterThan(0);
 
     const starvedRun = await db
       .select({ status: heartbeatRuns.status })

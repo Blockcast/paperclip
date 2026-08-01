@@ -106,6 +106,33 @@ export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 // the run — it only stops subsequent wakes for the issue from being parked
 // behind a holder that may never start.
 export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
+// BLO-19941: the same backstop, for a holder wedged at `running`.
+//
+// `running` is neither missing nor terminal, so isCleanable() is false forever
+// and — unlike the pre-claim case — executionLockedAt cannot be the basis: a
+// healthy 4h run legitimately holds a 4h-old lock. Age must therefore be
+// measured against the run's own most-recent *genuine* activity
+// (lastUsefulActionAt > lastOutputAt > startedAt), which is exactly the metric
+// the dispatcher's slot gate uses (`nonStaleRunningRuns`,
+// heartbeat.ts:17162-17171) and the reaper's own silence test
+// (`persistedSignalRef`, heartbeat.ts:16283-16289). Deliberately NOT updatedAt:
+// review/recovery churn bumps it every ~minute and would shield a dead run
+// forever (BLO-8827, and the reaper's own note at heartbeat.ts:16444-16448).
+//
+// reapOrphanedRuns is the primary path and normally flips such a run terminal
+// within minutes, but it is not a guarantee: several of its skips are
+// clock-unbounded (a persistent duplicate-Job/identity mismatch recomputes
+// identically every pass; the in-memory runningProcesses/activeRunExecutions
+// skips last as long as the pod does; the hot-restart-adoption and detached-pid
+// holds have no ceiling). This is the backstop for when it does not fire.
+//
+// 2h sits well clear of the reaper's own floors — 15m EXTERNAL_LIFECYCLE_STALE_MS
+// and the 45m EXTERNAL_LIFECYCLE_HARD_STALE_MS that gates destructive kills — so
+// the reaper always gets its full chance first and this only fires once it has
+// demonstrably failed. Shorter than the 6h pre-claim bound on purpose: a
+// `queued` holder may legitimately be waiting on capacity, whereas a `running`
+// holder has already had its liveness independently evaluated every ~30s.
+export const STALE_RUNNING_ISSUE_LOCK_MS = 2 * 60 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 // BLO-7113: re-fire suppression for `stale_active_run_evaluation` wrappers.
 // When the underlying `runs.status='running'` row is the canonical
@@ -540,6 +567,31 @@ function isAutomaticContinuationRecoveryRun(
       latestRun.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
     )
   );
+}
+
+// Recovery handoffs for workspace-preflight failures used to route the operator to
+// a generic "restore a live execution path" instruction, which names neither the
+// failing check nor a first probe. Give the actual cause instead. (BLO-18784)
+const WORKSPACE_PREFLIGHT_RECOVERY_GUIDANCE: Record<string, string> = {
+  workspace_git_submodule_unavailable:
+    "the git submodule preflight (`git submodule status --recursive`) could not leave the execution " +
+    "workspace's submodules in a usable state. A merely slow inspection no longer strands an issue, " +
+    "so this handoff means one of three things: a submodule fault was actually detected (conflicted " +
+    "gitlinks, or still uninitialized after the automatic repair); the repair commands themselves " +
+    "failed -- which can be transient, e.g. a network/auth failure fetching a submodule; or the " +
+    "inspection itself failed deterministically (malformed `.gitmodules`, corrupt checkout, " +
+    "permission error, missing git binary). Check the run's failure output to tell them apart: if the " +
+    "repair failed transiently, re-running may be sufficient; if a gitlink is genuinely conflicted or " +
+    "`.gitmodules` will not parse, fix the shared checkout first.",
+  workspace_repo_mismatch:
+    "the execution workspace is checked out from a different repository than the issue expects. " +
+    "Repoint or re-provision the workspace, then re-run.",
+};
+
+function describeWorkspacePreflightRecoveryCause(latestRun: LatestIssueRun): string | null {
+  const errorCode = readNonEmptyString(latestRun?.errorCode);
+  if (!errorCode) return null;
+  return WORKSPACE_PREFLIGHT_RECOVERY_GUIDANCE[errorCode] ?? null;
 }
 
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
@@ -3982,6 +4034,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       : "none";
     const retryReason = readNonEmptyString(parseObject(input.latestRun?.contextSnapshot)?.retryReason) ?? "none";
     const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+    const workspacePreflightCause = describeWorkspacePreflightRecoveryCause(input.latestRun);
 
     return [
       "Paperclip stopped automatic stranded-work recovery for this recovery issue.",
@@ -3994,7 +4047,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       failureSummary ? `- Failure: ${failureSummary.trim()}` : "- Failure: none recorded",
       "- Guard: recovery issues do not create nested `stranded_issue_recovery` issues.",
       "",
-      "Next action: the current recovery owner should inspect the failed run evidence, restore a live execution path or record the manual resolution, then move this recovery issue out of `blocked`.",
+      workspacePreflightCause
+        ? `Next action: ${workspacePreflightCause} Then move this recovery issue out of \`blocked\`.`
+        : "Next action: the current recovery owner should inspect the failed run evidence, restore a live execution path or record the manual resolution, then move this recovery issue out of `blocked`.",
     ].join("\n");
   }
 
@@ -4548,6 +4603,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (isProviderQuotaWait) return updated;
 
       const prefix = await getCompanyIssuePrefix(fresh.companyId);
+      const workspacePreflightHandoffCause = describeWorkspacePreflightRecoveryCause(input.latestRun);
       const recoveryOwner = action.ownerAgentId ? await getAgent(action.ownerAgentId) : null;
       const sourceAssignee = fresh.assigneeAgentId ? await getAgent(fresh.assigneeAgentId) : null;
       let notice: SuccessfulRunHandoffNotice | null = null;
@@ -4592,7 +4648,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               `- ${reassignmentMarker}: taken over from ${agentUiLink(sourceAssignee, prefix)}, which can no longer PATCH or comment on this issue as its assignee.`,
             ]
             : []),
-          "- Next action: the recovery owner should restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
+          workspacePreflightHandoffCause
+            ? `- Next action: ${workspacePreflightHandoffCause}`
+            : "- Next action: the recovery owner should restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
         ].join("\n")
         : [
           "",
@@ -7363,11 +7421,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               id: heartbeatRuns.id,
               status: heartbeatRuns.status,
               scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+              startedAt: heartbeatRuns.startedAt,
+              lastOutputAt: heartbeatRuns.lastOutputAt,
+              lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
             })
             .from(heartbeatRuns)
             .where(inArray(heartbeatRuns.id, referencedRunIds))
         : [];
-    const runById = new Map<string, { status: string; scheduledRetryAt: Date | null }>();
+    const runById = new Map<string, {
+      status: string;
+      scheduledRetryAt: Date | null;
+      startedAt: Date | null;
+      lastOutputAt: Date | null;
+      lastUsefulActionAt: Date | null;
+    }>();
     for (const row of runRows) runById.set(row.id, row);
 
     const isCleanable = (runId: string | null) => {
@@ -7415,17 +7482,55 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       return false;
     };
 
+    // BLO-19941: the `running` counterpart. Keyed on the run's own most-recent
+    // genuine activity, never on executionLockedAt (a healthy long run holds an
+    // old lock) and never on updatedAt (churn-renewable, BLO-8827). Clearing is
+    // non-destructive in exactly the same way as the pre-claim case: the run row
+    // is left alone, releaseIssueExecutionAndPromote's write is guarded by
+    // `eq(executionRunId, run.id)` so a late finish cannot stomp a new holder,
+    // and a fresh claim re-stamps under `or(isNull, eq(self))`.
+    // Returns the timestamp the `running` bound is measured from, or null when
+    // the holder is not a `running` run at all.
+    const runningLockStaleBasis = (runId: string | null, lockedAt: Date | null) => {
+      if (!runId) return null;
+      const run = runById.get(runId);
+      if (run?.status !== "running") return null;
+      // A `running` row that has not stamped any signal yet is anomalous, but it
+      // is also the shape of a run mid-claim, so fall back to the lock timestamp
+      // rather than clearing a lock that was taken seconds ago.
+      return run.lastUsefulActionAt ?? run.lastOutputAt ?? run.startedAt ?? lockedAt;
+    };
+    const isRunningLockSilent = (runId: string | null, lockedAt: Date | null) => {
+      const basis = runningLockStaleBasis(runId, lockedAt);
+      if (!basis) return false;
+      return Date.now() - basis.getTime() >= STALE_RUNNING_ISSUE_LOCK_MS;
+    };
+
     for (const issue of candidates) {
-      const executionLockExpired = isPreClaimLockExpired(
+      const runningLockSilent = isRunningLockSilent(
         issue.executionRunId,
         issue.executionLockedAt,
       );
+      const executionLockExpired = isPreClaimLockExpired(
+        issue.executionRunId,
+        issue.executionLockedAt,
+      ) || runningLockSilent;
+      // BLO-19941: in the wedge shape both columns point at the SAME wedged run
+      // (checkout and execution are claimed together), so the checkout guard
+      // below would `continue` before the execution check ever ran, making this
+      // sweep a no-op for exactly the case it needs to cover. Allow the checkout
+      // guard to be satisfied only by the `running`-silent branch and only when
+      // it is literally the same run id — a *different* live checkout holder
+      // still keeps its lock, and a pre-claim expiry never bypasses it.
+      const checkoutHeldBySameSilentRun = runningLockSilent
+        && issue.checkoutRunId != null
+        && issue.checkoutRunId === issue.executionRunId;
       // Guards are kept separate on purpose. The update below nulls the
       // checkout *and* execution columns together, so the new pre-claim-expiry
       // allowance must not become a blanket bypass of the checkout check: an
       // issue whose checkoutRunId points at a live (non-terminal) run keeps its
       // checkout lock no matter how stale the execution lock is.
-      if (!isCleanable(issue.checkoutRunId)) continue;
+      if (!isCleanable(issue.checkoutRunId) && !checkoutHeldBySameSilentRun) continue;
       if (!isCleanable(issue.executionRunId) && !executionLockExpired) continue;
 
       const sweepOutcome = await db.transaction(async (tx) => {
@@ -7713,8 +7818,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           // the pre-claim lock timeout, so an operator reading the audit trail
           // can tell whether a lock was released because its run finished or
           // because it was never claimed within STALE_PRE_CLAIM_ISSUE_LOCK_MS.
-          reason: executionLockExpired ? "pre_claim_lock_expired" : "run_terminal_or_missing",
-          ...(executionLockExpired
+          // BLO-19941 adds the third case: a holder wedged at `running`.
+          reason: runningLockSilent
+            ? "running_lock_silent"
+            : executionLockExpired
+            ? "pre_claim_lock_expired"
+            : "run_terminal_or_missing",
+          ...(runningLockSilent
+            ? {
+              runningLockSilentMs: (() => {
+                const basis = runningLockStaleBasis(
+                  issue.executionRunId,
+                  issue.executionLockedAt,
+                );
+                return basis ? Date.now() - basis.getTime() : null;
+              })(),
+              runningLockTimeoutMs: STALE_RUNNING_ISSUE_LOCK_MS,
+            }
+            : executionLockExpired
             ? {
               preClaimLockHeldMs: issue.executionLockedAt
                 ? Date.now() - issue.executionLockedAt.getTime()
