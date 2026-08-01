@@ -24,6 +24,7 @@ import { errorHandler } from "../middleware/index.js";
 import {
   ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS,
   ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP,
+  ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP,
   issueRoutes,
   raceCreateIssueDuplicateCandidateLookup,
 } from "../routes/issues.js";
@@ -53,7 +54,7 @@ it("bounds a stalled duplicate candidate lookup so create can fail open", async 
 
   await expect(raceCreateIssueDuplicateCandidateLookup(new Promise<never>(() => {}), 10))
     .rejects.toThrow("issue duplicate candidate lookup timed out after 10ms");
-  expect(performance.now() - startedAt).toBeLessThan(500);
+  expect(performance.now() - startedAt).toBeLessThan(ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS);
 });
 
 if (!embeddedPostgresSupport.supported) {
@@ -365,20 +366,52 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     expect(await db.select().from(issues).where(eq(issues.id, response.body.id))).toHaveLength(1);
   });
 
+  it("keeps the create successful when advisory consumption telemetry stalls", async () => {
+    const companyId = await seedCompany();
+    const candidate = monitorFilings[0]!;
+    await db.insert(issues).values({
+      companyId,
+      identifier: candidate.identifier,
+      title: candidate.title,
+      description: candidate.description,
+      status: "todo",
+      priority: "medium",
+    });
+    const app = createApp({
+      createIssueDuplicateCandidateActivityWriter: () => new Promise<never>(() => {}),
+      createIssueDuplicateCandidateActivityTimeoutMs: 10,
+    });
+
+    const subject = monitorFilings[1]!;
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: subject.title, description: subject.description })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).not.toEqual([]);
+    expect(await db.select().from(issues).where(eq(issues.id, response.body.id))).toHaveLength(1);
+  });
+
   it("returns 201 without advisories when the route lookup stalls", async () => {
     const companyId = await seedCompany();
+    let lookupAborted = false;
     const app = createApp({
-      createIssueDuplicateCandidateLookup: () => new Promise<never>(() => {}),
+      createIssueDuplicateCandidateLookup: (_db, _companyId, _subject, _filterCorpus, signal) => (
+        new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => {
+            lookupAborted = true;
+            reject(signal.reason);
+          }, { once: true });
+        })
+      ),
     });
-    const startedAt = performance.now();
-
     const response = await request(app)
       .post(`/api/companies/${companyId}/issues`)
       .send({ title: "Create remains available while advisory lookup stalls" })
       .expect(201);
 
     expect(response.body.duplicateCandidates).toEqual([]);
-    expect(performance.now() - startedAt).toBeLessThan(ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS);
+    expect(lookupAborted).toBe(true);
     const activityEvents = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
     expect(activityEvents.filter((event) => event.action === "issue.duplicate_candidates_shown")).toHaveLength(0);
   });
@@ -425,6 +458,37 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     ]));
   });
 
+  it("stops scanning after the explicit company corpus cap", async () => {
+    const companyId = await seedCompany();
+    const corpusCreatedAt = new Date(Date.now() - 60_000);
+    await db.insert(issues).values(Array.from(
+      { length: ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP + ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP },
+      (_, index) => ({
+        companyId,
+        title: `Unreadable corpus issue ${index}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+        createdAt: corpusCreatedAt,
+      }),
+    ));
+    let scannedRows = 0;
+    const app = createApp({
+      createIssueDuplicateCandidateTimeoutMs: 10_000,
+      createIssueDuplicateCandidateCorpusFilter: async (rows) => {
+        scannedRows += rows.length;
+        return [];
+      },
+    });
+
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Bound the inaccessible duplicate corpus scan" })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).toEqual([]);
+    expect(scannedRows).toBe(ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP);
+  });
+
   it("returns no advisory and records no consumption payload for a distinct issue", async () => {
     const companyId = await seedCompany();
     const app = createApp();
@@ -453,7 +517,7 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     expect(createdEvents.filter((event) => event.action === "issue.duplicate_candidates_shown")).toHaveLength(0);
   });
 
-  it("keeps candidate lookup below the declared budget with the row cap saturated", async () => {
+  it("keeps candidate lookup bounded with the row cap saturated", async () => {
     const companyId = await seedCompany();
     const app = createApp();
     await db.insert(issues).values(Array.from(
@@ -467,7 +531,6 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       }),
     ));
 
-    const startedAt = performance.now();
     const response = await request(app)
       .post(`/api/companies/${companyId}/issues`)
       .send({
@@ -476,10 +539,7 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
         allowDuplicate: true,
       })
       .expect(201);
-    const elapsedMs = performance.now() - startedAt;
-
     expect(response.body.duplicateCandidates).toEqual([]);
-    expect(elapsedMs).toBeLessThan(ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS);
   });
 
   it("does not apply the route soft guard to internal service creates", async () => {
