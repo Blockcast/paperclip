@@ -298,7 +298,7 @@ import { recoveryService } from "./recovery/service.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
-import { withAgentStartLock } from "./agent-start-lock.js";
+import { runDetachedFromAgentStartLock, withAgentStartLock } from "./agent-start-lock.js";
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -415,6 +415,27 @@ const STALE_QUEUED_MAINTENANCE_WAKE_REASONS = [
   "transient_failure_retry",
 ] as const;
 export const PR_REVIEW_QUEUE_FAIRNESS_MAX_WAIT_MS = 10 * 60 * 1000;
+/**
+ * BLO-20396: upper bound on how many queued rows one dispatch pass reads.
+ *
+ * The pass previously read the agent's *entire* queued set and then resolved
+ * dependency readiness and issue state for all of it before claiming anything.
+ * Under backlog (observed: 229-240 rows for a single agent, oldest 5 days) that
+ * made the critical section long enough to blow the old 30s start-lock budget,
+ * which in turn let a second pass run concurrently — the failure this fixes.
+ *
+ * Rows are read oldest-first, which is coherent with the age-based starvation
+ * escalation in the priority sort: the oldest rows are the most starved. When a
+ * queue exceeds this bound the truncation is logged rather than silently
+ * applied, and the surplus is picked up by the next pass (each claim frees a
+ * slot and re-triggers dispatch).
+ */
+const QUEUED_RUN_DISPATCH_SCAN_LIMIT = 200;
+/**
+ * Issue statuses that make any queued run targeting them pointless. Matches the
+ * convention used by execution-workspaces / issue-tree-control / routines.
+ */
+const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
@@ -10566,15 +10587,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
+    return setRunStatusIfCurrentStatus(runId, "running", status, patch, "setRunStatusIfRunning");
+  }
+
+  /**
+   * BLO-20396: compare-and-swap a run that is still `queued`.
+   *
+   * Queued-run cleanup used to go through the by-id `setRunStatus`, which always
+   * reports success — so overlapping dispatch passes each believed they had
+   * cancelled the same row and each emitted a cancellation log/event, and a
+   * cleanup pass could stomp a row another pass had already claimed to
+   * `running`. Gating on `status = 'queued'` makes exactly one caller the
+   * winner and lets the losers stay silent.
+   */
+  async function setRunStatusIfQueued(
+    runId: string,
+    status: string,
+    patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+  ) {
+    return setRunStatusIfCurrentStatus(runId, "queued", status, patch, "setRunStatusIfQueued");
+  }
+
+  async function setRunStatusIfCurrentStatus(
+    runId: string,
+    expectedStatus: string,
+    status: string,
+    patch: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
+    label: string,
+  ) {
     // BLO-16998: same transient-retry rationale as setRunStatus — the guarded
-    // finalize UPDATE is idempotent (status set-by-id, gated on status="running")
-    // so replaying it on a transient failure is safe.
+    // finalize UPDATE is idempotent (status set-by-id, gated on the expected
+    // current status) so replaying it on a transient failure is safe.
     const updated = await runWithTransientDbRetry(
       () =>
         db
           .update(heartbeatRuns)
           .set({ status, ...patch, updatedAt: new Date() })
-          .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
+          .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, expectedStatus)))
           .returning()
           .then((rows) => rows[0] ?? null),
       {
@@ -10587,7 +10636,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sqlstate: (error as { code?: string } | null)?.code,
               err: error,
             },
-            "setRunStatusIfRunning write hit a transient db error; retrying (BLO-16998)",
+            `${label} write hit a transient db error; retrying (BLO-16998)`,
           ),
       },
     );
@@ -14649,7 +14698,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     staleness: Extract<QueuedRunStaleness, { stale: true }>,
   ) {
     const now = new Date();
-    const cancelled = await setRunStatus(run.id, "cancelled", {
+    // BLO-20396: CAS on status='queued'. This gate now runs eagerly for every
+    // scanned row (not just rows the dispatch walk reaches), so concurrent
+    // passes can target the same row — only the winner may emit the
+    // cancellation event and release the issue lock.
+    const outcome = await setRunStatusIfQueued(run.id, "cancelled", {
       finishedAt: now,
       error: staleness.reason,
       errorCode: staleness.errorCode,
@@ -14662,7 +14715,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         timeoutFired: false,
       },
     });
-    if (!cancelled) return null;
+    if (!outcome.updated) return null;
+    const cancelled = outcome.run;
 
     await setWakeupStatus(run.wakeupRequestId, "skipped", {
       finishedAt: now,
@@ -14845,7 +14899,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const now = new Date();
     const reason =
       "Cancelled because a sibling run is already dispatched for this issue; the surviving run will continue the work";
-    const cancelled = await setRunStatus(run.id, "cancelled", {
+    // BLO-20396: gate on status='queued'. Overlapping dispatch passes used to
+    // each report cancelling the same row (the by-id write always "succeeds"),
+    // and could stomp a row a concurrent pass had already claimed to `running`.
+    // Losing the CAS means someone else already handled this row — stay silent.
+    const outcome = await setRunStatusIfQueued(run.id, "cancelled", {
       finishedAt: now,
       error: reason,
       errorCode: "duplicate_dispatch_suppressed",
@@ -14858,7 +14916,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         timeoutFired: false,
       },
     });
-    if (!cancelled) return null;
+    if (!outcome.updated) return null;
+    const cancelled = outcome.run;
 
     await setWakeupStatus(run.wakeupRequestId, "skipped", {
       finishedAt: now,
@@ -16914,7 +16973,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const context = parseObject(run.contextSnapshot);
     const wakeReason = readNonEmptyString(context.wakeReason);
     const reason = "Cancelled stale non-issue maintenance wake backlog; the current or next timer wake represents latest state";
-    const cancelled = await setRunStatus(run.id, "cancelled", {
+    // BLO-20396: CAS on status='queued'. The SELECT that produced `run` is not
+    // carried into the write, so without this gate a concurrent dispatch that
+    // already claimed the row to `running` would be silently stomped back to
+    // `cancelled` — and counted as pruned.
+    const outcome = await setRunStatusIfQueued(run.id, "cancelled", {
       finishedAt: now,
       error: reason,
       errorCode: "stale_maintenance_wake_backlog",
@@ -16925,6 +16988,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         maintenanceCleanupAt: now.toISOString(),
       },
     });
+    if (!outcome.updated) return null;
+    const cancelled = outcome.run;
     await setWakeupStatus(run.wakeupRequestId, "cancelled", {
       finishedAt: now,
       error: reason,
@@ -17389,7 +17454,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         agent = (await getAgent(agentId)) ?? agent;
       }
 
-      const queuedRuns = await db
+      const scannedQueuedRuns = await db
         .select()
         .from(heartbeatRuns)
         .where(and(
@@ -17397,12 +17462,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           eq(heartbeatRuns.status, "queued"),
           cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
         ))
-        .orderBy(asc(heartbeatRuns.createdAt));
-      if (queuedRuns.length === 0) return [];
+        .orderBy(asc(heartbeatRuns.createdAt))
+        .limit(QUEUED_RUN_DISPATCH_SCAN_LIMIT);
+      if (scannedQueuedRuns.length === 0) return [];
+      if (scannedQueuedRuns.length >= QUEUED_RUN_DISPATCH_SCAN_LIMIT) {
+        logger.warn(
+          { agentId, scanLimit: QUEUED_RUN_DISPATCH_SCAN_LIMIT },
+          "startNextQueuedRunForAgent: queued backlog exceeds the dispatch scan limit; considering only the oldest rows this pass",
+        );
+      }
 
-      const dependencyReadiness = await listQueuedRunDependencyReadiness(agent.companyId, queuedRuns);
-      const queuedIssueIds = [...new Set(
-        queuedRuns
+      // Resolve issue state before anything else so invalid rows are pruned
+      // deterministically rather than lazily. Previously pruning only happened
+      // for rows the priority walk happened to reach, so a run targeting an
+      // already-terminal issue could sit queued indefinitely behind
+      // higher-priority work (observed: 21 such rows for one agent, oldest 20h).
+      const scannedIssueIds = [...new Set(
+        scannedQueuedRuns
           .map((run) => readNonEmptyString(parseObject(run.contextSnapshot).issueId))
           .filter((issueId): issueId is string => Boolean(issueId)),
       )];
@@ -17414,11 +17490,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .from(issues)
         .where(
-          queuedIssueIds.length > 0
-            ? and(eq(issues.companyId, agent.companyId), inArray(issues.id, queuedIssueIds))
+          scannedIssueIds.length > 0
+            ? and(eq(issues.companyId, agent.companyId), inArray(issues.id, scannedIssueIds))
             : sql`false`,
         );
       const issueById = new Map(issueRows.map((row) => [row.id, row]));
+
+      const queuedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+      let prunedTerminalIssueRuns = 0;
+      for (const queuedRun of scannedQueuedRuns) {
+        const issueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
+        // Only consider pruning when we positively know the issue is terminal.
+        // A missing row means cross-company or deleted and is left to the
+        // claim-time gate. Note this runs the SAME evaluator the claim path
+        // uses rather than a parallel rule, so every exemption it encodes
+        // (e.g. source_scoped_recovery_action wakes) and its established error
+        // codes still apply — the only change is that it is now evaluated for
+        // the whole scanned set instead of lazily for rows the walk reaches.
+        const issue = issueId ? issueById.get(issueId) : null;
+        if (issueId && issue && TERMINAL_ISSUE_STATUSES.has(issue.status)) {
+          const staleness = await evaluateQueuedRunStaleness(
+            queuedRun,
+            issueId,
+            parseObject(queuedRun.contextSnapshot),
+          );
+          if (staleness.stale) {
+            const cancelled = await cancelQueuedRunForStaleIssue(queuedRun, issueId, staleness);
+            if (cancelled) prunedTerminalIssueRuns += 1;
+            continue;
+          }
+        }
+        queuedRuns.push(queuedRun);
+      }
+      if (prunedTerminalIssueRuns > 0) {
+        logger.info(
+          { agentId, prunedTerminalIssueRuns },
+          "startNextQueuedRunForAgent: pruned queued runs targeting terminal issues",
+        );
+      }
+      if (queuedRuns.length === 0) return [];
+
+      const dependencyReadiness = await listQueuedRunDependencyReadiness(agent.companyId, queuedRuns);
       const companyAgents = await listCompanyAgentOrgRows(agent.companyId);
       const hasAgedPrReview = queuedRuns.some(
         (run) =>
@@ -17559,11 +17671,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (claimedRuns.length >= availableSlots) break;
         const queuedIssueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
         if (queuedIssueId && inFlightIssueIds.has(queuedIssueId)) {
-          await cancelQueuedRunForDuplicateDispatch(queuedRun, queuedIssueId);
-          logger.info(
-            { runId: queuedRun.id, agentId, issueId: queuedIssueId },
-            "startNextQueuedRunForAgent: cancelled duplicate queued run for in-flight issue",
-          );
+          // BLO-20396: only report the cancellation when this pass is the one
+          // that actually moved the row. Previously every overlapping pass
+          // logged it, which is why the same run ids appeared to be cancelled
+          // repeatedly.
+          const cancelled = await cancelQueuedRunForDuplicateDispatch(queuedRun, queuedIssueId);
+          if (cancelled) {
+            logger.info(
+              { runId: queuedRun.id, agentId, issueId: queuedIssueId },
+              "startNextQueuedRunForAgent: cancelled duplicate queued run for in-flight issue",
+            );
+          }
           continue;
         }
         const claimed = await claimQueuedRun(queuedRun, companyAgents);
@@ -17574,15 +17692,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
-        const execution = executeRun(claimedRun.id).catch((err) => {
-          logger.error({ err, runId: claimedRun.id }, "queued heartbeat execution failed");
-        });
+        // BLO-20396: detach from the start-lock context. executeRun is launched
+        // here but outlives the critical section, and on completion it calls
+        // startNextQueuedRunForAgent again to pick up the next queued run. If
+        // it inherited this pass's held-agent set that follow-up dispatch would
+        // look re-entrant and be coalesced away, stalling the queue.
+        const execution = runDetachedFromAgentStartLock(() =>
+          executeRun(claimedRun.id).catch((err) => {
+            logger.error({ err, runId: claimedRun.id }, "queued heartbeat execution failed");
+          }));
         inFlightExecutions.add(execution);
         void execution.finally(() => {
           inFlightExecutions.delete(execution);
         });
       }
       return claimedRuns;
+    }, {
+      // BLO-20396: a nested (reap → promote → dispatch) or coalesced call does
+      // not run its own queue-selection pass; the pass it folded into claims the
+      // work. "No runs claimed by this call" is the correct answer for it.
+      onCoalesced: (): Array<typeof heartbeatRuns.$inferSelect> => [],
     });
   }
 
