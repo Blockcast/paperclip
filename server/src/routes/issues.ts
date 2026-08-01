@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, gte, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, lt, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -203,7 +203,9 @@ import { externalObjectService } from "../services/external-objects.js";
 
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS = 30;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP = 200;
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP = 1_000;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS = 500;
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ACTIVITY_TIMEOUT_MS = 1_000;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS = 1_000;
 
 type CreateIssueDuplicateCandidate = {
@@ -222,16 +224,22 @@ type CreateIssueDuplicateCandidateRow = IssueDuplicateDocument & {
   status: string;
   originKind: string | null;
   originId: string | null;
+  createdAt: Date;
 };
 
 export function raceCreateIssueDuplicateCandidateLookup<T>(
   promise: Promise<T>,
   timeoutMs = ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS,
+  onTimeout?: () => void,
+  operation = "issue duplicate candidate lookup",
 ): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<T>((_, reject) => {
     timer = setTimeout(
-      () => reject(new Error(`issue duplicate candidate lookup timed out after ${timeoutMs}ms`)),
+      () => {
+        onTimeout?.();
+        reject(new Error(`${operation} timed out after ${timeoutMs}ms`));
+      },
       timeoutMs,
     );
   });
@@ -247,14 +255,23 @@ async function findCreateIssueDuplicateCandidates(
   filterCorpus?: (
     rows: CreateIssueDuplicateCandidateRow[],
   ) => Promise<CreateIssueDuplicateCandidateRow[]>,
+  signal?: AbortSignal,
 ): Promise<CreateIssueDuplicateCandidate[]> {
   const cutoff = new Date(
     Date.now() - ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS * 24 * 60 * 60 * 1_000,
   );
   const visibleCorpus: CreateIssueDuplicateCandidateRow[] = [];
-  let offset = 0;
+  let scannedRows = 0;
+  let cursor: { createdAt: Date; id: string } | null = null;
   do {
-    const corpus = await db
+    signal?.throwIfAborted();
+    const cursorCondition: SQL | undefined = cursor
+      ? or(
+          lt(issueRows.createdAt, cursor.createdAt),
+          and(eq(issueRows.createdAt, cursor.createdAt), lt(issueRows.id, cursor.id)),
+        )
+      : undefined;
+    const corpus: CreateIssueDuplicateCandidateRow[] = await db
       .select({
         id: issueRows.id,
         identifier: issueRows.identifier,
@@ -269,6 +286,7 @@ async function findCreateIssueDuplicateCandidates(
         status: issueRows.status,
         originKind: issueRows.originKind,
         originId: issueRows.originId,
+        createdAt: issueRows.createdAt,
       })
       .from(issueRows)
       .where(and(
@@ -276,15 +294,25 @@ async function findCreateIssueDuplicateCandidates(
         isNull(issueRows.hiddenAt),
         gte(issueRows.createdAt, cutoff),
         notInArray(issueRows.id, [subject.id]),
+        cursorCondition,
       ))
       .orderBy(desc(issueRows.createdAt), desc(issueRows.id))
-      .limit(ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP)
-      .offset(offset);
+      .limit(Math.min(
+        ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP,
+        ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP - scannedRows,
+      ));
+    signal?.throwIfAborted();
     const readable = filterCorpus ? await filterCorpus(corpus) : corpus;
+    signal?.throwIfAborted();
     visibleCorpus.push(...readable);
-    offset += corpus.length;
+    scannedRows += corpus.length;
+    const lastRow = corpus.at(-1);
+    cursor = lastRow ? { createdAt: lastRow.createdAt, id: lastRow.id } : null;
     if (!filterCorpus || corpus.length < ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP) break;
-  } while (visibleCorpus.length < ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP);
+  } while (
+    visibleCorpus.length < ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP
+    && scannedRows < ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP
+  );
 
   return findIssueDuplicateCandidates(
     subject,
@@ -2758,7 +2786,9 @@ export function issueRoutes(
       actor: { agentId?: string | null; userId?: string | null };
     }) => Promise<unknown>;
     createIssueDuplicateCandidateLookup?: typeof findCreateIssueDuplicateCandidates;
+    createIssueDuplicateCandidateTimeoutMs?: number;
     createIssueDuplicateCandidateActivityWriter?: typeof logActivity;
+    createIssueDuplicateCandidateActivityTimeoutMs?: number;
     createIssueDuplicateCandidateCorpusFilter?: (
       rows: CreateIssueDuplicateCandidateRow[],
     ) => Promise<CreateIssueDuplicateCandidateRow[]>;
@@ -8354,6 +8384,7 @@ export function issueRoutes(
     }
     let duplicateCandidates: CreateIssueDuplicateCandidate[] = [];
     try {
+      const lookupAbortController = new AbortController();
       duplicateCandidates = await raceCreateIssueDuplicateCandidateLookup((async () => {
         const canReadCompanyScope = await actorCanReadCompanyScope(req, companyId);
         return (opts.createIssueDuplicateCandidateLookup ?? findCreateIssueDuplicateCandidates)(db, companyId, {
@@ -8362,8 +8393,9 @@ export function issueRoutes(
           title: issue.title,
           description: issue.description,
         }, opts.createIssueDuplicateCandidateCorpusFilter
-          ?? (canReadCompanyScope ? undefined : (rows) => filterIssuesForActor(req, rows)));
-      })());
+          ?? (canReadCompanyScope ? undefined : (rows) => filterIssuesForActor(req, rows)),
+        lookupAbortController.signal);
+      })(), opts.createIssueDuplicateCandidateTimeoutMs, () => lookupAbortController.abort());
     } catch (err) {
       logger.warn(
         { err, companyId, issueId: issue.id, issueIdentifier: issue.identifier },
@@ -8415,21 +8447,27 @@ export function issueRoutes(
 
     if (duplicateCandidates.length > 0) {
       try {
-        await (opts.createIssueDuplicateCandidateActivityWriter ?? logActivity)(db, {
-          companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          agentApiKeyId: actor.agentApiKeyId,
-          action: "issue.duplicate_candidates_shown",
-          entityType: "company",
-          entityId: companyId,
-          details: {
-            identifier: issue.identifier,
-            duplicateCandidates: duplicateCandidates.map(({ identifier, score }) => ({ identifier, score })),
-          },
-        });
+        await raceCreateIssueDuplicateCandidateLookup(
+          (opts.createIssueDuplicateCandidateActivityWriter ?? logActivity)(db, {
+            companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "issue.duplicate_candidates_shown",
+            entityType: "company",
+            entityId: companyId,
+            details: {
+              identifier: issue.identifier,
+              duplicateCandidates: duplicateCandidates.map(({ identifier, score }) => ({ identifier, score })),
+            },
+          }),
+          opts.createIssueDuplicateCandidateActivityTimeoutMs
+            ?? ISSUE_CREATE_DUPLICATE_CANDIDATE_ACTIVITY_TIMEOUT_MS,
+          undefined,
+          "issue duplicate candidate consumption event",
+        );
       } catch (err) {
         logger.warn(
           { err, companyId, issueId: issue.id, issueIdentifier: issue.identifier },
