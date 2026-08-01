@@ -20,59 +20,33 @@ import {
   type PluginContext,
   type PluginWebhookInput,
 } from "@paperclipai/plugin-sdk";
-import { DEFAULT_ISSUE_ROUTE_MAP, DEFAULT_OWNER_MAP } from "./constants.js";
 import { handleWebhook } from "./webhook-handler.js";
 import { runAlertEscalationSweep } from "./escalation.js";
-import type {
-  AlertmanagerPluginConfig,
-  IssueRouteMap,
-  OwnerMap,
-} from "./types.js";
+import {
+  buildConfig,
+  isEmptyConfig,
+  resolveCompanyScope,
+  resolveWebhookToken,
+} from "./config-scope.js";
+import type { AlertmanagerPluginConfig } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Module-level worker state
 //
-// `setup()` populates these once at startup; the webhook handler reads them.
-// Pattern mirrors paperclip-plugin-slack/src/worker.ts:78–82.
+// `setup()` populates these once at startup; the escalation job reads them.
+//
+// These are a SINGLE-COMPANY snapshot and the webhook path must not rely on
+// them. The host hands the worker an empty bootstrap config whenever more than
+// one company has configured this plugin (see plugin-loader.ts — "multiple
+// company configs; legacy bootstrap scope disabled"), so on a multi-company
+// instance `setup()` resolves nothing and these stay null. Webhook deliveries
+// carry their own `companyId` and re-resolve per request instead.
 // ---------------------------------------------------------------------------
 
 let pluginCtx: PluginContext | null = null;
 let pluginConfig: AlertmanagerPluginConfig | null = null;
 /** Resolved bearer token, kept in memory only — never written to state. */
 let resolvedWebhookToken: string | null = null;
-
-function mergeOwnerMap(ownerMap: OwnerMap | undefined): OwnerMap {
-  const merged: OwnerMap = {};
-  for (const [labelKey, valueMap] of Object.entries(DEFAULT_OWNER_MAP)) {
-    merged[labelKey] = { ...valueMap };
-  }
-  for (const [labelKey, valueMap] of Object.entries(ownerMap ?? {})) {
-    merged[labelKey] = { ...(merged[labelKey] ?? {}), ...valueMap };
-  }
-  return merged;
-}
-
-function mergeIssueRouteMap(
-  issueRouteMap: IssueRouteMap | undefined,
-): IssueRouteMap {
-  const merged: IssueRouteMap = {};
-  for (const [labelKey, valueMap] of Object.entries(DEFAULT_ISSUE_ROUTE_MAP)) {
-    merged[labelKey] = {};
-    for (const [labelValue, route] of Object.entries(valueMap)) {
-      merged[labelKey][labelValue] = { ...route };
-    }
-  }
-  for (const [labelKey, valueMap] of Object.entries(issueRouteMap ?? {})) {
-    merged[labelKey] = { ...(merged[labelKey] ?? {}) };
-    for (const [labelValue, route] of Object.entries(valueMap)) {
-      merged[labelKey][labelValue] = {
-        ...(merged[labelKey][labelValue] ?? {}),
-        ...route,
-      };
-    }
-  }
-  return merged;
-}
 
 // ---------------------------------------------------------------------------
 // Internal: apply a freshly-resolved config snapshot to the worker's in-memory
@@ -84,11 +58,7 @@ async function applyConfig(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
 ): Promise<void> {
-  pluginConfig = {
-    ...config,
-    ownerMap: mergeOwnerMap(config.ownerMap),
-    issueRouteMap: mergeIssueRouteMap(config.issueRouteMap),
-  };
+  pluginConfig = buildConfig(config);
 
   if (!pluginConfig.defaultCompanyId) {
     ctx.logger.warn(
@@ -96,33 +66,26 @@ async function applyConfig(
     );
   }
 
-  // Resolve the bearer token once. The secret-ref path is the recommended
-  // production posture; webhookToken is the dev-mode fallback (documented as
-  // such in the manifest schema and README).
-  if (pluginConfig.webhookTokenRef) {
-    try {
-      resolvedWebhookToken = await ctx.secrets.resolve(pluginConfig.webhookTokenRef);
-    } catch (err) {
-      ctx.logger.error(
-        `paperclip-plugin-alertmanager: failed to resolve webhookTokenRef: ${String(err)}`,
-      );
-      resolvedWebhookToken = null;
-    }
-  } else if (pluginConfig.webhookToken) {
-    resolvedWebhookToken = pluginConfig.webhookToken;
-  } else {
-    ctx.logger.warn(
-      "paperclip-plugin-alertmanager: no webhookToken or webhookTokenRef configured — webhook endpoint will reject every request",
-    );
-    resolvedWebhookToken = null;
-  }
+  resolvedWebhookToken = await resolveWebhookToken(ctx, pluginConfig);
 }
 
 export const plugin = definePlugin({
   async setup(ctx) {
     pluginCtx = ctx;
-    const rawConfig = await ctx.config.get();
-    await applyConfig(ctx, rawConfig as unknown as AlertmanagerPluginConfig);
+    const rawConfig = (await ctx.config.get()) as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    if (isEmptyConfig(rawConfig)) {
+      // Expected on multi-company instances: the host withholds the legacy
+      // bootstrap scope, so there is no single config to snapshot. Webhook
+      // deliveries resolve per-company; only the escalation sweep is affected.
+      ctx.logger.info(
+        "paperclip-plugin-alertmanager: no bootstrap-scoped config (multi-company instance) — webhooks resolve config per delivery; the escalation sweep stays idle until a single-company scope exists",
+      );
+    } else {
+      await applyConfig(ctx, rawConfig as unknown as AlertmanagerPluginConfig);
+    }
     ctx.jobs.register("check-alert-escalations", async () => {
       if (pluginConfig) await runAlertEscalationSweep(ctx, pluginConfig);
     });
@@ -140,13 +103,23 @@ export const plugin = definePlugin({
 
   async onWebhook(input: PluginWebhookInput) {
     const ctx = pluginCtx;
-    const config = pluginConfig;
-    if (!ctx || !config) {
+    if (!ctx) {
       // Setup hasn't completed — bail safely instead of throwing so AM
       // doesn't see a 500 and retry storm us.
       return;
     }
-    await handleWebhook(ctx, config, resolvedWebhookToken, input);
+    // Resolve against the company that owns THIS delivery. The setup()
+    // snapshot is empty on multi-company instances, so trusting it here
+    // rejects every request with "unauthorized" until someone re-saves
+    // config — and again after the next restart.
+    const scope = await resolveCompanyScope(
+      ctx,
+      input.companyId,
+      pluginConfig,
+      resolvedWebhookToken,
+    );
+    if (!scope) return;
+    await handleWebhook(ctx, scope.config, scope.token, input);
   },
 
   async onHealth() {
