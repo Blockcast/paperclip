@@ -4,6 +4,7 @@ import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "dri
 import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
+  agentWakeupRequests,
   agents,
   documents,
   documentRevisions,
@@ -3371,6 +3372,35 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
               status: issues.status,
             });
           if (cancelledIssue) {
+            const cancelledRuns = await tx
+              .update(heartbeatRuns)
+              .set({
+                status: "cancelled",
+                finishedAt: now,
+                error: "Cancelled because the pipeline case left the automation issue's originating stage",
+                errorCode: "pipeline_stage_exited",
+                updatedAt: now,
+              })
+              .where(and(
+                eq(heartbeatRuns.companyId, input.companyId),
+                inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+                sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${cancelledIssue.id}`,
+              ))
+              .returning({ wakeupRequestId: heartbeatRuns.wakeupRequestId });
+            const wakeupRequestIds = cancelledRuns
+              .map((run) => run.wakeupRequestId)
+              .filter((id): id is string => Boolean(id));
+            if (wakeupRequestIds.length > 0) {
+              await tx
+                .update(agentWakeupRequests)
+                .set({
+                  status: "skipped",
+                  finishedAt: now,
+                  error: "Cancelled because the pipeline case left the automation issue's originating stage",
+                  updatedAt: now,
+                })
+                .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
+            }
             await tx.insert(issueComments).values({
               companyId: input.companyId,
               issueId: cancelledIssue.id,

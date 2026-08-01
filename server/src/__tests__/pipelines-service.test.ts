@@ -3,6 +3,7 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   createDb,
@@ -72,6 +73,7 @@ describeEmbeddedPostgres("pipelineService", () => {
     await db.delete(activityLog);
     await db.delete(routineRuns);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
     await db.delete(routines);
@@ -1697,6 +1699,24 @@ describeEmbeddedPostgres("pipelineService", () => {
       const issueId = entered.automationExecution.status === "succeeded"
         ? entered.automationExecution.execution.executionIssueId
         : null;
+      const wakeupRequestId = randomUUID();
+      const heartbeatRunId = randomUUID();
+      await db.insert(agentWakeupRequests).values({
+        id: wakeupRequestId,
+        companyId: company.id,
+        agentId: routine.assigneeAgentId!,
+        source: "assignment",
+        status: "queued",
+      });
+      await db.insert(heartbeatRuns).values({
+        id: heartbeatRunId,
+        companyId: company.id,
+        agentId: routine.assigneeAgentId!,
+        status: "queued",
+        invocationSource: "assignment",
+        wakeupRequestId,
+        contextSnapshot: { issueId },
+      });
 
       await svc.transitionCase({
         companyId: company.id,
@@ -1715,11 +1735,21 @@ describeEmbeddedPostgres("pipelineService", () => {
         .select({ body: issueComments.body })
         .from(issueComments)
         .where(eq(issueComments.issueId, issueId!));
+      const [heartbeatRun] = await db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, heartbeatRunId));
+      const [wakeupRequest] = await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId));
       expect(issue!.status).toBe("cancelled");
       expect(issue!.cancelledAt).not.toBeNull();
       expect(issue!.executionRunId).toBeNull();
       expect(link!.retiredAt).not.toBeNull();
       expect(link!.retiredReason).toBe("stage_exited");
+      expect(heartbeatRun).toEqual({ status: "cancelled", errorCode: "pipeline_stage_exited" });
+      expect(wakeupRequest!.status).toBe("skipped");
       expect(comments.map((comment) => comment.body)).toContain(
         `Pipeline case "Case ${caseKey}" (${caseKey}) left stage "Drafting". This stage-entry automation issue was cancelled because its work is no longer current.`,
       );
