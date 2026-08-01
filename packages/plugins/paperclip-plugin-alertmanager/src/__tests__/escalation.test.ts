@@ -843,4 +843,183 @@ describe("BLO-20467 sweep reads legacy instance state through the migration path
       );
     });
   });
+
+  /**
+   * The migration window that is genuinely specific to adoption, as opposed to
+   * the read-modify-write race every escalation write shares.
+   *
+   * `readAlertState` reads two keys in sequence. Between them, another caller
+   * can complete the whole migration — publish the scoped row and delete the
+   * legacy one. The second read then comes back empty for a reason that has
+   * nothing to do with the alert being new, and without the confirming re-read
+   * `handleFiring` files a duplicate issue and orphans the original, so the
+   * original can never be closed by its resolution.
+   */
+  describe("adoption survives a concurrent migration completing mid-read", () => {
+    const keyOfRef = (ref: { scopeKind: string; scopeId?: string; stateKey: string }) =>
+      `${ref.scopeKind}/${ref.scopeId ?? "-"}/${ref.stateKey}`;
+
+    it("dedups instead of creating a second issue when another caller migrated first", async () => {
+      const legacy = dueState("company-1");
+      const store = new Map<string, AlertStateRecord>([["instance/-/alert:fp-1", legacy]]);
+
+      // The other caller's completed migration, in `writeAlertState`'s order:
+      // scoped row first, legacy row deleted second.
+      const migrated: AlertStateRecord = { ...legacy, escalationAttempt: 1 };
+      let migratedYet = false;
+      const migrateBetweenReads = () => {
+        if (migratedYet) return;
+        migratedYet = true;
+        store.set("company/company-1/alert:fp-1", migrated);
+        store.delete("instance/-/alert:fp-1");
+      };
+
+      const mocks = {
+        state: {
+          get: vi.fn(async (ref: any) => {
+            const value = store.get(keyOfRef(ref)) ?? null;
+            // Fire the interleaving right after our scoped read misses, so our
+            // legacy read lands on the deleted row.
+            if (ref.scopeKind === "company") migrateBetweenReads();
+            return value;
+          }),
+          set: vi.fn(async (ref: any, value: AlertStateRecord) => { store.set(keyOfRef(ref), value); }),
+          delete: vi.fn(async (ref: any) => { store.delete(keyOfRef(ref)); }),
+        },
+        issues: {
+          get: vi.fn(async () => ({ id: "issue-1", status: "todo" })),
+          update: vi.fn(async () => ({})),
+          create: vi.fn(async () => ({ id: "issue-DUPLICATE", identifier: "BLO-DUP" })),
+          createComment: vi.fn(async () => ({})),
+        },
+        events: { emit: vi.fn() },
+        metrics: { write: vi.fn() },
+        logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      };
+
+      await handleFiring(mocks as unknown as PluginContext, config(), alert());
+
+      // The whole point: this alert is already tracked, so the create path must
+      // not run. Under a two-read adoption it did — both reads came back empty
+      // and `handleFiring` concluded the fingerprint was new.
+      expect(mocks.issues.create).not.toHaveBeenCalled();
+      expect(mocks.metrics.write).toHaveBeenCalledWith(
+        "alertmanager.firing.deduped", 1, expect.anything(),
+      );
+      // ...and it deduped against the row the other caller published, not a
+      // stale copy: the rung it already advanced to is still there.
+      expect(store.get("company/company-1/alert:fp-1")).toEqual(
+        expect.objectContaining({ paperclipIssueId: "issue-1", escalationAttempt: 1 }),
+      );
+      expect(migratedYet).toBe(true);
+    });
+
+    it("still reports a genuinely unknown fingerprint as new", async () => {
+      // The confirming re-read must not turn every new alert into a dedup. With
+      // nothing in either scope, the create path is still the right one.
+      const store = new Map<string, AlertStateRecord>();
+      const mocks = {
+        state: {
+          get: vi.fn(async (ref: any) => store.get(keyOfRef(ref)) ?? null),
+          set: vi.fn(async (ref: any, value: AlertStateRecord) => { store.set(keyOfRef(ref), value); }),
+          delete: vi.fn(async () => undefined),
+        },
+        issues: {
+          create: vi.fn(async () => ({ id: "issue-NEW", identifier: "BLO-NEW" })),
+          get: vi.fn(async () => ({ id: "issue-NEW", status: "todo" })),
+          update: vi.fn(async () => ({})),
+          createComment: vi.fn(async () => ({})),
+        },
+        agents: { get: vi.fn(async () => null) },
+        access: { members: { list: vi.fn(async () => []) } },
+        events: { emit: vi.fn() },
+        metrics: { write: vi.fn() },
+        activity: { log: vi.fn(async () => undefined) },
+        logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      };
+
+      await handleFiring(mocks as unknown as PluginContext, config(), alert());
+
+      expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  /**
+   * Substantiates the scope boundary claimed in `alert-state.ts`: the surviving
+   * last-write-wins hazard is the ordinary read-modify-write of any store
+   * without CAS, NOT something adoption introduces.
+   *
+   * An acting sweep reads a record, a webhook resolves the alert, and the
+   * sweep's write of the advanced rung lands afterwards and drops `resolvedAt`.
+   * Asserted as an EQUIVALENCE rather than as a correct outcome: it is the
+   * same loss whether the row was just adopted from the legacy key or has been
+   * company-scoped since it was created and never went near that key. Fixing it
+   * needs CAS or a plugin-namespace guarded write, and applies to every
+   * escalation write — tracked in BLO-20650.
+   *
+   * If BLO-20650 lands, this test fails and should be replaced by an assertion
+   * that BOTH arms keep the resolution. It must never be "fixed" by relaxing
+   * the equivalence — that would hide adoption regressing on its own.
+   */
+  describe("BLO-20650 the surviving write race is not adoption-specific", () => {
+    const keyOfRef = (ref: { scopeKind: string; scopeId?: string; stateKey: string }) =>
+      `${ref.scopeKind}/${ref.scopeId ?? "-"}/${ref.stateKey}`;
+
+    /**
+     * Run an ACTING (due) sweep whose webhook-resolution interleaving fires
+     * after the record has been read. `seedKey` decides whether the row starts
+     * in the legacy instance scope (adoption path) or the company scope
+     * (never-migrated path).
+     */
+    const actingSweepRacedByResolution = async (seedKey: string) => {
+      const due = dueState("company-1");
+      const store = new Map<string, AlertStateRecord>([[seedKey, due]]);
+      const resolvedByWebhook: AlertStateRecord = {
+        ...due,
+        resolvedAt: "2026-07-11T00:30:00Z",
+        escalationComplete: true,
+        nextEscalationAt: null,
+      };
+
+      let raced = false;
+      const { ctx, mocks } = (() => {
+        const inner = mapBackedSweepContext([]);
+        // Swap in our own store so both arms share identical mechanics.
+        (inner.mocks.state as any).get = vi.fn(async (ref: any) => {
+          const value = store.get(keyOfRef(ref)) ?? null;
+          // The webhook resolves once the sweep has its record in hand.
+          if (value && !raced) {
+            raced = true;
+            store.set("company/company-1/alert:fp-1", resolvedByWebhook);
+            store.delete("instance/-/alert:fp-1");
+          }
+          return value;
+        });
+        (inner.mocks.state as any).set = vi.fn(async (ref: any, value: AlertStateRecord) => {
+          store.set(keyOfRef(ref), value);
+        });
+        (inner.mocks.state as any).delete = vi.fn(async (ref: any) => { store.delete(keyOfRef(ref)); });
+        return inner;
+      })();
+
+      await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+      void mocks;
+      const final = store.get("company/company-1/alert:fp-1");
+      return { resolutionKept: final?.resolvedAt === "2026-07-11T00:30:00Z", raced };
+    };
+
+    it("loses the resolution identically for an adopted and a long-scoped row", async () => {
+      const adopted = await actingSweepRacedByResolution("instance/-/alert:fp-1");
+      const longScoped = await actingSweepRacedByResolution("company/company-1/alert:fp-1");
+
+      // Both interleavings actually happened — otherwise the equality below
+      // would be vacuously true.
+      expect(adopted.raced).toBe(true);
+      expect(longScoped.raced).toBe(true);
+
+      // The outcome does not depend on whether the row was adopted. That is the
+      // claim `alert-state.ts` makes, checked rather than argued.
+      expect(adopted.resolutionKept).toBe(longScoped.resolutionKept);
+    });
+  });
 });

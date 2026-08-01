@@ -289,16 +289,31 @@ company has configured the plugin. So:
   detects this and disables itself with a log line naming the cause, rather than
   walking into a denial per tick. Escalation ladders do not advance for anyone.
 
-`bootstrapCompanyId` is computed at **activation and never recomputed**, and
-saving config only fires `onConfigChanged` on a running worker — the host
-restarts the worker only for plugins that *don't* implement that hook. A change
-in the *number* of configured companies is therefore invisible until the plugin
-is reactivated for some other reason: after a 1 → 2 change the sweep keeps
-running scoped to the original company instead of disabling, and after 2 → 1 it
-stays disabled. Neither is detectable from inside the plugin, because no
+`bootstrapCompanyId` is computed at **activation and never recomputed**, and no
 worker-facing API enumerates a plugin's configured companies — the host has
 `registry.listConfigCompanyIds`, but the worker protocol does not expose it
-(BLO-20595). Restarting the plugin re-derives the scope correctly.
+(BLO-20595). So the worker can neither refresh that scope nor even observe that
+it has gone stale. Left alone, a change in the *number* of configured companies
+would stay invisible until the plugin was reactivated for some unrelated reason:
+after a 1 → 2 change the sweep would keep running scoped to the original company
+instead of disabling, and after 2 → 1 it would stay disabled.
+
+The plugin closes that gap by refusing to handle live config. `onConfigChanged`
+fails with `METHOD_NOT_IMPLEMENTED`, which is the host's documented signal that a
+worker cannot apply a config change in place — `PUT /plugins/:id/config` responds
+by restarting the worker, and `restartWorker` is a full deactivate + reactivate
+cycle, so the loader recomputes `bootstrapCompanyId` from the config rows as they
+now stand. Every `0 → 1`, `1 → 2`, and `2 → 1` transition therefore lands on the
+correct scope without operator action.
+
+Note this cannot be achieved by simply omitting the hook: the SDK's
+`handleConfigChanged` returns successfully when no handler is defined, so the
+host sees a success and never restarts. The code has to be raised deliberately.
+
+The cost is a worker bounce on every config save. That is cheap here — config
+saves are rare operator actions, and an in-flight delivery caught by the bounce
+fails into the host's 502, which Alertmanager retries, the same safe path an
+ordinary deploy takes.
 
 Delivery is unaffected by all of this: a webhook carries its own company scope.
 

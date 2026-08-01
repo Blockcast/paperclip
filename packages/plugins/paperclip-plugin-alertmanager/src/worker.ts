@@ -23,6 +23,7 @@ import {
 import { handleWebhook } from "./webhook-handler.js";
 import { runAlertEscalationSweep } from "./escalation.js";
 import {
+  configChangedRequiresRestart,
   resolveCompanyScope,
   resolveSweepScope,
 } from "./config-scope.js";
@@ -70,16 +71,24 @@ export const plugin = definePlugin({
   },
 
   async onConfigChanged() {
-    const ctx = pluginCtx;
-    if (!ctx) return;
-    // Nothing to apply: no config is cached anywhere in this worker. Webhook
-    // deliveries read their own company's config per request and the escalation
-    // sweep reads its scoped company's config per tick, so the next of either
-    // already sees this edit. Kept as a hook purely so the reload is visible in
-    // the log.
-    ctx.logger.info(
-      "paperclip-plugin-alertmanager: config updated; readers resolve config per invocation, so no restart is required",
+    // Deliberately fails with METHOD_NOT_IMPLEMENTED so the host restarts this
+    // worker (`server/src/routes/plugins.ts` → `lifecycle.restartWorker`).
+    //
+    // Nothing here needs a live update — no config is cached in this worker, so
+    // the delivery path already sees this edit. The restart is for the one
+    // thing this worker CANNOT refresh in place: the escalation sweep's company
+    // scope, frozen into `bootstrapCompanyId` when the worker spawned. Only a
+    // restart recomputes it, so a `0 -> 1`, `1 -> 2`, or `2 -> 1` change in
+    // configured companies would otherwise leave the sweep running against a
+    // scope that no longer matches the config.
+    //
+    // Returning normally — as this hook used to — is what suppresses that
+    // restart, and so is not the harmless no-op it reads as. See
+    // `configChangedRequiresRestart` for the full mechanism.
+    pluginCtx?.logger.info(
+      "paperclip-plugin-alertmanager: config changed; requesting a worker restart so the escalation sweep's company scope is recomputed",
     );
+    throw configChangedRequiresRestart();
   },
 
   async onWebhook(input: PluginWebhookInput) {
