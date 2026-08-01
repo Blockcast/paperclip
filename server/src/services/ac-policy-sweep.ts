@@ -114,13 +114,15 @@ function formatIssueRef(issue: AcPolicyStaleCandidate) {
 /**
  * `null` humanClockAt is rendered as its own condition rather than folded into an
  * age, per the BLO-19484 amendment: never touched by a human is worse than merely
- * stale, and must stay visibly distinct in the table.
+ * stale, and must stay visibly distinct in the table. `undefined` means this
+ * report input did not carry the clock, and malformed values stay unknown rather
+ * than being promoted to the stronger "never touched" claim.
  */
 function formatHumanClock(issue: AcPolicyStaleCandidate) {
-  if (!("humanClockAt" in issue)) return "";
-  if (issue.humanClockAt == null) return " [never touched by a human]";
+  if (issue.humanClockAt === undefined) return "";
+  if (issue.humanClockAt === null) return " [never touched by a human]";
   const at = issue.humanClockAt instanceof Date ? issue.humanClockAt : new Date(issue.humanClockAt);
-  if (Number.isNaN(at.getTime())) return " [never touched by a human]";
+  if (Number.isNaN(at.getTime())) return " [human touch unknown]";
   return ` [last human touch ${at.toISOString().slice(0, 10)}]`;
 }
 

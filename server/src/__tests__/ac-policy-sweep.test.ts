@@ -85,13 +85,11 @@ describe("AC-policy stale candidate partitioning (report-only)", () => {
     // Regression guard for BLO-19484 / BLO-19487. The 2026-06-08 run of the retired
     // step destroyed user-assigned strategic issue PCL-354. Reintroducing a batch
     // planner requires a fresh CEO ruling, not a new export here.
-    const exported = Object.keys(acPolicySweep);
-
-    expect(exported).not.toContain("planAcPolicyAutoCancelBatch");
-    expect(exported).not.toContain("DEFAULT_AC_POLICY_CANCEL_SAFETY_CAP");
-    for (const name of exported) {
-      expect(name.toLowerCase()).not.toContain("cancel");
-    }
+    expect(Object.keys(acPolicySweep).sort()).toEqual([
+      "classifyAcPolicyStaleCandidate",
+      "formatAcPolicyStaleDashboardSections",
+      "partitionAcPolicyStaleCandidates",
+    ]);
 
     const partitioned = partitionAcPolicyStaleCandidates([
       { id: "a", title: "Stale task", status: "todo", assigneeAgentId: "agent-1" },
@@ -213,9 +211,26 @@ describe("AC-policy stale candidate partitioning (report-only)", () => {
   it("omits the human-clock annotation entirely when the caller supplies no clock", () => {
     const output = formatAcPolicyStaleDashboardSections([
       { id: "no-clock", identifier: "BLO-22", title: "No clock supplied", status: "todo" },
+      { id: "undefined-clock", identifier: "BLO-23", title: "Undefined clock", status: "todo", humanClockAt: undefined },
     ]);
 
     expect(output).toContain("- BLO-22 (no-clock) - No clock supplied");
+    expect(output).toContain("- BLO-23 (undefined-clock) - Undefined clock");
+    expect(output).not.toContain("never touched by a human");
+  });
+
+  it("reports malformed human-clock values as unknown", () => {
+    const output = formatAcPolicyStaleDashboardSections([
+      {
+        id: "malformed-clock",
+        identifier: "BLO-24",
+        title: "Bad clock",
+        status: "todo",
+        humanClockAt: "not-a-date",
+      },
+    ]);
+
+    expect(output).toContain("- BLO-24 (malformed-clock) - Bad clock [human touch unknown]");
     expect(output).not.toContain("never touched by a human");
   });
 });
