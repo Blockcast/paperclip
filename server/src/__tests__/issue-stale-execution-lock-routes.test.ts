@@ -939,4 +939,258 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       .then((rows) => rows[0]);
     expect(run?.status).toBe("scheduled_retry");
   });
+
+  // BLO-20321: a run that exists but has never executed (`queued` /
+  // `scheduled_retry`, startedAt null) is non-terminal, so the old
+  // terminal-only staleness test treated it as a live owner and answered the
+  // assignee's own write with 409. That made WIP monotonic — checkout adds WIP
+  // without a lock, parking or closing needs one, and the lock was held by the
+  // very queue backlog being drained.
+  describe("never-started execution lock owners (BLO-20321)", () => {
+    async function seedIssueOwnedByRun(input: {
+      companyId: string;
+      agentId: string;
+      ownerRunId: string;
+      title: string;
+    }) {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: input.companyId,
+        title: input.title,
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: input.agentId,
+        checkoutRunId: input.ownerRunId,
+        executionRunId: input.ownerRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+      return issueId;
+    }
+
+    async function seedNeverStartedOwnerRun(input: {
+      companyId: string;
+      agentId: string;
+      status: "queued" | "scheduled_retry";
+    }) {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        status: input.status,
+        invocationSource: "assignment",
+        // The defining property: dispatched but never executed.
+        startedAt: null,
+        scheduledRetryAt:
+          input.status === "scheduled_retry" ? new Date(Date.now() + 60_000) : undefined,
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      });
+      return runId;
+    }
+
+    it("lets the assignee PATCH an issue whose execution lock is held by a queued run", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const queuedOwnerRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const issueId = await seedIssueOwnedByRun({
+        companyId,
+        agentId,
+        ownerRunId: queuedOwnerRunId,
+        title: "Queued owner blocks its own assignee",
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      const row = await db
+        .select({ status: issues.status, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row?.status).toBe("todo");
+      // The lock moved to the acting run rather than staying with the queued one.
+      expect(row?.executionRunId).not.toBe(queuedOwnerRunId);
+    });
+
+    it("cancels the superseded queued run so it cannot start against the new status", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const queuedOwnerRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const issueId = await seedIssueOwnedByRun({
+        companyId,
+        agentId,
+        ownerRunId: queuedOwnerRunId,
+        title: "Superseded queued owner is reaped",
+      });
+      // cancelStaleIssueContextRuns targets runs by contextSnapshot.issueId.
+      await db
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: { issueId } })
+        .where(eq(heartbeatRuns.id, queuedOwnerRunId));
+
+      await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo" })
+        .expect(200);
+
+      const ownerRun = await db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, queuedOwnerRunId))
+        .then((rows) => rows[0]);
+      expect(ownerRun?.status).toBe("cancelled");
+      // Reaped by whichever adoption path won; both cancel the superseded run.
+      expect(["issue_checkout_adopted", "issue_execution_lock_adopted"]).toContain(
+        ownerRun?.errorCode,
+      );
+    });
+
+    it("lets the assignee PATCH an issue whose execution lock is held by a scheduled_retry run", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const retryOwnerRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "scheduled_retry",
+      });
+      const issueId = await seedIssueOwnedByRun({
+        companyId,
+        agentId,
+        ownerRunId: retryOwnerRunId,
+        title: "Retry-scheduled owner blocks its own assignee",
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "cancelled" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      const row = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row?.status).toBe("cancelled");
+    });
+
+    it("lets the assignee release an issue whose checkout run never started", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const queuedOwnerRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const issueId = await seedIssueOwnedByRun({
+        companyId,
+        agentId,
+        ownerRunId: queuedOwnerRunId,
+        title: "Release past a queued owner",
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .post(`/api/issues/${issueId}/release`)
+        .send();
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      const row = await db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        status: "todo",
+        assigneeAgentId: null,
+        checkoutRunId: null,
+        executionRunId: null,
+      });
+    });
+
+    it("still refuses when the owning run is genuinely running under a different run id", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const runningOwnerRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runningOwnerRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "assignment",
+        // Started — this is a real owner, and the race protection must hold.
+        startedAt: new Date(),
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      });
+      const issueId = await seedIssueOwnedByRun({
+        companyId,
+        agentId,
+        ownerRunId: runningOwnerRunId,
+        title: "Live owner still conflicts",
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.error).toBe("Issue run ownership conflict");
+    });
+
+    it("does not widen the authorization boundary for a non-assignee peer", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const peerAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: peerAgentId,
+        companyId,
+        name: "PeerAgent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      const queuedOwnerRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const issueId = await seedIssueOwnedByRun({
+        companyId,
+        agentId,
+        ownerRunId: queuedOwnerRunId,
+        title: "Peer cannot ride the reap path",
+      });
+
+      const res = await request(createApp(agentActor(companyId, peerAgentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo" });
+
+      // Reaping happens strictly downstream of authorization, so a peer without a
+      // grant is refused before it is ever reached.
+      expect(res.status, JSON.stringify(res.body)).not.toBe(200);
+      expect([403, 409]).toContain(res.status);
+
+      const row = await db
+        .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({ status: "in_progress", assigneeAgentId: agentId });
+    });
+  });
 });
