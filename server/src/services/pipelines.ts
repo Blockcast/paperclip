@@ -2905,6 +2905,146 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     });
   }
 
+  async function retireStageAutomationLink(
+    tx: PipelineDb,
+    input: {
+      companyId: string;
+      linkId: string;
+      caseTitle: string;
+      caseKey: string;
+      stageName: string;
+    },
+  ) {
+    const row = await tx
+      .select({
+        issueId: issues.id,
+        issueStatus: issues.status,
+        issueOriginKind: issues.originKind,
+        issueOriginId: issues.originId,
+        issueOriginRunId: issues.originRunId,
+        issueExecutionRunId: issues.executionRunId,
+        issueCheckoutRunId: issues.checkoutRunId,
+        routineId: pipelineAutomationExecutions.routineId,
+      })
+      .from(pipelineCaseIssueLinks)
+      .innerJoin(
+        pipelineAutomationExecutions,
+        and(
+          eq(pipelineCaseIssueLinks.automationAttemptId, pipelineAutomationExecutions.id),
+          eq(pipelineCaseIssueLinks.issueId, pipelineAutomationExecutions.executionIssueId),
+        ),
+      )
+      .innerJoin(issues, eq(pipelineCaseIssueLinks.issueId, issues.id))
+      .where(and(
+        eq(pipelineCaseIssueLinks.id, input.linkId),
+        eq(pipelineCaseIssueLinks.companyId, input.companyId),
+        eq(pipelineCaseIssueLinks.role, "automation"),
+        isNull(pipelineCaseIssueLinks.retiredAt),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!row) return;
+
+    await tx.execute(sql`select id from ${issues} where ${issues.id} = ${row.issueId} for update`);
+    const now = nowDate();
+    const [retiredLink] = await tx
+      .update(pipelineCaseIssueLinks)
+      .set({ retiredAt: now, retiredReason: "stage_exited", updatedAt: now })
+      .where(and(
+        eq(pipelineCaseIssueLinks.id, input.linkId),
+        isNull(pipelineCaseIssueLinks.retiredAt),
+      ))
+      .returning({ id: pipelineCaseIssueLinks.id });
+    if (!retiredLink) return;
+
+    if (
+      ["done", "cancelled"].includes(row.issueStatus) ||
+      row.issueOriginKind !== "routine_execution" ||
+      row.issueOriginId !== row.routineId ||
+      !row.issueOriginRunId
+    ) {
+      return;
+    }
+
+    const [cancelledIssue] = await tx
+      .update(issues)
+      .set({
+        status: "cancelled",
+        cancelledAt: now,
+        completedAt: null,
+        checkoutRunId: null,
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(issues.id, row.issueId),
+        eq(issues.companyId, input.companyId),
+        eq(issues.status, row.issueStatus),
+        eq(issues.originKind, "routine_execution"),
+        eq(issues.originId, row.routineId),
+        eq(issues.originRunId, row.issueOriginRunId),
+        sql`${issues.executionRunId} is not distinct from ${row.issueExecutionRunId}`,
+        sql`${issues.checkoutRunId} is not distinct from ${row.issueCheckoutRunId}`,
+        sql`not exists (
+          select 1 from ${pipelineCaseIssueLinks} other_link
+          where other_link.company_id = ${input.companyId}
+            and other_link.issue_id = ${row.issueId}
+            and other_link.role = 'automation'
+            and other_link.retired_at is null
+        )`,
+      ))
+      .returning({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        title: issues.title,
+        status: issues.status,
+      });
+    if (!cancelledIssue) return;
+
+    const cancelledRuns = await tx
+      .update(heartbeatRuns)
+      .set({
+        status: "cancelled",
+        finishedAt: now,
+        error: "Cancelled because the pipeline case left the automation issue's originating stage",
+        errorCode: "pipeline_stage_exited",
+        updatedAt: now,
+      })
+      .where(and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${cancelledIssue.id}`,
+      ))
+      .returning({ wakeupRequestId: heartbeatRuns.wakeupRequestId });
+    const wakeupRequestIds = cancelledRuns
+      .map((run) => run.wakeupRequestId)
+      .filter((id): id is string => Boolean(id));
+    if (wakeupRequestIds.length > 0) {
+      await tx
+        .update(agentWakeupRequests)
+        .set({
+          status: "skipped",
+          finishedAt: now,
+          error: "Cancelled because the pipeline case left the automation issue's originating stage",
+          updatedAt: now,
+        })
+        .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
+    }
+    await tx.insert(issueComments).values({
+      companyId: input.companyId,
+      issueId: cancelledIssue.id,
+      authorType: "system",
+      body: `Pipeline case "${input.caseTitle}" (${input.caseKey}) left stage "${input.stageName}". This stage-entry automation issue was cancelled because its work is no longer current.`,
+    });
+    await finalizeSummarySlotsForTerminalIssue(tx, {
+      ...cancelledIssue,
+      status: "cancelled",
+    });
+  }
+
   async function validateStageTargets(companyId: string, pipelineId: string, kind: PipelineStageKind | string, config: PipelineStageConfig) {
     if (kind !== "review") return;
     const rows = await db
@@ -3013,27 +3153,47 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             : `Routine run ${run.id} did not create or coalesce an execution issue`,
         );
       }
-      const [updated] = await db
-        .update(pipelineAutomationExecutions)
-        .set({
-          status: "succeeded",
-          executionIssueId: run.linkedIssueId,
-          error: null,
-          updatedAt: nowDate(),
-        })
-        .where(eq(pipelineAutomationExecutions.id, execution.id))
-        .returning();
-      await db
-        .insert(pipelineCaseIssueLinks)
-        .values({
-          companyId: execution.companyId,
-          caseId: execution.caseId,
-          issueId: run.linkedIssueId,
-          role: "automation",
-          createdByRunId: null,
-          automationAttemptId: execution.id,
-        })
-        .onConflictDoNothing({ target: [pipelineCaseIssueLinks.caseId, pipelineCaseIssueLinks.issueId] });
+      const executionIssueId = run.linkedIssueId;
+      const updated = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as PipelineDb;
+        const current = await getCaseWithStageForUpdateOrThrow(txDb, execution.companyId, execution.caseId);
+        await txDb.execute(sql`select id from ${issues} where ${issues.id} = ${executionIssueId} for update`);
+        const [updatedExecution] = await txDb
+          .update(pipelineAutomationExecutions)
+          .set({
+            status: "succeeded",
+            executionIssueId,
+            error: null,
+            updatedAt: nowDate(),
+          })
+          .where(eq(pipelineAutomationExecutions.id, execution.id))
+          .returning();
+        const [link] = await txDb
+          .insert(pipelineCaseIssueLinks)
+          .values({
+            companyId: execution.companyId,
+            caseId: execution.caseId,
+            issueId: executionIssueId,
+            role: "automation",
+            createdByRunId: null,
+            automationAttemptId: execution.id,
+          })
+          .onConflictDoNothing({ target: [pipelineCaseIssueLinks.caseId, pipelineCaseIssueLinks.issueId] })
+          .returning({ id: pipelineCaseIssueLinks.id });
+        if (
+          link &&
+          (current.case.stageId !== detail.stage.id || current.case.version !== detail.case.version)
+        ) {
+          await retireStageAutomationLink(txDb, {
+            companyId: execution.companyId,
+            linkId: link.id,
+            caseTitle: current.case.title,
+            caseKey: current.case.caseKey,
+            stageName: detail.stage.name,
+          });
+        }
+        return updatedExecution!;
+      });
       await writeCaseEvent(db, {
         companyId: execution.companyId,
         caseId: execution.caseId,
@@ -3047,7 +3207,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           status: run.status,
         },
       });
-      return { status: "succeeded", execution: updated! };
+      return { status: "succeeded", execution: updated };
     } catch (error) {
       const permissionPreflight = error instanceof PipelinePermissionPreflightError ? error : null;
       const message = permissionPreflight
@@ -3312,12 +3472,6 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       const stageAutomationLinks = await tx
         .select({
           linkId: pipelineCaseIssueLinks.id,
-          issueId: issues.id,
-          issueStatus: issues.status,
-          issueOriginKind: issues.originKind,
-          issueOriginId: issues.originId,
-          issueOriginRunId: issues.originRunId,
-          routineId: pipelineAutomationExecutions.routineId,
         })
         .from(pipelineCaseIssueLinks)
         .innerJoin(
@@ -3328,7 +3482,6 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           ),
         )
         .innerJoin(pipelineCaseEvents, eq(pipelineAutomationExecutions.triggeringEventId, pipelineCaseEvents.id))
-        .innerJoin(issues, eq(pipelineCaseIssueLinks.issueId, issues.id))
         .where(and(
           eq(pipelineCaseIssueLinks.companyId, input.companyId),
           eq(pipelineCaseIssueLinks.caseId, current.id),
@@ -3336,90 +3489,14 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           isNull(pipelineCaseIssueLinks.retiredAt),
           eq(pipelineCaseEvents.toStageId, fromStage.id),
         ));
-      const now = nowDate();
       for (const row of stageAutomationLinks) {
-        if (
-          !["done", "cancelled"].includes(row.issueStatus) &&
-          row.issueOriginKind === "routine_execution" &&
-          row.issueOriginId === row.routineId &&
-          row.issueOriginRunId
-        ) {
-          const [cancelledIssue] = await tx
-            .update(issues)
-            .set({
-              status: "cancelled",
-              cancelledAt: now,
-              completedAt: null,
-              checkoutRunId: null,
-              executionRunId: null,
-              executionAgentNameKey: null,
-              executionLockedAt: null,
-              updatedAt: now,
-            })
-            .where(and(
-              eq(issues.id, row.issueId),
-              eq(issues.companyId, input.companyId),
-              eq(issues.status, row.issueStatus),
-              eq(issues.originKind, "routine_execution"),
-              eq(issues.originId, row.routineId),
-              eq(issues.originRunId, row.issueOriginRunId),
-            ))
-            .returning({
-              id: issues.id,
-              companyId: issues.companyId,
-              identifier: issues.identifier,
-              title: issues.title,
-              status: issues.status,
-            });
-          if (cancelledIssue) {
-            const cancelledRuns = await tx
-              .update(heartbeatRuns)
-              .set({
-                status: "cancelled",
-                finishedAt: now,
-                error: "Cancelled because the pipeline case left the automation issue's originating stage",
-                errorCode: "pipeline_stage_exited",
-                updatedAt: now,
-              })
-              .where(and(
-                eq(heartbeatRuns.companyId, input.companyId),
-                inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
-                sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${cancelledIssue.id}`,
-              ))
-              .returning({ wakeupRequestId: heartbeatRuns.wakeupRequestId });
-            const wakeupRequestIds = cancelledRuns
-              .map((run) => run.wakeupRequestId)
-              .filter((id): id is string => Boolean(id));
-            if (wakeupRequestIds.length > 0) {
-              await tx
-                .update(agentWakeupRequests)
-                .set({
-                  status: "skipped",
-                  finishedAt: now,
-                  error: "Cancelled because the pipeline case left the automation issue's originating stage",
-                  updatedAt: now,
-                })
-                .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
-            }
-            await tx.insert(issueComments).values({
-              companyId: input.companyId,
-              issueId: cancelledIssue.id,
-              authorType: "system",
-              body: `Pipeline case "${current.title}" (${current.caseKey}) left stage "${fromStage.name}". This stage-entry automation issue was cancelled because its work is no longer current.`,
-            });
-            await finalizeSummarySlotsForTerminalIssue(tx, {
-              ...cancelledIssue,
-              status: "cancelled",
-            });
-          }
-        }
-        await tx
-          .update(pipelineCaseIssueLinks)
-          .set({ retiredAt: now, retiredReason: "stage_exited", updatedAt: now })
-          .where(and(
-            eq(pipelineCaseIssueLinks.id, row.linkId),
-            isNull(pipelineCaseIssueLinks.retiredAt),
-          ));
+        await retireStageAutomationLink(tx, {
+          companyId: input.companyId,
+          linkId: row.linkId,
+          caseTitle: current.title,
+          caseKey: current.caseKey,
+          stageName: fromStage.name,
+        });
       }
     }
     if (forcedTransition) {
