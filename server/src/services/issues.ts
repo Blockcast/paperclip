@@ -5920,13 +5920,14 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (
         issue?.executionRunId !== input.expectedExecutionRunId ||
-        issue.checkoutRunId !== input.expectedCheckoutRunId ||
-        (issue.checkoutRunId !== null &&
-          issue.checkoutRunId !== input.actorRunId &&
-          issue.checkoutRunId !== input.expectedExecutionRunId)
+        issue.checkoutRunId !== input.expectedCheckoutRunId
       ) return false;
 
-      const run = await tx
+      const ownerRunIds = [...new Set([
+        input.expectedExecutionRunId,
+        input.expectedCheckoutRunId,
+      ].filter((runId): runId is string => Boolean(runId)))].sort();
+      const ownerRuns = await tx
         .select({
           id: heartbeatRuns.id,
           status: heartbeatRuns.status,
@@ -5934,13 +5935,32 @@ export function issueService(db: Db) {
           wakeupRequestId: heartbeatRuns.wakeupRequestId,
         })
         .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, input.expectedExecutionRunId))
+        .where(inArray(heartbeatRuns.id, ownerRunIds))
+        .orderBy(asc(heartbeatRuns.id))
         .for("update")
-        .then((rows) => rows[0] ?? null);
-      if (!(await cancelNeverStartedOwnerRun(tx, run, {
+      const ownerRunById = new Map(ownerRuns.map((run) => [run.id, run]));
+      const executionOwnerRun = ownerRunById.get(input.expectedExecutionRunId) ?? null;
+      const distinctCheckoutOwnerId = input.expectedCheckoutRunId !== null &&
+        input.expectedCheckoutRunId !== input.actorRunId &&
+        input.expectedCheckoutRunId !== input.expectedExecutionRunId
+          ? input.expectedCheckoutRunId
+          : null;
+      const distinctCheckoutOwnerRun = distinctCheckoutOwnerId
+        ? ownerRunById.get(distinctCheckoutOwnerId) ?? null
+        : null;
+      if (distinctCheckoutOwnerId && !isReapableHeartbeatRunRow(distinctCheckoutOwnerRun)) {
+        return false;
+      }
+
+      const cancellation = {
         reason: "Cancelled because the stale issue execution lock was released",
         errorCode: "issue_execution_lock_reaped",
-      }))) return false;
+      };
+      if (
+        !(await cancelNeverStartedOwnerRun(tx, executionOwnerRun, cancellation)) ||
+        (distinctCheckoutOwnerId &&
+          !(await cancelNeverStartedOwnerRun(tx, distinctCheckoutOwnerRun, cancellation)))
+      ) return false;
 
       const cleared = await tx
         .update(issues)
