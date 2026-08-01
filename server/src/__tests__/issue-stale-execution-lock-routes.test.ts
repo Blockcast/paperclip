@@ -1292,6 +1292,63 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         executionRunId: liveExecutionRunId,
       });
     });
+
+    it("does not clear a reapable execution owner behind a divergent live checkout owner", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const liveCheckoutRunId = randomUUID();
+      const queuedExecutionRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const issueId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: liveCheckoutRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "assignment",
+        startedAt: new Date(),
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Live checkout owner protection",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: liveCheckoutRunId,
+        executionRunId: queuedExecutionRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const response = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Must not land" });
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+
+      const row = await db
+        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        checkoutRunId: liveCheckoutRunId,
+        executionRunId: queuedExecutionRunId,
+      });
+
+      const owners = await db
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, [liveCheckoutRunId, queuedExecutionRunId]));
+      expect(new Map(owners.map((owner) => [owner.id, owner.status]))).toEqual(
+        new Map([
+          [liveCheckoutRunId, "running"],
+          [queuedExecutionRunId, "queued"],
+        ]),
+      );
+    });
   });
 
   it("allows only one concurrent decision from a participant whose assignee drifted", async () => {
