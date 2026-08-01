@@ -88,13 +88,30 @@ export interface InstallCrashGuardOptions {
 
 const MAX_CAUSE_DEPTH = 10;
 
+/**
+ * Reads one error field without letting a throwing getter escape.
+ *
+ * `name`/`message`/`stack`/`cause` are plain properties on a normal Error but
+ * getters on subclasses and proxies, and this whole module runs *before* the
+ * synchronous breadcrumb the header calls load-bearing. Installing a handler
+ * also suppresses Node's default printer, so a throw in here would cost us the
+ * breadcrumb and the stack Node would otherwise have printed for free.
+ */
+function readErrorField(read: () => unknown): string | undefined {
+  try {
+    const value = read();
+    return typeof value === "string" ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function serializeOne(value: unknown): SerializedError {
   if (value instanceof Error) {
-    return {
-      name: value.name,
-      message: value.message,
-      ...(value.stack ? { stack: value.stack } : {}),
-    };
+    const name = readErrorField(() => value.name) ?? "Error";
+    const message = readErrorField(() => value.message) ?? "<unreadable message>";
+    const stack = readErrorField(() => value.stack);
+    return { name, message, ...(stack ? { stack } : {}) };
   }
   // `throw "boom"` and `Promise.reject({code:…})` both reach here. Keep the
   // raw rendering rather than coercing to an Error: the shape of what was
@@ -126,10 +143,19 @@ export function serializeCauseChain(error: unknown): SerializedError[] {
     if (typeof current === "object" && seen.has(current)) break;
     if (typeof current === "object") seen.add(current);
     chain.push(serializeOne(current));
-    current = current instanceof Error ? (current as { cause?: unknown }).cause : undefined;
+    current = current instanceof Error ? readCause(current) : undefined;
   }
 
   return chain;
+}
+
+/** `cause` is library-controlled and may be a throwing getter; see `readErrorField`. */
+function readCause(error: Error): unknown {
+  try {
+    return (error as { cause?: unknown }).cause;
+  } catch {
+    return undefined;
+  }
 }
 
 /** One-line stderr rendering; the structured record goes to pino separately. */
@@ -179,7 +205,15 @@ export function installProcessCrashGuard(options: InstallCrashGuardOptions): () 
       /* exit() below remains authoritative */
     }
 
-    const causeChain = serializeCauseChain(error);
+    // Belt-and-braces over the hardening inside `serializeCauseChain`: this runs
+    // before the breadcrumb, so an empty chain (which still renders a usable
+    // line) beats a throw that would cost us the breadcrumb entirely.
+    let causeChain: SerializedError[];
+    try {
+      causeChain = serializeCauseChain(error);
+    } catch {
+      causeChain = [];
+    }
 
     // Synchronous first, always — see the module header. If everything after
     // this line fails, this one line still reaches `kubectl logs --previous`.

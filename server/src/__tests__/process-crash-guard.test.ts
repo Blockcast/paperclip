@@ -64,6 +64,28 @@ describe("serializeCauseChain", () => {
     expect(chain.length).toBeGreaterThan(0);
     expect(chain.length).toBeLessThanOrEqual(10);
   });
+
+  it("survives throwing name/message/stack/cause getters", () => {
+    // `name`/`message`/`stack`/`cause` are plain properties on a normal Error but
+    // getters on subclasses and proxies. This runs before the synchronous
+    // breadcrumb, and installing the guard suppresses Node's default printer —
+    // so a throw here would lose both the breadcrumb and the stack we'd have got
+    // for free without the guard, which is worse than not having one.
+    const hostile = new Error("unreadable");
+    for (const field of ["name", "message", "stack", "cause"]) {
+      Object.defineProperty(hostile, field, {
+        get() {
+          throw new Error(`hostile ${field} getter`);
+        },
+      });
+    }
+
+    const chain = serializeCauseChain(hostile);
+
+    expect(chain).toHaveLength(1);
+    expect(chain[0]).toMatchObject({ name: "Error", message: "<unreadable message>" });
+    expect(chain[0]?.stack).toBeUndefined();
+  });
 });
 
 describe("installProcessCrashGuard (BLO-19722)", () => {
@@ -140,6 +162,27 @@ describe("installProcessCrashGuard (BLO-19722)", () => {
     processRef.emit("uncaughtException", new Error("db gone"));
 
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(CRASH_GUARD_EXIT_CODE));
+  });
+
+  it("still exits when the thrown error's own getters throw", async () => {
+    // End-to-end companion to the serializeCauseChain case above: a hostile
+    // error must not be able to preempt the exit, which is the one thing the
+    // guard has to guarantee.
+    const processRef = fakeProcess();
+    const exit = vi.fn();
+    const onCrash = vi.fn().mockResolvedValue(undefined);
+    const hostile = new Error("unreadable");
+    Object.defineProperty(hostile, "stack", {
+      get() {
+        throw new Error("hostile stack getter");
+      },
+    });
+
+    installProcessCrashGuard({ logger: fakeLogger(), onCrash, exit, processRef });
+    processRef.emit("uncaughtException", hostile);
+
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(CRASH_GUARD_EXIT_CODE));
+    expect(onCrash).toHaveBeenCalled();
   });
 
   it("exits immediately if a second crash arrives while handling the first", async () => {

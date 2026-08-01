@@ -1,7 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
+import {
+  agentWakeupRequests,
+  agents,
+  companies,
+  createDb,
+  heartbeatRunEvents,
+  heartbeatRuns,
+} from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -42,8 +49,12 @@ describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
   afterEach(async () => {
     // runningProcesses is module-level and shared across service instances.
     runningProcesses.clear();
-    // FK order: runs reference agents reference companies.
+    // FK order: events reference runs reference agents reference companies.
+    // Crash marking appends a lifecycle event and enqueues a retry, so both
+    // events and wakeup requests exist by the time a test finishes.
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -81,6 +92,10 @@ describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
         triggerDetail: "system",
         status: input.status ?? "running",
         externalRunId: input.externalRunId ?? null,
+        // A dispatched run always carries this; the process-loss retry path
+        // refuses to re-queue without it (`responsible_user_unresolved`), so
+        // omitting it here would make the retry assertion vacuous.
+        responsibleUserId: "crash-test-user",
         contextSnapshot: {},
       })
       .returning();
