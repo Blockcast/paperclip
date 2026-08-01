@@ -8390,11 +8390,13 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        if (issueData.parentId !== undefined) {
+          await lockIssueParentMutationCompany(existing.companyId, tx);
+        }
         if (blockedByIssueIds !== undefined) {
           await lockBlockedByIssueRowsForUpdate(id, existing.companyId, blockedByIssueIds, tx);
         }
         if (issueData.parentId !== undefined) {
-          await lockIssueParentMutationCompany(existing.companyId, tx);
           await assertValidIssueParent(existing.companyId, id, issueData.parentId, tx);
         }
         await tx.execute(

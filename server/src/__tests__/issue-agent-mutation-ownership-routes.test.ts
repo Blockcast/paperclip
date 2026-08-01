@@ -1468,6 +1468,39 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).toHaveBeenCalled();
   });
 
+  it("lets CEO coordination metadata bypass a foreign recovery-action owner guard", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+    mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
+    mockIssueService.update.mockResolvedValue(
+      makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, blockedByIssueIds: [] }),
+    );
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction({
+      ownerAgentId: staleAgentId,
+    }) as never);
+    mockAccessService.decide.mockImplementation(async (input: { action: string; scope?: Record<string, unknown> }) => {
+      if (input.action === "issue:read") {
+        return { allowed: true, action: input.action, reason: "allow_company_agent", explanation: "read." };
+      }
+      if (input.action === "issue:mutate" && input.scope?.coordinationMetadataOnly === true) {
+        return { allowed: true, action: input.action, reason: "allow_ceo_coordination_metadata", explanation: "ceo." };
+      }
+      return { allowed: false, action: input.action, reason: "deny_missing_grant", explanation: "denied." };
+    });
+
+    const res = await request(await createApp(ceoActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ blockedByIssueIds: [] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        blockedByIssueIds: [],
+        actorAgentId: ceoAgentId,
+      }),
+    );
+  });
+
   it("does not treat a body carrying work content as coordination-metadata-only, even for the CEO", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
     mockAccessService.decide.mockImplementation(async (input: { action: string; scope?: Record<string, unknown> }) => {

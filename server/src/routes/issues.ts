@@ -4066,6 +4066,7 @@ export function issueRoutes(
       allowScopedRecoveryOwnerSourceMutation?: boolean;
       allowRecoveryActionOwner?: boolean;
       coordinationMetadataOnly?: boolean;
+      onBoundaryDecision?: (decision: Awaited<ReturnType<typeof decideIssueAccess>>) => void;
     } = {},
   ) {
     if (req.actor.type !== "agent") return true;
@@ -4093,6 +4094,7 @@ export function issueRoutes(
       "issue:mutate",
       options.coordinationMetadataOnly ? { coordinationMetadataOnly: true } : undefined,
     );
+    options.onBoundaryDecision?.(boundaryDecision);
     if (!boundaryDecision.allowed) {
       if (await isActiveRecoveryActionOwner()) return true;
       respondIssueBoundaryDenied(res, boundaryDecision);
@@ -8353,6 +8355,7 @@ export function issueRoutes(
       )
       : false;
     const coordinationMetadataOnly = isCeoCoordinationMetadataOnlyPatchBody(req.body);
+    let allowedByCeoCoordinationMetadata = false;
     if (!(await assertAgentIssueMutationAllowed(
       req,
       res,
@@ -8361,6 +8364,10 @@ export function issueRoutes(
         allowBlockedCorrection: true,
         allowScopedRecoveryOwnerSourceMutation,
         coordinationMetadataOnly,
+        onBoundaryDecision: (decision) => {
+          allowedByCeoCoordinationMetadata =
+            decision.allowed && decision.reason === "allow_ceo_coordination_metadata";
+        },
       },
     ))) return;
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
@@ -8429,6 +8436,7 @@ export function issueRoutes(
       : null;
     if (
       recoveryRelevantSourceMutationRequested &&
+      !allowedByCeoCoordinationMetadata &&
       !(await assertRecoveryActionAuthority(
         req,
         res,

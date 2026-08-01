@@ -7524,6 +7524,74 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  it("does not deadlock a combined parent and blocker update against a parent-only update", async () => {
+    const companyId = randomUUID();
+    const issuePId = randomUUID();
+    const issueQId = randomUUID();
+    const issueXId = randomUUID();
+    const issueYId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      {
+        id: issuePId,
+        companyId,
+        title: "Issue P",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueQId,
+        companyId,
+        title: "Issue Q",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueXId,
+        companyId,
+        title: "Issue X",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueYId,
+        companyId,
+        title: "Issue Y",
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+
+    const results = await Promise.allSettled([
+      svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueYId] }),
+      svc.update(issueYId, { parentId: issueQId }),
+    ]);
+
+    for (const result of results) {
+      if (result.status === "rejected") {
+        expect(String(result.reason?.message ?? result.reason)).not.toMatch(/deadlock/i);
+      }
+    }
+    expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+
+    const [issueX, issueY] = await Promise.all([
+      svc.getById(issueXId),
+      svc.getById(issueYId),
+    ]);
+    expect(issueX?.parentId).toBe(issuePId);
+    expect(issueY?.parentId).toBe(issueQId);
+    await expect(svc.getRelationSummaries(issueXId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: issueYId })],
+    });
+  });
+
   it("rejects updates that pin a projectless issue to an isolated git worktree", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
