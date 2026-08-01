@@ -21,7 +21,8 @@ import { unprocessable } from "../errors.js";
 // ---------------------------------------------------------------------------
 
 function invalidSecretRef(secretRef: unknown): Error {
-  const rendered = typeof secretRef === "string" ? secretRef : JSON.stringify(secretRef);
+  const rendered =
+    typeof secretRef === "string" ? secretRef.trim() || "<empty>" : JSON.stringify(secretRef);
   const err = new Error(
     `Invalid secret reference for plugin: ${rendered ?? "<empty>"}. Use { type: "secret_ref", secretId, version? }`,
   );
@@ -45,15 +46,34 @@ function parseSecretRefBinding(value: unknown): EnvSecretRefBinding | null {
   return parsed.success ? parsed.data : null;
 }
 
+/**
+ * Legacy plugin configs stored a secret reference as a bare UUID string, and
+ * plugin `instanceConfigSchema`s still declare those fields as
+ * `type: "string", format: "secret-ref"`. Requiring the object form on both the
+ * write and resolve paths made those configs unwritable *and* unresolvable —
+ * the JSON-schema validator rejects the object, the secret-ref validator
+ * rejects the string, so no value satisfied both (BLO-20219).
+ *
+ * Coerce the legacy spelling to the object binding instead. Omitting `version`
+ * selects `latest`, which is exactly what the bare-string form always meant.
+ * Callers must only opt into this at schema-declared `format: "secret-ref"`
+ * paths, so an unrelated UUID-shaped config value is never treated as a secret.
+ */
+function coerceLegacySecretRef(value: unknown): EnvSecretRefBinding | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!isUuidSecretRef(trimmed)) return null;
+  return parseSecretRefBinding({ type: "secret_ref", secretId: trimmed });
+}
+
 function assertSecretRefBinding(
   value: unknown,
   path: string,
-  rejectLegacyUuid = false,
+  allowLegacyUuid = false,
 ): EnvSecretRefBinding | null {
-  if (rejectLegacyUuid && typeof value === "string" && isUuidSecretRef(value)) {
-    throw unprocessable(
-      `Plugin secret ref at ${path} must use { type: "secret_ref", secretId, version? }`,
-    );
+  if (allowLegacyUuid) {
+    const legacy = coerceLegacySecretRef(value);
+    if (legacy) return legacy;
   }
   if (!isPlainRecord(value) || value.type !== "secret_ref") return null;
   const parsed = parseSecretRefBinding(value);
@@ -100,6 +120,9 @@ export function extractSecretRefBindingsFromConfig(
   const secretPaths = collectSecretRefPaths(schema);
   for (const dotPath of secretPaths) {
     const current = readConfigValueAtPath(configJson as Record<string, unknown>, dotPath);
+    // Legacy bare-UUID refs are accepted *only* here, at paths the manifest
+    // declares as `format: "secret-ref"`. The untyped walk below must not
+    // coerce, or any UUID-shaped config value would become a secret binding.
     const binding = assertSecretRefBinding(current, dotPath, true);
     if (binding) addRef(binding, dotPath);
   }
@@ -221,11 +244,17 @@ export function createPluginSecretsHandler(
 
   return {
     async resolve(params: PluginSecretsResolveParams): Promise<string> {
-      if (typeof params.secretRef === "string") {
-        throw invalidSecretRef(params.secretRef.trim() || "<empty>");
-      }
+      // A legacy bare-UUID ref resolves as `{ secretId, version: "latest" }`.
+      // This does not widen what a worker can reach: `lookupBinding` below is
+      // the authorization gate, and it still requires an explicit
+      // companySecretBindings row scoped to this company *and* this plugin.
+      const rawRef =
+        typeof params.secretRef === "string"
+          ? coerceLegacySecretRef(params.secretRef)
+          : params.secretRef;
+      if (!rawRef) throw invalidSecretRef(params.secretRef);
 
-      const bindingRef = parseSecretRefBinding(params.secretRef);
+      const bindingRef = parseSecretRefBinding(rawRef);
       if (!bindingRef) throw invalidSecretRef(params.secretRef);
 
       const companyId = requireCompanyId(params.companyId);
