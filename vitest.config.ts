@@ -18,6 +18,7 @@ export default defineConfig({
       "packages/plugins/sdk",
       "packages/plugins/create-paperclip-plugin",
       "packages/mcp-external",
+      "packages/mcp-server",
       "server",
       "ui",
       "cli",
