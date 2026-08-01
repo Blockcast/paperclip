@@ -33,6 +33,7 @@ const UNSUCCESSFUL_TERMINAL_STATUSES = new Set<string>([
 
 export type ZeroTokenStartupFailureRunInput =
   | {
+    adapterType?: string | null;
     status?: string | null;
     error?: string | null;
     errorCode?: string | null;
@@ -81,6 +82,7 @@ export function isZeroTokenStartupFailureRun(
   if (!run.status || !UNSUCCESSFUL_TERMINAL_STATUSES.has(run.status)) return false;
   const errorCode = typeof run.errorCode === "string" ? run.errorCode.trim() : "";
   const isLegacySessionUnavailable =
+    (run.adapterType === "opencode_local" || run.adapterType === "opencode_k8s") &&
     errorCode === "adapter_failed" &&
     typeof run.error === "string" &&
     LEGACY_SESSION_UNAVAILABLE_ERROR_RE.test(run.error);

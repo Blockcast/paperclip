@@ -300,7 +300,10 @@ import {
   readContinuationAttempt,
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
-import { runUsageTokenCounts } from "./recovery/zero-token-startup-failure.js";
+import {
+  runUsageTokenCounts,
+  ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
+} from "./recovery/zero-token-startup-failure.js";
 import { clearAgentTaskSessions } from "./recovery/session-reset.js";
 import {
   recoveryAssigneeAdapterOverrides,
@@ -993,7 +996,7 @@ export function selectAgedPrReviewRunForFairDispatch(
  * when `shouldScheduleAutomaticRunRetry` already returned true.
  */
 function resolveAutomaticRunRetryOpts(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "contextSnapshot">,
 ) {
   if (run.errorCode === "k8s_concurrent_run_blocked") {
     return {
@@ -1011,8 +1014,13 @@ function resolveAutomaticRunRetryOpts(
     };
   }
   if (run.errorCode === "session_unavailable") {
+    const retryReason =
+      readNonEmptyString(parseObject(run.contextSnapshot).retryReason) ===
+      ZERO_TOKEN_SESSION_RESET_RETRY_REASON
+        ? ZERO_TOKEN_SESSION_RESET_RETRY_REASON
+        : SESSION_UNAVAILABLE_HEARTBEAT_RETRY_REASON;
     return {
-      retryReason: SESSION_UNAVAILABLE_HEARTBEAT_RETRY_REASON,
+      retryReason,
       wakeReason: SESSION_UNAVAILABLE_HEARTBEAT_RETRY_WAKE_REASON,
       maxAttempts: SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS,
       delayMs: SESSION_UNAVAILABLE_HEARTBEAT_RETRY_DELAY_MS,
@@ -1025,6 +1033,8 @@ function requiresIssueExecutionRetryLock(retryReason: string | null | undefined)
   return (
     retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
     retryReason === CAPACITY_BLOCKED_HEARTBEAT_RETRY_REASON ||
+    retryReason === SESSION_UNAVAILABLE_HEARTBEAT_RETRY_REASON ||
+    retryReason === ZERO_TOKEN_SESSION_RESET_RETRY_REASON ||
     retryReason === JOB_FAILED_HEARTBEAT_RETRY_REASON
   );
 }

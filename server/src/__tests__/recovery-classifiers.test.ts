@@ -291,6 +291,7 @@ describe("zero-token startup-failure classifier (BLO-5681)", () => {
   it("recognizes legacy generic failures carrying the production session-unavailable message", () => {
     expect(
       isZeroTokenStartupFailureRun({
+        adapterType: "opencode_k8s",
         status: "failed",
         errorCode: "adapter_failed",
         error: "Session unavailable",
@@ -298,9 +299,18 @@ describe("zero-token startup-failure classifier (BLO-5681)", () => {
     ).toBe(true);
     expect(
       isZeroTokenStartupFailureRun({
+        adapterType: "opencode_k8s",
         status: "failed",
         errorCode: "adapter_failed",
         error: "Provider unavailable",
+      }),
+    ).toBe(false);
+    expect(
+      isZeroTokenStartupFailureRun({
+        adapterType: "claude_k8s",
+        status: "failed",
+        errorCode: "adapter_failed",
+        error: "Session unavailable",
       }),
     ).toBe(false);
   });

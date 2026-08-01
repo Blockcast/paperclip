@@ -1583,6 +1583,50 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBe(2);
   });
 
+  it("preserves the zero-token reset marker on a session-unavailable retry", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date();
+    await seedQueuedRunFixture({
+      companyId,
+      agentId,
+      runId,
+      now,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_zero_token_session_reset",
+        retryReason: "zero_token_session_reset",
+      },
+    });
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "Session unavailable",
+      errorCode: "session_unavailable",
+      summary: "failed",
+      resultJson: {},
+      provider: "test",
+      model: "test-model",
+    });
+
+    await heartbeat.__test_executeRunForTesting(runId);
+
+    const retryRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.scheduledRetryReason).toBe("zero_token_session_reset");
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      retryReason: "zero_token_session_reset",
+      wakeReason: "session_unavailable_retry",
+      scheduledRetryAttempt: 1,
+    });
+  });
+
   // BLO-9147 AC1 — thin-snapshot adapter_failed retry gate
   it("BLO-9147 AC1: retries adapter_failed on pr_review run with thin snapshot (no githubPrNumber)", () => {
     // The persisted contextSnapshot only carries reviewKind (no githubPrNumber).

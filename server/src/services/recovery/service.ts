@@ -5896,7 +5896,10 @@ export function recoveryService(
           continue;
         }
 
-        if (isZeroTokenStartupFailureRun(latestRun)) {
+        if (
+          latestRun.agentId === agentId &&
+          isZeroTokenStartupFailureRun({ ...latestRun, adapterType: agent.adapterType })
+        ) {
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
             // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
             result.skipped += 1;
@@ -6148,7 +6151,10 @@ export function recoveryService(
         }
         continue;
       }
-      if (isZeroTokenStartupFailureRun(latestRun)) {
+      if (
+        latestRun?.agentId === agentId &&
+        isZeroTokenStartupFailureRun({ ...latestRun, adapterType: agent.adapterType })
+      ) {
         if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
           // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
           result.skipped += 1;
