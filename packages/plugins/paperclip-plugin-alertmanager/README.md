@@ -51,7 +51,7 @@ Configured per-instance via the host's plugin settings UI. Schema lives in
 
 | Key                  | Type    | Required | Notes |
 |----------------------|---------|----------|-------|
-| `defaultCompanyId`   | string  | yes      | Company that receives alerts when no routing label is set. |
+| `defaultCompanyId`   | string  | no       | Company that receives alerts when no routing label is set. Defaults to the delivering company; must match it when set. |
 | `webhookTokenRef`    | secret-ref | recommended | Static bearer token. AM sends `Authorization: Bearer <token>`. |
 | `webhookToken`       | string  | dev only | Inline token; use `webhookTokenRef` in production. |
 | `acceptOnlyLabels`   | object  | no       | Accept-only label filter, e.g. `{ paperclip: "true" }`. |
@@ -236,6 +236,15 @@ record the delivery `success` and answer 200, which tells Alertmanager the alert
 was accepted and stops it retrying — so a transient config-RPC blip would
 destroy the alert rather than delay it. The one case that is still dropped is a
 delivery carrying no `companyId` at all, because no retry can supply one.
+
+The delivering company is also **authoritative over `defaultCompanyId`**. The
+host chose that tenant by matching the endpoint key, so it is an authenticated
+fact; the stored `defaultCompanyId` is an operator-typed string inside that
+tenant's own row. When the row omits it, it is filled in from the delivering
+company. When it names a *different* company, the delivery is failed rather
+than honoured — otherwise the issue calls target a tenant outside this
+invocation's scope, the host denies them, and `handleWebhook`'s per-alert catch
+swallows the denial, producing a 200 with no issue filed anywhere.
 
 ### Alert state is scoped per company
 

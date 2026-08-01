@@ -62,7 +62,7 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "string",
         title: "Default company id",
         description:
-          "Company that receives alerts when no company-routing label is present.",
+          "Company that receives alerts when no company-routing label is present. Defaults to the company the delivery authenticated as; setting it to a different company is rejected.",
       },
       webhookTokenRef: {
         type: "string",
@@ -150,11 +150,11 @@ const manifest: PaperclipPluginManifestV1 = {
       },
     },
     // No fields are schema-required: the bootstrap auto-config endpoint
-    // posts a partial config (e.g. only webhookTokenRef) and the worker
-    // tolerates a missing defaultCompanyId — it warns at setup() and
-    // rejects per-alert in webhook-handler.ts. Forcing defaultCompanyId
-    // here previously broke fresh deploys until an operator wrote it
-    // by hand.
+    // posts a partial config (e.g. only webhookTokenRef). A missing
+    // defaultCompanyId is filled in from the delivering company at
+    // resolve time (config-scope.ts), so a fresh deploy files alerts
+    // correctly without an operator writing it by hand. Forcing it here
+    // previously broke fresh deploys outright.
     required: [],
   },
   webhooks: [

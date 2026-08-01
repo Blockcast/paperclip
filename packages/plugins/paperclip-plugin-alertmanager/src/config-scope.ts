@@ -150,11 +150,12 @@ export class CompanyScopeUnavailableError extends Error {
  *     bearer token and then file the resulting issues under the wrong tenant's
  *     `defaultCompanyId`.
  *
- * Failure modes are split by whether a retry could succeed. A read error or an
- * empty config throws `CompanyScopeUnavailableError` so Alertmanager retries and
- * the alert survives an operator fixing the config. A delivery with no
- * `companyId` at all returns `null`: no retry can add one, so it is dropped.
- * Neither ever falls open onto another tenant's credentials.
+ * Failure modes are split by whether a retry could succeed. A read error, an
+ * empty config, or a `defaultCompanyId` naming a different tenant throws
+ * `CompanyScopeUnavailableError` so Alertmanager retries and the alert survives
+ * an operator fixing the config. A delivery with no `companyId` at all returns
+ * `null`: no retry can add one, so it is dropped. Neither ever falls open onto
+ * another tenant's credentials.
  */
 export async function resolveCompanyScope(
   ctx: PluginContext,
@@ -192,6 +193,30 @@ export async function resolveCompanyScope(
     );
   }
   const config = buildConfig(raw as unknown as AlertmanagerPluginConfig);
+
+  // The host picked this delivery's tenant when it matched the endpoint key;
+  // `defaultCompanyId` is just an operator-typed field inside that tenant's own
+  // config row. Where they disagree, the host wins — it is the authenticated
+  // fact, and the stored string is the guess.
+  //
+  // Leaving them unreconciled loses alerts two different silent ways, both of
+  // which still answer HTTP 200 and so stop Alertmanager retrying:
+  //   - unset: every firing alert hits the `defaultCompanyId not configured`
+  //     guard in webhook-handler.ts and no-ops.
+  //   - pointing at another company: issue calls target a tenant outside this
+  //     invocation's scope, the host denies them, and `handleWebhook`'s
+  //     per-alert catch swallows the denial.
+  if (!config.defaultCompanyId) {
+    config.defaultCompanyId = companyId;
+  } else if (config.defaultCompanyId !== companyId) {
+    ctx.logger.error(
+      `paperclip-plugin-alertmanager: company ${companyId} has defaultCompanyId=${config.defaultCompanyId} — refusing to file its alerts under another tenant`,
+    );
+    throw new CompanyScopeUnavailableError(
+      `defaultCompanyId ${config.defaultCompanyId} does not match delivering company ${companyId}`,
+    );
+  }
+
   return {
     config,
     token: await resolveWebhookToken(ctx, config, companyId),

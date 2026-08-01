@@ -188,4 +188,36 @@ describe("resolveCompanyScope", () => {
     expect(scope?.config.ownerMap).toBeDefined();
     expect(Object.keys(scope?.config.issueRouteMap ?? {}).length).toBeGreaterThan(0);
   });
+
+  it("BLO-20467: adopts the delivering company as defaultCompanyId when the row omits it", async () => {
+    // Without this the delivery authenticates fine and then every firing alert
+    // hits webhook-handler's `defaultCompanyId not configured` guard and
+    // no-ops — while the host still records success and answers 200, so
+    // Alertmanager never retries and the alert is destroyed, not delayed.
+    const { ctx } = mkCtx({
+      configByCompany: { [COMPANY_A]: { webhookToken: TOKEN } },
+    });
+
+    const scope = await resolveCompanyScope(ctx, COMPANY_A);
+
+    expect(scope?.config.defaultCompanyId).toBe(COMPANY_A);
+  });
+
+  it("BLO-20467: refuses to file one company's alerts under another company's id", async () => {
+    // `defaultCompanyId` is an operator-typed string inside company A's own
+    // row; the delivering company is the host's authenticated choice. If A's
+    // row names B, the issue calls target a tenant outside this invocation's
+    // scope, the host denies them, and handleWebhook's per-alert catch
+    // swallows the denial — a 200 with no issue anywhere. Fail loudly instead.
+    const { ctx, mocks } = mkCtx({
+      configByCompany: {
+        [COMPANY_A]: { defaultCompanyId: COMPANY_B, webhookToken: TOKEN },
+      },
+    });
+
+    await expect(resolveCompanyScope(ctx, COMPANY_A)).rejects.toThrow(
+      CompanyScopeUnavailableError,
+    );
+    expect(mocks.logger.error).toHaveBeenCalled();
+  });
 });
