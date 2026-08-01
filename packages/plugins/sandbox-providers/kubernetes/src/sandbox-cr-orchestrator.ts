@@ -23,6 +23,7 @@
 
 import type { KubeClients } from "./kube-client.js";
 import type { SandboxOrchestrator, SandboxStatus } from "./sandbox-orchestrator.js";
+import { assertManifestHasNoLiteralSensitiveEnv } from "./sensitive-env-guard.js";
 
 const SANDBOX_GROUP = "agents.x-k8s.io";
 const SANDBOX_VERSION = "v1alpha1";
@@ -99,6 +100,9 @@ export async function createSandboxCr(
   namespace: string,
   manifest: Record<string, unknown>,
 ): Promise<{ uid: string }> {
+  // Choke point: this accepts an arbitrary manifest, so re-check here rather
+  // than trusting that it came from buildSandboxCrManifest.
+  assertManifestHasNoLiteralSensitiveEnv(manifest, `Sandbox in ${namespace}`);
   const result = await clients.custom.createNamespacedCustomObject({
     group: SANDBOX_GROUP,
     version: SANDBOX_VERSION,

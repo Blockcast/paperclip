@@ -1,4 +1,4 @@
-import type { V1Job, V1Pod } from "@kubernetes/client-node";
+import type { V1ContainerStatus, V1Job, V1Pod } from "@kubernetes/client-node";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -8,6 +8,8 @@ import {
   indexUniqueAgentJobRunStatuses,
   isActiveOrTerminatingAgentPod,
   matchExactAgentJob,
+  pickDiagnosticPod,
+  readContainerDiagnostic,
   type ManagedAgentJob,
 } from "../services/k8s-job-liveness.js";
 
@@ -184,5 +186,103 @@ describe("classifyManagedAgentPod", () => {
 
   it("exposes the adapter-type label constant", () => {
     expect(ADAPTER_TYPE_LABEL).toBe("paperclip.io/adapter-type");
+  });
+});
+
+describe("readContainerDiagnostic", () => {
+  it("names the container, exit code and reason a Job Failed condition omits", () => {
+    // Reproduces the BLO-18145 exit-128 signature: init container exits 0, the
+    // app container dies ~4s in. The Job condition for this only ever says
+    // "Job has reached the specified backoff limit".
+    const status = {
+      name: "claude",
+      state: {
+        terminated: {
+          exitCode: 128,
+          reason: "Error",
+          startedAt: new Date("2026-07-26T17:02:20.000Z"),
+          finishedAt: new Date("2026-07-26T17:02:24.000Z"),
+        },
+      },
+    } as unknown as V1ContainerStatus;
+
+    expect(readContainerDiagnostic(status, "app")).toEqual({
+      container: "claude",
+      kind: "app",
+      exitCode: 128,
+      reason: "Error",
+      signal: null,
+      terminationMessage: null,
+      startedAt: "2026-07-26T17:02:20.000Z",
+      finishedAt: "2026-07-26T17:02:24.000Z",
+    });
+  });
+
+  it("scrubs secrets out of the termination message", () => {
+    const status = {
+      name: "claude",
+      state: {
+        terminated: {
+          exitCode: 1,
+          reason: "Error",
+          message: 'boot failed: ANTHROPIC_API_KEY=sk-ant-abc123secret not accepted',
+        },
+      },
+    } as unknown as V1ContainerStatus;
+
+    const result = readContainerDiagnostic(status, "app");
+    expect(result!.terminationMessage).not.toContain("sk-ant-abc123secret");
+    expect(result!.terminationMessage).toContain("REDACTED");
+  });
+
+  it("falls back to lastState so a restarted container still reports why it died", () => {
+    const status = {
+      name: "claude",
+      state: { running: { startedAt: new Date("2026-08-01T00:00:00.000Z") } },
+      lastState: { terminated: { exitCode: 137, reason: "OOMKilled", signal: 9 } },
+    } as unknown as V1ContainerStatus;
+
+    const result = readContainerDiagnostic(status, "app");
+    expect(result).toMatchObject({ exitCode: 137, reason: "OOMKilled", signal: 9 });
+  });
+
+  it("returns null for a container that never terminated", () => {
+    const status = {
+      name: "claude",
+      state: { waiting: { reason: "PodInitializing" } },
+    } as unknown as V1ContainerStatus;
+
+    expect(readContainerDiagnostic(status, "app")).toBeNull();
+  });
+});
+
+describe("pickDiagnosticPod", () => {
+  function diagPod(name: string, phase: string, startTime: string): V1Pod {
+    return {
+      metadata: { name, creationTimestamp: new Date(startTime) },
+      status: { phase, startTime: new Date(startTime) },
+    } as unknown as V1Pod;
+  }
+
+  it("prefers a Failed pod over a newer Succeeded one", () => {
+    // A Job at its backoff limit can leave several pods behind; the attempts
+    // that succeeded explain nothing about the failure.
+    const chosen = pickDiagnosticPod([
+      diagPod("succeeded-newer", "Succeeded", "2026-08-01T02:00:00Z"),
+      diagPod("failed-older", "Failed", "2026-08-01T01:00:00Z"),
+    ]);
+    expect(chosen!.metadata!.name).toBe("failed-older");
+  });
+
+  it("picks the most recently started pod among several Failed ones", () => {
+    const chosen = pickDiagnosticPod([
+      diagPod("failed-old", "Failed", "2026-08-01T01:00:00Z"),
+      diagPod("failed-new", "Failed", "2026-08-01T03:00:00Z"),
+    ]);
+    expect(chosen!.metadata!.name).toBe("failed-new");
+  });
+
+  it("returns null when the pods are already GC'd", () => {
+    expect(pickDiagnosticPod([])).toBeNull();
   });
 });

@@ -173,7 +173,12 @@ describe("agent-hires approval path materializes instructions bundle content", (
     else process.env.PAPERCLIP_HOME = originalPaperclipHome;
     if (originalPaperclipInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
     else process.env.PAPERCLIP_INSTANCE_ID = originalPaperclipInstanceId;
-    await fs.rm(paperclipHome, { recursive: true, force: true });
+    await fs.rm(paperclipHome, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 100,
+    });
   });
 
   it("materializes requested AGENTS.md content on disk even when adapterConfig already declares a managed bundle from a cloned template", async () => {

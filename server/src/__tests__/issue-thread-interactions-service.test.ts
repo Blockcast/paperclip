@@ -548,7 +548,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       userId: "local-board",
     });
 
-    const cancelled = await interactionsSvc.cancelQuestions({
+    const cancelled = await interactionsSvc.withdrawInteraction({
       id: issueId,
       companyId,
     }, created.id, {
@@ -574,6 +574,254 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     }, {
       userId: "local-board",
     })).rejects.toThrow("Interaction has already been resolved");
+  });
+
+  describe("withdrawInteraction", () => {
+    const WITHDRAWABLE_PAYLOADS = [
+      {
+        kind: "ask_user_questions" as const,
+        payload: {
+          version: 1 as const,
+          questions: [{
+            id: "scope",
+            prompt: "Choose the scope",
+            selectionMode: "single" as const,
+            options: [{ id: "phase-1", label: "Phase 1" }],
+          }],
+        },
+        expectedResult: {
+          version: 1,
+          answers: [],
+          cancelled: true,
+          cancellationReason: "Asked the wrong thing",
+          summaryMarkdown: null,
+        },
+      },
+      {
+        kind: "suggest_tasks" as const,
+        payload: {
+          version: 1 as const,
+          tasks: [{ clientKey: "root", title: "Create the root follow-up" }],
+        },
+        expectedResult: {
+          version: 1,
+          cancelled: true,
+          cancellationReason: "Asked the wrong thing",
+        },
+      },
+      {
+        kind: "request_confirmation" as const,
+        payload: { version: 1 as const, prompt: "Apply this plan?" },
+        expectedResult: { version: 1, outcome: "cancelled", reason: "Asked the wrong thing" },
+      },
+      {
+        kind: "request_checkbox_confirmation" as const,
+        payload: {
+          version: 1 as const,
+          prompt: "Which files should be deleted?",
+          options: [{ id: "file-a", label: "a.txt" }],
+        },
+        expectedResult: { version: 1, outcome: "cancelled", reason: "Asked the wrong thing" },
+      },
+    ];
+
+    async function seedAgentIssue(title: string) {
+      const { companyId, goalId, issueId } = await seedConfirmationIssue(title);
+      const agentId = randomUUID();
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      return { companyId, goalId, issueId, agentId };
+    }
+
+    for (const { kind, payload, expectedResult } of WITHDRAWABLE_PAYLOADS) {
+      it(`withdraws pending ${kind} interactions and preserves the row`, async () => {
+        const { companyId, issueId, agentId } = await seedAgentIssue(`Withdraw ${kind}`);
+
+        const created = await interactionsSvc.create({ id: issueId, companyId }, {
+          kind,
+          payload,
+        } as CreateIssueThreadInteraction, { agentId });
+
+        const withdrawn = await interactionsSvc.withdrawInteraction(
+          { id: issueId, companyId },
+          created.id,
+          { reason: "Asked the wrong thing" },
+          { agentId },
+          { requireCreatedByAgentId: agentId },
+        );
+
+        expect(withdrawn.status).toBe("cancelled");
+        expect(withdrawn.result).toEqual(expectedResult);
+        expect(withdrawn.resolvedByAgentId).toBe(agentId);
+        expect(withdrawn.resolvedAt).toBeInstanceOf(Date);
+
+        // The row must remain readable in issue history, not be deleted or hidden.
+        const rows = await db
+          .select()
+          .from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.id, created.id));
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.status).toBe("cancelled");
+        expect(rows[0]?.createdByAgentId).toBe(agentId);
+      });
+    }
+
+    it("refuses to withdraw an interaction created by a different agent", async () => {
+      const { companyId, issueId, agentId } = await seedAgentIssue("Withdraw foreign card");
+      const otherAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: otherAgentId,
+        companyId,
+        name: "OtherCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      const created = await interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation",
+        payload: { version: 1, prompt: "Apply this plan?" },
+      }, { agentId });
+
+      await expect(interactionsSvc.withdrawInteraction(
+        { id: issueId, companyId },
+        created.id,
+        {},
+        { agentId: otherAgentId },
+        { requireCreatedByAgentId: otherAgentId },
+      )).rejects.toMatchObject({ status: 403 });
+
+      const rows = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, created.id));
+      expect(rows[0]?.status).toBe("pending");
+    });
+
+    it("refuses to withdraw an already-resolved interaction", async () => {
+      const { companyId, issueId, agentId } = await seedAgentIssue("Withdraw resolved card");
+
+      const created = await interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation",
+        payload: { version: 1, prompt: "Apply this plan?" },
+      }, { agentId });
+
+      await interactionsSvc.rejectInteraction({ id: issueId, companyId }, created.id, {}, {
+        userId: "local-board",
+      });
+
+      await expect(interactionsSvc.withdrawInteraction(
+        { id: issueId, companyId },
+        created.id,
+        {},
+        { agentId },
+        { requireCreatedByAgentId: agentId },
+      )).rejects.toMatchObject({ status: 409 });
+    });
+
+    it("refuses to withdraw a tool-action confirmation even for its creating agent", async () => {
+      const { companyId, issueId, agentId } = await seedAgentIssue("Withdraw tool-action gate");
+
+      // The tool gateway stamps its human-approval card with the *gated* agent's
+      // id, so createdByAgentId matching must not be enough to retract it.
+      const created = await interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation",
+        payload: {
+          version: 1,
+          prompt: "Approve tool action",
+          toolAction: {
+            version: 1,
+            actionRequestId: randomUUID(),
+            invocationId: randomUUID(),
+            toolName: "sheets.appendRow",
+            toolDisplayName: "Append row",
+            connectionId: null,
+            applicationId: null,
+            appDisplayName: null,
+            risk: "destructive",
+            previewMarkdown: "Append a row to the ledger",
+            argumentsSummaryJson: "{}",
+            argumentsHash: "hash-1",
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          },
+        },
+      }, { agentId });
+
+      await expect(interactionsSvc.withdrawInteraction(
+        { id: issueId, companyId },
+        created.id,
+        {},
+        { agentId },
+        { requireCreatedByAgentId: agentId },
+      )).rejects.toMatchObject({ status: 422 });
+
+      // A board user must not be able to strand the paired tool-action row either.
+      await expect(interactionsSvc.withdrawInteraction(
+        { id: issueId, companyId },
+        created.id,
+        {},
+        { userId: "local-board" },
+      )).rejects.toMatchObject({ status: 422 });
+
+      const rows = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, created.id));
+      expect(rows[0]?.status).toBe("pending");
+    });
+
+    it("refuses to withdraw board-only request_item_verdicts interactions", async () => {
+      const { companyId, issueId, agentId } = await seedAgentIssue("Withdraw verdicts card");
+
+      const created = await interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_item_verdicts",
+        payload: {
+          version: 1,
+          prompt: "Review generated artifacts.",
+          items: [{ id: "api", label: "API route" }],
+          verdicts: ["approve", "reject"],
+        },
+      }, { userId: "local-board" });
+
+      await expect(interactionsSvc.withdrawInteraction(
+        { id: issueId, companyId },
+        created.id,
+        {},
+        { agentId },
+        { requireCreatedByAgentId: agentId },
+      )).rejects.toMatchObject({ status: 422 });
+    });
+
+    it("lets a board user withdraw without an ownership constraint", async () => {
+      const { companyId, issueId, agentId } = await seedAgentIssue("Board withdraw");
+
+      const created = await interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation",
+        payload: { version: 1, prompt: "Apply this plan?" },
+      }, { agentId });
+
+      const withdrawn = await interactionsSvc.withdrawInteraction(
+        { id: issueId, companyId },
+        created.id,
+        { reason: "Superseded by a board decision" },
+        { userId: "local-board" },
+      );
+
+      expect(withdrawn.status).toBe("cancelled");
+      expect(withdrawn.resolvedByUserId).toBe("local-board");
+    });
   });
 
   it("expires ask_user_questions interactions by default when a user comments after creation", async () => {
