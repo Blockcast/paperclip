@@ -158,10 +158,11 @@ function checkoutStatusForCurrentRow() {
 }
 
 function checkoutStartedAtForCurrentRow(now: Date) {
+  const nowIso = now.toISOString();
   return sql<Date | null>`CASE
     WHEN ${preserveInReviewExecutionStageCheckoutCondition()} THEN ${issues.startedAt}
     WHEN ${issues.status} = 'in_progress' THEN ${issues.startedAt}
-    ELSE ${now}
+    ELSE ${nowIso}::timestamptz
   END`;
 }
 // Non-human author sentinels that agents post under. These ARE eligible for
