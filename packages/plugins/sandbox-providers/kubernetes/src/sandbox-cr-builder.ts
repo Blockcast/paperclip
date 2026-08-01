@@ -16,6 +16,8 @@
  * release path is explicit delete via sandboxCrOrchestrator.release().
  */
 
+import { assertNoLiteralSensitiveEnv } from "./sensitive-env-guard.js";
+
 export interface BuildSandboxCrManifestInput {
   namespace: string;
   sandboxName: string;
@@ -39,7 +41,7 @@ export function buildSandboxCrManifest(
     ...input.labels,
     "paperclip.io/role": "agent",
   };
-  return {
+  const manifest = {
     apiVersion: "agents.x-k8s.io/v1alpha1",
     kind: "Sandbox",
     metadata: {
@@ -138,4 +140,6 @@ export function buildSandboxCrManifest(
       },
     },
   };
+  assertNoLiteralSensitiveEnv(manifest.spec.podTemplate.spec, `Sandbox ${input.sandboxName}`);
+  return manifest;
 }
