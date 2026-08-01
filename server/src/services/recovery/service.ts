@@ -420,11 +420,48 @@ function summarizeAgentCapabilities(agent: typeof agents.$inferSelect | null | u
 // secrets in the raw error blob get scrubbed. errorCode is a stable
 // classifier (e.g. `rate_limit_exhausted`, `silent_failure`) and is never
 // itself sensitive — surface it always.
-function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
+// BLO-18278: the capacity-reset instant heartbeat finalization recovered from
+// the throttle fault (see parseProviderCapacityResetHorizon). Read from the
+// run's own resultJson so the strand comment can attribute the stall to the
+// provider window rather than to whatever terminal symptom got recorded last.
+// Returns the ISO string only when this really was a throttle family — a bare
+// `retryNotBefore` on some other family is not a capacity 429.
+function readProviderCapacityResetAt(run: NonNullable<LatestIssueRun>): string | null {
+  const resultJson = parseObject(run.resultJson);
+  const explicit = readNonEmptyString(resultJson.providerCapacityResetAt);
+  if (explicit) return explicit;
+
+  const family = readNonEmptyString(resultJson.errorFamily);
+  if (family !== "rate_limit_exhausted" && family !== "provider_quota") return null;
+  return (
+    readNonEmptyString(resultJson.retryNotBefore) ??
+    readNonEmptyString(resultJson.transientRetryNotBefore) ??
+    null
+  );
+}
+
+export function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
   if (!run) return null;
 
   const errorCode = readNonEmptyString(run.errorCode)?.trim() ?? null;
   const rawError = readNonEmptyString(run.error)?.trim() ?? null;
+
+  // BLO-18278: when the run was actually killed by a provider capacity
+  // throttle that advertised a reset, say so. The generic text this would
+  // otherwise emit — `job_failed` — External lifecycle Job failed:
+  // BackoffLimitExceeded — describes the symptom (the Job gave up) and reads
+  // as an infrastructure fault, which repeatedly sent readers looking at the
+  // cluster instead of at a provider window that had already reopened on its
+  // own. Naming the 429 and the instant is the difference between "our Job
+  // broke" and "the provider was closed until 21:29:59Z".
+  const capacityResetAt = readProviderCapacityResetAt(run);
+  if (capacityResetAt) {
+    const suffix = errorCode ? ` (surfaced as \`${errorCode}\`)` : "";
+    return (
+      ` Latest retry failure: provider capacity throttle (429) — the provider advertised a capacity reset at ` +
+      `${capacityResetAt}${suffix}. This is transient and self-healing; the issue is waiting on that reset, not on a broken runtime.`
+    );
+  }
 
   // Prefer the JSON `"message": "..."` field if the error body is a JSON
   // blob (matches the heartbeat-side summarizer); otherwise take the first
