@@ -5806,7 +5806,12 @@ export function issueService(db: Db) {
     });
   }
 
-  async function clearStaleExecutionLock(issueId: string, expectedExecutionRunId: string) {
+  async function clearStaleExecutionLock(input: {
+    issueId: string;
+    expectedCheckoutRunId: string | null;
+    expectedExecutionRunId: string;
+    actorRunId: string | null;
+  }) {
     // BLO-20321: reap never-started (`queued` / `scheduled_retry`) owners as well
     // as terminal ones. Callers re-acquire the lock and then run
     // cancelStaleIssueContextRuns(keepRunId: <actor run>), which cancels the
@@ -5814,12 +5819,21 @@ export function issueService(db: Db) {
     // since changed.
     return db.transaction(async (tx) => {
       const issue = await tx
-        .select({ executionRunId: issues.executionRunId })
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
         .from(issues)
-        .where(eq(issues.id, issueId))
+        .where(eq(issues.id, input.issueId))
         .for("update")
         .then((rows) => rows[0] ?? null);
-      if (issue?.executionRunId !== expectedExecutionRunId) return false;
+      if (
+        issue?.executionRunId !== input.expectedExecutionRunId ||
+        issue.checkoutRunId !== input.expectedCheckoutRunId ||
+        (issue.checkoutRunId !== null &&
+          issue.checkoutRunId !== input.actorRunId &&
+          issue.checkoutRunId !== input.expectedExecutionRunId)
+      ) return false;
 
       const run = await tx
         .select({
@@ -5829,7 +5843,7 @@ export function issueService(db: Db) {
           wakeupRequestId: heartbeatRuns.wakeupRequestId,
         })
         .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, expectedExecutionRunId))
+        .where(eq(heartbeatRuns.id, input.expectedExecutionRunId))
         .for("update")
         .then((rows) => rows[0] ?? null);
       if (!(await cancelNeverStartedOwnerRun(tx, run, {
@@ -5847,8 +5861,11 @@ export function issueService(db: Db) {
         })
         .where(
           and(
-            eq(issues.id, issueId),
-            eq(issues.executionRunId, expectedExecutionRunId),
+            eq(issues.id, input.issueId),
+            eq(issues.executionRunId, input.expectedExecutionRunId),
+            input.expectedCheckoutRunId
+              ? eq(issues.checkoutRunId, input.expectedCheckoutRunId)
+              : isNull(issues.checkoutRunId),
           ),
         )
         .returning({ id: issues.id })
@@ -9360,7 +9377,12 @@ export function issueService(db: Db) {
         current.executionRunId !== checkoutRunId &&
         (current.assigneeAgentId === agentId || current.assigneeAgentId == null)
       ) {
-        const cleared = await clearStaleExecutionLock(id, current.executionRunId);
+        const cleared = await clearStaleExecutionLock({
+          issueId: id,
+          expectedCheckoutRunId: current.checkoutRunId,
+          expectedExecutionRunId: current.executionRunId,
+          actorRunId: checkoutRunId,
+        });
         if (cleared) {
           const now = new Date();
           const retried = await db
@@ -9379,6 +9401,9 @@ export function issueService(db: Db) {
                 eq(issues.id, id),
                 inArray(issues.status, expectedStatuses),
                 isNull(issues.executionRunId),
+                current.checkoutRunId
+                  ? eq(issues.checkoutRunId, current.checkoutRunId)
+                  : isNull(issues.checkoutRunId),
               ),
             )
             .returning()
@@ -9658,7 +9683,12 @@ export function issueService(db: Db) {
         current.executionRunId &&
         current.executionRunId !== actorRunId
       ) {
-        const cleared = await clearStaleExecutionLock(id, current.executionRunId);
+        const cleared = await clearStaleExecutionLock({
+          issueId: id,
+          expectedCheckoutRunId: current.checkoutRunId,
+          expectedExecutionRunId: current.executionRunId,
+          actorRunId,
+        });
         if (cleared) {
           const refreshed = await db
             .update(issues)
@@ -9674,6 +9704,9 @@ export function issueService(db: Db) {
                 eq(issues.status, "in_progress"),
                 eq(issues.assigneeAgentId, actorAgentId),
                 isNull(issues.executionRunId),
+                current.checkoutRunId
+                  ? eq(issues.checkoutRunId, current.checkoutRunId)
+                  : isNull(issues.checkoutRunId),
               ),
             )
             .returning({
