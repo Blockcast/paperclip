@@ -228,9 +228,31 @@ globals are only ever populated by `onConfigChanged`, which the host fires per
 company without telling the worker which company it was — so they hold
 "whichever company saved config last". Serving that to a different company's
 delivery would check the request against the wrong tenant's bearer token and
-then file the resulting issues under the wrong tenant's `defaultCompanyId`. A
-company whose config cannot be read, or which has none stored, gets its
-delivery dropped instead.
+then file the resulting issues under the wrong tenant's `defaultCompanyId`.
+
+A company whose config cannot be read, or which has none stored, gets its
+delivery **failed** (502), not dropped. Returning normally would make the host
+record the delivery `success` and answer 200, which tells Alertmanager the alert
+was accepted and stops it retrying — so a transient config-RPC blip would
+destroy the alert rather than delay it. The one case that is still dropped is a
+delivery carrying no `companyId` at all, because no retry can supply one.
+
+### Alert state is scoped per company
+
+The per-fingerprint dedup row lives in **company** scope
+(`{scopeKind: "company", scopeId, stateKey: "alert:<fingerprint>"}` — see
+`alertStateRef` in `src/constants.ts`), keyed on the company the tracked issue is
+filed into.
+
+It used to live in `instance` scope, shared by every tenant. Alertmanager
+fingerprints are derived from alert labels, so two tenants running the same alert
+rules routinely produce the *same* fingerprint: company B's firing delivery would
+find company A's row and update/re-open A's issue instead of creating B's, and a
+B resolution would close A's issue.
+
+Rows written by an older build are read through and migrated into their owning
+company's scope on first sight, gated on the row's own `paperclipCompanyId` — so
+a row is only ever adopted by the company whose issue it actually tracks.
 
 **If you are writing another plugin, do not resolve credentials in `setup()`.**
 Doing so fails in a way that hides itself: saving config fires
@@ -241,8 +263,11 @@ deliveries with `502 unauthorized` while the stored config was perfectly valid;
 it then recurred twice more (BLO-20467) for a combined ~3h15m of dead alerting.
 
 Known limitation: the `check-alert-escalations` sweep still reads those module
-globals, so it stays idle until an `onConfigChanged` supplies a scope. It does
-not affect delivery.
+globals, so it sweeps exactly one company — whichever saved config last — and
+stays idle after a restart until an `onConfigChanged` supplies a scope. Both are
+logged when they happen rather than failing silently. Fixing it properly needs a
+host API to enumerate a plugin's configured companies, which `PluginConfigClient`
+does not expose today (BLO-20595). Delivery is unaffected.
 
 
 ### Bearer rotation in a Kubernetes deployment

@@ -282,9 +282,13 @@ describe("handleWebhook — firing first time", () => {
     expect(createArgs.description).toContain("[Dashboard](https://grafana/d/cilium)");
     expect(createArgs.description).toContain("[Runbook](https://wiki/runbooks/cilium-drops)");
 
-    // State row written
+    // State row written, scoped to the company that owns the issue (BLO-20467)
     expect(mocks.state.set).toHaveBeenCalledWith(
-      { scopeKind: "instance", stateKey: "alert:9a3b1e4c5f6d7890" },
+      {
+        scopeKind: "company",
+        scopeId: "company-1",
+        stateKey: "alert:9a3b1e4c5f6d7890",
+      },
       expect.objectContaining({
         paperclipIssueId: "issue-1",
         paperclipCompanyId: "company-1",
@@ -376,7 +380,11 @@ describe("handleWebhook — firing first time", () => {
     expect(createArgs.assigneeAgentId).toBe(BLOCKCAST_PHYSICAL_INFRA_AGENT_ID);
     expect(createArgs.assigneeUserId).toBeUndefined();
     expect(mocks.state.set).toHaveBeenCalledWith(
-      { scopeKind: "instance", stateKey: "alert:physical-bmc-1" },
+      {
+        scopeKind: "company",
+        scopeId: "company-1",
+        stateKey: "alert:physical-bmc-1",
+      },
       expect.objectContaining({
         assigneeAgentId: BLOCKCAST_PHYSICAL_INFRA_AGENT_ID,
         assigneeUserId: null,
@@ -766,7 +774,11 @@ describe("handleWebhook — resolved", () => {
       expect.objectContaining({ paperclipIssueId: "issue-existing" }),
     );
     expect(mocks.state.set).toHaveBeenCalledWith(
-      { scopeKind: "instance", stateKey: "alert:9a3b1e4c5f6d7890" },
+      {
+        scopeKind: "company",
+        scopeId: "company-1",
+        stateKey: "alert:9a3b1e4c5f6d7890",
+      },
       expect.objectContaining({
         paperclipIssueId: "issue-existing",
         paperclipCompanyId: "company-1",
@@ -992,5 +1004,160 @@ describe("handleWebhook — owner resolution fallback chain", () => {
     expect(mocks.users.findByEmail).not.toHaveBeenCalled();
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.assigneeUserId).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BLO-20467 — per-company alert state.
+//
+// These use a Map-backed state store keyed by the full serialized ScopeKey
+// rather than `vi.fn(async () => null)`, because the bug under test is
+// specifically that two tenants resolved to the SAME key. A mock that always
+// returns null cannot express a collision, so it would pass either way.
+// ---------------------------------------------------------------------------
+
+const mkStatefulCtx = (): { ctx: PluginContext; mocks: MockClients; store: Map<string, unknown> } => {
+  const { ctx, mocks } = mkCtx();
+  const store = new Map<string, unknown>();
+  const keyOf = (ref: { scopeKind: string; scopeId?: string; stateKey: string }) =>
+    `${ref.scopeKind}/${ref.scopeId ?? "-"}/${ref.stateKey}`;
+  mocks.state.get.mockImplementation(async (ref) => store.get(keyOf(ref)) ?? null);
+  mocks.state.set.mockImplementation(async (ref, value) => {
+    store.set(keyOf(ref), value);
+  });
+  mocks.state.delete.mockImplementation(async (ref) => {
+    store.delete(keyOf(ref));
+  });
+  return { ctx, mocks, store };
+};
+
+describe("BLO-20467 — alert state is namespaced per company", () => {
+  it("two tenants reporting the SAME fingerprint each get their own issue", async () => {
+    const { ctx, mocks } = mkStatefulCtx();
+    // Same alert, same fingerprint — routine when two tenants run the same
+    // alerting rules off the same upstream dashboards.
+    const alert = baseAlert();
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    mocks.issues.create.mockImplementationOnce(async () => ({ id: "issue-A" }));
+    await handleWebhook(
+      ctx,
+      baseConfig({ defaultCompanyId: "company-A" }),
+      TOKEN,
+      baseInput({ companyId: "company-A", parsedBody: envelope }),
+    );
+
+    mocks.issues.create.mockImplementationOnce(async () => ({ id: "issue-B" }));
+    await handleWebhook(
+      ctx,
+      baseConfig({ defaultCompanyId: "company-B" }),
+      TOKEN,
+      baseInput({ companyId: "company-B", parsedBody: envelope }),
+    );
+
+    // Before the fix, B found A's instance-scoped row and took the re-fire
+    // branch: one issue total, filed under A, and B's alert never tracked.
+    expect(mocks.issues.create).toHaveBeenCalledTimes(2);
+    expect(mocks.issues.create.mock.calls[0][0].companyId).toBe("company-A");
+    expect(mocks.issues.create.mock.calls[1][0].companyId).toBe("company-B");
+
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      { scopeKind: "company", scopeId: "company-A", stateKey: `alert:${alert.fingerprint}` },
+      expect.objectContaining({ paperclipIssueId: "issue-A", paperclipCompanyId: "company-A" }),
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      { scopeKind: "company", scopeId: "company-B", stateKey: `alert:${alert.fingerprint}` },
+      expect.objectContaining({ paperclipIssueId: "issue-B", paperclipCompanyId: "company-B" }),
+    );
+  });
+
+  it("one tenant's resolution cannot close another tenant's issue on a shared fingerprint", async () => {
+    const { ctx, mocks } = mkStatefulCtx();
+    const alert = baseAlert();
+
+    mocks.issues.create.mockImplementationOnce(async () => ({ id: "issue-A" }));
+    await handleWebhook(
+      ctx,
+      baseConfig({ defaultCompanyId: "company-A" }),
+      TOKEN,
+      baseInput({ companyId: "company-A", parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+
+    // Company B resolves the same fingerprint. B has no record of it, and must
+    // not reach for A's. `issues.list` returns [] so recoverStateFromIssue —
+    // which is already company-scoped — finds nothing either.
+    //
+    // issues.get must return an OPEN issue: handleResolved only calls update
+    // when the looked-up issue exists and is still open, so leaving the default
+    // `null` here would make the assertions below pass even with the bug.
+    mocks.issues.get.mockImplementation(async () => ({ id: "issue-A", status: "todo" }));
+    const resolvedEnvelope = baseEnvelope({
+      status: "resolved",
+      alerts: [{ ...alert, status: "resolved", endsAt: "2026-04-29T10:00:00Z" }],
+    });
+    await handleWebhook(
+      ctx,
+      baseConfig({ defaultCompanyId: "company-B", autoCloseOnResolve: true }),
+      TOKEN,
+      baseInput({ companyId: "company-B", parsedBody: resolvedEnvelope }),
+    );
+
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(mocks.issues.createComment).not.toHaveBeenCalled();
+  });
+
+  it("adopts a pre-upgrade instance-scoped row for the company that owns it", async () => {
+    const { ctx, mocks, store } = mkStatefulCtx();
+    const alert = baseAlert();
+    // A row written by the old build, before state was company-scoped.
+    const legacy: AlertStateRecord = {
+      paperclipIssueId: "issue-legacy",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "CiliumPolicyDropsHigh",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    store.set(`instance/-/alert:${alert.fingerprint}`, legacy);
+    mocks.issues.get.mockImplementation(async () => ({ id: "issue-legacy", status: "todo" }));
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+
+    // Treated as a re-fire of the tracked issue, NOT as a brand-new alert.
+    // Without the read-through, every alert firing across the upgrade would
+    // duplicate its issue and orphan the original.
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(store.get(`company/company-1/alert:${alert.fingerprint}`)).toBeTruthy();
+    // Legacy row removed so it cannot be re-adopted later.
+    expect(store.has(`instance/-/alert:${alert.fingerprint}`)).toBe(false);
+  });
+
+  it("refuses to adopt a legacy row belonging to a different company", async () => {
+    const { ctx, mocks, store } = mkStatefulCtx();
+    const alert = baseAlert();
+    const legacy: AlertStateRecord = {
+      paperclipIssueId: "issue-other-tenant",
+      paperclipCompanyId: "company-OTHER",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "CiliumPolicyDropsHigh",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    store.set(`instance/-/alert:${alert.fingerprint}`, legacy);
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+
+    // company-1 files its own issue and never touches company-OTHER's.
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.create.mock.calls[0][0].companyId).toBe("company-1");
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    // The other tenant's row is left exactly where it was.
+    expect(store.get(`instance/-/alert:${alert.fingerprint}`)).toEqual(legacy);
   });
 });
