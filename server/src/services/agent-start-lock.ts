@@ -91,6 +91,13 @@ export type AgentStartLockOptions<T> = {
    * passes `() => []` (no runs claimed *by this call*).
    */
   onCoalesced: () => T;
+  /**
+   * Fired when this call arrives while another section already holds the
+   * agent's lock and is folded into the single follow-up pass. Callers use this
+   * as a liveness signal for demand that arrived after the running section read
+   * its queue snapshot.
+   */
+  onCoalescedDemand?: () => void;
 };
 
 async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise<T> {
@@ -165,6 +172,7 @@ export async function withAgentStartLock<T>(
   const running = runningByAgent.get(agentId);
   if (!running) return runExclusively(agentId, fn);
 
+  options.onCoalescedDemand?.();
   const followUp = ensureCoalescedFollowUp(agentId, fn, running);
 
   // Deadlock guard: a caller that already holds *another* agent's lock must

@@ -17599,12 +17599,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     string,
     { createdAt: Date; id: string; passes: number }
   >();
+  const dispatchHeadRescanDemandByAgent = new Set<string>();
   const dispatchResumeCapRetryTimersByAgent = new Map<string, ReturnType<typeof setTimeout>>();
 
   /** Run one more dispatch pass for `agentId`, detached from this critical section. */
   function scheduleDetachedDispatchPass(agentId: string, reason: string) {
     const pass = runDetachedFromAgentStartLock(() =>
-      startNextQueuedRunForAgent(agentId).catch((err) => {
+      startNextQueuedRunForAgent(agentId, {
+        resumeContinuation:
+          reason === "resume_bounded_scan" || reason === "resume_bounded_scan_after_cap",
+      }).catch((err) => {
         logger.error(
           { err, agentId, reason },
           "startNextQueuedRunForAgent: follow-up dispatch failed",
@@ -17632,8 +17636,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     dispatchResumeCapRetryTimersByAgent.set(agentId, timer);
   }
 
-  async function startNextQueuedRunForAgent(agentId: string) {
+  async function startNextQueuedRunForAgent(
+    agentId: string,
+    dispatchPassOptions: { resumeContinuation?: boolean } = {},
+  ) {
     if (options.skipQueuedRunDispatch || dispatchStopped) return [];
+    if (!dispatchPassOptions.resumeContinuation && dispatchResumeCursorByAgent.has(agentId)) {
+      dispatchHeadRescanDemandByAgent.add(agentId);
+    }
     // Failure-B fence (BLO-9089): the api tier never claims/executes runs — it
     // does not own the adapter lifecycle, so dispatching here resolves to the
     // process-fallback adapter and dies with "Process adapter missing command".
@@ -17652,6 +17662,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const cutoff = await getWorktreeExecutionCutoff();
 
     return withAgentStartLock(agentId, async () => {
+      if (dispatchStopped) return [];
       let agent = await getAgent(agentId);
       if (!agent) return [];
       const invokability = await getAgentInvokability(agent);
@@ -17921,8 +17932,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
        */
       const advanceOrClearResumeCursor = (claimedCount: number): boolean => {
         if (scanExhausted || claimedCount > 0 || !scanCursor) {
+          const needsHeadRescan =
+            scanExhausted &&
+            claimedCount === 0 &&
+            Boolean(resumeState) &&
+            dispatchHeadRescanDemandByAgent.has(agentId);
           dispatchResumeCursorByAgent.delete(agentId);
+          dispatchHeadRescanDemandByAgent.delete(agentId);
           clearDelayedResumeCapRetry(agentId);
+          if (needsHeadRescan) {
+            scheduleDetachedDispatchPass(agentId, "resume_head_rescan_after_coalesced_demand");
+            return true;
+          }
           return false;
         }
         const passes = (resumeState?.passes ?? 0) + 1;
@@ -18116,6 +18137,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
+        if (dispatchStopped) break;
         const queuedIssueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
         if (queuedIssueId && inFlightIssueIds.has(queuedIssueId)) {
           // BLO-20396: only report the cancellation when this pass is the one
@@ -18165,6 +18187,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // not run its own queue-selection pass; the pass it folded into claims the
       // work. "No runs claimed by this call" is the correct answer for it.
       onCoalesced: (): Array<typeof heartbeatRuns.$inferSelect> => [],
+      onCoalescedDemand: () => {
+        if (!dispatchPassOptions.resumeContinuation && dispatchResumeCursorByAgent.has(agentId)) {
+          dispatchHeadRescanDemandByAgent.add(agentId);
+        }
+      },
     });
   }
 

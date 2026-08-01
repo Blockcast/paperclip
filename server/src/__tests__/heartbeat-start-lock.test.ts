@@ -133,6 +133,33 @@ describe("heartbeat agent start lock (BLO-20396)", () => {
     expect(next).toHaveBeenCalledTimes(1);
   });
 
+  it("notifies callers when demand folds into a running follow-up", async () => {
+    const agentId = randomUUID();
+    const first = deferred<string>();
+    const onCoalescedDemand = vi.fn();
+    const later = vi.fn(async () => "later");
+
+    const held = withAgentStartLock(
+      agentId,
+      async () => first.promise,
+      coalesced,
+    );
+    await Promise.resolve();
+
+    const joined = withAgentStartLock(agentId, later, {
+      onCoalesced: () => "coalesced" as const,
+      onCoalescedDemand,
+    });
+
+    expect(onCoalescedDemand).toHaveBeenCalledTimes(1);
+    expect(later).not.toHaveBeenCalled();
+
+    first.resolve("first");
+    await expect(held).resolves.toBe("first");
+    await expect(joined).resolves.toBe("later");
+    expect(later).toHaveBeenCalledTimes(1);
+  });
+
   it("surfaces a synchronous throw as a rejection without wedging the lock", async () => {
     const agentId = randomUUID();
     const throwsSync = vi.fn((() => {
