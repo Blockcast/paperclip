@@ -25,6 +25,12 @@ const mockInteractionService = vi.hoisted(() => ({
 const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
 }));
+const mockAccessDecide = vi.hoisted(() => vi.fn(async (input: { action?: string }) => ({
+  allowed: true,
+  action: input.action,
+  reason: "allow_explicit_grant",
+  explanation: "Allowed by test grant.",
+})));
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
@@ -56,12 +62,7 @@ function registerModuleMocks() {
     }),
     accessService: () => ({
       canUser: vi.fn(async () => true),
-      decide: vi.fn(async (input: { action?: string }) => ({
-        allowed: true,
-        action: input.action,
-        reason: "allow_explicit_grant",
-        explanation: "Allowed by test grant.",
-      })),
+      decide: mockAccessDecide,
       hasPermission: vi.fn(async () => true),
     }),
     agentService: () => ({
@@ -610,6 +611,39 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
+  it("cancels non-question interactions through the board-only route", async () => {
+    mockInteractionService.withdrawInteraction.mockResolvedValueOnce({
+      id: "interaction-1",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "suggest_tasks",
+      status: "cancelled",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: "run-1",
+      payload: { version: 1, tasks: [{ clientKey: "task-1", title: "One" }] },
+      result: { version: 1, cancelled: true, cancellationReason: null },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:05:00.000Z",
+      resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-1/cancel")
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(res.body.kind).toBe("suggest_tasks");
+    expect(mockInteractionService.withdrawInteraction).toHaveBeenCalledWith(
+      expect.anything(),
+      "interaction-1",
+      {},
+      expect.objectContaining({ userId: "local-board" }),
+    );
+  });
+
   const AGENT_ACTOR = {
     type: "agent",
     agentId: CREATED_AGENT_ID,
@@ -618,6 +652,7 @@ describe.sequential("issue thread interaction routes", () => {
   };
 
   it("lets the creating agent withdraw its own pending interaction", async () => {
+    mockIssueService.getById.mockResolvedValueOnce(createIssue({ assigneeAgentId: CREATED_AGENT_ID }));
     const app = await createApp(AGENT_ACTOR);
 
     const res = await request(app)
@@ -665,6 +700,34 @@ describe.sequential("issue thread interaction routes", () => {
       expect.objectContaining({ userId: "local-board" }),
       { requireCreatedByAgentId: null },
     );
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_commented",
+        payload: expect.objectContaining({
+          interactionId: "interaction-2",
+          interactionStatus: "cancelled",
+        }),
+      }),
+    );
+  });
+
+  it("enforces the issue:mutate boundary before agent withdrawal", async () => {
+    mockAccessDecide.mockResolvedValueOnce({
+      allowed: false,
+      action: "issue:mutate",
+      reason: "deny_trust_boundary",
+      explanation: "Issue mutation is outside the active trust boundary.",
+    });
+    const app = await createApp(AGENT_ACTOR);
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/withdraw")
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(mockAccessDecide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
+    expect(mockInteractionService.withdrawInteraction).not.toHaveBeenCalled();
   });
 
   it("surfaces the service's 403 when an agent withdraws a card it did not create", async () => {

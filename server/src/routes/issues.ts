@@ -10363,6 +10363,15 @@ export function issueRoutes(
         // Interactions are control-plane state, so a low-trust-review agent that
         // cannot create them must not be able to withdraw them either.
         if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
+        // Creator ownership limits which card can be withdrawn, but does not
+        // replace the issue-level trust boundary. Check that boundary without
+        // applying checkout ownership: stale-card cleanup must remain possible
+        // after another agent has taken over the issue.
+        const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
+        if (!boundaryDecision.allowed) {
+          respondIssueBoundaryDenied(res, boundaryDecision);
+          return;
+        }
         // Without a run id the watchdog scope above resolves to "none" and
         // silently stops confining the caller, so require one exactly as the
         // create route does. It also keeps the activity row run-attributed.
@@ -10405,13 +10414,22 @@ export function issueRoutes(
           interactionId: interaction.id,
           interactionKind: interaction.kind,
           interactionStatus: interaction.status,
-          withdrawalReason: readInteractionWithdrawalReason(interaction),
+          cancellationReason: readInteractionWithdrawalReason(interaction),
         },
       });
 
-      // No continuation wakeup: the withdrawing agent is already awake and
-      // retracted its own question, so waking the assignee would re-enter the
-      // run that just cancelled the card.
+      // Self-withdrawal must not re-enter the active assignee run. A board user
+      // (or any future non-assignee actor) still has to resume the waiting agent.
+      if (actor.agentId !== issue.assigneeAgentId) {
+        queueResolvedInteractionContinuationWakeup({
+          heartbeat,
+          issue,
+          interaction,
+          actor,
+          source: "issue.interaction.withdraw",
+        });
+      }
+
       res.json(interaction);
     },
   );
