@@ -50,6 +50,47 @@ describe("createSandboxCr", () => {
       createSandboxCr(clients as never, "ns", {}),
     ).rejects.toThrow("Sandbox CR created without a UID");
   });
+
+  // Without this the choke-point call in createSandboxCr could be deleted and
+  // the suite would stay green. Asserting the client was never touched is the
+  // point: a leaking manifest must not reach the API server at all.
+  it("refuses a leaking manifest before calling the Kubernetes client", async () => {
+    const create = vi.fn().mockResolvedValue({ metadata: { uid: "test-uid" } });
+    const clients = { custom: { createNamespacedCustomObject: create } };
+    const leaking = {
+      apiVersion: "agents.x-k8s.io/v1alpha1",
+      kind: "Sandbox",
+      spec: {
+        podTemplate: {
+          spec: { containers: [{ name: "agent", env: [{ name: "MCP_CONFIG", value: "{}" }] }] },
+        },
+      },
+    };
+    await expect(createSandboxCr(clients as never, "ns", leaking)).rejects.toThrow(
+      /agent\.env\[MCP_CONFIG\]/,
+    );
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  // The allowlist is keyed on name *and* value. Allowlisting `HOME` by name
+  // alone would let a credential ride in under an approved name.
+  it("refuses an allowlisted env name carrying a non-allowlisted value", async () => {
+    const create = vi.fn().mockResolvedValue({ metadata: { uid: "test-uid" } });
+    const clients = { custom: { createNamespacedCustomObject: create } };
+    const leaking = {
+      apiVersion: "agents.x-k8s.io/v1alpha1",
+      kind: "Sandbox",
+      spec: {
+        podTemplate: {
+          spec: { containers: [{ name: "agent", env: [{ name: "HOME", value: "sk-ant-leak" }] }] },
+        },
+      },
+    };
+    await expect(createSandboxCr(clients as never, "ns", leaking)).rejects.toThrow(
+      /agent\.env\[HOME\] \(value-not-allowlisted\)/,
+    );
+    expect(create).not.toHaveBeenCalled();
+  });
 });
 
 describe("getSandboxCrStatus", () => {
