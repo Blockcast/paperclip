@@ -347,6 +347,16 @@ async function waitForValue<T>(
   return latest ?? null;
 }
 
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 async function waitForHeartbeatIdle(
   db: ReturnType<typeof createDb>,
   timeoutMs = 3_000,
@@ -1479,6 +1489,57 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeup?.status).toBe("claimed");
   });
 
+  it("deduplicates concurrent process_lost reaps of the same local run", async () => {
+    const { runId, wakeupRequestId } = await seedRunFixture({
+      processPid: 999_999_999,
+      includeIssue: false,
+    });
+    const jobStatusGate = createDeferred<null>();
+    let jobStatusCalls = 0;
+    mockListAgentJobRunStatuses
+      .mockImplementationOnce(async () => {
+        jobStatusCalls += 1;
+        return jobStatusGate.promise;
+      })
+      .mockImplementationOnce(async () => {
+        jobStatusCalls += 1;
+        return jobStatusGate.promise;
+      });
+
+    const firstReap = heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    const secondReap = heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(await waitForValue(async () => jobStatusCalls >= 2 ? jobStatusCalls : null)).toBe(2);
+    jobStatusGate.resolve(null);
+
+    const results = await Promise.all([firstReap, secondReap]);
+    expect(results.reduce((sum, result) => sum + result.reaped, 0)).toBe(1);
+    expect(results.flatMap((result) => result.runIds)).toEqual([runId]);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("failed");
+
+    const runEvents = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId));
+    expect(
+      runEvents.filter((event) =>
+        event.eventType === "lifecycle" &&
+        event.level === "error" &&
+        event.message.includes("Process lost"),
+      ),
+    ).toHaveLength(1);
+  });
+
   it("skips generic timer wakes without invoking an adapter when no assigned work is actionable", async () => {
     const { companyId, agentId } = await seedIdleTimerAgentFixture();
     const heartbeat = createHeartbeat();
@@ -1644,7 +1705,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .update(heartbeatRuns)
       .set({
         resultJson: {
-          summary: "No locally recorded review outcome is available.",
+          summary: `Posted the consolidated Ally review on #1648 at ${headSha}.`,
         },
       })
       .where(eq(heartbeatRuns.id, runId));
@@ -1698,6 +1759,107 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .toBe(true);
   });
 
+  it("does not preserve a local review claim without trusted-App GitHub evidence", async () => {
+    const jobName = "agent-opencode-untrusted-review-claim";
+    const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+        githubRepoFullName: "Blockcast/onprem-k8s",
+        githubPrNumber: 1648,
+        githubHeadSha: headSha,
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    await db
+      .update(heartbeatRuns)
+      .set({ resultJson: { summary: `Posted the consolidated Ally review on #1648 at ${headSha}.` } })
+      .where(eq(heartbeatRuns.id, runId));
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ found: false });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledWith({
+      repoFullName: "Blockcast/onprem-k8s",
+      prNumber: 1648,
+      headSha,
+    });
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "failed",
+      errorCode: "pr_review_output_missing",
+    });
+    const retries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(retries).toHaveLength(1);
+  });
+
+  async function recoverClaimedReviewWithUnavailableVerification(kind: "result" | "throw") {
+    const jobName = `agent-opencode-review-verification-${kind}`;
+    const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+        githubRepoFullName: "Blockcast/onprem-k8s",
+        githubPrNumber: 1648,
+        githubHeadSha: headSha,
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    await db
+      .update(heartbeatRuns)
+      .set({ resultJson: { summary: `Posted the consolidated Ally review on #1648 at ${headSha}.` } })
+      .where(eq(heartbeatRuns.id, runId));
+    if (kind === "throw") {
+      mockGithubHasReviewerEvidenceForPr.mockRejectedValueOnce(new Error("GitHub unavailable"));
+    } else {
+      mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ error: "reviews_http_503" });
+    }
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+
+    await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    return heartbeat.getRun(runId);
+  }
+
+  it("keeps a missing-Job review claim fail-closed when GitHub returns an error", async () => {
+    await expect(recoverClaimedReviewWithUnavailableVerification("result")).resolves.toMatchObject({
+      status: "failed",
+      errorCode: "pr_review_verification_unavailable",
+      error: expect.stringContaining("reviews_http_503"),
+    });
+  });
+
+  it("keeps a missing-Job review claim fail-closed when GitHub verification throws", async () => {
+    await expect(recoverClaimedReviewWithUnavailableVerification("throw")).resolves.toMatchObject({
+      status: "failed",
+      errorCode: "pr_review_verification_unavailable",
+      error: expect.stringContaining("verification_threw"),
+    });
+  });
+
   it("fails and retries once when a PR-review request comment is not outcome evidence", async () => {
     const jobName = "agent-opencode-review-lost";
     const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
@@ -1738,7 +1900,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledTimes(1);
     expect(await heartbeat.getRun(runId)).toMatchObject({
       status: "failed",
-      errorCode: "job_missing",
+      errorCode: "pr_review_output_missing",
     });
     const retries = await db
       .select()
@@ -2948,6 +3110,105 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(progressAfterKeepalive?.lastOutputSeq).toBe(progressBeforeKeepalive?.lastOutputSeq);
     expect(progressAfterKeepalive?.lastOutputStream).toBe(progressBeforeKeepalive?.lastOutputStream);
     expect(settledRun?.stdoutExcerpt ?? "").not.toContain("[paperclip] keepalive");
+  });
+
+  async function settleClaimedPrReview(
+    verification:
+      | { kind: "result"; value: { found: true; via: "review" | "comment" } | { found: false } | { error: string } }
+      | { kind: "throw" },
+  ) {
+    const headSha = "075a9aeff53a229199ab0583e916f33c22459983";
+    const summary = `Posted the consolidated Ally review on #1648 at ${headSha}.`;
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      errorMessage: null,
+      summary,
+      resultJson: { summary },
+      provider: "test",
+      model: "test-model",
+    });
+    if (verification.kind === "throw") {
+      mockGithubHasReviewerEvidenceForPr.mockRejectedValueOnce(new Error("GitHub unavailable"));
+    } else {
+      mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce(verification.value);
+    }
+    const { runId } = await seedQueuedIssueRunFixture();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          reviewKind: "pr_review",
+          taskKey: `pr_review:Blockcast/onprem-k8s:1648:${headSha}`,
+          githubRepoFullName: "Blockcast/onprem-k8s",
+          githubPrNumber: 1648,
+          githubHeadSha: headSha,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    await heartbeat.resumeQueuedRuns();
+    const settledRun = await waitForRunToSettle(heartbeat, runId);
+
+    return { headSha, runId, settledRun };
+  }
+
+  it("completes a claimed PR review only after trusted exact-head App evidence is found", async () => {
+    const { headSha, settledRun } = await settleClaimedPrReview({
+      kind: "result",
+      value: { found: true, via: "comment" },
+    });
+
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledWith({
+      repoFullName: "Blockcast/onprem-k8s",
+      prNumber: 1648,
+      headSha,
+    });
+    expect(settledRun).toMatchObject({
+      status: "succeeded",
+      errorCode: null,
+    });
+  });
+
+  it("fails a completed PR-review run whose local claim has no trusted-App evidence", async () => {
+    const { headSha, settledRun } = await settleClaimedPrReview({
+      kind: "result",
+      value: { found: false },
+    });
+
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledWith({
+      repoFullName: "Blockcast/onprem-k8s",
+      prNumber: 1648,
+      headSha,
+    });
+    expect(settledRun).toMatchObject({
+      status: "failed",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
+  it("classifies a GitHub evidence API error separately from missing review output", async () => {
+    const { settledRun } = await settleClaimedPrReview({
+      kind: "result",
+      value: { error: "reviews_http_503" },
+    });
+
+    expect(settledRun).toMatchObject({
+      status: "failed",
+      errorCode: "pr_review_verification_unavailable",
+      error: expect.stringContaining("reviews_http_503"),
+    });
+  });
+
+  it("classifies a thrown GitHub evidence check separately from missing review output", async () => {
+    const { settledRun } = await settleClaimedPrReview({ kind: "throw" });
+
+    expect(settledRun).toMatchObject({
+      status: "failed",
+      errorCode: "pr_review_verification_unavailable",
+      error: expect.stringContaining("verification_threw"),
+    });
   });
 
   it("materializes missing opencode_k8s shared docs before adapter dispatch", async () => {

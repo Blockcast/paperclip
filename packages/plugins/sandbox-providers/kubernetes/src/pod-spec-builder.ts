@@ -1,3 +1,5 @@
+import { assertNoLiteralSensitiveEnv } from "./sensitive-env-guard.js";
+
 export interface BuildJobManifestInput {
   namespace: string;
   jobName: string;
@@ -22,7 +24,7 @@ export function buildJobManifest(input: BuildJobManifestInput): Record<string, u
     ...input.labels,
     "paperclip.io/role": "agent",
   };
-  return {
+  const manifest = {
     apiVersion: "batch/v1",
     kind: "Job",
     metadata: {
@@ -97,4 +99,6 @@ export function buildJobManifest(input: BuildJobManifestInput): Record<string, u
       },
     },
   };
+  assertNoLiteralSensitiveEnv(manifest.spec.template.spec, `Job ${input.jobName}`);
+  return manifest;
 }
