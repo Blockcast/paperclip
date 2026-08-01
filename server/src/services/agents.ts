@@ -765,6 +765,7 @@ export function agentService(db: Db) {
         await tx.delete(issueComments).where(eq(issueComments.authorAgentId, id));
         await tx.delete(approvalComments).where(eq(approvalComments.authorAgentId, id));
         await tx.update(approvals).set({ requestedByAgentId: null }).where(eq(approvals.requestedByAgentId, id));
+        await tx.update(approvals).set({ linkedAgentId: null }).where(eq(approvals.linkedAgentId, id));
         await tx.update(assets).set({ createdByAgentId: null }).where(eq(assets.createdByAgentId, id));
         await tx.update(financeEvents).set({ agentId: null }).where(eq(financeEvents.agentId, id));
         await tx.update(goals).set({ ownerAgentId: null }).where(eq(goals.ownerAgentId, id));

@@ -1,6 +1,6 @@
 ALTER TABLE "approvals" ADD COLUMN "linked_agent_id" uuid;
 --> statement-breakpoint
-ALTER TABLE "approvals" ADD CONSTRAINT "approvals_linked_agent_id_agents_id_fk" FOREIGN KEY ("linked_agent_id") REFERENCES "public"."agents"("id") ON DELETE no action ON UPDATE no action;
+ALTER TABLE "approvals" ADD CONSTRAINT "approvals_linked_agent_id_agents_id_fk" FOREIGN KEY ("linked_agent_id") REFERENCES "public"."agents"("id") ON DELETE set null ON UPDATE no action;
 --> statement-breakpoint
 UPDATE "approvals" AS approval
 SET "linked_agent_id" = agent."id"

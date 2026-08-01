@@ -4,6 +4,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
   agents,
+  approvals,
   companies,
   companySkills,
   createDb,
@@ -55,6 +56,7 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(routines);
+    await db.delete(approvals);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -153,6 +155,36 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
     await expect(db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).resolves.toHaveLength(0);
     await expect(db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).resolves.toHaveLength(0);
+  });
+
+  it("clears approval agent bindings before deleting the referenced agent", async () => {
+    const { agentId, companyId } = await seedFixture();
+    const approvalId = randomUUID();
+
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      linkedAgentId: agentId,
+      requestedByAgentId: agentId,
+      requestedByUserId: null,
+      status: "approved",
+      payload: { agentId, name: "CodexCoder" },
+    });
+
+    const removed = await agentService(db).remove(agentId);
+
+    expect(removed?.id).toBe(agentId);
+    await expect(db.select().from(agents).where(eq(agents.id, agentId))).resolves.toHaveLength(0);
+
+    const [approval] = await db
+      .select({
+        linkedAgentId: approvals.linkedAgentId,
+        requestedByAgentId: approvals.requestedByAgentId,
+      })
+      .from(approvals)
+      .where(eq(approvals.id, approvalId));
+    expect(approval).toEqual({ linkedAgentId: null, requestedByAgentId: null });
   });
 
   it("removes issue read states and activity rows before deleting the company", async () => {

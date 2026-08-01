@@ -8,7 +8,7 @@ export const approvals = pgTable(
     id: uuid("id").primaryKey().defaultRandom(),
     companyId: uuid("company_id").notNull().references(() => companies.id),
     type: text("type").notNull(),
-    linkedAgentId: uuid("linked_agent_id").references(() => agents.id),
+    linkedAgentId: uuid("linked_agent_id").references(() => agents.id, { onDelete: "set null" }),
     requestedByAgentId: uuid("requested_by_agent_id").references(() => agents.id),
     requestedByUserId: text("requested_by_user_id"),
     status: text("status").notNull().default("pending"),
