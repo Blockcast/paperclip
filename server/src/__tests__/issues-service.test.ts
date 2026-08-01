@@ -9028,3 +9028,200 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
   });
 
 });
+
+// BLO-18797 review follow-up #2 (Ally, PR #814). The delegate-recovery PATCH is
+// authorized *because* the row reads `blocked` — i.e. nobody is actively
+// running it. The route loads that snapshot well before issueService.update
+// re-reads and writes by id, and under READ COMMITTED a concurrent assignee
+// checkout can commit in the gap. Without a write-time precondition the
+// recovery would clear the blockers and stamp `todo` over a live run, which is
+// precisely the active-run protection the narrow patch shape exists to
+// preserve. These exercise the guard against a real row whose status changes
+// underneath, rather than a mocked service.
+describeEmbeddedPostgres("issueService.update expectedCurrentStatus (BLO-18797)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-expected-status-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  });
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(heartbeatRuns);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(goals);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedBlockedIssue() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "MulticastEngineer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // issues.execution_run_id carries an FK to heartbeat_runs, so the stand-in
+    // checkout below needs a real run row to point at.
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Delegate recovery target",
+      status: "blocked",
+      priority: "critical",
+      assigneeAgentId: agentId,
+    });
+
+    return { companyId, agentId, issueId, runId };
+  }
+
+  it("applies the update when the row still carries the expected status", async () => {
+    const { issueId } = await seedBlockedIssue();
+
+    const updated = await svc.update(issueId, {
+      status: "todo",
+      blockedByIssueIds: [],
+      expectedCurrentStatus: "blocked",
+    });
+
+    expect(updated?.status).toBe("todo");
+  });
+
+  it("rejects with 409 when the row left the expected status before the write", async () => {
+    const { issueId, runId } = await seedBlockedIssue();
+
+    // Stand in for the concurrent assignee checkout that lands between the
+    // route's authorization snapshot and this write.
+    await db
+      .update(issues)
+      .set({ status: "in_progress", executionRunId: runId, executionAgentNameKey: "multicastengineer" })
+      .where(eq(issues.id, issueId));
+
+    await expect(
+      svc.update(issueId, {
+        status: "todo",
+        blockedByIssueIds: [],
+        expectedCurrentStatus: "blocked",
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+
+    // The live run must survive untouched — a 409 that still clobbered the row
+    // would defeat the whole point of the guard.
+    const row = await db
+      .select({ status: issues.status, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("in_progress");
+    expect(row?.executionRunId).toBe(runId);
+  });
+
+  it("rejects with 409 when the row is reassigned before the write, leaving blockers intact", async () => {
+    const { companyId, issueId, agentId } = await seedBlockedIssue();
+
+    const blockerId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: "Upstream blocker",
+      status: "todo",
+      priority: "high",
+    });
+    await db.insert(issueRelations).values({
+      id: randomUUID(),
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    // allow_manager_chain was granted because the assignee was a report of the
+    // actor. Hand the row to an unrelated agent while it stays `blocked`: an
+    // id+status predicate alone would still match, and the manager would clear
+    // a stranger's blockers under a grant that no longer holds.
+    const unrelatedAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: unrelatedAgentId,
+      companyId,
+      name: "UnrelatedEngineer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(issues).set({ assigneeAgentId: unrelatedAgentId }).where(eq(issues.id, issueId));
+
+    await expect(
+      svc.update(issueId, {
+        status: "todo",
+        blockedByIssueIds: [],
+        expectedCurrentStatus: "blocked",
+        expectedCurrentAssigneeAgentId: agentId,
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+
+    const row = await db
+      .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("blocked");
+    expect(row?.assigneeAgentId).toBe(unrelatedAgentId);
+
+    const remainingBlockers = await db
+      .select({ issueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, issueId));
+    expect(remainingBlockers.map((relation) => relation.issueId)).toEqual([blockerId]);
+  });
+
+  it("leaves ordinary updates unguarded when no expected status is supplied", async () => {    const { issueId } = await seedBlockedIssue();
+
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+
+    const updated = await svc.update(issueId, { title: "Renamed without a precondition" });
+
+    expect(updated?.title).toBe("Renamed without a precondition");
+    expect(updated?.status).toBe("in_progress");
+  });
+});

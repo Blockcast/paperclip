@@ -3909,6 +3909,26 @@ export function issueRoutes(
     return decision !== true && decision.reason === "allow_issue_mention_grant";
   }
 
+  // BLO-18797: the creator / manager-chain allow-paths are a *comment* grant.
+  // They exist so a manager or the delegating creator can deliver a handoff
+  // onto a delegate's issue; the only status change they buy is the narrow
+  // blocked -> todo PATCH gated by isCreatorOrManagerChainRecoveryPatch.
+  // POST /issues/:id/comments also accepts `reopen` / `resume`, and the
+  // follow-up gate below it (assertExplicitResumeIntentAllowed) independently
+  // admits the same reporting chain via hasActiveCheckoutManagementOverride —
+  // a path that was unreachable while the comment boundary denied these actors
+  // outright. Left alone, admitting them here would hand a manager a reopen of
+  // any terminal issue through what this PR documents and tests as a
+  // comment-only grant. The comment route re-runs the mutation gate for these
+  // actors when a control field is present, so the request fails closed with an
+  // explicit 403 rather than silently dropping the caller's stated intent.
+  function isCreatorOrManagerChainDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    return (
+      decision !== true &&
+      (decision.reason === "allow_issue_creator" || decision.reason === "allow_manager_chain")
+    );
+  }
+
   // A recovery-handoff grant (BLO-18906) is comment-only by construction: it
   // exists so the agent a recovery transfer took the issue from can still write
   // its diagnosis down. It must never carry a state transition, so the comment
@@ -4078,6 +4098,22 @@ export function issueRoutes(
     );
   }
 
+  function isCreatorOrManagerChainRecoveryPatch(
+    issue: { status: string },
+    body: Record<string, unknown>,
+  ) {
+    if (issue.status !== "blocked") return false;
+    const keys = Object.keys(body);
+    return (
+      keys.length === 2 &&
+      keys.includes("status") &&
+      keys.includes("blockedByIssueIds") &&
+      body.status === "todo" &&
+      Array.isArray(body.blockedByIssueIds) &&
+      body.blockedByIssueIds.length === 0
+    );
+  }
+
   async function assertAgentIssueMutationAllowed(
     req: Request,
     res: Response,
@@ -4098,6 +4134,17 @@ export function issueRoutes(
       allowBlockedCorrection?: boolean;
       allowScopedRecoveryOwnerSourceMutation?: boolean;
       allowRecoveryActionOwner?: boolean;
+      /**
+       * BLO-18797: opt in to the allow_issue_creator / allow_manager_chain
+       * ownership bypass below. Off by default and deliberately so — this
+       * helper backs ~25 routes, including DELETE /issues/:id, the document
+       * delete/lock paths, work-product mutation and approval unlinking.
+       * Honouring the bypass unconditionally would hand every one of those to
+       * any issue creator, which is a far wider grant than the
+       * delegate-recovery PATCH this was written for. Pass it only from a
+       * route whose blast radius you have actually checked.
+       */
+      allowCreatorOrManagerChainOwnership?: boolean;
     } = {},
   ) {
     if (req.actor.type !== "agent") return true;
@@ -4120,12 +4167,58 @@ export function issueRoutes(
       return activeRecoveryAction?.ownerAgentId === actorAgentId;
     };
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
+    let creatorOrManagerChainDecision =
+      boundaryDecision.allowed && isCreatorOrManagerChainDecision(boundaryDecision)
+        ? boundaryDecision
+        : null;
     if (!boundaryDecision.allowed) {
       if (await isActiveRecoveryActionOwner()) return true;
-      respondIssueBoundaryDenied(res, boundaryDecision);
-      return false;
+      if (
+        options.allowCreatorOrManagerChainOwnership &&
+        isCreatorOrManagerChainRecoveryPatch(issue, req.body as Record<string, unknown>)
+      ) {
+        const commentDecision = await decideIssueAccess(req, issue, "issue:comment");
+        if (isCreatorOrManagerChainDecision(commentDecision)) {
+          creatorOrManagerChainDecision = commentDecision;
+        } else {
+          respondIssueBoundaryDenied(res, boundaryDecision);
+          return false;
+        }
+      } else {
+        respondIssueBoundaryDenied(res, boundaryDecision);
+        return false;
+      }
     }
     if (await isActiveRecoveryActionOwner()) return true;
+    // BLO-18113 / BLO-18797: creator / manager-chain grants are comment-only
+    // in authorization.ts. The one mutation they may carry is a tightly-shaped
+    // blocked -> todo delegate recovery PATCH, derived from a matching
+    // issue:comment decision when the normal issue:mutate boundary denies.
+    //
+    // Opt-in per route and patch shape. This helper guards ~25 routes; only the
+    // blocked -> todo delegate-recovery PATCH passes the bypass. Every other
+    // caller — most pointedly DELETE /issues/:id — fails closed before the
+    // checkout-management override below can widen the boundary decision.
+    if (
+      options.allowCreatorOrManagerChainOwnership &&
+      creatorOrManagerChainDecision &&
+      isCreatorOrManagerChainRecoveryPatch(issue, req.body as Record<string, unknown>)
+    ) {
+      return true;
+    }
+    if (creatorOrManagerChainDecision && !options.allowCreatorOrManagerChainOwnership) {
+      res.status(403).json({
+        error: "Agent cannot mutate another agent's issue outside delegate recovery",
+        details: {
+          issueId: issue.id,
+          assigneeAgentId: issue.assigneeAgentId,
+          actorAgentId,
+          status: issue.status,
+          securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+        },
+      });
+      return false;
+    }
     if (issue.assigneeAgentId === null) {
       return true;
     }
@@ -4135,6 +4228,19 @@ export function issueRoutes(
     if (issue.assigneeAgentId !== actorAgentId) {
       if (await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)) {
         return true;
+      }
+      if (creatorOrManagerChainDecision) {
+        res.status(403).json({
+          error: "Agent cannot mutate another agent's issue outside delegate recovery",
+          details: {
+            issueId: issue.id,
+            assigneeAgentId: issue.assigneeAgentId,
+            actorAgentId,
+            status: issue.status,
+            securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+          },
+        });
+        return false;
       }
       if (issue.status === "in_progress") {
         res.status(409).json({
@@ -8376,8 +8482,27 @@ export function issueRoutes(
       {
         allowBlockedCorrection: true,
         allowScopedRecoveryOwnerSourceMutation,
+        // BLO-18797: the delegate-recovery path. The helper additionally
+        // requires a blocked -> todo patch containing only status and
+        // blockedByIssueIds.
+        allowCreatorOrManagerChainOwnership: true,
       },
     ))) return;
+    // BLO-18797: the delegate-recovery bypass authorized this patch *because*
+    // the snapshot said `blocked` — an issue nobody is actively running. That
+    // read happened before any of the work below, so a concurrent assignee
+    // checkout can land in between and leave us clearing blockers and writing
+    // `todo` over a live run, which is exactly the active-run protection the
+    // narrow patch shape exists to preserve. Re-assert the status at write time
+    // (see `expectedCurrentStatus` in issues service `update`) and 409 instead.
+    // Deliberately keyed off the patch shape rather than the decision reason:
+    // the checkout-management override and recovery-action-owner paths reach
+    // this same mutation on someone else's issue and want the same guard.
+    const delegateRecoveryPatchInFlight =
+      req.actor.type === "agent" &&
+      !!existing.assigneeAgentId &&
+      existing.assigneeAgentId !== req.actor.agentId &&
+      isCreatorOrManagerChainRecoveryPatch(existing, req.body as Record<string, unknown>);
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);
@@ -8740,6 +8865,16 @@ export function issueRoutes(
               ...updateFields,
               actorAgentId: actor.agentId ?? null,
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
+              ...(delegateRecoveryPatchInFlight
+                ? {
+                    expectedCurrentStatus: "blocked",
+                    // BLO-18797: allow_manager_chain was granted because this
+                    // assignee is a report of the actor. Pin it too, or a
+                    // reassignment to an unrelated agent that keeps the row
+                    // blocked would still satisfy an id+status predicate.
+                    expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
+                  }
+                : {}),
             },
             tx,
           );
@@ -8765,6 +8900,14 @@ export function issueRoutes(
           ...updateFields,
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
+          ...(delegateRecoveryPatchInFlight
+            ? {
+                expectedCurrentStatus: "blocked",
+                // See the transactional branch above: the assignee is an
+                // authorization-relevant snapshot field for allow_manager_chain.
+                expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
+              }
+            : {}),
         });
       }
     } catch (err) {

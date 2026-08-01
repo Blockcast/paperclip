@@ -2355,6 +2355,114 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.remove).not.toHaveBeenCalled();
   });
 
+  it.each(commentGrantMutationDenialCases)(
+    "lets an exact blocked-to-todo delegate recovery patch proceed for a %s comment grant holder",
+    async (_kind, agentRows, issueOverrides) => {
+      useProductionIssueAuthorization(agentRows);
+      const stored = makeIssue({
+        status: "blocked",
+        assigneeAgentId: ownerAgentId,
+        ...issueOverrides,
+      });
+      mockIssueService.getById.mockResolvedValue(stored);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...stored,
+        ...patch,
+      }));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", blockedByIssueIds: [] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+      expect(mockIssueService.update).toHaveBeenCalled();
+      const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
+      expect(patch).toMatchObject({
+        status: "todo",
+        expectedCurrentStatus: "blocked",
+        expectedCurrentAssigneeAgentId: ownerAgentId,
+      });
+      expect(patch.blockedByIssueIds).toEqual([]);
+    },
+  );
+
+  it.each([
+    { status: "done", blockedByIssueIds: [] },
+    { status: "cancelled", blockedByIssueIds: [] },
+    { status: "todo", blockedByIssueIds: ["99999999-9999-4999-8999-999999999999"] },
+    { status: "todo", blockedByIssueIds: [], description: "Too broad" },
+  ])("keeps non-exact delegate recovery patches denied: %o", async (body) => {
+    useProductionIssueAuthorization([
+      makeAgent(peerAgentId),
+      makeAgent(ownerAgentId, { reportsTo: peerAgentId }),
+    ]);
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId, createdByAgentId: ownerAgentId }),
+    );
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send(body);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("surfaces 409 when the issue stops being blocked before the delegate recovery write lands", async () => {
+    useProductionIssueAuthorization([
+      makeAgent(peerAgentId),
+      makeAgent(ownerAgentId, { reportsTo: peerAgentId }),
+    ]);
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({
+        status: "blocked",
+        assigneeAgentId: ownerAgentId,
+        createdByAgentId: ownerAgentId,
+      }),
+    );
+    const { conflict } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+    mockIssueService.update.mockRejectedValue(
+      conflict("Issue status changed before the update could be applied", {
+        issueId,
+        expectedStatus: "blocked",
+        currentStatus: "in_progress",
+      }),
+    );
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo", blockedByIssueIds: [] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toContain("status changed");
+  });
+
+  it("does not pin expectedCurrentStatus on an ordinary assignee patch", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: true,
+      action: input.action,
+      reason: "allow_self",
+      explanation: "Assignee.",
+    }));
+    const stored = makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId });
+    mockIssueService.getById.mockResolvedValue(stored);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...stored,
+      ...patch,
+    }));
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo", blockedByIssueIds: [] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
+    expect(patch.expectedCurrentStatus).toBeUndefined();
+    expect(patch.expectedCurrentAssigneeAgentId).toBeUndefined();
+  });
+
   it.each([
     ["todo", "patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Todo update" })],
     ["blocked", "patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Blocked update" })],

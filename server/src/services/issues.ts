@@ -8105,6 +8105,31 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        /**
+         * BLO-18797: optimistic-concurrency guard. When set, the row must still
+         * carry this status at write time or the update is rejected with 409.
+         * Callers that authorized a mutation *because of* the row's current
+         * status must pass it — the authorization check reads a snapshot loaded
+         * by the route, and READ COMMITTED lets a concurrent writer (an
+         * assignee checkout, say) land between that read and this write. The
+         * status equality is repeated in the UPDATE's WHERE clause, not just
+         * asserted against `existing`, because only the WHERE is re-evaluated
+         * against the latest row version when the statement blocks on a
+         * concurrent transaction.
+         */
+        expectedCurrentStatus?: string;
+        /**
+         * BLO-18797: the same optimistic-concurrency guard for the assignee.
+         * `allow_manager_chain` is granted *because* the row's assignee is a
+         * report of the actor, so the assignee is an authorization-relevant
+         * snapshot field exactly like the status: a reassignment that lands
+         * between the route's read and this write would leave the actor
+         * clearing an unrelated agent's blockers under a grant that no longer
+         * holds. Pinned in the UPDATE's WHERE clause for the same reason as
+         * the status — only the WHERE is re-evaluated against the latest row
+         * version when the statement blocks on a concurrent transaction.
+         */
+        expectedCurrentAssigneeAgentId?: string | null;
       },
       dbOrTx: any = db,
     ) => {
@@ -8120,8 +8145,28 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        expectedCurrentStatus,
+        expectedCurrentAssigneeAgentId,
         ...issueData
       } = data;
+
+      if (expectedCurrentStatus !== undefined && existing.status !== expectedCurrentStatus) {
+        throw conflict("Issue status changed before the update could be applied", {
+          issueId: id,
+          expectedStatus: expectedCurrentStatus,
+          currentStatus: existing.status,
+        });
+      }
+      if (
+        expectedCurrentAssigneeAgentId !== undefined &&
+        existing.assigneeAgentId !== expectedCurrentAssigneeAgentId
+      ) {
+        throw conflict("Issue assignee changed before the update could be applied", {
+          issueId: id,
+          expectedAssigneeAgentId: expectedCurrentAssigneeAgentId,
+          currentAssigneeAgentId: existing.assigneeAgentId,
+        });
+      }
       const experimental = await instanceSettings.getExperimental();
       const isolatedWorkspacesEnabled = experimental.enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
@@ -8415,13 +8460,42 @@ export function issueService(db: Db) {
           projectGoalId: nextProjectGoalId,
           defaultGoalId: defaultCompanyGoal?.id ?? null,
         });
+        const writePreconditions = [
+          ...(expectedCurrentStatus === undefined ? [] : [eq(issues.status, expectedCurrentStatus)]),
+          ...(expectedCurrentAssigneeAgentId === undefined
+            ? []
+            : [
+                expectedCurrentAssigneeAgentId === null
+                  ? isNull(issues.assigneeAgentId)
+                  : eq(issues.assigneeAgentId, expectedCurrentAssigneeAgentId),
+              ]),
+        ];
         const updated = await tx
           .update(issues)
           .set(patch)
-          .where(eq(issues.id, id))
+          .where(
+            writePreconditions.length === 0
+              ? eq(issues.id, id)
+              : and(eq(issues.id, id), ...writePreconditions),
+          )
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
-        if (!updated) return null;
+        if (!updated) {
+          // With a precondition set, zero matched rows means a concurrent writer
+          // changed an authorization-relevant field after the snapshot check
+          // above — the precondition genuinely failed, so surface 409 rather
+          // than the 404 that a bare `return null` would produce.
+          if (writePreconditions.length > 0) {
+            throw conflict("Issue changed before the update could be applied", {
+              issueId: id,
+              ...(expectedCurrentStatus === undefined ? {} : { expectedStatus: expectedCurrentStatus }),
+              ...(expectedCurrentAssigneeAgentId === undefined
+                ? {}
+                : { expectedAssigneeAgentId: expectedCurrentAssigneeAgentId }),
+            });
+          }
+          return null;
+        }
         if (
           (updated.status === "done" || updated.status === "cancelled") &&
           existing.status !== updated.status
