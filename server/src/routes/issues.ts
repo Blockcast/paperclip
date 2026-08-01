@@ -201,6 +201,49 @@ const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
+
+// BLO-18289 (decision on BLO-18163): coordination metadata is the subset of
+// PATCH /issues/:id fields that describe how an issue sits in the graph rather
+// than what the work is. A `tasks:assign` holder who manages the assignee may
+// write these on someone else's issue; everything not listed here keeps the
+// pre-existing boundary, notably `description`/`title` (work content) and
+// `status` (see the exclusion note below for why).
+const COORDINATION_METADATA_FIELDS = new Set([
+  "blockedByIssueIds",
+  "priority",
+  "projectId",
+  "parentId",
+  "milestoneId",
+  "projectWorkspaceId",
+]);
+
+// Allowlisted fields that can change where a run executes, or whether it can
+// continue. Safe to change on a parked issue, corrupting on one a run currently
+// holds — so these are gated on the issue not having an execution lock, while
+// the rest of the allowlist is deliberately permitted regardless of the lock.
+const COORDINATION_METADATA_EXECUTION_SENSITIVE_FIELDS = new Set([
+  "parentId",
+  "projectId",
+  "projectWorkspaceId",
+]);
+
+function coordinationBlockerPatchOnlyRemoves(
+  current: readonly string[] | null | undefined,
+  next: readonly string[] | null | undefined,
+): boolean {
+  const currentSet = new Set(current ?? []);
+  return (next ?? []).every((issueId) => currentSet.has(issueId));
+}
+
+// Deliberately NOT allowlisted: `title`, `description`, `comment` (work
+// content), and `status`. Two independent reasons for `status`, either
+// sufficient: (1) flipping another agent's issue to `done` routes around the
+// artifact-evidence gate; (2) more sharply, `status: "cancelled"` terminates a
+// live run, and it is precisely the absence of any run-terminating field that
+// makes it safe for this path to bypass the in_progress 409 guard at all.
+// Admitting even cancelled-only would re-open the PR #814 bypass shape
+// (create issue -> assign to a peer -> cancel their in-flight run).
+
 const refreshExternalObjectsSchema = z.object({
   objectIds: z.array(z.string().uuid()).max(50).optional(),
 }).strict();
@@ -4128,6 +4171,95 @@ export function issueRoutes(
     );
   }
 
+  // BLO-18289: returns the coordination-metadata field names in this PATCH
+  // body, or null if the body is NOT exclusively coordination metadata.
+  //
+  // The all-or-nothing shape is what satisfies "a PATCH mixing an allowlisted
+  // field with a non-allowlisted one is rejected as a whole": a mixed body
+  // simply never activates this path, so the request falls through to the
+  // ordinary boundary check and is denied in full. There is no code path that
+  // applies the allowlisted half and drops the rest.
+  //
+  // Safe to read keys directly: `validate(updateIssueRouteSchema)` has already
+  // replaced req.body with the parsed result, and updateIssueSchema is built
+  // with `.partial()`, which strips unknown keys AND suppresses field defaults
+  // (a bare `.default()` under `.optional()` does not fire on an absent key).
+  // So the key set here is exactly what the caller sent.
+  function coordinationMetadataPatchFields(body: unknown): string[] | null {
+    if (typeof body !== "object" || body === null || Array.isArray(body)) return null;
+    const present = Object.entries(body as Record<string, unknown>)
+      .filter(([, value]) => value !== undefined)
+      .map(([key]) => key);
+    if (present.length === 0) return null;
+    if (!present.every((key) => COORDINATION_METADATA_FIELDS.has(key))) return null;
+    return present;
+  }
+
+  // BLO-18289: decide whether this agent may take the coordination-metadata
+  // path on this issue. Returns the authorization decision when the path is
+  // available, or null when it is not (caller then falls through to the
+  // ordinary, unchanged mutation boundary).
+  async function decideCoordinationMetadataPatch(
+    req: Request,
+    issue: {
+      id: string;
+      companyId: string;
+      projectId: string | null;
+      parentId: string | null;
+      status: string;
+      assigneeAgentId: string | null;
+      assigneeUserId: string | null;
+      blockedByIssueIds: string[] | null;
+      executionRunId?: string | null;
+    },
+    fields: string[],
+  ) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return null;
+    if (req.actor.companyId !== issue.companyId) return null;
+    // Self-owned and unassigned issues already have ordinary mutation
+    // authority; this path must not become a second, weaker way in.
+    if (!issue.assigneeAgentId || issue.assigneeAgentId === req.actor.agentId) return null;
+    // Rebinding execution context or adding blockers under a live execution
+    // lock can silently strand another agent's run; refuse the coordination
+    // path so the request falls through to the standard mutation boundary.
+    if (
+      issue.executionRunId &&
+      fields.some((field) => {
+        if (field === "blockedByIssueIds") {
+          return !coordinationBlockerPatchOnlyRemoves(
+            issue.blockedByIssueIds,
+            req.body.blockedByIssueIds as string[] | null | undefined,
+          );
+        }
+        return COORDINATION_METADATA_EXECUTION_SENSITIVE_FIELDS.has(field);
+      })
+    ) {
+      return null;
+    }
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "issue:coordination_metadata",
+      resource: {
+        type: "issue",
+        companyId: issue.companyId,
+        issueId: issue.id,
+        projectId: issue.projectId,
+        parentIssueId: issue.parentId,
+        assigneeAgentId: issue.assigneeAgentId,
+        assigneeUserId: issue.assigneeUserId,
+        status: issue.status,
+      },
+      scope: {
+        issueId: issue.id,
+        projectId: issue.projectId,
+        parentIssueId: issue.parentId,
+        assigneeAgentId: issue.assigneeAgentId,
+        assigneeUserId: issue.assigneeUserId,
+      },
+    });
+    return decision.allowed ? decision : null;
+  }
+
   function isCreatorOrManagerChainRecoveryPatch(
     issue: { status: string },
     body: Record<string, unknown>,
@@ -4170,6 +4302,7 @@ export function issueRoutes(
         previousAssigneeAgentId: string | null;
         issueStatus: string;
       }) => void;
+      allowCoordinationMetadata?: boolean;
       /**
        * BLO-18797: opt in to the allow_issue_creator / allow_manager_chain
        * ownership bypass below. Off by default and deliberately so — this
@@ -4194,6 +4327,17 @@ export function issueRoutes(
     }
     const watchdogDecision = await assertTaskWatchdogScopedIssueMutationAllowed(req, res, issue);
     if (watchdogDecision !== null) return watchdogDecision;
+    // BLO-18289: opt-in only. PATCH /issues/:id is the single caller that ever
+    // sets this, and only after decideCoordinationMetadataPatch() has confirmed
+    // BOTH that the body is exclusively coordination metadata AND that the
+    // actor holds tasks:assign over an assignee it manages. Every other caller
+    // of this helper — including DELETE /issues/:id — leaves it unset and is
+    // structurally unaffected, which is the PR #814 lesson: a `return true`
+    // inside this shared helper reaches ~two dozen mutation routes, so the
+    // gate has to live at the caller that knows what is being written.
+    if (options.allowCoordinationMetadata) {
+      return true;
+    }
     if (isCurrentIssueExecutionRun(req, issue)) {
       return true;
     }
@@ -8551,6 +8695,25 @@ export function issueRoutes(
         issueStatus: string;
       } | null;
     } = { current: null };
+    // BLO-18289: coordination-metadata allowlist. Evaluated before the boundary
+    // check so a manager holding tasks:assign can curate the dependency graph
+    // on a report's issue; null whenever the body is not exclusively
+    // coordination metadata, which leaves the existing boundary untouched.
+    const coordinationMetadataFields = coordinationMetadataPatchFields(req.body);
+    let existingRelations: Awaited<ReturnType<typeof svc.getRelationSummaries>> | null = null;
+    if (coordinationMetadataFields?.includes("blockedByIssueIds")) {
+      existingRelations = await svc.getRelationSummaries(existing.id);
+    }
+    const coordinationMetadataDecision = coordinationMetadataFields
+      ? await decideCoordinationMetadataPatch(
+        req,
+        {
+          ...existing,
+          blockedByIssueIds: existingRelations?.blockedBy.map((relation) => relation.id) ?? null,
+        },
+        coordinationMetadataFields,
+      )
+      : null;
     if (!(await assertAgentIssueMutationAllowed(
       req,
       res,
@@ -8562,6 +8725,7 @@ export function issueRoutes(
         onProductivityReviewOwnerMutationAllowed: (audit) => {
           productivityReviewSourceMutationAudit.current = audit;
         },
+        allowCoordinationMetadata: coordinationMetadataDecision !== null,
         // BLO-18797: the delegate-recovery path. The helper additionally
         // requires a blocked -> todo patch containing only status and
         // blockedByIssueIds.
@@ -8593,10 +8757,9 @@ export function issueRoutes(
       req.body.assigneeAgentId as string | null | undefined,
     );
     const titleOrDescriptionChanged = req.body.title !== undefined || req.body.description !== undefined;
-    const existingRelations =
-      Array.isArray(req.body.blockedByIssueIds)
-        ? await svc.getRelationSummaries(existing.id)
-        : null;
+    if (Array.isArray(req.body.blockedByIssueIds) && !existingRelations) {
+      existingRelations = await svc.getRelationSummaries(existing.id);
+    }
     const {
       comment: commentBody,
       reviewRequest,
@@ -9016,6 +9179,34 @@ export function issueRoutes(
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;
+    }
+
+    // BLO-18289: audit the allowlist path only once the write has actually
+    // landed. Emitting it alongside the authorization decision would record a
+    // mutation for requests that clear the coordination check and are then
+    // rejected further down (low-trust control-plane denial, dependency
+    // validation, a 422 from the service), i.e. an audit trail claiming writes
+    // that never happened.
+    if (coordinationMetadataDecision && coordinationMetadataFields) {
+      await logActivity(db, {
+        companyId: existing.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.coordination_metadata_updated",
+        entityType: "issue",
+        entityId: existing.id,
+        issueId: existing.id,
+        details: {
+          identifier: existing.identifier ?? null,
+          path: "coordination_metadata_allowlist",
+          fields: coordinationMetadataFields,
+          assigneeAgentId: existing.assigneeAgentId,
+          authorizationReason: coordinationMetadataDecision.reason,
+        },
+      });
     }
 
     // BLO-18294: the re-arm was refused because N consecutive re-checks reported
