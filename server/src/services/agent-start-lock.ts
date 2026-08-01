@@ -64,7 +64,8 @@ const LOCK_HELD_WARN_MS = 30_000;
 /**
  * Maximum number of distinct agents whose locks may be held on a single async
  * path. Bounds reap → promote → dispatch amplification; beyond this depth a
- * nested dispatch is skipped rather than recursing further.
+ * nested dispatch is detached to top level rather than recursing further, so
+ * the demand is preserved while the call stack is not.
  */
 const MAX_NESTED_DISPATCH_DEPTH = 4;
 
@@ -141,8 +142,23 @@ export async function withAgentStartLock<T>(
   if (held && held.size >= MAX_NESTED_DISPATCH_DEPTH) {
     logger.warn(
       { agentId, depth: held.size, maxDepth: MAX_NESTED_DISPATCH_DEPTH },
-      "nested queued-run dispatch exceeded max depth; coalescing to stop cleanup amplification",
+      "nested queued-run dispatch exceeded max depth; detaching to stop cleanup amplification",
     );
+    // Bound the recursion without discarding the demand. Returning
+    // `onCoalesced()` outright used to drop this agent's dispatch: when its own
+    // lock happened to be free there was no pass to fold into, so a
+    // reap -> promote chain that reached this depth left the agent's newly
+    // runnable queue stalled until an unrelated wake.
+    //
+    // Detaching satisfies both invariants at once. Nothing recurses — the pass
+    // is re-entered at top level, so depth does not grow — and the work still
+    // happens. This is the same shape the deadlock guard below already uses for
+    // the busy-lock case; only the free-lock case was leaking demand.
+    const running = runningByAgent.get(agentId);
+    const followUp = running
+      ? ensureCoalescedFollowUp(agentId, fn, running)
+      : heldAgentIds.exit(() => runExclusively(agentId, fn));
+    trackDetachedFollowUp(agentId, followUp);
     return options.onCoalesced();
   }
 

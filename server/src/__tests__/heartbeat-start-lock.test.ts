@@ -160,7 +160,7 @@ describe("heartbeat agent start lock (BLO-20396)", () => {
     expect(inner).not.toHaveBeenCalled();
   });
 
-  it("allows nesting across different agents but caps the depth", async () => {
+  it("caps nesting depth by detaching the deepest call instead of dropping it", async () => {
     const ids = Array.from({ length: 6 }, () => randomUUID());
     const calls: string[] = [];
 
@@ -176,9 +176,18 @@ describe("heartbeat agent start lock (BLO-20396)", () => {
       );
     };
 
+    // The chain is CUT at the depth bound rather than recursed through: the
+    // 5th call returns `onCoalesced()` to its caller instead of the nested
+    // result, so the top-level call never sees "leaf".
     await expect(nest(0)).resolves.toBe("depth-capped");
-    // MAX_NESTED_DISPATCH_DEPTH is 4, so the 5th distinct agent is refused.
-    expect(calls).toHaveLength(4);
+
+    // ...but the demand must not be discarded. Previously the depth guard
+    // returned `onCoalesced()` without registering anything, so when the 5th
+    // agent's own lock was free there was no pass to fold into and its queue
+    // stalled until an unrelated wake. It now runs detached at top level, and
+    // because that resets the depth the rest of the chain proceeds from there.
+    await _settleDetachedAgentStartLockWorkForTesting();
+    expect(calls).toEqual(ids);
   });
 
   it("serializes a burst so each queued item is handed out at most once", async () => {

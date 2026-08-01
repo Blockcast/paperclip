@@ -433,21 +433,26 @@ export const PR_REVIEW_QUEUE_FAIRNESS_MAX_WAIT_MS = 10 * 60 * 1000;
  */
 const QUEUED_RUN_DISPATCH_SCAN_LIMIT = 200;
 /**
- * BLO-20396 (review follow-up): how many dispatchable candidates one pass
- * collects before it stops paging and ranks what it has.
- *
- * Ranking is global over the collected set, so this only needs to be large
- * enough that the priority sort has a representative pool — available slots are
- * single-digit.
- */
-const QUEUED_RUN_DISPATCH_CANDIDATE_LIMIT = 200;
-/**
  * BLO-20396 (review follow-up): hard bound on batches read by one pass, so a
  * pathological backlog cannot make the critical section unbounded again. A pass
- * that stops here without filling its candidate pool logs loudly rather than
- * silently reporting an empty queue.
+ * that stops here without exhausting the queue records where it stopped and
+ * schedules a continuation, so the bound throttles a pass rather than capping
+ * how far into the queue dispatch can ever see.
  */
 const QUEUED_RUN_DISPATCH_MAX_SCAN_BATCHES = 10;
+/**
+ * BLO-20396 (review follow-up): how many consecutive resumed passes one wake
+ * may chain before giving up and restarting from the head of the queue.
+ *
+ * Each resumed pass advances strictly forward through a finite queue, so the
+ * chain terminates on its own once the scan exhausts. This cap only bounds the
+ * pathological case where the queue is deeper than
+ * `SCAN_LIMIT * MAX_SCAN_BATCHES * MAX_RESUME_PASSES` (20k rows) and every row
+ * in it is unclaimable. Restarting from the head is the right fallback there:
+ * by then the blocked rows nearest the head are the likeliest to have become
+ * ready.
+ */
+const QUEUED_RUN_DISPATCH_MAX_RESUME_PASSES = 10;
 /**
  * Issue statuses that make any queued run targeting them pointless. Matches the
  * convention used by execution-workspaces / issue-tree-control / routines.
@@ -17584,11 +17589,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    */
   function scheduleFollowUpDispatchAfterPrune(agentId: string, prunedRuns: number) {
     if (prunedRuns <= 0) return;
+    scheduleDetachedDispatchPass(agentId, "pruned_invalid_rows");
+  }
+
+  /**
+   * Where the last bounded pass stopped scanning, for agents whose queue is
+   * deeper than one pass may read. See the scan loop for why this has to
+   * survive across passes.
+   */
+  const dispatchResumeCursorByAgent = new Map<
+    string,
+    { createdAt: Date; id: string; passes: number }
+  >();
+
+  /** Run one more dispatch pass for `agentId`, detached from this critical section. */
+  function scheduleDetachedDispatchPass(agentId: string, reason: string) {
     const pass = runDetachedFromAgentStartLock(() =>
       startNextQueuedRunForAgent(agentId).catch((err) => {
         logger.error(
-          { err, agentId },
-          "startNextQueuedRunForAgent: follow-up dispatch after pruning failed",
+          { err, agentId, reason },
+          "startNextQueuedRunForAgent: follow-up dispatch failed",
         );
       }));
     inFlightExecutions.add(pass);
@@ -17737,7 +17757,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       >();
       const queuedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       let prunedTerminalIssueRuns = 0;
-      let scanCursor: { createdAt: Date; id: string } | null = null;
+      // Resume where the previous bounded pass stopped. A pass that hits the
+      // batch ceiling without exhausting the queue leaves this set, so the
+      // ceiling throttles how much one pass reads instead of capping how far
+      // into the queue dispatch can ever see.
+      const resumeState = dispatchResumeCursorByAgent.get(agentId) ?? null;
+      let scanCursor: { createdAt: Date; id: string } | null = resumeState
+        ? { createdAt: resumeState.createdAt, id: resumeState.id }
+        : null;
       let scannedBatches = 0;
       let scanExhausted = false;
 
@@ -17823,21 +17850,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         const batchReadiness = await listQueuedRunDependencyReadiness(agent.companyId, survivingRuns);
         for (const [issueId, readiness] of batchReadiness) dependencyReadiness.set(issueId, readiness);
-        for (const queuedRun of survivingRuns) {
-          const issueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
-          // Dependency-blocked runs are skipped rather than collected.
-          // claimQueuedRun re-checks readiness and refuses them, so they can
-          // never be claimed; carrying them would only let a wall of blocked
-          // rows crowd runnable work out of the candidate pool. Issue-less runs
-          // (every GitHub PR-review wake) have no dependencies and always pass.
-          if (issueId && batchReadiness.get(issueId)?.isDependencyReady === false) continue;
-          queuedRuns.push(queuedRun);
-        }
+        // Dependency-blocked rows are carried into the candidate pool, not
+        // skipped. An earlier revision of this fix dropped them here on the
+        // premise that claimQueuedRun would only ever refuse them — but the
+        // claim gate does more than refuse: it CANCELS a blocked run with
+        // `issue_dependencies_blocked`, marks its wakeup skipped, and releases
+        // the issue's execution lock (see cancelQueuedRunForBlockedDependencies).
+        // Skipping them stranded all three, leaving the issue lock held by a
+        // run that would never start. It also bypassed the claim gate's
+        // interaction-wake exemption, which lets some blocked runs legitimately
+        // proceed. They cannot crowd out runnable work: the dispatch rank puts
+        // an unready run at `12 + priorityRank`, below everything runnable, and
+        // collection no longer stops at a fixed candidate count.
+        for (const queuedRun of survivingRuns) queuedRuns.push(queuedRun);
 
-        if (queuedRuns.length >= QUEUED_RUN_DISPATCH_CANDIDATE_LIMIT || scanExhausted) break;
+        if (scanExhausted) break;
       }
 
-      if (!scanExhausted && queuedRuns.length < QUEUED_RUN_DISPATCH_CANDIDATE_LIMIT) {
+      if (!scanExhausted) {
         logger.warn(
           {
             agentId,
@@ -17849,6 +17879,57 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "startNextQueuedRunForAgent: hit the batch bound before exhausting the queued backlog; some rows were not examined this pass",
         );
       }
+
+      /**
+       * Carry the scan boundary into the next pass, and make sure a next pass
+       * actually happens.
+       *
+       * Without this, a queue whose first `SCAN_LIMIT * MAX_SCAN_BATCHES` rows
+       * are all unclaimable — every one dependency-blocked, so nothing is
+       * pruned and nothing is claimed — re-scans that same prefix on every
+       * pass and never reaches runnable work behind it. That is the prefix
+       * starvation this ticket removed at 200 rows, reappearing at the hard
+       * ceiling: no claim means nothing completes to re-trigger dispatch, and
+       * no prune means the prune-triggered follow-up does not fire either.
+       *
+       * The chain terminates. Each resumed pass advances the keyset cursor
+       * strictly forward through a finite queue, so it either reaches runnable
+       * work, exhausts the scan, or trips the resume cap — and all three clear
+       * the cursor so the following pass restarts from the head.
+       *
+       * Returns whether it scheduled a continuation, so the caller does not
+       * also schedule the prune follow-up and double up.
+       */
+      const advanceOrClearResumeCursor = (claimedCount: number): boolean => {
+        if (scanExhausted || claimedCount > 0 || !scanCursor) {
+          dispatchResumeCursorByAgent.delete(agentId);
+          return false;
+        }
+        const passes = (resumeState?.passes ?? 0) + 1;
+        if (passes >= QUEUED_RUN_DISPATCH_MAX_RESUME_PASSES) {
+          logger.error(
+            {
+              agentId,
+              passes,
+              maxResumePasses: QUEUED_RUN_DISPATCH_MAX_RESUME_PASSES,
+              scannedRows: passes * QUEUED_RUN_DISPATCH_SCAN_LIMIT
+                * QUEUED_RUN_DISPATCH_MAX_SCAN_BATCHES,
+            },
+            "startNextQueuedRunForAgent: queued backlog still unclaimable after the resume cap; restarting from the head of the queue",
+          );
+          dispatchResumeCursorByAgent.delete(agentId);
+          return false;
+        }
+        dispatchResumeCursorByAgent.set(agentId, { ...scanCursor, passes });
+        scheduleDetachedDispatchPass(agentId, "resume_bounded_scan");
+        return true;
+      };
+
+      /** Settle this pass's continuation bookkeeping exactly once. */
+      const finishPassWithoutClaims = () => {
+        if (advanceOrClearResumeCursor(0)) return;
+        scheduleFollowUpDispatchAfterPrune(agentId, prunedTerminalIssueRuns);
+      };
       if (prunedTerminalIssueRuns > 0) {
         logger.info(
           { agentId, prunedTerminalIssueRuns },
@@ -17856,7 +17937,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       }
       if (queuedRuns.length === 0) {
-        scheduleFollowUpDispatchAfterPrune(agentId, prunedTerminalIssueRuns);
+        finishPassWithoutClaims();
         return [];
       }
 
@@ -17891,6 +17972,96 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         lastStartedRun,
         dispatchNow,
       );
+      // BLO-12990: fold priority into the primary dispatch rank so a
+      // high-priority `todo` can preempt a low-priority `in_progress`.
+      // Old scheme made status the primary key (in_progress always beat
+      // todo regardless of priority gap). New formula:
+      //   ready run  → priorityRank * 2 + (in_progress ? 0 : 1)
+      //   no issueId → 10
+      //   not-ready  → 12 + priorityRank
+      // This lets high-priority todo (rank 3) beat low-priority in_progress
+      // (rank 6) while preserving the in_progress bonus within a tier.
+      // BLO-16253: aging term prevents indefinite starvation of a `todo`
+      // run — see STARVATION_* constants above. Recovery/wake_owner runs
+      // get a much shorter escalation floor (STARVATION_RECOVERY_ESCALATION_MS)
+      // since they represent already-detected breakage, not routine backlog.
+      const dispatchRank = (
+        issue: { status: string; priority: string | null } | null | undefined,
+        ready: boolean,
+        hasId: boolean,
+        waitedMs: number,
+        isRecoveryWake: boolean,
+      ): number => {
+        if (!hasId) {
+          // BLO-18995: issue-less runs (every GitHub PR-review wake) used to
+          // return a flat 10 here, *above* the aging escalation below, so the
+          // BLO-16253 anti-starvation floor was unreachable for the entire
+          // class. Every dependency-ready issue-bound run ranks
+          // `priorityRank * 2 + statusBonus` ∈ [0,9], so even a `low`-priority
+          // `todo` (7) permanently outranked an arbitrarily old PR review.
+          // Escalate aged issue-less runs to 2: they outrank routine medium/
+          // low work while preserving ranks 0-1 for explicit critical issue
+          // work. The PR-review fairness promotion above remains the bounded
+          // path for an aged review to jump even critical work.
+          return waitedMs >= STARVATION_FULL_ESCALATION_MS ? 2 : 10;
+        }
+        // NB: the aging escalation below stays *underneath* this `!ready`
+        // check on purpose. A dependency-blocked run must never escalate to
+        // the front of the queue no matter how long it has waited, because it
+        // cannot run yet.
+        if (!ready) return 12 + issueRunPriorityRank(issue?.priority);
+        const escalationFloorMs = isRecoveryWake
+          ? STARVATION_RECOVERY_ESCALATION_MS
+          : STARVATION_FULL_ESCALATION_MS;
+        const priorityRank = issueRunPriorityRank(issue?.priority);
+        // Aging must guarantee progress without erasing the emergency lane.
+        // Aged non-critical issue work joins rank 2 alongside aged issue-less
+        // work, ahead of routine medium/low work but behind critical ranks
+        // 0-1. Critical work itself still ages to rank 0 for FIFO ordering
+        // within that tier.
+        if (waitedMs >= escalationFloorMs) return priorityRank === 0 ? 0 : 2;
+        const statusBonus =
+          issue?.status === "in_progress" || waitedMs >= STARVATION_STATUS_BOOST_MS ? 0 : 1;
+        return priorityRank * 2 + statusBonus;
+      };
+      // Rank every collected candidate up front, once.
+      //
+      // This is what keeps priority *global* rather than confined to whichever
+      // rows the scan happened to reach first. Collection walks the queue
+      // oldest-first, so ranking only the first N rows would let a fresh
+      // `critical` or recovery wake sit behind N older low-priority rows and
+      // never be considered — the aging formula above is explicitly designed
+      // for the opposite (fresh critical ranks 0-1, aged non-critical ranks 2).
+      //
+      // Precomputing is also what makes ranking the whole scanned window
+      // affordable: the comparator used to re-parse each side's
+      // `contextSnapshot` on every comparison, so an N-row sort cost
+      // O(N log N) JSON parses. It is now O(N).
+      const dispatchRankByRunId = new Map<string, number>();
+      for (const queuedRun of queuedRuns) {
+        const snapshot = parseObject(queuedRun.contextSnapshot);
+        const issueId = readNonEmptyString(snapshot.issueId);
+        const ready = issueId
+          ? (dependencyReadiness.get(issueId)?.isDependencyReady ?? true)
+          : true;
+        const issue = issueId ? issueById.get(issueId) : null;
+        // Require both recoveryActionId AND source:"issue_recovery_action" (every
+        // enqueueWakeup call in recovery/service.ts stamps both together) so this
+        // stays an explicit, narrowly-scoped coupling rather than any future wake
+        // path inheriting the fast track by incidentally reusing the bare field.
+        const isRecoveryWake = Boolean(readNonEmptyString(snapshot.recoveryActionId))
+          && snapshot.source === "issue_recovery_action";
+        dispatchRankByRunId.set(
+          queuedRun.id,
+          dispatchRank(
+            issue,
+            ready,
+            Boolean(issueId),
+            dispatchNow.getTime() - queuedRun.createdAt.getTime(),
+            isRecoveryWake,
+          ),
+        );
+      }
       const prioritizedRuns = [...queuedRuns].sort((left, right) => {
         if (left.id === fairnessPromotedPrReviewRunId && right.id !== fairnessPromotedPrReviewRunId) {
           return -1;
@@ -17898,83 +18069,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (right.id === fairnessPromotedPrReviewRunId && left.id !== fairnessPromotedPrReviewRunId) {
           return 1;
         }
-        const leftIssueId = readNonEmptyString(parseObject(left.contextSnapshot).issueId);
-        const rightIssueId = readNonEmptyString(parseObject(right.contextSnapshot).issueId);
-        const leftReadiness = leftIssueId ? dependencyReadiness.get(leftIssueId) : null;
-        const rightReadiness = rightIssueId ? dependencyReadiness.get(rightIssueId) : null;
-        const leftReady = leftIssueId ? (leftReadiness?.isDependencyReady ?? true) : true;
-        const rightReady = rightIssueId ? (rightReadiness?.isDependencyReady ?? true) : true;
-        const leftIssue = leftIssueId ? issueById.get(leftIssueId) : null;
-        const rightIssue = rightIssueId ? issueById.get(rightIssueId) : null;
-        // BLO-12990: fold priority into the primary dispatch rank so a
-        // high-priority `todo` can preempt a low-priority `in_progress`.
-        // Old scheme made status the primary key (in_progress always beat
-        // todo regardless of priority gap). New formula:
-        //   ready run  → priorityRank * 2 + (in_progress ? 0 : 1)
-        //   no issueId → 10
-        //   not-ready  → 12 + priorityRank
-        // This lets high-priority todo (rank 3) beat low-priority in_progress
-        // (rank 6) while preserving the in_progress bonus within a tier.
-        // BLO-16253: aging term prevents indefinite starvation of a `todo`
-        // run — see STARVATION_* constants above. Recovery/wake_owner runs
-        // get a much shorter escalation floor (STARVATION_RECOVERY_ESCALATION_MS)
-        // since they represent already-detected breakage, not routine backlog.
-        const dispatchRank = (
-          issue: { status: string; priority: string | null } | null | undefined,
-          ready: boolean,
-          hasId: boolean,
-          waitedMs: number,
-          isRecoveryWake: boolean,
-        ): number => {
-          if (!hasId) {
-            // BLO-18995: issue-less runs (every GitHub PR-review wake) used to
-            // return a flat 10 here, *above* the aging escalation below, so the
-            // BLO-16253 anti-starvation floor was unreachable for the entire
-            // class. Every dependency-ready issue-bound run ranks
-            // `priorityRank * 2 + statusBonus` ∈ [0,9], so even a `low`-priority
-            // `todo` (7) permanently outranked an arbitrarily old PR review.
-            // Escalate aged issue-less runs to 2: they outrank routine medium/
-            // low work while preserving ranks 0-1 for explicit critical issue
-            // work. The PR-review fairness promotion above remains the bounded
-            // path for an aged review to jump even critical work.
-            return waitedMs >= STARVATION_FULL_ESCALATION_MS ? 2 : 10;
-          }
-          // NB: the aging escalation below stays *underneath* this `!ready`
-          // check on purpose. A dependency-blocked run must never escalate to
-          // the front of the queue no matter how long it has waited, because it
-          // cannot run yet.
-          if (!ready) return 12 + issueRunPriorityRank(issue?.priority);
-          const escalationFloorMs = isRecoveryWake
-            ? STARVATION_RECOVERY_ESCALATION_MS
-            : STARVATION_FULL_ESCALATION_MS;
-          const priorityRank = issueRunPriorityRank(issue?.priority);
-          // Aging must guarantee progress without erasing the emergency lane.
-          // Aged non-critical issue work joins rank 2 alongside aged issue-less
-          // work, ahead of routine medium/low work but behind critical ranks
-          // 0-1. Critical work itself still ages to rank 0 for FIFO ordering
-          // within that tier.
-          if (waitedMs >= escalationFloorMs) return priorityRank === 0 ? 0 : 2;
-          const statusBonus =
-            issue?.status === "in_progress" || waitedMs >= STARVATION_STATUS_BOOST_MS ? 0 : 1;
-          return priorityRank * 2 + statusBonus;
-        };
-        const leftWaitedMs = dispatchNow.getTime() - left.createdAt.getTime();
-        const rightWaitedMs = dispatchNow.getTime() - right.createdAt.getTime();
-        // Require both recoveryActionId AND source:"issue_recovery_action" (every
-        // enqueueWakeup call in recovery/service.ts stamps both together) so this
-        // stays an explicit, narrowly-scoped coupling rather than any future wake
-        // path inheriting the fast track by incidentally reusing the bare field.
-        const isRecoveryWakeContext = (contextSnapshot: unknown) => {
-          const parsed = parseObject(contextSnapshot);
-          return (
-            Boolean(readNonEmptyString(parsed.recoveryActionId)) &&
-            parsed.source === "issue_recovery_action"
-          );
-        };
-        const leftIsRecoveryWake = isRecoveryWakeContext(left.contextSnapshot);
-        const rightIsRecoveryWake = isRecoveryWakeContext(right.contextSnapshot);
-        const leftRank = dispatchRank(leftIssue, leftReady, !!leftIssueId, leftWaitedMs, leftIsRecoveryWake);
-        const rightRank = dispatchRank(rightIssue, rightReady, !!rightIssueId, rightWaitedMs, rightIsRecoveryWake);
+        const leftRank = dispatchRankByRunId.get(left.id) ?? Number.MAX_SAFE_INTEGER;
+        const rightRank = dispatchRankByRunId.get(right.id) ?? Number.MAX_SAFE_INTEGER;
         return leftRank !== rightRank
           ? leftRank - rightRank
           : left.createdAt.getTime() - right.createdAt.getTime();
@@ -18020,9 +18116,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (queuedIssueId) inFlightIssueIds.add(queuedIssueId);
       }
       if (claimedRuns.length === 0) {
-        scheduleFollowUpDispatchAfterPrune(agentId, prunedTerminalIssueRuns);
+        finishPassWithoutClaims();
         return [];
       }
+      // A claim means work started; its completion re-triggers dispatch from
+      // the head of the queue, which is where the next pass should look.
+      advanceOrClearResumeCursor(claimedRuns.length);
 
       for (const claimedRun of claimedRuns) {
         // BLO-20396: detach from the start-lock context. executeRun is launched
