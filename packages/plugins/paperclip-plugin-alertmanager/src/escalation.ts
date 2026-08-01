@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { DEFAULT_COVER_DEDUP_WINDOW_MINUTES, DEFAULT_ESCALATION_DEADLINE_MINUTES } from "./constants.js";
-import { readAlertState } from "./alert-state.js";
+import { readAlertState, writeAlertState } from "./alert-state.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { ORIGIN_KIND, type AlertmanagerAlert, type AlertmanagerPluginConfig, type AlertStateRecord } from "./types.js";
 
@@ -381,11 +381,12 @@ async function advanceIssueLadder(
   // escalation deadline can fall due before Alertmanager's next repeat delivery
   // arrives to migrate it, and a scoped-only read would see `null` here and
   // silently skip the ladder for up to a full `repeat_interval`.
-  const { ref, record: state } = await readAlertState(ctx, companyId, issue.originId);
+  const handle = await readAlertState(ctx, companyId, issue.originId);
+  const state = handle.record;
   if (!state || state.resolvedAt || state.escalationComplete || !state.nextEscalationAt || Date.parse(state.nextEscalationAt) > now.getTime()) return;
   const hold = holdUntil(await ctx.issues.listComments(issue.id, companyId));
   if (hold && hold > now.getTime()) {
-    await ctx.state.set(ref, { ...state, nextEscalationAt: new Date(hold).toISOString() });
+    await writeAlertState(ctx, handle, { ...state, nextEscalationAt: new Date(hold).toISOString() });
     return;
   }
   const attempt = state.escalationAttempt ?? 0;
@@ -398,7 +399,7 @@ async function advanceIssueLadder(
     // sweep instead of silently never covering.
     await createCover(ctx, issue, companyId, state.alertname, config, now);
     await ctx.issues.createComment(issue.id, "[alert-escalation] Agent chain exhausted while alert remains firing; created a [user-cover] escalation.", companyId);
-    await ctx.state.set(ref, { ...state, escalationAttempt: MAX_ATTEMPTS, escalationComplete: true, nextEscalationAt: null });
+    await writeAlertState(ctx, handle, { ...state, escalationAttempt: MAX_ATTEMPTS, escalationComplete: true, nextEscalationAt: null });
     return;
   }
 
@@ -407,7 +408,7 @@ async function advanceIssueLadder(
   // repeat of the same rung (comment storm). The reassign rung re-reads the
   // live assignee next time, so an interrupted rung self-heals upward.
   const next = attempt + 1;
-  await ctx.state.set(ref, { ...state, escalationAttempt: next, escalationComplete: false, nextEscalationAt: new Date(now.getTime() + rungIntervalMs(state, config)).toISOString() });
+  await writeAlertState(ctx, handle, { ...state, escalationAttempt: next, escalationComplete: false, nextEscalationAt: new Date(now.getTime() + rungIntervalMs(state, config)).toISOString() });
 
   if (attempt === 0 && current) {
     await ctx.issues.createComment(issue.id, `[alert-escalation 1/${MAX_ATTEMPTS}] Alert is still firing; waking current owner ${current.name}.`, companyId);

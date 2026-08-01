@@ -250,9 +250,14 @@ rules routinely produce the *same* fingerprint: company B's firing delivery woul
 find company A's row and update/re-open A's issue instead of creating B's, and a
 B resolution would close A's issue.
 
-Rows written by an older build are read through and migrated into their owning
-company's scope on first sight, gated on the row's own `paperclipCompanyId` — so
-a row is only ever adopted by the company whose issue it actually tracks.
+Rows written by an older build are read through, gated on the row's own
+`paperclipCompanyId` — so a row is only ever surfaced to the company whose issue
+it actually tracks. The read itself writes nothing: the row moves into company
+scope as a side effect of the reader's *own* next write, which carries that
+reader's update rather than a replayed snapshot. That ordering is what stops a
+webhook and the escalation sweep, both mid-migration on the same fingerprint,
+from landing a stale copy on top of a record the other has already advanced or
+resolved. `ctx.state` has no compare-and-swap to guard such a write against.
 
 **If you are writing another plugin, do not resolve credentials in `setup()`.**
 Doing so fails in a way that hides itself: saving config fires
@@ -262,12 +267,31 @@ change to blame. Diagnosed in BLO-20049, where it rejected 100% of alert
 deliveries with `502 unauthorized` while the stored config was perfectly valid;
 it then recurred twice more (BLO-20467) for a combined ~3h15m of dead alerting.
 
-Known limitation: the `check-alert-escalations` sweep still reads those module
-globals, so it sweeps exactly one company — whichever saved config last — and
-stays idle after a restart until an `onConfigChanged` supplies a scope. Both are
-logged when they happen rather than failing silently. Fixing it properly needs a
-host API to enumerate a plugin's configured companies, which `PluginConfigClient`
-does not expose today (BLO-20595). Delivery is unaffected.
+Known limitation: the `check-alert-escalations` sweep holds no config of its own.
+A job tick reads whatever company the *host* scoped it to, which the host sets to
+the `bootstrapCompanyId` computed in `activatePlugin` — and only when exactly one
+company has configured the plugin. So:
+
+- **One configured company** — the sweep is scoped to it and reads that company's
+  live config every tick. It is correct immediately after a restart, with no
+  operator action.
+- **Two or more** — the host gives scheduled jobs no company scope and denies
+  every company-scoped call, including the sweep's own `issues.list`. The sweep
+  detects this and disables itself with a log line naming the cause, rather than
+  walking into a denial per tick. Escalation ladders do not advance for anyone.
+
+`bootstrapCompanyId` is computed at **activation and never recomputed**, and
+saving config only fires `onConfigChanged` on a running worker — the host
+restarts the worker only for plugins that *don't* implement that hook. A change
+in the *number* of configured companies is therefore invisible until the plugin
+is reactivated for some other reason: after a 1 → 2 change the sweep keeps
+running scoped to the original company instead of disabling, and after 2 → 1 it
+stays disabled. Neither is detectable from inside the plugin, because no
+worker-facing API enumerates a plugin's configured companies — the host has
+`registry.listConfigCompanyIds`, but the worker protocol does not expose it
+(BLO-20595). Restarting the plugin re-derives the scope correctly.
+
+Delivery is unaffected by all of this: a webhook carries its own company scope.
 
 
 ### Bearer rotation in a Kubernetes deployment
