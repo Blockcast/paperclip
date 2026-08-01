@@ -66,6 +66,7 @@ import {
   issueCommentPresentationSchema,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
+  SYSTEM_ISSUE_DOCUMENT_KEYS,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
@@ -912,6 +913,12 @@ export type ChildIssueCompletionSummary = {
 function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
   if (actorRunId) return checkoutRunId === actorRunId;
   return checkoutRunId == null;
+}
+
+function normalizeAgentNameKey(value: string | null | undefined) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  return normalized.length > 0 ? normalized : null;
 }
 
 export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set([
@@ -1903,6 +1910,14 @@ const DURABLE_LANDING_SHAPES = ["pr-link", "landing-artifact"] as const;
  *
  * Only `allDetected` is merged — `verdict`, `missing` and `requiredFound` stay
  * exactly as freshly computed, which is the whole point of re-evaluating.
+ *
+ * Note (BLO-19081): the done gate's third evidence path — a run-attributed
+ * durable artifact, see `fetchDurableArtifactEvidence` below — deliberately does
+ * NOT rely on this carry-forward. It queries the artifact rows live at close
+ * time, so it has no comment-window to age out of and nothing to preserve. If
+ * you add a fourth shape, prefer that pattern over widening
+ * `DURABLE_LANDING_SHAPES`: a live row is a stronger record than a cached
+ * verdict field, which is only needed for shapes scraped from comment text.
  */
 function preserveDurableLandingEvidence<T extends { allDetected?: unknown }>(
   fresh: T,
@@ -1916,6 +1931,217 @@ function preserveDurableLandingEvidence<T extends { allDetected?: unknown }>(
   );
   if (carried.length === 0) return fresh;
   return { ...fresh, allDetected: [...freshDetected, ...carried] };
+}
+
+/**
+ * Work-product types that count as a durable, inspectable deliverable for the
+ * done gate. Deliberately narrow: `pull_request` / `branch` / `commit` are
+ * already covered by the pr-link path, and `preview_url` / `runtime_service`
+ * describe ephemeral infrastructure rather than a reviewable artifact.
+ */
+const DURABLE_ARTIFACT_WORK_PRODUCT_TYPES = ["artifact", "document"] as const;
+const UUID_SQL_SOURCE =
+  "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}";
+const UUID_SQL_PATTERN = `^${UUID_SQL_SOURCE}$`;
+const ATTACHMENT_CONTENT_URL_SQL_PATTERN = `^/api/attachments/${UUID_SQL_SOURCE}/content(\\?download=1)?$`;
+
+function hasTrustedOrPromotedSourceTrust(sourceTrustColumn: any): SQL {
+  return or(
+    isNull(sourceTrustColumn as any),
+    sql`${sourceTrustColumn}->>'disposition' = 'promoted'`,
+  )!;
+}
+
+function hasInspectableWorkProductUrlLocator(): SQL {
+  return or(
+    // External artifact URLs are accepted as reviewer-openable locators. The
+    // server deliberately does not resolve them here because that would create
+    // SSRF surface; internal attachment URLs resolve against same-issue rows.
+    sql`${issueWorkProducts.url} ~* '^https?://[^[:space:]]+$'`,
+    sql`case
+      when ${issueWorkProducts.url} ~* ${ATTACHMENT_CONTENT_URL_SQL_PATTERN}
+      then exists (
+        select 1
+        from issue_attachments durable_url_attachment
+        where durable_url_attachment.company_id = ${issueWorkProducts.companyId}
+          and durable_url_attachment.issue_id = ${issueWorkProducts.issueId}
+          and (
+            ${issueWorkProducts.url} = '/api/attachments/' || durable_url_attachment.id::text || '/content'
+            or ${issueWorkProducts.url} = '/api/attachments/' || durable_url_attachment.id::text || '/content?download=1'
+          )
+      )
+      else false
+    end`,
+  )!;
+}
+
+function hasInspectableWorkProductLocator(issueId: string): SQL {
+  return or(
+    hasInspectableWorkProductUrlLocator(),
+    and(
+      sql`jsonb_typeof(${issueWorkProducts.metadata}->'resourceRef') = 'object'`,
+      sql`${issueWorkProducts.metadata}->'resourceRef'->>'kind' = 'workspace_file'`,
+      sql`${issueWorkProducts.metadata}->'resourceRef'->>'issueId' = ${issueId}`,
+      sql`${issueWorkProducts.metadata}->'resourceRef'->>'workspaceKind' in ('execution_workspace', 'project_workspace')`,
+      sql`${issueWorkProducts.metadata}->'resourceRef'->>'relativePath' ~ '[^[:space:]]'`,
+      sql`${issueWorkProducts.metadata}->'resourceRef'->>'displayPath' ~ '[^[:space:]]'`,
+      sql`case
+        when ${issueWorkProducts.metadata}->'resourceRef'->>'workspaceId' ~* ${UUID_SQL_PATTERN}
+        then (
+          (
+            ${issueWorkProducts.metadata}->'resourceRef'->>'workspaceKind' = 'execution_workspace'
+            and exists (
+              select 1
+              from execution_workspaces durable_execution_workspace
+              where durable_execution_workspace.id = (${issueWorkProducts.metadata}->'resourceRef'->>'workspaceId')::uuid
+                and durable_execution_workspace.company_id = ${issueWorkProducts.companyId}
+                and durable_execution_workspace.source_issue_id = ${issueWorkProducts.issueId}
+            )
+          )
+          or (
+            ${issueWorkProducts.metadata}->'resourceRef'->>'workspaceKind' = 'project_workspace'
+            and exists (
+              select 1
+              from project_workspaces durable_project_workspace
+              where durable_project_workspace.id = (${issueWorkProducts.metadata}->'resourceRef'->>'workspaceId')::uuid
+                and durable_project_workspace.company_id = ${issueWorkProducts.companyId}
+            )
+          )
+        )
+        else false
+      end`,
+    )!,
+    sql`case
+      when ${issueWorkProducts.metadata}->>'attachmentId' ~* ${UUID_SQL_PATTERN}
+      then exists (
+        select 1
+        from issue_attachments durable_attachment
+        where durable_attachment.id = (${issueWorkProducts.metadata}->>'attachmentId')::uuid
+          and durable_attachment.company_id = ${issueWorkProducts.companyId}
+          and durable_attachment.issue_id = ${issueWorkProducts.issueId}
+          and ${issueWorkProducts.metadata}->>'contentPath' = '/api/attachments/' || durable_attachment.id::text || '/content'
+          and ${issueWorkProducts.metadata}->>'openPath' = '/api/attachments/' || durable_attachment.id::text || '/content'
+          and ${issueWorkProducts.metadata}->>'downloadPath' = '/api/attachments/' || durable_attachment.id::text || '/content?download=1'
+      )
+      else false
+    end`,
+    sql`case
+      when ${issueWorkProducts.metadata}->>'documentId' ~* ${UUID_SQL_PATTERN}
+      then exists (
+        select 1
+        from issue_documents durable_issue_document
+        inner join documents durable_document
+          on durable_document.id = durable_issue_document.document_id
+        inner join document_revisions durable_revision
+          on durable_revision.id = durable_document.latest_revision_id
+        where durable_document.id = (${issueWorkProducts.metadata}->>'documentId')::uuid
+          and durable_issue_document.company_id = ${issueWorkProducts.companyId}
+          and durable_issue_document.issue_id = ${issueWorkProducts.issueId}
+          and durable_issue_document.key not in (${DONE_GATE_NON_QUALIFYING_DOCUMENT_KEY_SQL_LIST})
+          and (durable_document.source_trust is null or durable_document.source_trust->>'disposition' = 'promoted')
+          and durable_revision.created_by_run_id is not null
+          and durable_revision.body ~ '[^[:space:]]'
+      )
+      else false
+    end`,
+    sql`exists (
+      select 1
+      from issue_documents durable_issue_document
+      inner join documents durable_document
+        on durable_document.id = durable_issue_document.document_id
+      inner join document_revisions durable_revision
+        on durable_revision.id = durable_document.latest_revision_id
+      where durable_issue_document.company_id = ${issueWorkProducts.companyId}
+        and durable_issue_document.issue_id = ${issueWorkProducts.issueId}
+        and durable_issue_document.key = ${issueWorkProducts.metadata}->>'documentKey'
+        and durable_issue_document.key not in (${DONE_GATE_NON_QUALIFYING_DOCUMENT_KEY_SQL_LIST})
+        and (durable_document.source_trust is null or durable_document.source_trust->>'disposition' = 'promoted')
+        and durable_revision.created_by_run_id is not null
+        and durable_revision.body ~ '[^[:space:]]'
+    )`,
+  )!;
+}
+
+/**
+ * Document keys that must NOT satisfy the done gate.
+ *
+ * `plan` is authored at the START of the work, so accepting it would let every
+ * issue that was ever planned self-certify completion — the plan is a statement
+ * of intent, not a deliverable. The system keys are scaffolding the platform
+ * writes on the agent's behalf (`continuation-summary` is emitted automatically
+ * when a run hands off), so neither is evidence the agent produced anything.
+ */
+const DONE_GATE_NON_QUALIFYING_DOCUMENT_KEYS: readonly string[] = [
+  ...SYSTEM_ISSUE_DOCUMENT_KEYS,
+  "plan",
+];
+const DONE_GATE_NON_QUALIFYING_DOCUMENT_KEY_SQL_LIST = sql.join(
+  DONE_GATE_NON_QUALIFYING_DOCUMENT_KEYS.map((key) => sql`${key}`),
+  sql`, `,
+);
+
+/**
+ * Does this issue carry a durable artifact that a real run produced? (BLO-19081)
+ *
+ * See the docblock in `done-gate.ts` for why this exists and why it is not a
+ * hole in the gate. Two qualifying shapes, both requiring run attribution:
+ *
+ *  - an issue document (excluding plan/system keys) whose latest revision has a
+ *    non-empty body, is stamped `createdByRunId`, and is trusted or promoted;
+ *  - an active, trusted-or-promoted, inspectable `artifact`/`document` work
+ *    product stamped `createdByRunId`.
+ *
+ * `createdByRunId` is validated against the authenticated actor's run context in
+ * the route layer, so an agent cannot attribute evidence to another run.
+ *
+ * Call this LAZILY — only when the cheaper gate checks have already decided to
+ * block — so the common update path pays no extra query.
+ */
+async function fetchDurableArtifactEvidence(dbOrTx: any, issueId: string, companyId: string): Promise<boolean> {
+  const [documentRows, workProductRows] = await Promise.all([
+    dbOrTx
+      .select({ key: issueDocuments.key })
+      .from(issueDocuments)
+      .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
+      .innerJoin(documentRevisions, eq(documentRevisions.id, documents.latestRevisionId))
+      .where(
+        and(
+          eq(issueDocuments.companyId, companyId),
+          eq(issueDocuments.issueId, issueId),
+          notInArray(issueDocuments.key, [...DONE_GATE_NON_QUALIFYING_DOCUMENT_KEYS]),
+          hasTrustedOrPromotedSourceTrust(documents.sourceTrust),
+          isNotNull(documentRevisions.createdByRunId),
+          // Must contain at least one non-whitespace character. A body of
+          // spaces, tabs or newlines is as empty as `''` and would otherwise
+          // be the cheapest way to satisfy the gate with no deliverable.
+          // NOT `length(trim(...)) > 0` — Postgres `trim`/`btrim` strips only
+          // SPACES by default, so "\n\t" survives it and passes. Deliberately
+          // not a minimum length beyond blank either: an arbitrary threshold
+          // invites padding, and the substantive check is a reviewer opening
+          // the artifact.
+          sql`${documentRevisions.body} ~ '[^[:space:]]'`,
+        ),
+      )
+      .limit(1)
+      .for("update", { of: [issueDocuments, documents] }),
+    dbOrTx
+      .select({ id: issueWorkProducts.id })
+      .from(issueWorkProducts)
+      .where(
+        and(
+          eq(issueWorkProducts.companyId, companyId),
+          eq(issueWorkProducts.issueId, issueId),
+          inArray(issueWorkProducts.type, [...DURABLE_ARTIFACT_WORK_PRODUCT_TYPES]),
+          eq(issueWorkProducts.status, "active"),
+          hasTrustedOrPromotedSourceTrust(issueWorkProducts.sourceTrust),
+          isNotNull(issueWorkProducts.createdByRunId),
+          hasInspectableWorkProductLocator(issueId),
+        ),
+      )
+      .limit(1)
+      .for("update"),
+  ]);
+  return documentRows.length > 0 || workProductRows.length > 0;
 }
 
 /**
@@ -2053,6 +2279,7 @@ const SYSTEM_HARNESS_CHILD_ORIGIN_KINDS: string[] = [
 const PRODUCTIVITY_REVIEW_TERMINAL_STATUSES = ["done", "cancelled"];
 const PRODUCTIVITY_REVIEW_ACTIVITY_ACTIONS = [
   "issue.productivity_review_created",
+  "issue.productivity_review_source_mutation",
   "issue.productivity_review_updated",
 ];
 const PRODUCTIVITY_REVIEW_TRIGGERS: readonly IssueProductivityReviewTrigger[] = [
@@ -2540,10 +2767,20 @@ async function listIssueBlockerAttentionMap(
   companyId: string,
   issueRows: IssueBlockerAttentionInputNode[],
 ): Promise<Map<string, IssueBlockerAttention>> {
-  const roots = issueRows.filter((row) => row.companyId === companyId && row.status === "blocked");
+  const companyIssueRows = issueRows.filter((row) => row.companyId === companyId);
+  const dependencyReadinessMap = await listIssueDependencyReadinessMap(
+    dbOrTx,
+    companyId,
+    companyIssueRows.map((row) => row.id),
+  );
+  const roots = companyIssueRows.filter((row) =>
+    !BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES.includes(row.status) &&
+    (row.status === "blocked" || (dependencyReadinessMap.get(row.id)?.unresolvedBlockerCount ?? 0) > 0),
+  );
+  const rootIds = new Set(roots.map((root) => root.id));
   const attentionMap = new Map<string, IssueBlockerAttention>();
   for (const row of issueRows) {
-    if (row.status !== "blocked") {
+    if (!rootIds.has(row.id)) {
       attentionMap.set(row.id, createIssueBlockerAttention());
     }
   }
@@ -2915,8 +3152,31 @@ async function listIssueBlockerAttentionMap(
   for (const root of roots) {
     const rootNodeIds = nodeIdsByRoot.get(root.id) ?? new Set([root.id]);
     const rootTraversalTruncated = truncatedRootIds.has(root.id);
-    const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
+    const dependencyReadiness = dependencyReadinessMap.get(root.id);
+    const unresolvedBlockerIssueIds = new Set(
+      dependencyReadiness?.unresolvedBlockerIssueIds ?? [],
+    );
+    const pendingFinalizeBlockerCount = new Set(
+      dependencyReadiness?.pendingFinalizeBlockerIssueIds ?? [],
+    ).size;
+    const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => {
+      if (unresolvedBlockerIssueIds.has(edge.blockerIssueId)) return true;
+      const blockerNode = nodesById.get(edge.blockerIssueId);
+      return (
+        blockerNode?.parentId === root.id &&
+        !BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES.includes(blockerNode.status)
+      );
+    });
     if (topLevelEdges.length === 0) {
+      if (pendingFinalizeBlockerCount > 0) {
+        attentionMap.set(root.id, createIssueBlockerAttention({
+          state: "covered",
+          reason: "active_dependency",
+          unresolvedBlockerCount: pendingFinalizeBlockerCount,
+          coveredBlockerCount: pendingFinalizeBlockerCount,
+        }));
+        continue;
+      }
       attentionMap.set(root.id, createIssueBlockerAttention({
         state: "needs_attention",
         reason: "attention_required",
@@ -2928,9 +3188,10 @@ async function listIssueBlockerAttentionMap(
       edge,
       result: classifyPath(edge.blockerIssueId, new Set([root.id]), rootNodeIds, rootTraversalTruncated),
     }));
-    const coveredBlockerCount = classified.filter((entry) => entry.result.covered).length;
+    const classifiedCoveredBlockerCount = classified.filter((entry) => entry.result.covered).length;
+    const coveredBlockerCount = classifiedCoveredBlockerCount + pendingFinalizeBlockerCount;
     const stalledBlockerCount = classified.filter((entry) => entry.result.stalled).length;
-    const attentionBlockerCount = classified.length - coveredBlockerCount - stalledBlockerCount;
+    const attentionBlockerCount = classified.length - classifiedCoveredBlockerCount - stalledBlockerCount;
     const hardAttentionEntry = classified.find((entry) => !entry.result.covered && !entry.result.stalled);
     const stalledEntry = classified.find((entry) => entry.result.stalled);
     const sampleEntry = hardAttentionEntry ?? stalledEntry ?? classified[0] ?? null;
@@ -2949,7 +3210,8 @@ async function listIssueBlockerAttentionMap(
       reason = "stalled_review";
     } else {
       state = "covered";
-      reason = topLevelEdges.every((edge) => nodesById.get(edge.blockerIssueId)?.parentId === root.id)
+      reason = pendingFinalizeBlockerCount === 0 &&
+        topLevelEdges.every((edge) => nodesById.get(edge.blockerIssueId)?.parentId === root.id)
         ? "active_child"
         : "active_dependency";
     }
@@ -2957,7 +3219,7 @@ async function listIssueBlockerAttentionMap(
     attentionMap.set(root.id, createIssueBlockerAttention({
       state,
       reason,
-      unresolvedBlockerCount: topLevelEdges.length,
+      unresolvedBlockerCount: topLevelEdges.length + pendingFinalizeBlockerCount,
       coveredBlockerCount,
       stalledBlockerCount,
       attentionBlockerCount,
@@ -4345,6 +4607,32 @@ export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
 
+  async function runningCheckoutExecutionPatch(
+    checkoutRunId: string | null,
+    agentId: string,
+    now: Date,
+  ) {
+    if (!checkoutRunId) return {};
+
+    const row = await db
+      .select({
+        status: heartbeatRuns.status,
+        runAgentId: heartbeatRuns.agentId,
+        agentName: agents.name,
+      })
+      .from(heartbeatRuns)
+      .leftJoin(agents, and(eq(agents.companyId, heartbeatRuns.companyId), eq(agents.id, heartbeatRuns.agentId)))
+      .where(eq(heartbeatRuns.id, checkoutRunId))
+      .then((rows) => rows[0] ?? null);
+
+    if (row?.status !== "running" || row.runAgentId !== agentId) return {};
+    return {
+      executionRunId: checkoutRunId,
+      executionAgentNameKey: normalizeAgentNameKey(row.agentName),
+      executionLockedAt: now,
+    };
+  }
+
   function normalizeCreateIssueTitle(title: string) {
     return title.trim().replace(/\s+/g, " ").toLowerCase();
   }
@@ -5177,6 +5465,19 @@ export function issueService(db: Db) {
     });
   }
 
+  async function lockHeartbeatRunsForUpdate(
+    tx: Pick<Db, "execute">,
+    runIds: Array<string | null | undefined>,
+  ) {
+    const ids = [...new Set(runIds.filter((id): id is string => Boolean(id)))].sort();
+    if (ids.length === 0) return;
+    await tx.execute(
+      sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} in (${
+        sql.join(ids.map((id) => sql`${id}`), sql`, `)
+      }) order by ${heartbeatRuns.id} for update`,
+    );
+  }
+
   async function adoptActiveActorIssueRun(input: {
     issueId: string;
     companyId: string;
@@ -5193,11 +5494,37 @@ export function issueService(db: Db) {
     }))) return null;
 
     return db.transaction(async (tx) => {
+      const lockedIssue = await tx
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, input.issueId))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (
+        !lockedIssue ||
+        lockedIssue.companyId !== input.companyId ||
+        lockedIssue.status !== "in_progress" ||
+        lockedIssue.assigneeAgentId !== input.actorAgentId ||
+        lockedIssue.checkoutRunId !== input.expectedCheckoutRunId ||
+        (input.expectedExecutionRunId
+          ? lockedIssue.executionRunId !== input.expectedExecutionRunId
+          : lockedIssue.executionRunId != null)
+      ) {
+        return null;
+      }
+
+      await lockHeartbeatRunsForUpdate(tx, [input.actorRunId]);
       const actorRun = await tx
         .select({ status: heartbeatRuns.status })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, input.actorRunId))
-        .for("update")
         .then((rows) => rows[0] ?? null);
       if (actorRun?.status !== "running") return null;
 
@@ -5268,14 +5595,7 @@ export function issueService(db: Db) {
         return { adopted: null, latest: lockedIssue };
       }
 
-      await Promise.all([
-        tx.execute(
-          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.expectedCheckoutRunId} for update`,
-        ),
-        tx.execute(
-          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
-        ),
-      ]);
+      await lockHeartbeatRunsForUpdate(tx, [input.expectedCheckoutRunId, input.actorRunId]);
       const [existingRun, actorRun] = await Promise.all([
         tx
           .select({ status: heartbeatRuns.status })
@@ -5371,11 +5691,33 @@ export function issueService(db: Db) {
     actorRunId: string;
   }) {
     const adopted = await db.transaction(async (tx) => {
+      const lockedIssue = await tx
+        .select({
+          id: issues.id,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, input.issueId))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (
+        !lockedIssue ||
+        lockedIssue.status !== "in_progress" ||
+        lockedIssue.assigneeAgentId !== input.actorAgentId ||
+        lockedIssue.checkoutRunId !== null ||
+        (lockedIssue.executionRunId !== null && lockedIssue.executionRunId !== input.actorRunId)
+      ) {
+        return null;
+      }
+
+      await lockHeartbeatRunsForUpdate(tx, [input.actorRunId]);
       const actorRun = await tx
         .select({ status: heartbeatRuns.status })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, input.actorRunId))
-        .for("update")
         .then((rows) => rows[0] ?? null);
       if (actorRun?.status !== "running") return null;
 
@@ -8213,18 +8555,26 @@ export function issueService(db: Db) {
 
       // Done-execution gate (narrated-completion hardening, instance flag
       // `enableDoneExecutionGate`, default off). Blocks an agent self-marking
-      // an issue `done` when no real execution run ever occurred and no
-      // pr-link evidence was recorded — the failure mode where agents post
-      // "## Done" via the board API without shipping code. Never gates human
-      // actors. See server/src/services/done-gate.ts.
+      // an issue `done` when no real execution run ever occurred, no pr-link
+      // evidence was recorded, and no run-attributed durable artifact exists —
+      // the failure mode where agents post "## Done" via the board API without
+      // shipping code. Never gates human actors. See done-gate.ts.
+      //
+      // Both expensive lookups (the evidence refresh and the durable-artifact
+      // query) run ONLY once the cheap checks have already decided to block, so
+      // the ordinary update path is unaffected. `hasDurableArtifactEvidence:
+      // false` in the pre-check is what makes that laziness correct: it can
+      // only cause us to look harder, never to skip a block.
       let doneTransitionEvidenceVerdict: Awaited<ReturnType<typeof runEvidenceGate>> | null = null;
       let doneGateEvidenceVerdict = existing.lastEvidenceVerdict;
+      let doneGateNeedsDurableArtifactCheck = false;
       const doneGateInput = {
         fromStatus: existing.status,
         toStatus: issueData.status,
         existingExecutionRunId: existing.executionRunId,
         lastEvidenceVerdict: doneGateEvidenceVerdict,
         isAgentActor: actorAgentId != null,
+        hasDurableArtifactEvidence: false,
       };
       if (experimental.enableDoneExecutionGate && shouldBlockNarratedDone(doneGateInput)) {
         try {
@@ -8249,22 +8599,14 @@ export function issueService(db: Db) {
             "done-execution gate: evidence refresh failed; preserving block posture",
           );
         }
-      }
-
-      if (
-        experimental.enableDoneExecutionGate &&
-        shouldBlockNarratedDone({
+        doneGateNeedsDurableArtifactCheck = shouldBlockNarratedDone({
           fromStatus: existing.status,
           toStatus: issueData.status,
           existingExecutionRunId: existing.executionRunId,
           lastEvidenceVerdict: doneGateEvidenceVerdict,
           isAgentActor: actorAgentId != null,
-        })
-      ) {
-        throw unprocessable(
-          "Issue cannot be marked done without execution evidence (no execution run and no pr-link evidence)",
-          { reason: "no_execution_run_and_no_pr_evidence", issueId: id },
-        );
+          hasDurableArtifactEvidence: false,
+        });
       }
 
       const patch: Partial<typeof issues.$inferInsert> = {
@@ -8479,6 +8821,40 @@ export function issueService(db: Db) {
           projectGoalId: nextProjectGoalId,
           defaultGoalId: defaultCompanyGoal?.id ?? null,
         });
+        if (doneGateNeedsDurableArtifactCheck) {
+          let doneGateHasDurableArtifact = false;
+          try {
+            doneGateHasDurableArtifact = await fetchDurableArtifactEvidence(tx, id, existing.companyId);
+          } catch (err) {
+            logger.warn(
+              {
+                issueId: id,
+                err: err instanceof Error ? err.message : String(err),
+              },
+              "done-execution gate: durable-artifact lookup failed; returning retryable error",
+            );
+            throw new HttpError(503, "Done-gate durable artifact evidence lookup failed", {
+              reason: "done_gate_evidence_lookup_failed",
+              issueId: id,
+              retryable: true,
+            });
+          }
+          if (
+            shouldBlockNarratedDone({
+              fromStatus: existing.status,
+              toStatus: issueData.status,
+              existingExecutionRunId: existing.executionRunId,
+              lastEvidenceVerdict: doneGateEvidenceVerdict,
+              isAgentActor: actorAgentId != null,
+              hasDurableArtifactEvidence: doneGateHasDurableArtifact,
+            })
+          ) {
+            throw unprocessable(
+              "Issue cannot be marked done without execution evidence (no execution run, no pr-link evidence, and no run-attributed durable artifact). Attach a PR link, or write the deliverable to an issue document (PUT /api/issues/:id/documents/:key) before closing — a comment body is not sufficient.",
+              { reason: "no_execution_run_and_no_pr_evidence", issueId: id },
+            );
+          }
+        }
         const writePreconditions = [
           ...(expectedCurrentStatus === undefined ? [] : [eq(issues.status, expectedCurrentStatus)]),
           ...(expectedCurrentAssigneeAgentId === undefined
@@ -8688,6 +9064,7 @@ export function issueService(db: Db) {
       await assertAssignableAgent(db, issueCompany.companyId, agentId, { kind: "work" });
 
       const now = new Date();
+      const checkoutExecutionPatch = await runningCheckoutExecutionPatch(checkoutRunId, agentId, now);
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(issueCompany.companyId, id);
       if (
         activePauseHold &&
@@ -8753,6 +9130,7 @@ export function issueService(db: Db) {
           assigneeAgentId: agentId,
           assigneeUserId: null,
           checkoutRunId,
+          ...checkoutExecutionPatch,
           status: "in_progress",
           startedAt: now,
           updatedAt: now,
@@ -8823,6 +9201,7 @@ export function issueService(db: Db) {
           .update(issues)
           .set({
             checkoutRunId,
+            ...checkoutExecutionPatch,
             updatedAt: new Date(),
           })
           .where(
@@ -8875,11 +9254,15 @@ export function issueService(db: Db) {
           const adoptionSet: Record<string, unknown> = {
             assigneeAgentId: agentId,
             checkoutRunId,
-            executionAgentNameKey: null,
-            executionLockedAt: now,
+            ...checkoutExecutionPatch,
             status: "in_progress",
             updatedAt: now,
           };
+          if (!("executionRunId" in checkoutExecutionPatch)) {
+            adoptionSet.executionRunId = null;
+            adoptionSet.executionAgentNameKey = null;
+            adoptionSet.executionLockedAt = null;
+          }
           if (current.status !== "in_progress") {
             adoptionSet.startedAt = now;
           }
@@ -8930,6 +9313,7 @@ export function issueService(db: Db) {
               assigneeAgentId: agentId,
               assigneeUserId: null,
               checkoutRunId,
+              ...checkoutExecutionPatch,
               status: "in_progress",
               startedAt: now,
               updatedAt: now,

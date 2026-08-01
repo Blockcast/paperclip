@@ -1,5 +1,7 @@
 import { Router, type Request } from "express";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { heartbeatRuns } from "@paperclipai/db";
 import {
   catalogSkillListQuerySchema,
   companySkillCommentCreateSchema,
@@ -88,6 +90,21 @@ export function companySkillRoutes(db: Db) {
   const issues = issueService(db);
   const heartbeat = heartbeatService(db);
   const skillPolicies = companySkillPolicyService(db);
+
+  async function cancelLiveHarnessIssueRuns(companyId: string, issueId: string) {
+    const liveRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        inArray(heartbeatRuns.status, ["queued", "scheduled_retry", "running"]),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+      ));
+
+    for (const run of liveRuns) {
+      await heartbeat.cancelRun(run.id, "Cancelled by skill test run request");
+    }
+  }
 
   function asString(value: unknown): string | null {
     if (typeof value !== "string") return null;
@@ -679,9 +696,7 @@ export function companySkillRoutes(db: Db) {
       cancelHarnessIssue: async (issueId) => {
         const issue = await issues.getById(issueId);
         if (!issue || issue.companyId !== companyId) return;
-        if (issue.executionRunId) {
-          await heartbeat.cancelRun(issue.executionRunId, "Cancelled by skill test run request");
-        }
+        await cancelLiveHarnessIssueRuns(companyId, issueId);
         if (issue.status !== "done" && issue.status !== "cancelled") {
           await issues.update(issueId, {
             status: "cancelled",

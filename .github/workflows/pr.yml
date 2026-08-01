@@ -86,8 +86,14 @@ jobs:
       - name: Test PR test-coverage gate
         run: node --test ./.github/scripts/tests/check-pr-test-coverage.test.mjs
 
+      - name: Test Ally review-consistency guard
+        run: node --test ./scripts/check-ally-review-consistency.test.mjs
+
       - name: Test general-server shard partition
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
+
+      - name: Test vitest project coverage
+        run: node --test ./scripts/__tests__/vitest-project-coverage.test.mjs
 
       - name: Test release verify workflow wiring
         run: node --test ./scripts/__tests__/release-verify-workflow.test.mjs
@@ -512,7 +518,9 @@ jobs:
 
   e2e:
     needs: [policy]
-    runs-on: default
+    # Keep the long browser suite off the org-wide default pool so PR bursts
+    # cannot hold shared capacity for the full e2e runtime.
+    runs-on: arc-e2e
     # The serial browser suite now covers 43 flows and remained active through
     # test 42 when ARC enforced the previous 30-minute job ceiling.
     timeout-minutes: 60

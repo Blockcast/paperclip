@@ -5,7 +5,25 @@ const PRODUCTIVITY_REVIEW_ORIGIN_KINDS = new Set([
   "productivity_review_escalation",
 ]);
 
-export const DEFAULT_AC_POLICY_CANCEL_SAFETY_CAP = 25;
+/**
+ * The AC-policy sweep (routine 8b764d66) is REPORT-ONLY as of revision 7.
+ *
+ * Ratified by the CEO on BLO-19484 (option 1), implemented via BLO-19487. The
+ * destructive cancellation step this module used to plan is retired: there is no
+ * batch planner, no safety cap, and no destruction-eligible bucket, because
+ * nothing is destroyed. Both buckets below are reporting outputs.
+ *
+ * Why (do not relitigate without new evidence): the step formed a candidate batch
+ * in four consecutive runs and was correctly refused every time, because
+ * spot-checks kept finding live work inside a batch the filter called safe. The
+ * single run that did execute (2026-06-08) destroyed PCL-354, a user-assigned
+ * strategic issue. Root cause is not a threshold — grace-flag age measures issue
+ * *format* ("nobody added a markdown heading"), not issue *liveness*. Genuine
+ * abandonment is owned by stranded-issue recovery and productivity review.
+ *
+ * If a future change proposes reintroducing a destructive path, that needs a fresh
+ * ruling on BLO-19484, not a new default here.
+ */
 
 export type AcPolicyIssueRef = {
   id: string;
@@ -13,7 +31,7 @@ export type AcPolicyIssueRef = {
   status?: string | null;
 };
 
-export type AcPolicyCancelCandidate = {
+export type AcPolicyStaleCandidate = {
   id: string;
   identifier?: string | null;
   title: string;
@@ -23,14 +41,23 @@ export type AcPolicyCancelCandidate = {
   createdByUserId?: string | null;
   originKind?: string | null;
   blocks?: AcPolicyIssueRef[] | null;
+  /**
+   * Newest human-attributable touch, from the `humanClockAt` computation in
+   * `human-gated-ageing.ts`. NEVER derive this from `updatedAt` / `lastActivityAt`:
+   * migration 0076 bumps those on *any* comment insert with no author_type filter,
+   * and this routine's own grace-flag comments are the main thing bumping them — it
+   * would be reading back its own writes. `null` means no human has ever touched the
+   * issue, which is reported as its own condition rather than as a large age.
+   */
+  humanClockAt?: Date | string | null;
 };
 
 export type AcPolicyCandidateClassification =
-  | { bucket: "auto-cancel-safe" }
+  | { bucket: "stale-non-compliant" }
   | { bucket: "needs-human-triage"; reasons: string[] };
 
-export function classifyAcPolicyCancelCandidate(
-  candidate: AcPolicyCancelCandidate,
+export function classifyAcPolicyStaleCandidate(
+  candidate: AcPolicyStaleCandidate,
 ): AcPolicyCandidateClassification {
   const reasons: string[] = [];
 
@@ -57,72 +84,77 @@ export function classifyAcPolicyCancelCandidate(
   }
 
   if (reasons.length > 0) return { bucket: "needs-human-triage", reasons };
-  return { bucket: "auto-cancel-safe" };
+  return { bucket: "stale-non-compliant" };
 }
 
-export function partitionAcPolicyCancelCandidates(candidates: AcPolicyCancelCandidate[]) {
-  const autoCancelSafe: AcPolicyCancelCandidate[] = [];
-  const needsHumanTriage: Array<AcPolicyCancelCandidate & { triageReasons: string[] }> = [];
+/**
+ * Splits stale candidates into two report-only buckets. Neither is actionable;
+ * the split exists because the two need different follow-up.
+ */
+export function partitionAcPolicyStaleCandidates(candidates: AcPolicyStaleCandidate[]) {
+  const staleNonCompliant: AcPolicyStaleCandidate[] = [];
+  const needsHumanTriage: Array<AcPolicyStaleCandidate & { triageReasons: string[] }> = [];
 
   for (const candidate of candidates) {
-    const classification = classifyAcPolicyCancelCandidate(candidate);
-    if (classification.bucket === "auto-cancel-safe") {
-      autoCancelSafe.push(candidate);
+    const classification = classifyAcPolicyStaleCandidate(candidate);
+    if (classification.bucket === "stale-non-compliant") {
+      staleNonCompliant.push(candidate);
     } else {
       needsHumanTriage.push({ ...candidate, triageReasons: classification.reasons });
     }
   }
 
-  return { autoCancelSafe, needsHumanTriage };
+  return { staleNonCompliant, needsHumanTriage };
 }
 
-export function planAcPolicyAutoCancelBatch(
-  candidates: AcPolicyCancelCandidate[],
-  safetyCap = DEFAULT_AC_POLICY_CANCEL_SAFETY_CAP,
-) {
-  const partitioned = partitionAcPolicyCancelCandidates(candidates);
-  const cancelPaused = partitioned.autoCancelSafe.length > safetyCap;
-
-  return {
-    ...partitioned,
-    safetyCap,
-    cancelPaused,
-    autoCancelBatch: cancelPaused ? [] : partitioned.autoCancelSafe,
-  };
-}
-
-function formatIssueRef(issue: AcPolicyCancelCandidate) {
+function formatIssueRef(issue: AcPolicyStaleCandidate) {
   return issue.identifier ? `${issue.identifier} (${issue.id})` : issue.id;
 }
 
-export function formatAcPolicyCancelDashboardSections(candidates: AcPolicyCancelCandidate[]) {
-  const plan = planAcPolicyAutoCancelBatch(candidates);
-  const lines: string[] = [`### Auto-cancel-safe candidates (${plan.autoCancelSafe.length})`];
+/**
+ * `null` humanClockAt is rendered as its own condition rather than folded into an
+ * age, per the BLO-19484 amendment: never touched by a human is worse than merely
+ * stale, and must stay visibly distinct in the table. `undefined` means this
+ * report input did not carry the clock, and malformed values stay unknown rather
+ * than being promoted to the stronger "never touched" claim.
+ */
+function formatHumanClock(issue: AcPolicyStaleCandidate) {
+  if (issue.humanClockAt === undefined) return "";
+  if (issue.humanClockAt === null) return " [never touched by a human]";
+  const at = issue.humanClockAt instanceof Date ? issue.humanClockAt : new Date(issue.humanClockAt);
+  if (Number.isNaN(at.getTime())) return " [human touch unknown]";
+  return ` [last human touch ${at.toISOString().slice(0, 10)}]`;
+}
 
-  if (plan.cancelPaused) {
-    lines.push(
-      `Cancellation paused: ${plan.autoCancelSafe.length} safe candidates exceeds safety cap ${plan.safetyCap}.`,
-    );
-  }
+export function formatAcPolicyStaleDashboardSections(candidates: AcPolicyStaleCandidate[]) {
+  const partitioned = partitionAcPolicyStaleCandidates(candidates);
+  const lines: string[] = [
+    `### Stale non-compliant candidates — report only (${partitioned.staleNonCompliant.length})`,
+  ];
 
-  if (plan.autoCancelSafe.length === 0) {
+  if (partitioned.staleNonCompliant.length === 0) {
     lines.push("- None");
   } else {
-    for (const candidate of plan.autoCancelSafe) {
-      lines.push(`- ${formatIssueRef(candidate)} - ${candidate.title}`);
+    for (const candidate of partitioned.staleNonCompliant) {
+      lines.push(`- ${formatIssueRef(candidate)} - ${candidate.title}${formatHumanClock(candidate)}`);
     }
   }
 
-  lines.push("", `### Needs-human-triage candidates (${plan.needsHumanTriage.length})`);
-  if (plan.needsHumanTriage.length === 0) {
+  lines.push(
+    "",
+    `### Needs-human-triage candidates — report only (${partitioned.needsHumanTriage.length})`,
+  );
+  if (partitioned.needsHumanTriage.length === 0) {
     lines.push("- None");
   } else {
-    for (const candidate of plan.needsHumanTriage) {
+    for (const candidate of partitioned.needsHumanTriage) {
       lines.push(
-        `- ${formatIssueRef(candidate)} - ${candidate.title} (${candidate.triageReasons.join(", ")})`,
+        `- ${formatIssueRef(candidate)} - ${candidate.title} (${candidate.triageReasons.join(", ")})${formatHumanClock(candidate)}`,
       );
     }
   }
+
+  lines.push("", "Issues cancelled by this sweep: 0 (this routine is report-only — see BLO-19484).");
 
   return lines.join("\n");
 }

@@ -432,6 +432,73 @@ describe("approval routes idempotent retries", () => {
     );
   });
 
+  // `requestedByAgentId` is an attribution signal other subsystems reason about, so an agent must
+  // not be able to nominate someone else as the requester of an approval it filed.
+  it("ignores a body-supplied requestedByAgentId from an agent actor", async () => {
+    mockApprovalService.create.mockResolvedValue({
+      id: "approval-attr",
+      companyId: "company-1",
+      type: "request_board_approval",
+      requestedByAgentId: "agent-1",
+      requestedByUserId: null,
+      status: "pending",
+      payload: { title: "Approve hosting spend" },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      createdAt: new Date("2026-04-06T00:00:00.000Z"),
+      updatedAt: new Date("2026-04-06T00:00:00.000Z"),
+    });
+
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        requestedByAgentId: "00000000-0000-0000-0000-0000000000ff",
+        payload: { title: "Approve hosting spend" },
+      });
+
+    expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
+    expect(mockApprovalService.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({ requestedByAgentId: "agent-1", requestedByUserId: null }),
+    );
+  });
+
+  it("honours a body-supplied requestedByAgentId from a user actor", async () => {
+    mockApprovalService.create.mockResolvedValue({
+      id: "approval-attr-user",
+      companyId: "company-1",
+      type: "request_board_approval",
+      requestedByAgentId: "00000000-0000-0000-0000-0000000000ff",
+      requestedByUserId: "user-1",
+      status: "pending",
+      payload: { title: "Approve hosting spend" },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      createdAt: new Date("2026-04-06T00:00:00.000Z"),
+      updatedAt: new Date("2026-04-06T00:00:00.000Z"),
+    });
+
+    const res = await request(await createApp({ type: "user", userId: "user-1" }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        requestedByAgentId: "00000000-0000-0000-0000-0000000000ff",
+        payload: { title: "Approve hosting spend" },
+      });
+
+    expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
+    expect(mockApprovalService.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        requestedByAgentId: "00000000-0000-0000-0000-0000000000ff",
+        requestedByUserId: "user-1",
+      }),
+    );
+  });
+
   it("blocks status-only recovery runs from creating approvals", async () => {
     const res = await request(await createAgentApp({
       contextSnapshot: {
