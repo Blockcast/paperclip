@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
-  isSensitiveEnvName,
+  isMountedSecretPath,
+  isSafeLiteralEnv,
   findLiteralSensitiveEnvVars,
   assertNoLiteralSensitiveEnv,
   assertManifestHasNoLiteralSensitiveEnv,
@@ -10,43 +11,98 @@ function podSpecWithEnv(env: unknown[], key = "containers"): Record<string, unkn
   return { [key]: [{ name: "agent", env }] };
 }
 
-describe("isSensitiveEnvName", () => {
-  it("matches the agreed credential-name patterns, case-insensitively", () => {
-    for (const name of [
-      "ANTHROPIC_API_KEY",
-      "BOOTSTRAP_TOKEN",
-      "GITHUB_WEBHOOK_SECRET",
-      "DB_PASSWORD",
-      "AWS_CREDENTIAL_FILE_CONTENTS",
-      "PROXY_AUTHORIZATION",
-      "lowercase_token",
+describe("isMountedSecretPath", () => {
+  it("accepts absolute paths under a known secret-mount root", () => {
+    for (const value of [
+      "/paperclip/.secrets/github-token/token",
+      "/var/run/secrets/kubernetes.io/serviceaccount/token",
+      "/run/secrets/db-password",
+      "/etc/paperclip/tls.key",
     ]) {
-      expect(isSensitiveEnvName(name), name).toBe(true);
+      expect(isMountedSecretPath(value), value).toBe(true);
     }
   });
 
-  it("does not match ordinary configuration names", () => {
-    for (const name of ["HOME", "PATH", "PAPERCLIP_RUN_ID", "NODE_ENV", "HOSTNAME"]) {
-      expect(isSensitiveEnvName(name), name).toBe(false);
+  it("rejects anything that is not actually a mounted path", () => {
+    for (const value of [
+      "sk-ant-not-a-real-key", // the bypass this check exists to close
+      "ghp_0123456789abcdef",
+      "relative/path/token",
+      "/tmp/token", // absolute, but outside the allowed roots
+      "/paperclip/../etc/shadow", // traversal
+      "/paperclip/.secrets/a b", // whitespace
+      "",
+      undefined,
+      42,
+    ]) {
+      expect(isMountedSecretPath(value), String(value)).toBe(false);
+    }
+  });
+});
+
+describe("isSafeLiteralEnv", () => {
+  it("permits explicitly allowlisted non-secret names", () => {
+    expect(isSafeLiteralEnv("HOME", "/home/paperclip")).toBe(true);
+  });
+
+  // This is the inversion. Under the previous denylist these all passed purely
+  // because their names missed /TOKEN|SECRET|.../i. MCP_CONFIG is the known
+  // counter-example: it carries a merged mcp.json with embedded
+  // `Authorization: Bearer ...` headers.
+  it("refuses any literal that is not affirmatively known to be safe", () => {
+    for (const name of ["MCP_CONFIG", "PATH", "NODE_ENV", "PAPERCLIP_RUN_ID", "HOSTNAME"]) {
+      expect(isSafeLiteralEnv(name, "anything"), name).toBe(false);
     }
   });
 
-  it("exempts *_FILE path pointers, which hold a mount path and not the secret", () => {
-    // Rejecting these would push callers off the very pattern we want them on.
-    expect(isSensitiveEnvName("PAPERCLIP_GITHUB_TOKEN_FILE")).toBe(false);
-    expect(isSensitiveEnvName("PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY_FILE")).toBe(false);
+  it("permits a *_FILE pointer only when its value really is a mounted path", () => {
+    expect(
+      isSafeLiteralEnv("PAPERCLIP_GITHUB_TOKEN_FILE", "/paperclip/.secrets/github-token/token"),
+    ).toBe(true);
+    // The name-only exemption was a bypass: a *_FILE var whose value is the
+    // credential itself, not a path to it.
+    expect(isSafeLiteralEnv("API_TOKEN_FILE", "sk-ant-the-actual-token")).toBe(false);
+    expect(isSafeLiteralEnv("DB_PASSWORD_FILE", "hunter2")).toBe(false);
   });
 });
 
 describe("findLiteralSensitiveEnvVars", () => {
-  it("reports a sensitive-named env var carrying a literal value", () => {
+  it("reports an env var carrying a literal credential value", () => {
     const found = findLiteralSensitiveEnvVars(
       podSpecWithEnv([{ name: "ANTHROPIC_API_KEY", value: "sk-not-a-real-key" }]),
     );
-    expect(found).toEqual([{ container: "agent", envName: "ANTHROPIC_API_KEY" }]);
+    expect(found).toEqual([
+      { container: "agent", envName: "ANTHROPIC_API_KEY", reason: "not-allowlisted" },
+    ]);
   });
 
-  it("accepts a sensitive name sourced via valueFrom.secretKeyRef", () => {
+  it("reports MCP_CONFIG, which the previous name-pattern denylist missed", () => {
+    const found = findLiteralSensitiveEnvVars(
+      podSpecWithEnv([{ name: "MCP_CONFIG", value: '{"headers":{"Authorization":"Bearer x"}}' }]),
+    );
+    expect(found).toEqual([{ container: "agent", envName: "MCP_CONFIG", reason: "not-allowlisted" }]);
+  });
+
+  it("reports a *_FILE var whose value is a credential rather than a path", () => {
+    const found = findLiteralSensitiveEnvVars(
+      podSpecWithEnv([{ name: "API_TOKEN_FILE", value: "sk-ant-the-actual-token" }]),
+    );
+    expect(found).toEqual([
+      { container: "agent", envName: "API_TOKEN_FILE", reason: "file-pointer-not-a-path" },
+    ]);
+  });
+
+  it("accepts a *_FILE var pointing at a real mounted secret path", () => {
+    expect(
+      findLiteralSensitiveEnvVars(
+        podSpecWithEnv([
+          { name: "PAPERCLIP_GITHUB_TOKEN_FILE", value: "/paperclip/.secrets/github-token/token" },
+        ]),
+      ),
+    ).toEqual([]);
+  });
+
+  it("accepts a value sourced via valueFrom.secretKeyRef", () => {
     const found = findLiteralSensitiveEnvVars(
       podSpecWithEnv([
         { name: "ANTHROPIC_API_KEY", valueFrom: { secretKeyRef: { name: "s", key: "k" } } },
@@ -55,7 +111,7 @@ describe("findLiteralSensitiveEnvVars", () => {
     expect(found).toEqual([]);
   });
 
-  it("accepts non-sensitive literals such as HOME", () => {
+  it("accepts the allowlisted HOME literal", () => {
     expect(findLiteralSensitiveEnvVars(podSpecWithEnv([{ name: "HOME", value: "/home/paperclip" }])))
       .toEqual([]);
   });
@@ -65,7 +121,9 @@ describe("findLiteralSensitiveEnvVars", () => {
       const found = findLiteralSensitiveEnvVars(
         podSpecWithEnv([{ name: "MCP_AUTH_HEADER", value: "Bearer nope" }], key),
       );
-      expect(found, key).toEqual([{ container: "agent", envName: "MCP_AUTH_HEADER" }]);
+      expect(found, key).toEqual([
+        { container: "agent", envName: "MCP_AUTH_HEADER", reason: "not-allowlisted" },
+      ]);
     }
   });
 
@@ -96,6 +154,17 @@ describe("assertNoLiteralSensitiveEnv", () => {
       message = (err as Error).message;
     }
     expect(message).not.toContain(secret);
+  });
+
+  it("tells the caller how to fix it, including the allowlist escape hatch", () => {
+    let message = "";
+    try {
+      assertNoLiteralSensitiveEnv(podSpecWithEnv([{ name: "NODE_ENV", value: "production" }]), "Job x");
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain("SAFE_LITERAL_ENV_NAMES");
+    expect(message).toContain("secretKeyRef");
   });
 
   it("passes a clean spec", () => {
