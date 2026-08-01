@@ -25,6 +25,7 @@ import {
   ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS,
   ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP,
   issueRoutes,
+  raceCreateIssueDuplicateCandidateLookup,
 } from "../routes/issues.js";
 import {
   ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS,
@@ -46,6 +47,14 @@ const monitorFilings = JSON.parse(
     "utf8",
   ),
 ) as FilingFixture[];
+
+it("bounds a stalled duplicate candidate lookup so create can fail open", async () => {
+  const startedAt = performance.now();
+
+  await expect(raceCreateIssueDuplicateCandidateLookup(new Promise<never>(() => {}), 10))
+    .rejects.toThrow("issue duplicate candidate lookup timed out after 10ms");
+  expect(performance.now() - startedAt).toBeLessThan(500);
+});
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -301,14 +310,21 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       .expect(201);
     expect(explicitlyAllowed.body.duplicateCandidates).not.toEqual([]);
 
-    const createdEvents = await db
+    const activityEvents = await db
       .select()
       .from(activityLog)
-      .where(eq(activityLog.entityId, response.body.id));
-    const consumptionEvents = createdEvents.filter(
-      (event) => event.action === "issue.created" && Array.isArray(event.details?.duplicateCandidates),
+      .where(eq(activityLog.companyId, companyId));
+    const consumptionEvents = activityEvents.filter(
+      (event) => event.action === "issue.duplicate_candidates_shown"
+        && event.details?.identifier === response.body.identifier,
     );
     expect(consumptionEvents).toHaveLength(1);
+    expect(activityEvents.filter((event) => event.action === "issue.duplicate_candidates_shown"))
+      .toHaveLength(2);
+    expect(consumptionEvents[0]).toMatchObject({
+      entityType: "company",
+      entityId: companyId,
+    });
     expect(consumptionEvents[0]?.details).toMatchObject({
       identifier: response.body.identifier,
       duplicateCandidates: response.body.duplicateCandidates.map(
@@ -318,6 +334,8 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
         }),
       ),
     });
+    expect(activityEvents.find((event) => event.action === "issue.created")?.details)
+      .not.toHaveProperty("duplicateCandidates");
   });
 
   it("returns no advisory and records no consumption payload for a distinct issue", async () => {
@@ -344,8 +362,8 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     const createdEvents = await db
       .select()
       .from(activityLog)
-      .where(eq(activityLog.entityId, response.body.id));
-    expect(createdEvents.filter((event) => event.details?.duplicateCandidates !== undefined)).toHaveLength(0);
+      .where(eq(activityLog.companyId, companyId));
+    expect(createdEvents.filter((event) => event.action === "issue.duplicate_candidates_shown")).toHaveLength(0);
   });
 
   it("keeps candidate lookup below the declared budget with the row cap saturated", async () => {
