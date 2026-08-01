@@ -9,10 +9,13 @@
  * (~200k heartbeat_runs, ~20k issues, one agent holding a deep queued backlog)
  * and asserting on EXPLAIN (ANALYZE, BUFFERS) output.
  *
- * It also measures the priority lane, which review flagged separately: the lane
- * joins issues through `context_snapshot ->> 'issueId' = cast(issues.id as text)`
- * and its LIMIT bounds returned rows, not rows inspected. The zero-match case is
- * the worst case, because nothing lets the executor stop early.
+ * It also measures the priority lane, which review flagged separately. The lane
+ * used to join issues through `context_snapshot ->> 'issueId' = cast(issues.id
+ * as text)`, whose LIMIT bounded returned rows rather than rows inspected; the
+ * zero-match case is the worst case, because nothing lets the executor stop
+ * early. Both the old shape and the two bounded statements that replaced it are
+ * measured here, so the improvement is executable evidence rather than a claim
+ * in a review comment.
  */
 import fs from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
@@ -27,6 +30,15 @@ const SCAN_LIMIT = 200;
 const TOTAL_RUNS = 200_000;
 const TOTAL_ISSUES = Number(process.env.BLO20396_ISSUES ?? 20_000);
 const AGENT_QUEUED_ROWS = 350;
+/**
+ * The issue ids the agent's queued rows point at — the exact set the
+ * dispatcher screens for UUID shape and then passes to the lookup below.
+ * Mirrors the `series + 100` offset used when seeding that backlog.
+ */
+const LANE_ISSUE_IDS = Array.from(
+  { length: AGENT_QUEUED_ROWS },
+  (_, index) => `00000000-0000-4000-8000-${String(index + 101).padStart(12, "0")}`,
+);
 const COMPANY = "11111111-1111-4111-8111-111111111111";
 const AGENT = "22222222-2222-4222-8222-222222222222";
 const PLAN_REPORT = process.env.BLO20396_PLAN_REPORT ?? null;
@@ -57,14 +69,44 @@ function scanKinds(node: Record<string, unknown>): string[] {
     .filter((kind) => kind.includes("Scan"));
 }
 
-/** Total rows the executor actually touched, summed across all nodes. */
+/**
+ * Total rows the executor actually EXAMINED, summed across all nodes.
+ *
+ * `Actual Rows` alone counts rows a node EMITTED, which hides exactly the cost
+ * this test exists to bound: a scan that walks 50k rows and filters them down
+ * to 200 reports 200, and every bounded-work assertion below would pass while
+ * the executor did arbitrarily more work. PostgreSQL reports the discarded rows
+ * separately, so they are added back here. Both `Actual Rows` and the
+ * `Rows Removed by ...` counters are per-loop averages, so both scale by loops.
+ */
 function rowsInspected(node: Record<string, unknown>): number {
   return planNodes(node).reduce((total, entry) => {
-    const rows = Number(entry["Actual Rows"] ?? 0);
     const loops = Number(entry["Actual Loops"] ?? 1);
-    return total + rows * loops;
+    const emitted = Number(entry["Actual Rows"] ?? 0);
+    const discarded =
+      Number(entry["Rows Removed by Filter"] ?? 0)
+      + Number(entry["Rows Removed by Index Recheck"] ?? 0)
+      + Number(entry["Rows Removed by Join Filter"] ?? 0);
+    return total + (emitted + discarded) * loops;
   }, 0);
 }
+
+/** The plan node that scans a named index, so its conditions can be inspected. */
+function indexScanNode(
+  node: Record<string, unknown>,
+  indexName: string,
+): Record<string, unknown> | null {
+  return planNodes(node).find((entry) => entry["Index Name"] === indexName) ?? null;
+}
+
+/**
+ * The keyset predicate as PostgreSQL renders a row comparison, e.g.
+ * `((created_at, id) > ('...'::timestamptz, '...'::uuid))`. Matched as a row
+ * constructor rather than by substring: bare `id` also appears inside
+ * `agent_id`, so `toContain("id")` would pass on a plan that never used the
+ * cursor at all.
+ */
+const KEYSET_PREDICATE = /\(\s*created_at\s*,\s*id\s*\)/;
 
 async function seed(sql: postgres.Sql) {
   // FK triggers off: this fixture only needs the two tables under test.
@@ -154,8 +196,11 @@ const DISPATCH_CURSOR_QUERY = `
    LIMIT ${SCAN_LIMIT}
 `;
 
-/** The priority lane exactly as the dispatcher issues it today. */
-const PRIORITY_LANE_QUERY = `
+/** The priority lane as it was BEFORE the fifth review follow-up. Kept as
+ * executable evidence of why it changed: the JSON->text join makes issues_pkey
+ * unusable, so the lane's LIMIT bounds returned rows while the executor scans
+ * the whole company issue table. */
+const PRIORITY_LANE_BEFORE = `
   SELECT heartbeat_runs.*, issues.id, issues.status, issues.priority
     FROM heartbeat_runs
     INNER JOIN issues
@@ -176,30 +221,53 @@ const PRIORITY_LANE_QUERY = `
 `;
 
 /**
- * Same lane, but joined on the stored generated column instead of the JSON
- * expression. context_issue_id has existed since migration 0079
- * (GENERATED ALWAYS AS (context_snapshot ->> 'issueId') STORED), so this is a
- * rewrite of the predicate, not a new column.
+ * The lane as the dispatcher issues it TODAY: split in two, so each predicate
+ * can reach an index and each kind of row gets its own budget.
+ *
+ * Lane A — critical issues. Pulling `priority = 'critical'` out of the OR is
+ * what lets the planner use the pre-existing `issues_company_priority_idx`.
+ * The join moved to the stored generated column `context_issue_id`
+ * (migration 0079). Note the cast direction: uuid -> text is total, whereas
+ * `issues.id = context_issue_id::uuid` would parse untrusted text per outer
+ * row and can raise `invalid input syntax for type uuid`.
  */
-const PRIORITY_LANE_SARGABLE = `
+const PRIORITY_LANE_CRITICAL = `
   SELECT heartbeat_runs.*, issues.id, issues.status, issues.priority
     FROM heartbeat_runs
     INNER JOIN issues
       ON issues.company_id = '${COMPANY}'::uuid
-     AND issues.id = heartbeat_runs.context_issue_id::uuid
+     AND heartbeat_runs.context_issue_id = cast(issues.id as text)
    WHERE heartbeat_runs.agent_id = '${AGENT}'::uuid
      AND heartbeat_runs.status = 'queued'
-     AND heartbeat_runs.context_issue_id IS NOT NULL
+     AND issues.priority = 'critical'
      AND issues.status NOT IN ('done', 'cancelled')
-     AND (
-       issues.priority = 'critical'
-       OR (
-         heartbeat_runs.context_snapshot ->> 'source' = 'issue_recovery_action'
-         AND heartbeat_runs.context_snapshot ->> 'recoveryActionId' is not null
-       )
-     )
    ORDER BY heartbeat_runs.created_at ASC, heartbeat_runs.id ASC
    LIMIT ${SCAN_LIMIT}
+`;
+
+/**
+ * Lane B — recovery-action wakes. Recovery-ness is a property of the RUN, so
+ * this needs no join at all: the agent's queued rows are a bounded candidate
+ * set through the dispatch index.
+ */
+const PRIORITY_LANE_RECOVERY = `
+  SELECT * FROM heartbeat_runs
+   WHERE agent_id = '${AGENT}'::uuid
+     AND status = 'queued'
+     AND context_snapshot ->> 'source' = 'issue_recovery_action'
+     AND context_snapshot ->> 'recoveryActionId' is not null
+   ORDER BY created_at ASC, id ASC
+   LIMIT ${SCAN_LIMIT}
+`;
+
+/**
+ * Lane B step 2. The id list is built and UUID-screened in JS, so it arrives as
+ * bound parameters rather than as a cast inside a join condition.
+ */
+const PRIORITY_LANE_ISSUE_LOOKUP = `
+  SELECT id, status, priority FROM issues
+   WHERE company_id = '${COMPANY}'::uuid
+     AND id IN (${LANE_ISSUE_IDS.map((id) => `'${id}'::uuid`).join(", ")})
 `;
 
 describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
@@ -226,40 +294,90 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     record("dispatch keyset cursor scan", cursor);
     expect(indexesUsed(cursor.root)).toContain(DISPATCH_INDEX);
 
+    // It is not enough that the index appears somewhere in the plan: the keyset
+    // predicate has to be SATISFIED BY the index rather than re-checked after
+    // it. If `(created_at, id) > (...)` lands in `Filter` instead of
+    // `Index Cond`, PostgreSQL walks the agent's partition from the beginning
+    // and discards the prefix on every resumed pass — the scan is then bounded
+    // only by LIMIT on OUTPUT, which is the unbounded-work shape the resume
+    // cursor exists to remove. That plan still contains the index name, so the
+    // assertion above cannot distinguish it.
+    const cursorNode = indexScanNode(cursor.root, DISPATCH_INDEX);
+    expect(cursorNode).not.toBeNull();
+    expect(String(cursorNode?.["Index Cond"] ?? "")).toMatch(KEYSET_PREDICATE);
+    expect(String(cursorNode?.["Filter"] ?? "")).not.toMatch(KEYSET_PREDICATE);
+
     // The index supplies (created_at, id) order, so no Sort over wide rows.
     expect(planNodes(head.root).map((n) => n["Node Type"])).not.toContain("Sort");
 
-    // A LIMIT-bounded head scan must not touch the whole backlog.
+    // A LIMIT-bounded scan must not touch the whole backlog. `rowsInspected`
+    // counts rows discarded by filters as well as emitted, so a plan that
+    // post-filters the cursor fails here rather than reporting its 200 output
+    // rows and passing.
     expect(rowsInspected(head.root)).toBeLessThanOrEqual(SCAN_LIMIT * 3);
+    expect(rowsInspected(cursor.root)).toBeLessThanOrEqual(SCAN_LIMIT * 3);
 
     // --- Priority lane: zero-match worst case ------------------------------
-    const lane = await explain(sql, PRIORITY_LANE_QUERY);
-    record("priority lane (current, JSON join, zero matches)", lane);
+    const laneBefore = await explain(sql, PRIORITY_LANE_BEFORE);
+    record("priority lane BEFORE (single query, OR, JSON->text join)", laneBefore);
 
-    const laneSargable = await explain(sql, PRIORITY_LANE_SARGABLE);
-    record("priority lane (join on stored context_issue_id)", laneSargable);
+    const laneCritical = await explain(sql, PRIORITY_LANE_CRITICAL);
+    record("priority lane A (critical, split out of the OR)", laneCritical);
+
+    const laneRecovery = await explain(sql, PRIORITY_LANE_RECOVERY);
+    record("priority lane B (recovery, run-side only)", laneRecovery);
+
+    const laneIssues = await explain(sql, PRIORITY_LANE_ISSUE_LOOKUP);
+    record("priority lane B step 2 (issues by primary key)", laneIssues);
 
     if (PLAN_REPORT) fs.writeFileSync(PLAN_REPORT, report.join("\n"));
 
-    // The lane must at least stay off a sequential scan of heartbeat_runs; the
-    // agent's queued rows are reachable through the dispatch index.
-    expect(indexesUsed(lane.root)).toContain(DISPATCH_INDEX);
+    // The superseded lane is MEASURED but deliberately NOT asserted on. It is
+    // recorded in the plan report as the justification for the split — at the
+    // time of the change it seq-scanned the company's whole issue table on
+    // every dispatch pass under the strict per-agent start lock, 14,034 rows at
+    // 20k issues and 67,367 at 100k. Asserting that it *stays* that way would
+    // turn diagnostic evidence into a regression lock: adding an expression
+    // index that rescued the old shape is a legitimate change, and it would
+    // fail CI here for no reason. What must hold is the bound on the lanes the
+    // dispatcher actually issues, asserted absolutely below.
 
-    // Measured behaviour of the lane as written today: the heartbeat_runs side
-    // is bounded by the dispatch index, but `... ->> 'issueId' = cast(id as text)`
-    // is not sargable on issues.id, so the issues side is a full company scan on
-    // every dispatch pass. Rows inspected therefore scale with the company's
-    // issue count, not with the LIMIT — measured 14,034 at 20k issues and 67,367
-    // at 100k, i.e. linear.
-    expect(scanKinds(lane.root)).toContain("Seq Scan");
-    expect(rowsInspected(lane.root)).toBeGreaterThan(TOTAL_ISSUES / 4);
+    // Lane A: with `priority = 'critical'` as its own predicate the issues side
+    // is index-driven, so the company's issue table is no longer read whole.
+    // Coverage is unchanged — a critical row is still found at any queue depth,
+    // which is why this is a split rather than a bounded re-read of the head.
+    expect(scanKinds(laneCritical.root)).not.toContain("Seq Scan");
 
-    // Joining on the stored generated column instead keeps the issues side on
-    // its primary key, so rows inspected stay flat in the agent's queue depth
-    // (350 at both 20k and 100k issues). Recorded here so the difference is
-    // executable evidence rather than an assertion in a review comment.
-    expect(indexesUsed(laneSargable.root)).toContain("issues_pkey");
-    expect(scanKinds(laneSargable.root)).not.toContain("Seq Scan");
-    expect(rowsInspected(laneSargable.root)).toBeLessThanOrEqual(AGENT_QUEUED_ROWS * 2);
+    // Lane B needs no join at all, so it is bounded by the dispatch index.
+    expect(indexesUsed(laneRecovery.root)).toContain(DISPATCH_INDEX);
+    expect(scanKinds(laneRecovery.root)).not.toContain("Seq Scan");
+
+    // Resolving lane B's issues stays on the primary key.
+    expect(indexesUsed(laneIssues.root)).toContain("issues_pkey");
+    expect(scanKinds(laneIssues.root)).not.toContain("Seq Scan");
+
+    // The property that actually matters, stated as an absolute: every lane the
+    // dispatcher issues is bounded by the AGENT'S QUEUE DEPTH and not by the
+    // company's issue count. TOTAL_ISSUES is 20k here and configurable up to
+    // 100k via BLO20396_ISSUES, so a lane that regressed to scanning issues
+    // fails this at either scale — which is the real acceptance criterion, and
+    // it holds no matter what the superseded query does.
+    //
+    // The multiplier is derived from the measured lane A plan, not picked:
+    // the runs side is an index scan of the agent's queued rows, the issues
+    // side is an index scan over the company's CRITICAL issues (one, here),
+    // and the nested loop then materialises that inner side once per outer row
+    // and discards the non-matches — so the queue-depth term is counted about
+    // three times over. Measured 1051, identical at 20k and 100k issues.
+    //
+    // Note what this does and does not claim. Lane A is O(agent queue depth),
+    // the same order as the dispatch scan beside it and independent of company
+    // size — but it is NOT O(SCAN_LIMIT): in the zero-match worst case measured
+    // here nothing lets the LIMIT stop the scan early.
+    const LANE_BOUND = AGENT_QUEUED_ROWS * 4;
+    expect(LANE_BOUND).toBeLessThan(TOTAL_ISSUES / 4);
+    expect(rowsInspected(laneCritical.root)).toBeLessThanOrEqual(LANE_BOUND);
+    expect(rowsInspected(laneRecovery.root)).toBeLessThanOrEqual(LANE_BOUND);
+    expect(rowsInspected(laneIssues.root)).toBeLessThanOrEqual(LANE_BOUND);
   }, 900_000);
 });

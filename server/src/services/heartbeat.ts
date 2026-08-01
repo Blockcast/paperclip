@@ -450,6 +450,14 @@ const QUEUED_RUN_DISPATCH_MAX_SCAN_BATCHES = 10;
  * wake from spinning immediately through an extremely deep unclaimable backlog.
  */
 const QUEUED_RUN_DISPATCH_MAX_RESUME_PASSES = 10;
+/**
+ * BLO-20396 (fifth review follow-up): `heartbeat_runs.context_issue_id` is a
+ * generated `text` column, so a queued row can carry an `issueId` that is not
+ * UUID-shaped. Ids are screened through this before they reach an `issues.id`
+ * lookup, because a malformed value would otherwise become a cast error inside
+ * a query rather than a row that is simply skipped.
+ */
+const UUID_PATTERN = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const QUEUED_RUN_DISPATCH_RESUME_CAP_RETRY_DELAY_MS = 1_000;
 /**
  * Issue statuses that make any queued run targeting them pointless. Matches the
@@ -17896,7 +17904,58 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const queuedRunIds = new Set(queuedRuns.map((run) => run.id));
-      const priorityLaneRows = await db
+      /**
+       * Priority lane: a `critical` or recovery-action row must be rankable
+       * even when it sits outside the window this pass scanned.
+       *
+       * BLO-20396 (fifth review follow-up) split this in two. It used to be a
+       * single query that inner-joined `issues` on
+       *
+       *     context_snapshot ->> 'issueId' = cast(issues.id as text)
+       *
+       * with `priority = 'critical' OR <recovery predicate>` and one
+       * `ORDER BY created_at, id LIMIT SCAN_LIMIT`. That had two defects, and
+       * they turned out to share a cause — the OR.
+       *
+       * 1. Priority inversion. The LIMIT was applied BEFORE dispatch ranking,
+       *    and both kinds of row competed for the same 200 slots, so more than
+       *    200 older recovery rows could push a newer runnable critical row out
+       *    of the lane entirely.
+       *
+       * 2. A full table scan under the lock. The OR spans a column of `issues`
+       *    and a JSON field of `heartbeat_runs`, so no single index satisfies
+       *    it and the existing `issues_company_priority_idx` went unused:
+       *    PostgreSQL seq-scanned the company's whole issue table on EVERY
+       *    dispatch pass, while holding the strict per-agent start lock. The
+       *    result LIMIT bounded output, not work. Measured on the zero-match
+       *    worst case: 14,034 rows inspected / 21.4 ms at 20k issues,
+       *    67,367 / 100.9 ms at 100k — linear in company size rather than in
+       *    queue depth, so it degraded for every agent as the company grew.
+       *
+       * Separating the lanes fixes both: each gets its own budget, and each
+       * predicate can now reach an index. Coverage is unchanged — the critical
+       * lane still finds a critical row at ANY queue depth, which is why this
+       * is a split rather than a bounded re-read of the queue head.
+       */
+      // Lane A — issues whose priority is `critical`.
+      //
+      // Splitting this out of the OR is what makes it sargable on BOTH sides.
+      // `issues_company_priority_idx (company_id, priority)` already exists, but
+      // the combined lane's `priority = 'critical' OR <run-side recovery
+      // predicate>` made it unusable, so the planner fell back to reading the
+      // whole issue table. As its own predicate it drives from that index, and
+      // the critical issues in a company are few.
+      //
+      // The join moved to the STORED generated column `context_issue_id`
+      // (migration 0079), which `idx_heartbeat_runs_company_agent_context_issue_created`
+      // covers, so the runs side is indexed too. Note the cast direction:
+      // uuid -> text is total and safe. The tempting inverse,
+      // `issues.id = context_issue_id::uuid`, is a trap — it parses untrusted
+      // text per outer row, so one malformed `issueId` anywhere in the queue
+      // raises `invalid input syntax for type uuid` and takes dispatch down for
+      // that agent. A `~` guard in WHERE does not fix it, because nothing
+      // orders it before the join condition.
+      const criticalLaneRows = await db
         .select({
           run: heartbeatRuns,
           issue: {
@@ -17910,31 +17969,82 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           issues,
           and(
             eq(issues.companyId, agent.companyId),
-            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = cast(${issues.id} as text)`,
+            eq(heartbeatRuns.contextIssueId, sql`cast(${issues.id} as text)`),
           ),
         )
         .where(and(
           eq(heartbeatRuns.agentId, agentId),
           eq(heartbeatRuns.status, "queued"),
           cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+          eq(issues.priority, "critical"),
           notInArray(issues.status, [...TERMINAL_ISSUE_STATUSES]),
-          or(
-            eq(issues.priority, "critical"),
-            and(
-              sql`${heartbeatRuns.contextSnapshot} ->> 'source' = 'issue_recovery_action'`,
-              sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' is not null`,
-            ),
-          ),
         ))
         .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
         .limit(QUEUED_RUN_DISPATCH_SCAN_LIMIT);
+
+      // Lane B — recovery-action wakes. Recovery-ness is a property of the RUN,
+      // not of the issue, so this needs no join at all: the agent's queued rows
+      // are a bounded candidate set through the dispatch index, and their issues
+      // are then resolved by primary key. Terminal issues are filtered in JS.
+      //
+      // Its own budget, separate from lane A. Previously both shared a single
+      // `LIMIT 200` applied BEFORE dispatch ranking, so more than 200 older
+      // recovery rows could push a newer runnable critical row out of the lane
+      // entirely — the exact priority inversion the lane exists to prevent.
+      const recoveryLaneRows = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "queued"),
+          cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'source' = 'issue_recovery_action'`,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' is not null`,
+        ))
+        .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+        .limit(QUEUED_RUN_DISPATCH_SCAN_LIMIT);
+
+      const recoveryIssueIdsToLoad = new Set<string>();
+      for (const run of recoveryLaneRows) {
+        const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+        // UUID-screened in JS so a malformed id is a skipped row rather than a
+        // cast error inside the lookup.
+        if (!issueId || !UUID_PATTERN.test(issueId) || issueById.has(issueId)) continue;
+        recoveryIssueIdsToLoad.add(issueId);
+      }
+      if (recoveryIssueIdsToLoad.size > 0) {
+        const recoveryIssueRows = await db
+          .select({
+            id: issues.id,
+            status: issues.status,
+            priority: issues.priority,
+          })
+          .from(issues)
+          .where(and(
+            eq(issues.companyId, agent.companyId),
+            inArray(issues.id, [...recoveryIssueIdsToLoad]),
+          ));
+        for (const issueRow of recoveryIssueRows) issueById.set(issueRow.id, issueRow);
+      }
+
       const priorityLaneRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
-      for (const { run, issue } of priorityLaneRows) {
-        issueById.set(issue.id, issue);
-        if (queuedRunIds.has(run.id)) continue;
+      const admitToPriorityLane = (run: typeof heartbeatRuns.$inferSelect) => {
+        if (queuedRunIds.has(run.id)) return;
         queuedRunIds.add(run.id);
         priorityLaneRuns.push(run);
         queuedRuns.push(run);
+      };
+      for (const { run, issue } of criticalLaneRows) {
+        issueById.set(issue.id, issue);
+        admitToPriorityLane(run);
+      }
+      for (const run of recoveryLaneRows) {
+        const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+        // A missing issue row means cross-company or deleted. The previous
+        // inner join dropped those too; the claim-time gate still handles them.
+        const issue = issueId ? issueById.get(issueId) : null;
+        if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) continue;
+        admitToPriorityLane(run);
       }
       if (priorityLaneRuns.length > 0) {
         const priorityLaneReadiness = await listQueuedRunDependencyReadiness(agent.companyId, priorityLaneRuns);
@@ -18235,7 +18345,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // work. "No runs claimed by this call" is the correct answer for it.
       onCoalesced: (): Array<typeof heartbeatRuns.$inferSelect> => [],
       onCoalescedDemand: () => {
-        if (!dispatchPassOptions.resumeContinuation && dispatchResumeCursorByAgent.has(agentId)) {
+        // BLO-20396 (fifth review follow-up): record the demand whether or not
+        // a resume cursor exists YET. Gating on `dispatchResumeCursorByAgent`
+        // here lost every wake that folded into a pass which had not installed
+        // its cursor — which is every wake arriving during the FIRST bounded
+        // pass, because the cursor is installed at the very end of that pass.
+        // Such a wake was dropped, the pass then installed a cursor, and the
+        // resume chain it scheduled started PAST the newly eligible row and ran
+        // to exhaustion without ever revisiting the head. The row then waited
+        // for an unrelated wake — the same starvation class this ticket exists
+        // to remove.
+        //
+        // A coalesced caller never runs its own queue-selection pass, so its
+        // demand is only ever satisfied by the pass it folded into. Deciding at
+        // demand time whether that pass will cover the head is not possible; it
+        // is decided in advanceOrClearResumeCursor, which holds the marker
+        // across every cursor-installed pass and honours it once the chain
+        // reaches the end of the queue.
+        //
+        // Deliberately NOT suppressed when the in-flight pass started at the
+        // head and exhausted. A row inserted after that pass read its final
+        // batch but before this call coalesced is invisible to it, so treating
+        // "started at head and exhausted" as proof of coverage would reopen a
+        // narrower version of the same hole. The cost of not suppressing is one
+        // trailing head-start pass, which the `Set` collapses across any number
+        // of concurrent wakes and which the dispatch index answers in ~0.5 ms
+        // (see packages/db/src/heartbeat-dispatch-query-plan.test.ts). The
+        // chain terminates: a trailing pass that takes no new demand clears the
+        // marker and schedules nothing.
+        if (!dispatchPassOptions.resumeContinuation) {
           dispatchHeadRescanDemandByAgent.add(agentId);
         }
       },
