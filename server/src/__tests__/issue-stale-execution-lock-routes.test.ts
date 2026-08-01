@@ -1349,6 +1349,54 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         ]),
       );
     });
+
+    it("reaps divergent never-started owners when checking out a todo issue", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const queuedCheckoutRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const queuedExecutionRunId = await seedNeverStartedOwnerRun({
+        companyId,
+        agentId,
+        status: "queued",
+      });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Divergent never-started owner recovery",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: queuedCheckoutRunId,
+        executionRunId: queuedExecutionRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const response = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId, expectedStatuses: ["todo"] });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body).toMatchObject({
+        status: "in_progress",
+        checkoutRunId: currentRunId,
+        executionRunId: currentRunId,
+      });
+
+      const owners = await db
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, [queuedCheckoutRunId, queuedExecutionRunId]));
+      expect(new Map(owners.map((owner) => [owner.id, owner.status]))).toEqual(
+        new Map([
+          [queuedCheckoutRunId, "cancelled"],
+          [queuedExecutionRunId, "cancelled"],
+        ]),
+      );
+    });
   });
 
   it("allows only one concurrent decision from a participant whose assignee drifted", async () => {
