@@ -38,6 +38,18 @@ import { logger } from "../middleware/logger.js";
  * the current async path, and skip the nested call: the outer section has not
  * yet selected its queue, so it will pick up the same work anyway.
  *
+ * The same reaper makes *cross-agent* cycles reachable too: a pass holding
+ * agent A's lock can nest into agent B's, while a concurrent pass holding B
+ * nests into A. If both waited, neither would ever finish and nothing would
+ * time out. So the module enforces one invariant:
+ *
+ *   **A caller that holds any agent's lock never awaits another agent's lock.**
+ *
+ * When such a caller finds the target busy it registers the coalesced follow-up
+ * (so the work still happens, detached and at top level) and returns
+ * `onCoalesced()` immediately. Only lock-free callers ever block, and a waiter
+ * holding nothing cannot be a node in a wait cycle — so no cycle can form.
+ *
  * Callers must pass the same `fn` semantics for a given agentId — a coalesced
  * follow-up executes the *first* contender's callback and shares its result
  * with everyone who joined. `startNextQueuedRunForAgent` is the only caller and
@@ -61,6 +73,12 @@ const runningByAgent = new Map<string, Promise<void>>();
 
 /** The single coalesced follow-up queued behind the running section, if any. */
 const followUpByAgent = new Map<string, Promise<unknown>>();
+
+/**
+ * Follow-up passes that were scheduled without a waiter, because scheduling
+ * caller already held another agent's lock (see the deadlock guard below).
+ */
+const detachedFollowUps = new Set<Promise<unknown>>();
 
 /** Agent ids whose locks are held by the current async execution path. */
 const heldAgentIds = new AsyncLocalStorage<ReadonlySet<string>>();
@@ -131,8 +149,41 @@ export async function withAgentStartLock<T>(
   const running = runningByAgent.get(agentId);
   if (!running) return runExclusively(agentId, fn);
 
-  const existingFollowUp = followUpByAgent.get(agentId);
-  if (existingFollowUp) return existingFollowUp as Promise<T>;
+  const followUp = ensureCoalescedFollowUp(agentId, fn, running);
+
+  // Deadlock guard: a caller that already holds *another* agent's lock must
+  // never wait on this one. Two dispatch passes that each hold one agent's
+  // lock and then await the other's wait on each other forever, and there is
+  // no longer a timeout to break the cycle. That shape is reachable, not
+  // hypothetical: the orphan reaper is not agent-scoped, so
+  // reap -> promote -> dispatch crosses from agent A's section into agent B's
+  // and can come back to A.
+  //
+  // The follow-up registered above already runs detached at top level, so the
+  // work still happens on schedule; this caller simply does not block on it.
+  // That yields the invariant which makes a cycle impossible: a caller holding
+  // any lock never awaits another, so only lock-free callers ever wait — and a
+  // waiter that holds nothing cannot be a node in a wait cycle.
+  if (held && held.size > 0) {
+    trackDetachedFollowUp(agentId, followUp);
+    return options.onCoalesced();
+  }
+  return followUp;
+}
+
+/**
+ * Register (or join) the single coalesced follow-up pass for an agent.
+ *
+ * Every caller that arrives while the lock is held shares one follow-up, so N
+ * concurrent wakes produce at most one extra pass rather than N queued passes.
+ */
+function ensureCoalescedFollowUp<T>(
+  agentId: string,
+  fn: () => Promise<T>,
+  running: Promise<void>,
+): Promise<T> {
+  const existing = followUpByAgent.get(agentId);
+  if (existing) return existing as Promise<T>;
 
   // Clear the slot before running so callers arriving *during* the follow-up
   // open a new one rather than joining a pass that has already read the queue.
@@ -145,6 +196,24 @@ export async function withAgentStartLock<T>(
   });
   followUpByAgent.set(agentId, followUp);
   return followUp;
+}
+
+/**
+ * Keep a handle on a follow-up that no caller is awaiting.
+ *
+ * Attaching a rejection handler here keeps a failing detached pass from
+ * surfacing as an unhandled rejection; the original promise still rejects for
+ * anyone who later joins it.
+ */
+function trackDetachedFollowUp(agentId: string, followUp: Promise<unknown>): void {
+  const settled = followUp.then(
+    () => undefined,
+    (err) => {
+      logger.error({ err, agentId }, "detached queued-run dispatch pass failed");
+    },
+  );
+  detachedFollowUps.add(settled);
+  void settled.finally(() => detachedFollowUps.delete(settled));
 }
 
 /**
@@ -162,8 +231,21 @@ export function runDetachedFromAgentStartLock<T>(fn: () => T): T {
   return heldAgentIds.exit(fn);
 }
 
+/**
+ * Test-only: await every dispatch pass that was scheduled without a waiter.
+ *
+ * A detached pass can itself schedule another, so this loops until the set is
+ * empty rather than draining a single snapshot.
+ */
+export async function _settleDetachedAgentStartLockWorkForTesting(): Promise<void> {
+  while (detachedFollowUps.size > 0) {
+    await Promise.all([...detachedFollowUps]);
+  }
+}
+
 /** Test-only: drop all in-process lock state. */
 export function _resetAgentStartLocksForTesting() {
   runningByAgent.clear();
   followUpByAgent.clear();
+  detachedFollowUps.clear();
 }

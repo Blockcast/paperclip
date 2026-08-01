@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { _resetAgentStartLocksForTesting, withAgentStartLock } from "../services/agent-start-lock.js";
+import {
+  _resetAgentStartLocksForTesting,
+  _settleDetachedAgentStartLockWorkForTesting,
+  withAgentStartLock,
+} from "../services/agent-start-lock.js";
 
 const coalesced = { onCoalesced: () => "coalesced" as const };
 
@@ -63,6 +67,58 @@ describe("heartbeat agent start lock (BLO-20396)", () => {
     const ran = laterStarts.filter((fn) => fn.mock.calls.length > 0);
     expect(ran).toHaveLength(1);
     expect(maxConcurrent).toBe(1);
+  });
+
+  it("does not deadlock when two agents' dispatch passes nest into each other", async () => {
+    // The orphan reaper is not agent-scoped, so reap -> promote -> dispatch can
+    // cross from agent A's critical section into agent B's while a concurrent
+    // pass crosses from B into A. Before the deadlock guard both nested calls
+    // awaited the other agent's follow-up — and that follow-up could only start
+    // once the very section that was waiting had finished. A cycle, with no
+    // timeout left to break it.
+    const agentA = randomUUID();
+    const agentB = randomUUID();
+    const bothEntered = deferred<void>();
+    let entered = 0;
+
+    const nestedIntoA = vi.fn(async () => "nested-a");
+    const nestedIntoB = vi.fn(async () => "nested-b");
+    const nestedResults: string[] = [];
+
+    const outerSection = (otherAgentId: string, nested: () => Promise<string>) => async () => {
+      entered += 1;
+      if (entered === 2) bothEntered.resolve();
+      // Park until both sections are held concurrently, so each nested call is
+      // guaranteed to find the other agent's lock busy.
+      await bothEntered.promise;
+      nestedResults.push(await withAgentStartLock(otherAgentId, nested, coalesced));
+      return "outer";
+    };
+
+    const passA = withAgentStartLock(agentA, outerSection(agentB, nestedIntoB), coalesced);
+    const passB = withAgentStartLock(agentB, outerSection(agentA, nestedIntoA), coalesced);
+
+    let deadlockTimer: ReturnType<typeof setTimeout> | undefined;
+    const deadlocked = new Promise<never>((_resolve, reject) => {
+      deadlockTimer = setTimeout(() => reject(new Error("cross-agent dispatch deadlocked")), 5_000);
+    });
+    try {
+      await expect(Promise.race([Promise.all([passA, passB]), deadlocked])).resolves.toEqual([
+        "outer",
+        "outer",
+      ]);
+    } finally {
+      clearTimeout(deadlockTimer);
+    }
+
+    // Neither nested call blocked on the other agent's lock.
+    expect(nestedResults).toEqual(["coalesced", "coalesced"]);
+
+    // The nested work is deferred, not dropped: each was registered as a
+    // coalesced follow-up and runs once the holding section releases.
+    await _settleDetachedAgentStartLockWorkForTesting();
+    expect(nestedIntoA).toHaveBeenCalledTimes(1);
+    expect(nestedIntoB).toHaveBeenCalledTimes(1);
   });
 
   it("releases the lock when a critical section rejects", async () => {

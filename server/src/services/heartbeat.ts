@@ -417,7 +417,7 @@ const STALE_QUEUED_MAINTENANCE_WAKE_REASONS = [
 ] as const;
 export const PR_REVIEW_QUEUE_FAIRNESS_MAX_WAIT_MS = 10 * 60 * 1000;
 /**
- * BLO-20396: upper bound on how many queued rows one dispatch pass reads.
+ * BLO-20396: how many queued rows one dispatch pass reads per batch.
  *
  * The pass previously read the agent's *entire* queued set and then resolved
  * dependency readiness and issue state for all of it before claiming anything.
@@ -426,12 +426,28 @@ export const PR_REVIEW_QUEUE_FAIRNESS_MAX_WAIT_MS = 10 * 60 * 1000;
  * which in turn let a second pass run concurrently — the failure this fixes.
  *
  * Rows are read oldest-first, which is coherent with the age-based starvation
- * escalation in the priority sort: the oldest rows are the most starved. When a
- * queue exceeds this bound the truncation is logged rather than silently
- * applied, and the surplus is picked up by the next pass (each claim frees a
- * slot and re-triggers dispatch).
+ * escalation in the priority sort: the oldest rows are the most starved. The
+ * pass pages forward through batches with a keyset cursor rather than ranking a
+ * single fixed prefix — see the scan loop for why a prefix alone is a liveness
+ * hazard.
  */
 const QUEUED_RUN_DISPATCH_SCAN_LIMIT = 200;
+/**
+ * BLO-20396 (review follow-up): how many dispatchable candidates one pass
+ * collects before it stops paging and ranks what it has.
+ *
+ * Ranking is global over the collected set, so this only needs to be large
+ * enough that the priority sort has a representative pool — available slots are
+ * single-digit.
+ */
+const QUEUED_RUN_DISPATCH_CANDIDATE_LIMIT = 200;
+/**
+ * BLO-20396 (review follow-up): hard bound on batches read by one pass, so a
+ * pathological backlog cannot make the critical section unbounded again. A pass
+ * that stops here without filling its candidate pool logs loudly rather than
+ * silently reporting an empty queue.
+ */
+const QUEUED_RUN_DISPATCH_MAX_SCAN_BATCHES = 10;
 /**
  * Issue statuses that make any queued run targeting them pointless. Matches the
  * convention used by execution-workspaces / issue-tree-control / routines.
@@ -17550,6 +17566,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  /**
+   * BLO-20396 (review follow-up): re-dispatch after a pass that pruned invalid
+   * rows but claimed nothing.
+   *
+   * Pruning changes the queue, so a further pass can now reach work that was
+   * sitting behind the rows just removed. Without this the queue would wait for
+   * an unrelated wake, because nothing started and so nothing will complete to
+   * re-trigger dispatch.
+   *
+   * This terminates rather than amplifying: it only fires when this pass
+   * actually removed at least one row, and rows are finite and never
+   * un-pruned. A pass that claims nothing and prunes nothing schedules nothing.
+   * The detach is required — we are inside the critical section, and an
+   * inherited lock context would make the nested call look re-entrant and be
+   * coalesced away.
+   */
+  function scheduleFollowUpDispatchAfterPrune(agentId: string, prunedRuns: number) {
+    if (prunedRuns <= 0) return;
+    const pass = runDetachedFromAgentStartLock(() =>
+      startNextQueuedRunForAgent(agentId).catch((err) => {
+        logger.error(
+          { err, agentId },
+          "startNextQueuedRunForAgent: follow-up dispatch after pruning failed",
+        );
+      }));
+    inFlightExecutions.add(pass);
+    void pass.finally(() => inFlightExecutions.delete(pass));
+  }
+
   async function startNextQueuedRunForAgent(agentId: string) {
     if (options.skipQueuedRunDispatch || dispatchStopped) return [];
     // Failure-B fence (BLO-9089): the api tier never claims/executes runs — it
@@ -17674,73 +17719,135 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         agent = (await getAgent(agentId)) ?? agent;
       }
 
-      const scannedQueuedRuns = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(and(
-          eq(heartbeatRuns.agentId, agentId),
-          eq(heartbeatRuns.status, "queued"),
-          cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
-        ))
-        .orderBy(asc(heartbeatRuns.createdAt))
-        .limit(QUEUED_RUN_DISPATCH_SCAN_LIMIT);
-      if (scannedQueuedRuns.length === 0) return [];
-      if (scannedQueuedRuns.length >= QUEUED_RUN_DISPATCH_SCAN_LIMIT) {
-        logger.warn(
-          { agentId, scanLimit: QUEUED_RUN_DISPATCH_SCAN_LIMIT },
-          "startNextQueuedRunForAgent: queued backlog exceeds the dispatch scan limit; considering only the oldest rows this pass",
-        );
-      }
-
-      // Resolve issue state before anything else so invalid rows are pruned
-      // deterministically rather than lazily. Previously pruning only happened
-      // for rows the priority walk happened to reach, so a run targeting an
-      // already-terminal issue could sit queued indefinitely behind
-      // higher-priority work (observed: 21 such rows for one agent, oldest 20h).
-      const scannedIssueIds = [...new Set(
-        scannedQueuedRuns
-          .map((run) => readNonEmptyString(parseObject(run.contextSnapshot).issueId))
-          .filter((issueId): issueId is string => Boolean(issueId)),
-      )];
-      const issueRows = await db
-        .select({
-          id: issues.id,
-          status: issues.status,
-          priority: issues.priority,
-        })
-        .from(issues)
-        .where(
-          scannedIssueIds.length > 0
-            ? and(eq(issues.companyId, agent.companyId), inArray(issues.id, scannedIssueIds))
-            : sql`false`,
-        );
-      const issueById = new Map(issueRows.map((row) => [row.id, row]));
-
+      // Page forward through the queue in bounded batches instead of ranking a
+      // single fixed-size prefix. A prefix is not merely a performance choice,
+      // it is a liveness hazard: when the oldest N rows are all
+      // dependency-blocked, every pass ranks the same unclaimable prefix,
+      // claims nothing, and nothing ever completes to trigger another pass — so
+      // a runnable row sitting behind them starves indefinitely. The same gap
+      // applies to a prefix that is entirely prunable. Paging with a keyset
+      // cursor lets one pass walk past a wall of invalid or blocked rows and
+      // still reach real work.
+      const issueById = new Map<string, { id: string; status: string; priority: string | null }>();
+      const dependencyReadiness = new Map<
+        string,
+        Awaited<ReturnType<typeof issuesSvc.listDependencyReadiness>> extends Map<string, infer V>
+          ? V
+          : never
+      >();
       const queuedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       let prunedTerminalIssueRuns = 0;
-      for (const queuedRun of scannedQueuedRuns) {
-        const issueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
-        // Only consider pruning when we positively know the issue is terminal.
-        // A missing row means cross-company or deleted and is left to the
-        // claim-time gate. Note this runs the SAME evaluator the claim path
-        // uses rather than a parallel rule, so every exemption it encodes
-        // (e.g. source_scoped_recovery_action wakes) and its established error
-        // codes still apply — the only change is that it is now evaluated for
-        // the whole scanned set instead of lazily for rows the walk reaches.
-        const issue = issueId ? issueById.get(issueId) : null;
-        if (issueId && issue && TERMINAL_ISSUE_STATUSES.has(issue.status)) {
-          const staleness = await evaluateQueuedRunStaleness(
-            queuedRun,
-            issueId,
-            parseObject(queuedRun.contextSnapshot),
-          );
-          if (staleness.stale) {
-            const cancelled = await cancelQueuedRunForStaleIssue(queuedRun, issueId, staleness);
-            if (cancelled) prunedTerminalIssueRuns += 1;
-            continue;
-          }
+      let scanCursor: { createdAt: Date; id: string } | null = null;
+      let scannedBatches = 0;
+      let scanExhausted = false;
+
+      while (scannedBatches < QUEUED_RUN_DISPATCH_MAX_SCAN_BATCHES) {
+        scannedBatches += 1;
+        // Annotated rather than inferred: `scanCursor` is assigned from this
+        // batch's last row, so control-flow analysis would otherwise chase
+        // `batch` -> `scanCursor` -> `batch` and give up with an implicit any.
+        const batch: Array<typeof heartbeatRuns.$inferSelect> = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.status, "queued"),
+            cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+            // Keyset cursor. created_at alone is not unique (bulk wake fan-out
+            // stamps identical timestamps), so the id tiebreak is what keeps
+            // paging from skipping or repeating rows at a batch boundary.
+            // The bounds are bound as text with explicit casts: inside a raw
+            // `sql` template there is no column mapper, and postgres-js rejects
+            // a bare Date at bind time.
+            scanCursor
+              ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${scanCursor.createdAt.toISOString()}::timestamptz, ${scanCursor.id}::uuid)`
+              : undefined,
+          ))
+          .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+          .limit(QUEUED_RUN_DISPATCH_SCAN_LIMIT);
+        if (batch.length === 0) {
+          scanExhausted = true;
+          break;
         }
-        queuedRuns.push(queuedRun);
+        const lastScannedRun = batch[batch.length - 1]!;
+        scanCursor = { createdAt: lastScannedRun.createdAt, id: lastScannedRun.id };
+        if (batch.length < QUEUED_RUN_DISPATCH_SCAN_LIMIT) scanExhausted = true;
+
+        const batchIssueIds = [...new Set(
+          batch
+            .map((run) => readNonEmptyString(parseObject(run.contextSnapshot).issueId))
+            .filter((issueId): issueId is string => Boolean(issueId)),
+        )];
+        if (batchIssueIds.length > 0) {
+          const issueRows = await db
+            .select({
+              id: issues.id,
+              status: issues.status,
+              priority: issues.priority,
+            })
+            .from(issues)
+            .where(and(eq(issues.companyId, agent.companyId), inArray(issues.id, batchIssueIds)));
+          for (const issueRow of issueRows) issueById.set(issueRow.id, issueRow);
+        }
+
+        // Prune invalid rows for the whole batch rather than lazily for rows the
+        // priority walk happens to reach. Previously a run targeting an
+        // already-terminal issue could sit queued indefinitely behind
+        // higher-priority work (observed: 21 such rows for one agent, oldest
+        // 20h).
+        const survivingRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+        for (const queuedRun of batch) {
+          const issueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
+          // Only consider pruning when we positively know the issue is terminal.
+          // A missing row means cross-company or deleted and is left to the
+          // claim-time gate. Note this runs the SAME evaluator the claim path
+          // uses rather than a parallel rule, so every exemption it encodes
+          // (e.g. source_scoped_recovery_action wakes) and its established error
+          // codes still apply — the only change is that it is now evaluated for
+          // the whole scanned batch instead of lazily for rows the walk reaches.
+          const issue = issueId ? issueById.get(issueId) : null;
+          if (issueId && issue && TERMINAL_ISSUE_STATUSES.has(issue.status)) {
+            const staleness = await evaluateQueuedRunStaleness(
+              queuedRun,
+              issueId,
+              parseObject(queuedRun.contextSnapshot),
+            );
+            if (staleness.stale) {
+              const cancelled = await cancelQueuedRunForStaleIssue(queuedRun, issueId, staleness);
+              if (cancelled) prunedTerminalIssueRuns += 1;
+              continue;
+            }
+          }
+          survivingRuns.push(queuedRun);
+        }
+
+        const batchReadiness = await listQueuedRunDependencyReadiness(agent.companyId, survivingRuns);
+        for (const [issueId, readiness] of batchReadiness) dependencyReadiness.set(issueId, readiness);
+        for (const queuedRun of survivingRuns) {
+          const issueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
+          // Dependency-blocked runs are skipped rather than collected.
+          // claimQueuedRun re-checks readiness and refuses them, so they can
+          // never be claimed; carrying them would only let a wall of blocked
+          // rows crowd runnable work out of the candidate pool. Issue-less runs
+          // (every GitHub PR-review wake) have no dependencies and always pass.
+          if (issueId && batchReadiness.get(issueId)?.isDependencyReady === false) continue;
+          queuedRuns.push(queuedRun);
+        }
+
+        if (queuedRuns.length >= QUEUED_RUN_DISPATCH_CANDIDATE_LIMIT || scanExhausted) break;
+      }
+
+      if (!scanExhausted && queuedRuns.length < QUEUED_RUN_DISPATCH_CANDIDATE_LIMIT) {
+        logger.warn(
+          {
+            agentId,
+            scannedBatches,
+            scanLimit: QUEUED_RUN_DISPATCH_SCAN_LIMIT,
+            maxScanBatches: QUEUED_RUN_DISPATCH_MAX_SCAN_BATCHES,
+            candidates: queuedRuns.length,
+          },
+          "startNextQueuedRunForAgent: hit the batch bound before exhausting the queued backlog; some rows were not examined this pass",
+        );
       }
       if (prunedTerminalIssueRuns > 0) {
         logger.info(
@@ -17748,10 +17855,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "startNextQueuedRunForAgent: pruned queued runs targeting terminal issues",
         );
       }
-      if (queuedRuns.length === 0) return [];
+      if (queuedRuns.length === 0) {
+        scheduleFollowUpDispatchAfterPrune(agentId, prunedTerminalIssueRuns);
+        return [];
+      }
 
-      const dependencyReadiness = await listQueuedRunDependencyReadiness(agent.companyId, queuedRuns);
       const companyAgents = await listCompanyAgentOrgRows(agent.companyId);
+
       const hasAgedPrReview = queuedRuns.some(
         (run) =>
           run.createdAt.getTime() <=
@@ -17909,7 +18019,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         claimedRuns.push(claimed);
         if (queuedIssueId) inFlightIssueIds.add(queuedIssueId);
       }
-      if (claimedRuns.length === 0) return [];
+      if (claimedRuns.length === 0) {
+        scheduleFollowUpDispatchAfterPrune(agentId, prunedTerminalIssueRuns);
+        return [];
+      }
 
       for (const claimedRun of claimedRuns) {
         // BLO-20396: detach from the start-lock context. executeRun is launched
