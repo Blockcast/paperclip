@@ -39,6 +39,8 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const ALLY_LOGIN_RE =
   /^(allyblockcast|blockcast-ally|ally-bot|blockcast-ci-packages)(\[bot\])?$/;
@@ -46,6 +48,10 @@ const ALLY_LOGIN_RE =
 /** A heading like `### Important Issues (2)` — but not `(0)`. */
 const BLOCKING_SECTION_RE =
   /^#+[ \t]*(critical|important)[^\n]*\((?!0\))\d+\)/im;
+
+/** A prior-finding disposition that says the blocker is still present. */
+const STILL_PRESENT_DISPOSITION_RE =
+  /^[ \t]*-[ \t]*\*\*prior:[^\n]*\*\*[ \t]*(?:—|-)[ \t]*still-present[ \t]*(?:—|-)/im;
 
 /** The single standalone attestation line Ally is required to emit. */
 const ATTESTED_HEAD_RE = /^[ \t]*(?:[_*]+)?[ \t]*reviewed head:[ \t]*`?([0-9a-f]{40})`?[ \t]*(?:[_*]+)?[ \t]*$/im;
@@ -56,6 +62,10 @@ export function isAllyLogin(login) {
 
 export function hasBlockingFindings(body) {
   return BLOCKING_SECTION_RE.test(String(body ?? ""));
+}
+
+export function hasStillPresentDisposition(body) {
+  return STILL_PRESENT_DISPOSITION_RE.test(String(body ?? ""));
 }
 
 export function attestedHead(body) {
@@ -97,6 +107,11 @@ export function findPrViolations(pr) {
     if (hasBlockingFindings(review.body)) {
       violations.push(
         `I2a PR #${pr.number} @${short}: review ${review.id} is APPROVED but its body reports a Critical/Important finding`,
+      );
+    }
+    if (hasStillPresentDisposition(review.body)) {
+      violations.push(
+        `I2c PR #${pr.number} @${short}: review ${review.id} is APPROVED but its body marks a prior finding still-present`,
       );
     }
   }
@@ -171,10 +186,14 @@ function main() {
   }
 
   console.log(
-    `Ally review-consistency guard passed: ${prs.length} open PR(s) in ${repo}, one operative attestation each.`,
+    `Ally review-consistency guard passed: no attestation conflicts found across ${prs.length} open PR(s) in ${repo}.`,
   );
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+export function isMainModule(argvPath = process.argv[1], moduleUrl = import.meta.url) {
+  return Boolean(argvPath) && resolve(argvPath) === fileURLToPath(moduleUrl);
+}
+
+if (isMainModule()) {
   main();
 }

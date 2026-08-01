@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
+import { resolve } from "node:path";
 import { describe, it } from "node:test";
+import { pathToFileURL } from "node:url";
 
 import {
   attestedHead,
   findPrViolations,
   findViolations,
   hasBlockingFindings,
+  hasStillPresentDisposition,
   isAllyLogin,
+  isMainModule,
   operativeAllyReviews,
 } from "./check-ally-review-consistency.mjs";
 
@@ -74,6 +78,26 @@ describe("hasBlockingFindings", () => {
   it("does NOT fire on the word 'important' in prose", () => {
     assert.equal(
       hasBlockingFindings("This is an important consideration (0) worth noting"),
+      false,
+    );
+  });
+});
+
+describe("hasStillPresentDisposition", () => {
+  it("fires on a prior finding marked still-present", () => {
+    assert.equal(
+      hasStillPresentDisposition(
+        "- **prior:354d5b9 important 1** — still-present — the issue remains",
+      ),
+      true,
+    );
+  });
+
+  it("does NOT fire on fixed prior findings or prose", () => {
+    assert.equal(
+      hasStillPresentDisposition(
+        "- **prior:354d5b9 important 1** — fixed — the issue is closed\nstill-present in quoted prose",
+      ),
       false,
     );
   });
@@ -171,6 +195,23 @@ describe("findPrViolations", () => {
     assert.match(violations[0], /^I2a PR #2 @ff1c72db: review 7 is APPROVED/);
   });
 
+  it("I2c: catches an APPROVED whose prior finding disposition is still-present", () => {
+    const pr = {
+      number: 5,
+      headSha: HEAD,
+      reviews: [
+        review({
+          id: 12,
+          state: "APPROVED",
+          body: `Reviewed head: ${HEAD}\n### Prior Findings Dispositioned (1)\n- **prior:354d5b9 important 1** — still-present — not mirrored below`,
+        }),
+      ],
+    };
+    const violations = findPrViolations(pr);
+    assert.equal(violations.length, 1);
+    assert.match(violations[0], /^I2c PR #5 @ff1c72db: review 12 is APPROVED/);
+  });
+
   // The exact shape of Blockcast/paperclip#870 review 4830097206.
   it("I3: catches a review whose attested head differs from its recorded commit", () => {
     const pr = {
@@ -249,5 +290,17 @@ describe("findViolations", () => {
 
   it("tolerates an empty PR list", () => {
     assert.deepEqual(findViolations([]), []);
+  });
+});
+
+describe("isMainModule", () => {
+  it("matches file URLs for paths containing spaces", () => {
+    const scriptPath = resolve("/tmp/ally space/check-ally-review-consistency.mjs");
+    assert.equal(isMainModule(scriptPath, pathToFileURL(scriptPath).href), true);
+  });
+
+  it("does not match a different argv path", () => {
+    const scriptPath = resolve("/tmp/ally space/check-ally-review-consistency.mjs");
+    assert.equal(isMainModule("/tmp/other-script.mjs", pathToFileURL(scriptPath).href), false);
   });
 });
