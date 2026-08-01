@@ -384,8 +384,10 @@ export async function checkSharedDependencyConsistencyAfterRecheck(
       return next;
     }
     check = next;
-    previousProblemKey = nextProblemKey;
-    previousProblemFirstSeenAt = now;
+    if (nextProblemKey !== previousProblemKey) {
+      previousProblemKey = nextProblemKey;
+      previousProblemFirstSeenAt = now;
+    }
   }
 
   return check;

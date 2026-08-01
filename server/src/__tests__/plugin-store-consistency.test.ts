@@ -118,6 +118,22 @@ describe("checkSharedDependencyConsistency", () => {
     expect(result.installedVersion).toBe("2026.513.0");
   }, 10_000);
 
+  it("fails closed once the same mismatch stays stable past the minimum window", async () => {
+    const installDir = await tempInstallDir();
+    await writeLockfileVersion(installDir, SDK_PACKAGE, "2026.513.0");
+    await writeInstalledPackageVersion(installDir, SDK_PACKAGE, "1.0.0");
+
+    const startedAt = Date.now();
+    const result = await checkSharedDependencyConsistencyAfterRecheck(installDir, SDK_PACKAGE);
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(elapsedMs).toBeGreaterThanOrEqual(10_000);
+    expect(elapsedMs).toBeLessThan(20_000);
+    expect(result.consistent).toBe(false);
+    expect(result.lockfileVersion).toBe("2026.513.0");
+    expect(result.installedVersion).toBe("1.0.0");
+  }, 25_000);
+
   it("does not flag a mismatch when there is no lockfile at all (local dev)", async () => {
     const installDir = await tempInstallDir();
     await writeInstalledPackageVersion(installDir, SDK_PACKAGE, "1.0.0");
