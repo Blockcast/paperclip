@@ -1010,12 +1010,6 @@ const EXTERNAL_LIFECYCLE_ADAPTERS = new Set([
 // threshold. Issue/worktree ownership stays more conservative: a running row
 // holds its issue until it reaches a terminal/missing lifecycle state.
 const EXTERNAL_LIFECYCLE_STALE_MS = RUN_STALE_SILENCE_MS;
-// BLO-19722: how far back `reconcileWorkerCrashedRuns` looks for runs whose
-// worker-crash recovery never finished. A crash-marked run is only interesting
-// until something recovers it, and the pass runs at every worker start, so a
-// day is generous — it spans a weekend of restarts without letting the scan
-// grow unbounded over the table's history.
-const WORKER_CRASH_RECONCILE_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 // Bounded so a pathological backlog cannot stall startup recovery ahead of the
 // reattach and reaper passes; the next start picks up whatever is left.
 const WORKER_CRASH_RECONCILE_MAX_RUNS = 200;
@@ -12235,7 +12229,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    *
    * The residual window is one run wide: claimed, budget expires mid-cleanup.
    * {@link reconcileWorkerCrashedRuns} closes it durably at next startup by
-   * re-running the (idempotent) cleanup for recent `worker_crashed` runs.
+   * re-running the (idempotent) cleanup for every `worker_crashed` run still
+   * missing its retry, with no wall-clock cutoff that could age one out.
    *
    * Without this, every run the crash orphaned stayed `running` until a reaper
    * noticed minutes later and reconciled it as `job_missing` — "External
@@ -12243,9 +12238,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * names the symptom (a Job we can no longer see) and hides the cause (this
    * process died). Operators then chase Kubernetes for a fault that was ours.
    *
-   * Runs with an external runtime id stay `running`: their Kubernetes Job may
-   * still be healthy, and the existing reattach / missing-Job reconcilers are
-   * the only paths that can preserve or correctly classify that work.
+   * Runs on an external-lifecycle adapter stay `running`: their Kubernetes Job
+   * may still be healthy, and the existing reattach / missing-Job reconcilers
+   * are the only paths that can preserve or correctly classify that work. The
+   * test for this is the agent's adapter type, not whether `external_run_id`
+   * happens to be stamped yet — see the comment on the ownership query below.
    */
   async function markRunsInterruptedByWorkerCrash(input: {
     reason: string;
@@ -12257,16 +12254,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const runIds = Array.from(new Set([...runningProcesses.keys(), ...activeRunExecutions]));
     if (runIds.length === 0) return { markedRunIds: [] };
 
+    // Decide "is this run's lifecycle ours to end?" from the agent's adapter
+    // type, never from `external_run_id`. A null id does NOT mean local:
+    // `executeRun` adds a run to `activeRunExecutions` before it has even
+    // loaded the agent, while the backing Job name is stamped later and
+    // best-effort, only once a reap cycle observes the Job (see the stamping
+    // comment above `jobRunStatuses`). A claude_k8s / opencode_k8s run
+    // therefore spends a real window owned-but-unstamped, and terminalizing it
+    // there would queue a replacement against a Job that is still healthy —
+    // duplicate execution of the same run, which is strictly worse than the
+    // orphaned row this guard exists to prevent.
+    //
+    // A run whose agent row is missing drops out of this join and is left
+    // `running` for the reaper. That is the fail-safe direction: we only
+    // terminalize work we can positively prove we own.
+    const ownedRuns = await db
+      .select({ runId: heartbeatRuns.id, adapterType: agents.adapterType })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(inArray(heartbeatRuns.id, runIds));
+    const localRunIds = ownedRuns
+      .filter((row) => !hasExternalLifecycle(row.adapterType))
+      .map((row) => row.runId);
+    if (localRunIds.length === 0) return { markedRunIds: [] };
+
     const message = `Interrupted by worker process crash (${input.reason})`;
 
     const markedRunIds: string[] = [];
     const retryRunIds: string[] = [];
 
-    for (const runId of runIds) {
+    for (const runId of localRunIds) {
       // Claim one run at a time. Gated on status='running' so we never overwrite
-      // a run that already reached a terminal state on its way out, and on
-      // external_run_id IS NULL so live Kubernetes Jobs remain visible to the
-      // restart reattach path.
+      // a run that already reached a terminal state on its way out. The
+      // external_run_id guard is kept as a second line of defence behind the
+      // adapter-type filter above: a local-adapter run that somehow carries an
+      // external id is not one we should be terminalizing either.
       const claimed = await db
         .update(heartbeatRuns)
         .set({
@@ -12397,33 +12419,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    *
    * We do not try to distinguish "cleanup finished" from "cleanup interrupted":
    * {@link recoverCrashInterruptedRun} is idempotent, so re-running it for
-   * every recent crash-marked run is both cheaper and less error-prone than
-   * persisting a completion marker. The `retryOfRunId` pre-filter keeps the
-   * common case (recovery completed normally) to a single indexed query that
-   * returns nothing.
+   * every unrecovered crash-marked run is both cheaper and less error-prone
+   * than persisting a completion marker. The `retryOfRunId` pre-filter keeps
+   * the common case (recovery completed normally) to a single indexed query
+   * that returns nothing.
    */
-  async function reconcileWorkerCrashedRuns(options: { lookbackMs?: number; now?: Date } = {}): Promise<{
+  async function reconcileWorkerCrashedRuns(options: { maxRuns?: number; now?: Date } = {}): Promise<{
     reconciledRunIds: string[];
     retryRunIds: string[];
   }> {
     const now = options.now ?? new Date();
-    const lookbackMs = options.lookbackMs ?? WORKER_CRASH_RECONCILE_LOOKBACK_MS;
-    const since = new Date(now.getTime() - lookbackMs);
+    const maxRuns = options.maxRuns ?? WORKER_CRASH_RECONCILE_MAX_RUNS;
 
+    // Deliberately NOT bounded by elapsed wall time. These rows are already
+    // terminal, so the orphan reaper — which only scans `running` — can never
+    // find them; this pass is the only thing that will. A `finishedAt >= since`
+    // cutoff would therefore not defer the work, it would abandon it: an outage
+    // longer than the window, or one failed startup pass followed by a day of
+    // uptime, would age the row out permanently while its issue lock still
+    // points at a dead run.
+    //
+    // Bounding is by batch size instead, with a deterministic oldest-first
+    // order so repeated passes make monotonic progress over a backlog. The
+    // `not exists` retry pre-filter means every recovered run drops out of the
+    // candidate set, so successive starts drain the tail rather than re-reading
+    // it, and the steady-state query returns nothing off an index.
     const candidates = await db
       .select()
       .from(heartbeatRuns)
       .where(and(
         eq(heartbeatRuns.status, "interrupted"),
         eq(heartbeatRuns.errorCode, "worker_crashed"),
-        gte(heartbeatRuns.finishedAt, since),
         // No retry child => cleanup never reached the retry step for this run.
         sql`not exists (
           select 1 from heartbeat_runs retry
           where retry.retry_of_run_id = ${heartbeatRuns.id}
         )`,
       ))
-      .limit(WORKER_CRASH_RECONCILE_MAX_RUNS);
+      .orderBy(asc(heartbeatRuns.finishedAt), asc(heartbeatRuns.id))
+      .limit(maxRuns);
 
     const reconciledRunIds: string[] = [];
     const retryRunIds: string[] = [];

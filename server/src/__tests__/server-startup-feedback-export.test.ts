@@ -44,6 +44,7 @@ const {
     resolveSchedulingSuppression: resolveHeartbeatSchedulingSuppressionMock,
     resumeRunningExternalRuntimeRuns: vi.fn(async () => 0),
     stopDispatch: vi.fn(),
+    reconcileWorkerCrashedRuns: vi.fn(async () => ({ reconciledRunIds: [], retryRunIds: [] })),
     reconcileHotRestartAdoption: vi.fn(async () => ({ mode: "none" })),
     reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
@@ -388,7 +389,6 @@ describe("startServer feedback export wiring", () => {
       expect(heartbeatServiceMock.reapOrphanedRuns).not.toHaveBeenCalled();
       expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(1);
-
       expect(intervalCallback).not.toBeNull();
       intervalCallback?.();
       await Promise.resolve();
@@ -400,6 +400,31 @@ describe("startServer feedback export wiring", () => {
     } finally {
       setIntervalSpy.mockRestore();
     }
+  });
+
+  it("still repairs crash-orphaned runs when heartbeat scheduling is suppressed", async () => {
+    // BLO-19722: this is state REPAIR, not dispatch. A run the crash guard
+    // claimed but never finished recovering is already terminal, so the orphan
+    // reaper (which only scans `running`) cannot find it, while its issue
+    // execution lock may still point at the dead run — blocking that issue for
+    // every worker, suppressed or not. The pass is startup-only, so skipping it
+    // here strands the row until some future unsuppressed restart happens to
+    // occur.
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
+      suppressed: true,
+      reason: "worktree_instance",
+    });
+
+    await startServer();
+
+    expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(1);
+    // Suppression must still hold for everything that dispatches or reaps.
+    expect(heartbeatServiceMock.reapOrphanedRuns).not.toHaveBeenCalled();
+    expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
   });
 
   it("does not replay hot-restart adoption when the orphan reaper retries", async () => {

@@ -205,9 +205,34 @@ describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
     expect(run!.errorCode).toBeNull();
   });
 
+  it("leaves an owned external-lifecycle run running before its Job id is stamped", async () => {
+    const heartbeat = heartbeatService(db);
+    // The pre-stamp window is real, not theoretical: executeRun registers a run
+    // in the live-execution registry before it has even loaded the agent, and
+    // external_run_id is only stamped later, best-effort, once a reap cycle
+    // observes the backing Job. So a healthy claude_k8s run spends real time
+    // owned-with-a-null-id. Terminalizing it here would queue a replacement
+    // against a Job that is still running — duplicate execution of the same
+    // run, which is worse than the orphaned row this guard exists to prevent.
+    const { runId } = await seedRun({ adapterType: "claude_k8s", externalRunId: null });
+    markLiveInThisWorker(runId);
+
+    const result = await heartbeat.markRunsInterruptedByWorkerCrash({ reason: "uncaughtException: boom" });
+
+    expect(result.markedRunIds).toEqual([]);
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run!.status).toBe("running");
+    expect(run!.errorCode).toBeNull();
+    expect(run!.finishedAt).toBeNull();
+    // And no replacement was queued against the live Job.
+    const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(retries).toHaveLength(0);
+  });
+
   it("marks every in-flight run the worker owned, not just the first", async () => {
     const heartbeat = heartbeatService(db);
-    const first = await seedRun({ adapterType: "claude_k8s" });
+    const first = await seedRun({ adapterType: "claude_local" });
     const second = await seedRun({ adapterType: "codex_local" });
     markLiveInThisWorker(first.runId);
     markLiveInThisWorker(second.runId);
@@ -215,6 +240,24 @@ describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
     const result = await heartbeat.markRunsInterruptedByWorkerCrash({ reason: "unhandledRejection: pool drained" });
 
     expect(result.markedRunIds.sort()).toEqual([first.runId, second.runId].sort());
+  });
+
+  it("marks only the local runs when the worker owned a mix of adapters", async () => {
+    const heartbeat = heartbeatService(db);
+    const local = await seedRun({ adapterType: "codex_local" });
+    const externalUnstamped = await seedRun({ adapterType: "claude_k8s", externalRunId: null });
+    markLiveInThisWorker(local.runId);
+    markLiveInThisWorker(externalUnstamped.runId);
+
+    const result = await heartbeat.markRunsInterruptedByWorkerCrash({ reason: "uncaughtException: boom" });
+
+    // A mixed batch must not let the local sweep drag an external run with it.
+    expect(result.markedRunIds).toEqual([local.runId]);
+    const [external] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, externalUnstamped.runId));
+    expect(external!.status).toBe("running");
   });
 
   it("is a no-op when the worker held no in-flight runs", async () => {
@@ -291,17 +334,45 @@ describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
       expect(afterSecond.map((row) => row.id)).toEqual(afterFirst.map((row) => row.id));
     });
 
-    it("ignores crash-marked runs older than the lookback window", async () => {
+    it("recovers a crash-marked run no matter how long it sat unrecovered", async () => {
       const heartbeat = heartbeatService(db);
+      // These rows are terminal, so the orphan reaper (which only scans
+      // `running`) can never find them — this pass is the only thing that
+      // will. A wall-clock cutoff would not defer that work, it would abandon
+      // it: an outage longer than the window, or one failed startup pass
+      // followed by a day of uptime, would age the row out permanently while
+      // its issue lock still points at a dead run.
       const { runId } = await seedClaimedButUnrecovered({
-        finishedAt: new Date(Date.now() - 48 * 60 * 60 * 1000),
+        finishedAt: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
       });
 
       const result = await heartbeat.reconcileWorkerCrashedRuns();
 
-      expect(result.reconciledRunIds).toEqual([]);
+      expect(result.reconciledRunIds).toEqual([runId]);
       const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
-      expect(retries).toHaveLength(0);
+      expect(retries).toHaveLength(1);
+      expect(retries[0]!.status).toBe("queued");
+    });
+
+    it("drains the oldest unrecovered runs first when a backlog exceeds the batch limit", async () => {
+      const heartbeat = heartbeatService(db);
+      // Bounding is by batch size, not by age, so the order has to be
+      // deterministic for successive startups to make monotonic progress
+      // instead of re-reading the same head of the backlog.
+      const oldest = await seedClaimedButUnrecovered({
+        finishedAt: new Date(Date.now() - 72 * 60 * 60 * 1000),
+      });
+      const newest = await seedClaimedButUnrecovered({
+        finishedAt: new Date(Date.now() - 1 * 60 * 60 * 1000),
+      });
+
+      const first = await heartbeat.reconcileWorkerCrashedRuns({ maxRuns: 1 });
+      expect(first.reconciledRunIds).toEqual([oldest.runId]);
+
+      // The recovered run drops out of the candidate set via the retry
+      // pre-filter, so the next pass advances rather than repeating.
+      const second = await heartbeat.reconcileWorkerCrashedRuns({ maxRuns: 1 });
+      expect(second.reconciledRunIds).toEqual([newest.runId]);
     });
 
     it("ignores terminal runs that were not attributed to a worker crash", async () => {
