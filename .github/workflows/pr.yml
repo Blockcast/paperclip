@@ -89,6 +89,9 @@ jobs:
       - name: Test general-server shard partition
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
 
+      - name: Test vitest project coverage
+        run: node --test ./scripts/__tests__/vitest-project-coverage.test.mjs
+
       - name: Test release verify workflow wiring
         run: node --test ./scripts/__tests__/release-verify-workflow.test.mjs
 
