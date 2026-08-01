@@ -203,7 +203,37 @@ ending in `_url` is ignored.
 - **mTLS is the V2 upgrade path** for stronger mutual auth (spec §11 Q4).
   Static bearer is V1 because it's the lowest-friction way to get rolling.
 - The bearer token is kept in worker memory only — never written to plugin
-  state, never logged.
+  state, never logged. It is resolved **per delivery**, not cached, so a
+  rotated secret takes effect on the next request and a restart can never
+  leave the worker holding a stale (or absent) token.
+
+### Multi-company instances: config is resolved per delivery
+
+Plugin config is company-scoped, and the host deliberately hands a worker an
+**empty** bootstrap config whenever more than one company has configured this
+plugin:
+
+```
+plugin-loader: multiple company configs; legacy bootstrap scope disabled  {configuredCompanyCount: 3}
+```
+
+`ctx.config.get()` with no argument therefore returns `{}` on such an instance —
+the single-company bootstrap scope is a legacy compatibility path, not the
+contract. Webhook deliveries carry the host-selected `companyId`, and this
+plugin resolves both config and bearer token from it per request
+(`src/config-scope.ts`), falling back to the `setup()` snapshot only when the
+per-company read is empty.
+
+**If you are writing another plugin, do not resolve credentials in `setup()`.**
+Doing so fails in a way that hides itself: saving config fires
+`onConfigChanged` and re-hydrates the cached value, so the fault disappears the
+moment you touch config and returns at the next worker restart with no config
+change to blame. Diagnosed in BLO-20049, where it rejected 100% of alert
+deliveries with `502 unauthorized` while the stored config was perfectly valid.
+
+Known limitation: the `check-alert-escalations` sweep still needs a
+single-company scope and stays idle without one. It does not affect delivery.
+
 
 ### Bearer rotation in a Kubernetes deployment
 
