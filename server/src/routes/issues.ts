@@ -2807,6 +2807,11 @@ export function issueRoutes(
     }) => Promise<unknown>;
     createIssueDuplicateCandidateLookup?: typeof findCreateIssueDuplicateCandidates;
     createIssueDuplicateCandidateTimeoutMs?: number;
+    createIssueDuplicateCandidateCompanyScopeReader?: (
+      scopedDb: Db,
+      req: Request,
+      companyId: string,
+    ) => Promise<boolean>;
     createIssueDuplicateCandidateActivityWriter?: typeof logActivity;
     createIssueDuplicateCandidateActivityTimeoutMs?: number;
     createIssueDuplicateCandidateCorpusFilter?: CreateIssueDuplicateCandidateCorpusFilter;
@@ -4335,8 +4340,8 @@ export function issueRoutes(
     return readable;
   }
 
-  async function actorCanReadCompanyScope(req: Request, companyId: string) {
-    const decision = await access.decide({
+  async function actorCanReadCompanyScope(req: Request, companyId: string, scopedDb?: Db) {
+    const decision = await (scopedDb ? accessService(scopedDb) : access).decide({
       actor: req.actor,
       action: "company_scope:read",
       resource: { type: "company", companyId },
@@ -8444,7 +8449,18 @@ export function issueRoutes(
     try {
       const lookupAbortController = new AbortController();
       duplicateCandidates = await raceCreateIssueDuplicateCandidateLookup((async () => {
-        const canReadCompanyScope = await actorCanReadCompanyScope(req, companyId);
+        const canReadCompanyScope = await db.transaction(async (tx) => {
+          await tx.execute(sql`select set_config(
+            'statement_timeout',
+            ${String(opts.createIssueDuplicateCandidateTimeoutMs
+              ?? ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS)},
+            true
+          )`);
+          return (opts.createIssueDuplicateCandidateCompanyScopeReader
+            ?? ((scopedDb, scopedReq, scopedCompanyId) => (
+              actorCanReadCompanyScope(scopedReq, scopedCompanyId, scopedDb)
+            )))(tx as unknown as Db, req, companyId);
+        });
         return (opts.createIssueDuplicateCandidateLookup ?? findCreateIssueDuplicateCandidates)(db, companyId, {
           id: issue.id,
           identifier: issue.identifier,
@@ -8509,20 +8525,28 @@ export function issueRoutes(
     if (duplicateCandidates.length > 0) {
       try {
         await raceCreateIssueDuplicateCandidateLookup(
-          (opts.createIssueDuplicateCandidateActivityWriter ?? logActivity)(db, {
-            companyId,
-            actorType: actor.actorType,
-            actorId: actor.actorId,
-            agentId: actor.agentId,
-            runId: actor.runId,
-            agentApiKeyId: actor.agentApiKeyId,
-            action: "issue.duplicate_candidates_shown",
-            entityType: "company",
-            entityId: companyId,
-            details: {
-              identifier: issue.identifier,
-              duplicateCandidates: duplicateCandidates.map(({ identifier, score }) => ({ identifier, score })),
-            },
+          db.transaction(async (tx) => {
+            await tx.execute(sql`select set_config(
+              'statement_timeout',
+              ${String(opts.createIssueDuplicateCandidateActivityTimeoutMs
+                ?? ISSUE_CREATE_DUPLICATE_CANDIDATE_ACTIVITY_TIMEOUT_MS)},
+              true
+            )`);
+            await (opts.createIssueDuplicateCandidateActivityWriter ?? logActivity)(tx as unknown as Db, {
+              companyId,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              agentId: actor.agentId,
+              runId: actor.runId,
+              agentApiKeyId: actor.agentApiKeyId,
+              action: "issue.duplicate_candidates_shown",
+              entityType: "company",
+              entityId: companyId,
+              details: {
+                identifier: issue.identifier,
+                duplicateCandidates: duplicateCandidates.map(({ identifier, score }) => ({ identifier, score })),
+              },
+            });
           }),
           opts.createIssueDuplicateCandidateActivityTimeoutMs
             ?? ISSUE_CREATE_DUPLICATE_CANDIDATE_ACTIVITY_TIMEOUT_MS,
