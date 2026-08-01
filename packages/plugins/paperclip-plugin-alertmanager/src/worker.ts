@@ -65,7 +65,7 @@ async function applyConfig(
 
   if (!pluginConfig.defaultCompanyId) {
     ctx.logger.warn(
-      "paperclip-plugin-alertmanager: defaultCompanyId is not configured — incoming alerts will be dropped until it is set",
+      "paperclip-plugin-alertmanager: defaultCompanyId is not configured — the escalation sweep has no company scope and alert ladders will not advance; incoming webhook deliveries are unaffected (they resolve the delivering company per request)",
     );
     return;
   }

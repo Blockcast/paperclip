@@ -85,6 +85,30 @@ export function isEmptyConfig(
  *
  * `webhookTokenRef` is the production posture; `webhookToken` is the
  * documented dev-mode inline fallback.
+ *
+ * Returns `null` ONLY when this company has configured no credential at all.
+ * That is a determinate answer — nothing can authenticate against an endpoint
+ * with no token — so the caller is right to reject the delivery.
+ *
+ * A *failure to resolve* a configured ref is a different thing entirely, and is
+ * raised rather than returned. `ctx.secrets.resolve` is typed `Promise<string>`
+ * and signals every failure by throwing, so a caught error means we do not know
+ * what the expected token is. Not knowing the expected credential is not
+ * evidence that the presented one is wrong: reporting it as `unauthorized`
+ * writes a false `alertmanager.webhook.unauthorized` metric — the exact signal
+ * an operator reads as "someone is sending bad credentials" — and records
+ * "unauthorized" on the delivery row instead of the real secrets error, sending
+ * an incident investigation in the wrong direction.
+ *
+ * Transient (provider outage) and permanent (malformed ref) failures are
+ * deliberately treated alike, because they are not distinguishable here: the
+ * host collapses every worker→host handler error to a JSON-RPC
+ * `INTERNAL_ERROR` with only a message string (`plugin-worker-manager.ts`
+ * `errorCodeForWorkerHostError`), discarding the originating HTTP status. Given
+ * that, failing retryably is the safe default in both directions — a permanent
+ * misconfiguration surfaces as repeated `failed` deliveries carrying the real
+ * error text, which is louder and more diagnostic than a silent 401, while a
+ * transient outage keeps the alert alive.
  */
 export async function resolveWebhookToken(
   ctx: PluginContext,
@@ -99,7 +123,9 @@ export async function resolveWebhookToken(
       ctx.logger.error(
         `paperclip-plugin-alertmanager: failed to resolve webhookTokenRef${forCompany}: ${String(err)}`,
       );
-      return null;
+      throw new CompanyScopeUnavailableError(
+        `could not resolve webhookTokenRef${forCompany}: ${String(err)}`,
+      );
     }
   }
   if (config.webhookToken) return config.webhookToken;
@@ -116,8 +142,9 @@ export interface CompanyScope {
 
 /**
  * Raised when this delivery's company scope could not be established for a
- * reason that may not still hold on a retry — a failed config RPC, or a company
- * with no stored config yet.
+ * reason that may not still hold on a retry — a failed config RPC, a company
+ * with no stored config yet, or a configured `webhookTokenRef` that could not
+ * be resolved.
  *
  * It must propagate out of `onWebhook`. Returning normally makes the host record
  * the delivery `success` and answer HTTP 200 (`server/src/routes/plugins.ts`

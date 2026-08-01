@@ -9,6 +9,7 @@
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
+  AlertDeliveryIncompleteError,
   WebhookUnauthorizedError,
   handleWebhook,
   verifyBearerToken,
@@ -1159,5 +1160,107 @@ describe("BLO-20467 — alert state is namespaced per company", () => {
     expect(mocks.issues.update).not.toHaveBeenCalled();
     // The other tenant's row is left exactly where it was.
     expect(store.get(`instance/-/alert:${alert.fingerprint}`)).toEqual(legacy);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Delivery acknowledgement semantics
+//
+// Regression cover for BLO-20467: the per-alert catch swallowed downstream
+// failures and returned normally, so the host recorded `success` + HTTP 200 and
+// Alertmanager stopped retrying a delivery that produced no durable issue or
+// state row. Batch isolation is preserved — siblings still run — but the
+// delivery must FAIL so the alert survives.
+// ---------------------------------------------------------------------------
+
+describe("handleWebhook — delivery acknowledgement", () => {
+  const twoAlertEnvelope = () =>
+    baseEnvelope({
+      alerts: [
+        baseAlert({ fingerprint: "aaaa1111" }),
+        baseAlert({ fingerprint: "bbbb2222" }),
+      ],
+    });
+
+  it("rejects the delivery when issue creation fails", async () => {
+    const { ctx } = mkCtx();
+    (ctx as unknown as MockClients).issues.create.mockRejectedValue(
+      new Error("issues.create RPC unavailable"),
+    );
+
+    await expect(
+      handleWebhook(ctx, baseConfig(), TOKEN, baseInput()),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+  });
+
+  it("rejects the delivery when persisting alert state fails", async () => {
+    const { ctx } = mkCtx();
+    (ctx as unknown as MockClients).state.set.mockRejectedValue(
+      new Error("plugin state store unavailable"),
+    );
+
+    await expect(
+      handleWebhook(ctx, baseConfig(), TOKEN, baseInput()),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+  });
+
+  it("still processes sibling alerts, then fails the delivery naming only the failed one", async () => {
+    // Batch isolation and non-acknowledgement are both required; a fix that
+    // aborted the loop on first failure would pass the assertions above and
+    // still regress the behaviour this catch exists for.
+    const { ctx, mocks } = mkCtx();
+    // Fail the first alert only; the mapper owns title construction, so drive
+    // the failure off call order rather than asserting on issue fields here.
+    let call = 0;
+    mocks.issues.create.mockImplementation(async () => {
+      call += 1;
+      if (call === 1) throw new Error("issues.create RPC unavailable");
+      return { id: "issue-ok" };
+    });
+
+    const err = await handleWebhook(
+      ctx,
+      baseConfig(),
+      TOKEN,
+      baseInput({ parsedBody: twoAlertEnvelope() }),
+    ).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(AlertDeliveryIncompleteError);
+    // The second alert was still attempted despite the first one failing.
+    expect(mocks.issues.create).toHaveBeenCalledTimes(2);
+    expect((err as AlertDeliveryIncompleteError).fingerprints).toEqual(["aaaa1111"]);
+  });
+
+  it("acknowledges (returns) when every alert succeeds", async () => {
+    const { ctx } = mkCtx();
+    await expect(
+      handleWebhook(ctx, baseConfig(), TOKEN, baseInput({ parsedBody: twoAlertEnvelope() })),
+    ).resolves.toBeUndefined();
+  });
+
+  it("still acknowledges a malformed payload — permanent, so retrying is pointless", async () => {
+    const { ctx } = mkCtx();
+    await expect(
+      handleWebhook(ctx, baseConfig(), TOKEN, baseInput({ parsedBody: { nope: true } })),
+    ).resolves.toBeUndefined();
+  });
+
+  it("does not let a metrics outage abort the remaining alerts", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.issues.create.mockRejectedValue(new Error("issues.create RPC unavailable"));
+    mocks.metrics.write.mockRejectedValue(new Error("metrics sink unavailable"));
+
+    const err = await handleWebhook(
+      ctx,
+      baseConfig(),
+      TOKEN,
+      baseInput({ parsedBody: twoAlertEnvelope() }),
+    ).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(AlertDeliveryIncompleteError);
+    expect((err as AlertDeliveryIncompleteError).fingerprints).toEqual([
+      "aaaa1111",
+      "bbbb2222",
+    ]);
   });
 });

@@ -78,7 +78,14 @@ describe("resolveWebhookToken", () => {
     expect(mocks.secrets.resolve).toHaveBeenCalledWith(SECRET_REF, { companyId: COMPANY_A });
   });
 
-  it("fails closed (null, no throw) when the ref cannot be resolved", async () => {
+  it("fails RETRYABLY when a configured ref cannot be resolved", async () => {
+    // Regression: this used to return null, which `handleWebhook` reports as
+    // WebhookUnauthorizedError. Failing to load the expected token is not
+    // evidence that the presented token is wrong — reporting it as
+    // `unauthorized` writes a false auth-failure metric and buries the real
+    // secrets error. Transient and permanent resolve failures are treated
+    // alike because the host collapses both to a JSON-RPC INTERNAL_ERROR with
+    // no status to classify on.
     const { ctx, mocks } = mkCtx({
       resolveSecret: async () => {
         throw new Error('Invalid secret reference for plugin. Use { type: "secret_ref", secretId }');
@@ -86,11 +93,33 @@ describe("resolveWebhookToken", () => {
     });
     const config = { webhookTokenRef: "bare-uuid-string" } as unknown as AlertmanagerPluginConfig;
 
-    await expect(resolveWebhookToken(ctx, config, COMPANY_A)).resolves.toBeNull();
+    await expect(resolveWebhookToken(ctx, config, COMPANY_A)).rejects.toThrow(
+      CompanyScopeUnavailableError,
+    );
     expect(mocks.logger.error).toHaveBeenCalled();
   });
 
+  it("propagates a secret-provider outage out of resolveCompanyScope so the delivery is retried", async () => {
+    // Boundary test: the failure must survive the whole scope-resolution path,
+    // not just the leaf helper, because that is what reaches onWebhook and
+    // decides the host's delivery status.
+    const { ctx } = mkCtx({
+      configByCompany: {
+        [COMPANY_A]: { defaultCompanyId: COMPANY_A, webhookTokenRef: SECRET_REF },
+      },
+      resolveSecret: async () => {
+        throw new Error("secret provider unavailable (503)");
+      },
+    });
+
+    await expect(resolveCompanyScope(ctx, COMPANY_A)).rejects.toThrow(
+      CompanyScopeUnavailableError,
+    );
+  });
+
   it("warns and returns null when neither token nor ref is configured", async () => {
+    // Unchanged, and deliberately so: "no credential is configured" IS a
+    // determinate answer, so rejecting the delivery is correct.
     const { ctx, mocks } = mkCtx();
     await expect(
       resolveWebhookToken(ctx, {} as AlertmanagerPluginConfig, COMPANY_A),

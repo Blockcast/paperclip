@@ -40,6 +40,28 @@ export class WebhookUnauthorizedError extends Error {
   }
 }
 
+/**
+ * Raised after the per-alert loop when at least one alert in the batch could not
+ * be processed, so that the delivery fails and Alertmanager retries it.
+ *
+ * Alerts are caught individually to keep batch isolation — one poisoned alert
+ * must not abandon its siblings — but "isolated" must not become "acknowledged".
+ * Returning normally makes the host record `success` and answer HTTP 200
+ * (`server/src/routes/plugins.ts` "Step 8"), which ends Alertmanager's retries
+ * for a delivery that produced no durable issue or state row.
+ */
+export class AlertDeliveryIncompleteError extends Error {
+  readonly fingerprints: readonly string[];
+
+  constructor(fingerprints: readonly string[]) {
+    super(
+      `${fingerprints.length} alert(s) in this delivery could not be processed (${fingerprints.join(", ")}) — failing the delivery so Alertmanager retries`,
+    );
+    this.name = "AlertDeliveryIncompleteError";
+    this.fingerprints = fingerprints;
+  }
+}
+
 function nonEmptyString(value: string | null | undefined): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
@@ -500,7 +522,14 @@ async function recoverStateFromIssue(
  * Top-level webhook handler. Pure-ish: takes ctx + config + token + input,
  * returns void. Throws `WebhookUnauthorizedError` when the bearer token
  * fails verification — the worker's onWebhook re-throws this so the host
- * can surface a 401 / drop the delivery.
+ * can surface a 401 / drop the delivery. Throws `AlertDeliveryIncompleteError`
+ * when any alert in the batch failed to process, so the host records the
+ * delivery `failed` and Alertmanager retries it.
+ *
+ * Returning normally is an acknowledgement: it makes the host answer HTTP 200
+ * and ends Alertmanager's retries. Only do that when the delivery needs no
+ * retry — a malformed or unsupported-version payload, or a filtered alert —
+ * never when something that could succeed later has failed.
  */
 export async function handleWebhook(
   ctx: PluginContext,
@@ -542,6 +571,8 @@ export async function handleWebhook(
     return;
   }
 
+  const failedFingerprints: string[] = [];
+
   for (const alert of body.alerts) {
     if (!alertMatchesLabelFilter(alert, config.acceptOnlyLabels)) {
       await ctx.metrics.write("alertmanager.webhook.filtered", 1, {
@@ -562,14 +593,36 @@ export async function handleWebhook(
         );
       }
     } catch (err) {
-      // Spec §5.2 step 3: log + 200 on schema mismatch; same principle
-      // here — don't let a single bad alert poison the whole batch.
+      // Catch per alert so one failure cannot abandon the rest of the batch —
+      // but record it, because the delivery is NOT complete. Spec §5.2 step 3's
+      // "log + 200" applies to a *malformed payload*, which is handled above and
+      // is permanent; these failures are issue-RPC, state-store, event, and
+      // metric errors, which are transient. Swallowing them answered HTTP 200,
+      // so Alertmanager stopped retrying and the alert was destroyed with no
+      // durable issue or state row — the same silent-loss class as the outage
+      // this plugin already suffered (BLO-20467).
       ctx.logger.error(
         `paperclip-plugin-alertmanager: error processing alert ${alert.fingerprint}: ${String(err)}`,
       );
-      await ctx.metrics.write("alertmanager.alert.error", 1, {
-        alertname: alert.labels.alertname ?? "unknown",
-      });
+      failedFingerprints.push(alert.fingerprint);
+      try {
+        await ctx.metrics.write("alertmanager.alert.error", 1, {
+          alertname: alert.labels.alertname ?? "unknown",
+        });
+      } catch (metricErr) {
+        // Telemetry is best-effort; a metrics outage must not be the thing that
+        // aborts the remaining alerts. The delivery already counts as failed.
+        ctx.logger.error(
+          `paperclip-plugin-alertmanager: failed to record alert error metric for ${alert.fingerprint}: ${String(metricErr)}`,
+        );
+      }
     }
+  }
+
+  if (failedFingerprints.length > 0) {
+    // Replaying the whole batch is safe: handleFiring/handleResolved both key
+    // off the stored per-fingerprint alert state, so alerts that already
+    // succeeded update their existing issue rather than filing a duplicate.
+    throw new AlertDeliveryIncompleteError(failedFingerprints);
   }
 }
