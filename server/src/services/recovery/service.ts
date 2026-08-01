@@ -5186,14 +5186,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     });
     if (!outcome) return null;
 
+    // ORDER IS LOAD-BEARING: the exhaustion notice must be posted BEFORE the wake is
+    // enqueued. Master posts it inline inside the escalation transaction, i.e. ahead of
+    // this whole post-commit block; hoisting it out (see the construction site for why we
+    // must) has to preserve that relative order. The notice is an issue comment, and
+    // migration 0076's AFTER INSERT trigger bumps `issues.last_activity_at` — which is what
+    // the NEXT sweep reads as `hasNewActivitySinceLastAttempt`. Posting it after the wake
+    // instead flips that predicate on the following sweep, diverting the owner wake into the
+    // assignee-fallback branch and silently truncating the owner's wake budget.
+    if (outcome.exhaustionNotice) {
+      await postStrandedRecoveryExhaustionNotice(outcome.exhaustionNotice);
+    }
     if (outcome.pendingWake) {
       await enqueueSourceScopedStrandedRecoveryWake(outcome.pendingWake);
     }
     if (outcome.activity) {
       await logActivity(db, outcome.activity);
-    }
-    if (outcome.exhaustionNotice) {
-      await postStrandedRecoveryExhaustionNotice(outcome.exhaustionNotice);
     }
     if (outcome.humanDecisionEvent) {
       await emitNeedsHumanDecisionEscalationEvent(outcome.humanDecisionEvent);
