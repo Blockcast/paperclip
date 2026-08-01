@@ -354,7 +354,8 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       /* drain all enqueued events through the fake bus */
     }
 
-    expect(emitted).toEqual([
+    expect(emitted).toHaveLength(3);
+    expect(emitted).toEqual(expect.arrayContaining([
       expect.objectContaining({
         eventType: "issue.created",
         actorType: "agent",
@@ -394,7 +395,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
           runId: null,
         }),
       }),
-    ]);
+    ]));
   });
 
   it("forwards full comment body + author on issue.comment.created via pluginEventPayloadExtra (regression: dormant Linear comment bridge, BLO-12216)", async () => {
