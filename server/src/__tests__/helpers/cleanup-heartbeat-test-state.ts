@@ -9,6 +9,7 @@ import type { heartbeatService } from "../../services/heartbeat.ts";
 
 type Db = ReturnType<typeof createDb>;
 type Heartbeat = ReturnType<typeof heartbeatService>;
+const TEST_DATABASE_CLEANUP_LOCK_KEY = "paperclip:test-database-cleanup";
 
 export type CleanupHeartbeatTestStateOptions = {
   /**
@@ -53,11 +54,13 @@ export type CleanupHeartbeatTestStateOptions = {
  *      dispatches) so postRun lifecycle hooks finish their writes
  *      BEFORE the TRUNCATE.
  *
- *   3. `TRUNCATE TABLE "companies", <extras> CASCADE` — single statement
- *      drops every FK-related row in one shot, immune to the per-table
- *      ordering races that surfaced as "delete from companies violates
- *      ... FK on document_revisions" in dep-sched (master verify_canary
- *      run 26136174642).
+ *   3. Take a transaction-scoped advisory lock, then `TRUNCATE TABLE
+ *      "companies", <extras> CASCADE`. The lock serializes destructive cleanup
+ *      across Vitest processes sharing a database, preventing concurrent
+ *      CASCADE lock walks from deadlocking. The single TRUNCATE still avoids
+ *      the per-table ordering races that surfaced as "delete from companies
+ *      violates ... FK on document_revisions" in dep-sched (master
+ *      verify_canary run 26136174642).
  *
  * Tests that previously had a bespoke `cancelActiveRunsForCleanup`
  * helper, a pg_terminate_backend statement, a 3-retry on 40P01, or a
@@ -96,7 +99,12 @@ export async function cleanupHeartbeatTestState(
 
   const truncateList = ['"companies"', ...extraTruncateTables.map((t) => `"${t}"`)].join(", ");
   await runWithTransientDbRetry(async () => {
-    await db.execute(sql.raw(`TRUNCATE TABLE ${truncateList} CASCADE`));
+    await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${TEST_DATABASE_CLEANUP_LOCK_KEY}, 0))`,
+      );
+      await tx.execute(sql.raw(`TRUNCATE TABLE ${truncateList} CASCADE`));
+    });
   }, {
     maxAttempts: 5,
     baseDelayMs: 50,
