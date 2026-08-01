@@ -153,4 +153,19 @@ describe("assertManifestHasNoLiteralSensitiveEnv", () => {
     // Depth-bounded, so a cycle terminates instead of blowing the stack.
     expect(() => assertManifestHasNoLiteralSensitiveEnv(cyclic, "cyclic")).not.toThrow();
   });
+
+  // Recognising a pod spec and scanning one must agree on where containers
+  // live, or a spec carrying only initContainers/ephemeralContainers would be
+  // walked past without ever being scanned.
+  it("recognises a pod spec by any container list, not just `containers`", () => {
+    for (const key of ["containers", "initContainers", "ephemeralContainers"]) {
+      const manifest = {
+        kind: "Job",
+        spec: { template: { spec: { [key]: [{ name: "agent", env: [{ name: "API_TOKEN", value: "x" }] }] } } },
+      };
+      expect(() => assertManifestHasNoLiteralSensitiveEnv(manifest, "Job"), key).toThrow(
+        /agent\.env\[API_TOKEN\]/,
+      );
+    }
+  });
 });

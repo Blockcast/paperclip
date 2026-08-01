@@ -33,10 +33,15 @@ interface ContainerLike {
   env?: unknown;
 }
 
+// Every place a pod spec can carry containers. Used both to scan a known pod
+// spec and to recognise one inside an arbitrary manifest — keep it single so
+// the two cannot drift apart.
+const CONTAINER_LIST_KEYS = ["initContainers", "containers", "ephemeralContainers"] as const;
+
 function collectContainers(podSpec: unknown): Array<{ kind: string; container: ContainerLike }> {
   const spec = (podSpec ?? {}) as Record<string, unknown>;
   const out: Array<{ kind: string; container: ContainerLike }> = [];
-  for (const kind of ["initContainers", "containers", "ephemeralContainers"]) {
+  for (const kind of CONTAINER_LIST_KEYS) {
     const list = spec[kind];
     if (!Array.isArray(list)) continue;
     for (const container of list) {
@@ -102,7 +107,7 @@ function collectPodSpecs(node: unknown, depth = 0): unknown[] {
   const obj = node as Record<string, unknown>;
   const found: unknown[] = [];
   // A pod spec is any object carrying a container list.
-  if (Array.isArray(obj.containers) || Array.isArray(obj.initContainers)) found.push(obj);
+  if (CONTAINER_LIST_KEYS.some((key) => Array.isArray(obj[key]))) found.push(obj);
   for (const value of Object.values(obj)) found.push(...collectPodSpecs(value, depth + 1));
   return found;
 }
