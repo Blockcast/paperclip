@@ -121,10 +121,14 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   await setMode("planning");
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(issuePath);
-  await expect(page.getByText(/^(Planning|Plan mode)$/).first()).toBeVisible();
+  const mobileComposer = page.getByTestId("issue-chat-composer");
+  await expect(mobileComposer).toHaveAttribute("data-pending-work-mode", "planning", {
+    timeout: 30_000,
+  });
   const mobilePlanningToggle = page.getByTestId("issue-chat-composer-work-mode-toggle");
   await expect(mobilePlanningToggle).toBeVisible();
   await expect(mobilePlanningToggle).toHaveAttribute("data-pending-work-mode", "planning");
+  await expect(mobilePlanningToggle).toHaveAttribute("title", /Plan mode is on/);
   await page.screenshot({
     path: `${screenshotDir}/mobile-planning-detail-${timestamp}.png`,
     fullPage: true,
