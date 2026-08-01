@@ -1,5 +1,5 @@
 /**
- * Company-scoped read of a fingerprint's dedup row, with pre-BLO-20467
+ * Company-scoped read/write of a fingerprint's dedup row, with pre-BLO-20467
  * migration.
  *
  * Lives in its own module rather than in `webhook-handler.ts` because both
@@ -12,11 +12,32 @@ import { alertStateRef, legacyInstanceAlertStateRef } from "./constants.js";
 import type { AlertStateRecord } from "./types.js";
 
 /**
- * Read a fingerprint's dedup row from its owning company's scope, migrating a
- * pre-BLO-20467 instance-scoped row on first sight.
+ * A fingerprint's dedup row plus everything needed to write it back.
  *
- * The migration is gated on `paperclipCompanyId`: a legacy row is adopted only
- * by the company whose issue it actually tracks. A row belonging to another
+ * Pair every `readAlertState` with `writeAlertState` rather than calling
+ * `ctx.state.set(handle.ref, ...)` directly — the handle carries the legacy key
+ * whose cleanup would otherwise be missed.
+ */
+export interface AlertStateHandle {
+  /** Company-scoped key this record belongs at, and must be written back to. */
+  readonly ref: ReturnType<typeof alertStateRef>;
+  /** The record, or `null` when this fingerprint is unknown to this company. */
+  readonly record: AlertStateRecord | null;
+  /**
+   * The legacy instance-scoped key the record was read from, when the company
+   * scope had no row yet. `null` whenever there is nothing to clean up — the
+   * scoped row already existed, no legacy row exists, or the legacy row belongs
+   * to a different tenant and must be left alone.
+   */
+  readonly legacyRef: ReturnType<typeof legacyInstanceAlertStateRef> | null;
+}
+
+/**
+ * Read a fingerprint's dedup row, falling back to a pre-BLO-20467
+ * instance-scoped row when the company scope has none yet.
+ *
+ * The fallback is gated on `paperclipCompanyId`: a legacy row is surfaced only
+ * to the company whose issue it actually tracks. A row belonging to another
  * tenant is ignored (and left in place), which is precisely the cross-tenant
  * reuse this change exists to stop. Without the read-through, every alert
  * firing at upgrade time would look new — duplicating live issues and orphaning
@@ -27,31 +48,74 @@ import type { AlertStateRecord } from "./types.js";
  * across the upgrade and skip its ladder silently, because a ladder can fall
  * due before Alertmanager's next `repeat_interval` delivery arrives to migrate
  * the row — turning a missed escalation into a wait of up to `repeat_interval`.
+ *
+ * THIS FUNCTION WRITES NOTHING, and that is deliberate. An earlier version
+ * copied the legacy row to the scoped key here, which made a read racy against
+ * a concurrent writer: a webhook and a sweep could both observe an empty scope
+ * and read the same snapshot, and whichever copied it *second* would land a
+ * verbatim pre-migration record on top of a scoped row the other had already
+ * advanced or resolved — dropping `resolvedAt` and replaying an escalation
+ * rung. `ctx.state` offers no compare-and-swap to guard that write against
+ * (`PluginStateClient` is get/list/set/delete, and `plugin_state` has no
+ * version column), so the fix is to not make the write at all.
+ *
+ * Migration therefore happens as a side effect of the caller's own write: every
+ * reader here goes on to persist a record *derived from* what it read, via
+ * `writeAlertState`. That write carries the caller's intended mutation instead
+ * of reverting to a snapshot, so the ordering of two racing callers can no
+ * longer lose a resolution outright.
+ *
+ * What remains is the ordinary last-write-wins of any read-modify-write over a
+ * store without CAS — identical for a migrated row and a long-scoped one, and
+ * neither introduced nor removed by this module. Serializing that fully needs
+ * either CAS on `ctx.state` or the contended key moved into the plugin's own
+ * namespace (where `ctx.db.execute` can do a guarded upsert, as `escalation.ts`
+ * already does for cover membership). Tracked in BLO-20650 — deliberately out of
+ * scope here because it applies to every escalation write, not to migration.
+ *
+ * The narrower thing this DOES buy: a reader that decides to take no action now
+ * writes nothing at all, so it can no longer destroy a concurrent resolution
+ * just by having looked.
  */
 export async function readAlertState(
   ctx: PluginContext,
   companyId: string,
   fingerprint: string,
-): Promise<{ ref: ReturnType<typeof alertStateRef>; record: AlertStateRecord | null }> {
+): Promise<AlertStateHandle> {
   const ref = alertStateRef(companyId, fingerprint);
   const scoped = (await ctx.state.get(ref)) as AlertStateRecord | null;
-  if (scoped) return { ref, record: scoped };
+  if (scoped) return { ref, record: scoped, legacyRef: null };
 
   const legacyRef = legacyInstanceAlertStateRef(fingerprint);
   const legacy = (await ctx.state.get(legacyRef)) as AlertStateRecord | null;
   if (legacy && legacy.paperclipCompanyId === companyId) {
-    await ctx.state.set(ref, legacy);
-    try {
-      await ctx.state.delete(legacyRef);
-    } catch (err) {
-      // The scoped copy is already durable, so the migration has taken effect;
-      // a stale legacy row is inert (only this company could ever adopt it, and
-      // it will never be read again now that the scoped row exists).
-      ctx.logger.warn(
-        `paperclip-plugin-alertmanager: migrated alert ${fingerprint} to company scope but could not remove the legacy row: ${String(err)}`,
-      );
-    }
-    return { ref, record: legacy };
+    return { ref, record: legacy, legacyRef };
   }
-  return { ref, record: null };
+  return { ref, record: null, legacyRef: null };
+}
+
+/**
+ * Persist a dedup row to its company scope, retiring the legacy row it was
+ * adopted from.
+ *
+ * Order matters: the scoped write lands first, so a failure between the two
+ * leaves the legacy row in place and the next read simply adopts it again.
+ * Once the scoped row exists the legacy row is unreachable — `readAlertState`
+ * returns before ever looking at it — so failing to delete it costs an inert
+ * row, never correctness.
+ */
+export async function writeAlertState(
+  ctx: PluginContext,
+  handle: AlertStateHandle,
+  record: AlertStateRecord,
+): Promise<void> {
+  await ctx.state.set(handle.ref, record);
+  if (!handle.legacyRef) return;
+  try {
+    await ctx.state.delete(handle.legacyRef);
+  } catch (err) {
+    ctx.logger.warn(
+      `paperclip-plugin-alertmanager: migrated alert ${handle.ref.stateKey} to company scope but could not remove the legacy row: ${String(err)}`,
+    );
+  }
 }
