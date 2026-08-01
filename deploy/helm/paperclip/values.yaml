@@ -172,6 +172,12 @@ githubApp:
   privateKeyKey: private_key.pem
   # -- GitHub login of the reviewer bot used to filter reviews/comments. Empty -> server default ("allyblockcast[bot]").
   reviewerBotLogin: ""
+  # -- Commit-status context to FAIL when a PR-review run exhausts its automatic
+  # retries (e.g. "review/ally-complete"). A required status that is never posted
+  # reads as "Expected — waiting for status" forever, so an exhausted reviewer
+  # chain silently wedges the PR. Empty (default) -> the server posts no status.
+  # Requires the App to hold `statuses: write` on the target repos.
+  prReviewGateStatusContext: ""
 
 # -- Pod spec knobs.
 pod:

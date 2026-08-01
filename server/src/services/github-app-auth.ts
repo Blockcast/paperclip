@@ -82,18 +82,62 @@ export function _resetInstallationTokenCache(): void {
   cachedInstallationToken = null;
 }
 
+export type GitHubInstallationTokenResult =
+  | { ok: true; token: string }
+  | { ok: false; retryable: boolean; reason: string; statusCode?: number };
+
+function isRetryableGithubHttpStatus(status: number): boolean {
+  return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
+type ClassifiedGithubHttpFailure = { retryable: boolean; reason: string };
+
+async function githubRateLimitSignal(res: Response): Promise<boolean> {
+  const retryAfter = res.headers?.get("retry-after");
+  if (retryAfter && retryAfter.trim().length > 0) return true;
+  if (res.headers?.get("x-ratelimit-remaining") === "0") return true;
+
+  const body = await res.json().catch(() => null) as unknown;
+  const bodyText = JSON.stringify(body ?? "").toLowerCase();
+  return bodyText.includes("rate limit") || bodyText.includes("secondary rate limit") || bodyText.includes("abuse detection");
+}
+
+async function classifyGithubHttpFailure(prefix: string, res: Response): Promise<ClassifiedGithubHttpFailure> {
+  if (res.status === 403 && await githubRateLimitSignal(res)) {
+    return { retryable: true, reason: `${prefix}_rate_limited` };
+  }
+  const status = res.status;
+  if (isRetryableGithubHttpStatus(status)) {
+    return { retryable: true, reason: `${prefix}_http_${status}` };
+  }
+  return { retryable: false, reason: `${prefix}_http_${status}` };
+}
+
+export function githubAppCredentialsConfigured(): boolean {
+  const cfg = loadConfig();
+  return Boolean(
+    cfg.githubAppId.trim() &&
+    cfg.githubAppInstallationId.trim() &&
+    cfg.githubAppPrivateKey.trim(),
+  );
+}
+
 /**
  * Return a cached or freshly-minted installation access token, or null when
  * creds are absent or the GitHub API call fails.
  */
-export async function getInstallationToken(nowMs: number = Date.now()): Promise<string | null> {
+export async function getInstallationTokenResult(nowMs: number = Date.now()): Promise<GitHubInstallationTokenResult> {
   if (cachedInstallationToken && cachedInstallationToken.expiresAtMs - TOKEN_REFRESH_SKEW_MS > nowMs) {
-    return cachedInstallationToken.token;
+    return { ok: true, token: cachedInstallationToken.token };
   }
   const cfg = loadConfig();
   const installationId = cfg.githubAppInstallationId.trim();
   const jwt = mintAppJwt(nowMs);
-  if (!jwt || !installationId) return null;
+  if (!githubAppCredentialsConfigured()) {
+    return { ok: false, retryable: false, reason: "missing_github_app_credentials" };
+  }
+  if (!jwt) return { ok: false, retryable: false, reason: "invalid_github_app_private_key" };
+  if (!installationId) return { ok: false, retryable: false, reason: "missing_github_app_installation_id" };
 
   const url = `${gitHubApiBase(GITHUB_HOST)}/app/installations/${installationId}/access_tokens`;
   let res: Response;
@@ -103,18 +147,26 @@ export async function getInstallationToken(nowMs: number = Date.now()): Promise<
       headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${jwt}` },
     });
   } catch {
-    return null;
+    return { ok: false, retryable: true, reason: "github_app_token_fetch_failed" };
   }
-  if (!res.ok) return null;
+  if (!res.ok) {
+    const classified = await classifyGithubHttpFailure("github_app_token", res);
+    return { ok: false, ...classified, statusCode: res.status };
+  }
   const body = (await res.json().catch(() => null)) as { token?: string; expires_at?: string } | null;
-  if (!body?.token) return null;
+  if (!body?.token) return { ok: false, retryable: true, reason: "github_app_token_missing" };
 
   const parsedExpiry = body.expires_at ? Date.parse(body.expires_at) : NaN;
   cachedInstallationToken = {
     token: body.token,
     expiresAtMs: Number.isFinite(parsedExpiry) ? parsedExpiry : nowMs + 30 * 60 * 1000,
   };
-  return cachedInstallationToken.token;
+  return { ok: true, token: cachedInstallationToken.token };
+}
+
+export async function getInstallationToken(nowMs: number = Date.now()): Promise<string | null> {
+  const result = await getInstallationTokenResult(nowMs);
+  return result.ok ? result.token : null;
 }
 
 export type ReviewerEvidenceResult =
@@ -246,7 +298,10 @@ export async function githubHasReviewerEvidenceForPr(input: {
     for (let page = 1; page <= 10; page += 1) {
       const url = `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`;
       const res = await ghFetch(url, { headers });
-      if (!res.ok) return { error: `reviews_http_${res.status}` };
+      if (!res.ok) {
+        const classified = await classifyGithubHttpFailure("reviews", res);
+        return { error: classified.reason };
+      }
       const batch = (await res.json()) as Array<{ user?: { login?: string }; commit_id?: string | null }>;
       for (const review of batch) {
         if (normalizeGithubLogin(review.user?.login ?? "") !== botLogin) continue;
@@ -269,7 +324,10 @@ export async function githubHasReviewerEvidenceForPr(input: {
       for (let page = 1; page <= 10; page += 1) {
         const url = `${apiBase}/repos/${input.repoFullName}/issues/${input.prNumber}/comments?per_page=100&page=${page}`;
         const res = await ghFetch(url, { headers });
-        if (!res.ok) return { error: `comments_http_${res.status}` };
+        if (!res.ok) {
+          const classified = await classifyGithubHttpFailure("comments", res);
+          return { error: classified.reason };
+        }
         const batch = (await res.json()) as Array<{ user?: { login?: string }; body?: string }>;
         for (const comment of batch) {
           if (normalizeGithubLogin(comment.user?.login ?? "") !== botLogin) continue;
@@ -339,6 +397,153 @@ export async function githubListIssueCommentBodies(input: {
   } catch {
     return null;
   }
+}
+
+export type GitHubCommitStatusState = "error" | "failure" | "pending" | "success";
+
+export type GitHubCommitStatusPostResult =
+  | { ok: true; statusCode: number }
+  | { ok: false; retryable: boolean; reason: string; statusCode?: number };
+
+export type GitHubCommitStatusLookupResult =
+  | {
+      ok: true;
+      status: {
+        state: GitHubCommitStatusState;
+        context: string;
+        createdAt: string | null;
+        targetUrl: string | null;
+      } | null;
+    }
+  | { ok: false; retryable: boolean; reason: string; statusCode?: number };
+
+function asCommitStatusFailure(result: Extract<GitHubInstallationTokenResult, { ok: false }>): GitHubCommitStatusPostResult {
+  return {
+    ok: false,
+    retryable: result.retryable,
+    reason: result.reason,
+    ...(result.statusCode ? { statusCode: result.statusCode } : {}),
+  };
+}
+
+/**
+ * Read the latest commit status for a single context. The REST list is sorted
+ * here by created_at so callers do not depend on GitHub response ordering.
+ */
+export async function githubGetLatestCommitStatusForContext(input: {
+  repoFullName: string;
+  sha: string;
+  context: string;
+}): Promise<GitHubCommitStatusLookupResult> {
+  const token = await getInstallationTokenResult();
+  if (!token.ok) return asCommitStatusFailure(token) as GitHubCommitStatusLookupResult;
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token.token}` };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  try {
+    const candidates: Array<{
+      state: GitHubCommitStatusState;
+      context: string;
+      createdAt: string | null;
+      targetUrl: string | null;
+    }> = [];
+    for (let page = 1; page <= 10; page += 1) {
+      const url = `${apiBase}/repos/${input.repoFullName}/commits/${input.sha}/statuses?per_page=100&page=${page}`;
+      const res = await ghFetch(url, { headers });
+      if (!res.ok) {
+        const classified = await classifyGithubHttpFailure("commit_status_read", res);
+        return { ok: false, ...classified, statusCode: res.status };
+      }
+      const body = (await res.json().catch(() => [])) as Array<{
+        context?: string;
+        state?: string;
+        created_at?: string | null;
+        target_url?: string | null;
+      }>;
+      candidates.push(
+        ...body
+          .filter((status) => status.context === input.context)
+          .map((status) => ({
+            state: status.state as GitHubCommitStatusState,
+            context: status.context ?? "",
+            createdAt: typeof status.created_at === "string" ? status.created_at : null,
+            targetUrl: typeof status.target_url === "string" ? status.target_url : null,
+          }))
+          .filter((status) =>
+            status.state === "error" ||
+            status.state === "failure" ||
+            status.state === "pending" ||
+            status.state === "success",
+          ),
+      );
+      if (body.length < 100) break;
+    }
+    candidates.sort((left, right) => {
+      const leftTime = left.createdAt ? Date.parse(left.createdAt) : 0;
+      const rightTime = right.createdAt ? Date.parse(right.createdAt) : 0;
+      return rightTime - leftTime;
+    });
+    return { ok: true, status: candidates[0] ?? null };
+  } catch {
+    return { ok: false, retryable: true, reason: "commit_status_read_fetch_failed" };
+  }
+}
+
+/**
+ * Post a commit status as the GitHub App with a classified result so callers
+ * can retry transient failures and surface permanent configuration/permission
+ * failures separately.
+ */
+export async function githubPostCommitStatusDetailed(input: {
+  repoFullName: string;
+  sha: string;
+  context: string;
+  state: GitHubCommitStatusState;
+  description?: string;
+  targetUrl?: string | null;
+}): Promise<GitHubCommitStatusPostResult> {
+  const token = await getInstallationTokenResult();
+  if (!token.ok) return asCommitStatusFailure(token);
+  const headers = {
+    ...GITHUB_API_HEADERS,
+    authorization: `Bearer ${token.token}`,
+    "content-type": "application/json",
+  };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  try {
+    const url = `${apiBase}/repos/${input.repoFullName}/statuses/${input.sha}`;
+    const res = await ghFetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        state: input.state,
+        context: input.context,
+        // GitHub truncates at 140 chars; trim here so the message we intend is
+        // the message that lands rather than an arbitrary server-side cut.
+        ...(input.description ? { description: input.description.slice(0, 140) } : {}),
+        ...(input.targetUrl ? { target_url: input.targetUrl } : {}),
+      }),
+    });
+    if (res.ok) return { ok: true, statusCode: res.status };
+    const classified = await classifyGithubHttpFailure("commit_status_write", res);
+    return { ok: false, ...classified, statusCode: res.status };
+  } catch {
+    return { ok: false, retryable: true, reason: "commit_status_write_fetch_failed" };
+  }
+}
+
+/**
+ * Boolean compatibility wrapper for existing call sites.
+ */
+export async function githubPostCommitStatus(input: {
+  repoFullName: string;
+  sha: string;
+  context: string;
+  state: GitHubCommitStatusState;
+  description?: string;
+  targetUrl?: string | null;
+}): Promise<boolean> {
+  const result = await githubPostCommitStatusDetailed(input);
+  return result.ok;
 }
 
 /**
