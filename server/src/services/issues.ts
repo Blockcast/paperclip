@@ -7383,16 +7383,20 @@ export function issueService(db: Db) {
       });
 
       if (blockParentUntilDone) {
-        const existingBlockers = await db
-          .select({ blockerIssueId: issueRelations.issueId })
-          .from(issueRelations)
-          .where(and(eq(issueRelations.companyId, parent.companyId), eq(issueRelations.relatedIssueId, parent.id), eq(issueRelations.type, "blocks")));
-        await syncBlockedByIssueIds(
-          parent.id,
-          parent.companyId,
-          [...new Set([...existingBlockers.map((row) => row.blockerIssueId), child.id])],
-          { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
-        );
+        await db.transaction(async (tx) => {
+          await lockIssueParentMutationCompany(parent.companyId, tx);
+          const existingBlockers = await tx
+            .select({ blockerIssueId: issueRelations.issueId })
+            .from(issueRelations)
+            .where(and(eq(issueRelations.companyId, parent.companyId), eq(issueRelations.relatedIssueId, parent.id), eq(issueRelations.type, "blocks")));
+          await syncBlockedByIssueIds(
+            parent.id,
+            parent.companyId,
+            [...new Set([...existingBlockers.map((row) => row.blockerIssueId), child.id])],
+            { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
+            tx,
+          );
+        });
         [child] = await withIssueRelationSummaries(parent.companyId, [child], db);
       }
 
@@ -7789,6 +7793,13 @@ export function issueService(db: Db) {
           const [enriched] = await withIssueLabels(tx, [existingIssue]);
           const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
           return withRelations;
+        }
+
+        // Create can mutate the same issue graph as update via parentId and
+        // blockedByIssueIds. Keep the company-scoped graph lock outermost
+        // before create-time blocker sync starts taking row locks.
+        if (issueData.parentId !== undefined || blockedByIssueIds !== undefined) {
+          await lockIssueParentMutationCompany(companyId, tx);
         }
 
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);

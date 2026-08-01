@@ -7651,6 +7651,76 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  it("does not deadlock a create-with-blockers against a combined parent and blocker update", async () => {
+    const companyId = randomUUID();
+    const issuePId = "00000000-0000-4000-8000-000000000001";
+    const issueXId = "00000000-0000-4000-8000-000000000002";
+    const issueZId = "00000000-0000-4000-8000-000000000004";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      {
+        id: issuePId,
+        companyId,
+        title: "Issue P",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueXId,
+        companyId,
+        title: "Issue X",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueZId,
+        companyId,
+        title: "Issue Z",
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+
+    const results = await Promise.allSettled([
+      svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueZId] }),
+      svc.create(companyId, {
+        title: "New dependent",
+        status: "todo",
+        priority: "medium",
+        blockedByIssueIds: [issuePId, issueZId],
+      }),
+    ]);
+
+    for (const result of results) {
+      if (result.status === "rejected") {
+        expect(String(result.reason?.message ?? result.reason)).not.toMatch(/deadlock/i);
+      }
+    }
+    expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+
+    const issueX = await svc.getById(issueXId);
+    expect(issueX?.parentId).toBe(issuePId);
+    await expect(svc.getRelationSummaries(issueXId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: issueZId })],
+    });
+    const createResult = results[1];
+    expect(createResult.status).toBe("fulfilled");
+    const createdIssueId = createResult.status === "fulfilled" ? createResult.value.id : "";
+    await expect(svc.getRelationSummaries(createdIssueId)).resolves.toMatchObject({
+      blockedBy: [
+        expect.objectContaining({ id: issuePId }),
+        expect.objectContaining({ id: issueZId }),
+      ],
+    });
+  });
+
   it("rejects updates that pin a projectless issue to an isolated git worktree", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
