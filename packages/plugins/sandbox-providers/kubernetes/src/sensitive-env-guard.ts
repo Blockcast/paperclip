@@ -90,3 +90,36 @@ export function assertNoLiteralSensitiveEnv(podSpec: unknown, manifestDescriptio
       `secret, rename it so it does not match /${SENSITIVE_ENV_NAME.source}/i, or use a *_FILE path pointer.`,
   );
 }
+
+// Job nests its pod spec under spec.template.spec; the Sandbox CR uses
+// spec.podTemplate.spec; future kinds will pick their own path. Rather than
+// making every call site know the shape, find pod specs structurally.
+const MAX_MANIFEST_DEPTH = 8;
+
+function collectPodSpecs(node: unknown, depth = 0): unknown[] {
+  if (depth > MAX_MANIFEST_DEPTH || !node || typeof node !== "object") return [];
+  if (Array.isArray(node)) return node.flatMap((item) => collectPodSpecs(item, depth + 1));
+  const obj = node as Record<string, unknown>;
+  const found: unknown[] = [];
+  // A pod spec is any object carrying a container list.
+  if (Array.isArray(obj.containers) || Array.isArray(obj.initContainers)) found.push(obj);
+  for (const value of Object.values(obj)) found.push(...collectPodSpecs(value, depth + 1));
+  return found;
+}
+
+/**
+ * Shape-agnostic variant of assertNoLiteralSensitiveEnv: walks an entire
+ * manifest for embedded pod specs and asserts on each.
+ *
+ * This is the choke-point check. The builders assert on their own output, but
+ * `createJob`/`createSandboxCr` accept an arbitrary manifest, so a hand-built
+ * one would otherwise reach the API server unguarded.
+ */
+export function assertManifestHasNoLiteralSensitiveEnv(
+  manifest: unknown,
+  manifestDescription: string,
+): void {
+  for (const podSpec of collectPodSpecs(manifest)) {
+    assertNoLiteralSensitiveEnv(podSpec, manifestDescription);
+  }
+}

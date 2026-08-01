@@ -3,6 +3,7 @@ import {
   isSensitiveEnvName,
   findLiteralSensitiveEnvVars,
   assertNoLiteralSensitiveEnv,
+  assertManifestHasNoLiteralSensitiveEnv,
 } from "../../src/sensitive-env-guard.js";
 
 function podSpecWithEnv(env: unknown[], key = "containers"): Record<string, unknown> {
@@ -101,5 +102,55 @@ describe("assertNoLiteralSensitiveEnv", () => {
     expect(() =>
       assertNoLiteralSensitiveEnv(podSpecWithEnv([{ name: "HOME", value: "/home/paperclip" }]), "Job x"),
     ).not.toThrow();
+  });
+});
+
+describe("assertManifestHasNoLiteralSensitiveEnv", () => {
+  // The builders assert on their own output, but createJob/createSandboxCr take
+  // an arbitrary manifest — this is the check that cannot be bypassed.
+  const jobManifest = (env: unknown[]) => ({
+    apiVersion: "batch/v1",
+    kind: "Job",
+    spec: { template: { spec: { containers: [{ name: "agent", env }] } } },
+  });
+  const sandboxCrManifest = (env: unknown[]) => ({
+    apiVersion: "agents.x-k8s.io/v1alpha1",
+    kind: "Sandbox",
+    spec: { podTemplate: { spec: { containers: [{ name: "agent", env }] } } },
+  });
+
+  it("finds a pod spec nested under a Job's spec.template.spec", () => {
+    expect(() =>
+      assertManifestHasNoLiteralSensitiveEnv(
+        jobManifest([{ name: "API_TOKEN", value: "leaked" }]),
+        "Job in ns",
+      ),
+    ).toThrow(/agent\.env\[API_TOKEN\]/);
+  });
+
+  it("finds a pod spec nested under a Sandbox CR's spec.podTemplate.spec", () => {
+    expect(() =>
+      assertManifestHasNoLiteralSensitiveEnv(
+        sandboxCrManifest([{ name: "API_TOKEN", value: "leaked" }]),
+        "Sandbox in ns",
+      ),
+    ).toThrow(/agent\.env\[API_TOKEN\]/);
+  });
+
+  it("passes clean manifests of both shapes", () => {
+    const clean = [{ name: "HOME", value: "/home/paperclip" }];
+    expect(() => assertManifestHasNoLiteralSensitiveEnv(jobManifest(clean), "Job")).not.toThrow();
+    expect(() =>
+      assertManifestHasNoLiteralSensitiveEnv(sandboxCrManifest(clean), "Sandbox"),
+    ).not.toThrow();
+  });
+
+  it("tolerates manifests with no pod spec, and cyclic/deep input", () => {
+    expect(() => assertManifestHasNoLiteralSensitiveEnv({ kind: "ConfigMap" }, "cm")).not.toThrow();
+    expect(() => assertManifestHasNoLiteralSensitiveEnv(null, "null")).not.toThrow();
+    const cyclic: Record<string, unknown> = { kind: "Job" };
+    cyclic.self = cyclic;
+    // Depth-bounded, so a cycle terminates instead of blowing the stack.
+    expect(() => assertManifestHasNoLiteralSensitiveEnv(cyclic, "cyclic")).not.toThrow();
   });
 });
