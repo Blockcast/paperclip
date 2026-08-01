@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { buildJobManifest } from "../../src/pod-spec-builder.js";
+import { findLiteralSensitiveEnvVars } from "../../src/sensitive-env-guard.js";
 
 const baseInput = {
   namespace: "paperclip-acme",
@@ -92,5 +93,20 @@ describe("buildJobManifest", () => {
     expect(job.metadata.labels["paperclip.io/run-id"]).toBe("r1");
     expect(job.spec.template.metadata.labels["paperclip.io/run-id"]).toBe("r1");
     expect(job.spec.template.metadata.labels["paperclip.io/role"]).toBe("agent");
+  });
+
+  // BLO-17973/BLO-17980: a read-only GET Pod returns every literal env value,
+  // so credential material must never appear in one.
+  it("emits no credential material in literal env values", () => {
+    const job = buildJobManifest(baseInput);
+    expect(findLiteralSensitiveEnvVars(job.spec.template.spec)).toEqual([]);
+  });
+
+  it("passes credentials via envFrom.secretRef rather than literal env entries", () => {
+    const job = buildJobManifest(baseInput);
+    const container = job.spec.template.spec.containers[0];
+    expect(container.envFrom).toEqual([{ secretRef: { name: baseInput.envSecretName } }]);
+    // Pin the literal allowlist: anything added here must be non-secret.
+    expect(container.env).toEqual([{ name: "HOME", value: "/home/paperclip" }]);
   });
 });
