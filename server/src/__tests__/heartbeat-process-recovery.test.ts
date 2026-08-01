@@ -5524,6 +5524,177 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await heartbeat.cancelRun(queuedRunId);
   });
 
+  // BLO-19461 characterization. These two pin the CURRENT behaviour of the
+  // window between EXTERNAL_LIFECYCLE_STALE_MS (15 min) and
+  // EXTERNAL_LIFECYCLE_HARD_STALE_MS (45 min) for an agent whose every run has
+  // gone silent while its k8s Job is still `phase: active`.
+  //
+  // The stall is NOT slot exhaustion: BLO-12990 Fix #1 already drops silent runs
+  // from `runningCount` (heartbeat.ts:17529-17541), so slots are free. It is the
+  // all-or-nothing orphan-Job guard at heartbeat.ts:17555 —
+  // `runningCount === 0 && hasActiveExternalJob` returns [] — which defers to a
+  // reaper that will not force-kill until the 45-minute hard floor. The agent is
+  // therefore totally undispatchable for 30 minutes with nothing working to end
+  // it, and because the trigger is `runningCount === 0` this is independent of
+  // how many slots the agent has: one hung run on a 1-slot agent behaves the same.
+  //
+  // The first test is the defect and is expected to FLIP once the guard's window
+  // is bounded. The second guards the 2026-05-23 RCA (heartbeat.ts:1047-1059):
+  // whatever bound is introduced, a hard-stale run must still be force-killed
+  // with a reason naming adapter silence, not `job_missing`.
+  it("leaves a fully-silent external-lifecycle agent undispatchable below the hard-stale floor (BLO-19461)", async () => {
+    // Past the 15-min soft floor, comfortably below the 45-min hard floor.
+    const silentSince = new Date(Date.now() - 20 * 60 * 1000);
+    const { companyId, agentId, issueId, runId: silentRunId } = await seedRunFixture({
+      adapterType: "claude_k8s",
+      agentStatus: "running",
+      includeIssue: true,
+      lastOutputAt: silentSince,
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId: silentRunId });
+    const reservation = await seedLaunchedReservation({ companyId, agentId, runId: silentRunId });
+    // The Job is alive and still `active` — this is a hung adapter, not a lost Job.
+    mockListAgentJobRunStatuses.mockResolvedValue(
+      new Map([
+        [silentRunId, {
+          phase: "active",
+          reason: null,
+          message: null,
+          name: reservation.jobName,
+          uid: reservation.jobUid,
+        }],
+      ]),
+    );
+    mockHasActiveJobForAgent.mockResolvedValue(true);
+
+    const queuedWakeupId = randomUUID();
+    const queuedRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: queuedWakeupId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_continuation_needed",
+      payload: { issueId },
+      status: "queued",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: queuedWakeupId,
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_continuation_needed" },
+      createdAt: new Date("2026-03-19T00:10:00.000Z"),
+      updatedAt: new Date("2026-03-19T00:10:00.000Z"),
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    // The reaper declines to touch the hung run: it is silent, but under 45 min.
+    const silentRun = await heartbeat.getRun(silentRunId);
+    expect(silentRun?.status).toBe("running");
+    // ...and the guard blocks the whole agent, so queued work does not dispatch.
+    const queuedRun = await heartbeat.getRun(queuedRunId);
+    expect(queuedRun?.status).toBe("queued");
+    expect(mockAdapterExecute.mock.calls.some(([ctx]) => ctx.runId === queuedRunId)).toBe(false);
+  });
+
+  it("force-kills a hard-stale live Job with a silence reason and releases the agent (BLO-19461)", async () => {
+    // Past the 45-min hard floor.
+    const silentSince = new Date(Date.now() - 46 * 60 * 1000);
+    const { companyId, agentId, runId: silentRunId } = await seedRunFixture({
+      adapterType: "claude_k8s",
+      agentStatus: "running",
+      // No issue: this case is only about the reaper, and an attached issue
+      // drags in the release-and-promote tail, which is not what we assert here.
+      includeIssue: false,
+      lastOutputAt: silentSince,
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId: silentRunId });
+    const reservation = await seedLaunchedReservation({ companyId, agentId, runId: silentRunId });
+    mockListAgentJobRunStatuses.mockResolvedValue(
+      new Map([
+        [silentRunId, {
+          phase: "active",
+          reason: null,
+          message: null,
+          name: reservation.jobName,
+          uid: reservation.jobUid,
+        }],
+      ]),
+    );
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(silentRunId);
+    const silentRun = await heartbeat.getRun(silentRunId);
+    expect(silentRun?.status).toBe("failed");
+    // The reason must name adapter silence, never `job_missing` — the Job was
+    // present and active; it was us who killed it.
+    expect(silentRun?.errorCode).toBe("external_lifecycle_stale_killed");
+    expect(mockDeleteAgentJobsForRun).toHaveBeenCalled();
+  });
+
+  // Control for the pair above: identical fixture to the "undispatchable" case,
+  // except the agent has no live Job. Slots are free in BOTH cases (the silent
+  // run is excluded from `runningCount` either way), so if this one dispatches
+  // and the other does not, the blocker is provably the `hasActiveExternalJob`
+  // guard at heartbeat.ts:17555 and NOT slot exhaustion. This is the evidence
+  // that the "N hung runs occupy N slots" model of BLO-19461 was wrong.
+  it("dispatches queued work for an equally-silent agent once no live Job remains (BLO-19461 control)", async () => {
+    const silentSince = new Date(Date.now() - 20 * 60 * 1000);
+    const { companyId, agentId, issueId, runId: silentRunId } = await seedRunFixture({
+      adapterType: "claude_k8s",
+      agentStatus: "running",
+      includeIssue: true,
+      lastOutputAt: silentSince,
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId: silentRunId });
+    // Same 20-min silence as the blocked case, but the Job is gone and the
+    // dispatcher's k8s backstop reports the agent free.
+    mockListLiveAgentJobRunIds.mockResolvedValue(new Set());
+    mockHasActiveJobForAgent.mockResolvedValue(false);
+
+    const queuedWakeupId = randomUUID();
+    const queuedRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: queuedWakeupId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_continuation_needed",
+      payload: { issueId },
+      status: "queued",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: queuedWakeupId,
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_continuation_needed" },
+      createdAt: new Date("2026-03-19T00:10:00.000Z"),
+      updatedAt: new Date("2026-03-19T00:10:00.000Z"),
+    });
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForValue(async () => {
+      const run = await heartbeat.getRun(queuedRunId);
+      return run && run.status !== "queued" ? run : null;
+    });
+
+    const queuedRun = await heartbeat.getRun(queuedRunId);
+    expect(queuedRun?.status).not.toBe("queued");
+    await heartbeat.cancelRun(queuedRunId);
+  });
+
   it("cancels a queued stale routine duplicate when another open issue owns the execution lock", async () => {
     const { companyId, agentId, issueId: duplicateIssueId } = await seedAssignedTodoNoRunFixture();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
