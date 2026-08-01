@@ -203,6 +203,7 @@ import { externalObjectService } from "../services/external-objects.js";
 
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS = 30;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP = 200;
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS = 500;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS = 1_000;
 
 type CreateIssueDuplicateCandidate = {
@@ -222,6 +223,22 @@ type CreateIssueDuplicateCandidateRow = IssueDuplicateDocument & {
   originKind: string | null;
   originId: string | null;
 };
+
+export function raceCreateIssueDuplicateCandidateLookup<T>(
+  promise: Promise<T>,
+  timeoutMs = ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`issue duplicate candidate lookup timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
 
 async function findCreateIssueDuplicateCandidates(
   db: Db,
@@ -8321,13 +8338,15 @@ export function issueRoutes(
     }
     let duplicateCandidates: CreateIssueDuplicateCandidate[] = [];
     try {
-      const canReadCompanyScope = await actorCanReadCompanyScope(req, companyId);
-      duplicateCandidates = await findCreateIssueDuplicateCandidates(db, companyId, {
-        id: issue.id,
-        identifier: issue.identifier,
-        title: issue.title,
-        description: issue.description,
-      }, canReadCompanyScope ? undefined : (rows) => filterIssuesForActor(req, rows));
+      duplicateCandidates = await raceCreateIssueDuplicateCandidateLookup((async () => {
+        const canReadCompanyScope = await actorCanReadCompanyScope(req, companyId);
+        return findCreateIssueDuplicateCandidates(db, companyId, {
+          id: issue.id,
+          identifier: issue.identifier,
+          title: issue.title,
+          description: issue.description,
+        }, canReadCompanyScope ? undefined : (rows) => filterIssuesForActor(req, rows));
+      })());
     } catch (err) {
       logger.warn(
         { err, companyId, issueId: issue.id, issueIdentifier: issue.identifier },
@@ -8355,7 +8374,6 @@ export function issueRoutes(
       details: {
         title: issue.title,
         identifier: issue.identifier,
-        ...(duplicateCandidates.length > 0 ? { duplicateCandidates } : {}),
         ...(watchdogProductBugFollowUp
           ? {
             watchdogDiscovery: {
@@ -8377,6 +8395,24 @@ export function issueRoutes(
         }),
       },
     });
+
+    if (duplicateCandidates.length > 0) {
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.duplicate_candidates_shown",
+        entityType: "company",
+        entityId: companyId,
+        details: {
+          identifier: issue.identifier,
+          duplicateCandidates: duplicateCandidates.map(({ identifier, score }) => ({ identifier, score })),
+        },
+      });
+    }
 
     if (executionPolicy?.monitor) {
       await logActivity(db, {
