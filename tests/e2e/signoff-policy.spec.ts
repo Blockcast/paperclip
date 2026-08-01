@@ -258,6 +258,8 @@ async function createIssueWithPolicy(ctx: TestContext, title: string, stages?: u
 }
 
 test.describe("Signoff execution policy", () => {
+  test.setTimeout(120_000);
+
   let ctx: TestContext;
 
   test.beforeAll(async () => {

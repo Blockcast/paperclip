@@ -18,6 +18,7 @@ import type {
   CancelIssueThreadInteraction,
   CreateIssueThreadInteraction,
   IssueThreadInteraction,
+  IssueThreadInteractionResult,
   RequestCheckboxConfirmationInteraction,
   RequestConfirmationInteraction,
   RequestConfirmationTarget,
@@ -47,7 +48,7 @@ import {
   suggestTasksResultSchema,
   submitIssueThreadInteractionVerdictsSchema,
 } from "@paperclipai/shared";
-import { conflict, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { issueService, runWorkspaceIsFinalized } from "./issues.js";
 
@@ -55,6 +56,80 @@ type InteractionActor = {
   agentId?: string | null;
   userId?: string | null;
 };
+
+/**
+ * Kinds that can be withdrawn: the four an agent can create. request_item_verdicts
+ * is board-authored and excluded.
+ *
+ * Note this is a kind allowlist only — it is NOT sufficient on its own to decide
+ * ownership. request_confirmation is also the kind the tool gateway uses for its
+ * human-approval cards, and it stamps those with the *gated agent's* id
+ * (server/src/services/tool-gateway.ts, createdByAgentId = session.agentId), so a
+ * "you created it" test alone would let an agent retract its own oversight gate.
+ * isServerOwnedToolActionInteraction below closes that.
+ */
+const WITHDRAWABLE_INTERACTION_KINDS = [
+  "ask_user_questions",
+  "request_confirmation",
+  "request_checkbox_confirmation",
+  "suggest_tasks",
+] as const;
+
+type WithdrawableInteractionKind = (typeof WITHDRAWABLE_INTERACTION_KINDS)[number];
+
+function isWithdrawableInteractionKind(kind: string): kind is WithdrawableInteractionKind {
+  return (WITHDRAWABLE_INTERACTION_KINDS as readonly string[]).includes(kind);
+}
+
+/**
+ * Tool-action confirmations are the human approval gate in front of a write or
+ * destructive connector call. The gateway stamps them with the gated agent's id,
+ * so they are the one case where createdByAgentId does not mean "the agent owns
+ * this card". They must be accepted or rejected by a board user (or expire) —
+ * never withdrawn, by an agent or a board user, since cancelling one strands the
+ * paired tool_action_requests row with no issue-thread path to resolve it.
+ */
+function isServerOwnedToolActionInteraction(row: { kind: string; payload: unknown }): boolean {
+  if (row.kind !== "request_confirmation") return false;
+  const payload = row.payload;
+  if (typeof payload !== "object" || payload === null) return false;
+  return (payload as { toolAction?: unknown }).toolAction !== undefined
+    && (payload as { toolAction?: unknown }).toolAction !== null;
+}
+
+type WithdrawInteractionOptions = {
+  /**
+   * When set, the withdrawal only succeeds if the row's `createdByAgentId`
+   * matches. Routes pass the calling agent's id here; board users pass nothing.
+   */
+  requireCreatedByAgentId?: string | null;
+};
+
+/**
+ * Per-kind `result` payload for a withdrawn card. Each kind's result schema is
+ * parsed on read by hydrateInteraction, so the shape has to satisfy that kind's
+ * required fields while recording the withdrawal reason.
+ */
+function buildWithdrawnInteractionResult(
+  kind: WithdrawableInteractionKind,
+  reason: string | null,
+): IssueThreadInteractionResult {
+  switch (kind) {
+    case "ask_user_questions":
+      return {
+        version: 1,
+        answers: [],
+        cancelled: true,
+        cancellationReason: reason,
+        summaryMarkdown: null,
+      };
+    case "suggest_tasks":
+      return { version: 1, cancelled: true, cancellationReason: reason };
+    case "request_confirmation":
+    case "request_checkbox_confirmation":
+      return { version: 1, outcome: "cancelled", reason };
+  }
+}
 
 const ISSUE_THREAD_INTERACTION_IDEMPOTENCY_CONSTRAINT =
   "issue_thread_interactions_company_issue_idempotency_uq";
@@ -1905,11 +1980,12 @@ export function issueThreadInteractionService(db: Db) {
       return answered;
     },
 
-    cancelQuestions: async (
+    withdrawInteraction: async (
       issue: { id: string; companyId: string },
       interactionId: string,
       input: CancelIssueThreadInteraction,
       actor: InteractionActor,
+      options: WithdrawInteractionOptions = {},
     ) => {
       const data = cancelIssueThreadInteractionSchema.parse(input);
       const current = await db
@@ -1922,8 +1998,23 @@ export function issueThreadInteractionService(db: Db) {
       if (current.companyId !== issue.companyId || current.issueId !== issue.id) {
         throw notFound("Interaction not found");
       }
-      if (current.kind !== "ask_user_questions") {
-        throw unprocessable("Only ask_user_questions interactions can be cancelled");
+      if (!isWithdrawableInteractionKind(current.kind)) {
+        throw unprocessable(
+          `${current.kind} interactions cannot be withdrawn; withdrawable kinds are ${WITHDRAWABLE_INTERACTION_KINDS.join(", ")}`,
+        );
+      }
+      if (isServerOwnedToolActionInteraction(current)) {
+        throw unprocessable(
+          "Tool-action confirmations are a human approval gate and cannot be withdrawn; accept or reject it instead",
+        );
+      }
+
+      // Agent callers may only withdraw a card they created. The predicate is
+      // re-applied in the UPDATE ... WHERE below so a concurrent writer cannot
+      // slip between this read and the write.
+      const requiredCreatorAgentId = options.requireCreatedByAgentId ?? null;
+      if (requiredCreatorAgentId && current.createdByAgentId !== requiredCreatorAgentId) {
+        throw forbidden("Agents can only withdraw issue-thread interactions they created");
       }
       if (current.status !== "pending") {
         throw conflict("Interaction has already been resolved");
@@ -1934,13 +2025,7 @@ export function issueThreadInteractionService(db: Db) {
         .update(issueThreadInteractions)
         .set({
           status: "cancelled",
-          result: {
-            version: 1,
-            answers: [],
-            cancelled: true,
-            cancellationReason: reason,
-            summaryMarkdown: null,
-          },
+          result: buildWithdrawnInteractionResult(current.kind, reason),
           resolvedByAgentId: actor.agentId ?? null,
           resolvedByUserId: actor.userId ?? null,
           resolvedAt: new Date(),
@@ -1949,6 +2034,9 @@ export function issueThreadInteractionService(db: Db) {
         .where(and(
           eq(issueThreadInteractions.id, interactionId),
           eq(issueThreadInteractions.status, "pending"),
+          ...(requiredCreatorAgentId
+            ? [eq(issueThreadInteractions.createdByAgentId, requiredCreatorAgentId)]
+            : []),
         ))
         .returning();
 

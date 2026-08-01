@@ -29,7 +29,9 @@ export type {
   IssueLivenessState,
 } from "./issue-graph-liveness.js";
 export {
+  STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
   recoveryService,
+  strandedRecoveryWakeAttemptsExhausted,
 } from "./service.js";
 export {
   ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES,

@@ -58,6 +58,11 @@ const mockHeartbeatService = vi.hoisted(() => ({
   reportRunActivity: vi.fn(async () => undefined),
 }));
 
+const mockIssueRecoveryActionService = vi.hoisted(() => ({
+  getActiveForIssue: vi.fn(async () => null),
+  listActiveForIssues: vi.fn(async () => new Map()),
+}));
+
 const mockInstanceSettingsService = vi.hoisted(() => ({
   get: vi.fn(async () => ({
     id: "instance-settings-1",
@@ -118,10 +123,7 @@ vi.mock("../services/index.js", () => ({
   heartbeatService: () => mockHeartbeatService,
   instanceSettingsService: () => mockInstanceSettingsService,
   issueApprovalService: () => ({}),
-  issueRecoveryActionService: () => ({
-    getActiveForIssue: vi.fn(async () => null),
-    listActiveForIssues: vi.fn(async () => new Map()),
-  }),
+  issueRecoveryActionService: () => mockIssueRecoveryActionService,
   issueThreadInteractionService: () => ({
     listForIssue: vi.fn(async () => []),
     expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
@@ -215,6 +217,8 @@ describe.sequential("issue goal context routes", () => {
     mockIssueService.getActiveInboxArchiveFields.mockResolvedValue({});
     mockIssueService.getActiveRun.mockResolvedValue(null);
     mockIssueService.listAttachments.mockResolvedValue([]);
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
+    mockIssueRecoveryActionService.listActiveForIssues.mockResolvedValue(new Map());
     mockDocumentsService.getIssueDocumentPayload.mockResolvedValue({});
     mockDocumentsService.getIssueDocumentByKey.mockResolvedValue(null);
     mockExecutionWorkspaceService.getById.mockResolvedValue(null);
@@ -498,6 +502,29 @@ describe.sequential("issue goal context routes", () => {
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(res.body.replyAuthorization).toMatchObject({ canComment: true, remediation: null });
+    });
+
+    it("reports canComment for an active source-scoped recovery owner", async () => {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action === "issue:read",
+        action: input.action,
+        reason: input.action === "issue:read" ? "allow_test" : "deny_missing_grant",
+        explanation: "Test.",
+      }));
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+        ownerAgentId: mentionedAgentId,
+      });
+
+      const res = await request(createApp(agentActor(mentionedAgentId))).get(
+        "/api/issues/11111111-1111-4111-8111-111111111111/heartbeat-context",
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.replyAuthorization).toMatchObject({
+        canComment: true,
+        reason: "allow_source_scoped_recovery_owner",
+        remediation: null,
+      });
     });
 
     it("reports canComment for the current execution run without a comment grant", async () => {

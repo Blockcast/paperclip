@@ -401,6 +401,104 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     expect(row).toEqual({ checkoutRunId: runningRunId, executionRunId: queuedRunId });
   });
 
+  it("clears an expired pre-claim lock when the same queued run also holds checkout (BLO-19566)", async () => {
+    // Contrast with the test directly above: there, checkoutRunId points at a
+    // *different* live run and the checkout guard rightly wins. Here both
+    // columns point at the SAME never-started run, which is what a normal
+    // checkout produces — it stamps checkout and execution together. BLO-19941
+    // opened the checkout guard for that shape but only for a `running` holder,
+    // leaving the BLO-18995 pre-claim path unreachable for every
+    // checkout-stamped issue. Measured on the live fleet 2026-08-01T05:32Z, the
+    // only two pins in the whole fleet past the 6h bound were both in this
+    // population (BLO-19999 8.6h, BLO-20042 6.8h).
+    const { companyId, agentId, queuedRunId } = await seed();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Pre-claim lock where one queued run holds checkout and execution",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      checkoutRunId: queuedRunId,
+      executionRunId: queuedRunId,
+      // Past STALE_PRE_CLAIM_ISSUE_LOCK_MS (6h).
+      executionLockedAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: null, executionRunId: null, executionLockedAt: null });
+
+    // Non-destructive in the same way as every other branch: the queued run is
+    // left alone and re-acquires the lock if it is ever claimed.
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRunId))
+      .then((rows) => rows[0]);
+    expect(run?.status).toBe("queued");
+
+    // Attributed to the pre-claim bound, not the BLO-19941 running-silent one.
+    const audit = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.stale_lock_cleared"))
+      .then((rows) => rows[0]);
+    const details = audit?.details as
+      | { reason?: string; preClaimLockTimeoutMs?: number }
+      | null;
+    expect(details?.reason).toBe("pre_claim_lock_expired");
+    expect(details?.preClaimLockTimeoutMs).toBe(6 * 60 * 60 * 1000);
+  });
+
+  it("preserves a fresh pre-claim lock even when the same queued run holds checkout (BLO-19566)", async () => {
+    // The widened checkout allowance must stay bounded by the same 6h timeout —
+    // it opens the guard for the same-run shape, it does not make that shape
+    // sweepable on sight.
+    const { companyId, agentId, queuedRunId } = await seed();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Fresh pre-claim lock, same run holds checkout",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      checkoutRunId: queuedRunId,
+      executionRunId: queuedRunId,
+      // Well inside STALE_PRE_CLAIM_ISSUE_LOCK_MS (6h).
+      executionLockedAt: new Date(Date.now() - 30 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(0);
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: queuedRunId, executionRunId: queuedRunId });
+  });
+
   it("does not clear a stale pre-claim lock if a claim refreshes executionLockedAt after scan", async () => {
     const { companyId, agentId, queuedRunId } = await seed();
     const issueId = randomUUID();

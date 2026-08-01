@@ -1527,6 +1527,24 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ).toBe(false);
   });
 
+  it("retries reviewer-verification outages only in a PR-review context", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "pr_review_verification_unavailable",
+        resultJson: {},
+        contextSnapshot: { taskKey: "pr_review:Blockcast/onprem-k8s:1817" },
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "pr_review_verification_unavailable",
+        resultJson: {},
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(false);
+  });
+
   it("does not retry plain adapter failures when the wake is not an idempotent PR review", () => {
     expect(
       shouldScheduleAutomaticRunRetry({

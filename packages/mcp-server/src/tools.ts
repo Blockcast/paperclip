@@ -150,6 +150,12 @@ const createSuggestTasksToolSchema = z.object({
   payload: suggestTasksPayloadSchema,
 });
 
+const withdrawInteractionToolSchema = z.object({
+  issueId: issueIdSchema,
+  interactionId: z.string().uuid(),
+  reason: z.string().trim().max(4000).optional(),
+});
+
 const createAskUserQuestionsToolSchema = z.object({
   issueId: issueIdSchema,
   idempotencyKey: z.string().trim().max(255).nullable().optional(),
@@ -333,7 +339,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipListIssues",
-      "List issues for a company with optional filters (status, projectId, assigneeAgentId, labelId, q, ...). Omitting a filter does not scope it — pass status explicitly if you only want open work; unfiltered can return the full company backlog.\n\nRELATIONAL FIELDS ARE NOT HYDRATED HERE. `blockedBy` is absent unless you pass includeBlockedBy=true; `blocks` and `children` are NEVER present at any setting. An absent key is not an empty relation — never conclude 'this issue has no blockers' or 'this epic has no children' from a list row. To enumerate children pass parentId (direct) or descendantOf (subtree); to read `blocks`, call paperclipGetIssue.\n\n`blockerAttention` is a coarse triage signal, NOT a summary of `blockedBy`, and reading it as one is wrong in three ways: (1) it is only computed for rows whose status is literally `blocked` — on every other row it is all-zeros meaning NOT COMPUTED, not 'no blockers'; (2) `unresolvedBlockerCount` counts explicit blockers UNION open child issues, so it legitimately exceeds `blockedBy.length`; (3) `sampleBlockerIdentifier` is drawn from the transitive closure and often names an issue absent from `blockedBy`. Use it to rank attention, never to decide a specific issue is unblocked.",
+      "List issues for a company with optional filters (status, projectId, assigneeAgentId, labelId, q, ...). Omitting a filter does not scope it — pass status explicitly if you only want open work; unfiltered can return the full company backlog.\n\nRELATIONAL FIELDS ARE NOT HYDRATED HERE. `blockedBy` is absent unless you pass includeBlockedBy=true; `blocks` and `children` are NEVER present at any setting. An absent key is not an empty relation — never conclude 'this issue has no blockers' or 'this epic has no children' from a list row. To enumerate children pass parentId (direct) or descendantOf (subtree); to read `blocks`, call paperclipGetIssue.\n\n`blockerAttention` is a coarse triage signal, NOT a summary of `blockedBy`, and reading it as one is wrong in three ways: (1) it is computed for non-terminal rows whose status is `blocked` or whose dependency readiness has unresolved explicit blockers; all-zeros means the row is not an attention root, but open child issues do NOT make a row a root, so all-zeros still tells you nothing about children — enumerate them with parentId; (2) `unresolvedBlockerCount` counts explicit blockers UNION open child issues, so it legitimately exceeds `blockedBy.length`; (3) `sampleBlockerIdentifier` is drawn from the transitive closure and often names an issue absent from `blockedBy`. Use it to rank attention, never to decide a specific issue is unblocked.",
       listIssuesSchema,
       async (input) => listIssues(client, input),
     ),
@@ -628,6 +634,17 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
             ...body,
           },
         }),
+    ),
+    makeTool(
+      "paperclipWithdrawInteraction",
+      "Withdraw a still-pending issue-thread interaction you created (ask_user_questions, request_confirmation, request_checkbox_confirmation, suggest_tasks). Marks it cancelled so it leaves the board's actionable queue while staying visible in issue history. You can only withdraw cards you created, and only while they are still pending. Tool-action confirmations are the human approval gate in front of a write/destructive tool call and can never be withdrawn — accept or reject those instead.",
+      withdrawInteractionToolSchema,
+      async ({ issueId, interactionId, ...body }) =>
+        client.requestJson(
+          "POST",
+          `/issues/${encodeURIComponent(issueId)}/interactions/${encodeURIComponent(interactionId)}/withdraw`,
+          { body },
+        ),
     ),
     makeTool(
       "paperclipUpsertIssueDocument",
