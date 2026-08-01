@@ -252,34 +252,45 @@ async function findCreateIssueDuplicateCandidates(
   const cutoff = new Date(
     Date.now() - ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS * 24 * 60 * 60 * 1_000,
   );
-  const corpus = await db
-    .select({
-      id: issueRows.id,
-      identifier: issueRows.identifier,
-      title: issueRows.title,
-      description: issueRows.description,
-      companyId: issueRows.companyId,
-      projectId: issueRows.projectId,
-      parentId: issueRows.parentId,
-      assigneeAgentId: issueRows.assigneeAgentId,
-      assigneeUserId: issueRows.assigneeUserId,
-      createdByAgentId: issueRows.createdByAgentId,
-      status: issueRows.status,
-      originKind: issueRows.originKind,
-      originId: issueRows.originId,
-    })
-    .from(issueRows)
-    .where(and(
-      eq(issueRows.companyId, companyId),
-      isNull(issueRows.hiddenAt),
-      gte(issueRows.createdAt, cutoff),
-      notInArray(issueRows.id, [subject.id]),
-    ))
-    .orderBy(desc(issueRows.createdAt), desc(issueRows.id))
-    .limit(ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP);
-  const visibleCorpus = filterCorpus ? await filterCorpus(corpus) : corpus;
+  const visibleCorpus: CreateIssueDuplicateCandidateRow[] = [];
+  let offset = 0;
+  do {
+    const corpus = await db
+      .select({
+        id: issueRows.id,
+        identifier: issueRows.identifier,
+        title: issueRows.title,
+        description: issueRows.description,
+        companyId: issueRows.companyId,
+        projectId: issueRows.projectId,
+        parentId: issueRows.parentId,
+        assigneeAgentId: issueRows.assigneeAgentId,
+        assigneeUserId: issueRows.assigneeUserId,
+        createdByAgentId: issueRows.createdByAgentId,
+        status: issueRows.status,
+        originKind: issueRows.originKind,
+        originId: issueRows.originId,
+      })
+      .from(issueRows)
+      .where(and(
+        eq(issueRows.companyId, companyId),
+        isNull(issueRows.hiddenAt),
+        gte(issueRows.createdAt, cutoff),
+        notInArray(issueRows.id, [subject.id]),
+      ))
+      .orderBy(desc(issueRows.createdAt), desc(issueRows.id))
+      .limit(ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP)
+      .offset(offset);
+    const readable = filterCorpus ? await filterCorpus(corpus) : corpus;
+    visibleCorpus.push(...readable);
+    offset += corpus.length;
+    if (!filterCorpus || corpus.length < ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP) break;
+  } while (visibleCorpus.length < ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP);
 
-  return findIssueDuplicateCandidates(subject, visibleCorpus).candidates.map((candidate) => ({
+  return findIssueDuplicateCandidates(
+    subject,
+    visibleCorpus.slice(0, ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP),
+  ).candidates.map((candidate) => ({
     identifier: candidate.identifier ?? candidate.id,
     title: candidate.title,
     score: candidate.score,
@@ -2791,6 +2802,11 @@ export function issueRoutes(
       actionRequestId: string;
       actor: { agentId?: string | null; userId?: string | null };
     }) => Promise<unknown>;
+    createIssueDuplicateCandidateLookup?: typeof findCreateIssueDuplicateCandidates;
+    createIssueDuplicateCandidateActivityWriter?: typeof logActivity;
+    createIssueDuplicateCandidateCorpusFilter?: (
+      rows: CreateIssueDuplicateCandidateRow[],
+    ) => Promise<CreateIssueDuplicateCandidateRow[]>;
   } = {},
 ) {
   const router = Router();
@@ -8891,12 +8907,13 @@ export function issueRoutes(
     try {
       duplicateCandidates = await raceCreateIssueDuplicateCandidateLookup((async () => {
         const canReadCompanyScope = await actorCanReadCompanyScope(req, companyId);
-        return findCreateIssueDuplicateCandidates(db, companyId, {
+        return (opts.createIssueDuplicateCandidateLookup ?? findCreateIssueDuplicateCandidates)(db, companyId, {
           id: issue.id,
           identifier: issue.identifier,
           title: issue.title,
           description: issue.description,
-        }, canReadCompanyScope ? undefined : (rows) => filterIssuesForActor(req, rows));
+        }, opts.createIssueDuplicateCandidateCorpusFilter
+          ?? (canReadCompanyScope ? undefined : (rows) => filterIssuesForActor(req, rows)));
       })());
     } catch (err) {
       logger.warn(
@@ -8948,21 +8965,28 @@ export function issueRoutes(
     });
 
     if (duplicateCandidates.length > 0) {
-      await logActivity(db, {
-        companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        agentApiKeyId: actor.agentApiKeyId,
-        action: "issue.duplicate_candidates_shown",
-        entityType: "company",
-        entityId: companyId,
-        details: {
-          identifier: issue.identifier,
-          duplicateCandidates: duplicateCandidates.map(({ identifier, score }) => ({ identifier, score })),
-        },
-      });
+      try {
+        await (opts.createIssueDuplicateCandidateActivityWriter ?? logActivity)(db, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.duplicate_candidates_shown",
+          entityType: "company",
+          entityId: companyId,
+          details: {
+            identifier: issue.identifier,
+            duplicateCandidates: duplicateCandidates.map(({ identifier, score }) => ({ identifier, score })),
+          },
+        });
+      } catch (err) {
+        logger.warn(
+          { err, companyId, issueId: issue.id, issueIdentifier: issue.identifier },
+          "issue duplicate candidate consumption event failed; continuing successful create",
+        );
+      }
     }
 
     if (executionPolicy?.monitor) {
