@@ -232,6 +232,10 @@ function coerceDate(value: Date | string | null | undefined) {
   return value instanceof Date ? value : new Date(value);
 }
 
+function isTerminalIssueStatus(status: string | null | undefined) {
+  return status === "done" || status === "cancelled";
+}
+
 function deliberateFutureMonitor(issue: IssueRow, now: Date) {
   const monitorNextCheckAt = coerceDate(issue.monitorNextCheckAt);
   const monitorScheduledBy = issue.monitorScheduledBy;
@@ -490,7 +494,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // BLO-6243: a source that has reached a terminal status (done/cancelled) — including via
     // a race between candidate selection and this recheck — is a post-terminal sweep artifact,
     // not a work-stoppage signal. Surface it distinctly so the caller can suppress + audit it.
-    const terminal = status === "done" || status === "cancelled";
+    const terminal = isTerminalIssueStatus(status);
     return { reviewable, terminal, status };
   }
 
@@ -829,7 +833,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     logger.info(details, "productivity review long_active_duration suppressed by scheduled monitor");
   }
 
-  async function closeOpenSuppressedMonitorReviews(now: Date, companyId?: string) {
+  /**
+   * BLO-20549: sweep already-open productivity reviews and retire the ones whose alarm no longer
+   * stands. This is the only place that can retire them — the reconcile candidate query scans
+   * `todo`/`in_progress` sources only, so once a source reaches a terminal status it drops out of
+   * the loop and `evaluateSourceReviewability` never sees it again. A review created while its
+   * source was still active would otherwise stay open forever, costing a manager run to triage.
+   */
+  async function closeOpenSuppressedReviews(now: Date, companyId?: string) {
     const reviewRows = await db
       .select()
       .from(issues)
@@ -876,22 +887,50 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       }
     }
 
-    let closed = 0;
+    let closedMonitorScheduled = 0;
+    let closedTerminalSource = 0;
     for (const review of reviewRows) {
       if (!review.originId) continue;
-      const trigger = reviewTriggerById.get(review.id);
-      if (trigger !== "long_active_duration") continue;
       const sourceIssue = sourceIssueById.get(review.originId) ?? null;
       if (!sourceIssue) continue;
       if (sourceIssue.companyId !== review.companyId) continue;
-      // Deliberately monitor-only. An approval gate suppresses *new* reviews but never closes one
-      // that already fired: the approval that would justify the close is creatable by the very
-      // agent under review (`POST /companies/:companyId/approvals` resolves `requestedByAgentId`
-      // from an agent actor and hard-codes `status: "pending"`), so honouring it here would let a
-      // flagged agent retire its own oversight artifact. A monitor is set by the assignee or the
-      // board through a server-owned column and self-expires, which is why it keeps this path.
-      const monitor = deliberateFutureMonitor(sourceIssue, now);
-      if (!monitor) continue;
+      const trigger = reviewTriggerById.get(review.id);
+
+      let suppressedBy: "terminal_source" | "monitor_scheduled" | null = null;
+      let suppressionDetails: Record<string, unknown> = {};
+      // A terminal source outranks the monitor attribution: it retires the review outright,
+      // whereas a future monitor only defers the one alarm that reads elapsed time. Applies to
+      // every trigger — all three measure in-flight behaviour, so a finished episode moots them
+      // all — and deliberately does not require a known trigger, so a review whose creation entry
+      // has aged out of the activity log is still swept on source status alone.
+      //
+      // This does close a review that already fired, which the approval gate below is barred from
+      // doing, because the two are not the same kind of claim. A `pending` approval is free for
+      // the reviewed agent to mint and commits it to nothing. Terminating the source issue costs
+      // the agent the work item itself: it cannot both keep working the issue and silence the
+      // review, `done` is subject to terminal-status hygiene, and `cancelled` abandons the work.
+      // The close is audit-only in the BLO-6243 sense — the activity-log entry keeps an
+      // attributed, permanently observable trace of which source status retired the review.
+      if (isTerminalIssueStatus(sourceIssue.status)) {
+        suppressedBy = "terminal_source";
+        suppressionDetails = { sourceStatus: sourceIssue.status };
+      } else if (trigger === "long_active_duration") {
+        // Deliberately monitor-only. An approval gate suppresses *new* reviews but never closes one
+        // that already fired: the approval that would justify the close is creatable by the very
+        // agent under review (`POST /companies/:companyId/approvals` resolves `requestedByAgentId`
+        // from an agent actor and hard-codes `status: "pending"`), so honouring it here would let a
+        // flagged agent retire its own oversight artifact. A monitor is set by the assignee or the
+        // board through a server-owned column and self-expires, which is why it keeps this path.
+        const monitor = deliberateFutureMonitor(sourceIssue, now);
+        if (monitor) {
+          suppressedBy = "monitor_scheduled";
+          suppressionDetails = {
+            monitorNextCheckAt: monitor.monitorNextCheckAt.toISOString(),
+            monitorScheduledBy: monitor.monitorScheduledBy,
+          };
+        }
+      }
+      if (!suppressedBy) continue;
 
       await db
         .update(issues)
@@ -908,15 +947,15 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         details: {
           source: "productivity_review.reconcile",
           sourceIssueId: sourceIssue.id,
-          trigger: "long_active_duration",
-          suppressedBy: "monitor_scheduled",
-          monitorNextCheckAt: monitor.monitorNextCheckAt.toISOString(),
-          monitorScheduledBy: monitor.monitorScheduledBy,
+          trigger: trigger ?? null,
+          suppressedBy,
+          ...suppressionDetails,
         },
       });
-      closed += 1;
+      if (suppressedBy === "terminal_source") closedTerminalSource += 1;
+      else closedMonitorScheduled += 1;
     }
-    return closed;
+    return { monitorScheduled: closedMonitorScheduled, terminalSource: closedTerminalSource };
   }
 
   async function countIssueRunsSince(companyId: string, agentId: string, issueId: string, since: Date) {
@@ -1075,7 +1114,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     //
     // The suppression is deliberately bounded and forward-only: it lapses once the approval ages
     // past `approvalGateMaxAgeMs`, and it never closes a review that already fired (see
-    // `closeOpenSuppressedMonitorReviews`). Both limits exist because the reviewed agent can
+    // `closeOpenSuppressedReviews`). Both limits exist because the reviewed agent can
     // create the approval itself, so the gate delays oversight at most one window and cannot
     // erase it.
     if (trigger === "long_active_duration") {
@@ -1647,6 +1686,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       monitorScheduledSuppressed: 0,
       approvalGatedSuppressed: 0,
       closedSuppressedMonitorReviews: 0,
+      closedTerminalSourceReviews: 0,
       creationCapped: 0,
       noActionSuppressed: 0,
       skipped: 0,
@@ -1656,7 +1696,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       failedIssueIds: [] as string[],
     };
 
-    result.closedSuppressedMonitorReviews = await closeOpenSuppressedMonitorReviews(now, opts?.companyId);
+    const closedSuppressed = await closeOpenSuppressedReviews(now, opts?.companyId);
+    result.closedSuppressedMonitorReviews = closedSuppressed.monitorScheduled;
+    result.closedTerminalSourceReviews = closedSuppressed.terminalSource;
 
     const prefixCache = new Map<string, string>();
     for (const candidate of candidates) {
