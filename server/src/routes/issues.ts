@@ -1747,7 +1747,13 @@ function isCurrentIssueExecutionRun(
   if (req.actor.type !== "agent") return false;
   const runId = req.actor.runId;
   if (!runId) return false;
-  return issue.checkoutRunId === runId || issue.executionRunId === runId;
+  const ownsCheckout = issue.checkoutRunId === runId;
+  const ownsExecution = issue.executionRunId === runId;
+  return (
+    (ownsCheckout || ownsExecution) &&
+    (issue.checkoutRunId == null || ownsCheckout) &&
+    (issue.executionRunId == null || ownsExecution)
+  );
 }
 
 function summarizeIssueMonitor(
