@@ -42,20 +42,25 @@ export function approvalService(db: Db) {
     return existing;
   }
 
-  // Lenient half of the binding lookup: resolves the bound agent only while it is
-  // still a pending hire in the approval's own company, and reports "nothing to
-  // clean up" as null rather than as an error.
+  function payloadAgentId(approval: ApprovalRecord) {
+    return typeof approval.payload.agentId === "string" ? approval.payload.agentId : null;
+  }
+
+  // Lenient half of the binding lookup: resolves the bound or legacy payload
+  // agent only while it is still a pending hire in the approval's own company,
+  // and reports "nothing to clean up" as null rather than as an error.
   async function findBoundPendingAgent(
     approval: ApprovalRecord,
     dbOrTx: Db = db,
   ) {
-    if (!approval.linkedAgentId) return null;
+    const agentId = approval.linkedAgentId ?? payloadAgentId(approval);
+    if (!agentId) return null;
     return dbOrTx
       .select({ id: agents.id })
       .from(agents)
       .where(
         and(
-          eq(agents.id, approval.linkedAgentId),
+          eq(agents.id, agentId),
           eq(agents.companyId, approval.companyId),
           eq(agents.status, "pending_approval"),
         ),
@@ -69,12 +74,12 @@ export function approvalService(db: Db) {
     approval: ApprovalRecord,
     dbOrTx: Db = db,
   ) {
-    const payloadAgentId = typeof approval.payload.agentId === "string" ? approval.payload.agentId : null;
+    const legacyPayloadAgentId = payloadAgentId(approval);
     if (!approval.linkedAgentId) {
-      if (!payloadAgentId) return null;
+      if (!legacyPayloadAgentId) return null;
       throw conflict("Hire approval is not bound to a pending agent", { approvalId: approval.id });
     }
-    if (payloadAgentId !== approval.linkedAgentId) {
+    if (legacyPayloadAgentId !== approval.linkedAgentId) {
       throw conflict("Hire approval is not bound to a pending agent", { approvalId: approval.id });
     }
     const boundAgent = await findBoundPendingAgent(approval, dbOrTx);
@@ -176,11 +181,13 @@ export function approvalService(db: Db) {
       const now = new Date();
       if (applied && updated.type === "hire_agent") {
         const payload = updated.payload as Record<string, unknown>;
-        if (updated.linkedAgentId) {
-          await agentsSvc.activatePendingApproval(updated.linkedAgentId, payload);
+        const boundPendingAgent = await findBoundPendingAgent(updated);
+        const hasExplicitAgentBinding = Boolean(updated.linkedAgentId ?? payloadAgentId(updated));
+        if (boundPendingAgent) {
+          const activation = await agentsSvc.activatePendingApproval(boundPendingAgent.id, payload);
           await reconcileApprovedBuiltInAgent(updated.companyId, payload);
-          hireApprovedAgentId = updated.linkedAgentId;
-        } else {
+          hireApprovedAgentId = activation?.agent.id ?? boundPendingAgent.id;
+        } else if (!hasExplicitAgentBinding) {
           const created = await agentsSvc.create(updated.companyId, {
             name: String(payload.name ?? "New Agent"),
             role: String(payload.role ?? "general"),
