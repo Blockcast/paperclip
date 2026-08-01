@@ -18,6 +18,7 @@ import {
   issueComments,
   issueRecoveryActions,
   issues,
+  issueWorkProducts,
 } from "@paperclipai/db";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import {
@@ -1393,6 +1394,151 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(1);
     expect(runs[0]?.status).toBe("queued");
+  });
+
+  // BLO-19566 AC4. Before this, nothing wrote a `pull_request` work product,
+  // so productivity/liveness accounting -- whose own verdict criteria ask for
+  // "a non-stale PR/MR link in the source issue's evidence" -- could never find
+  // one, and an assignee pushing commits to an open PR read as zero progress.
+  describe("pull_request work products", () => {
+    function prPayload(opts: {
+      action: string;
+      identifier: string;
+      number?: number;
+      title?: string | null;
+      draft?: boolean;
+      merged?: boolean;
+      headSha?: string;
+    }) {
+      return {
+        action: opts.action,
+        pull_request: {
+          number: opts.number ?? 4242,
+          title: opts.title === undefined ? `Fix ${opts.identifier}` : opts.title,
+          body: null,
+          html_url: `https://github.com/Blockcast/paperclip/pull/${opts.number ?? 4242}`,
+          draft: opts.draft ?? false,
+          merged: opts.merged ?? false,
+          head: { ref: `fix/${opts.identifier.toLowerCase()}`, sha: opts.headSha ?? "head-one" },
+        },
+        repository: { full_name: "Blockcast/paperclip" },
+      };
+    }
+
+    async function postPr(
+      app: express.Express,
+      payload: Record<string, unknown>,
+      deliveryId: string,
+    ) {
+      const { body, signature } = signedRequest(payload);
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", deliveryId)
+        .set("content-type", "application/json")
+        .send(body);
+    }
+
+    it("creates a pull_request work product on the referenced issue", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40001");
+      const app = buildApp();
+
+      const res = await postPr(app, prPayload({ action: "opened", identifier: "BLO-40001" }), "wp-opened");
+      expect(res.status).toBe(200);
+
+      const rows = await db
+        .select()
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#4242",
+        url: "https://github.com/Blockcast/paperclip/pull/4242",
+        status: "ready_for_review",
+        title: "Fix BLO-40001",
+      });
+    });
+
+    it("updates the same row on a later push instead of appending one per event", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40002");
+      const app = buildApp();
+
+      await postPr(app, prPayload({ action: "opened", identifier: "BLO-40002", number: 4243 }), "wp-seq-1");
+      const afterOpen = await db
+        .select({ id: issueWorkProducts.id, updatedAt: issueWorkProducts.updatedAt })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(afterOpen).toHaveLength(1);
+
+      await postPr(
+        app,
+        prPayload({ action: "synchronize", identifier: "BLO-40002", number: 4243, headSha: "head-two" }),
+        "wp-seq-2",
+      );
+
+      const afterPush = await db
+        .select()
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      // One PR, one row -- the identity excludes the head SHA on purpose.
+      expect(afterPush).toHaveLength(1);
+      expect(afterPush[0]?.id).toBe(afterOpen[0]?.id);
+      expect(afterPush[0]?.metadata).toMatchObject({ headSha: "head-two", lastEventAction: "synchronize" });
+      // updatedAt is what liveness reads as "the PR moved"; it must advance.
+      expect(afterPush[0]!.updatedAt.getTime()).toBeGreaterThanOrEqual(afterOpen[0]!.updatedAt.getTime());
+    });
+
+    it("records the terminal state when the PR merges", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40003");
+      const app = buildApp();
+
+      await postPr(app, prPayload({ action: "opened", identifier: "BLO-40003", number: 4244 }), "wp-merge-1");
+      await postPr(
+        app,
+        prPayload({ action: "closed", identifier: "BLO-40003", number: 4244, merged: true }),
+        "wp-merge-2",
+      );
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("merged");
+    });
+
+    it("records a draft PR as draft rather than ready_for_review", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40004");
+      const app = buildApp();
+
+      await postPr(
+        app,
+        prPayload({ action: "opened", identifier: "BLO-40004", number: 4245, draft: true }),
+        "wp-draft",
+      );
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows[0]?.status).toBe("draft");
+    });
+
+    it("writes a row for an unassigned issue (evidence about the PR, not a wake)", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40005", { assignee: false });
+      const app = buildApp();
+
+      await postPr(app, prPayload({ action: "opened", identifier: "BLO-40005", number: 4246 }), "wp-unassigned");
+
+      const rows = await db
+        .select({ id: issueWorkProducts.id })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+    });
   });
 
   it("does not coalesce reviewer PR wakes into a thin null-scope automation run (BLO-7457)", async () => {

@@ -59,6 +59,8 @@ import {
   enrichAuthoredLocForRow,
   type RecordMergedPullRequestInput,
 } from "../services/issue-pull-requests.js";
+import { workProductService } from "../services/work-products.js";
+import { buildPullRequestWorkProductFields } from "../services/pull-request-work-products.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
@@ -504,6 +506,10 @@ interface ResolvedEventContext {
   prDeletions?: number | null;
   prBranch?: string | null;
   prBody?: string | null;
+  // pull_request events only. The raw GitHub `action`, retained so the
+  // work-product upsert (BLO-19566) can describe the PR's state without
+  // reverse-mapping it out of wakeReason.
+  prAction?: string | null;
 }
 
 // Cap review body in contextSnapshot so the heartbeat-run row stays small.
@@ -847,6 +853,7 @@ function resolveEventContext(
         prDeletions: typeof pr?.deletions === "number" ? (pr.deletions as number) : null,
         prBranch: (head?.ref as string | undefined) ?? null,
         prBody: (pr?.body as string | undefined) ?? null,
+        prAction: action,
       };
     }
     default:
@@ -2378,6 +2385,67 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     }
 
+    // PR work-product upsert (BLO-19566 AC4). Liveness/productivity accounting
+    // is blind to PR progress unless the issue carries a first-class
+    // `pull_request` work product: the productivity reviewer's own verdict
+    // criteria ask for "a non-stale PR/MR link in the source issue's evidence",
+    // and nothing was ever writing one. An agent shipping commits to an open PR
+    // therefore read as zero progress (BLO-19541 misfired on exactly this).
+    //
+    // Runs for every PR event and every matched issue, including terminal and
+    // unassigned ones -- the row is evidence about the PR, not a wake. Keyed on
+    // repo#number so pushes update one row per issue instead of appending.
+    // Best-effort: a persist failure must never break the wake path, mirroring
+    // the merged-PR forward-capture above.
+    let workProductsUpserted = 0;
+    if (
+      eventName === "pull_request" &&
+      context.prNumber !== null &&
+      context.repoFullName &&
+      matched.length > 0
+    ) {
+      const fields = buildPullRequestWorkProductFields({
+        repoFullName: context.repoFullName,
+        prNumber: context.prNumber,
+        prTitle: context.prTitle ?? null,
+        prUrl: context.prUrl ?? null,
+        headSha: context.headSha ?? null,
+        prBranch: context.prBranch ?? null,
+        prDraft: context.prDraft,
+        prMerged: context.prMerged,
+        prMergedAt: context.prMergedAt ?? null,
+        action: context.prAction ?? "",
+      });
+      const workProducts = workProductService(db);
+      for (const issue of matched) {
+        try {
+          await workProducts.upsertByExternalId(
+            issue.id,
+            issue.companyId,
+            { provider: "github", type: "pull_request", externalId: fields.externalId },
+            {
+              title: fields.title,
+              url: fields.url,
+              status: fields.status,
+              metadata: fields.metadata,
+            },
+          );
+          workProductsUpserted += 1;
+        } catch (err) {
+          logger.error(
+            {
+              err,
+              issueId: issue.id,
+              identifier: issue.identifier,
+              prNumber: context.prNumber,
+              repoFullName: context.repoFullName,
+            },
+            "pull_request work product upsert failed",
+          );
+        }
+      }
+    }
+
     // PR→issue back-link (BLO-13353, #973 symptom-1). On PR open/reopen, post a
     // one-time comment linking the PR to its Paperclip issue(s) so a human
     // reading the PR can navigate back. Best-effort and idempotent: a hidden
@@ -2435,7 +2503,6 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       });
       return;
     }
-
     const heartbeat = heartbeatService(db, {
       pluginWorkerManager: config.pluginWorkerManager,
       ...config.heartbeatOptions,
@@ -2717,6 +2784,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       skipped,
       reopened,
       reviewerRunsCancelled,
+      ...(workProductsUpserted > 0 ? { workProductsUpserted } : {}),
       ...(backLinked.length ? { backLinked } : {}),
       ...(escalated.length ? { escalated } : {}),
     });

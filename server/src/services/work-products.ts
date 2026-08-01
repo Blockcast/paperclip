@@ -1,4 +1,4 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, isNotNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueWorkProducts } from "@paperclipai/db";
 import type { IssueWorkProduct } from "@paperclipai/shared";
@@ -75,6 +75,65 @@ export function workProductService(db: Db) {
           .returning()
           .then((rows) => rows[0] ?? null);
       });
+      return row ? toIssueWorkProduct(row) : null;
+    },
+
+    /**
+     * Insert-or-update a work product that has a stable external identity
+     * (BLO-19566). Used by the GitHub webhook, where one PR emits many events
+     * (opened, synchronize, ready_for_review, closed) that must converge on a
+     * single row rather than appending one per delivery.
+     *
+     * Atomic via the partial unique index on
+     * (company_id, issue_id, provider, type, external_id) -- a plain
+     * select-then-insert has no row to lock before the first insert, so two
+     * concurrent `synchronize` deliveries would both miss and both insert.
+     *
+     * `insertOnly` fields are applied when the row is created and preserved on
+     * update, so first-seen provenance (createdByRunId, isPrimary) is not
+     * rewritten by later events.
+     */
+    upsertByExternalId: async (
+      issueId: string,
+      companyId: string,
+      key: { provider: string; type: string; externalId: string },
+      data: Omit<
+        typeof issueWorkProducts.$inferInsert,
+        "issueId" | "companyId" | "provider" | "type" | "externalId"
+      >,
+    ) => {
+      const now = new Date();
+      const row = await db
+        .insert(issueWorkProducts)
+        .values({
+          ...data,
+          companyId,
+          issueId,
+          provider: key.provider,
+          type: key.type,
+          externalId: key.externalId,
+          updatedAt: now,
+        })
+        .onConflictDoUpdate({
+          target: [
+            issueWorkProducts.companyId,
+            issueWorkProducts.issueId,
+            issueWorkProducts.provider,
+            issueWorkProducts.type,
+            issueWorkProducts.externalId,
+          ],
+          targetWhere: isNotNull(issueWorkProducts.externalId),
+          set: {
+            title: data.title,
+            url: data.url,
+            status: data.status,
+            summary: data.summary,
+            metadata: data.metadata,
+            updatedAt: now,
+          },
+        })
+        .returning()
+        .then((rows) => rows[0] ?? null);
       return row ? toIssueWorkProduct(row) : null;
     },
 

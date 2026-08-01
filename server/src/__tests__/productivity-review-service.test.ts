@@ -10,6 +10,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueRelations,
+  issueWorkProducts,
   issues,
 } from "@paperclipai/db";
 import {
@@ -273,6 +274,102 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment completed-run streak: 10");
 
     expect(await listRefreshComments(reviews[0]!.id)).toHaveLength(0);
+  });
+
+  // BLO-19566 AC4. The productivity reviewer's verdict criteria ask for "a
+  // non-stale PR/MR link in the source issue's evidence", but collectEvidence
+  // never queried one, so an assignee pushing commits to an open PR produced an
+  // evidence pack indistinguishable from an idle issue. BLO-19541 misfired on
+  // exactly this: it reported "0/6h runs, none recorded" while PR #806 had
+  // commits from that same morning.
+  describe("pull-request evidence (BLO-19566)", () => {
+    async function seedIssueWithPullRequest(opts: { prUpdatedAt: Date; status?: string }) {
+      const seeded = await seedAssignedIssue();
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#806",
+        title: "Widen the authz grant",
+        url: "https://github.com/Blockcast/paperclip/pull/806",
+        status: opts.status ?? "ready_for_review",
+        createdAt: opts.prUpdatedAt,
+        updatedAt: opts.prUpdatedAt,
+      });
+      return seeded;
+    }
+
+    it("surfaces a recently-pushed PR instead of reporting zero progress signal", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      // Pushed 2h ago -- inside the 6h window the AC names.
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const reviews = await listProductivityReviews(seeded.companyId);
+      expect(reviews).toHaveLength(1);
+      const description = reviews[0]?.description ?? "";
+      // The regression this guards: the line used to be absent entirely.
+      expect(description).toContain("Linked pull request:");
+      expect(description).toContain("https://github.com/Blockcast/paperclip/pull/806");
+      expect(description).toContain("non-stale");
+      expect(description).not.toContain("Linked pull request: none recorded");
+      // And the manager is told the PR satisfies the second verdict criterion,
+      // so a live PR is not read as "no concrete progress signal".
+      expect(description).toContain("The second signal is already present");
+    });
+
+    it("marks a PR that has not moved in over 24h as stale", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 30 * 60 * 60 * 1000),
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request:");
+      expect(description).toContain("stale");
+      // A stale PR must NOT be advertised as satisfying the verdict criterion.
+      expect(description).not.toContain("The second signal is already present");
+    });
+
+    it("still reports none recorded when the issue genuinely has no PR", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request: none recorded");
+    });
   });
 
   // BLO-19094: an open review grants its assignee issue:comment/issue:mutate on

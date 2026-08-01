@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -543,6 +543,161 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .then((rows) => rows[0]);
     expect(row?.executionRunId).toBe(queuedRunId);
     expect(row?.executionLockedAt?.getTime()).toBe(refreshedLockedAt.getTime());
+  });
+
+  // Ally's review suggestion on #905 (BLO-19566). The widened same-run checkout
+  // allowance decides eligibility from a snapshot read during the scan, so the
+  // holder's run status can change before the compare-and-swap lands. The CAS
+  // re-checks the three lock columns but NOT the run's status, which is
+  // deliberate — pin the resulting contract so a future change to either side
+  // has to state its intent.
+  //
+  // Why clearing is still safe when the holder starts mid-sweep: a claim that
+  // actually starts a run goes through claimQueuedRun, which re-stamps
+  // executionLockedAt and therefore loses the CAS (covered by the
+  // "claim refreshes executionLockedAt after scan" test above). The window
+  // exercised here is the narrower one where only the run row moves. The
+  // resulting shape — a live run whose issue holds no lock — is the same one
+  // enqueueProcessLossRetry and the orphan reaper produce on purpose: the run
+  // is left alone and re-acquires the lock on its next checkout.
+  it("clears the lock but leaves the run intact when the holder starts after the scan (BLO-19566)", async () => {
+    const { companyId, agentId, queuedRunId } = await seed();
+    const issueId = randomUUID();
+    const staleLockedAt = new Date(Date.now() - 7 * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Same-run pre-claim holder that starts mid-sweep",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      checkoutRunId: queuedRunId,
+      executionRunId: queuedRunId,
+      executionLockedAt: staleLockedAt,
+    });
+
+    const heartbeat = heartbeatService(db);
+    let sweepPromise: ReturnType<typeof heartbeat.sweepStaleIssueLocks> | null = null;
+
+    // Hold the issue row so the sweep parks on the CAS after it has scanned,
+    // then flip the holder queued -> running inside that window.
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select id from issues where id = ${issueId} for update`);
+      sweepPromise = heartbeat.sweepStaleIssueLocks();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "running", startedAt: new Date() })
+        .where(eq(heartbeatRuns.id, queuedRunId));
+    });
+
+    expect(sweepPromise).not.toBeNull();
+    const result = await sweepPromise!;
+
+    // The lock clears: the run row moved but the issue row did not, so the CAS
+    // still matches the scanned snapshot.
+    expect(result.cleared).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    // The load-bearing half of the contract — the sweep is non-destructive. A
+    // run that just started is never cancelled or failed by lock recovery.
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRunId))
+      .then((rows) => rows[0]);
+    expect(run?.status).toBe("running");
+
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        status: issues.status,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: null, executionRunId: null, status: "in_progress" });
+  });
+
+  it("does not double-dispatch a deferred wake when the holder starts after the scan (BLO-19566)", async () => {
+    // Same race, but with a deferred issue wake queued behind the lock. The
+    // concern is a second run being dispatched for an issue whose original
+    // holder just went live. Exactly one wake must leave `deferred_issue_execution`.
+    const { companyId, agentId, queuedRunId } = await seed();
+    const issueId = randomUUID();
+    const deferredWakeId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Same-run pre-claim holder with a deferred wake behind it",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      checkoutRunId: queuedRunId,
+      executionRunId: queuedRunId,
+      executionLockedAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId,
+        _paperclipWakeContext: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_comment_followup",
+        },
+      },
+      status: "deferred_issue_execution",
+    });
+
+    const heartbeat = heartbeatService(db);
+    let sweepPromise: ReturnType<typeof heartbeat.sweepStaleIssueLocks> | null = null;
+
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select id from issues where id = ${issueId} for update`);
+      sweepPromise = heartbeat.sweepStaleIssueLocks();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "running", startedAt: new Date() })
+        .where(eq(heartbeatRuns.id, queuedRunId));
+    });
+
+    expect(sweepPromise).not.toBeNull();
+    const result = await sweepPromise!;
+    expect(result.cleared).toBe(1);
+
+    // The started holder is untouched.
+    const holder = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRunId))
+      .then((rows) => rows[0]);
+    expect(holder?.status).toBe("running");
+
+    // The deferred wake is promoted at most once — no fan-out from the race.
+    const stillDeferred = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ));
+    expect(stillDeferred).toHaveLength(0);
+
+    const promoted = await db
+      .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeId))
+      .then((rows) => rows[0]);
+    expect(promoted?.status).not.toBe("deferred_issue_execution");
   });
 
   it("promotes the oldest eligible deferred issue wake after clearing an expired pre-claim lock", async () => {
