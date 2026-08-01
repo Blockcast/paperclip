@@ -3307,6 +3307,91 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         transitionClass: input.transitionClass ?? "manual",
       },
     });
+    if (fromStage.id !== toStage.id) {
+      const stageAutomationLinks = await tx
+        .select({
+          linkId: pipelineCaseIssueLinks.id,
+          issueId: issues.id,
+          issueStatus: issues.status,
+          issueOriginKind: issues.originKind,
+          issueOriginId: issues.originId,
+          issueOriginRunId: issues.originRunId,
+          routineId: pipelineAutomationExecutions.routineId,
+        })
+        .from(pipelineCaseIssueLinks)
+        .innerJoin(
+          pipelineAutomationExecutions,
+          and(
+            eq(pipelineCaseIssueLinks.automationAttemptId, pipelineAutomationExecutions.id),
+            eq(pipelineCaseIssueLinks.issueId, pipelineAutomationExecutions.executionIssueId),
+          ),
+        )
+        .innerJoin(pipelineCaseEvents, eq(pipelineAutomationExecutions.triggeringEventId, pipelineCaseEvents.id))
+        .innerJoin(issues, eq(pipelineCaseIssueLinks.issueId, issues.id))
+        .where(and(
+          eq(pipelineCaseIssueLinks.companyId, input.companyId),
+          eq(pipelineCaseIssueLinks.caseId, current.id),
+          eq(pipelineCaseIssueLinks.role, "automation"),
+          isNull(pipelineCaseIssueLinks.retiredAt),
+          eq(pipelineCaseEvents.toStageId, fromStage.id),
+        ));
+      const now = nowDate();
+      for (const row of stageAutomationLinks) {
+        if (
+          !["done", "cancelled"].includes(row.issueStatus) &&
+          row.issueOriginKind === "routine_execution" &&
+          row.issueOriginId === row.routineId &&
+          row.issueOriginRunId
+        ) {
+          const [cancelledIssue] = await tx
+            .update(issues)
+            .set({
+              status: "cancelled",
+              cancelledAt: now,
+              completedAt: null,
+              checkoutRunId: null,
+              executionRunId: null,
+              executionAgentNameKey: null,
+              executionLockedAt: null,
+              updatedAt: now,
+            })
+            .where(and(
+              eq(issues.id, row.issueId),
+              eq(issues.companyId, input.companyId),
+              eq(issues.status, row.issueStatus),
+              eq(issues.originKind, "routine_execution"),
+              eq(issues.originId, row.routineId),
+              eq(issues.originRunId, row.issueOriginRunId),
+            ))
+            .returning({
+              id: issues.id,
+              companyId: issues.companyId,
+              identifier: issues.identifier,
+              title: issues.title,
+              status: issues.status,
+            });
+          if (cancelledIssue) {
+            await tx.insert(issueComments).values({
+              companyId: input.companyId,
+              issueId: cancelledIssue.id,
+              authorType: "system",
+              body: `Pipeline case "${current.title}" (${current.caseKey}) left stage "${fromStage.name}". This stage-entry automation issue was cancelled because its work is no longer current.`,
+            });
+            await finalizeSummarySlotsForTerminalIssue(tx, {
+              ...cancelledIssue,
+              status: "cancelled",
+            });
+          }
+        }
+        await tx
+          .update(pipelineCaseIssueLinks)
+          .set({ retiredAt: now, retiredReason: "stage_exited", updatedAt: now })
+          .where(and(
+            eq(pipelineCaseIssueLinks.id, row.linkId),
+            isNull(pipelineCaseIssueLinks.retiredAt),
+          ));
+      }
+    }
     if (forcedTransition) {
       await writeCaseEvent(tx, {
         companyId: input.companyId,
