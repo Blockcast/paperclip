@@ -168,6 +168,8 @@ import {
 } from "./issue-rewake-throttle.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
 import { githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
+import { loadConfig } from "../config.js";
+import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
 import {
   ensureReferencedSharedDocsMaterialized,
   normalizeInstructionsEntryFile,
@@ -6031,6 +6033,89 @@ function normalizeInteractionContinuationWakeContext(
   clearInteractionContinuationWakeContext(contextSnapshot);
 }
 
+// BLO-19118: the GitHub PR block describes ONE pull request. It is not a bag of
+// independent fields — `githubPrReviewBody` only means anything alongside the
+// `githubPrNumber`/`githubHeadSha` it arrived with. Coalescing merges snapshots
+// field-by-field, so any key the incoming wake does not re-supply survives from
+// the previous one; for two wakes about *different* PRs that silently welds one
+// PR's review onto another PR's identity.
+//
+// That is not hypothetical: a wake is routed to an issue by the BLO- refs in the
+// PR body, so two PRs that both mention BLO-x resolve to the same issue, hence
+// the same coalescing task key. Observed 2026-07-30 — a `ready_for_review` for
+// #837 inherited #824's review body (head bfc470e, a different branch entirely)
+// because `ready_for_review` carries no review fields of its own. The agent is
+// then told "the findings are on YOUR pull request" about a review of someone
+// else's diff.
+const GITHUB_PR_CONTEXT_KEYS = [
+  "githubPrNumber",
+  "githubRepoFullName",
+  "githubPrTitle",
+  "githubPrUrl",
+  "githubEventUrl",
+  "githubHeadSha",
+  "githubEvent",
+  "githubDeliveryId",
+  "githubCommentId",
+  "githubCommentUrl",
+  "githubReviewUrl",
+  "githubReviewFeedbackCommentId",
+  "githubPrAuthorLogin",
+  "githubPaperclipIdentifiers",
+  "githubPrReviewBody",
+  "githubPrReviewState",
+  "githubPrReviewAuthorLogin",
+  "githubPrReviewRequestBody",
+  "githubPrReviewRequestAuthorLogin",
+  "githubReviewFeedbackActionable",
+  "prRole",
+  "reviewKind",
+] as const;
+
+function readGithubPrIdentity(contextSnapshot: Record<string, unknown>) {
+  const raw = contextSnapshot.githubPrNumber;
+  const prNumber =
+    typeof raw === "number" && Number.isFinite(raw)
+      ? raw
+      : typeof raw === "string" && raw.trim().length > 0 && Number.isFinite(Number(raw))
+        ? Number(raw)
+        : null;
+  if (prNumber === null) return null;
+  return `${readNonEmptyString(contextSnapshot.githubRepoFullName) ?? "unknown-repo"}#${prNumber}`;
+}
+
+function readGithubPrScopedWakeCommentIds(contextSnapshot: Record<string, unknown>) {
+  const ids = new Set<string>();
+  const githubCommentId = readNonEmptyString(contextSnapshot.githubCommentId);
+  if (githubCommentId) ids.add(githubCommentId);
+  const reviewFeedbackCommentId = readNonEmptyString(contextSnapshot.githubReviewFeedbackCommentId);
+  if (reviewFeedbackCommentId) ids.add(reviewFeedbackCommentId);
+
+  const paperclipWake = parseObject(contextSnapshot[PAPERCLIP_WAKE_PAYLOAD_KEY]);
+  const comments = Array.isArray(paperclipWake.comments) ? paperclipWake.comments : [];
+  const identity = readGithubPrIdentity(contextSnapshot);
+  for (const rawComment of comments) {
+    const comment = parseObject(rawComment);
+    const metadata = parseObject(comment.metadata);
+    if (readNonEmptyString(metadata.kind) !== "github_pr_review_feedback") continue;
+    const metadataIdentity = readGithubPrIdentity({
+      githubRepoFullName: metadata.repoFullName,
+      githubPrNumber: metadata.prNumber,
+    });
+    if (identity !== null && metadataIdentity !== null && metadataIdentity !== identity) continue;
+    const commentId = readNonEmptyString(comment.id);
+    if (commentId) ids.add(commentId);
+  }
+
+  return ids;
+}
+
+function preserveNonGithubPrWakeCommentIds(contextSnapshot: Record<string, unknown>) {
+  const githubPrScopedCommentIds = readGithubPrScopedWakeCommentIds(contextSnapshot);
+  if (githubPrScopedCommentIds.size === 0) return extractWakeCommentIds(contextSnapshot);
+  return extractWakeCommentIds(contextSnapshot).filter((commentId) => !githubPrScopedCommentIds.has(commentId));
+}
+
 type AcceptedPlanWakeRoutingDecision = {
   otherActiveClaimIssueId: string;
   otherActiveClaimIdentifier: string | null;
@@ -6093,6 +6178,25 @@ export function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
+  // BLO-19118: when the incoming wake names a different pull request, every
+  // inherited GitHub field describes the wrong artifact. Drop the block as a
+  // unit instead of letting the spread above carry over whichever keys the
+  // incoming wake happens not to re-supply. Keys the incoming wake DID supply
+  // are its own and stay. Same PR — or a non-PR wake, which leaves the block
+  // untouched — keeps the previous behaviour.
+  // NOTE: `parseObject` returns `existingRaw` itself when it is already an
+  // object, so this must edit `merged` (freshly created) and never `existing`.
+  const incomingPrIdentity = readGithubPrIdentity(incoming);
+  const existingPrIdentity = readGithubPrIdentity(existing);
+  const isDifferentGithubPr =
+    incomingPrIdentity !== null &&
+    existingPrIdentity !== null &&
+    incomingPrIdentity !== existingPrIdentity;
+  if (isDifferentGithubPr) {
+    for (const key of GITHUB_PR_CONTEXT_KEYS) {
+      if (!(key in incoming)) delete merged[key];
+    }
+  }
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
   }
@@ -6100,7 +6204,9 @@ export function mergeCoalescedContextSnapshot(
   for (const key of ["issueId", "taskId", "taskKey"] as const) {
     merged[key] = readNonEmptyString(incoming[key]) ?? readNonEmptyString(existing[key]) ?? merged[key];
   }
-  const mergedCommentIds = mergeWakeCommentIds(existing, incoming);
+  const mergedCommentIds = isDifferentGithubPr
+    ? mergeWakeCommentIds(preserveNonGithubPrWakeCommentIds(existing), incoming)
+    : mergeWakeCommentIds(existing, incoming);
   if (mergedCommentIds.length > 0) {
     const latestCommentId = mergedCommentIds[mergedCommentIds.length - 1];
     merged[WAKE_COMMENT_IDS_KEY] = mergedCommentIds;
@@ -6108,6 +6214,11 @@ export function mergeCoalescedContextSnapshot(
     merged.wakeCommentId = latestCommentId;
     // The merged context should carry canonical comment ids; the next wake will
     // regenerate any structured payload from those ids.
+    delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
+  } else if (isDifferentGithubPr) {
+    delete merged[WAKE_COMMENT_IDS_KEY];
+    delete merged.commentId;
+    delete merged.wakeCommentId;
     delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
   }
   if (!hasInteractionContinuationWakeContext(incoming)) {
@@ -6714,6 +6825,39 @@ export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown>
     // before accepting a "skipped as self-review" summary.
     prAuthorLogin: readNonEmptyString(contextSnapshot.githubPrAuthorLogin),
   };
+}
+
+/**
+ * Resolve where to post the "reviewer never finished" commit status for a run
+ * whose bounded retry chain just exhausted, or null when no status should be
+ * written. (BLO-17456)
+ *
+ * A required status context that is never posted renders as "Expected —
+ * waiting for status to be reported" indefinitely: branch protection blocks the
+ * PR and nothing signals the result is never coming. Failing the context turns
+ * that silent wedge into a visible red check. GitHub keeps the latest status
+ * per (sha, context), so a later real result from the context owner overwrites
+ * it — this is not terminal for the PR.
+ *
+ * Returns null unless ALL of the following hold, because a status posted to the
+ * wrong place is worse than one not posted at all:
+ *  - an operator opted in by configuring a context name (this server does not
+ *    own the branch-protection rule, so it must not invent one);
+ *  - the run is a PR-review run (`derivePaperclipPrReview`);
+ *  - the wake carried a repo AND an exact head SHA — statuses are per-commit,
+ *    so a guessed SHA would fail an unrelated commit.
+ */
+export function resolvePrReviewGateStatusTarget(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  gateContext: string,
+): { repoFullName: string; sha: string; context: string; prNumber: number; prUrl: string | null } | null {
+  const context = gateContext.trim();
+  if (!context) return null;
+  const prReview = derivePaperclipPrReview(contextSnapshot);
+  if (!prReview) return null;
+  const { repoFullName, headSha, prNumber, prUrl } = prReview;
+  if (!repoFullName || !headSha) return null;
+  return { repoFullName, sha: headSha, context, prNumber, prUrl: prUrl ?? null };
 }
 
 const PR_REVIEW_OUTPUT_EVIDENCE_MAX_CHARS = 240_000;
@@ -7410,7 +7554,13 @@ export function buildPaperclipTaskMarkdown(input: {
     if (prReview.eventUrl && prReview.eventUrl !== prReview.prUrl) {
       lines.push(`- GitHub event URL: ${quoteTaskScalar(prReview.eventUrl)}`);
     }
-    if (prReview.headSha) lines.push(`- Head SHA: ${quoteTaskScalar(prReview.headSha)}`);
+    // BLO-19118: this is the head GitHub reported when the webhook fired, not
+    // the head now. A wake can sit queued for tens of minutes (observed: 30+),
+    // and the author may push in that window — trusting it verbatim makes the
+    // agent diff a superseded commit. Say so, so the run re-resolves.
+    if (prReview.headSha) {
+      lines.push(`- Head SHA at wake time: ${quoteTaskScalar(prReview.headSha)} (may be superseded — confirm the current head before diffing or checking out)`);
+    }
     if (prReview.event) lines.push(`- GitHub event: ${quoteTaskScalar(prReview.event)}`);
     if (prReview.prRole === "author") {
       const reviewerLabel = prReview.reviewAuthorLogin ?? "A reviewer";
@@ -8205,6 +8355,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }),
     });
     return interaction.id;
+  }
+
+  /**
+   * Queue the configured PR-review gate status failure for a run whose bounded
+   * retry chain just exhausted, so a never-arriving required check stops reading
+   * as "still waiting". The outbox owns evidence re-checks, retry, and final
+   * delivery logging; the heartbeat lifecycle only records that the work was
+   * durably queued. (BLO-17456)
+   */
+  async function queueExhaustedPrReviewGateStatus(
+    run: typeof heartbeatRuns.$inferSelect,
+    contextSnapshot: Record<string, unknown>,
+  ) {
+    const target = resolvePrReviewGateStatusTarget(
+      contextSnapshot,
+      loadConfig().prReviewGateStatusContext,
+    );
+    if (!target) return;
+
+    const delivery = await enqueueGithubCommitStatusDelivery(db, {
+      companyId: run.companyId,
+      sourceRunId: run.id,
+      repoFullName: target.repoFullName,
+      sha: target.sha,
+      context: target.context,
+      state: "failure",
+      description: "Paperclip reviewer run exhausted its automatic retries; no review was posted.",
+      targetUrl: target.prUrl,
+      prNumber: target.prNumber,
+      prUrl: target.prUrl,
+    });
+    await appendRunEvent(run, await nextRunEventSeq(run.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message:
+        delivery.status === "queued" || delivery.status === "processing"
+          ? `Queued PR-review gate status failure delivery for ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)} after retry exhaustion`
+          : `PR-review gate status failure delivery for ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)} is already ${delivery.status}`,
+      payload: {
+        deliveryId: delivery.id,
+        deliveryStatus: delivery.status,
+        statusContext: target.context,
+        repoFullName: target.repoFullName,
+        prNumber: target.prNumber,
+        headSha: target.sha,
+      },
+    });
   }
 
   async function escalatePlanApprovalResumeFailureNeedsAttention(input: {
@@ -12853,6 +13051,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         });
       }
+      // BLO-17456: a PR-review chain that exhausts here leaves its required
+      // status context unposted, so the PR sits on "Expected — waiting for
+      // status" with nothing signalling that no result is coming. Queue a
+      // durable status delivery so stale writes are guarded by a final
+      // GitHub-evidence read and transient GitHub/token failures can retry.
+      // Opt-in and swallowed so status delivery can never alter exhaustion
+      // handling.
+      await queueExhaustedPrReviewGateStatus(run, contextSnapshot).catch((error) => {
+        logger.warn(
+          { err: error, runId: run.id },
+          "failed to queue exhausted PR-review gate status",
+        );
+      });
       return {
         outcome: "retry_exhausted" as const,
         attempt: nextAttempt,
