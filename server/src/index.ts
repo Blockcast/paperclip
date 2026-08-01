@@ -78,6 +78,7 @@ import {
 import { BUNDLED_PLUGIN_PACKAGES } from "./bootstrap/bundled-plugin-packages.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
+import { githubReviewerAppSlug } from "./services/github-app-auth.js";
 import { coordinateHeartbeatSchedulerShutdown } from "./shutdown.js";
 import type {
   InstanceDatabaseBackupRunResult,
@@ -257,6 +258,29 @@ export async function startServer(): Promise<StartedServer> {
   // connection or the HTTP server exists — see instrumentation.ts.
   await instrumentationReady;
   let config = loadConfig();
+  if (config.githubPrReviewerAgentIds.length > 0) {
+    if (!githubReviewerAppSlug(config.prReviewerBotLogin)) {
+      logger.warn(
+        { configuredLogin: config.prReviewerBotLogin || null },
+        "PAPERCLIP_PR_REVIEWER_BOT_LOGIN must use an App identity such as <slug>[bot] or app/<slug>; bare user logins cannot verify PR-review evidence",
+      );
+    } else {
+      const missingGithubAppCredentialNames = [
+        !config.githubAppId?.trim() ? "GITHUB_APP_ID" : null,
+        !config.githubAppInstallationId?.trim() ? "GITHUB_APP_INSTALLATION_ID" : null,
+        !config.githubAppPrivateKey?.trim() ? "GITHUB_APP_PRIVATE_KEY" : null,
+      ].filter((value): value is string => Boolean(value));
+      if (missingGithubAppCredentialNames.length > 0) {
+        logger.warn(
+          {
+            configuredLogin: config.prReviewerBotLogin,
+            missingCredentials: missingGithubAppCredentialNames,
+          },
+          "GitHub App credentials are required to verify PR-review evidence; missing credentials will fail reviewer completion closed",
+        );
+      }
+    }
+  }
   initTelemetry({ enabled: config.telemetryEnabled });
   if (process.env.PAPERCLIP_SECRETS_PROVIDER === undefined) {
     process.env.PAPERCLIP_SECRETS_PROVIDER = config.secretsProvider;

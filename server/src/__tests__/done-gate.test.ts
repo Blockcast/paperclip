@@ -8,6 +8,7 @@ describe("shouldBlockNarratedDone", () => {
     existingExecutionRunId: null as string | null,
     lastEvidenceVerdict: null as unknown,
     isAgentActor: true,
+    hasDurableArtifactEvidence: false,
   };
 
   it("blocks an agent marking done with no execution run and no pr-link evidence", () => {
@@ -79,5 +80,71 @@ describe("shouldBlockNarratedDone", () => {
     expect(
       shouldBlockNarratedDone({ ...base, fromStatus: "todo", lastEvidenceVerdict: { evidenceFound: "not-an-array" } }),
     ).toBe(true);
+  });
+
+  // BLO-19081: `existingExecutionRunId` is a transient lock that
+  // `issues.update()` nulls on any transition away from `in_progress`, so
+  // investigation-shaped work (no commit, no PR, lock long released) could not
+  // be closed by an agent at all. A run-attributed durable artifact is the
+  // third accepted evidence shape.
+  describe("durable-artifact evidence (BLO-19081)", () => {
+    it("allows done for an investigation-shaped issue: durable artifact, no run, no pr-link", () => {
+      expect(
+        shouldBlockNarratedDone({
+          ...base,
+          fromStatus: "in_review",
+          existingExecutionRunId: null,
+          lastEvidenceVerdict: { verdict: "warn", evidenceFound: [], allDetected: [] },
+          hasDurableArtifactEvidence: true,
+        }),
+      ).toBe(false);
+    });
+
+    it("STILL BLOCKS when the only evidence is a comment body (gate not deleted)", () => {
+      // The caller derives `hasDurableArtifactEvidence` exclusively from
+      // issue-document / work-product rows, never from comment text. A
+      // thread full of well-sourced prose therefore leaves it false and the
+      // close must still fail. If this ever goes green with `true`, the gate
+      // has been removed rather than fixed.
+      expect(
+        shouldBlockNarratedDone({
+          ...base,
+          fromStatus: "in_review",
+          existingExecutionRunId: null,
+          lastEvidenceVerdict: {
+            verdict: "warn",
+            evidenceFound: [],
+            // Every non-durable shape an agent can produce from prose alone.
+            allDetected: ["checklist:done-when", "test-output", "kubectl-state", "url-probe"],
+          },
+          hasDurableArtifactEvidence: false,
+        }),
+      ).toBe(true);
+    });
+
+    it("keeps blocking a runless narrator even when it claims completion in prose", () => {
+      expect(
+        shouldBlockNarratedDone({ ...base, fromStatus: "todo", hasDurableArtifactEvidence: false }),
+      ).toBe(true);
+    });
+
+    it("regression guard: a real checkout still allows done with no artifact and no pr-link", () => {
+      expect(
+        shouldBlockNarratedDone({
+          ...base,
+          existingExecutionRunId: "run-123",
+          hasDurableArtifactEvidence: false,
+        }),
+      ).toBe(false);
+    });
+
+    it("does not let a durable artifact unblock a non-done transition or a human no-op", () => {
+      expect(
+        shouldBlockNarratedDone({ ...base, toStatus: "in_review", hasDurableArtifactEvidence: true }),
+      ).toBe(false);
+      expect(
+        shouldBlockNarratedDone({ ...base, fromStatus: "done", hasDurableArtifactEvidence: true }),
+      ).toBe(false);
+    });
   });
 });

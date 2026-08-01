@@ -250,6 +250,8 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
     executionPolicy: null,
     executionState: null,
     hiddenAt: null,
+    originKind: "manual",
+    originId: null,
     ...overrides,
   };
 }
@@ -426,10 +428,21 @@ function createAuthorizationDecisionDb(input: { actor?: { agentId?: string | nul
   return {
     select: vi.fn((selection: Record<string, unknown> = {}) => ({
       from: vi.fn(() => ({
-        where: vi.fn(() => ({
-          then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-            Promise.resolve(rowsForSelection(selection)).then(onFulfilled, onRejected),
-        })),
+        where: vi.fn(() => {
+          const settle = (
+            onFulfilled: (rows: unknown[]) => unknown,
+            onRejected?: (reason: unknown) => unknown,
+          ) => Promise.resolve(rowsForSelection(selection)).then(onFulfilled, onRejected);
+          // BLO-19094: the productivity-review source grant terminates its
+          // query with `.limit(1)` rather than awaiting the where() thenable
+          // directly, so the double has to offer both endings. Without this the
+          // whole issue:mutate branch throws "limit is not a function" and every
+          // route test using this double reports 500 instead of its real status.
+          return {
+            then: settle,
+            limit: vi.fn(() => ({ then: settle })),
+          };
+        }),
       })),
     })),
   };
@@ -1073,6 +1086,135 @@ describe("agent issue mutation checkout ownership", () => {
     const deleteRes = await request(await createApp(ownerActor()))
       .delete(`/api/issues/${issueId}`);
     expect(deleteRes.status, JSON.stringify(deleteRes.body)).toBe(403);
+    expect(mockIssueService.remove).not.toHaveBeenCalled();
+  });
+
+  // BLO-19094: a productivity review is assigned to a reviewer, but every
+  // remedy it can order (block / cancel / reassign / snooze) is a mutation of
+  // the SOURCE issue. Unlike the recovery handoff above, this grant therefore
+  // has to cover issue:mutate as well as issue:comment — a comment-only grant
+  // leaves the review able to detect and never able to fix.
+  const productivityReviewDecide = async (input: { action: string }) => ({
+    allowed: input.action === "issue:comment"
+      || input.action === "issue:mutate"
+      || input.action === "issue:read"
+      || input.action === "tasks:assign",
+    action: input.action,
+    reason: input.action === "issue:comment" || input.action === "issue:mutate"
+      ? "allow_productivity_review_grant"
+      : "allow_test_default",
+    explanation: "Allowed by an open productivity review the actor owns for this issue.",
+  });
+  const productivitySourceMutationAuditCalls = () =>
+    mockLogActivity.mock.calls.filter(([, entry]) =>
+      (entry as { action?: string }).action === "issue.productivity_review_source_mutation"
+    );
+
+  it("lets a productivity-review owner reassign a source issue pinned open by a paused assignee", async () => {
+    // The exact condition the review exists to catch: in_progress, held by an
+    // agent that will never run again to release it. Without the route-layer
+    // override this returns 409 "checked out by another agent" even once the
+    // authorization boundary allows the actor through.
+    //
+    // The paused assignee is mocked rather than merely asserted about because
+    // the point is that the route reaches the mutation WITHOUT the assignee
+    // ever running or being consulted for liveness. The DB-level paused/error
+    // coverage of the grant predicate itself lives in
+    // authorization-service.test.ts.
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+    }));
+    mockAccessService.decide.mockImplementation(productivityReviewDecide);
+    mockAgentService.getById.mockResolvedValue(makeAgent(peerAgentId, { status: "paused" }));
+    mockAgentService.resolveByReference.mockResolvedValue({
+      ambiguous: false,
+      agent: makeAgent(ownerAgentId),
+    });
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo", assigneeAgentId: ownerAgentId });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({ status: "todo", assigneeAgentId: ownerAgentId }),
+    );
+    expect(productivitySourceMutationAuditCalls()).toHaveLength(1);
+    expect(productivitySourceMutationAuditCalls()[0]?.[1]).toMatchObject({
+      action: "issue.productivity_review_source_mutation",
+      entityId: issueId,
+      details: {
+        reviewerAgentId: ownerAgentId,
+        previousAssigneeAgentId: peerAgentId,
+        issueStatus: "in_progress",
+        changedFields: expect.arrayContaining(["status", "assigneeAgentId"]),
+      },
+    });
+    const auditCallIndex = mockLogActivity.mock.calls.findIndex(([, entry]) =>
+      (entry as { action?: string }).action === "issue.productivity_review_source_mutation"
+    );
+    expect(mockLogActivity.mock.invocationCallOrder[auditCallIndex]).toBeGreaterThan(
+      mockIssueService.update.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("does not audit a productivity-review source mutation when the PATCH changes no issue fields", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      title: "Owned active issue",
+    }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        title: "Owned active issue",
+      }),
+      ...patch,
+    }));
+    mockAccessService.decide.mockImplementation(productivityReviewDecide);
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Owned active issue" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    expect(productivitySourceMutationAuditCalls()).toHaveLength(0);
+  });
+
+  it("does not audit a productivity-review source mutation when the PATCH fails after authorization", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+    }));
+    mockIssueService.update.mockRejectedValueOnce(new Error("update failed"));
+    mockAccessService.decide.mockImplementation(productivityReviewDecide);
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo" });
+
+    expect(res.status).toBe(500);
+    expect(productivitySourceMutationAuditCalls()).toHaveLength(0);
+  });
+
+  it("keeps destructive routes closed to a productivity-review owner", async () => {
+    // Only PATCH /issues/:id opts into the reviewer override. DELETE shares the
+    // same mutation helper and must stay denied — an early return above the
+    // helper's per-route options is the bypass that sank PR #814.
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+    }));
+    mockAccessService.decide.mockImplementation(productivityReviewDecide);
+
+    const deleteRes = await request(await createApp(ownerActor()))
+      .delete(`/api/issues/${issueId}`);
+
+    expect(deleteRes.status, JSON.stringify(deleteRes.body)).toBe(409);
     expect(mockIssueService.remove).not.toHaveBeenCalled();
   });
 

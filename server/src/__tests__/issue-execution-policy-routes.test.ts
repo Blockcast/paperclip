@@ -18,6 +18,10 @@ const mockIssueService = vi.hoisted(() => ({
   // BLO-18294: the monitor convergence guard reads live blocker edges on every arm.
   listDependencyReadiness: vi.fn(async () => new Map()),
   getWakeableParentAfterChildCompletion: vi.fn(),
+  // Destructive path, mocked so the authorization boundary tests can assert it
+  // is never reached rather than relying on an incidental undefined-method throw.
+  listAttachments: vi.fn(async () => []),
+  remove: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -1513,6 +1517,129 @@ describe("issue execution policy routes", () => {
       // grant never gets far enough to hit the stage's own "only the active
       // reviewer or approver can advance" 422.
       expect(res.status).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("lets the current execution participant approve even when the issue assignee drifted", async () => {
+      const divergedAssigneeAgentId = "44444444-4444-4444-8444-444444444444";
+      const issue = {
+        ...makeStuckReviewIssue(),
+        assigneeAgentId: divergedAssigneeAgentId,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: mandateBoundParticipantAgentId,
+        companyId: "company-1",
+        runId: "run-current-participant-diverged-assignee",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({
+          status: "done",
+          comment: "Approving as the active execution-stage participant.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        expect.objectContaining({
+          status: "done",
+          executionState: expect.objectContaining({
+            status: "completed",
+            completedStageIds: [reviewStageId],
+            lastDecisionOutcome: "approved",
+            lastDecisionId: expect.any(String),
+          }),
+        }),
+        expect.anything(),
+      );
+    });
+
+    // Boundary tests for the participant grant above (BLO-19081 review finding).
+    // The grant is double-narrowed — opt-in via options.allowExecutionStageDecision
+    // and restricted to a stage-decision body — because assertAgentIssueMutationAllowed
+    // backs 25 routes. Without these, a re-widening would pass the suite silently.
+    it("does not let the execution participant reach a destructive route on the drifted issue", async () => {
+      const divergedAssigneeAgentId = "44444444-4444-4444-8444-444444444444";
+      const issue = {
+        ...makeStuckReviewIssue(),
+        assigneeAgentId: divergedAssigneeAgentId,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      // DELETE /issues/:id calls assertAgentIssueMutationAllowed with no options,
+      // so the stage-decision grant must not be consulted there at all.
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: mandateBoundParticipantAgentId,
+        companyId: "company-1",
+        runId: "run-participant-tries-delete",
+      })).delete("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.remove).not.toHaveBeenCalled();
+    });
+
+    it("does not let the execution participant ride the stage grant into a non-decision patch", async () => {
+      const divergedAssigneeAgentId = "44444444-4444-4444-8444-444444444444";
+      const issue = {
+        ...makeStuckReviewIssue(),
+        assigneeAgentId: divergedAssigneeAgentId,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      // Same actor, same issue, same route as the passing approve test — the only
+      // difference is that the body carries a field beyond {status, comment}, so
+      // it is not a stage decision and falls back to the ownership path. `title`
+      // is chosen deliberately: it has no permission gate of its own, so the
+      // ownership boundary is the only thing that can reject this request and the
+      // assertion cannot pass for an unrelated reason.
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: mandateBoundParticipantAgentId,
+        companyId: "company-1",
+        runId: "run-participant-overreaches",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({
+          status: "done",
+          comment: "Approving.",
+          title: "Retitled while I was here",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("still rejects a non-participant agent on the drifted issue", async () => {
+      const divergedAssigneeAgentId = "44444444-4444-4444-8444-444444444444";
+      const issue = {
+        ...makeStuckReviewIssue(),
+        assigneeAgentId: divergedAssigneeAgentId,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      // Drift is not a general-purpose opening: only the pinned participant gets
+      // the stage decision, not any agent that happens to send the right body.
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: unrelatedAgentId,
+        companyId: "company-1",
+        runId: "run-unrelated-on-drifted-issue",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ status: "done", comment: "Trying to bypass review" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });

@@ -2826,12 +2826,11 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(ids(listById.get(doubleBlockedId)?.blockedBy)).toEqual([doubleBlockerAId, doubleBlockerBId].sort());
   });
 
-  it("zeroes blockerAttention on non-blocked rows even when blockers exist", async () => {
-    // BLO-19046: blockerAttention is computed only for rows whose status is
-    // literally `blocked`; every other row gets an all-zero default. That zero
-    // means "not computed", NOT "no blockers", and is the second silent-empty
-    // trap in this family. Pinned so the semantics stay documented rather than
-    // being mistaken for a summary of `blockedBy`.
+  it("computes blockerAttention on non-terminal rows with explicit blockers", async () => {
+    // BLO-19046/BLO-19261: `blockedBy` remains the source of truth for the
+    // blocker set, and blockerAttention is now computed for non-terminal rows
+    // with explicit unresolved blockers even when the row status is not
+    // literally `blocked`.
     const companyId = randomUUID();
     const blockerId = randomUUID();
     const todoDependentId = randomUUID();
@@ -2855,14 +2854,26 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       type: "blocks",
     });
 
-    type Row = { id: string; blockedBy?: Array<{ id: string }>; blockerAttention?: { unresolvedBlockerCount: number } };
+    type Row = {
+      id: string;
+      blockedBy?: Array<{ id: string }>;
+      blockerAttention?: {
+        state: string;
+        reason: string;
+        unresolvedBlockerCount: number;
+        attentionBlockerCount: number;
+      };
+    };
     const rows = (await svc.list(companyId, { includeBlockedBy: true })) as Row[];
     const dependent = rows.find((row) => row.id === todoDependentId);
 
-    // The blocker edge is real and `blockedBy` reports it...
     expect(dependent?.blockedBy?.map((row) => row.id)).toEqual([blockerId]);
-    // ...while blockerAttention reports zero purely because status !== "blocked".
-    expect(dependent?.blockerAttention?.unresolvedBlockerCount).toBe(0);
+    expect(dependent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 1,
+      attentionBlockerCount: 1,
+    });
   });
 
   it("trims list payload fields that can grow large on issue index routes", async () => {
