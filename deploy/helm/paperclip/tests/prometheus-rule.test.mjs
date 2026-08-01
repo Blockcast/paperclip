@@ -212,3 +212,70 @@ test("PaperclipGithubReviewRequestSuppressionOutage pages on outage-like causes 
     );
   }
 });
+
+test("PaperclipPrReviewWakeTerminalFailed is pr_review-scoped, gauge-keyed, and links its runbook (BLO-20255)", () => {
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.match(rendered, /alert: PaperclipPrReviewWakeTerminalFailed/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipPrReviewWakeTerminalFailed[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "terminal-failed alert must render an expr");
+
+  // Pin the scope selector. Dropping it would sum scope="other" too, and
+  // ordinary issue wakes that failed are re-driven by the issue's own
+  // lifecycle -- paging on those trains the operator to ignore this alert.
+  assert.match(
+    expr,
+    /^sum\(paperclip_agent_wakeup_terminal_failed_unresolved\{scope="pr_review"\}\) > 0$/,
+    "terminal-failed alert must select only scope=pr_review and fire on a strictly positive gauge",
+  );
+
+  // The gauge is zero-initialized across the whole label grid, so `> 0` is the
+  // silent-in-steady-state guarantee. `>= 0` would fire permanently.
+  assert.doesNotMatch(expr, />=\s*0/, "must not fire on a zero-valued gauge");
+
+  const [, forWindow] = rendered.match(
+    /alert: PaperclipPrReviewWakeTerminalFailed[\s\S]*?\n\s+for: (.+)\n/,
+  ) ?? [];
+  // The `for` window is load-bearing for the "a retried row must not page"
+  // guarantee: the BLO-18030 bounded retry's first two steps are 2m and 10m
+  // (BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS), and a retried row leaves the
+  // gauge via the successor-wake exclusion. Anything at or under 10m would race
+  // the retry and page on work that is actively being re-driven.
+  assert.ok(forWindow, "terminal-failed alert must render a for window");
+  const forMinutes = /^(\d+)m$/.test(forWindow.trim())
+    ? Number(forWindow.trim().slice(0, -1))
+    : /^(\d+)h$/.test(forWindow.trim())
+      ? Number(forWindow.trim().slice(0, -1)) * 60
+      : null;
+  assert.ok(
+    forMinutes !== null && forMinutes > 10,
+    `for window ${forWindow} must exceed the 10m second bounded-retry step so a retried row cannot page`,
+  );
+
+  // The runbook link is the operator's decision procedure (re-review vs
+  // accept). This is the first paperclip alert to carry runbook_url; without
+  // the assertion a future edit drops it silently.
+  assert.match(
+    rendered,
+    /alert: PaperclipPrReviewWakeTerminalFailed[\s\S]*?runbook_url: "[^"]*runbooks\/agent-wakeup-terminal-failed\.md"/,
+    "terminal-failed alert must link the runbook from its annotation",
+  );
+});

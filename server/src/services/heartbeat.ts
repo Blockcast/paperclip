@@ -258,6 +258,8 @@ import {
   GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED,
   GITHUB_SUPPRESSION_CAUSE_SCHEDULED_RETRY_GATE,
   setGithubReviewRequestDeadLetterUnresolved,
+  setAgentWakeupTerminalFailedUnresolved,
+  terminalFailedWakeScopeForTaskKey,
   setExternalLifecycleRunningRuns,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
@@ -24391,6 +24393,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     await publishGithubReviewDeadLetterGauge(now);
+    await publishAgentWakeupTerminalFailedGauge(now);
 
     return { recovered, superseded, exhausted, stillFailing };
   }
@@ -24495,6 +24498,180 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       setGithubReviewRequestDeadLetterUnresolved(byReason);
     } catch (err) {
       logger.warn({ err }, "failed to publish github review dead-letter gauge (BLO-18859)");
+    }
+  }
+
+  /**
+   * Recency window for {@link publishAgentWakeupTerminalFailedGauge}. Same
+   * reasoning as {@link GITHUB_DEAD_LETTER_GAUGE_WINDOW_MS}: a `failed` row is
+   * terminal and never cleared, so an all-time count would climb monotonically
+   * and pin the alert on forever after the first one. Bounding by `finishedAt`
+   * makes the gauge mean "terminal-failed wakes recent enough to still be worth
+   * acting on".
+   */
+  const TERMINAL_FAILED_WAKE_GAUGE_WINDOW_MS = 24 * 60 * 60 * 1000;
+  const TERMINAL_FAILED_WAKE_GAUGE_SCAN_LIMIT = 500;
+
+  /**
+   * Re-derive the unresolved terminal-`failed` wake gauge from committed
+   * `agent_wakeup_requests` rows (BLO-20255).
+   *
+   * `reconcileFailedWakeDispatches` only ever selects `dispatch_failed`, so a
+   * row that lands on `failed` is never re-driven by anything. BLO-18030 /
+   * PR #900 added a bounded retry for the one slice that is provably safe to
+   * re-run (a stale-killed `pr_review` whose GitHub probe found no review), and
+   * deliberately left the other three cases terminal so we never double-post a
+   * review. Those are correct to leave alone and wrong to leave unmonitored —
+   * this gauge is the monitoring half.
+   *
+   * Two joins that are easy to get wrong:
+   *
+   * 1. `error_code` comes from `heartbeat_runs`, not from the wake row. The
+   *    wake table has no such column; the terminal-outcome path writes the code
+   *    to the run and only prose to `agent_wakeup_requests.error`. The join is
+   *    a LEFT join because the "deferred wake could not be promoted" sites set
+   *    `status='failed'` with no run at all — those are real terminal rows and
+   *    must still be counted, under `error_code="none"`.
+   *
+   * 2. The successor-wake exclusion is what keeps a retried row from paging. A
+   *    bounded retry creates a new `heartbeat_runs` row carrying the same
+   *    `context_task_key`; a fresh webhook push creates a new
+   *    `agent_wakeup_requests` row carrying the same `payload->>'taskKey'`.
+   *    Either one means the work has been picked back up, so both are checked.
+   *    A row whose taskKey is null cannot be checked and is counted — it is
+   *    genuinely unmonitored, which is the thing this gauge exists to surface.
+   *
+   * Best-effort: a failure here must not break the reconcile pass, whose real
+   * job is re-driving dispatches.
+   */
+  async function publishAgentWakeupTerminalFailedGauge(now: Date) {
+    try {
+      const cutoff = new Date(now.getTime() - TERMINAL_FAILED_WAKE_GAUGE_WINDOW_MS);
+      const wakeTaskKey = sql<string | null>`${agentWakeupRequests.payload} ->> 'taskKey'`;
+
+      const rows = await db
+        .select({
+          id: agentWakeupRequests.id,
+          finishedAt: agentWakeupRequests.finishedAt,
+          taskKey: wakeTaskKey,
+          errorCode: heartbeatRuns.errorCode,
+        })
+        .from(agentWakeupRequests)
+        .leftJoin(heartbeatRuns, eq(heartbeatRuns.id, agentWakeupRequests.runId))
+        .where(
+          and(
+            eq(agentWakeupRequests.status, "failed"),
+            gte(agentWakeupRequests.finishedAt, cutoff),
+          ),
+        )
+        .orderBy(desc(agentWakeupRequests.finishedAt))
+        .limit(TERMINAL_FAILED_WAKE_GAUGE_SCAN_LIMIT);
+
+      if (rows.length === 0) {
+        setAgentWakeupTerminalFailedUnresolved([]);
+        return;
+      }
+
+      // Only rows with a taskKey can be covered by a successor, and the
+      // successor must postdate the failure. Bounding both follow-up queries by
+      // the oldest candidate's finishedAt keeps them off a full-table scan.
+      const taskKeys = [
+        ...new Set(rows.map((row) => row.taskKey).filter((key): key is string => !!key)),
+      ];
+      const oldestFinishedAt = rows.reduce<Date>(
+        (oldest, row) => (row.finishedAt && row.finishedAt < oldest ? row.finishedAt : oldest),
+        rows[0]?.finishedAt ?? cutoff,
+      );
+
+      const latestSuccessorByTaskKey = new Map<string, Date>();
+      // The driver hands back a `max(timestamptz)` aggregate as a STRING, not a
+      // Date, no matter what the `sql<Date | null>` annotation claims -- the
+      // same reason `refreshExternalRuntimeReservationMetrics` re-wraps its
+      // `min(reservedAt)` in `new Date(...)`. Comparing that string to a real
+      // Date with `>` coerces both to numbers, the string becomes NaN, and
+      // EVERY comparison silently answers false -- which would have quietly
+      // disabled the successor exclusion entirely and paged on exactly the
+      // retried rows this gauge promises never to page on. Parse at the
+      // boundary and keep the map strictly Date-typed.
+      const noteSuccessor = (taskKey: string | null, at: unknown) => {
+        if (!taskKey || !at) return;
+        const parsed = at instanceof Date ? at : new Date(at as string);
+        if (Number.isNaN(parsed.getTime())) return;
+        const current = latestSuccessorByTaskKey.get(taskKey);
+        if (!current || parsed > current) latestSuccessorByTaskKey.set(taskKey, parsed);
+      };
+
+      if (taskKeys.length > 0) {
+        // Two exclusions, both load-bearing:
+        //
+        // 1. `notInArray(id, candidateIds)` -- a candidate must never be its own
+        //    successor. `requestedAt` is when the wake was ASKED for and
+        //    `finishedAt` is when it died, so any row whose failure we are
+        //    scoring also satisfies "requested after some candidate's
+        //    finishedAt" as soon as two candidates share a taskKey (and, for a
+        //    row requested after an earlier sibling failed, itself). Without
+        //    this the gauge silently suppresses the very rows it exists to
+        //    surface.
+        //
+        // 2. `ne(status, "failed")` -- a successor that ALSO ended terminal
+        //    `failed` is not a re-drive, it is a second failure. Counting it as
+        //    coverage would hide a PR-review chain that is failing repeatedly,
+        //    which is precisely the pathology worth paging on.
+        const candidateIds = rows.map((row) => row.id);
+        const successorWakes = await db
+          .select({
+            taskKey: wakeTaskKey,
+            latest: sql<string | null>`max(${agentWakeupRequests.requestedAt})`,
+          })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              inArray(wakeTaskKey, taskKeys),
+              gt(agentWakeupRequests.requestedAt, oldestFinishedAt),
+              notInArray(agentWakeupRequests.id, candidateIds),
+              ne(agentWakeupRequests.status, "failed"),
+            ),
+          )
+          .groupBy(wakeTaskKey);
+        for (const row of successorWakes) noteSuccessor(row.taskKey, row.latest);
+
+        const successorRuns = await db
+          .select({
+            taskKey: heartbeatRuns.contextTaskKey,
+            latest: sql<string | null>`max(${heartbeatRuns.createdAt})`,
+          })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              inArray(heartbeatRuns.contextTaskKey, taskKeys),
+              gt(heartbeatRuns.createdAt, oldestFinishedAt),
+              ne(heartbeatRuns.status, "failed"),
+            ),
+          )
+          .groupBy(heartbeatRuns.contextTaskKey);
+        for (const row of successorRuns) noteSuccessor(row.taskKey, row.latest);
+      }
+
+      const counts = new Map<string, { errorCode: string | null; scope: string; count: number }>();
+      for (const row of rows) {
+        const finishedAt = row.finishedAt;
+        if (row.taskKey && finishedAt) {
+          const successorAt = latestSuccessorByTaskKey.get(row.taskKey);
+          // Strictly-after: a successor stamped at the same instant as the
+          // failure is the same event, not a re-drive.
+          if (successorAt && successorAt > finishedAt) continue;
+        }
+        const errorCode = row.errorCode ?? null;
+        const scope = terminalFailedWakeScopeForTaskKey(row.taskKey);
+        const key = `${errorCode ?? ""} ${scope}`;
+        const existing = counts.get(key);
+        if (existing) existing.count += 1;
+        else counts.set(key, { errorCode, scope, count: 1 });
+      }
+
+      setAgentWakeupTerminalFailedUnresolved([...counts.values()]);
+    } catch (err) {
+      logger.warn({ err }, "failed to publish terminal-failed wake gauge (BLO-20255)");
     }
   }
 
