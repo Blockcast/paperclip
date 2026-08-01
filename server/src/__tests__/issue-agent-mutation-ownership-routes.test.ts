@@ -3270,4 +3270,335 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
   });
+
+  // BLO-18289 (decision on BLO-18163). A tasks:assign holder who manages the
+  // assignee may PATCH coordination metadata — blocker edges, priority,
+  // project, parent, milestone — on an issue assigned to someone else, so the
+  // agent who curates the dependency graph is not structurally locked out of
+  // it. Work content and `status` stay behind the original boundary.
+  describe("coordination-metadata allowlist", () => {
+    // The real grant+manager-chain logic lives in decideBase and is covered in
+    // authorization-service.test.ts; here we drive the route wiring, so
+    // issue:coordination_metadata is mocked as the authorization outcome.
+    function coordinationHolderDecide(allowed: boolean) {
+      return async (input: { action: string }) => ({
+        allowed: input.action === "issue:read"
+          || (input.action === "issue:coordination_metadata" && allowed),
+        action: input.action,
+        reason: input.action === "issue:coordination_metadata" && allowed
+          ? "allow_explicit_grant"
+          : input.action === "issue:read"
+          ? "allow_company_agent"
+          : "deny_missing_grant",
+        explanation: "Coordination-metadata allowlist test decision.",
+      });
+    }
+
+    // Assigned to ownerAgentId, parked (not checked out), so the only thing
+    // that can let peerAgentId through is the coordination-metadata path.
+    function otherAgentsParkedIssue(overrides: Record<string, unknown> = {}) {
+      return makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, ...overrides });
+    }
+
+    it("lets a tasks:assign holder clear a blocker edge on another agent's issue", async () => {
+      mockIssueService.getById.mockResolvedValue(otherAgentsParkedIssue());
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ blockedByIssueIds: [] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ blockedByIssueIds: [] }),
+      );
+    });
+
+    it("emits an audit record naming the actor and the coordination path", async () => {
+      mockIssueService.getById.mockResolvedValue(otherAgentsParkedIssue());
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ blockedByIssueIds: [], priority: "low" })
+        .expect(200);
+
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.coordination_metadata_updated",
+          entityId: issueId,
+          agentId: peerAgentId,
+          details: expect.objectContaining({
+            path: "coordination_metadata_allowlist",
+            fields: expect.arrayContaining(["blockedByIssueIds", "priority"]),
+            assigneeAgentId: ownerAgentId,
+          }),
+        }),
+      );
+    });
+
+    it("still denies an agent that does not hold tasks:assign", async () => {
+      mockIssueService.getById.mockResolvedValue(otherAgentsParkedIssue());
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(false));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ blockedByIssueIds: [] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("does not let a holder rewrite another agent's description", async () => {
+      mockIssueService.getById.mockResolvedValue(otherAgentsParkedIssue());
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ description: "Rewritten by a coordinator." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("does not let a holder retitle another agent's issue", async () => {
+      mockIssueService.getById.mockResolvedValue(otherAgentsParkedIssue());
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Retitled by a coordinator." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    // `status` is excluded so no allowlisted field can terminate another
+    // agent's run — that exclusion is what makes bypassing the in_progress
+    // guard safe for the rest of the list.
+    it("does not let a holder change status on another agent's issue", async () => {
+      mockIssueService.getById.mockResolvedValue(otherAgentsParkedIssue());
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "cancelled" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    // No partial application: the allowlisted half must not land either.
+    it("rejects a mixed allowlisted + non-allowlisted PATCH as a whole", async () => {
+      mockIssueService.getById.mockResolvedValue(otherAgentsParkedIssue());
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ blockedByIssueIds: [], description: "Smuggled in alongside a blocker edit." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.coordination_metadata_updated" }),
+      );
+    });
+
+    it("allows a workspace rebind while the issue is parked", async () => {
+      mockIssueService.getById.mockResolvedValue(otherAgentsParkedIssue());
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ projectWorkspaceId: "99999999-9999-4999-8999-999999999999" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    });
+
+    // Rebinding where a live run executes would repoint work in flight, so the
+    // coordination path declines and the request falls through to ordinary
+    // authorization — which denies a non-assignee at the boundary. The
+    // invariant under test is that the rebind does not land and takes no
+    // audit record, not the particular refusal code.
+    it("refuses a workspace rebind while another agent holds the issue in_progress", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId, executionRunId: ownerRunId }),
+      );
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ projectWorkspaceId: "99999999-9999-4999-8999-999999999999" });
+
+      expect(res.status, JSON.stringify(res.body)).toBeGreaterThanOrEqual(400);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.coordination_metadata_updated" }),
+      );
+    });
+
+    it("refuses a workspace rebind while another agent holds the issue in_review", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "in_review", assigneeAgentId: ownerAgentId, executionRunId: ownerRunId }),
+      );
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ projectWorkspaceId: "99999999-9999-4999-8999-999999999999" });
+
+      expect(res.status, JSON.stringify(res.body)).toBeGreaterThanOrEqual(400);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.coordination_metadata_updated" }),
+      );
+    });
+
+    it("refuses a project rebind while another agent holds an execution lock", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          status: "in_progress",
+          assigneeAgentId: ownerAgentId,
+          executionRunId: ownerRunId,
+          projectId: "88888888-8888-4888-8888-888888888888",
+        }),
+      );
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ projectId: "99999999-9999-4999-8999-999999999999" });
+
+      expect(res.status, JSON.stringify(res.body)).toBeGreaterThanOrEqual(400);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.coordination_metadata_updated" }),
+      );
+    });
+
+    it("refuses a parent rebind while another agent holds an execution lock", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId, executionRunId: ownerRunId }),
+      );
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ parentId: "99999999-9999-4999-8999-999999999999" });
+
+      expect(res.status, JSON.stringify(res.body)).toBeGreaterThanOrEqual(400);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.coordination_metadata_updated" }),
+      );
+    });
+
+    // Cutting a stale blocker edge is the BLO-18163 use case and cannot
+    // disturb a live run. Adding a new blocker is execution-sensitive because
+    // queued continuations cancel when unresolved blockers are present.
+    it("still allows blocker removal while the issue has an execution lock", async () => {
+      const blockerId = "99999999-9999-4999-8999-999999999999";
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          status: "in_progress",
+          assigneeAgentId: ownerAgentId,
+          executionRunId: ownerRunId,
+        }),
+      );
+      mockIssueService.getRelationSummaries.mockResolvedValue({
+        blockedBy: [{ id: blockerId }],
+        blocks: [],
+      });
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ blockedByIssueIds: [] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    });
+
+    it("allows partial blocker removal while the issue has an execution lock", async () => {
+      const keptBlockerId = "88888888-8888-4888-8888-888888888888";
+      const removedBlockerId = "99999999-9999-4999-8999-999999999999";
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          status: "in_progress",
+          assigneeAgentId: ownerAgentId,
+          executionRunId: ownerRunId,
+        }),
+      );
+      mockIssueService.getRelationSummaries.mockResolvedValue({
+        blockedBy: [{ id: keptBlockerId }, { id: removedBlockerId }],
+        blocks: [],
+      });
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ blockedByIssueIds: [keptBlockerId] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+    });
+
+    it("refuses blocker addition while another agent holds an execution lock", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          status: "in_progress",
+          assigneeAgentId: ownerAgentId,
+          executionRunId: ownerRunId,
+        }),
+      );
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ blockedByIssueIds: ["99999999-9999-4999-8999-999999999999"] });
+
+      expect(res.status, JSON.stringify(res.body)).toBeGreaterThanOrEqual(400);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.coordination_metadata_updated" }),
+      );
+    });
+
+    // The audit record must describe a write that happened. Emitting it next
+    // to the authorization decision would log a mutation for every request
+    // that clears the coordination check and is then rejected downstream.
+    it("does not emit an audit record when the write itself fails", async () => {
+      mockIssueService.getById.mockResolvedValue(otherAgentsParkedIssue());
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+      mockIssueService.update.mockRejectedValue(new Error("write rejected downstream"));
+
+      await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ blockedByIssueIds: [] });
+
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.coordination_metadata_updated" }),
+      );
+    });
+
+    // PR #814's lesson: the shared mutation helper backs ~two dozen routes, so
+    // the allowlist must not have widened anything but PATCH.
+    it("does not extend coordination authority to issue deletion", async () => {
+      mockIssueService.getById.mockResolvedValue(otherAgentsParkedIssue());
+      mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+      const res = await request(await createApp(peerActor())).delete(`/api/issues/${issueId}`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.remove).not.toHaveBeenCalled();
+    });
+  });
 });
