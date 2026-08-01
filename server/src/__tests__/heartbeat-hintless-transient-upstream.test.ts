@@ -181,6 +181,44 @@ describe("isHintlessTransientUpstreamFault for the BLO-19879 gateway allocation 
     ).toBe(true);
   });
 
+  it("requires a 400 authoritative status before bypassing the status short-circuit", () => {
+    for (const status of [401, 403, 500] as const) {
+      expect(
+        isHintlessTransientUpstreamFault({
+          api_error_status: status,
+          result: 'API Error: 400 {"code":"allocation_missing"}',
+        }),
+      ).toBe(false);
+      expect(
+        isHintlessTransientUpstreamFault({
+          error_status: status,
+          result: '{"code":"allocation_missing"}',
+        }),
+      ).toBe(false);
+    }
+  });
+
+  it("does not match allocation_missing quotes in free-text result surfaces", () => {
+    expect(
+      isHintlessTransientUpstreamFault({
+        api_error_status: 400,
+        result: 'While reviewing this PR I saw {"code":"allocation_missing"} in the incident notes.',
+      }),
+    ).toBe(false);
+    expect(
+      isHintlessTransientUpstreamFault({
+        api_error_status: 400,
+        message: '{"code":"allocation_missing"}',
+      }),
+    ).toBe(false);
+    expect(
+      isHintlessTransientUpstreamFault({
+        api_error_status: 400,
+        summary: '{"code":"allocation_missing"}',
+      }),
+    ).toBe(false);
+  });
+
   // Matched on the machine-readable code, not the prose, so a reworded gateway
   // message cannot silently drop the run back to a terminal strand.
   it("keys on the error code rather than the message wording", () => {
