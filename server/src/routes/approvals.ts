@@ -152,8 +152,14 @@ export function approvalRoutes(
       ...approvalInput,
       payload: normalizedPayload,
       requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
+      // An agent actor cannot nominate a different requester. The body field stays honoured for
+      // user actors (a human filing on an agent's behalf), but letting an agent set it would make
+      // `requestedByAgentId` unusable as an attribution signal — anything downstream that reasons
+      // about who asked for an approval could be pointed at an innocent agent.
       requestedByAgentId:
-        approvalInput.requestedByAgentId ?? (actor.actorType === "agent" ? actor.actorId : null),
+        actor.actorType === "agent"
+          ? actor.actorId
+          : (approvalInput.requestedByAgentId ?? null),
       status: "pending",
       decisionNote: null,
       decidedByUserId: null,

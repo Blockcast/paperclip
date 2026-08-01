@@ -1834,24 +1834,30 @@ export async function worktreeCleanupCommand(nameArg: string, opts: WorktreeClea
         });
         spinner.stop(`Removed git worktree at ${linkedWorktree.worktree}.`);
       } catch (error) {
-        spinner.stop(pc.yellow(`Could not remove worktree cleanly, will prune instead.`));
+        spinner.stop(pc.yellow(`Could not remove worktree cleanly; leaving its registration in place.`));
         p.log.warning(extractExecSyncErrorMessage(error) ?? String(error));
       }
     } else {
-      spinner.start("Pruning stale worktree entry...");
-      execFileSync("git", ["worktree", "prune"], {
-        cwd: sourceCwd,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      spinner.stop("Pruned stale worktree entry.");
+      spinner.start("Removing stale worktree entry...");
+      try {
+        // Scoped to this worktree's own path rather than `git worktree prune`,
+        // which is repo-global and would also drop the registrations of any
+        // concurrently running worktree whose directory git cannot read at this
+        // moment (BLO-19607). A worktree locked by another run is refused by
+        // git here, which is the protection we want.
+        execFileSync("git", ["worktree", "remove", "--force", linkedWorktree.worktree], {
+          cwd: sourceCwd,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        spinner.stop("Removed stale worktree entry.");
+      } catch (error) {
+        spinner.stop(pc.yellow("Could not remove stale worktree entry."));
+        p.log.warning(extractExecSyncErrorMessage(error) ?? String(error));
+      }
     }
-  } else {
-    // Even without a linked worktree, prune to clean up any orphaned entries
-    execFileSync("git", ["worktree", "prune"], {
-      cwd: sourceCwd,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
   }
+  // No repo-global `git worktree prune` here: removing one worktree must never
+  // collect registrations that belong to other runs sharing this checkout.
 
   // 3b. Remove the worktree directory if it still exists (e.g. partial creation)
   if (existsSync(targetPath)) {
