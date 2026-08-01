@@ -798,6 +798,166 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("creates one durable wake intent when retry reservations race", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    const svc = issueRecoveryActionService(db);
+    const action = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "source-scoped:fingerprint:reservation-race",
+      evidence: { latestRunId: "run-reservation-race" },
+      nextAction: "Wake the recovery owner.",
+      wakePolicy: { type: "wake_owner" },
+      maxAttempts: 3,
+      timeoutAt: new Date(Date.now() + STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS),
+    });
+    const reserve = () =>
+      svc.reserveWakeAttempt({
+        companyId,
+        actionId: action.id,
+        sourceIssueId,
+        ownerAgentId: managerId,
+        wakePolicyType: "wake_owner",
+        requireBlockedSourceIssue: true,
+        requireNoOutstandingIssueWake: true,
+        buildWakeIntent: (reservedAction) => ({
+          agentId: managerId,
+          opts: {
+            source: "assignment",
+            triggerDetail: "system",
+            reason: "source_scoped_recovery_action",
+            idempotencyKey: `source_scoped_recovery_action:${reservedAction.id}:${reservedAction.attemptCount}`,
+            payload: {
+              issueId: sourceIssueId,
+              sourceIssueId,
+              recoveryActionId: reservedAction.id,
+            },
+            requestedByActorType: "system",
+            requestedByActorId: null,
+            contextSnapshot: {
+              issueId: sourceIssueId,
+              taskId: sourceIssueId,
+              wakeReason: "source_scoped_recovery_action",
+              recoveryActionId: reservedAction.id,
+            },
+          },
+        }),
+      });
+
+    const reservations = await Promise.all([reserve(), reserve()]);
+    const deliveredReservations = reservations.filter((reservation) => reservation !== null);
+    expect(deliveredReservations).toHaveLength(1);
+    expect(deliveredReservations[0]?.wakeIntentId).toEqual(expect.any(String));
+
+    const [updatedAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(updatedAction).toMatchObject({ attemptCount: 2 });
+
+    const intents = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, "dispatch_failed")));
+    expect(intents).toHaveLength(1);
+    expect(intents[0]).toMatchObject({
+      agentId: managerId,
+      reason: "source_scoped_recovery_action",
+      idempotencyKey: `source_scoped_recovery_action:${action.id}:2`,
+    });
+    const payload = intents[0]!.payload as Record<string, unknown>;
+    expect(payload).toMatchObject({
+      issueId: sourceIssueId,
+      sourceIssueId,
+      recoveryActionId: action.id,
+    });
+    expect(payload.dispatchRetry).toMatchObject({
+      attempts: 0,
+      originalOpts: {
+        reason: "source_scoped_recovery_action",
+        idempotencyKey: `source_scoped_recovery_action:${action.id}:2`,
+      },
+    });
+  });
+
+  it("does not spend another retry while a durable wake intent is pending", async () => {
+    const { companyId, managerId, sourceIssue, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "blocked", assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
+    const svc = issueRecoveryActionService(db);
+    const action = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "source-scoped:fingerprint:pending-intent",
+      evidence: { latestRunId: "run-pending-intent" },
+      nextAction: "Wake the recovery owner.",
+      wakePolicy: { type: "wake_owner" },
+      maxAttempts: 3,
+      timeoutAt: new Date(Date.now() + STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS),
+    });
+    const reserved = await svc.reserveWakeAttempt({
+      companyId,
+      actionId: action.id,
+      sourceIssueId,
+      ownerAgentId: managerId,
+      wakePolicyType: "wake_owner",
+      requireBlockedSourceIssue: true,
+      requireNoOutstandingIssueWake: true,
+      buildWakeIntent: (reservedAction) => ({
+        agentId: managerId,
+        opts: {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "source_scoped_recovery_action",
+          idempotencyKey: `source_scoped_recovery_action:${reservedAction.id}:${reservedAction.attemptCount}`,
+          payload: {
+            issueId: sourceIssueId,
+            sourceIssueId,
+            recoveryActionId: reservedAction.id,
+          },
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          contextSnapshot: {
+            issueId: sourceIssueId,
+            taskId: sourceIssueId,
+            wakeReason: "source_scoped_recovery_action",
+            recoveryActionId: reservedAction.id,
+          },
+        },
+      }),
+    });
+    expect(reserved?.wakeIntentId).toEqual(expect.any(String));
+
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() } as never));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const result = await recovery.reconcileStrandedAssignedIssues();
+    expect(result.recoveryWakeDeliveryRetried).toBe(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const [unchangedAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(unchangedAction).toMatchObject({ attemptCount: 2 });
+    const [intent] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, reserved!.wakeIntentId!));
+    expect(intent).toMatchObject({
+      status: "dispatch_failed",
+      agentId: managerId,
+    });
+    expect(sourceIssue.id).toBe(sourceIssueId);
+  });
+
   it.each([
     ["process_lost", undefined, "coder"],
     ["adapter_failed", "successful_run_missing_state", "coder"],
@@ -1637,11 +1797,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       createdAt: new Date(),
     } as const;
 
-    // Count wakes addressed to a specific owner. Total call count is the wrong measure:
-    // `enqueueSourceScopedStrandedRecoveryWake` also has an assignee-fallback branch that
-    // wakes the assignee instead of the owner, and those calls are not owner wakes.
+    // Count wakes addressed to a specific agent. Total call count is the wrong measure:
+    // unrelated recovery routing can also wake agents outside the owner sequence being
+    // asserted here.
     const wakesTo = (agentId: string) =>
       enqueueWakeup.mock.calls.filter((call) => call[0] === agentId).length;
+    const secondLineWakeBudgetSpent = () => wakesTo(secondManagerId) + wakesTo(secondCoderId);
 
     // 1. Spend the whole budget against the first owner.
     const ESCALATIONS = STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS + 2;
@@ -1687,12 +1848,18 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       ownerAgentId: secondManagerId,
       attemptCount: 1,
     });
+    // First attempt for a replacement owner must wake that owner; this is the regression
+    // that failed when owner B inherited owner A's spent budget.
     expect(wakesTo(secondManagerId)).toBe(1);
+    expect(secondLineWakeBudgetSpent()).toBe(1);
 
     // 4. The restored budget is still a budget: the new owner is bounded exactly as the
     //    first one was, so this cannot become a way to wake someone forever by churning
     //    the assignee. (The fingerprint ends in the assignee and changes on every sweep,
     //    which is why the reset keys on the owner instead.)
+    //    BLO-8677 deliberately redirects repeated owner-not-assignee retries to the
+    //    assignee fallback when no new activity landed since the last attempt, so the
+    //    owner sequence's spent budget is the owner wake plus its fallback wakes.
     //    Escalation reassigns the source issue to the recovery owner, and ownership routes
     //    through the assignee's `reportsTo` — so the assignee is put back on the second
     //    reporting line before each sweep. Without that the routing walks up to the CTO and
@@ -1709,7 +1876,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         comment: "Automatic continuation recovery failed.",
       });
     }
-    expect(wakesTo(secondManagerId)).toBe(STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS);
+    expect(secondLineWakeBudgetSpent()).toBe(STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS);
+    expect(wakesTo(secondCoderId)).toBeGreaterThan(0);
     // The first owner's budget stayed spent — the reset is scoped to the new owner.
     expect(wakesTo(managerId)).toBe(STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS);
 

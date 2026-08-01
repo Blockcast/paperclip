@@ -1483,7 +1483,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => Boolean(rows[0]));
   }
 
-  const OUTSTANDING_ISSUE_WAKE_STATUSES = ["queued", "deferred_issue_execution", "claimed", "running"] as const;
+  const OUTSTANDING_ISSUE_WAKE_STATUSES = [
+    "dispatch_failed",
+    "queued",
+    "deferred_issue_execution",
+    "claimed",
+    "running",
+  ] as const;
 
   async function hasQueuedIssueWake(companyId: string, issueId: string, agentId?: string | null) {
     return db
@@ -3992,17 +3998,147 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { action, hasNewActivitySinceLastAttempt };
   }
 
+  function buildSourceScopedStrandedRecoveryWakeDelivery(input: {
+    action: Awaited<ReturnType<typeof recoveryActionsSvc.upsertSourceScoped>>;
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+    recoveryCause: StrandedRecoveryCause;
+    hasNewActivitySinceLastAttempt: boolean;
+  }): { agentId: string; opts: RecoveryWakeupOptions } | null {
+    if (input.recoveryCause === "provider_quota" && !input.action.ownerAgentId) return null;
+    if (input.recoveryCause === "workspace_validation_failed" || input.recoveryCause === "configuration_incomplete") {
+      return null;
+    }
+    if (!input.action.ownerAgentId) return null;
+    if (strandedRecoveryWakeAttemptsExhausted(input.action)) return null;
+    const ownerIsNonAssignee = input.action.ownerAgentId !== input.issue.assigneeAgentId;
+    if (!input.hasNewActivitySinceLastAttempt && ownerIsNonAssignee && input.action.attemptCount > 1) {
+      const assigneeAgentId = input.issue.assigneeAgentId;
+      if (!assigneeAgentId) return null;
+      return {
+        agentId: assigneeAgentId,
+        opts: {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "source_scoped_recovery_action",
+          idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}:assignee_fallback`,
+          payload: withRecoveryModelProfileHint({
+            issueId: input.issue.id,
+            sourceIssueId: input.issue.id,
+            recoveryActionId: input.action.id,
+            strandedRunId: input.latestRun?.id ?? null,
+            recoveryCause: input.recoveryCause,
+            suppressedNonAssigneeWake: true,
+          }, "status_only"),
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          contextSnapshot: withRecoveryModelProfileHint({
+            issueId: input.issue.id,
+            taskId: input.issue.id,
+            wakeReason: "source_scoped_recovery_action",
+            skipIssueComment: true,
+            source: "issue_recovery_action",
+            recoveryActionId: input.action.id,
+            sourceIssueId: input.issue.id,
+            strandedRunId: input.latestRun?.id ?? null,
+            recoveryCause: input.recoveryCause,
+            suppressedNonAssigneeWake: true,
+          }, "status_only"),
+        },
+      };
+    }
+    // NOTE (BLO-18996): `attemptCount` restarts at 1 whenever the action's owner changes,
+    // and refunds decrement it when no wake was delivered. This key can therefore repeat
+    // within one owner sequence after refunded attempts, and across owner sequences after
+    // reassignment. That is safe today because nothing dedupes this path on `idempotencyKey`:
+    // `enqueueWakeup` coalesces on (companyId, agentId, taskKey). If you ever add
+    // idempotency-key dedup here, include the owner and a non-refunded delivery sequence first.
+    return {
+      agentId: input.action.ownerAgentId,
+      opts: {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "source_scoped_recovery_action",
+        idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}`,
+        payload: withRecoveryModelProfileHint({
+          issueId: input.issue.id,
+          sourceIssueId: input.issue.id,
+          recoveryActionId: input.action.id,
+          strandedRunId: input.latestRun?.id ?? null,
+          recoveryCause: input.recoveryCause,
+        }, "status_only"),
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: withRecoveryModelProfileHint({
+          issueId: input.issue.id,
+          taskId: input.issue.id,
+          wakeReason: "source_scoped_recovery_action",
+          skipIssueComment: true,
+          source: "issue_recovery_action",
+          recoveryActionId: input.action.id,
+          sourceIssueId: input.issue.id,
+          strandedRunId: input.latestRun?.id ?? null,
+          recoveryCause: input.recoveryCause,
+        }, "status_only"),
+      },
+    };
+  }
+
+  async function markSourceScopedWakeIntent(input: {
+    wakeIntentId?: string | null;
+    status: "dispatch_recovered" | "dispatch_superseded";
+    error?: string | null;
+  }) {
+    if (!input.wakeIntentId) return;
+    const now = new Date();
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        status: input.status,
+        error: input.error ?? null,
+        finishedAt: now,
+        updatedAt: now,
+      })
+      .where(eq(agentWakeupRequests.id, input.wakeIntentId));
+  }
+
+  async function markSourceScopedWakeIntentFailed(input: { wakeIntentId?: string | null; error: unknown }) {
+    if (!input.wakeIntentId) return;
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        error: input.error instanceof Error ? input.error.message : String(input.error),
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(agentWakeupRequests.id, input.wakeIntentId),
+        eq(agentWakeupRequests.status, "dispatch_failed"),
+      ));
+  }
+
   async function enqueueSourceScopedStrandedRecoveryWake(input: {
     action: Awaited<ReturnType<typeof recoveryActionsSvc.upsertSourceScoped>>;
     issue: typeof issues.$inferSelect;
     latestRun: LatestIssueRun;
     recoveryCause: StrandedRecoveryCause;
     hasNewActivitySinceLastAttempt: boolean;
+    wakeIntentId?: string | null;
   }) {
-    if (input.recoveryCause === "provider_quota" && !input.action.ownerAgentId) return;
-    if (input.recoveryCause === "workspace_validation_failed" || input.recoveryCause === "configuration_incomplete") return;
-    if (!input.action.ownerAgentId) return;
-    if (strandedRecoveryWakeAttemptsExhausted(input.action)) return;
+    const delivery = buildSourceScopedStrandedRecoveryWakeDelivery(input);
+    if (!delivery) {
+      if (input.wakeIntentId) {
+        await markSourceScopedWakeIntent({
+          wakeIntentId: input.wakeIntentId,
+          status: "dispatch_superseded",
+          error: "source-scoped recovery wake no longer has a deliverable target",
+        });
+        await recoveryActionsSvc.releaseWakeAttempt({
+          companyId: input.issue.companyId,
+          actionId: input.action.id,
+        });
+      }
+      return;
+    }
     // BLO-18996 (review follow-up): the attempt this wake spends was already committed.
     // `recoveryActionsSvc` runs on the outer `db`, not on `escalateStrandedAssignedIssue`'s
     // transaction, so `upsertSourceScoped`'s `attemptCount` increment is durable before we
@@ -4025,6 +4161,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // does not depend on `attemptCount` moving at all. Attempts bound delivered-but-
     // unproductive wakes; the horizon bounds wall-clock regardless of delivery.
     const refundUnspentWakeAttempt = async (cause: "enqueue_threw" | "enqueue_not_delivered", error?: unknown) => {
+      if (input.wakeIntentId && cause === "enqueue_threw") {
+        await markSourceScopedWakeIntentFailed({ wakeIntentId: input.wakeIntentId, error });
+        return;
+      }
       const release = () =>
         recoveryActionsSvc.releaseWakeAttempt({
           companyId: input.issue.companyId,
@@ -4067,91 +4207,34 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       try {
         queued = await deps.enqueueWakeup(agentId, opts);
       } catch (error) {
-        // Refund, then rethrow so the escalation still fails loudly.
+        // With a durable intent, the existing dispatch-failed reconciler owns retrying the
+        // wake, so the attempt is not refunded on an unexpected throw.
         await refundUnspentWakeAttempt("enqueue_threw", error);
         throw error;
       }
-      if (!queued) await refundUnspentWakeAttempt("enqueue_not_delivered");
+      if (!queued) {
+        if (input.wakeIntentId) {
+          await markSourceScopedWakeIntent({
+            wakeIntentId: input.wakeIntentId,
+            status: "dispatch_superseded",
+            error: "source-scoped recovery wake was declined by the immediate enqueue path",
+          });
+        }
+        await refundUnspentWakeAttempt("enqueue_not_delivered");
+      } else if (input.wakeIntentId) {
+        await markSourceScopedWakeIntent({
+          wakeIntentId: input.wakeIntentId,
+          status: "dispatch_recovered",
+        });
+      }
       return queued;
     };
-    const ownerIsNonAssignee = input.action.ownerAgentId !== input.issue.assigneeAgentId;
-    if (!input.hasNewActivitySinceLastAttempt && ownerIsNonAssignee && input.action.attemptCount > 1) {
-      const assigneeAgentId = input.issue.assigneeAgentId;
-      if (!assigneeAgentId) {
-        await refundUnspentWakeAttempt("enqueue_not_delivered");
-        return;
-      }
-      await enqueueOrRefundAttempt(assigneeAgentId, {
-        source: "assignment",
-        triggerDetail: "system",
-        reason: "source_scoped_recovery_action",
-        idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}:assignee_fallback`,
-        payload: withRecoveryModelProfileHint({
-          issueId: input.issue.id,
-          sourceIssueId: input.issue.id,
-          recoveryActionId: input.action.id,
-          strandedRunId: input.latestRun?.id ?? null,
-          recoveryCause: input.recoveryCause,
-          suppressedNonAssigneeWake: true,
-        }, "status_only"),
-        requestedByActorType: "system",
-        requestedByActorId: null,
-        contextSnapshot: withRecoveryModelProfileHint({
-          issueId: input.issue.id,
-          taskId: input.issue.id,
-          wakeReason: "source_scoped_recovery_action",
-          skipIssueComment: true,
-          source: "issue_recovery_action",
-          recoveryActionId: input.action.id,
-          sourceIssueId: input.issue.id,
-          strandedRunId: input.latestRun?.id ?? null,
-          recoveryCause: input.recoveryCause,
-          suppressedNonAssigneeWake: true,
-        }, "status_only"),
-      });
-      await reassertSourceScopedRecoveryBlockedAfterWake({
-        sourceIssueId: input.issue.id,
-        recoveryActionId: input.action.id,
-        agentId: assigneeAgentId,
-      });
-      return;
-    }
-    // NOTE (BLO-18996): `attemptCount` restarts at 1 whenever the action's owner changes,
-    // and refunds decrement it when no wake was delivered. This key can therefore repeat
-    // within one owner sequence after refunded attempts, and across owner sequences after
-    // reassignment. That is safe today because nothing dedupes this path on `idempotencyKey`:
-    // `enqueueWakeup` coalesces on (companyId, agentId, taskKey). If you ever add
-    // idempotency-key dedup here, include the owner and a non-refunded delivery sequence first.
-    await enqueueOrRefundAttempt(input.action.ownerAgentId, {
-      source: "assignment",
-      triggerDetail: "system",
-      reason: "source_scoped_recovery_action",
-      idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}`,
-      payload: withRecoveryModelProfileHint({
-        issueId: input.issue.id,
-        sourceIssueId: input.issue.id,
-        recoveryActionId: input.action.id,
-        strandedRunId: input.latestRun?.id ?? null,
-        recoveryCause: input.recoveryCause,
-      }, "status_only"),
-      requestedByActorType: "system",
-      requestedByActorId: null,
-      contextSnapshot: withRecoveryModelProfileHint({
-        issueId: input.issue.id,
-        taskId: input.issue.id,
-        wakeReason: "source_scoped_recovery_action",
-        skipIssueComment: true,
-        source: "issue_recovery_action",
-        recoveryActionId: input.action.id,
-        sourceIssueId: input.issue.id,
-        strandedRunId: input.latestRun?.id ?? null,
-        recoveryCause: input.recoveryCause,
-      }, "status_only"),
-    });
+
+    await enqueueOrRefundAttempt(delivery.agentId, delivery.opts);
     await reassertSourceScopedRecoveryBlockedAfterWake({
       sourceIssueId: input.issue.id,
       recoveryActionId: input.action.id,
-      agentId: input.action.ownerAgentId,
+      agentId: delivery.agentId,
     });
   }
 
@@ -4356,6 +4439,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (!action || action.id !== candidate.actionId || !action.ownerAgentId) continue;
       if (strandedRecoveryWakeAttemptsExhausted(action)) continue;
       if (await hasQueuedIssueWake(candidate.issue.companyId, candidate.issue.id, action.ownerAgentId)) continue;
+      const latestRun = await getLatestIssueRun(candidate.issue.companyId, candidate.issue.id);
+      const previewAction = { ...action, attemptCount: action.attemptCount + 1 };
+      const previewDelivery = buildSourceScopedStrandedRecoveryWakeDelivery({
+        action: previewAction,
+        issue: candidate.issue,
+        latestRun,
+        recoveryCause: action.cause as StrandedRecoveryCause,
+        hasNewActivitySinceLastAttempt: false,
+      });
+      if (!previewDelivery) continue;
 
       const reserved = await recoveryActionsSvc.reserveWakeAttempt({
         companyId: candidate.issue.companyId,
@@ -4365,6 +4458,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         wakePolicyType: "wake_owner",
         requireBlockedSourceIssue: true,
         requireNoOutstandingIssueWake: true,
+        buildWakeIntent: (reservedAction) => {
+          const delivery = buildSourceScopedStrandedRecoveryWakeDelivery({
+            action: reservedAction,
+            issue: candidate.issue,
+            latestRun,
+            recoveryCause: reservedAction.cause as StrandedRecoveryCause,
+            hasNewActivitySinceLastAttempt: false,
+          });
+          return delivery ?? previewDelivery;
+        },
       });
       if (!reserved) continue;
 
@@ -4372,9 +4475,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         await enqueueSourceScopedStrandedRecoveryWake({
           action: reserved,
           issue: candidate.issue,
-          latestRun: await getLatestIssueRun(candidate.issue.companyId, candidate.issue.id),
+          latestRun,
           recoveryCause: reserved.cause as StrandedRecoveryCause,
           hasNewActivitySinceLastAttempt: false,
+          wakeIntentId: reserved.wakeIntentId ?? null,
         });
         retried += 1;
       } catch (err) {

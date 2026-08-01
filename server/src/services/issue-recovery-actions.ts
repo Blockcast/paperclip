@@ -12,6 +12,7 @@ import type {
 export const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
 const SOURCE_SCOPED_WAKE_HORIZON_EVIDENCE_KEY = "sourceScopedWakeHorizonAt";
+const SOURCE_SCOPED_WAKE_INTENT_RETRY_DELAY_MS = 60_000;
 
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -50,8 +51,50 @@ export type ResolveIssueRecoveryActionInput = {
   resolutionNote?: string | null;
 };
 
+type RecoveryWakeIntentOptions = {
+  source?: "timer" | "assignment" | "on_demand" | "automation";
+  triggerDetail?: "manual" | "ping" | "callback" | "system";
+  reason?: string | null;
+  payload?: Record<string, unknown> | null;
+  idempotencyKey?: string | null;
+  requestedByActorType?: "user" | "agent" | "system";
+  requestedByActorId?: string | null;
+  contextSnapshot?: Record<string, unknown>;
+};
+
+type RecoveryWakeIntentInput = {
+  agentId: string;
+  opts: RecoveryWakeIntentOptions;
+};
+
+type ReservedWakeAttempt = IssueRecoveryAction & {
+  wakeIntentId?: string | null;
+};
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function safeJsonObject(value: unknown, fallback: Record<string, unknown> = {}) {
+  try {
+    const parsed = JSON.parse(JSON.stringify(value ?? null));
+    return isRecord(parsed) ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function safeWakeIntentOptions(opts: RecoveryWakeIntentOptions) {
+  return safeJsonObject(opts, {
+    source: opts.source ?? null,
+    triggerDetail: opts.triggerDetail ?? null,
+    reason: opts.reason ?? null,
+    payload: safeJsonObject(opts.payload, { unserializable: true }),
+    idempotencyKey: opts.idempotencyKey ?? null,
+    requestedByActorType: opts.requestedByActorType ?? null,
+    requestedByActorId: opts.requestedByActorId ?? null,
+    contextSnapshot: safeJsonObject(opts.contextSnapshot),
+  }) as RecoveryWakeIntentOptions;
 }
 
 function toValidDate(value: unknown): Date | null {
@@ -411,55 +454,100 @@ export function issueRecoveryActionService(db: Db) {
     wakePolicyType?: string;
     requireBlockedSourceIssue?: boolean;
     requireNoOutstandingIssueWake?: boolean;
-  }): Promise<IssueRecoveryAction | null> {
+    buildWakeIntent?: (action: IssueRecoveryAction) => RecoveryWakeIntentInput;
+  }): Promise<ReservedWakeAttempt | null> {
     const now = new Date();
-    const [updated] = await db
-      .update(issueRecoveryActions)
-      .set({
-        attemptCount: sql`${issueRecoveryActions.attemptCount} + 1`,
-        lastAttemptAt: now,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(issueRecoveryActions.id, input.actionId),
-          eq(issueRecoveryActions.companyId, input.companyId),
-          input.sourceIssueId ? eq(issueRecoveryActions.sourceIssueId, input.sourceIssueId) : undefined,
-          input.ownerAgentId ? eq(issueRecoveryActions.ownerAgentId, input.ownerAgentId) : undefined,
-          input.wakePolicyType
-            ? sql`${issueRecoveryActions.wakePolicy} ->> 'type' = ${input.wakePolicyType}`
-            : undefined,
-          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
-          sql`(${issueRecoveryActions.maxAttempts} is null or ${issueRecoveryActions.attemptCount} < ${issueRecoveryActions.maxAttempts})`,
-          sql`(${issueRecoveryActions.timeoutAt} is null or ${issueRecoveryActions.timeoutAt} > ${now})`,
-          input.requireBlockedSourceIssue && input.sourceIssueId
-            ? exists(
-              db
-                .select({ id: issues.id })
-                .from(issues)
-                .where(and(
-                  eq(issues.companyId, input.companyId),
-                  eq(issues.id, input.sourceIssueId),
-                  eq(issues.status, "blocked"),
-                  isNull(issues.assigneeUserId),
-                  isNull(issues.hiddenAt),
-                )),
-            )
-            : undefined,
-          input.requireNoOutstandingIssueWake && input.sourceIssueId && input.ownerAgentId
-            ? sql`not exists (
-                select 1
-                from ${agentWakeupRequests}
-                where ${agentWakeupRequests.companyId} = ${input.companyId}
-                  and ${agentWakeupRequests.agentId} = ${input.ownerAgentId}
-                  and ${agentWakeupRequests.status} in ('queued', 'deferred_issue_execution', 'claimed', 'running')
-                  and ${agentWakeupRequests.payload} ->> 'issueId' = ${input.sourceIssueId}
-              )`
-            : undefined,
-        ),
-      )
-      .returning();
-    return updated ? toReadModel(updated) : null;
+    return db.transaction(async (tx) => {
+      const [updated] = await tx
+        .update(issueRecoveryActions)
+        .set({
+          attemptCount: sql`${issueRecoveryActions.attemptCount} + 1`,
+          lastAttemptAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(issueRecoveryActions.id, input.actionId),
+            eq(issueRecoveryActions.companyId, input.companyId),
+            input.sourceIssueId ? eq(issueRecoveryActions.sourceIssueId, input.sourceIssueId) : undefined,
+            input.ownerAgentId ? eq(issueRecoveryActions.ownerAgentId, input.ownerAgentId) : undefined,
+            input.wakePolicyType
+              ? sql`${issueRecoveryActions.wakePolicy} ->> 'type' = ${input.wakePolicyType}`
+              : undefined,
+            inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+            sql`(${issueRecoveryActions.maxAttempts} is null or ${issueRecoveryActions.attemptCount} < ${issueRecoveryActions.maxAttempts})`,
+            sql`(${issueRecoveryActions.timeoutAt} is null or ${issueRecoveryActions.timeoutAt} > ${now.toISOString()}::timestamptz)`,
+            input.requireBlockedSourceIssue && input.sourceIssueId
+              ? exists(
+                tx
+                  .select({ id: issues.id })
+                  .from(issues)
+                  .where(and(
+                    eq(issues.companyId, input.companyId),
+                    eq(issues.id, input.sourceIssueId),
+                    eq(issues.status, "blocked"),
+                    isNull(issues.assigneeUserId),
+                    isNull(issues.hiddenAt),
+                  )),
+              )
+              : undefined,
+            input.requireNoOutstandingIssueWake && input.sourceIssueId && input.ownerAgentId
+              ? sql`not exists (
+                  select 1
+                  from ${agentWakeupRequests}
+                  where ${agentWakeupRequests.companyId} = ${input.companyId}
+                    and ${agentWakeupRequests.status} in ('dispatch_failed', 'queued', 'deferred_issue_execution', 'claimed', 'running')
+                    and (
+                      ${agentWakeupRequests.payload} ->> 'recoveryActionId' = ${input.actionId}
+                      or (
+                        ${agentWakeupRequests.agentId} = ${input.ownerAgentId}
+                        and ${agentWakeupRequests.payload} ->> 'issueId' = ${input.sourceIssueId}
+                      )
+                    )
+                )`
+              : undefined,
+          ),
+        )
+        .returning();
+      if (!updated) return null;
+
+      const action = toReadModel(updated);
+      const wakeIntent = input.buildWakeIntent?.(action);
+      if (!wakeIntent) return action;
+
+      const opts = wakeIntent.opts;
+      const originalOpts = safeWakeIntentOptions(opts);
+      const payload = safeJsonObject(opts.payload);
+      const [intent] = await tx
+        .insert(agentWakeupRequests)
+        .values({
+          companyId: input.companyId,
+          agentId: wakeIntent.agentId,
+          source: opts.source ?? "on_demand",
+          triggerDetail: opts.triggerDetail ?? null,
+          reason: opts.reason ?? null,
+          payload: {
+            ...payload,
+            issueId: input.sourceIssueId ?? payload.issueId ?? null,
+            sourceIssueId: input.sourceIssueId ?? payload.sourceIssueId ?? null,
+            recoveryActionId: input.actionId,
+            dispatchRetry: {
+              attempts: 0,
+              nextAttemptAt: new Date(now.getTime() + SOURCE_SCOPED_WAKE_INTENT_RETRY_DELAY_MS).toISOString(),
+              originalOpts,
+              lastError: "source-scoped recovery wake reserved but not yet dispatched",
+            },
+          },
+          status: "dispatch_failed",
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          updatedAt: now,
+        })
+        .returning({ id: agentWakeupRequests.id });
+
+      return { ...action, wakeIntentId: intent?.id ?? null };
+    });
   }
 
   async function resolveActiveForIssue(
