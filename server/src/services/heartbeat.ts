@@ -12421,21 +12421,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * run, and `finalizeAgentStatus` is a set-by-id. Each step is also
    * individually guarded — one agent failing to finalize must not strand the
    * rest, and the crash caller is on a clock.
-   *
-   * Guarded does not mean ignorable. Three steps are *required* for this run to
-   * count as recovered — the retry decision, the issue-lock disposition, and
-   * agent finalization — and the completion marker is written only when all
-   * three actually succeeded. A caught failure in any of them leaves the marker
-   * null so {@link reconcileWorkerCrashedRuns} replays the run, because the
-   * alternative is durably recording a recovery that did not happen: a
-   * transient `getAgent` or enqueue failure would leave a terminal run with no
-   * retry, a failed release would leave its issue locked to a dead run, and
-   * either way the row would vanish from the only pass that could still fix it.
    */
   async function recoverCrashInterruptedRun(
     run: typeof heartbeatRuns.$inferSelect,
     context: { reason: string; message: string; now: Date },
-  ): Promise<{ retryRunId: string | null; completed: boolean }> {
+  ): Promise<{ retryRunId: string | null }> {
     const { reason, message, now } = context;
     let retry: typeof heartbeatRuns.$inferSelect | null = null;
 
@@ -12456,40 +12446,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
 
     let agent: typeof agents.$inferSelect | null = null;
-    let agentLookupFailed = false;
     try {
       agent = await getAgent(run.agentId);
     } catch (error) {
-      agentLookupFailed = true;
       logger.warn({ err: error, agentId: run.agentId, runId: run.id }, "failed to load crash-interrupted run agent");
     }
-
-    // Distinguish "no retry, deliberately" from "no retry, because something
-    // broke". `enqueueProcessLossRetry` returns null only on its own decision
-    // that the agent is not invokable, having already released the issue lock;
-    // that is a complete recovery. A throw, or an agent row we could not read,
-    // is not — the run still needs a retry nobody has queued. A genuinely
-    // deleted agent (null without a throw) can never be retried, so it counts
-    // as settled rather than replaying forever.
-    let retryOutcome: "created" | "suppressed" | "failed" = "failed";
     try {
-      if (agent) {
-        retry = await enqueueProcessLossRetry(run, agent, now);
-        retryOutcome = retry ? "created" : "suppressed";
-      } else if (!agentLookupFailed) {
-        retryOutcome = "suppressed";
-      }
+      if (agent) retry = await enqueueProcessLossRetry(run, agent, now);
     } catch (error) {
       logger.warn({ err: error, runId: run.id }, "failed to enqueue crash-interrupted run retry");
     }
-
-    // The retry inherits the issue lock, so it only needs releasing when no
-    // retry took it over.
-    let lockDisposed = retryOutcome === "created";
     if (!retry) {
       try {
         await releaseIssueExecutionAndPromote(run);
-        lockDisposed = true;
       } catch (error) {
         logger.warn({ err: error, runId: run.id }, "failed to release crash-interrupted issue execution lock");
       }
@@ -12510,33 +12479,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       logger.warn({ err: error, runId: run.id }, "failed to append crash-interrupted run event");
     }
 
-    let agentFinalized = false;
     try {
       await finalizeAgentStatus(run.agentId, "interrupted", message, {
         errorCode: "worker_crashed",
         runId: run.id,
       });
-      agentFinalized = true;
     } catch {
       /* keep going; reconcileWorkerCrashedRuns remains the backstop */
     }
 
-    // Last write, deliberately, and only when every required step above
-    // actually succeeded. This is the durable "this run is recovered" marker
-    // that {@link reconcileWorkerCrashedRuns} selects on, so stamping it after
-    // a caught failure would erase the run from the only pass that could still
-    // finish it — the exact failure the marker exists to prevent. Leaving it
-    // null costs one replayed (idempotent) cleanup next startup; setting it
-    // wrongly costs the run permanently.
-    const completed = retryOutcome !== "failed" && lockDisposed && agentFinalized;
-    if (!completed) {
-      logger.warn(
-        { runId: run.id, retryOutcome, lockDisposed, agentFinalized },
-        "worker-crash recovery incomplete; leaving run for startup reconciliation",
-      );
-      return { retryRunId: retry?.id ?? null, completed };
-    }
-
+    // Last write, deliberately: this is the durable "every step above ran"
+    // marker that {@link reconcileWorkerCrashedRuns} selects on. Stamping it
+    // any earlier would let a crash mid-cleanup hide an unfinished run from the
+    // only pass that can find it. Best-effort, like every other step here — if
+    // this write is the one that dies, the run stays a candidate and the whole
+    // (idempotent) cleanup is simply replayed next startup.
     try {
       await db
         .update(heartbeatRuns)
@@ -12544,10 +12501,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(heartbeatRuns.id, run.id));
     } catch (error) {
       logger.warn({ err: error, runId: run.id }, "failed to stamp crash recovery completion");
-      return { retryRunId: retry?.id ?? null, completed: false };
     }
 
-    return { retryRunId: retry?.id ?? null, completed: true };
+    return { retryRunId: retry?.id ?? null };
   }
 
   /**
@@ -12574,15 +12530,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * Re-running recovery is still safe by construction (every step is
    * idempotent), which is what lets the marker be best-effort: a crash that
    * kills the stamp itself just replays the cleanup next time.
-   *
-   * The whole pass is serialized across replicas by one advisory lock, not just
-   * the retry insertion inside `enqueueProcessLossRetry`. Serializing only the
-   * retry still let every replica cancel wakeups, release locks, append a
-   * parent lifecycle event and finalize the same agent concurrently — and
-   * `nextRunEventSeq` is itself a check-then-insert, so the duplicated events
-   * race for a sequence number. Since this is a best-effort startup sweep, a
-   * replica that loses the lock simply skips the pass; the winner is already
-   * draining the same queue, and the next boot retries whatever is left.
    */
   async function reconcileWorkerCrashedRuns(options: { maxRuns?: number; now?: Date } = {}): Promise<{
     reconciledRunIds: string[];
@@ -12590,36 +12537,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }> {
     const now = options.now ?? new Date();
     const maxRuns = options.maxRuns ?? WORKER_CRASH_RECONCILE_MAX_RUNS;
-
-    // Hold the pass-level lock for as long as this transaction is open. The
-    // recovery work below deliberately runs on the pool rather than inside
-    // `tx` — these helpers are shared with the crash and reap paths and must
-    // not inherit a caller's transaction — but mutual exclusion does not
-    // require that: the lock is a mutex, and holding it for the duration of the
-    // pass is enough. `xact` scope means a replica that dies mid-pass releases
-    // it automatically, so a crashed recoverer can never wedge the sweep.
-    return db.transaction(async (tx) => {
-      const rows = await tx.execute(
-        sql`select pg_try_advisory_xact_lock(hashtextextended('heartbeat-worker-crash-reconcile', 0)) as acquired`,
-      );
-      const row = Array.isArray(rows) ? rows[0] : null;
-      if (
-        !row ||
-        typeof row !== "object" ||
-        (row as Record<string, unknown>).acquired !== true
-      ) {
-        logger.info("skipping worker-crash reconciliation; another replica holds the pass lock");
-        return { reconciledRunIds: [], retryRunIds: [] };
-      }
-      return reconcileWorkerCrashedRunsLocked({ maxRuns, now });
-    });
-  }
-
-  async function reconcileWorkerCrashedRunsLocked(options: { maxRuns: number; now: Date }): Promise<{
-    reconciledRunIds: string[];
-    retryRunIds: string[];
-  }> {
-    const { maxRuns, now } = options;
 
     // Deliberately NOT bounded by elapsed wall time. These rows are already
     // terminal, so the orphan reaper — which only scans `running` — can never
@@ -12631,9 +12548,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     //
     // Bounding is by batch size instead, with a deterministic oldest-first
     // order so repeated passes make monotonic progress over a backlog. Stamping
-    // `crashRecoveryCompletedAt` drops a recovered run out of the candidate
-    // set, so successive starts drain the tail rather than re-reading it. There
-    // is no index behind this scan on purpose — see migration 0208.
+    // `crashRecoveryCompletedAt` drops a recovered run out of the candidate set
+    // (and out of the partial index behind it, migration 0208), so successive
+    // starts drain the tail rather than re-reading it, and the steady-state
+    // query is an empty index probe.
     const candidates = await db
       .select()
       .from(heartbeatRuns)
@@ -12649,10 +12567,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const retryRunIds: string[] = [];
 
     for (const run of candidates) {
-      // Re-read the marker before working the run. Cross-replica exclusion is
-      // already handled by the pass lock; this catches the in-process case
-      // where an earlier pass in this same process recovered the run after the
-      // candidate list was materialized.
+      // Re-read under the marker before doing any work. This pass runs on every
+      // replica at startup — suppressed or not — so a peer that started
+      // moments earlier may have finished this run while we were iterating.
+      // The expensive, non-idempotent half (retry creation) is already
+      // serialized by an advisory lock inside `enqueueProcessLossRetry`; this
+      // check keeps the cheap half from redundantly re-running too, so a losing
+      // replica skips the run entirely rather than duplicating its lifecycle
+      // events and agent finalization.
       const fresh = await db
         .select()
         .from(heartbeatRuns)
