@@ -90,6 +90,10 @@ import {
   type SuccessfulRunHandoffState,
   type WorkspaceRuntimeService,
 } from "@paperclipai/shared";
+import {
+  findIssueDuplicateCandidates,
+  type IssueDuplicateDocument,
+} from "@paperclipai/shared/issue-duplicate-matcher";
 import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import type { StorageService } from "../storage/types.js";
@@ -178,8 +182,8 @@ import {
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
+  type IssueMonitorConvergence,
 } from "../services/issue-execution-policy.js";
-import type { IssueMonitorConvergence } from "../services/issue-execution-policy.js";
 import { monitorConvergenceComment } from "../services/issue-monitor-convergence-message.js";
 import type { IssueUnblockOwner } from "../services/issue-monitor-convergence-message.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
@@ -197,6 +201,73 @@ import {
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
+
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS = 30;
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP = 200;
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS = 1_000;
+
+type CreateIssueDuplicateCandidate = {
+  identifier: string;
+  title: string;
+  score: number;
+};
+
+type CreateIssueDuplicateCandidateRow = IssueDuplicateDocument & {
+  companyId: string;
+  projectId: string | null;
+  parentId: string | null;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
+  createdByAgentId: string | null;
+  status: string;
+  originKind: string | null;
+  originId: string | null;
+};
+
+async function findCreateIssueDuplicateCandidates(
+  db: Db,
+  companyId: string,
+  subject: IssueDuplicateDocument,
+  filterCorpus?: (
+    rows: CreateIssueDuplicateCandidateRow[],
+  ) => Promise<CreateIssueDuplicateCandidateRow[]>,
+): Promise<CreateIssueDuplicateCandidate[]> {
+  const cutoff = new Date(
+    Date.now() - ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS * 24 * 60 * 60 * 1_000,
+  );
+  const corpus = await db
+    .select({
+      id: issueRows.id,
+      identifier: issueRows.identifier,
+      title: issueRows.title,
+      description: issueRows.description,
+      companyId: issueRows.companyId,
+      projectId: issueRows.projectId,
+      parentId: issueRows.parentId,
+      assigneeAgentId: issueRows.assigneeAgentId,
+      assigneeUserId: issueRows.assigneeUserId,
+      createdByAgentId: issueRows.createdByAgentId,
+      status: issueRows.status,
+      originKind: issueRows.originKind,
+      originId: issueRows.originId,
+    })
+    .from(issueRows)
+    .where(and(
+      eq(issueRows.companyId, companyId),
+      isNull(issueRows.hiddenAt),
+      gte(issueRows.createdAt, cutoff),
+      notInArray(issueRows.id, [subject.id]),
+    ))
+    .orderBy(desc(issueRows.createdAt), desc(issueRows.id))
+    .limit(ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP);
+  const visibleCorpus = filterCorpus ? await filterCorpus(corpus) : corpus;
+
+  return findIssueDuplicateCandidates(subject, visibleCorpus).candidates.map((candidate) => ({
+    identifier: candidate.identifier ?? candidate.id,
+    title: candidate.title,
+    score: candidate.score,
+  }));
+}
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -8793,10 +8864,26 @@ export function issueRoutes(
         ...issue,
         deduplicated: true,
         deduplicationReason,
+        duplicateCandidates: [],
         relatedWork: referenceSummary,
         referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
       });
       return;
+    }
+    let duplicateCandidates: CreateIssueDuplicateCandidate[] = [];
+    try {
+      const canReadCompanyScope = await actorCanReadCompanyScope(req, companyId);
+      duplicateCandidates = await findCreateIssueDuplicateCandidates(db, companyId, {
+        id: issue.id,
+        identifier: issue.identifier,
+        title: issue.title,
+        description: issue.description,
+      }, canReadCompanyScope ? undefined : (rows) => filterIssuesForActor(req, rows));
+    } catch (err) {
+      logger.warn(
+        { err, companyId, issueId: issue.id, issueIdentifier: issue.identifier },
+        "issue duplicate candidate lookup failed; continuing create without advisories",
+      );
     }
     await issueReferencesSvc.syncIssue(issue.id);
     await externalObjectsSvc.syncIssueSafely(issue.id);
@@ -8819,6 +8906,7 @@ export function issueRoutes(
       details: {
         title: issue.title,
         identifier: issue.identifier,
+        ...(duplicateCandidates.length > 0 ? { duplicateCandidates } : {}),
         ...(watchdogProductBugFollowUp
           ? {
             watchdogDiscovery: {
@@ -8898,6 +8986,7 @@ export function issueRoutes(
 
     res.status(201).json({
       ...issue,
+      duplicateCandidates,
       relatedWork: referenceSummary,
       referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
     });
