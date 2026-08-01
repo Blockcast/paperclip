@@ -21,6 +21,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { issueService } from "../services/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1247,6 +1248,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         status: "running",
         invocationSource: "assignment",
         startedAt: new Date(),
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
       });
       await db.insert(issues).values({
         id: issueId,
@@ -1260,6 +1262,10 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         executionAgentNameKey: "codexcoder",
         executionLockedAt: new Date(),
       });
+      await db
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: { issueId } })
+        .where(eq(heartbeatRuns.id, currentRunId));
 
       const response = await request(createApp(agentActor(companyId, agentId, currentRunId)))
         .patch(`/api/issues/${issueId}`)
@@ -1403,5 +1409,48 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       .from(issueExecutionDecisions)
       .where(eq(issueExecutionDecisions.issueId, issueId));
     expect(decisions).toHaveLength(1);
+  });
+
+  it("rejects a decision update derived from a stale execution policy", async () => {
+    const { companyId, agentId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const originalPolicy = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [],
+    };
+    const revisedPolicy = {
+      ...originalPolicy,
+      stages: [{
+        id: randomUUID(),
+        type: "review",
+        approvalsNeeded: 1,
+        participants: [{ type: "agent", agentId }],
+      }],
+    };
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Policy CAS",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionPolicy: originalPolicy,
+      executionState: { status: "idle" },
+    });
+    await db.update(issues).set({ executionPolicy: revisedPolicy }).where(eq(issues.id, issueId));
+
+    await expect(issueService(db).update(issueId, {
+      status: "done",
+      expectedCurrentExecutionState: { status: "idle" },
+      expectedCurrentExecutionPolicy: originalPolicy,
+    })).rejects.toMatchObject({ status: 409 });
+
+    const row = await db
+      .select({ status: issues.status, executionPolicy: issues.executionPolicy })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ status: "in_review", executionPolicy: revisedPolicy });
   });
 });
