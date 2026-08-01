@@ -309,6 +309,15 @@ describe("IssueDocumentAnnotations", () => {
     return root;
   }
 
+  async function waitForThread(threadId: string) {
+    let thread: HTMLElement | null = null;
+    await vi.waitFor(() => {
+      thread = container.querySelector(`[data-thread-id="${threadId}"]`) as HTMLElement | null;
+      expect(thread).not.toBeNull();
+    });
+    return thread!;
+  }
+
   it("renders the open count chip and opens the panel on click", async () => {
     mockAnnotationsApi.list.mockResolvedValue([makeThread()]);
     const root = createTestRoot();
@@ -640,8 +649,7 @@ describe("IssueDocumentAnnotations", () => {
     await flush();
 
     // Click the open thread to expand it.
-    const threadCard = container.querySelector('[data-thread-id="open-1"]') as HTMLElement | null;
-    expect(threadCard).not.toBeNull();
+    const threadCard = await waitForThread("open-1");
     await act(async () => threadCard!.click());
     await flush();
 
@@ -875,7 +883,7 @@ describe("IssueDocumentAnnotations", () => {
     await flush();
     await flush();
 
-    const openThread = container.querySelector('[data-thread-id="open-1"]') as HTMLElement | null;
+    const openThread = await waitForThread("open-1");
     await act(async () => openThread!.click());
     await flush();
 
@@ -911,8 +919,7 @@ describe("IssueDocumentAnnotations", () => {
     await flush();
     await flush();
 
-    const openThread = container.querySelector('[data-thread-id="open-1"]') as HTMLElement | null;
-    expect(openThread).not.toBeNull();
+    const openThread = await waitForThread("open-1");
     await act(async () => openThread!.click());
     await flush();
 
@@ -960,8 +967,7 @@ describe("IssueDocumentAnnotations", () => {
     await flush();
     await flush();
 
-    const openThread = container.querySelector('[data-thread-id="open-1"]') as HTMLElement | null;
-    expect(openThread).not.toBeNull();
+    const openThread = await waitForThread("open-1");
     await act(async () => openThread!.click());
     await flush();
 
@@ -974,8 +980,7 @@ describe("IssueDocumentAnnotations", () => {
     expect(mockAnnotationsApi.updateStatus).toHaveBeenCalledWith("issue-1", "plan", "open-1", "resolved");
 
     // Resolved threads stay in the same list (filter tabs were removed).
-    const resolvedThread = container.querySelector('[data-thread-id="resolved-1"]') as HTMLElement | null;
-    expect(resolvedThread).not.toBeNull();
+    const resolvedThread = await waitForThread("resolved-1");
     await act(async () => resolvedThread!.click());
     await flush();
 
