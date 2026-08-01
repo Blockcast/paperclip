@@ -9584,7 +9584,8 @@ export function issueService(db: Db) {
       if (
         current.assigneeAgentId === agentId &&
         current.status === "in_progress" &&
-        sameRunLock(current.checkoutRunId, checkoutRunId)
+        sameRunLock(current.checkoutRunId, checkoutRunId) &&
+        (current.executionRunId == null || current.executionRunId === checkoutRunId)
       ) {
         const row = await db.select().from(issues).where(eq(issues.id, id)).then((rows) => rows[0] ?? null);
         if (!row) throw notFound("Issue not found");
@@ -9710,7 +9711,8 @@ export function issueService(db: Db) {
         if (
           candidate.status === "in_progress" &&
           candidate.assigneeAgentId === actorAgentId &&
-          sameRunLock(candidate.checkoutRunId, actorRunId)
+          sameRunLock(candidate.checkoutRunId, actorRunId) &&
+          (candidate.executionRunId == null || candidate.executionRunId === actorRunId)
         ) {
           return { ...candidate, adoptedFromRunId: null as string | null };
         }
