@@ -2017,7 +2017,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     await db
       .update(issues)
-      .set({ assigneeAgentId: null })
+      .set({
+        assigneeAgentId: null,
+        lastActivityAt: new Date(afterFirst!.lastAttemptAt as Date | string),
+      })
       .where(eq(issues.id, sourceIssueId));
 
     await sweep();
