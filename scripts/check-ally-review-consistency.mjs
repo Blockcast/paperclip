@@ -154,16 +154,51 @@ function gh(args) {
   });
 }
 
-function fetchOpenPrs(repo) {
-  const numbers = JSON.parse(
-    gh(["pr", "list", "--repo", repo, "--state", "open", "--limit", "200", "--json", "number"]),
-  ).map((row) => row.number);
+/**
+ * `gh pr list` caps at whatever `--limit` we pass and truncates silently. A
+ * truncated list would let the guard print a pass over PRs it never fetched —
+ * the same fail-open shape this script exists to catch — so hitting the cap is
+ * a hard error, not a warning.
+ */
+const PR_LIST_LIMIT = 500;
 
-  return numbers.map((number) => ({
-    number,
-    headSha: JSON.parse(gh(["api", `repos/${repo}/pulls/${number}`])).head.sha,
+export function assertPrListComplete(rows, repo, limit = PR_LIST_LIMIT) {
+  if ((rows ?? []).length >= limit) {
+    throw new Error(
+      `gh pr list returned ${rows.length} open PR(s) for ${repo}, at the --limit of ` +
+        `${limit}: the list is probably truncated and this guard cannot assert ` +
+        `its invariant over PRs it never fetched. Raise PR_LIST_LIMIT.`,
+    );
+  }
+  return rows;
+}
+
+function fetchOpenPrs(repo) {
+  // number + headRefOid both come back from this one call; fetching the head
+  // via `gh api repos/{repo}/pulls/{number}` instead would pull a ~22 KB
+  // payload per PR to read one field.
+  const rows = JSON.parse(
+    gh([
+      "pr",
+      "list",
+      "--repo",
+      repo,
+      "--state",
+      "open",
+      "--limit",
+      String(PR_LIST_LIMIT),
+      "--json",
+      "number,headRefOid",
+    ]),
+  );
+
+  assertPrListComplete(rows, repo);
+
+  return rows.map((row) => ({
+    number: row.number,
+    headSha: row.headRefOid,
     reviews: JSON.parse(
-      gh(["api", `repos/${repo}/pulls/${number}/reviews`, "--paginate"]),
+      gh(["api", `repos/${repo}/pulls/${row.number}/reviews`, "--paginate"]),
     ),
   }));
 }

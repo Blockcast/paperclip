@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 
 import {
+  assertPrListComplete,
   attestedHead,
   findPrViolations,
   findViolations,
@@ -302,5 +303,21 @@ describe("isMainModule", () => {
   it("does not match a different argv path", () => {
     const scriptPath = resolve("/tmp/ally space/check-ally-review-consistency.mjs");
     assert.equal(isMainModule("/tmp/other-script.mjs", pathToFileURL(scriptPath).href), false);
+  });
+});
+
+describe("assertPrListComplete", () => {
+  it("passes a list comfortably under the limit", () => {
+    const rows = [{ number: 1 }, { number: 2 }];
+    assert.equal(assertPrListComplete(rows, "o/r", 10), rows);
+  });
+
+  it("throws when the returned count reaches the limit, rather than passing silently", () => {
+    const rows = Array.from({ length: 10 }, (_, i) => ({ number: i }));
+    assert.throws(() => assertPrListComplete(rows, "o/r", 10), /probably truncated/);
+  });
+
+  it("tolerates a nullish list", () => {
+    assert.doesNotThrow(() => assertPrListComplete(undefined, "o/r", 10));
   });
 });
