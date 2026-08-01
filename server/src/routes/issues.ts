@@ -228,6 +228,17 @@ type CreateIssueDuplicateCandidateRow = IssueDuplicateDocument & {
   createdAt: Date;
 };
 
+type CreateIssueDuplicateCandidateCorpusFilter = (
+  rows: CreateIssueDuplicateCandidateRow[],
+  signal?: AbortSignal,
+  scopedDb?: Db,
+) => Promise<CreateIssueDuplicateCandidateRow[]>;
+
+type CreateIssueDuplicateCandidatePage = {
+  corpus: Array<CreateIssueDuplicateCandidateRow & { createdAtMicros: string }>;
+  readable: CreateIssueDuplicateCandidateRow[];
+};
+
 export function raceCreateIssueDuplicateCandidateLookup<T>(
   promise: Promise<T>,
   timeoutMs = ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS,
@@ -249,67 +260,76 @@ export function raceCreateIssueDuplicateCandidateLookup<T>(
   });
 }
 
-async function findCreateIssueDuplicateCandidates(
+export async function findCreateIssueDuplicateCandidates(
   db: Db,
   companyId: string,
   subject: IssueDuplicateDocument,
-  filterCorpus?: (
-    rows: CreateIssueDuplicateCandidateRow[],
-  ) => Promise<CreateIssueDuplicateCandidateRow[]>,
+  filterCorpus?: CreateIssueDuplicateCandidateCorpusFilter,
   signal?: AbortSignal,
+  statementTimeoutMs = ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS,
 ): Promise<CreateIssueDuplicateCandidate[]> {
   const cutoff = new Date(
     Date.now() - ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS * 24 * 60 * 60 * 1_000,
   );
   const visibleCorpus: CreateIssueDuplicateCandidateRow[] = [];
   let scannedRows = 0;
-  let cursor: { createdAt: Date; id: string } | null = null;
+  let cursor: { createdAtMicros: string; id: string } | null = null;
+  const createdAtMicros = sql<string>`(
+    extract(epoch from ${issueRows.createdAt}) * 1000000
+  )::numeric(20, 0)`;
   do {
     signal?.throwIfAborted();
     const cursorCondition: SQL | undefined = cursor
       ? or(
-          lt(issueRows.createdAt, cursor.createdAt),
-          and(eq(issueRows.createdAt, cursor.createdAt), lt(issueRows.id, cursor.id)),
+          lt(createdAtMicros, cursor.createdAtMicros),
+          and(eq(createdAtMicros, cursor.createdAtMicros), lt(issueRows.id, cursor.id)),
         )
       : undefined;
-    const corpus: CreateIssueDuplicateCandidateRow[] = await db
-      .select({
-        id: issueRows.id,
-        identifier: issueRows.identifier,
-        title: issueRows.title,
-        description: issueRows.description,
-        companyId: issueRows.companyId,
-        projectId: issueRows.projectId,
-        parentId: issueRows.parentId,
-        assigneeAgentId: issueRows.assigneeAgentId,
-        assigneeUserId: issueRows.assigneeUserId,
-        createdByAgentId: issueRows.createdByAgentId,
-        status: issueRows.status,
-        originKind: issueRows.originKind,
-        originId: issueRows.originId,
-        createdAt: issueRows.createdAt,
-      })
-      .from(issueRows)
-      .where(and(
-        eq(issueRows.companyId, companyId),
-        isNull(issueRows.hiddenAt),
-        gte(issueRows.createdAt, cutoff),
-        notInArray(issueRows.id, [subject.id]),
-        cursorCondition,
-      ))
-      .orderBy(desc(issueRows.createdAt), desc(issueRows.id))
-      .limit(Math.min(
-        ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP,
-        ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP - scannedRows,
-      ));
+    const page: CreateIssueDuplicateCandidatePage = await db.transaction(async (tx) => {
+      await tx.execute(sql`select set_config('statement_timeout', ${String(statementTimeoutMs)}, true)`);
+      const corpus: CreateIssueDuplicateCandidatePage["corpus"] = await tx
+        .select({
+          id: issueRows.id,
+          identifier: issueRows.identifier,
+          title: issueRows.title,
+          description: issueRows.description,
+          companyId: issueRows.companyId,
+          projectId: issueRows.projectId,
+          parentId: issueRows.parentId,
+          assigneeAgentId: issueRows.assigneeAgentId,
+          assigneeUserId: issueRows.assigneeUserId,
+          createdByAgentId: issueRows.createdByAgentId,
+          status: issueRows.status,
+          originKind: issueRows.originKind,
+          originId: issueRows.originId,
+          createdAt: issueRows.createdAt,
+          createdAtMicros,
+        })
+        .from(issueRows)
+        .where(and(
+          eq(issueRows.companyId, companyId),
+          isNull(issueRows.hiddenAt),
+          gte(issueRows.createdAt, cutoff),
+          notInArray(issueRows.id, [subject.id]),
+          cursorCondition,
+        ))
+        .orderBy(desc(issueRows.createdAt), desc(issueRows.id))
+        .limit(Math.min(
+          ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP,
+          ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP - scannedRows,
+        ));
+      signal?.throwIfAborted();
+      const readable = filterCorpus
+        ? await filterCorpus(corpus, signal, tx as unknown as Db)
+        : corpus;
+      return { corpus, readable };
+    });
     signal?.throwIfAborted();
-    const readable = filterCorpus ? await filterCorpus(corpus) : corpus;
-    signal?.throwIfAborted();
-    visibleCorpus.push(...readable);
-    scannedRows += corpus.length;
-    const lastRow = corpus.at(-1);
-    cursor = lastRow ? { createdAt: lastRow.createdAt, id: lastRow.id } : null;
-    if (!filterCorpus || corpus.length < ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP) break;
+    visibleCorpus.push(...page.readable);
+    scannedRows += page.corpus.length;
+    const lastRow = page.corpus.at(-1);
+    cursor = lastRow ? { createdAtMicros: lastRow.createdAtMicros, id: lastRow.id } : null;
+    if (!filterCorpus || page.corpus.length < ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP) break;
   } while (
     visibleCorpus.length < ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP
     && scannedRows < ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP
@@ -2834,9 +2854,7 @@ export function issueRoutes(
     createIssueDuplicateCandidateTimeoutMs?: number;
     createIssueDuplicateCandidateActivityWriter?: typeof logActivity;
     createIssueDuplicateCandidateActivityTimeoutMs?: number;
-    createIssueDuplicateCandidateCorpusFilter?: (
-      rows: CreateIssueDuplicateCandidateRow[],
-    ) => Promise<CreateIssueDuplicateCandidateRow[]>;
+    createIssueDuplicateCandidateCorpusFilter?: CreateIssueDuplicateCandidateCorpusFilter;
   } = {},
 ) {
   const router = Router();
@@ -4740,9 +4758,49 @@ export function issueRoutes(
     return action.ownerAgentId === issue.assigneeAgentId;
   }
 
-  async function filterIssuesForActor<T extends Parameters<typeof decideIssueAccess>[1]>(req: Request, rows: T[]) {
-    const decisions = await Promise.all(rows.map((issue) => decideIssueAccess(req, issue, "issue:read")));
-    return rows.filter((_, index) => decisions[index]?.allowed);
+  async function filterIssuesForActor<T extends Parameters<typeof decideIssueAccess>[1]>(
+    req: Request,
+    rows: T[],
+    signal?: AbortSignal,
+    scopedDb?: Db,
+  ) {
+    if (!signal && !scopedDb) {
+      const decisions = await Promise.all(rows.map((issue) => decideIssueAccess(req, issue, "issue:read")));
+      return rows.filter((_, index) => decisions[index]?.allowed);
+    }
+    const scopedAccess = scopedDb ? accessService(scopedDb) : access;
+    const readable: T[] = [];
+    for (const issue of rows) {
+      signal?.throwIfAborted();
+      const decision = await scopedAccess.decide({
+        actor: req.actor,
+        action: "issue:read",
+        resource: {
+          type: "issue",
+          companyId: issue.companyId,
+          issueId: issue.id,
+          projectId: issue.projectId,
+          parentIssueId: issue.parentId,
+          assigneeAgentId: issue.assigneeAgentId,
+          assigneeUserId: issue.assigneeUserId,
+          createdByAgentId: issue.createdByAgentId ?? null,
+          status: issue.status,
+          originKind: issue.originKind,
+          originId: issue.originId ?? null,
+        },
+        scope: {
+          issueId: issue.id,
+          projectId: issue.projectId,
+          parentIssueId: issue.parentId,
+          assigneeAgentId: issue.assigneeAgentId,
+          assigneeUserId: issue.assigneeUserId,
+          originKind: issue.originKind ?? null,
+          originId: issue.originId ?? null,
+        },
+      });
+      if (decision.allowed) readable.push(issue);
+    }
+    return readable;
   }
 
   async function actorCanReadCompanyScope(req: Request, companyId: string) {
@@ -8944,8 +9002,11 @@ export function issueRoutes(
           title: issue.title,
           description: issue.description,
         }, opts.createIssueDuplicateCandidateCorpusFilter
-          ?? (canReadCompanyScope ? undefined : (rows) => filterIssuesForActor(req, rows)),
-        lookupAbortController.signal);
+          ?? (canReadCompanyScope
+            ? undefined
+            : (rows, signal, scopedDb) => filterIssuesForActor(req, rows, signal, scopedDb)),
+        lookupAbortController.signal,
+        opts.createIssueDuplicateCandidateTimeoutMs);
       })(), opts.createIssueDuplicateCandidateTimeoutMs, () => lookupAbortController.abort());
     } catch (err) {
       logger.warn(
