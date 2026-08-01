@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { performance } from "node:perf_hooks";
 import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
@@ -11,6 +13,7 @@ import {
   heartbeatRuns,
   issueCreateIdempotencyKeys,
   issues,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -18,7 +21,11 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/index.js";
-import { issueRoutes } from "../routes/issues.js";
+import {
+  ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS,
+  ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP,
+  issueRoutes,
+} from "../routes/issues.js";
 import {
   ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS,
   issueService,
@@ -26,6 +33,19 @@ import {
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+type FilingFixture = {
+  identifier: string;
+  title: string;
+  description: string;
+};
+
+const monitorFilings = JSON.parse(
+  readFileSync(
+    new URL("../../../packages/shared/src/__fixtures__/issue-duplicate-monitor-filings.json", import.meta.url),
+    "utf8",
+  ),
+) as FilingFixture[];
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -50,6 +70,7 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
+    await db.delete(projects);
     await db.delete(companies);
   });
 
@@ -85,6 +106,11 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       priority: "medium",
     }).returning();
     return parent;
+  }
+
+  async function seedProject(companyId: string, name: string) {
+    const [project] = await db.insert(projects).values({ companyId, name }).returning();
+    return project;
   }
 
   it("replays the existing issue for the same company idempotency key", async () => {
@@ -226,6 +252,129 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       .expect(201);
 
     expect(duplicate.body.id).not.toBe(first.body.id);
+  });
+
+  it("returns company-scoped advisory candidates and records one queryable consumption event", async () => {
+    const companyId = await seedCompany();
+    const candidateProject = await seedProject(companyId, "Candidate project");
+    const createdProject = await seedProject(companyId, "Created project");
+    const app = createApp();
+    const seededFilings = [monitorFilings[0]!, monitorFilings[2]!, monitorFilings[3]!];
+
+    await db.insert(issues).values(seededFilings.map((filing) => ({
+      companyId,
+      projectId: candidateProject.id,
+      identifier: filing.identifier,
+      title: filing.title,
+      description: filing.description,
+      status: "todo",
+      priority: "medium",
+    })));
+
+    const subject = monitorFilings[1]!;
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        projectId: createdProject.id,
+        title: subject.title,
+        description: subject.description,
+        allowDuplicate: false,
+      })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates.map((candidate: { identifier: string }) => candidate.identifier).sort())
+      .toEqual(seededFilings.map((filing) => filing.identifier).sort());
+    expect(response.body.duplicateCandidates[0]).toEqual(expect.objectContaining({
+      identifier: expect.any(String),
+      title: expect.any(String),
+      score: expect.any(Number),
+    }));
+
+    const explicitlyAllowed = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        projectId: createdProject.id,
+        title: `Retry: ${subject.title}`,
+        description: subject.description,
+        allowDuplicate: true,
+      })
+      .expect(201);
+    expect(explicitlyAllowed.body.duplicateCandidates).not.toEqual([]);
+
+    const createdEvents = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, response.body.id));
+    const consumptionEvents = createdEvents.filter(
+      (event) => event.action === "issue.created" && Array.isArray(event.details?.duplicateCandidates),
+    );
+    expect(consumptionEvents).toHaveLength(1);
+    expect(consumptionEvents[0]?.details).toMatchObject({
+      identifier: response.body.identifier,
+      duplicateCandidates: response.body.duplicateCandidates.map(
+        (candidate: { identifier: string; score: number }) => ({
+          identifier: candidate.identifier,
+          score: candidate.score,
+        }),
+      ),
+    });
+  });
+
+  it("returns no advisory and records no consumption payload for a distinct issue", async () => {
+    const companyId = await seedCompany();
+    const app = createApp();
+    await db.insert(issues).values({
+      companyId,
+      identifier: "BLO-17001",
+      title: "Issue list rows wrap at tablet width",
+      description: "The `IssueRow` layout hides the assignee avatar at 1024px.",
+      status: "todo",
+      priority: "medium",
+    });
+
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Worker retry backoff resets after restart",
+        description: "Persist `nextAttemptAt` so adapter retries survive a worker crashloop.",
+      })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).toEqual([]);
+    const createdEvents = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, response.body.id));
+    expect(createdEvents.filter((event) => event.details?.duplicateCandidates !== undefined)).toHaveLength(0);
+  });
+
+  it("keeps candidate lookup below the declared budget with the row cap saturated", async () => {
+    const companyId = await seedCompany();
+    const app = createApp();
+    await db.insert(issues).values(Array.from(
+      { length: ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP },
+      (_, index) => ({
+        companyId,
+        title: `Bounded candidate ${index}`,
+        description: `Investigate uniqueSymbol${index} in server/src/bounded/candidate-${index}.ts`,
+        status: "todo",
+        priority: "medium",
+      }),
+    ));
+
+    const startedAt = performance.now();
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Completely separate release documentation task",
+        description: "Update the operator handbook release checklist and screenshots.",
+        allowDuplicate: true,
+      })
+      .expect(201);
+    const elapsedMs = performance.now() - startedAt;
+
+    expect(response.body.duplicateCandidates).toEqual([]);
+    expect(elapsedMs).toBeLessThan(ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS);
   });
 
   it("does not apply the route soft guard to internal service creates", async () => {
