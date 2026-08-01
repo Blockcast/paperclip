@@ -705,3 +705,9 @@ describe("paperclip MCP tools", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
+
+// BLO-20076 SCRATCH PROOF -- deliberately failing. Never merged; this branch
+// exists only to demonstrate that CI actually executes this file.
+it("BLO-20076 scratch: deliberate failure proving CI runs this file", () => {
+  expect("mcp-server-tests-are-executed-by-ci").toBe("this-assertion-must-fail");
+});
