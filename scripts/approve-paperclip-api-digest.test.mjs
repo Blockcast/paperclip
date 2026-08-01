@@ -7,10 +7,13 @@
 // tests drive the real file with a stub `kubectl` so the ring semantics are
 // pinned here, in the repo that ships them, without needing a cluster.
 //
-// `jq` is a hard dependency of the script itself, so the behavioural cases are
-// skipped (visibly, with a reason) on a runner that lacks it. The structural
-// case at the bottom always runs — it is what stops the rotation from being
-// re-inlined into the workflow and drifting again.
+// `jq` is a hard dependency of the script itself. Locally the behavioural cases
+// skip (visibly, with a reason) on a machine that lacks it; in CI they must NOT,
+// because a skip and a pass are the same green tick — losing jq from the runner
+// image would silently reduce this file to its one structural case while the
+// policy job still reported success. Under CI a missing dependency is a failure.
+// The structural cases at the bottom always run: they are what stops the
+// rotation from being re-inlined into the workflow and drifting again.
 
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
@@ -31,8 +34,21 @@ function have(bin) {
   }
 }
 
-const missing = ["jq", "bash"].filter((b) => !have(b));
+const REQUIRED_BINS = ["jq", "bash"];
+const missing = REQUIRED_BINS.filter((b) => !have(b));
 const skip = missing.length ? `requires ${missing.join(" + ")} on PATH` : false;
+
+// Fail closed on CI rather than skipping into a green run.
+test("behavioural prerequisites are present on CI", () => {
+  if (!process.env.CI) return;
+  assert.deepEqual(
+    missing,
+    [],
+    `CI runner is missing ${missing.join(", ")}; the behavioural cases below would ` +
+      "silently skip and this job would still pass. Install the dependency in the " +
+      "policy job (or drop it from the script) rather than letting coverage vanish.",
+  );
+});
 
 /** A 64-lowercase-hex digest, distinct per `n`. */
 const digest = (n) => `sha256:${n.toString(16).padStart(64, "0")}`;
@@ -226,7 +242,7 @@ test("the deploy workflow calls the script rather than re-inlining the rotation"
 
   assert.match(
     step,
-    /\.\/scripts\/approve-paperclip-api-digest\.sh "\$\{DIGEST\}"/,
+    /"\$\{APPROVE_SCRIPT\}" "\$\{DIGEST\}"/,
     "the step must invoke the committed script",
   );
   assert.doesNotMatch(
@@ -238,9 +254,64 @@ test("the deploy workflow calls the script rather than re-inlining the rotation"
   // The approver is the higher-privilege of the two credentials this job
   // handles; on a self-hosted runner a mid-step failure must not leave it on
   // disk, so the trap has to be armed before the secret is written.
-  const trapAt = step.indexOf("trap 'rm -f");
+  const trapAt = step.indexOf("trap 'rm -rf");
   const writeAt = step.indexOf('printf \'%s\' "${APPROVER_KUBECONFIG}"');
-  assert.notEqual(trapAt, -1, "the step must install an EXIT trap for the approver kubeconfig");
+  assert.notEqual(trapAt, -1, "the step must install an EXIT trap for the approver credential");
   assert.notEqual(writeAt, -1, "the step must write the approver kubeconfig");
   assert.ok(trapAt < writeAt, "the EXIT trap must be armed before the credential reaches disk");
+
+  // A fixed path is opened through any symlink already sitting at that name.
+  // arc-deploy is a self-hosted pool, so residue from an earlier workload could
+  // redirect the credential write; mktemp -d cannot open an existing entry.
+  assert.match(
+    step,
+    /mktemp -d "\$\{RUNNER_TEMP\}\/approver\.X{6,}"/,
+    "the approver credential must live under a mktemp -d directory",
+  );
+  assert.doesNotMatch(
+    step,
+    /approver_kubeconfig="\$\{?RUNNER_TEMP\}?\//,
+    "the approver credential path must not be a predictable literal",
+  );
+});
+
+// The approval step runs with a credential that can rewrite the live admission
+// allowlist. `target_sha` is operator-supplied and, for a rollback, an arbitrary
+// historical revision — so the tooling it executes must come from the workflow's
+// own revision instead. Without this the credential runs whatever that commit
+// contained: nothing (rollback to before the script existed) or a reverted
+// implementation.
+test("the approval step runs tooling from the trusted workflow revision", () => {
+  const workflow = readFileSync(WORKFLOW, "utf8");
+
+  const checkoutAt = workflow.indexOf("- name: Checkout release tooling at trusted revision");
+  const approveAt = workflow.indexOf("- name: Approve deploy digest at admission time");
+  assert.notEqual(checkoutAt, -1, "docker.yml must check out release tooling separately");
+  assert.ok(checkoutAt < approveAt, "the tooling checkout must precede the approval step");
+
+  const checkout = workflow.slice(checkoutAt, approveAt);
+  assert.match(
+    checkout,
+    /ref: \$\{\{ github\.workflow_sha \}\}/,
+    "release tooling must be pinned to github.workflow_sha, not the deploy target",
+  );
+  assert.match(
+    checkout,
+    /path: \.release-tooling/,
+    "release tooling must land beside, not on top of, the deploy checkout",
+  );
+  assert.match(
+    checkout,
+    /actual=\$\(git -C \.release-tooling rev-parse HEAD/,
+    "the resolved tooling revision must be asserted, not assumed",
+  );
+
+  // The deploy checkout is still what Helm renders — only the approval tooling
+  // moves to the trusted revision.
+  const approveStep = workflow.slice(approveAt);
+  assert.doesNotMatch(
+    approveStep.slice(0, approveStep.search(/^ {6}- name: /m) || undefined),
+    /\.\/scripts\/approve-paperclip-api-digest\.sh/,
+    "the approval step must not execute the script out of the deploy checkout",
+  );
 });

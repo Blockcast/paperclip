@@ -389,10 +389,61 @@ jobs:
       # stops a direct namespace write from forging an approval. The approver
       # credential is bound to a Role over exactly one ConfigMap name and holds
       # no cluster-scoped permission.
+      # The release tooling runs from the TRUSTED workflow revision, not from the
+      # checkout above. That checkout is `target_sha` — an operator-supplied
+      # commit, which for a rollback is an arbitrary historical revision of this
+      # repo. Executing a script out of it with the release-approver credential
+      # would mean the credential runs whatever that commit happened to contain:
+      # a rollback to before this script existed dies on `No such file or
+      # directory`, and a rollback onto a commit carrying a later-reverted
+      # version silently runs that old code against the live approval object.
+      #
+      # github.workflow_sha is the commit the currently-executing workflow file
+      # came from, so the script and the workflow step invoking it are always the
+      # same revision and neither is chosen by the deploy requester. The target
+      # checkout stays in place: the Helm chart and application artifact must
+      # still come from the historical commit being rolled out.
+      - name: Checkout release tooling at trusted revision
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-tooling
+          fetch-depth: 1
+          sparse-checkout: scripts/approve-paperclip-api-digest.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Verify release tooling revision
+        id: tooling
+        env:
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          # Assert rather than assume, matching "Verify target commit" above: if
+          # the context is ever empty or the checkout silently resolves
+          # elsewhere, fail here instead of approving a digest with tooling of
+          # unknown provenance.
+          expected=$(printf '%s' "${WORKFLOW_SHA}" | tr '[:upper:]' '[:lower:]')
+          if [[ ! "${expected}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "github.workflow_sha is not a full commit SHA: '${WORKFLOW_SHA}'" >&2
+            exit 1
+          fi
+          actual=$(git -C .release-tooling rev-parse HEAD | tr '[:upper:]' '[:lower:]')
+          if [ "${actual}" != "${expected}" ]; then
+            echo "Release tooling resolved to ${actual}, expected ${expected}" >&2
+            exit 1
+          fi
+          script="$(pwd)/.release-tooling/scripts/approve-paperclip-api-digest.sh"
+          if [ ! -f "${script}" ]; then
+            echo "Approval script missing from trusted revision ${expected}" >&2
+            exit 1
+          fi
+          echo "approve_script=${script}" >> "$GITHUB_OUTPUT"
+
       - name: Approve deploy digest at admission time
         env:
           APPROVER_KUBECONFIG: ${{ secrets.KUBECONFIG_PAPERCLIP_RELEASE_APPROVER }}
           DIGEST: ${{ steps.artifact.outputs.digest }}
+          APPROVE_SCRIPT: ${{ steps.tooling.outputs.approve_script }}
           # Must match maxApprovedApiDigests in the admission policy. The policy
           # denies every rollout if the window is longer, so this is a hard
           # ceiling rather than a preference.
@@ -405,20 +456,24 @@ jobs:
             exit 1
           fi
 
-          mkdir -p "$RUNNER_TEMP/.kube"
-          approver_kubeconfig="$RUNNER_TEMP/.kube/approver"
-          approval_log="$RUNNER_TEMP/approval.log"
+          # mktemp -d, not a fixed path: `> "$RUNNER_TEMP/.kube/approver"`
+          # follows a pre-existing symlink at that name, and arc-deploy is a
+          # self-hosted pool, so residue from an earlier workload could redirect
+          # this write — the higher-privilege credential of the two this job
+          # handles — somewhere it survives. mktemp creates a fresh 0700
+          # directory or fails; it never opens something that already exists.
+          approver_dir="$(mktemp -d "${RUNNER_TEMP}/approver.XXXXXXXX")"
+          approver_kubeconfig="${approver_dir}/kubeconfig"
+          approval_log="${approver_dir}/approval.log"
 
-          # Arm the cleanup BEFORE the credential reaches disk. This is the
-          # higher-privilege identity of the two the job handles, and the runner
-          # is a long-lived self-hosted host, so a kubectl/jq failure exiting
-          # under `set -e` must not leave it behind. umask instead of a
-          # follow-up chmod so the file is never briefly world-readable.
-          trap 'rm -f "${approver_kubeconfig}" "${approval_log}"' EXIT
+          # Arm the cleanup BEFORE the credential reaches disk, so a kubectl/jq
+          # failure exiting under `set -e` cannot leave it behind. umask instead
+          # of a follow-up chmod so the file is never briefly world-readable.
+          trap 'rm -rf "${approver_dir}"' EXIT
           (umask 077; printf '%s' "${APPROVER_KUBECONFIG}" > "${approver_kubeconfig}")
 
           KUBECONFIG="${approver_kubeconfig}" \
-            ./scripts/approve-paperclip-api-digest.sh "${DIGEST}" | tee "${approval_log}"
+            "${APPROVE_SCRIPT}" "${DIGEST}" | tee "${approval_log}"
 
           {
             echo "### Admission approval"
