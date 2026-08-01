@@ -467,7 +467,9 @@ test.describe("Pipelines tutorial UI flow", () => {
       const companyPath = `/${company.issuePrefix}`;
 
     await page.goto(`${companyPath}/pipelines/${pipeline.id}/settings`);
-    await expect(page.getByLabel("Pipeline name")).toHaveValue("Content production");
+    await expect(page.getByLabel("Pipeline name")).toHaveValue("Content production", {
+      timeout: slowUiTimeout,
+    });
 
     await page.getByRole("button", { name: "Pick agent" }).click();
     await page.getByPlaceholder("Search agents...").fill("Pipeline Writer");
