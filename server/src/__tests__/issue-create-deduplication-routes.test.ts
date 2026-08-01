@@ -393,6 +393,64 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     expect(await db.select().from(issues).where(eq(issues.id, response.body.id))).toHaveLength(1);
   });
 
+  it("cancels a blocked advisory consumption telemetry write", async () => {
+    const companyId = await seedCompany();
+    const candidate = monitorFilings[0]!;
+    await db.insert(issues).values({
+      companyId,
+      identifier: candidate.identifier,
+      title: candidate.title,
+      description: candidate.description,
+      status: "todo",
+      priority: "medium",
+    });
+    const blockingDb = createDb(tempDb!.connectionString);
+    let writerErrorCode: string | undefined;
+    let writerFinished!: () => void;
+    const writerCompletion = new Promise<void>((resolve) => {
+      writerFinished = resolve;
+    });
+    const app = createApp({
+      createIssueDuplicateCandidateActivityTimeoutMs: 25,
+      createIssueDuplicateCandidateActivityWriter: async (scopedDb) => {
+        let releaseLock!: () => void;
+        const release = new Promise<void>((resolve) => {
+          releaseLock = resolve;
+        });
+        let lockAcquired!: () => void;
+        const acquired = new Promise<void>((resolve) => {
+          lockAcquired = resolve;
+        });
+        const lock = blockingDb.transaction(async (tx) => {
+          await tx.execute(sql`lock table activity_log in access exclusive mode`);
+          lockAcquired();
+          await release;
+        });
+        await acquired;
+        try {
+          await scopedDb.select().from(activityLog);
+        } catch (error) {
+          writerErrorCode = (error as { code?: string; cause?: { code?: string } }).cause?.code
+            ?? (error as { code?: string }).code;
+        } finally {
+          releaseLock();
+          await lock;
+          writerFinished();
+        }
+      },
+    });
+
+    const subject = monitorFilings[1]!;
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: subject.title, description: subject.description })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).not.toEqual([]);
+    await writerCompletion;
+    expect(writerErrorCode).toBe("57014");
+  });
+
   it("returns 201 without advisories when the route lookup stalls", async () => {
     const companyId = await seedCompany();
     let lookupAborted = false;
@@ -544,6 +602,55 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       releaseLock();
       await lock;
     }
+  });
+
+  it("cancels a blocked company-scope authorization decision", async () => {
+    const companyId = await seedCompany();
+    const blockingDb = createDb(tempDb!.connectionString);
+    let authorizationErrorCode: string | undefined;
+    let authorizationFinished!: () => void;
+    const authorizationCompletion = new Promise<void>((resolve) => {
+      authorizationFinished = resolve;
+    });
+    const app = createApp({
+      createIssueDuplicateCandidateTimeoutMs: 25,
+      createIssueDuplicateCandidateCompanyScopeReader: async (scopedDb) => {
+        let releaseLock!: () => void;
+        const release = new Promise<void>((resolve) => {
+          releaseLock = resolve;
+        });
+        let lockAcquired!: () => void;
+        const acquired = new Promise<void>((resolve) => {
+          lockAcquired = resolve;
+        });
+        const lock = blockingDb.transaction(async (tx) => {
+          await tx.execute(sql`lock table activity_log in access exclusive mode`);
+          lockAcquired();
+          await release;
+        });
+        await acquired;
+        try {
+          await scopedDb.select().from(activityLog);
+        } catch (error) {
+          authorizationErrorCode = (error as { code?: string; cause?: { code?: string } }).cause?.code
+            ?? (error as { code?: string }).code;
+        } finally {
+          releaseLock();
+          await lock;
+          authorizationFinished();
+        }
+        return false;
+      },
+    });
+
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Company authorization remains bounded" })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).toEqual([]);
+    await authorizationCompletion;
+    expect(authorizationErrorCode).toBe("57014");
   });
 
   it("stops scanning after the explicit company corpus cap", async () => {
