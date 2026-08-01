@@ -8665,6 +8665,8 @@ export function issueService(db: Db) {
          * former participant acting on stale route state.
          */
         expectedCurrentExecutionState?: Record<string, unknown> | null;
+        /** Pins the policy from which an execution-stage transition was derived. */
+        expectedCurrentExecutionPolicy?: Record<string, unknown> | null;
       },
       dbOrTx: any = db,
     ) => {
@@ -8683,6 +8685,7 @@ export function issueService(db: Db) {
         expectedCurrentStatus,
         expectedCurrentAssigneeAgentId,
         expectedCurrentExecutionState,
+        expectedCurrentExecutionPolicy,
         ...issueData
       } = data;
 
@@ -8708,6 +8711,14 @@ export function issueService(db: Db) {
         JSON.stringify(existing.executionState ?? null) !== JSON.stringify(expectedCurrentExecutionState)
       ) {
         throw conflict("Issue execution stage changed before the decision could be applied", {
+          issueId: id,
+        });
+      }
+      if (
+        expectedCurrentExecutionPolicy !== undefined &&
+        JSON.stringify(existing.executionPolicy ?? null) !== JSON.stringify(expectedCurrentExecutionPolicy)
+      ) {
+        throw conflict("Issue execution policy changed before the decision could be applied", {
           issueId: id,
         });
       }
@@ -9115,6 +9126,13 @@ export function issueService(db: Db) {
                   ? isNull(issues.executionState)
                   : sql`${issues.executionState} = ${JSON.stringify(expectedCurrentExecutionState)}::jsonb`,
               ]),
+          ...(expectedCurrentExecutionPolicy === undefined
+            ? []
+            : [
+                expectedCurrentExecutionPolicy === null
+                  ? isNull(issues.executionPolicy)
+                  : sql`${issues.executionPolicy} = ${JSON.stringify(expectedCurrentExecutionPolicy)}::jsonb`,
+              ]),
         ];
         const updated = await tx
           .update(issues)
@@ -9141,6 +9159,9 @@ export function issueService(db: Db) {
               ...(expectedCurrentExecutionState === undefined
                 ? {}
                 : { expectedExecutionState: true }),
+              ...(expectedCurrentExecutionPolicy === undefined
+                ? {}
+                : { expectedExecutionPolicy: true }),
             });
           }
           return null;
@@ -9759,23 +9780,29 @@ export function issueService(db: Db) {
           }
 
           const latestCandidate = staleAdoption.latest ?? candidate;
-          const activeActorRun = await adoptActiveActorIssueRun({
-            issueId: id,
-            companyId: latestCandidate.companyId,
-            actorAgentId,
-            actorRunId,
-            expectedCheckoutRunId: latestCandidate.checkoutRunId,
-            expectedExecutionRunId: latestCandidate.executionRunId,
-          });
+          // Active issue-scoped runs may supersede one older owner, but must not
+          // collapse divergent ownership after stale adoption rejected either
+          // side. In particular, a reapable execution owner cannot make a
+          // distinct live checkout owner replaceable.
+          if (latestCandidate.checkoutRunId === latestCandidate.executionRunId) {
+            const activeActorRun = await adoptActiveActorIssueRun({
+              issueId: id,
+              companyId: latestCandidate.companyId,
+              actorAgentId,
+              actorRunId,
+              expectedCheckoutRunId: latestCandidate.checkoutRunId,
+              expectedExecutionRunId: latestCandidate.executionRunId,
+            });
 
-          if (activeActorRun) {
-            return {
-              ownership: {
-                ...activeActorRun,
-                adoptedFromRunId: latestCandidate.checkoutRunId,
-              },
-              latest: null,
-            };
+            if (activeActorRun) {
+              return {
+                ownership: {
+                  ...activeActorRun,
+                  adoptedFromRunId: latestCandidate.checkoutRunId,
+                },
+                latest: null,
+              };
+            }
           }
 
           if (staleAdoption.latest) {
