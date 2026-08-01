@@ -1981,11 +1981,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const queuedRun = { id: randomUUID() } as never;
     const enqueueWakeup = vi.fn(async () => queuedRun);
     const recovery = recoveryService(db, { enqueueWakeup });
-    const quotaRun = {
+    const failedRun = {
       agentId: coderId,
       status: "failed",
-      error: "Provider usage quota reached for this model.",
-      errorCode: "provider_quota",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
       contextSnapshot: { issueId: sourceIssueId },
       livenessState: "needs_followup",
       resultJson: null,
@@ -1997,8 +1997,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       await recovery.escalateStrandedAssignedIssue({
         issue: fresh!,
         previousStatus: "in_progress",
-        latestRun: { ...quotaRun, id: randomUUID() },
-        comment: "Provider quota recovery deferred.",
+        latestRun: { ...failedRun, id: randomUUID() },
+        comment: "Automatic continuation recovery failed.",
         recoveryOwnerAgentId: managerId,
       });
     };
@@ -2019,6 +2019,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .update(issues)
       .set({
         assigneeAgentId: null,
+        // Establish the unchanged-state precondition explicitly. The first escalation's
+        // system comment otherwise counts as new activity and correctly permits another wake.
         lastActivityAt: new Date(afterFirst!.lastAttemptAt as Date | string),
       })
       .where(eq(issues.id, sourceIssueId));

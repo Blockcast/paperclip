@@ -41,13 +41,30 @@ describe("extractSecretRefBindingsFromConfig", () => {
     )).toEqual([]);
   });
 
-  it("rejects legacy UUID strings at schema-declared secret fields", () => {
+  it("coerces legacy UUID strings at schema-declared secret fields", () => {
     const secretId = "77777777-7777-4777-8777-777777777777";
 
-    expect(() => extractSecretRefBindingsFromConfig(
+    expect(extractSecretRefBindingsFromConfig(
       { token: secretId },
       { type: "object", properties: { token: { format: "secret-ref" } } },
-    )).toThrow(/must use.*secret_ref/i);
+    )).toEqual([
+      {
+        secretId,
+        configPath: "token",
+        versionSelector: "latest",
+        required: true,
+        label: "token",
+        projectionClass: undefined,
+        projectionAllowlistKey: null,
+      },
+    ]);
+  });
+
+  it("ignores non-UUID strings at schema-declared secret fields", () => {
+    expect(extractSecretRefBindingsFromConfig(
+      { token: "not-a-uuid" },
+      { type: "object", properties: { token: { format: "secret-ref" } } },
+    )).toEqual([]);
   });
 });
 
@@ -62,12 +79,12 @@ describe("createPluginSecretsHandler fail-closed guards", () => {
     expect(db.select).not.toHaveBeenCalled();
   });
 
-  it("rejects legacy string refs before provider resolution", async () => {
+  it("rejects non-UUID string refs before provider resolution", async () => {
     const db = { select: vi.fn(() => { throw new Error("db should not be touched"); }) };
     const handler = createPluginSecretsHandler({ db: db as never, pluginId });
 
     await expect(
-      handler.resolve({ companyId: randomUUID(), secretRef: randomUUID() }),
+      handler.resolve({ companyId: randomUUID(), secretRef: "not-a-secret-id" }),
     ).rejects.toThrow(/use \{ type: "secret_ref"/i);
     expect(db.select).not.toHaveBeenCalled();
   });
@@ -180,6 +197,70 @@ describeEmbeddedPostgres("createPluginSecretsHandler shared vault integration", 
       outcome: "success",
       errorCode: null,
     });
+  });
+
+  it("resolves a stored config written under the previous bare-string ref format", async () => {
+    // BLO-20219: configs written before the object-ref contract hold a bare
+    // UUID string, and their plugin manifests still declare the field as
+    // `type: "string", format: "secret-ref"`. Both the binding sync and the
+    // worker resolve must accept that spelling or the config is unusable.
+    await seedPlugin();
+    const companyId = await seedCompany("Legacy Ref Co");
+    const svc = secretService(db);
+    const secret = await svc.create(companyId, {
+      name: `legacy-plugin-token-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "legacy-resolved-secret",
+    });
+
+    // The config as a pre-contract-change plugin stored it.
+    const legacyConfig = { webhookTokenRef: secret.id };
+    const schema = {
+      type: "object",
+      properties: {
+        webhookTokenRef: { type: "string", format: "secret-ref" },
+      },
+    };
+
+    const refs = extractSecretRefBindingsFromConfig(legacyConfig, schema);
+    expect(refs).toHaveLength(1);
+    expect(refs[0]).toMatchObject({ secretId: secret.id, configPath: "webhookTokenRef" });
+
+    await svc.syncSecretRefsForTarget(
+      companyId,
+      { targetType: "plugin", targetId: pluginId },
+      refs,
+      { replaceAll: true },
+    );
+
+    const handler = createPluginSecretsHandler({ db, pluginId });
+    await expect(
+      handler.resolve({ companyId, secretRef: legacyConfig.webhookTokenRef }),
+    ).resolves.toBe("legacy-resolved-secret");
+  });
+
+  it("still refuses a legacy string ref for a secret not bound to this plugin", async () => {
+    // Coercion must not become an authorization bypass: the binding row, not
+    // the ref spelling, is the gate.
+    await seedPlugin();
+    const companyId = await seedCompany("Unbound Ref Co");
+    const svc = secretService(db);
+    const unboundSecret = await svc.create(companyId, {
+      name: `unbound-plugin-secret-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "should-not-be-readable",
+    });
+
+    const handler = createPluginSecretsHandler({ db, pluginId });
+    await expect(
+      handler.resolve({ companyId, secretRef: unboundSecret.id }),
+    ).rejects.toThrow(/not bound/i);
+
+    const events = await db
+      .select()
+      .from(secretAccessEvents)
+      .where(eq(secretAccessEvents.secretId, unboundSecret.id));
+    expect(events).toHaveLength(0);
   });
 
   it("fails closed for cross-company resolve before secret provider access", async () => {
