@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -25,6 +25,7 @@ import {
   ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS,
   ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP,
   ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP,
+  findCreateIssueDuplicateCandidates,
   issueRoutes,
   raceCreateIssueDuplicateCandidateLookup,
 } from "../routes/issues.js";
@@ -456,6 +457,93 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     expect(response.body.duplicateCandidates).toEqual(expect.arrayContaining([
       expect.objectContaining({ identifier: candidate.identifier }),
     ]));
+  });
+
+  it("does not skip rows with distinct microseconds inside the cursor millisecond", async () => {
+    const companyId = await seedCompany();
+    const allowedProject = await seedProject(companyId, "Allowed project");
+    const deniedProject = await seedProject(companyId, "Denied project");
+    const candidate = monitorFilings[0]!;
+    const candidateId = randomUUID();
+    await db.insert(issues).values({
+      id: candidateId,
+      companyId,
+      projectId: allowedProject.id,
+      identifier: candidate.identifier,
+      title: candidate.title,
+      description: candidate.description,
+      status: "todo",
+      priority: "medium",
+    });
+    await db.insert(issues).values(Array.from(
+      { length: ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP },
+      (_, index) => ({
+        companyId,
+        projectId: deniedProject.id,
+        title: `Microsecond boundary issue ${index}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+      }),
+    ));
+    await db.execute(sql`
+      update issues
+      set created_at = date_trunc('milliseconds', now() - interval '1 minute')
+        + case
+          when id = ${candidateId} then interval '100 microseconds'
+          else (200 + substring(title from '[0-9]+$')::integer) * interval '1 microsecond'
+        end
+      where company_id = ${companyId}
+    `);
+    const app = createApp({
+      createIssueDuplicateCandidateCorpusFilter: async (rows) => (
+        rows.filter((row) => row.projectId === allowedProject.id)
+      ),
+    });
+    const subject = monitorFilings[1]!;
+
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ projectId: allowedProject.id, title: subject.title, description: subject.description })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ identifier: candidate.identifier }),
+    ]));
+  });
+
+  it("cancels an in-flight corpus query at the database statement deadline", async () => {
+    const companyId = await seedCompany();
+    const blockingDb = createDb(tempDb!.connectionString);
+    let releaseLock!: () => void;
+    const release = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    let lockAcquired!: () => void;
+    const acquired = new Promise<void>((resolve) => {
+      lockAcquired = resolve;
+    });
+    const lock = blockingDb.transaction(async (tx) => {
+      await tx.execute(sql`lock table issues in access exclusive mode`);
+      lockAcquired();
+      await release;
+    });
+    await acquired;
+    const startedAt = performance.now();
+
+    try {
+      await expect(findCreateIssueDuplicateCandidates(
+        db,
+        companyId,
+        { id: randomUUID(), identifier: null, title: "Blocked query", description: null },
+        undefined,
+        undefined,
+        25,
+      )).rejects.toMatchObject({ cause: { code: "57014" } });
+      expect(performance.now() - startedAt).toBeLessThan(ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS);
+    } finally {
+      releaseLock();
+      await lock;
+    }
   });
 
   it("stops scanning after the explicit company corpus cap", async () => {
