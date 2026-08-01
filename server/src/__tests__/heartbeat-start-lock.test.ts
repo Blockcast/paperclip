@@ -171,20 +171,26 @@ describe("heartbeat agent start lock (BLO-20396)", () => {
     await expect(withAgentStartLock(agentId, next, coalesced)).resolves.toBe("next");
   });
 
-  it("coalesces a re-entrant call for the same agent instead of deadlocking", async () => {
+  it("coalesces a re-entrant call for the same agent without dropping the follow-up", async () => {
     const agentId = randomUUID();
     const inner = vi.fn(async () => "inner");
+    const onCoalescedDemand = vi.fn();
 
     // Mirrors reap → releaseIssueExecutionAndPromote → startNextQueuedRunForAgent
     // re-entering dispatch for the agent whose lock is already held.
     const result = await withAgentStartLock(
       agentId,
-      async () => withAgentStartLock(agentId, inner, coalesced),
+      async () => withAgentStartLock(agentId, inner, {
+        onCoalesced: () => "coalesced" as const,
+        onCoalescedDemand,
+      }),
       coalesced,
     );
 
     expect(result).toBe("coalesced");
-    expect(inner).not.toHaveBeenCalled();
+    expect(onCoalescedDemand).toHaveBeenCalledTimes(1);
+    await _settleDetachedAgentStartLockWorkForTesting();
+    expect(inner).toHaveBeenCalledTimes(1);
   });
 
   it("caps nesting depth by detaching the deepest call instead of dropping it", async () => {

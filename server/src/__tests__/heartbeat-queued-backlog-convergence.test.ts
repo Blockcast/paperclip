@@ -692,13 +692,15 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
       return runId;
     };
 
-    // 210 older, runnable, low-priority rows — past the 200-candidate cap the
-    // collection loop used to stop at.
+    // 2,010 older, runnable, low-priority rows — past the 200-candidate cap
+    // the collection loop used to stop at, and past the 2,000-row bounded scan
+    // window. Priority must not be scoped to whichever old rows the bounded
+    // scan happened to see first.
     const lowPriorityRunIds: string[] = [];
-    for (let i = 0; i < 210; i += 1) {
+    for (let i = 0; i < 2_010; i += 1) {
       lowPriorityRunIds.push(addQueuedRun(addIssue("todo", "low"), i * 1000));
     }
-    expect(lowPriorityRunIds.length).toBeGreaterThan(200);
+    expect(lowPriorityRunIds.length).toBeGreaterThan(2_000);
 
     // The newest row, and the only critical one.
     const criticalRunId = addQueuedRun(addIssue("todo", "critical"), 500_000);

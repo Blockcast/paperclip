@@ -144,6 +144,12 @@ export async function withAgentStartLock<T>(
       { agentId, depth: held.size },
       "agent start lock already held on this path; coalescing nested queued-run dispatch",
     );
+    options.onCoalescedDemand?.();
+    const running = runningByAgent.get(agentId);
+    const followUp = running
+      ? ensureCoalescedFollowUp(agentId, fn, running)
+      : heldAgentIds.exit(() => runExclusively(agentId, fn));
+    trackDetachedFollowUp(agentId, followUp);
     return options.onCoalesced();
   }
   if (held && held.size >= MAX_NESTED_DISPATCH_DEPTH) {

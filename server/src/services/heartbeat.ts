@@ -17895,6 +17895,52 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (scanExhausted) break;
       }
 
+      const queuedRunIds = new Set(queuedRuns.map((run) => run.id));
+      const priorityLaneRows = await db
+        .select({
+          run: heartbeatRuns,
+          issue: {
+            id: issues.id,
+            status: issues.status,
+            priority: issues.priority,
+          },
+        })
+        .from(heartbeatRuns)
+        .innerJoin(
+          issues,
+          and(
+            eq(issues.companyId, agent.companyId),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issues.id}`,
+          ),
+        )
+        .where(and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "queued"),
+          cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+          notInArray(issues.status, [...TERMINAL_ISSUE_STATUSES]),
+          or(
+            eq(issues.priority, "critical"),
+            and(
+              sql`${heartbeatRuns.contextSnapshot} ->> 'source' = 'issue_recovery_action'`,
+              sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' is not null`,
+            ),
+          ),
+        ))
+        .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+        .limit(QUEUED_RUN_DISPATCH_SCAN_LIMIT);
+      const priorityLaneRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+      for (const { run, issue } of priorityLaneRows) {
+        issueById.set(issue.id, issue);
+        if (queuedRunIds.has(run.id)) continue;
+        queuedRunIds.add(run.id);
+        priorityLaneRuns.push(run);
+        queuedRuns.push(run);
+      }
+      if (priorityLaneRuns.length > 0) {
+        const priorityLaneReadiness = await listQueuedRunDependencyReadiness(agent.companyId, priorityLaneRuns);
+        for (const [issueId, readiness] of priorityLaneReadiness) dependencyReadiness.set(issueId, readiness);
+      }
+
       if (!scanExhausted) {
         logger.warn(
           {
@@ -17931,12 +17977,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
        * also schedule the prune follow-up and double up.
        */
       const advanceOrClearResumeCursor = (claimedCount: number): boolean => {
-        if (scanExhausted || claimedCount > 0 || !scanCursor) {
-          const needsHeadRescan =
-            scanExhausted &&
-            claimedCount === 0 &&
-            Boolean(resumeState) &&
-            dispatchHeadRescanDemandByAgent.has(agentId);
+        const needsHeadRescan = dispatchHeadRescanDemandByAgent.has(agentId);
+        if (scanExhausted || !scanCursor) {
           dispatchResumeCursorByAgent.delete(agentId);
           dispatchHeadRescanDemandByAgent.delete(agentId);
           clearDelayedResumeCapRetry(agentId);
@@ -17944,6 +17986,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             scheduleDetachedDispatchPass(agentId, "resume_head_rescan_after_coalesced_demand");
             return true;
           }
+          return false;
+        }
+        if (claimedCount > 0) {
+          dispatchResumeCursorByAgent.set(agentId, { ...scanCursor, passes: resumeState?.passes ?? 0 });
+          clearDelayedResumeCapRetry(agentId);
           return false;
         }
         const passes = (resumeState?.passes ?? 0) + 1;
