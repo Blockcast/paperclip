@@ -106,6 +106,25 @@ export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 // the run — it only stops subsequent wakes for the issue from being parked
 // behind a holder that may never start.
 export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
+// BLO-19848: absolute ceiling on how long ANY pre-claim holder may pin an
+// issue's execution lock, measured from executionLockedAt.
+//
+// The `scheduled_retry` branch of isPreClaimLockExpired measures staleness from
+// the run's own scheduledRetryAt so that a deliberately parked retry is not
+// reclaimed before its deadline. But scheduledRetryAt is caller-supplied and
+// unbounded — the ccrotate provider-capacity path (heartbeat.ts, errorCode
+// `rate_limit_exhausted`) can park a retry days out, and each re-park pushes the
+// basis further into the future. The window is then not bounded at all, which is
+// how BLO-18307 sat wedged for ~1d7h behind run b65ac519 at `scheduled_retry`
+// while its engineering work was already merged.
+//
+// 12h = the 6h pre-claim bound plus one full 6h grace period past the lock
+// timestamp. A retry scheduled inside that horizon still gets its full
+// deadline-relative window; one scheduled beyond it is reclaimed at 12h. As with
+// every other branch here, clearing the lock does not cancel the run — the
+// claim-time update is guarded by `or(isNull(executionRunId), eq(..., self))`,
+// so a retry that does eventually fire simply re-acquires.
+export const MAX_PRE_CLAIM_ISSUE_LOCK_MS = 2 * STALE_PRE_CLAIM_ISSUE_LOCK_MS;
 // BLO-19941: the same backstop, for a holder wedged at `running`.
 //
 // `running` is neither missing nor terminal, so isCleanable() is false forever
@@ -7476,8 +7495,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         // Scheduled retries are intentionally parked until their retry deadline.
         // Only clear them once that deadline itself has gone stale; provider
         // capacity retries may be scheduled far into the future.
+        //
+        // BLO-19848: but cap the hold. scheduledRetryAt is unbounded and
+        // re-parkable, so a deadline-relative window alone lets a holder pin the
+        // lock indefinitely. Whichever bound trips first wins.
         const staleBasis = run.scheduledRetryAt ?? lockedAt;
-        return Date.now() - staleBasis.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS;
+        return (
+          Date.now() - staleBasis.getTime() >= STALE_PRE_CLAIM_ISSUE_LOCK_MS ||
+          Date.now() - lockedAt.getTime() >= MAX_PRE_CLAIM_ISSUE_LOCK_MS
+        );
       }
       return false;
     };
@@ -7519,18 +7545,31 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // (checkout and execution are claimed together), so the checkout guard
       // below would `continue` before the execution check ever ran, making this
       // sweep a no-op for exactly the case it needs to cover. Allow the checkout
-      // guard to be satisfied only by the `running`-silent branch and only when
-      // it is literally the same run id — a *different* live checkout holder
-      // still keeps its lock, and a pre-claim expiry never bypasses it.
-      const checkoutHeldBySameSilentRun = runningLockSilent
+      // guard to be satisfied only when the expired execution holder is
+      // literally the same run id — a *different* live checkout holder still
+      // keeps its lock.
+      //
+      // BLO-19848: originally this allowance covered only the `running`-silent
+      // branch, on the reasoning that a pre-claim expiry should never bypass the
+      // checkout guard. That left the `scheduled_retry` wedge uncovered: BLO-18307
+      // had checkoutRunId === executionRunId === b65ac519 at `scheduled_retry`,
+      // so isCleanable(checkoutRunId) was false, the `running` allowance did not
+      // apply, and the loop `continue`d past the issue on every 30s pass for
+      // ~1d7h. The same-run restriction is what makes this safe, not the branch
+      // it came from: when both columns name one non-live run there is no second
+      // holder to protect, and clearing does not cancel that run — claimQueuedRun
+      // re-acquires under `or(isNull(executionRunId), eq(executionRunId, self))`
+      // and startNextQueuedRunForAgent's per-issue dedupe still prevents two
+      // concurrent runs for one issue.
+      const checkoutHeldBySameExpiredRun = executionLockExpired
         && issue.checkoutRunId != null
         && issue.checkoutRunId === issue.executionRunId;
       // Guards are kept separate on purpose. The update below nulls the
-      // checkout *and* execution columns together, so the new pre-claim-expiry
-      // allowance must not become a blanket bypass of the checkout check: an
-      // issue whose checkoutRunId points at a live (non-terminal) run keeps its
-      // checkout lock no matter how stale the execution lock is.
-      if (!isCleanable(issue.checkoutRunId) && !checkoutHeldBySameSilentRun) continue;
+      // checkout *and* execution columns together, so the expiry allowance must
+      // not become a blanket bypass of the checkout check: an issue whose
+      // checkoutRunId points at a live run *other than* the expired execution
+      // holder keeps its checkout lock no matter how stale the execution lock is.
+      if (!isCleanable(issue.checkoutRunId) && !checkoutHeldBySameExpiredRun) continue;
       if (!isCleanable(issue.executionRunId) && !executionLockExpired) continue;
 
       const sweepOutcome = await db.transaction(async (tx) => {

@@ -1028,4 +1028,130 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .then((rows) => rows[0]);
     expect(row?.checkoutRunId).toBe(runningRunId);
   });
+
+  // BLO-19848: the BLO-18307 production shape. checkout and execution are
+  // claimed together, so both columns name ONE run parked at `scheduled_retry`.
+  // Before this fix nothing could clear it: isCleanable() is false for a
+  // non-terminal status, the BLO-19941 `running`-silent allowance does not
+  // apply, and so the loop `continue`d at the checkout guard on every 30s pass.
+  // BLO-18307 stayed wedged ~1d7h with its fix already merged, returning 409 to
+  // three close attempts by the assignee.
+  async function seedWedgedScheduledRetryIssue(input: {
+    companyId: string;
+    agentId: string;
+    lockedAt: Date;
+    scheduledRetryAt: Date;
+    sameRunHoldsCheckout?: boolean;
+  }) {
+    const wedgedRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: wedgedRunId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status: "scheduled_retry",
+      invocationSource: "automation",
+      startedAt: null,
+      scheduledRetryAt: input.scheduledRetryAt,
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "ccrotate_capacity",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: input.companyId,
+      title: "Lock held by a run parked at scheduled_retry",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: input.agentId,
+      checkoutRunId: input.sameRunHoldsCheckout === false ? null : wedgedRunId,
+      executionRunId: wedgedRunId,
+      executionLockedAt: input.lockedAt,
+    });
+    return { wedgedRunId, issueId };
+  }
+
+  it("clears a lock whose scheduled_retry holder also holds the checkout column (BLO-19848)", async () => {
+    const { companyId, agentId } = await seed();
+    const { issueId } = await seedWedgedScheduledRetryIssue({
+      companyId,
+      agentId,
+      lockedAt: new Date(Date.now() - 31 * 60 * 60 * 1000),
+      // Retry deadline itself went stale 7h ago — past the 6h pre-claim bound.
+      scheduledRetryAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: null,
+      executionRunId: null,
+      executionLockedAt: null,
+    });
+  });
+
+  it("reclaims a scheduled_retry lock parked past the absolute ceiling (BLO-19848)", async () => {
+    // scheduledRetryAt is caller-supplied and re-parkable, so a purely
+    // deadline-relative window is not a bound at all: a capacity retry pushed
+    // days out — and pushed again on each re-park — pins the lock forever.
+    // MAX_PRE_CLAIM_ISSUE_LOCK_MS (12h from executionLockedAt) is the ceiling.
+    const { companyId, agentId } = await seed();
+    const { issueId } = await seedWedgedScheduledRetryIssue({
+      companyId,
+      agentId,
+      lockedAt: new Date(Date.now() - 13 * 60 * 60 * 1000),
+      // Deadline still 3 days out: the 6h deadline-relative bound cannot fire.
+      scheduledRetryAt: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    const row = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.executionRunId).toBeNull();
+  });
+
+  it("does not clear a scheduled_retry lock held by a different live checkout run (BLO-19848)", async () => {
+    // The same-run restriction is what makes the checkout allowance safe. A
+    // distinct live checkout holder must keep its lock however stale the
+    // execution holder is.
+    const { companyId, agentId, runningRunId } = await seed();
+    const { issueId } = await seedWedgedScheduledRetryIssue({
+      companyId,
+      agentId,
+      lockedAt: new Date(Date.now() - 31 * 60 * 60 * 1000),
+      scheduledRetryAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+      sameRunHoldsCheckout: false,
+    });
+    await db
+      .update(issues)
+      .set({ checkoutRunId: runningRunId })
+      .where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(0);
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.checkoutRunId).toBe(runningRunId);
+  });
 });

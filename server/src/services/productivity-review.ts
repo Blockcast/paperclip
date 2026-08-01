@@ -44,6 +44,13 @@ const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
 const MAX_PARENT_WALK_DEPTH = 25;
+// BLO-19848: how long a `running` execution holder may go without a genuine
+// activity signal before its elapsed time stops being attributed to live work.
+// Matches STALE_RUNNING_ISSUE_LOCK_MS in recovery/service.ts, which is the point
+// the stale-lock sweeper itself stops believing the holder — kept as a local
+// constant rather than an import to avoid coupling the detector to the recovery
+// service's module graph.
+const NON_LIVE_EXECUTION_SILENCE_MS = 2 * 60 * 60 * 1000;
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
 // BLO-3281 AC2 hard floor: even if the detector scan cadence is faster
 // than this, the refresh-evidence-comment path stays throttled at 5 min.
@@ -89,6 +96,10 @@ type ProductivityReviewEvidence = {
   commentCountLastHour: number;
   commentCountLastSixHours: number;
   elapsedMs: number | null;
+  // BLO-19848: wall-clock excluded from elapsedMs because the issue's
+  // executionRunId was pinned by a run that was not live. 0 when the holder is
+  // live or absent.
+  nonLiveHoldMs: number;
   monitorGating: {
     gatedMs: number;
     unattendedMs: number;
@@ -204,6 +215,65 @@ function isActiveProductivityReviewUniqueConflict(error: unknown) {
 function coerceDate(value: Date | string | null | undefined) {
   if (!value) return null;
   return value instanceof Date ? value : new Date(value);
+}
+
+/**
+ * BLO-19848: the moment an issue's execution stopped being attributable to a
+ * live run, or null while the current holder is genuinely live.
+ *
+ * `long_active_duration` measures wall-clock from `issues.started_at` to `now`
+ * with no reference to whether anything is actually executing. That is correct
+ * while a run is working and wrong the instant the holding run stops: an issue
+ * whose `executionRunId` is pinned by a non-live run keeps accruing "active"
+ * time indefinitely, so the detector reports an episode that ended days ago and
+ * files a review against an assignee who cannot even transition the issue (the
+ * same wedge produces `409 Issue run ownership conflict`). BLO-18307 accrued a
+ * reported "1d 7h active episode" behind a `scheduled_retry` holder whose fix
+ * had already merged; BLO-12565 and BLO-12696 are the same shape.
+ *
+ * Liveness here is deliberately stricter than `ACTIVE_RUN_STATUSES`. `queued`
+ * and `scheduled_retry` are non-terminal but are, by definition, not executing —
+ * counting their elapsed time is exactly the bug. A `running` holder counts as
+ * live until it goes silent past NON_LIVE_EXECUTION_SILENCE_MS, measured on the
+ * run's own activity columns (the same basis the stale-lock sweeper and the
+ * dispatcher's slot gate use) rather than on `updatedAt`, which review and
+ * recovery churn would otherwise keep fresh forever (BLO-8827).
+ *
+ * Returns the clamp point — the run's last genuine signal — so the episode is
+ * truncated at the last moment work was actually observed rather than dropped
+ * to zero. An issue with no execution holder at all returns null and keeps
+ * full wall-clock accounting: that is an unowned `in_progress` issue, which is
+ * genuine stalling and exactly what the trigger should still catch.
+ */
+function nonLiveExecutionHoldSince(
+  issue: IssueRow,
+  executionRun: HeartbeatRunRow | null,
+  now: Date,
+): Date | null {
+  if (!issue.executionRunId) return null;
+  // Pointer to a run row we cannot see: treat the lock timestamp as the last
+  // attributable moment rather than trusting an unverifiable holder.
+  if (!executionRun) return coerceDate(issue.executionLockedAt);
+
+  const lastSignal =
+    coerceDate(executionRun.lastUsefulActionAt) ??
+    coerceDate(executionRun.lastOutputAt) ??
+    coerceDate(executionRun.startedAt) ??
+    coerceDate(issue.executionLockedAt);
+
+  if (executionRun.status === "running") {
+    if (!lastSignal) return null; // mid-claim; do not truncate on a bare row
+    return now.getTime() - lastSignal.getTime() >= NON_LIVE_EXECUTION_SILENCE_MS
+      ? lastSignal
+      : null;
+  }
+
+  if (TERMINAL_RUN_STATUSES.includes(executionRun.status as (typeof TERMINAL_RUN_STATUSES)[number])) {
+    return coerceDate(executionRun.finishedAt) ?? lastSignal;
+  }
+
+  // queued / scheduled_retry: parked, not executing.
+  return lastSignal;
 }
 
 function deliberateFutureMonitor(issue: IssueRow, now: Date) {
@@ -931,8 +1001,26 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number]),
     ).length;
     const activeStartedAt = sourceIssue.startedAt ?? sourceIssue.executionLockedAt ?? null;
+    // BLO-19848: clamp the episode end to the last moment execution was
+    // attributable to a live run, so a wedged holder cannot accrue "active"
+    // time on work that already finished. See nonLiveExecutionHoldSince.
+    const executionRun = sourceIssue.executionRunId
+      ? await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, sourceIssue.executionRunId))
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+      : null;
+    const nonLiveHoldSince = nonLiveExecutionHoldSince(sourceIssue, executionRun, now);
+    // Clamping below activeStartedAt collapses to 0 via Math.max — i.e. a holder
+    // that went non-live before the episode began contributes no active time.
+    const attributableEndAt = nonLiveHoldSince ?? now;
+    const nonLiveHoldMs = nonLiveHoldSince
+      ? Math.max(0, now.getTime() - nonLiveHoldSince.getTime())
+      : 0;
     const elapsedMs = sourceIssue.status === "in_progress" && activeStartedAt
-      ? Math.max(0, now.getTime() - activeStartedAt.getTime())
+      ? Math.max(0, attributableEndAt.getTime() - activeStartedAt.getTime())
       : null;
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
@@ -986,6 +1074,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       commentCountLastHour: assigneeRunCommentCountLastHour,
       commentCountLastSixHours: assigneeRunCommentCountLastSixHours,
       elapsedMs,
+      nonLiveHoldMs,
       monitorGating: monitorGatingBreakdown(sourceIssue, activeStartedAt, elapsedMs, now),
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
@@ -1095,6 +1184,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
+      ...(evidence.nonLiveHoldMs > 0
+        ? [
+            `- Excluded as non-live execution hold: ${msToHuman(evidence.nonLiveHoldMs)} (issue's executionRunId pinned by a run that was not live; not counted toward the trigger — BLO-19848)`,
+          ]
+        : []),
       ...(evidence.monitorGating
         ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
         : []),

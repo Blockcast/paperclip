@@ -570,6 +570,128 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(hold.held).toBe(false);
   });
 
+  // BLO-19848: `long_active_duration` measured raw wall-clock from
+  // issues.started_at to now with no reference to whether anything was actually
+  // executing, so an issue pinned by a non-live executionRunId kept accruing
+  // "active" time after its work finished. The assignee could not even
+  // transition the issue out (the same wedge returns 409 Issue run ownership
+  // conflict), so the review fired on work that was already merged and the
+  // assignee had no way to stop it. BLO-18307 reported a "1d 7h active episode"
+  // behind a `scheduled_retry` holder; BLO-12565 and BLO-12696 match.
+  async function pinExecutionRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    status: "scheduled_retry" | "queued" | "running" | "succeeded";
+    lockedAt: Date;
+    lastOutputAt?: Date | null;
+    finishedAt?: Date | null;
+  }) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status: input.status,
+      invocationSource: "assignment",
+      startedAt: null,
+      lastOutputAt: input.lastOutputAt ?? null,
+      finishedAt: input.finishedAt ?? null,
+      contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
+    });
+    await db
+      .update(issues)
+      .set({ executionRunId: runId, checkoutRunId: runId, executionLockedAt: input.lockedAt })
+      .where(eq(issues.id, input.issueId));
+    return { runId };
+  }
+
+  it("does not fire long_active_duration on an episode pinned by a scheduled_retry run (BLO-19848)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await pinExecutionRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      status: "scheduled_retry",
+      // Parked from the moment the episode began: nothing has executed since,
+      // so zero of the 7h is attributable to a live run.
+      lockedAt: episodeStart,
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("does not fire long_active_duration on an episode pinned by a terminal run (BLO-19848)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await pinExecutionRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      status: "succeeded",
+      lockedAt: episodeStart,
+      // Finished 30m into the episode; the remaining 6.5h is not active work.
+      finishedAt: new Date(episodeStart.getTime() + 30 * 60 * 1000),
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+  });
+
+  it("still fires long_active_duration while the execution holder is live (BLO-19848)", async () => {
+    // The guard against over-correcting: a genuinely long *live* episode must
+    // still be reviewable. Only non-live hold time is excluded.
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await pinExecutionRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      status: "running",
+      lockedAt: episodeStart,
+      // Produced output 10 minutes ago — well inside the silence bound.
+      lastOutputAt: new Date(now.getTime() - 10 * 60 * 1000),
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("excludes only the silent tail when a running holder goes quiet mid-episode (BLO-19848)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await pinExecutionRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      status: "running",
+      lockedAt: episodeStart,
+      // Last output 3h ago — past the 2h silence bound, so the episode is
+      // truncated there: 4h attributable, under the 6h threshold.
+      lastOutputAt: new Date(now.getTime() - 3 * 60 * 60 * 1000),
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+  });
+
   it("suppresses long-active productivity reviews for deliberate future monitor waits", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const monitorNextCheckAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
