@@ -26,32 +26,34 @@ import {
   buildConfig,
   isEmptyConfig,
   resolveCompanyScope,
-  resolveWebhookToken,
 } from "./config-scope.js";
 import type { AlertmanagerPluginConfig } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Module-level worker state
 //
-// `setup()` populates these once at startup; the escalation job reads them.
+// Read ONLY by the escalation job. The webhook path must never consult these.
 //
-// These are a SINGLE-COMPANY snapshot and the webhook path must not rely on
-// them. The host hands the worker an empty bootstrap config whenever more than
-// one company has configured this plugin (see plugin-loader.ts — "multiple
-// company configs; legacy bootstrap scope disabled"), so on a multi-company
-// instance `setup()` resolves nothing and these stay null. Webhook deliveries
-// carry their own `companyId` and re-resolve per request instead.
+// `setup()` cannot populate them: plugin-loader.ts builds the bootstrap config
+// as a literal `{}` for every install, so the snapshot is always empty. The
+// only thing that ever sets them is `onConfigChanged`, which the host fires
+// per company without saying which one — so they hold "whichever company saved
+// config last". That is fine for a single-company install's escalation sweep
+// and actively wrong for authenticating a webhook, which is why deliveries
+// re-resolve from their own `companyId` instead.
+//
+// Deliberately no cached bearer token here: the SDK contract for
+// `ctx.secrets.resolve` is that secret values must never be cached, and a
+// cached token is exactly what let a worker restart silently disable auth.
 // ---------------------------------------------------------------------------
 
 let pluginCtx: PluginContext | null = null;
 let pluginConfig: AlertmanagerPluginConfig | null = null;
-/** Resolved bearer token, kept in memory only — never written to state. */
-let resolvedWebhookToken: string | null = null;
 
 // ---------------------------------------------------------------------------
 // Internal: apply a freshly-resolved config snapshot to the worker's in-memory
-// state. Used by both setup() (first start) and onConfigChanged() (operator
-// edits the instance config at runtime, no restart required).
+// state for the escalation job. Used by onConfigChanged() (operator edits the
+// instance config at runtime, no restart required).
 // ---------------------------------------------------------------------------
 
 async function applyConfig(
@@ -65,8 +67,6 @@ async function applyConfig(
       "paperclip-plugin-alertmanager: defaultCompanyId is not configured — incoming alerts will be dropped until it is set",
     );
   }
-
-  resolvedWebhookToken = await resolveWebhookToken(ctx, pluginConfig);
 }
 
 export const plugin = definePlugin({
@@ -77,11 +77,13 @@ export const plugin = definePlugin({
       | null
       | undefined;
     if (isEmptyConfig(rawConfig)) {
-      // Expected on multi-company instances: the host withholds the legacy
-      // bootstrap scope, so there is no single config to snapshot. Webhook
-      // deliveries resolve per-company; only the escalation sweep is affected.
+      // The normal path, on every install: plugin-loader.ts hands the worker a
+      // literal `{}`, because plugin config is company-scoped and setup() has
+      // no company context. Not a misconfiguration — webhook deliveries resolve
+      // their own company's config per request. Only the escalation sweep is
+      // affected, and it stays idle until an onConfigChanged supplies a scope.
       ctx.logger.info(
-        "paperclip-plugin-alertmanager: no bootstrap-scoped config (multi-company instance) — webhooks resolve config per delivery; the escalation sweep stays idle until a single-company scope exists",
+        "paperclip-plugin-alertmanager: bootstrap config is empty (expected — config is company-scoped); webhooks resolve config per delivery",
       );
     } else {
       await applyConfig(ctx, rawConfig as unknown as AlertmanagerPluginConfig);
@@ -109,15 +111,10 @@ export const plugin = definePlugin({
       return;
     }
     // Resolve against the company that owns THIS delivery. The setup()
-    // snapshot is empty on multi-company instances, so trusting it here
-    // rejects every request with "unauthorized" until someone re-saves
-    // config — and again after the next restart.
-    const scope = await resolveCompanyScope(
-      ctx,
-      input.companyId,
-      pluginConfig,
-      resolvedWebhookToken,
-    );
+    // snapshot is empty on every instance, and the module globals only ever
+    // hold whichever company saved config last — so they are never a safe
+    // stand-in for the delivering tenant's credentials.
+    const scope = await resolveCompanyScope(ctx, input.companyId);
     if (!scope) return;
     await handleWebhook(ctx, scope.config, scope.token, input);
   },

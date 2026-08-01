@@ -12,7 +12,6 @@
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
-  buildConfig,
   isEmptyConfig,
   resolveCompanyScope,
   resolveWebhookToken,
@@ -100,14 +99,16 @@ describe("resolveWebhookToken", () => {
 });
 
 describe("resolveCompanyScope", () => {
+  const COMPANY_B = "b1d3f3d3-adc9-48af-beb1-013a18368d84";
+
   it("BLO-20049: resolves the delivering company's token even when setup() snapshotted nothing", async () => {
-    // Exactly the production shape: >1 company configured, so the host gave
-    // setup() an empty config and both module globals are null.
+    // Exactly the production shape: the host always gives setup() an empty
+    // config, so there is nothing cached and the read must stand on its own.
     const { ctx, mocks } = mkCtx({
       configByCompany: { [COMPANY_A]: { defaultCompanyId: COMPANY_A, webhookToken: TOKEN } },
     });
 
-    const scope = await resolveCompanyScope(ctx, COMPANY_A, null, null);
+    const scope = await resolveCompanyScope(ctx, COMPANY_A);
 
     expect(scope).not.toBeNull();
     expect(scope?.token).toBe(TOKEN);
@@ -120,40 +121,48 @@ describe("resolveCompanyScope", () => {
     const { ctx } = mkCtx({
       configByCompany: {
         [COMPANY_A]: { webhookToken: TOKEN },
-        "b1d3f3d3-adc9-48af-beb1-013a18368d84": { webhookToken: otherToken },
+        [COMPANY_B]: { webhookToken: otherToken },
       },
     });
 
-    const a = await resolveCompanyScope(ctx, COMPANY_A, null, null);
-    const b = await resolveCompanyScope(ctx, "b1d3f3d3-adc9-48af-beb1-013a18368d84", null, null);
+    const a = await resolveCompanyScope(ctx, COMPANY_A);
+    const b = await resolveCompanyScope(ctx, COMPANY_B);
 
     expect(a?.token).toBe(TOKEN);
     expect(b?.token).toBe(otherToken);
   });
 
-  it("falls back to the setup() snapshot for single-company installs", async () => {
-    // Host returns {} for this company; the legacy bootstrap snapshot stands in.
-    const { ctx } = mkCtx();
-    const fallback = buildConfig(inlineConfig());
+  it("BLO-20467: a company with no stored config is rejected, never served another tenant's token", async () => {
+    // Company B has no config row. The worker globals may well hold company A's
+    // config, because onConfigChanged fires per company without saying which —
+    // so the only safe answer for B is "no scope", not "A's scope".
+    const { ctx, mocks } = mkCtx({
+      configByCompany: { [COMPANY_A]: { defaultCompanyId: COMPANY_A, webhookToken: TOKEN } },
+    });
 
-    const scope = await resolveCompanyScope(ctx, COMPANY_A, fallback, TOKEN);
-
-    expect(scope?.token).toBe(TOKEN);
-    expect(scope?.config.defaultCompanyId).toBe(COMPANY_A);
+    await expect(resolveCompanyScope(ctx, COMPANY_B)).resolves.toBeNull();
+    expect(mocks.logger.error).toHaveBeenCalled();
   });
 
-  it("returns null when there is neither per-company config nor a snapshot", async () => {
-    const { ctx } = mkCtx();
-    await expect(resolveCompanyScope(ctx, COMPANY_A, null, null)).resolves.toBeNull();
-  });
-
-  it("does not let a config-read failure serve a stale cross-company token", async () => {
-    const { ctx, mocks } = mkCtx();
+  it("BLO-20467: a config-read failure is rejected, never served another tenant's token", async () => {
+    const { ctx, mocks } = mkCtx({
+      configByCompany: { [COMPANY_A]: { defaultCompanyId: COMPANY_A, webhookToken: TOKEN } },
+    });
     mocks.config.get.mockRejectedValueOnce(new Error("db down"));
 
-    const scope = await resolveCompanyScope(ctx, COMPANY_A, null, null);
+    const scope = await resolveCompanyScope(ctx, COMPANY_B);
 
     expect(scope).toBeNull();
+    expect(mocks.logger.error).toHaveBeenCalled();
+  });
+
+  it("BLO-20467: a delivery with no companyId is dropped rather than guessing a tenant", async () => {
+    const { ctx, mocks } = mkCtx({
+      configByCompany: { [COMPANY_A]: { webhookToken: TOKEN } },
+    });
+
+    await expect(resolveCompanyScope(ctx, undefined)).resolves.toBeNull();
+    expect(mocks.config.get).not.toHaveBeenCalled();
     expect(mocks.logger.error).toHaveBeenCalled();
   });
 
@@ -162,7 +171,7 @@ describe("resolveCompanyScope", () => {
       configByCompany: { [COMPANY_A]: { webhookToken: TOKEN } },
     });
 
-    const scope = await resolveCompanyScope(ctx, COMPANY_A, null, null);
+    const scope = await resolveCompanyScope(ctx, COMPANY_A);
 
     expect(scope?.config.ownerMap).toBeDefined();
     expect(Object.keys(scope?.config.issueRouteMap ?? {}).length).toBeGreaterThan(0);
