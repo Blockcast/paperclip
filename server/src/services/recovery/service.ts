@@ -4009,7 +4009,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const ownerIsNonAssignee = input.action.ownerAgentId !== input.issue.assigneeAgentId;
     if (!input.hasNewActivitySinceLastAttempt && ownerIsNonAssignee && input.action.attemptCount > 1) {
       const assigneeAgentId = input.issue.assigneeAgentId;
-      if (!assigneeAgentId) return;
+      if (!assigneeAgentId) {
+        await refundUnspentWakeAttempt("enqueue_not_delivered");
+        return;
+      }
       await enqueueOrRefundAttempt(assigneeAgentId, {
         source: "assignment",
         triggerDetail: "system",

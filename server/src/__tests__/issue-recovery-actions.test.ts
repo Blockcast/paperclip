@@ -1974,6 +1974,61 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(afterDelivery!.attemptCount).toBe(1);
   }, 180_000);
 
+  it("refunds a suppressed non-assignee wake when the source issue has no assignee fallback", async () => {
+    const { managerId, coderId, sourceIssueId } = await seedCompany();
+    const queuedRun = { id: randomUUID() } as never;
+    const enqueueWakeup = vi.fn(async () => queuedRun);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const quotaRun = {
+      agentId: coderId,
+      status: "failed",
+      error: "Provider usage quota reached for this model.",
+      errorCode: "provider_quota",
+      contextSnapshot: { issueId: sourceIssueId },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+    const sweep = async () => {
+      const [fresh] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      await recovery.escalateStrandedAssignedIssue({
+        issue: fresh!,
+        previousStatus: "in_progress",
+        latestRun: { ...quotaRun, id: randomUUID() },
+        comment: "Provider quota recovery deferred.",
+        recoveryOwnerAgentId: managerId,
+      });
+    };
+
+    await sweep();
+    const [afterFirst] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+    expect(afterFirst).toMatchObject({
+      ownerAgentId: managerId,
+      maxAttempts: STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
+      attemptCount: 1,
+    });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: null })
+      .where(eq(issues.id, sourceIssueId));
+
+    await sweep();
+
+    const [afterSuppressed] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    expect(afterSuppressed!.attemptCount).toBe(1);
+    expect(strandedRecoveryWakeAttemptsExhausted(afterSuppressed!)).toBe(false);
+  }, 180_000);
+
   it("still refunds the attempt when the first refund write fails", async () => {
     // BLO-18996 (review follow-up). The refund is itself a separate database write on the
     // service's own connection, so it can fail on its own. It must not rethrow — on the
