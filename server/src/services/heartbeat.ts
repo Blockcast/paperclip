@@ -406,7 +406,7 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
  * misconfigured `maxConcurrentRuns` cannot alone blow past what the cluster
  * is provisioned to run for one agent concurrently.
  */
-const EXTERNAL_LIFECYCLE_SLOT_CAPACITY = 5;
+const EXTERNAL_LIFECYCLE_SLOT_CAPACITY = 8;
 const STALE_QUEUED_MAINTENANCE_WAKE_MAX_AGE_MS = 30 * 60 * 1000;
 const STALE_QUEUED_MAINTENANCE_WAKE_BATCH_SIZE = 250;
 const STALE_QUEUED_MAINTENANCE_WAKE_REASONS = [
