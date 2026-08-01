@@ -12,6 +12,7 @@
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
+  CompanyScopeUnavailableError,
   isEmptyConfig,
   resolveCompanyScope,
   resolveWebhookToken,
@@ -132,27 +133,34 @@ describe("resolveCompanyScope", () => {
     expect(b?.token).toBe(otherToken);
   });
 
-  it("BLO-20467: a company with no stored config is rejected, never served another tenant's token", async () => {
+  it("BLO-20467: a company with no stored config throws so the delivery fails, never served another tenant's token", async () => {
     // Company B has no config row. The worker globals may well hold company A's
     // config, because onConfigChanged fires per company without saying which —
     // so the only safe answer for B is "no scope", not "A's scope".
+    //
+    // It throws rather than returning null: returning normally would make the
+    // host record the delivery `success` and answer 200, so Alertmanager would
+    // never retry and the alert would be destroyed rather than delayed until an
+    // operator adds B's config.
     const { ctx, mocks } = mkCtx({
       configByCompany: { [COMPANY_A]: { defaultCompanyId: COMPANY_A, webhookToken: TOKEN } },
     });
 
-    await expect(resolveCompanyScope(ctx, COMPANY_B)).resolves.toBeNull();
+    await expect(resolveCompanyScope(ctx, COMPANY_B)).rejects.toThrow(
+      CompanyScopeUnavailableError,
+    );
     expect(mocks.logger.error).toHaveBeenCalled();
   });
 
-  it("BLO-20467: a config-read failure is rejected, never served another tenant's token", async () => {
+  it("BLO-20467: a config-read failure throws so Alertmanager retries, never served another tenant's token", async () => {
     const { ctx, mocks } = mkCtx({
       configByCompany: { [COMPANY_A]: { defaultCompanyId: COMPANY_A, webhookToken: TOKEN } },
     });
     mocks.config.get.mockRejectedValueOnce(new Error("db down"));
 
-    const scope = await resolveCompanyScope(ctx, COMPANY_B);
-
-    expect(scope).toBeNull();
+    await expect(resolveCompanyScope(ctx, COMPANY_B)).rejects.toThrow(
+      CompanyScopeUnavailableError,
+    );
     expect(mocks.logger.error).toHaveBeenCalled();
   });
 
@@ -161,7 +169,11 @@ describe("resolveCompanyScope", () => {
       configByCompany: { [COMPANY_A]: { webhookToken: TOKEN } },
     });
 
-    await expect(resolveCompanyScope(ctx, undefined)).resolves.toBeNull();
+    // Dropped, not thrown: unlike a config failure, no retry can supply a
+    // companyId, so failing the delivery would only produce a retry loop.
+    await expect(
+      resolveCompanyScope(ctx, undefined as unknown as string),
+    ).resolves.toBeNull();
     expect(mocks.config.get).not.toHaveBeenCalled();
     expect(mocks.logger.error).toHaveBeenCalled();
   });

@@ -60,11 +60,24 @@ async function applyConfig(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
 ): Promise<void> {
+  const previousScope = pluginConfig?.defaultCompanyId ?? null;
   pluginConfig = buildConfig(config);
 
   if (!pluginConfig.defaultCompanyId) {
     ctx.logger.warn(
       "paperclip-plugin-alertmanager: defaultCompanyId is not configured — incoming alerts will be dropped until it is set",
+    );
+    return;
+  }
+  // The escalation sweep runs for exactly one company: whichever one this
+  // config names. `onConfigChanged` does not say which company saved, so on a
+  // multi-company install a save by tenant B silently moves the sweep off
+  // tenant A. Log the transition so that reassignment is observable rather than
+  // invisible; the sweep itself stays self-consistent either way, because it
+  // reads `defaultCompanyId` out of the very config row it is holding.
+  if (previousScope && previousScope !== pluginConfig.defaultCompanyId) {
+    ctx.logger.warn(
+      `paperclip-plugin-alertmanager: escalation sweep scope moved from company ${previousScope} to ${pluginConfig.defaultCompanyId} — only one company is swept at a time (BLO-20595)`,
     );
   }
 }
@@ -89,7 +102,18 @@ export const plugin = definePlugin({
       await applyConfig(ctx, rawConfig as unknown as AlertmanagerPluginConfig);
     }
     ctx.jobs.register("check-alert-escalations", async () => {
-      if (pluginConfig) await runAlertEscalationSweep(ctx, pluginConfig);
+      if (!pluginConfig) {
+        // Idle until the first onConfigChanged. Deliveries are unaffected —
+        // they resolve per request — but escalation ladders do not advance, so
+        // say so on every tick instead of no-op'ing silently. Fixing this needs
+        // a host API to enumerate a plugin's configured companies, which
+        // PluginConfigClient does not expose today (BLO-20595).
+        ctx.logger.warn(
+          "paperclip-plugin-alertmanager: escalation sweep skipped — no company scope yet (config is company-scoped and setup() receives none); alert escalation ladders are not advancing until an operator saves config (BLO-20595)",
+        );
+        return;
+      }
+      await runAlertEscalationSweep(ctx, pluginConfig);
     });
     ctx.logger.info("paperclip-plugin-alertmanager started");
   },
@@ -106,14 +130,23 @@ export const plugin = definePlugin({
   async onWebhook(input: PluginWebhookInput) {
     const ctx = pluginCtx;
     if (!ctx) {
-      // Setup hasn't completed — bail safely instead of throwing so AM
-      // doesn't see a 500 and retry storm us.
-      return;
+      // Setup has not completed. Transient and self-healing, so surface it as a
+      // failed delivery: the host answers 502 and Alertmanager retries once the
+      // worker is up. Returning normally would record `success` + HTTP 200 and
+      // destroy the alert — the silent-loss failure mode this plugin already
+      // suffered a 67-minute outage from (BLO-20467).
+      throw new Error(
+        "paperclip-plugin-alertmanager: worker setup has not completed; rejecting delivery so Alertmanager retries",
+      );
     }
     // Resolve against the company that owns THIS delivery. The setup()
     // snapshot is empty on every instance, and the module globals only ever
     // hold whichever company saved config last — so they are never a safe
     // stand-in for the delivering tenant's credentials.
+    //
+    // A retryable failure (config RPC error, no stored config) throws
+    // CompanyScopeUnavailableError and propagates. `null` means the delivery
+    // carried no companyId, which no retry can fix, so it is dropped.
     const scope = await resolveCompanyScope(ctx, input.companyId);
     if (!scope) return;
     await handleWebhook(ctx, scope.config, scope.token, input);
