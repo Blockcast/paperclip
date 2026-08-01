@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { DEFAULT_COVER_DEDUP_WINDOW_MINUTES, DEFAULT_ESCALATION_DEADLINE_MINUTES, alertStateRef } from "./constants.js";
+import { DEFAULT_COVER_DEDUP_WINDOW_MINUTES, DEFAULT_ESCALATION_DEADLINE_MINUTES } from "./constants.js";
+import { readAlertState } from "./alert-state.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { ORIGIN_KIND, type AlertmanagerAlert, type AlertmanagerPluginConfig, type AlertStateRecord } from "./types.js";
 
@@ -375,8 +376,12 @@ async function advanceIssueLadder(
   now: Date,
 ): Promise<void> {
   if (["done", "cancelled"].includes(issue.status) || !issue.originId) return;
-  const ref = alertStateRef(companyId, issue.originId);
-  const state = await ctx.state.get(ref) as AlertStateRecord | null;
+  // Read-through, not a bare scoped get: an alert that was already firing when
+  // this version deployed still has its row in the legacy instance scope. Its
+  // escalation deadline can fall due before Alertmanager's next repeat delivery
+  // arrives to migrate it, and a scoped-only read would see `null` here and
+  // silently skip the ladder for up to a full `repeat_interval`.
+  const { ref, record: state } = await readAlertState(ctx, companyId, issue.originId);
   if (!state || state.resolvedAt || state.escalationComplete || !state.nextEscalationAt || Date.parse(state.nextEscalationAt) > now.getTime()) return;
   const hold = holdUntil(await ctx.issues.listComments(issue.id, companyId));
   if (hold && hold > now.getTime()) {
