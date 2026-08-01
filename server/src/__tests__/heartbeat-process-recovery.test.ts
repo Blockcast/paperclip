@@ -5012,7 +5012,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(blockedAfterUpdate!.startedAt?.toISOString()).toBe(originalStartedAt!.toISOString());
   });
 
-  it("BLO-18643: active source-scoped recovery also blocks a plain assignee update when owner differs", async () => {
+  // BLO-18643 (review follow-up): the assignee-fallback wake branch in
+  // `enqueueSourceScopedStrandedRecoveryWake` fires only when the recovery action
+  // is owned by someone OTHER than the assignee, and it wakes the assignee. The
+  // guard must therefore be issue-scoped, not owner-scoped: keying it on
+  // `ownerAgentId === actorAgentId` made it unsatisfiable on exactly that branch.
+  it("BLO-18643: active source-scoped recovery blocks a plain assignee update when the recovery owner is a different agent", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -5042,10 +5047,24 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(issueRecoveryActions)
       .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
     expect(action).toBeTruthy();
+
+    // With a second agent present the escalation hands BOTH the recovery action and
+    // the issue to that manager, so the raw post-escalation row has
+    // owner === assignee. Re-pin the assignee to the original agent to model the
+    // assignee-fallback wake, where the woken agent is the assignee and the action
+    // is owned by someone else.
     await db
       .update(issueRecoveryActions)
       .set({ ownerAgentId: managerId })
       .where(eq(issueRecoveryActions.id, action!.id));
+    await db.update(issues).set({ assigneeAgentId: agentId }).where(eq(issues.id, issueId));
+
+    const [ownerCheck] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action!.id));
+    expect(ownerCheck!.ownerAgentId).toBe(managerId);
+    expect(ownerCheck!.ownerAgentId).not.toBe(agentId);
 
     const [blockedBeforeUpdate] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(blockedBeforeUpdate).toMatchObject({
