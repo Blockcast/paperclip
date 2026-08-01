@@ -117,34 +117,54 @@ export interface CompanyScope {
 /**
  * Load the config + bearer token for the company that owns this delivery.
  *
- * Falls back to the `setup()` snapshot only when the per-company read yields
- * nothing, so single-company installs behave exactly as before.
+ * The delivering company's own config row is the ONLY acceptable source, and
+ * there is deliberately no fallback to the `setup()` snapshot. Two reasons:
+ *
+ *  1. The snapshot is worthless. `plugin-loader.ts` builds the bootstrap config
+ *     as a literal `{}` for every install — single- and multi-company alike —
+ *     so it never carries a token to fall back to.
+ *  2. The snapshot is dangerous. The only thing that ever populates those
+ *     module globals is `onConfigChanged`, which the host fires per company
+ *     without telling the worker which one it was. The globals therefore hold
+ *     "whichever company saved config last". Serving that to a different
+ *     company's delivery would authenticate it against the wrong tenant's
+ *     bearer token and then file the resulting issues under the wrong tenant's
+ *     `defaultCompanyId`.
+ *
+ * So an empty read or a read error yields `null`, and the caller drops the
+ * delivery, rather than falling open onto another tenant's credentials.
  */
 export async function resolveCompanyScope(
   ctx: PluginContext,
   companyId: string | undefined,
-  fallbackConfig: AlertmanagerPluginConfig | null,
-  fallbackToken: string | null,
 ): Promise<CompanyScope | null> {
-  if (companyId) {
-    try {
-      const raw = (await ctx.config.get(companyId)) as
-        | Record<string, unknown>
-        | null
-        | undefined;
-      if (!isEmptyConfig(raw)) {
-        const config = buildConfig(raw as unknown as AlertmanagerPluginConfig);
-        return {
-          config,
-          token: await resolveWebhookToken(ctx, config, companyId),
-        };
-      }
-    } catch (err) {
-      ctx.logger.error(
-        `paperclip-plugin-alertmanager: failed to load config for company ${companyId}: ${String(err)}`,
-      );
-    }
+  if (!companyId) {
+    ctx.logger.error(
+      "paperclip-plugin-alertmanager: webhook delivery carried no companyId — dropping rather than guessing a tenant",
+    );
+    return null;
   }
-  if (!fallbackConfig) return null;
-  return { config: fallbackConfig, token: fallbackToken };
+  let raw: Record<string, unknown> | null | undefined;
+  try {
+    raw = (await ctx.config.get(companyId)) as
+      | Record<string, unknown>
+      | null
+      | undefined;
+  } catch (err) {
+    ctx.logger.error(
+      `paperclip-plugin-alertmanager: failed to load config for company ${companyId}: ${String(err)}`,
+    );
+    return null;
+  }
+  if (isEmptyConfig(raw)) {
+    ctx.logger.error(
+      `paperclip-plugin-alertmanager: no stored config for company ${companyId} — rejecting delivery`,
+    );
+    return null;
+  }
+  const config = buildConfig(raw as unknown as AlertmanagerPluginConfig);
+  return {
+    config,
+    token: await resolveWebhookToken(ctx, config, companyId),
+  };
 }

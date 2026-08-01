@@ -207,32 +207,42 @@ ending in `_url` is ignored.
   rotated secret takes effect on the next request and a restart can never
   leave the worker holding a stale (or absent) token.
 
-### Multi-company instances: config is resolved per delivery
+### Config is resolved per delivery, per company
 
-Plugin config is company-scoped, and the host deliberately hands a worker an
-**empty** bootstrap config whenever more than one company has configured this
-plugin:
+Plugin config is company-scoped, and `setup()` has no company context — so the
+host hands every worker an **empty** bootstrap config, on single- and
+multi-company instances alike (`plugin-loader.ts`: "Workers receive an empty
+bootstrap config and must use `ctx.config.get(companyId)` at runtime"). On a
+multi-company instance you will also see:
 
 ```
 plugin-loader: multiple company configs; legacy bootstrap scope disabled  {configuredCompanyCount: 3}
 ```
 
-`ctx.config.get()` with no argument therefore returns `{}` on such an instance —
-the single-company bootstrap scope is a legacy compatibility path, not the
-contract. Webhook deliveries carry the host-selected `companyId`, and this
-plugin resolves both config and bearer token from it per request
-(`src/config-scope.ts`), falling back to the `setup()` snapshot only when the
-per-company read is empty.
+`ctx.config.get()` with no argument therefore returns `{}`. Webhook deliveries
+carry the host-selected `companyId`, and this plugin resolves both config and
+bearer token from it per request (`src/config-scope.ts`).
+
+There is deliberately **no fallback** to the `setup()` snapshot. The module
+globals are only ever populated by `onConfigChanged`, which the host fires per
+company without telling the worker which company it was — so they hold
+"whichever company saved config last". Serving that to a different company's
+delivery would check the request against the wrong tenant's bearer token and
+then file the resulting issues under the wrong tenant's `defaultCompanyId`. A
+company whose config cannot be read, or which has none stored, gets its
+delivery dropped instead.
 
 **If you are writing another plugin, do not resolve credentials in `setup()`.**
 Doing so fails in a way that hides itself: saving config fires
 `onConfigChanged` and re-hydrates the cached value, so the fault disappears the
 moment you touch config and returns at the next worker restart with no config
 change to blame. Diagnosed in BLO-20049, where it rejected 100% of alert
-deliveries with `502 unauthorized` while the stored config was perfectly valid.
+deliveries with `502 unauthorized` while the stored config was perfectly valid;
+it then recurred twice more (BLO-20467) for a combined ~3h15m of dead alerting.
 
-Known limitation: the `check-alert-escalations` sweep still needs a
-single-company scope and stays idle without one. It does not affect delivery.
+Known limitation: the `check-alert-escalations` sweep still reads those module
+globals, so it stays idle until an `onConfigChanged` supplies a scope. It does
+not affect delivery.
 
 
 ### Bearer rotation in a Kubernetes deployment
