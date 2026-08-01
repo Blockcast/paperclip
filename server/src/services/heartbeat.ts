@@ -3262,6 +3262,83 @@ function retryAfterDelayMs(value: unknown): number | null {
   return Math.ceil(parsed * 1000);
 }
 
+// BLO-18278: a provider capacity 429 tells us exactly when to come back, but on
+// the k8s adapters it says so in PROSE, inside the error message:
+//
+//   API Error: Request rejected (429) · BYOS provider capacity for 'anthropic'
+//   is temporarily unavailable; capacity may reset at 2026-07-26T21:29:59.782Z;
+//   retry in 9571s
+//
+// Nothing was reading that. claude-local/codex-local parse it adapter-side
+// (claude-local/src/server/parse.ts) and hand back a structured `retryNotBefore`,
+// but the shipped claude_k8s / opencode_k8s adapter bundles contain no
+// occurrence of `retryNotBefore`, `capacity may reset`, `resume_at`, or
+// `retry_after` at all — so on those adapters the horizon reached heartbeat
+// finalization as text and was dropped. `retryNotBefore` persisted null,
+// readTransientRetryNotBeforeFromRun returned null, and the hint-honoring
+// branch in scheduleBoundedRetryForRun (which already overrides `dueAt` with an
+// advertised reset, uncapped) was unreachable. The run therefore took the
+// rate-limit family's flat 90s hop — ~18x short of the 9571s the provider
+// asked for — so every attempt landed inside the same closed window until the
+// Job hit BackoffLimitExceeded and the issue was stranded. Live proof: run
+// 9727eaf0-9cea-461d-9101-f833f8de29fe.
+//
+// Parsing it here, server-side, is deliberately where the fix goes: it is the
+// one point every adapter's output funnels through, so it covers the k8s
+// bundles we do not build without duplicating the local adapters' parser.
+const PROVIDER_CAPACITY_RESET_AT_PATTERN =
+  /(?:\b(?:resume_at|retry_not_before|retryNotBefore)\b[\\'"\s]*[:=][\\'"\s]*|\b(?:capacity\s+)?may\s+reset\s+at\s+)(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))/i;
+const PROVIDER_CAPACITY_RETRY_IN_PATTERN = /\bretry\s+in\s+(\d+(?:\.\d+)?)\s*(?:s\b|secs?\b|seconds?\b)/i;
+
+// An advertised horizon further out than this is treated as unusable rather
+// than parked on: a bad parse (or a provider bug) must not silently sideline an
+// issue for days. 24h comfortably covers real capacity windows — the observed
+// fault asked for ~2h40m — while bounding the blast radius of a wrong read.
+const PROVIDER_CAPACITY_MAX_HORIZON_MS = 24 * 60 * 60 * 1000;
+
+export function parseProviderCapacityResetHorizon(
+  input: { resultJson?: Record<string, unknown> | null; errorMessage?: string | null },
+  now = Date.now(),
+): Date | null {
+  const resultJson = input.resultJson ?? null;
+  const candidates: unknown[] = [input.errorMessage];
+  if (resultJson) {
+    for (const key of ["result", "message", "error", "summary"] as const) {
+      candidates.push(resultJson[key]);
+    }
+  }
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+
+    // An absolute timestamp is authoritative when present: it survives any
+    // delay between the provider emitting the fault and us finalizing the run,
+    // whereas the relative "retry in Ns" is only correct at emission time.
+    const absolute = candidate.match(PROVIDER_CAPACITY_RESET_AT_PATTERN)?.[1];
+    if (absolute) {
+      const parsed = new Date(absolute).getTime();
+      if (Number.isFinite(parsed) && parsed > now && parsed - now <= PROVIDER_CAPACITY_MAX_HORIZON_MS) {
+        return new Date(parsed);
+      }
+      // A parsed-but-unusable absolute horizon (already elapsed, or absurdly
+      // far out) is a deliberate no-hint answer for THIS field rather than a
+      // reason to fall back to the relative form in the same string, which
+      // would disagree with it.
+      continue;
+    }
+
+    const relativeSeconds = candidate.match(PROVIDER_CAPACITY_RETRY_IN_PATTERN)?.[1];
+    if (relativeSeconds) {
+      const seconds = Number.parseFloat(relativeSeconds);
+      if (Number.isFinite(seconds) && seconds > 0 && seconds * 1000 <= PROVIDER_CAPACITY_MAX_HORIZON_MS) {
+        return new Date(now + Math.ceil(seconds * 1000));
+      }
+    }
+  }
+
+  return null;
+}
+
 function zeroTokenUsage(usage: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number } | undefined) {
   if (!usage) return true;
   return (usage.inputTokens ?? 0) <= 0 && (usage.outputTokens ?? 0) <= 0 && (usage.cachedInputTokens ?? 0) <= 0;
@@ -19923,6 +20000,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ) {
                 break;
               }
+              // BLO-18278: if the provider advertised a reset the in-run loop
+              // cannot outlast, stop here instead of spending the remaining
+              // attempts inside a window that is still closed. The whole budget
+              // is MAX_ATTEMPTS x MAX_DELAY, and each attempt relaunches the
+              // agent Job — which is how the observed 9571s horizon became a
+              // BackoffLimitExceeded strand rather than a wait. Breaking out
+              // finalizes the run as rate_limit_exhausted carrying
+              // `retryNotBefore`, and scheduleBoundedRetryForRun then parks a
+              // `scheduled_retry` row AT the advertised reset (that override is
+              // uncapped, unlike this loop's 10-min clamp). `scheduled_retry` is
+              // a live execution path to hasActiveExecutionPath, so the strand
+              // sweep leaves the issue alone.
+              const inRunHorizonBudgetMs =
+                (K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS - ccrotateRetryAttempt) *
+                K8S_CCROTATE_IN_RUN_RETRY_MAX_DELAY_MS;
+              const advertisedResetAt = parseProviderCapacityResetHorizon({
+                resultJson: adapterResult.resultJson,
+                errorMessage: adapterResult.errorMessage,
+              });
+              if (advertisedResetAt && advertisedResetAt.getTime() - Date.now() > inRunHorizonBudgetMs) {
+                await appendRunEvent(currentRun, seq++, {
+                  eventType: "lifecycle",
+                  stream: "system",
+                  level: "warn",
+                  message:
+                    "provider advertised a capacity reset beyond the in-run retry budget; deferring to a scheduled retry at that reset",
+                  payload: {
+                    advertisedResetAt: advertisedResetAt.toISOString(),
+                    inRunHorizonBudgetMs,
+                    attemptsUsed: ccrotateRetryAttempt,
+                    maxAttempts: K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS,
+                  },
+                });
+                await onLog(
+                  "stderr",
+                  `[paperclip] Provider capacity resets at ${advertisedResetAt.toISOString()}, beyond this run's retry budget; deferring to a scheduled retry.\n`,
+                );
+                break;
+              }
               ccrotateRetryAttempt += 1;
               const retryDelayMs = k8sCcrotateRetryDelayMs(adapterResult);
               if (externalRuntimeReservation) {
@@ -20146,6 +20262,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         isHintlessTransientUpstreamFault(adapterResult.resultJson, {
           errorMessage: adapterResult.errorMessage,
         });
+      // BLO-18278: recover the capacity-reset horizon a throttle fault stated in
+      // prose. Only consulted when the adapter did not already hand back a
+      // structured `retryNotBefore` (claude-local/codex-local do), and only for
+      // the throttle families — a horizon quoted inside some unrelated failure's
+      // tool output must not push that failure's retry into next week.
+      const providerCapacityResetAt =
+        (rateLimitExhaustedOverride || providerThrottledNoProgressOverride) && !adapterResult.retryNotBefore
+          ? parseProviderCapacityResetHorizon({
+              resultJson: adapterResult.resultJson,
+              errorMessage: adapterResult.errorMessage,
+            })
+          : null;
+      const effectiveRetryNotBefore =
+        adapterResult.retryNotBefore ?? providerCapacityResetAt?.toISOString() ?? null;
       let prReviewCompletionEvidence = outcome === "succeeded"
         ? evaluatePrReviewCompletionEvidence(context, {
           resultJson: adapterResult.resultJson ?? null,
@@ -20350,6 +20480,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               resultJson: {
                 ...parseObject(adapterResult.resultJson),
                 configFreshness: configFreshnessResultMetadata,
+                // BLO-18278: keep the provenance of a prose-recovered horizon so
+                // the strand comment can name the reset instant, and so a wrong
+                // parse is debuggable from the persisted run rather than only
+                // from the raw log. Set here, inside `resultJson`, because
+                // mergeAdapterRecoveryMetadata only forwards errorFamily and
+                // retryNotBefore — any other key passed alongside them is
+                // dropped.
+                ...(providerCapacityResetAt
+                  ? { providerCapacityResetAt: providerCapacityResetAt.toISOString() }
+                  : {}),
                 ...(prReviewIncompleteOverride
                   ? {
                     prReviewOutputGate: {
@@ -20371,7 +20511,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 : transientUpstreamOverride
                   ? "transient_upstream"
                 : (adapterResult.errorFamily ?? null),
-              retryNotBefore: adapterResult.retryNotBefore ?? null,
+              retryNotBefore: effectiveRetryNotBefore,
               ...(providerThrottledNoProgressOverride ? { providerThrottleNoProgress: true } : {}),
             }),
             modelProfileApplication,
