@@ -290,6 +290,10 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
   return betterAuth(authConfig);
 }
 
+function normalizeAuthLocationHeader(value: string | number | string[] | undefined): string | string[] | undefined {
+  return typeof value === "number" ? String(value) : value;
+}
+
 export function createBetterAuthHandler(auth: BetterAuthHandlerTarget): RequestHandler {
   const handler = toNodeHandler(auth);
   return (req, res, next) => {
@@ -298,7 +302,7 @@ export function createBetterAuthHandler(auth: BetterAuthHandlerTarget): RequestH
       const outcome = classifyAuthResponse({
         operation,
         statusCode: res.statusCode,
-        location: res.getHeader("location"),
+        location: normalizeAuthLocationHeader(res.getHeader("location")),
       });
       recordAuthRequest({ operation, outcome });
       logger.info(

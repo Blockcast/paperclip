@@ -108,6 +108,33 @@ type DbOrTransaction = Db | DbTransaction;
 // the run — it only stops subsequent wakes for the issue from being parked
 // behind a holder that may never start.
 export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
+// BLO-19941: the same backstop, for a holder wedged at `running`.
+//
+// `running` is neither missing nor terminal, so isCleanable() is false forever
+// and — unlike the pre-claim case — executionLockedAt cannot be the basis: a
+// healthy 4h run legitimately holds a 4h-old lock. Age must therefore be
+// measured against the run's own most-recent *genuine* activity
+// (lastUsefulActionAt > lastOutputAt > startedAt), which is exactly the metric
+// the dispatcher's slot gate uses (`nonStaleRunningRuns`,
+// heartbeat.ts:17162-17171) and the reaper's own silence test
+// (`persistedSignalRef`, heartbeat.ts:16283-16289). Deliberately NOT updatedAt:
+// review/recovery churn bumps it every ~minute and would shield a dead run
+// forever (BLO-8827, and the reaper's own note at heartbeat.ts:16444-16448).
+//
+// reapOrphanedRuns is the primary path and normally flips such a run terminal
+// within minutes, but it is not a guarantee: several of its skips are
+// clock-unbounded (a persistent duplicate-Job/identity mismatch recomputes
+// identically every pass; the in-memory runningProcesses/activeRunExecutions
+// skips last as long as the pod does; the hot-restart-adoption and detached-pid
+// holds have no ceiling). This is the backstop for when it does not fire.
+//
+// 2h sits well clear of the reaper's own floors — 15m EXTERNAL_LIFECYCLE_STALE_MS
+// and the 45m EXTERNAL_LIFECYCLE_HARD_STALE_MS that gates destructive kills — so
+// the reaper always gets its full chance first and this only fires once it has
+// demonstrably failed. Shorter than the 6h pre-claim bound on purpose: a
+// `queued` holder may legitimately be waiting on capacity, whereas a `running`
+// holder has already had its liveness independently evaluated every ~30s.
+export const STALE_RUNNING_ISSUE_LOCK_MS = 2 * 60 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 // BLO-7113: re-fire suppression for `stale_active_run_evaluation` wrappers.
 // When the underlying `runs.status='running'` row is the canonical
@@ -157,6 +184,84 @@ export const STRANDED_RECENT_PROGRESS_EXEMPTION_MS = Math.max(
   Number(process.env.STRANDED_RECENT_PROGRESS_EXEMPTION_MS) || 30 * 60 * 1000,
 );
 
+/**
+ * BLO-18996: hard ceiling on how many times one source-scoped recovery action may wake
+ * an owner before the sweep stops re-firing it.
+ *
+ * Every wake this action mints is discretionary — nothing downstream verifies that the
+ * owner it names can actually discharge it. When the owner cannot (the reported case: a
+ * `stranded_assigned_issue` action named an owner who was then 403'd by `issue:comment`
+ * on the very issue it woke them about), the action never resolves, `attemptCount` grows
+ * without bound, and each sweep pays for another wake that cannot possibly make
+ * progress. Bounding the wakes converts a silent infinite loop into a visible terminal
+ * state: the action stays open with `attemptCount > maxAttempts`, which is directly
+ * queryable, and the source issue carries a one-time system comment saying so.
+ *
+ * Deliberately generous — this is a runaway backstop, not a retry policy. Legitimate
+ * recovery converges in one or two attempts, and a discharge resolves the action so the
+ * next escalation starts a fresh one at attempt 1.
+ */
+export const STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS = Math.max(
+  2,
+  Number(process.env.STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS) || 5,
+);
+
+/**
+ * BLO-18996: outer horizon on the same loop, in wall-clock time rather than attempts.
+ *
+ * `attemptCount` is a per-OWNER budget — it restarts when the action changes hands, which is
+ * what makes a genuinely reassigned owner reachable again. But owner identity is not stable
+ * across sweeps: escalation reassigns the source issue to the recovery owner, and
+ * `resolveStrandedIssueRecoveryOwnerAgentId` then routes from the new assignee's `reportsTo`.
+ * In an org deeper than two levels that ping-pongs (CTO -> CEO -> CTO -> ...), because the
+ * CEO has no `reportsTo` and the role fallback orders `cto` first. Every sweep is then an
+ * owner change, the per-owner counter never leaves 1, and the attempt budget alone bounds
+ * nothing — measured at 30 wakes over 30 sweeps against a budget of 5.
+ *
+ * So the attempt budget cannot be the only bound. This horizon is anchored to the action's
+ * own creation instant, which no sweep rewrites, and therefore holds no matter how ownership
+ * churns. Past it the sweep stops waking anyone for the action and says so once on the
+ * source issue, exactly as attempt exhaustion does.
+ */
+export const STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS = Math.max(
+  60_000,
+  Number(process.env.STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS) || 6 * 60 * 60 * 1000,
+);
+
+/**
+ * Escape a literal for use inside a `LIKE` pattern. Mirrors the helper in
+ * `services/issues.ts` (module-private there); the call sites below pair it with an
+ * explicit `ESCAPE '\'` clause, which is the same idiom that file uses.
+ */
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, "\\$&");
+}
+
+/**
+ * True once this action has spent its wake budget. Only actions that actually carry a
+ * budget are bounded: `maxAttempts` is left null for the causes that never wake an owner
+ * (OWNERLESS provider-quota monitor waits, manual-repair holds), so neither their
+ * long-lived `attemptCount` nor their age trips this. Provider-quota WITH a manager-ladder
+ * owner is not in that set — it wakes that owner, so it is bounded like any other
+ * escalation.
+ *
+ * Two independent bounds, either of which is terminal:
+ *   - the per-owner attempt budget, which restarts on reassignment; and
+ *   - `timeoutAt`, the creation-anchored horizon that owner churn cannot reset.
+ * `maxAttempts !== null` gates both, so "does this action wake anyone at all" stays a single
+ * decision made once at escalation time.
+ */
+export function strandedRecoveryWakeAttemptsExhausted(
+  action: { attemptCount: number; maxAttempts: number | null; timeoutAt?: Date | string | null },
+  now: Date = new Date(),
+) {
+  if (action.maxAttempts === null) return false;
+  if (action.attemptCount > action.maxAttempts) return true;
+  if (!action.timeoutAt) return false;
+  const horizon = action.timeoutAt instanceof Date ? action.timeoutAt : new Date(action.timeoutAt);
+  return Number.isFinite(horizon.getTime()) && horizon.getTime() <= now.getTime();
+}
+
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
@@ -201,6 +306,21 @@ type StrandedRecoveryCause =
   | typeof SUCCESSFUL_RUN_MISSING_STATE_REASON;
 
 type StrandedPreviousStatus = "todo" | "in_progress" | "in_review";
+
+// Payload for the BLO-18996 wake-exhaustion notice. Built inside the escalation
+// transaction (pure data, no I/O) and posted after it commits — see
+// `postStrandedRecoveryExhaustionNotice`.
+type StrandedRecoveryExhaustionNotice = {
+  issueId: string;
+  attemptBudgetSpent: boolean;
+  actionId: string;
+  ownerAgentId: string | null;
+  ownerLink: string;
+  attemptCount: number;
+  maxAttempts: number | null;
+  timeoutAt: string | null;
+  recoveryCause: StrandedRecoveryCause;
+};
 
 type SuccessfulRunHandoffRecoveryEvidence = {
   sourceRunId: string | null;
@@ -3678,7 +3798,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       input.issue.companyId,
       input.issue.id,
       input.recoveryCause,
-      // Include assignee so a reassignment resets attempt count and re-allows a fresh wake.
+      // Include assignee so a reassignment is a distinct failure signature. NOTE: this does
+      // NOT drive the wake-budget reset, despite what this comment claimed before BLO-18996
+      // — escalation reassigns the issue to the recovery owner, so this segment changes on
+      // every sweep of an unresolved failure. The budget resets on a change of
+      // `ownerAgentId` instead; see `upsertSourceScopedUnlocked`.
       input.issue.assigneeAgentId ?? "unassigned",
     ].join(":");
   }
@@ -3733,6 +3857,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       preferredOwnerAgentId: input.recoveryOwnerAgentId,
     });
     const ownerAgentId = routing.ownerAgentId;
+    // BLO-18996: the single predicate for "will any sweep wake an owner for this action".
+    // The wake budget and the wake path have to agree, and previously they were written as
+    // two separate expressions that disagreed on exactly one shape: `provider_quota` is
+    // monitor-only ONLY when it has no owner, but the budget condition excluded the cause
+    // outright. `resolveStrandedRecoveryRouting` gives provider-quota a manager-ladder owner
+    // whenever the quota-hit agent is not invokable, and that shape takes the `wake_owner`
+    // branch below and clears every early return in
+    // `enqueueSourceScopedStrandedRecoveryWake` — so it woke an owner forever on a null
+    // budget. Deriving all of it from one boolean is what stops that drift recurring.
+    const wakesOwner = Boolean(ownerAgentId) &&
+      recoveryCause !== "workspace_validation_failed" &&
+      recoveryCause !== "configuration_incomplete";
     const sourceAssignee = input.issue.assigneeAgentId
       ? await getAgent(input.issue.assigneeAgentId)
       : null;
@@ -3814,7 +3950,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       monitorPolicy: recoveryCause === "provider_quota" && !ownerAgentId
         ? { type: "wait_recovery", retryAgentId: routing.returnOwnerAgentId }
         : null,
-      maxAttempts: null,
+      // BLO-18996: only the wake-an-owner shape gets a budget. The monitor-only and
+      // manual-repair shapes above return early from
+      // `enqueueSourceScopedStrandedRecoveryWake` by design and are expected to sit open
+      // across many sweeps, so giving them a ceiling would manufacture a spurious
+      // exhaustion. `wakesOwner` is the same predicate those early returns implement.
+      maxAttempts: wakesOwner ? STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS : null,
+      // The creation-anchored outer horizon for the same shape. `upsertSourceScoped`
+      // preserves an existing `timeoutAt`, so this only takes effect on the insert that
+      // opens the action — which is what makes it immune to the owner ping-pong that
+      // restarts `attemptCount`. Recomputed from `now` on every sweep but discarded on all
+      // but the first, deliberately.
+      timeoutAt: wakesOwner ? new Date(now.getTime() + STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS) : null,
       lastAttemptAt: now,
     }, dbOrTx);
 
@@ -3831,11 +3978,86 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     if (input.recoveryCause === "provider_quota" && !input.action.ownerAgentId) return;
     if (input.recoveryCause === "workspace_validation_failed" || input.recoveryCause === "configuration_incomplete") return;
     if (!input.action.ownerAgentId) return;
+    if (strandedRecoveryWakeAttemptsExhausted(input.action)) return;
+    // BLO-18996 (review follow-up): the attempt this wake spends was already committed.
+    // `recoveryActionsSvc` runs on the outer `db`, not on `escalateStrandedAssignedIssue`'s
+    // transaction, so `upsertSourceScoped`'s `attemptCount` increment is durable before we
+    // get here and the surrounding rollback cannot take it back. Without a refund an enqueue
+    // that woke nobody burns budget anyway — five such sweeps retire the action having woken
+    // nobody, while the exhaustion notice reports five wakes.
+    //
+    // "Woke nobody" is NOT just a throw. `enqueueWakeup` returns null on nine separate
+    // non-delivery paths — provider-capacity deferral (`checkPenstockAvailabilityForAgent`),
+    // an active tree pause hold, heartbeat/wake-on-demand disabled, cooldown, the
+    // no-actionable-timer-work skip — and every one of those either writes a *skipped*
+    // request row or nothing at all. None of them queues a run. So the budget must be spent
+    // on a non-null return only, which is the sole outcome that means a wake reached the
+    // queue. (See the same null-is-not-an-error reading at the blockers-resolved backstop
+    // below, `result.deferredOrFailed`.)
+    //
+    // Refunding every null cannot reopen the unbounded loop this PR exists to close: a
+    // permanently-deferred owner is still retired by `timeoutAt`, the creation-anchored
+    // horizon in `strandedRecoveryWakeAttemptsExhausted`, which no sweep rewrites and which
+    // does not depend on `attemptCount` moving at all. Attempts bound delivered-but-
+    // unproductive wakes; the horizon bounds wall-clock regardless of delivery.
+    const refundUnspentWakeAttempt = async (cause: "enqueue_threw" | "enqueue_not_delivered", error?: unknown) => {
+      const release = () =>
+        recoveryActionsSvc.releaseWakeAttempt({
+          companyId: input.issue.companyId,
+          actionId: input.action.id,
+        });
+      try {
+        await release();
+      } catch (firstError) {
+        // One retry, because the failure mode this compensates for is a transient database
+        // blip and a second attempt is nearly free. If it still fails we must not rethrow —
+        // on the `enqueue_threw` path that would mask the enqueue's own error, which is the
+        // more diagnostic one. But it must not vanish either: a swallowed refund leaves the
+        // attempt spent for a wake nobody received, so record it under a stable message that
+        // can be counted. Bounded damage by construction — over-counting is at most one
+        // attempt per failed refund against a 5-attempt budget that `timeoutAt` also bounds,
+        // so the degradation is a slightly early retirement with a comment on the issue, not
+        // a silent loop.
+        try {
+          await release();
+        } catch (secondError) {
+          logger.warn(
+            {
+              err: secondError,
+              firstErr: firstError,
+              enqueueErr: error,
+              cause,
+              companyId: input.issue.companyId,
+              issueId: input.issue.id,
+              recoveryActionId: input.action.id,
+              attemptCount: input.action.attemptCount,
+              maxAttempts: input.action.maxAttempts,
+            },
+            "recovery wake attempt refund failed after retry; budget over-counted by one attempt",
+          );
+        }
+      }
+    };
+    const enqueueOrRefundAttempt: typeof deps.enqueueWakeup = async (agentId, opts) => {
+      let queued: Awaited<ReturnType<typeof deps.enqueueWakeup>>;
+      try {
+        queued = await deps.enqueueWakeup(agentId, opts);
+      } catch (error) {
+        // Refund, then rethrow so the escalation still fails loudly.
+        await refundUnspentWakeAttempt("enqueue_threw", error);
+        throw error;
+      }
+      if (!queued) await refundUnspentWakeAttempt("enqueue_not_delivered");
+      return queued;
+    };
     const ownerIsNonAssignee = input.action.ownerAgentId !== input.issue.assigneeAgentId;
     if (!input.hasNewActivitySinceLastAttempt && ownerIsNonAssignee && input.action.attemptCount > 1) {
       const assigneeAgentId = input.issue.assigneeAgentId;
-      if (!assigneeAgentId) return;
-      await deps.enqueueWakeup(assigneeAgentId, {
+      if (!assigneeAgentId) {
+        await refundUnspentWakeAttempt("enqueue_not_delivered");
+        return;
+      }
+      await enqueueOrRefundAttempt(assigneeAgentId, {
         source: "assignment",
         triggerDetail: "system",
         reason: "source_scoped_recovery_action",
@@ -3870,7 +4092,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
       return;
     }
-    await deps.enqueueWakeup(input.action.ownerAgentId, {
+    // NOTE (BLO-18996): `attemptCount` restarts at 1 whenever the action's owner changes,
+    // and refunds decrement it when no wake was delivered. This key can therefore repeat
+    // within one owner sequence after refunded attempts, and across owner sequences after
+    // reassignment. That is safe today because nothing dedupes this path on `idempotencyKey`:
+    // `enqueueWakeup` coalesces on (companyId, agentId, taskKey). If you ever add
+    // idempotency-key dedup here, include the owner and a non-refunded delivery sequence first.
+    await enqueueOrRefundAttempt(input.action.ownerAgentId, {
       source: "assignment",
       triggerDetail: "system",
       reason: "source_scoped_recovery_action",
@@ -3901,6 +4129,70 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       recoveryActionId: input.action.id,
       agentId: input.action.ownerAgentId,
     });
+  }
+
+  // Emits the BLO-18996 wake-exhaustion notice AFTER the escalation transaction has
+  // committed. See the comment at the `exhaustionNotice` construction site for why this
+  // cannot run inline inside that transaction on this branch.
+  async function postStrandedRecoveryExhaustionNotice(notice: StrandedRecoveryExhaustionNotice) {
+    // Key the dedup marker on whatever starts a new sequence for the bound that fired.
+    // The row is reused across reassignments (`upsertSourceScoped` updates the active row
+    // in place), so an id-only marker would suppress this notice forever after the first
+    // exhaustion — including for a later owner whose budget legitimately reset and was
+    // then spent again, hence the owner in the attempt-budget key. The horizon is the
+    // opposite case: it fires once and stays fired while ownership churns underneath, so
+    // keying it on the owner would re-announce on every ping-pong sweep. Key it on the
+    // horizon instant, which is fixed for the life of the action.
+    const exhaustionMarker = notice.attemptBudgetSpent
+      ? `Recovery wake budget exhausted for action \`${notice.actionId}\` (owner \`${notice.ownerAgentId ?? "unassigned"}\`)`
+      : `Recovery wake horizon reached for action \`${notice.actionId}\` (horizon \`${notice.timeoutAt}\`)`;
+    // Exact, unbounded marker lookup — deliberately NOT a "scan the latest N comments"
+    // window. This notice fires at the END of an action's life, which is precisely when
+    // the source issue has accumulated the most automation chatter, so a bounded window
+    // is guaranteed to age the marker out and let a later sweep re-announce the same
+    // exhaustion. Filtered by issue + author in SQL and capped at one row, so it costs
+    // an index seek rather than the 50-row fetch it replaces.
+    const alreadyAnnounced = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.issueId, notice.issueId),
+        eq(issueComments.authorType, "system"),
+        sql`${issueComments.body} LIKE ${`%${escapeLikePattern(exhaustionMarker)}%`} ESCAPE '\\'`,
+      ))
+      .limit(1)
+      .then((rows) => rows.length > 0);
+    if (alreadyAnnounced) return;
+
+    await issuesSvc.addComment(
+      notice.issueId,
+      [
+        `${exhaustionMarker}.`,
+        "",
+        notice.attemptBudgetSpent
+          ? `Paperclip woke the recovery owner ${notice.maxAttempts} times without this action being ` +
+            "discharged, so it has stopped waking anyone for it. The action stays open and needs a human " +
+            "or a board operator to resolve it."
+          : "This recovery action passed its auto-recovery horizon without being discharged, so Paperclip " +
+            "has stopped waking anyone for it. Recovery ownership was being reassigned faster than any one " +
+            "owner could spend its attempt budget, which is why the attempt count below is low. The action " +
+            "stays open and needs a human or a board operator to resolve it.",
+        "",
+        `- Recovery owner: ${notice.ownerLink}`,
+        `- Attempts: ${notice.attemptCount} (budget ${notice.maxAttempts})`,
+        `- Auto-recovery horizon: ${notice.timeoutAt ?? "none"}`,
+        `- Cause: \`${notice.recoveryCause}\``,
+        notice.attemptBudgetSpent
+          ? "- Next action: discharge or cancel this recovery action, reassign the source issue, or record an " +
+            "intentional manual resolution. Handing the action to a different recovery owner starts a fresh " +
+            "attempt sequence and restores the wake budget; re-running it against the same owner does not."
+          : "- Next action: discharge or cancel this recovery action, or record an intentional manual " +
+            "resolution. Reassigning will NOT restore the wake budget — the horizon above is fixed for the " +
+            "life of the action, so a new owner does not get fresh attempts.",
+      ].join("\n"),
+      {},
+      { authorType: "system" },
+    );
   }
 
   // Backstop only — NOT the primary guard.
@@ -4795,6 +5087,38 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
       }
 
+      // BLO-18996 + BLO-18643 merge: master computes and POSTS the wake-exhaustion
+      // notice here, inline, using the `db` handle. That is safe on master but not on
+      // this branch. `issuesSvc.addComment` inserts into `issue_comments`, and migration
+      // 0076 installs an AFTER INSERT trigger there that UPDATEs the parent `issues` row.
+      // This escalation transaction already holds that row, so posting from a SEPARATE
+      // connection while `tx` is still open makes the trigger block on our own lock while
+      // we block on the comment — a cross-connection self-deadlock, the same class as the
+      // earlier Critical finding on this PR.
+      //
+      // So compute the payload here (pure data, no I/O) and emit it after the transaction
+      // commits, alongside `activity` and `humanDecisionEvent`, which is the pattern this
+      // branch already established for exactly this reason.
+      const exhaustionNotice: StrandedRecoveryExhaustionNotice | null =
+        strandedRecoveryWakeAttemptsExhausted(action)
+          ? {
+            issueId: fresh.id,
+            // Which bound stopped it, because the operator's next move differs: a spent
+            // per-owner budget can be restored by handing the action to a different owner,
+            // but the horizon cannot be restored at all.
+            attemptBudgetSpent: action.attemptCount > (action.maxAttempts ?? Infinity),
+            actionId: action.id,
+            ownerAgentId: action.ownerAgentId ?? null,
+            ownerLink: agentUiLink(recoveryOwner, prefix),
+            attemptCount: action.attemptCount,
+            maxAttempts: action.maxAttempts ?? null,
+            timeoutAt: action.timeoutAt instanceof Date
+              ? action.timeoutAt.toISOString()
+              : (action.timeoutAt ?? null),
+            recoveryCause,
+          }
+          : null;
+
       const activity: LogActivityInput = {
         companyId: fresh.companyId,
         actorType: "system",
@@ -4825,6 +5149,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           latestRunErrorCode: input.latestRun?.errorCode ?? null,
           recoveryActionId: action.id,
           recoveryActionAttemptCount: action.attemptCount,
+          // BLO-18996: the fields a "which recovery actions have stopped making progress"
+          // query needs, without having to join the actions table. `attemptCount` alone is
+          // not enough to spot a stalled action, because owner churn keeps it near 1 — the
+          // horizon is what identifies that class.
+          recoveryActionMaxAttempts: action.maxAttempts,
+          recoveryWakeBudgetExhausted: strandedRecoveryWakeAttemptsExhausted(action),
+          recoveryWakeHorizonAt: action.timeoutAt instanceof Date
+            ? action.timeoutAt.toISOString()
+            : action.timeoutAt ?? null,
           recoveryOwnerAgentId: action.ownerAgentId,
           previousOwnerAgentId: action.previousOwnerAgentId,
           returnOwnerAgentId: action.returnOwnerAgentId,
@@ -4849,7 +5182,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         };
       }
 
-      return { updated, pendingWake, activity, humanDecisionEvent };
+      return { updated, pendingWake, activity, humanDecisionEvent, exhaustionNotice };
     });
     if (!outcome) return null;
 
@@ -4858,6 +5191,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
     if (outcome.activity) {
       await logActivity(db, outcome.activity);
+    }
+    if (outcome.exhaustionNotice) {
+      await postStrandedRecoveryExhaustionNotice(outcome.exhaustionNotice);
     }
     if (outcome.humanDecisionEvent) {
       await emitNeedsHumanDecisionEscalationEvent(outcome.humanDecisionEvent);
@@ -7536,11 +7872,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               id: heartbeatRuns.id,
               status: heartbeatRuns.status,
               scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+              startedAt: heartbeatRuns.startedAt,
+              lastOutputAt: heartbeatRuns.lastOutputAt,
+              lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
             })
             .from(heartbeatRuns)
             .where(inArray(heartbeatRuns.id, referencedRunIds))
         : [];
-    const runById = new Map<string, { status: string; scheduledRetryAt: Date | null }>();
+    const runById = new Map<string, {
+      status: string;
+      scheduledRetryAt: Date | null;
+      startedAt: Date | null;
+      lastOutputAt: Date | null;
+      lastUsefulActionAt: Date | null;
+    }>();
     for (const row of runRows) runById.set(row.id, row);
 
     const isCleanable = (runId: string | null) => {
@@ -7588,17 +7933,80 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       return false;
     };
 
+    // BLO-19941: the `running` counterpart. Keyed on the run's own most-recent
+    // genuine activity, never on executionLockedAt (a healthy long run holds an
+    // old lock) and never on updatedAt (churn-renewable, BLO-8827). Clearing is
+    // non-destructive in exactly the same way as the pre-claim case: the run row
+    // is left alone, releaseIssueExecutionAndPromote's write is guarded by
+    // `eq(executionRunId, run.id)` so a late finish cannot stomp a new holder,
+    // and a fresh claim re-stamps under `or(isNull, eq(self))`.
+    // Returns the timestamp the `running` bound is measured from, or null when
+    // the holder is not a `running` run at all.
+    const runningLockStaleBasis = (runId: string | null, lockedAt: Date | null) => {
+      if (!runId) return null;
+      const run = runById.get(runId);
+      if (run?.status !== "running") return null;
+      // A `running` row that has not stamped any signal yet is anomalous, but it
+      // is also the shape of a run mid-claim, so fall back to the lock timestamp
+      // rather than clearing a lock that was taken seconds ago.
+      return run.lastUsefulActionAt ?? run.lastOutputAt ?? run.startedAt ?? lockedAt;
+    };
+    const isRunningLockSilent = (runId: string | null, lockedAt: Date | null) => {
+      const basis = runningLockStaleBasis(runId, lockedAt);
+      if (!basis) return false;
+      return Date.now() - basis.getTime() >= STALE_RUNNING_ISSUE_LOCK_MS;
+    };
+
     for (const issue of candidates) {
-      const executionLockExpired = isPreClaimLockExpired(
+      const runningLockSilent = isRunningLockSilent(
         issue.executionRunId,
         issue.executionLockedAt,
       );
+      const executionLockExpired = isPreClaimLockExpired(
+        issue.executionRunId,
+        issue.executionLockedAt,
+      ) || runningLockSilent;
+      // BLO-19941: in the wedge shape both columns point at the SAME wedged run
+      // (checkout and execution are claimed together), so the checkout guard
+      // below would `continue` before the execution check ever ran, making this
+      // sweep a no-op for exactly the case it needs to cover.
+      //
+      // BLO-19566 extends that allowance from `running`-silent to the pre-claim
+      // (`queued`) case, which BLO-19941 deliberately left out. The exclusion
+      // made the BLO-18995 pre-claim path dead code for every issue checked out
+      // the normal way, because checkout stamps both columns at once. Measured
+      // on the live fleet 2026-08-01T05:32Z (81 issues holding a `queued` pin):
+      // of the 55 with a null checkoutRunId — where the guard already passes —
+      // none had held a lock past the 6h bound, while both of the only two pins
+      // in the fleet that *had* (BLO-19999 at 8.6h, BLO-20042 at 6.8h) sat in
+      // the 25-issue same-run population the guard skips.
+      //
+      // Safety is the same argument BLO-18995 made for the execution column,
+      // and it extends to the checkout column: claimQueuedRun stamps only
+      // executionRunId/executionAgentNameKey/executionLockedAt and neither reads
+      // nor requires checkoutRunId (heartbeat.ts), and its `or(isNull(
+      // executionRunId), eq(executionRunId, claimed.id))` guard is satisfied by
+      // the swept state, so a late claim still succeeds. Ownership checks that
+      // gate a run's work are disjunctions over both columns
+      // (isCurrentIssueExecutionRun, routes/issues.ts), so a null checkout does
+      // not 409 the run or block its comments, and canAdoptUnownedCheckout /
+      // adoptUnownedCheckoutRun re-stamp it on the next checkout. The resulting
+      // shape (null checkoutRunId + non-null executionRunId on a queued run) is
+      // already produced on purpose by enqueueProcessLossRetry and the orphan
+      // reaper's per-issue self-heal.
+      //
+      // The same-run-id restriction is what keeps this narrow: a *different*
+      // live checkout holder still keeps its lock no matter how stale the
+      // execution lock is.
+      const checkoutHeldBySameWedgedRun = executionLockExpired
+        && issue.checkoutRunId != null
+        && issue.checkoutRunId === issue.executionRunId;
       // Guards are kept separate on purpose. The update below nulls the
       // checkout *and* execution columns together, so the new pre-claim-expiry
       // allowance must not become a blanket bypass of the checkout check: an
       // issue whose checkoutRunId points at a live (non-terminal) run keeps its
       // checkout lock no matter how stale the execution lock is.
-      if (!isCleanable(issue.checkoutRunId)) continue;
+      if (!isCleanable(issue.checkoutRunId) && !checkoutHeldBySameWedgedRun) continue;
       if (!isCleanable(issue.executionRunId) && !executionLockExpired) continue;
 
       const sweepOutcome = await db.transaction(async (tx) => {
@@ -7886,8 +8294,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           // the pre-claim lock timeout, so an operator reading the audit trail
           // can tell whether a lock was released because its run finished or
           // because it was never claimed within STALE_PRE_CLAIM_ISSUE_LOCK_MS.
-          reason: executionLockExpired ? "pre_claim_lock_expired" : "run_terminal_or_missing",
-          ...(executionLockExpired
+          // BLO-19941 adds the third case: a holder wedged at `running`.
+          reason: runningLockSilent
+            ? "running_lock_silent"
+            : executionLockExpired
+            ? "pre_claim_lock_expired"
+            : "run_terminal_or_missing",
+          ...(runningLockSilent
+            ? {
+              runningLockSilentMs: (() => {
+                const basis = runningLockStaleBasis(
+                  issue.executionRunId,
+                  issue.executionLockedAt,
+                );
+                return basis ? Date.now() - basis.getTime() : null;
+              })(),
+              runningLockTimeoutMs: STALE_RUNNING_ISSUE_LOCK_MS,
+            }
+            : executionLockExpired
             ? {
               preClaimLockHeldMs: issue.executionLockedAt
                 ? Date.now() - issue.executionLockedAt.getTime()

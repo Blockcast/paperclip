@@ -131,6 +131,125 @@ describe("isHintlessTransientUpstreamFault", () => {
   });
 });
 
+// BLO-19879 — the penstock gateway's `400 allocation_missing`.
+//
+// Same strand shape as BLO-18138 but reached by a different route: the status
+// is 4xx, so the run is not a brownout by status and master leaves it a
+// terminal `adapter_failed`. It is nonetheless transient — the gateway emits it
+// only while no BYOS vault node serving the requested provider is in the active
+// set, and the identical request succeeds once one returns.
+//
+// Live proof: on 2026-07-31, while `blockcast-omar` (the only node with
+// anthropic in PENSTOCK_VAULT_PROVIDERS, replicas: 1) was unavailable
+// 16:50–17:20Z, provider-blind failover routed anthropic traffic to
+// `blockcast-sfo12` (openai,codex). 83 runs hit this in 40h; 80 stranded.
+describe("isHintlessTransientUpstreamFault for the BLO-19879 gateway allocation fault", () => {
+  // Verbatim from heartbeat_runs for run d4344b4f (result_json), including the
+  // api_error_status: 400 that makes the ordering below load-bearing.
+  const BLO_19879_RESULT_JSON = {
+    api_error_status: 400,
+    result:
+      'API Error: 400 {"error":"No allocation configured for org \'org_penstock\' provider ' +
+      '\'anthropic\' on BYOS node \'blockcast-sfo12\'","code":"allocation_missing",' +
+      '"correlation_id":"a2a3dff4-75e5-4dbc-a6e5-9ce2b0f1c8d7"}',
+    is_error: true,
+  } as const;
+
+  it("classifies the real allocation_missing payload as transient", () => {
+    expect(isHintlessTransientUpstreamFault(BLO_19879_RESULT_JSON)).toBe(true);
+  });
+
+  it("matches when only an errorMessage survives", () => {
+    expect(
+      isHintlessTransientUpstreamFault(null, { errorMessage: BLO_19879_RESULT_JSON.result }),
+    ).toBe(true);
+  });
+
+  // The regression this fix exists to prevent. The authoritative-status
+  // short-circuit returns false for any status outside {503,529} BEFORE the
+  // text patterns are consulted, so a detector placed among those patterns
+  // would be dead code against a 400 and the strand would silently persist.
+  // Pinning a bare 400 alongside proves the ordering is what rescues this and
+  // that 4xx has not been broadly widened.
+  it("is not defeated by the 400 status short-circuit", () => {
+    expect(isHintlessTransientUpstreamFault({ api_error_status: 400 })).toBe(false);
+    expect(
+      isHintlessTransientUpstreamFault({
+        api_error_status: 400,
+        result: '{"code":"allocation_missing"}',
+      }),
+    ).toBe(true);
+  });
+
+  it("requires a 400 authoritative status before bypassing the status short-circuit", () => {
+    for (const status of [401, 403, 500] as const) {
+      expect(
+        isHintlessTransientUpstreamFault({
+          api_error_status: status,
+          result: 'API Error: 400 {"code":"allocation_missing"}',
+        }),
+      ).toBe(false);
+      expect(
+        isHintlessTransientUpstreamFault({
+          error_status: status,
+          result: '{"code":"allocation_missing"}',
+        }),
+      ).toBe(false);
+    }
+  });
+
+  it("does not match allocation_missing quotes in free-text result surfaces", () => {
+    expect(
+      isHintlessTransientUpstreamFault({
+        api_error_status: 400,
+        result: 'While reviewing this PR I saw {"code":"allocation_missing"} in the incident notes.',
+      }),
+    ).toBe(false);
+    expect(
+      isHintlessTransientUpstreamFault({
+        api_error_status: 400,
+        message: '{"code":"allocation_missing"}',
+      }),
+    ).toBe(false);
+    expect(
+      isHintlessTransientUpstreamFault({
+        api_error_status: 400,
+        summary: '{"code":"allocation_missing"}',
+      }),
+    ).toBe(false);
+  });
+
+  // Matched on the machine-readable code, not the prose, so a reworded gateway
+  // message cannot silently drop the run back to a terminal strand.
+  it("keys on the error code rather than the message wording", () => {
+    expect(
+      isHintlessTransientUpstreamFault(null, {
+        errorMessage: 'API Error: 400 {"error":"totally different wording","code":"allocation_missing"}',
+      }),
+    ).toBe(true);
+    // A genuine bad request must still fail fast rather than burn the curve.
+    expect(
+      isHintlessTransientUpstreamFault(null, {
+        errorMessage: 'API Error: 400 {"error":"invalid model","code":"invalid_request_error"}',
+      }),
+    ).toBe(false);
+    // Prose mentioning the condition without the structured code is not a match.
+    expect(
+      isHintlessTransientUpstreamFault(null, { errorMessage: "no allocation configured" }),
+    ).toBe(false);
+  });
+
+  it("stays disjoint from the rate-limit family", () => {
+    expect(isRateLimitExhausted(BLO_19879_RESULT_JSON, { errorMessage: null })).toBe(false);
+    expect(
+      isRetryableK8sCcrotateThrottleResult({
+        errorMessage: BLO_19879_RESULT_JSON.result,
+        resultJson: BLO_19879_RESULT_JSON as unknown as Record<string, unknown>,
+      }),
+    ).toBe(false);
+  });
+});
+
 describe("shouldScheduleAutomaticRunRetry for a hint-less transient upstream run", () => {
   const contextSnapshot = { issueId: randomUUID(), wakeReason: "issue_assigned" };
 

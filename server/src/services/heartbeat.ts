@@ -88,6 +88,7 @@ import {
   deleteAgentJobExact,
   deleteAgentJobsForRun,
   deleteAgentPodExact,
+  captureAgentJobFailureDiagnostics,
   hasActiveJobForAgent,
   indexUniqueAgentJobRunStatuses,
   listAgentJobRunStatuses,
@@ -406,7 +407,7 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
  * misconfigured `maxConcurrentRuns` cannot alone blow past what the cluster
  * is provisioned to run for one agent concurrently.
  */
-const EXTERNAL_LIFECYCLE_SLOT_CAPACITY = 5;
+const EXTERNAL_LIFECYCLE_SLOT_CAPACITY = 8;
 const STALE_QUEUED_MAINTENANCE_WAKE_MAX_AGE_MS = 30 * 60 * 1000;
 const STALE_QUEUED_MAINTENANCE_WAKE_BATCH_SIZE = 250;
 const STALE_QUEUED_MAINTENANCE_WAKE_REASONS = [
@@ -773,7 +774,10 @@ export function shouldScheduleAutomaticRunRetry(
   // instead of the platform just trying again. Bounded-retry it like the other
   // pr_review-scoped recoverable failures above so a transient posting glitch
   // self-heals instead of silently stranding the exact-head gate.
-  if (run.errorCode === "pr_review_output_missing") {
+  if (
+    run.errorCode === "pr_review_output_missing" ||
+    run.errorCode === "pr_review_verification_unavailable"
+  ) {
     return isPrReviewRetryContext(parseObject(run.contextSnapshot));
   }
 
@@ -3145,6 +3149,7 @@ function looksLikeRetryableDeadlineExceeded(value: unknown): boolean {
 // decides when a closed account window reopens). Only no-hint server-fault
 // shapes land here.
 const TRANSIENT_UPSTREAM_STATUS_CODES = new Set(["503", "529"]);
+const TRANSIENT_UPSTREAM_TEXT_KEYS = ["result", "message", "error", "summary"] as const;
 const TRANSIENT_UPSTREAM_TEXT_PATTERNS = [
   /API Error:\s*(?:503|529)\b/i,
   /service\s+(?:is\s+)?(?:temporarily\s+)?unavailable/i,
@@ -3153,6 +3158,33 @@ const TRANSIENT_UPSTREAM_TEXT_PATTERNS = [
   /overloaded_error/i,
   /\bserver_error\b/i,
 ];
+
+// BLO-19879: the penstock gateway answers `400 {"code":"allocation_missing"}`
+// when it routes a request to a BYOS vault node that does not serve the
+// requested provider. Despite the 4xx status this is a *gateway-side routing*
+// fault, not a malformed request: the same payload succeeds as soon as a
+// provider-capable node is back in the active set. On 2026-07-31, while the
+// only anthropic-capable node (`blockcast-omar`, replicas: 1) was unavailable
+// 16:50–17:20Z, provider-blind failover sent anthropic traffic to
+// `blockcast-sfo12` (PENSTOCK_VAULT_PROVIDERS=openai,codex) and stranded 80
+// runs as terminal `adapter_failed` — 70.5% of all failed runs in the burst.
+//
+// This MUST be tested before the authoritative-status short-circuit in
+// isHintlessTransientUpstreamFault: these runs carry api_error_status=400, so
+// a TRANSIENT_UPSTREAM_TEXT_PATTERNS entry alone would never be reached and
+// would be a silent no-op.
+//
+// Matched on the machine-readable `code`, not the prose, so a reworded gateway
+// message cannot silently drop it back to terminal. Scoped to this one code
+// rather than 400s generally — a genuine bad request must still fail fast
+// instead of burning the full 2m/10m/30m/2h retry curve.
+const GATEWAY_ALLOCATION_FAULT_PATTERN = /^\s*(?:API Error:\s*400\b[^{]*)?\{[\s\S]*"code"\s*:\s*"allocation_missing"/i;
+const GATEWAY_ALLOCATION_FAULT_TEXT_KEYS = ["result", "error"] as const;
+
+function looksLikeGatewayAllocationFault(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  return GATEWAY_ALLOCATION_FAULT_PATTERN.test(value);
+}
 
 function looksLikeTransientUpstreamText(value: unknown): boolean {
   if (typeof value !== "string") return false;
@@ -3170,10 +3202,35 @@ function normalizeHttpStatusCode(value: unknown): string | null {
   return String(parsed);
 }
 
+function allocationFaultStatusGate(resultJson: Record<string, unknown> | null | undefined): "allow" | "deny" {
+  if (!resultJson) return "allow";
+  let hasAuthoritativeStatus = false;
+  for (const key of ["api_error_status", "error_status"] as const) {
+    const status = normalizeHttpStatusCode(resultJson[key]);
+    if (status == null) continue;
+    if (status === "400") return "allow";
+    hasAuthoritativeStatus = true;
+  }
+  return hasAuthoritativeStatus ? "deny" : "allow";
+}
+
 export function isHintlessTransientUpstreamFault(
   resultJson: Record<string, unknown> | null | undefined,
   opts?: { errorMessage?: string | null },
 ): boolean {
+  // BLO-19879: checked first, above the authoritative-status short-circuit
+  // below, because the gateway allocation fault carries a 400 and would
+  // otherwise be rejected before any text matching runs. Still require an
+  // actual 400 when resultJson carries an authoritative status, and match only
+  // gateway-shaped payload text so agent-authored prose that merely quotes the
+  // literal cannot turn terminal 401/403/etc. failures into scheduled retries.
+  if (allocationFaultStatusGate(resultJson) === "allow" && resultJson) {
+    for (const key of GATEWAY_ALLOCATION_FAULT_TEXT_KEYS) {
+      if (looksLikeGatewayAllocationFault(resultJson[key])) return true;
+    }
+  }
+  if (looksLikeGatewayAllocationFault(opts?.errorMessage)) return true;
+
   // Two status surfaces: the Claude SDK's final result event uses
   // `api_error_status`, while the per-attempt `api_retry` events that precede
   // an exhausted retry budget use `error_status` — the latter is the field the
@@ -3188,7 +3245,7 @@ export function isHintlessTransientUpstreamFault(
   if (hasAuthoritativeStatus) return false;
 
   if (resultJson) {
-    for (const key of ["result", "message", "error", "summary"] as const) {
+    for (const key of TRANSIENT_UPSTREAM_TEXT_KEYS) {
       if (looksLikeTransientUpstreamText(resultJson[key])) return true;
     }
   }
@@ -6824,6 +6881,67 @@ export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown>
     // self-review, so the gate must confirm the PR was genuinely bot-authored
     // before accepting a "skipped as self-review" summary.
     prAuthorLogin: readNonEmptyString(contextSnapshot.githubPrAuthorLogin),
+  };
+}
+
+type GithubReviewerEvidenceVerification =
+  | { status: "found"; via: "review" | "comment"; repoFullName: string; prNumber: number; headSha: string | null }
+  | { status: "not_found"; repoFullName: string; prNumber: number; headSha: string | null }
+  | { status: "unavailable"; reason: string; repoFullName: string | null; prNumber: number | null; headSha: string | null };
+
+async function verifyGithubReviewerEvidence(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+): Promise<GithubReviewerEvidenceVerification> {
+  const prReview = derivePaperclipPrReview(contextSnapshot);
+  if (!prReview?.repoFullName || prReview.prNumber === null) {
+    return {
+      status: "unavailable",
+      reason: "missing_pr_target",
+      repoFullName: prReview?.repoFullName ?? null,
+      prNumber: prReview?.prNumber ?? null,
+      headSha: prReview?.headSha ?? null,
+    };
+  }
+
+  try {
+    const verified = await githubHasReviewerEvidenceForPr({
+      repoFullName: prReview.repoFullName,
+      prNumber: prReview.prNumber,
+      headSha: prReview.headSha,
+    });
+    if ("error" in verified) {
+      return {
+        status: "unavailable",
+        reason: verified.error,
+        repoFullName: prReview.repoFullName,
+        prNumber: prReview.prNumber,
+        headSha: prReview.headSha,
+      };
+    }
+    return {
+      status: verified.found ? "found" : "not_found",
+      ...(verified.found ? { via: verified.via } : {}),
+      repoFullName: prReview.repoFullName,
+      prNumber: prReview.prNumber,
+      headSha: prReview.headSha,
+    } as GithubReviewerEvidenceVerification;
+  } catch {
+    return {
+      status: "unavailable",
+      reason: "verification_threw",
+      repoFullName: prReview.repoFullName,
+      prNumber: prReview.prNumber,
+      headSha: prReview.headSha,
+    };
+  }
+}
+
+function unavailablePrReviewVerification(reason: string) {
+  return {
+    status: "missing" as const,
+    errorCode: "pr_review_verification_unavailable",
+    errorMessage:
+      `PR reviewer evidence could not be verified with GitHub (${reason}); retrying without trusting the local completion claim`,
   };
 }
 
@@ -15281,6 +15399,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
+  /**
+   * Best-effort capture of the failed Job's pod-level terminal state.
+   *
+   * The Job `Failed` condition only ever says "backoff limit reached" — it names
+   * no container and carries no exit code — so without this a recurrence leaves
+   * no evidence once the pod is GC'd. Never throws and never blocks
+   * finalization; a null result simply means the run record keeps the
+   * Job-level fields it always had.
+   */
+  async function captureFailedJobContainerDiagnostics(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id">,
+    jobStatus: AgentJobRunStatus | null,
+  ) {
+    try {
+      const jobName = readNonEmptyString(jobStatus?.name) ??
+        readNonEmptyString((await getActiveExternalRuntimeReservation(db, run.id))?.jobName);
+      if (!jobName) return null;
+      return await captureAgentJobFailureDiagnostics(jobName);
+    } catch (error) {
+      logger.warn(
+        { runId: run.id, error: error instanceof Error ? error.message : String(error) },
+        "failed-Job container diagnostics capture failed; finalizing without them",
+      );
+      return null;
+    }
+  }
+
   async function finalizeExternalLifecycleTerminalRun(input: {
     run: typeof heartbeatRuns.$inferSelect;
     adapterType: string;
@@ -15290,34 +15435,61 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     staleKill?: boolean;
   }) {
     let preserveRecordedOutcome = false;
+    let prReviewIncompleteOverride: {
+      errorCode: string;
+      errorMessage: string;
+    } | null = null;
     if (!input.staleKill && !input.jobStatus) {
       let reviewEvidence = evaluatePrReviewCompletionEvidence(
         parseObject(input.run.contextSnapshot),
         { resultJson: parseObject(input.run.resultJson) },
       );
-      if (reviewEvidence.status === "missing") {
-        try {
-          const prReview = derivePaperclipPrReview(parseObject(input.run.contextSnapshot));
-          if (prReview?.repoFullName && prReview.prNumber !== null) {
-            const verified = await githubHasReviewerEvidenceForPr({
-              repoFullName: prReview.repoFullName,
-              prNumber: prReview.prNumber,
-              headSha: prReview.headSha,
-            });
-            if ("found" in verified && verified.found) {
-              reviewEvidence = { status: "posted_review" };
-            }
-          }
-        } catch {
-          // GitHub verification is additive; failures retain the local missing verdict.
+      const claimedReview =
+        reviewEvidence.status === "posted_review" || reviewEvidence.status === "already_reviewed";
+      if (reviewEvidence.status === "missing" || claimedReview) {
+        const verification = await verifyGithubReviewerEvidence(
+          parseObject(input.run.contextSnapshot),
+        );
+        await appendRunEvent(input.run, await nextRunEventSeq(input.run.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: verification.status === "unavailable" ? "warn" : "info",
+          message:
+            verification.status === "found"
+              ? `GitHub-verified ${verification.via} by the reviewer App during missing-Job recovery`
+              : `GitHub reviewer-evidence check did not preserve missing-Job recovery: ${verification.status === "unavailable" ? verification.reason : "no_evidence_found"}`,
+          payload: {
+            repoFullName: verification.repoFullName,
+            prNumber: verification.prNumber,
+            headSha: verification.headSha,
+            outcome: verification.status,
+            ...(verification.status === "found" ? { via: verification.via } : {}),
+            ...(verification.status === "unavailable" ? { reason: verification.reason } : {}),
+          },
+        });
+        if (verification.status === "found") {
+          reviewEvidence = { status: "posted_review" };
+        } else if (verification.status === "unavailable") {
+          reviewEvidence = unavailablePrReviewVerification(verification.reason);
+        } else if (claimedReview) {
+          reviewEvidence = {
+            status: "missing",
+            errorCode: "pr_review_output_missing",
+            errorMessage:
+              "PR reviewer run claimed a posted review, but GitHub has no exact-head review from a trusted reviewer identity",
+          };
         }
       }
+      prReviewIncompleteOverride =
+        reviewEvidence.status === "missing" || reviewEvidence.status === "auth_expired"
+          ? reviewEvidence
+          : null;
       preserveRecordedOutcome = reviewEvidence.status === "posted_review" ||
         reviewEvidence.status === "already_reviewed" ||
         reviewEvidence.status === "archived_repo_skipped" ||
         reviewEvidence.status === "self_review_skipped";
     }
-    const terminalOutcome = input.staleKill
+    const baseTerminalOutcome = input.staleKill
       ? {
           status: "failed" as const,
           wakeupStatus: "failed" as const,
@@ -15330,10 +15502,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           jobMessage: input.jobStatus?.message ?? null,
         }
       : externalLifecycleTerminalOutcome(input.jobStatus, preserveRecordedOutcome);
+    const terminalOutcome =
+      baseTerminalOutcome && prReviewIncompleteOverride && !input.staleKill
+        ? {
+            ...baseTerminalOutcome,
+            errorCode: prReviewIncompleteOverride.errorCode,
+            error: prReviewIncompleteOverride.errorMessage,
+          }
+        : baseTerminalOutcome;
     if (!terminalOutcome) return false;
 
     const adapterInvocationStarted = terminalOutcome.errorCode === "job_failed"
       ? await hasAdapterInvocationEvent(input.run.id)
+      : null;
+
+    // Read the pod's terminal container state while the pod still exists. This
+    // is the only point in the lifecycle where it is still available.
+    const containerDiagnostics = terminalOutcome.errorCode === "job_failed"
+      ? await captureFailedJobContainerDiagnostics(input.run, input.jobStatus)
       : null;
 
     const resultJson = mergeRunStopMetadataForAgent(
@@ -15348,6 +15534,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             jobReason: terminalOutcome.jobReason,
             jobMessage: terminalOutcome.jobMessage,
             ...(adapterInvocationStarted !== null ? { adapterInvocationStarted } : {}),
+            ...(containerDiagnostics ? { containerDiagnostics } : {}),
           },
         },
         errorCode: terminalOutcome.errorCode,
@@ -16684,7 +16871,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // once the mint is committed (so a failed/aborted setRunStatus never
       // over-counts). Split by adapter + error-string bucket + the durable
       // classification, all bounded.
-      let finalizedRun = await setRunStatus(run.id, "failed", {
+      const finalizedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
         finishedAt: now,
@@ -16707,12 +16894,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : result;
         })(),
       });
+      if (!finalizedRunWrite.updated || !finalizedRunWrite.run) {
+        // Another reap invocation won the terminal transition for this run.
+        // Do not duplicate process_lost metrics, retries, wakeup finalization,
+        // run events, or issue-promotion side effects.
+        if (finalizedRunWrite.run?.status !== "running") {
+          runningProcesses.delete(run.id);
+          activeRunExecutions.delete(run.id);
+        }
+        continue;
+      }
+      let finalizedRun = finalizedRunWrite.run;
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
       });
-      if (!finalizedRun) finalizedRun = await getRun(run.id);
-      if (!finalizedRun) continue;
       // BLO-16184: the process_lost mint is now committed for this run -- count it
       // (bounded adapter + error-string bucket + durable classification).
       recordProcessLost({
@@ -18579,6 +18775,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             name: agent.name,
             companyId: agent.companyId,
           },
+          executionWorkspaceId: plannedExecutionWorkspaceId,
           heartbeatRunId: run.id,
           enableWorkspaceBranchReconcileForward:
             resolvedInstanceSettings.experimental.enableWorkspaceBranchReconcileForward,
@@ -20099,58 +20296,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           summary: adapterResult.summary ?? null,
         })
         : { status: "not_applicable" as const };
-      // BLO-10448: the evidence guard above is a text heuristic over the agent's
-      // free-text summary and misfires on legitimate runs (idempotency skips,
-      // comment-mode reviews) — the PR WAS reviewed but the phrasing wasn't
-      // matched, flagging a false pr_review_output_missing. Before keeping that
-      // verdict, authoritatively check GitHub for a reviewer-bot review/comment at
-      // THIS head. Only rescues a false `missing`; any error / unconfigured creds /
-      // not-found leaves the heuristic verdict intact (safe, additive fallback).
-      if (prReviewCompletionEvidence.status === "missing") {
-        try {
-          const prReview = derivePaperclipPrReview(context);
-          if (prReview && prReview.repoFullName && prReview.prNumber !== null) {
-            const verified = await githubHasReviewerEvidenceForPr({
-              repoFullName: prReview.repoFullName,
-              prNumber: prReview.prNumber,
-              headSha: prReview.headSha,
-            });
-            if ("found" in verified && verified.found) {
-              await appendRunEvent(run, await nextRunEventSeq(run.id), {
-                eventType: "lifecycle",
-                stream: "system",
-                level: "info",
-                message: `GitHub-verified ${verified.via} by the reviewer bot on ${prReview.repoFullName}#${prReview.prNumber}; suppressing false pr_review_output_missing`,
-                payload: {
-                  repoFullName: prReview.repoFullName,
-                  prNumber: prReview.prNumber,
-                  headSha: prReview.headSha,
-                  via: verified.via,
-                },
-              });
-              prReviewCompletionEvidence = { status: "posted_review" as const };
-            } else {
-              // BLO-10878: the non-rescue path used to be silent, making residual
-              // false `pr_review_output_missing` unclassifiable. Record why the
-              // GitHub check did not rescue (a specific `{error}` code, or genuine
-              // not-found) so the remaining residual is diagnosable from events.
-              await appendRunEvent(run, await nextRunEventSeq(run.id), {
-                eventType: "lifecycle",
-                stream: "system",
-                level: "info",
-                message: `GitHub reviewer-evidence check kept pr_review_output_missing on ${prReview.repoFullName}#${prReview.prNumber}: ${"error" in verified ? verified.error : "no_evidence_found"}`,
-                payload: {
-                  repoFullName: prReview.repoFullName,
-                  prNumber: prReview.prNumber,
-                  headSha: prReview.headSha,
-                  outcome: "error" in verified ? verified.error : "not_found",
-                },
-              });
-            }
-          }
-        } catch {
-          // Verification is best-effort; on any unexpected fault we keep the
-          // heuristic `missing` verdict (unchanged pre-BLO-10448 behavior).
+      // BLO-10448/BLO-19573: GitHub is authoritative for both missing evidence
+      // and local "posted/already reviewed" claims. The latter must not complete
+      // a task when the side effect came from an ineligible user-seat identity.
+      const claimedReview =
+        prReviewCompletionEvidence.status === "posted_review" ||
+        prReviewCompletionEvidence.status === "already_reviewed";
+      if (prReviewCompletionEvidence.status === "missing" || claimedReview) {
+        const verification = await verifyGithubReviewerEvidence(context);
+        await appendRunEvent(run, await nextRunEventSeq(run.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: verification.status === "unavailable" ? "warn" : "info",
+          message:
+            verification.status === "found"
+              ? `GitHub-verified ${verification.via} by the reviewer App on ${verification.repoFullName}#${verification.prNumber}`
+              : `GitHub reviewer-evidence check rejected PR-review completion${verification.repoFullName && verification.prNumber !== null ? ` on ${verification.repoFullName}#${verification.prNumber}` : ""}: ${verification.status === "unavailable" ? verification.reason : "no_evidence_found"}`,
+          payload: {
+            repoFullName: verification.repoFullName,
+            prNumber: verification.prNumber,
+            headSha: verification.headSha,
+            outcome: verification.status,
+            ...(verification.status === "found" ? { via: verification.via } : {}),
+            ...(verification.status === "unavailable" ? { reason: verification.reason } : {}),
+          },
+        });
+        if (verification.status === "found") {
+          prReviewCompletionEvidence = { status: "posted_review" as const };
+        } else if (verification.status === "unavailable") {
+          prReviewCompletionEvidence = unavailablePrReviewVerification(verification.reason);
+        } else if (claimedReview) {
+          prReviewCompletionEvidence = {
+            status: "missing",
+            errorCode: "pr_review_output_missing",
+            errorMessage:
+              "PR reviewer run claimed a posted review, but GitHub has no exact-head review from a trusted reviewer identity",
+          };
         }
       }
       const prReviewIncompleteOverride =
