@@ -1428,6 +1428,72 @@ describe("issue execution policy routes", () => {
       );
     });
 
+    it("lets the active stage participant decide even when the assignee field diverged", async () => {
+      const divergedAssigneeAgentId = "44444444-4444-4444-8444-444444444444";
+      const issue = {
+        ...makeStuckReviewIssue(),
+        assigneeAgentId: divergedAssigneeAgentId,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: mandateBoundParticipantAgentId,
+        companyId: "company-1",
+        runId: "run-blo-20321-participant-drift",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({
+          status: "done",
+          comment: "Approving as the active execution-stage participant.",
+        });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        expect.objectContaining({
+          status: "done",
+          executionState: expect.objectContaining({
+            status: "completed",
+            completedStageIds: [reviewStageId],
+            lastDecisionOutcome: "approved",
+            lastDecisionId: expect.any(String),
+          }),
+        }),
+        expect.anything(),
+      );
+    });
+
+    it("does not let a diverged stage participant smuggle unrelated edits through the decision path", async () => {
+      const issue = {
+        ...makeStuckReviewIssue(),
+        assigneeAgentId: "44444444-4444-4444-8444-444444444444",
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: mandateBoundParticipantAgentId,
+        companyId: "company-1",
+        runId: "run-blo-20321-participant-drift-smuggle",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({
+          status: "done",
+          title: "Unauthorized rewrite",
+          comment: "Trying to approve and rewrite task content.",
+        });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
     it("still rejects an unrelated, unauthorized agent (regression: override does not open the stage to anyone)", async () => {
       const issue = makeStuckReviewIssue();
       mockIssueService.getById.mockResolvedValue(issue);

@@ -4208,6 +4208,31 @@ export function issueRoutes(
     );
   }
 
+  function isExecutionStageDecisionPatchBody(body: unknown) {
+    if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+    const patch = body as Record<string, unknown>;
+    const presentKeys = Object.entries(patch)
+      .filter(([, value]) => value !== undefined)
+      .map(([key]) => key);
+    if (presentKeys.length === 0) return false;
+    const allowedKeys = new Set(["status", "comment", "reviewRequest"]);
+    if (!presentKeys.every((key) => allowedKeys.has(key))) return false;
+    return patch.status === "done" || patch.status === "in_progress";
+  }
+
+  function isAgentExecutionStageParticipantDecision(
+    req: Request,
+    issue: { status: string; executionState?: unknown },
+  ) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return false;
+    if (!isExecutionStageDecisionPatchBody(req.body)) return false;
+    if (issue.status !== "in_review") return false;
+    const executionState = parseIssueExecutionState(issue.executionState);
+    if (executionState?.status !== "pending") return false;
+    const actor = { type: "agent" as const, agentId: req.actor.agentId, userId: null };
+    return executionPrincipalsEqual(executionState.currentParticipant, actor);
+  }
+
   // BLO-18289: returns the coordination-metadata field names in this PATCH
   // body, or null if the body is NOT exclusively coordination metadata.
   //
@@ -4335,6 +4360,13 @@ export function issueRoutes(
       allowRecoveryActionOwner?: boolean;
       allowCoordinationMetadata?: boolean;
       /**
+       * PATCH /issues/:id only: when an execution-stage currentParticipant and
+       * issue assignee diverge, the participant must still be able to submit a
+       * decision-shaped stage patch. Keep this opt-in and shape-gated because
+       * this helper also protects delete/document/work-product routes.
+       */
+      allowExecutionStageParticipantDecision?: boolean;
+      /**
        * BLO-18797: opt in to the allow_issue_creator / allow_manager_chain
        * ownership bypass below. Off by default and deliberately so — this
        * helper backs ~25 routes, including DELETE /issues/:id, the document
@@ -4434,6 +4466,12 @@ export function issueRoutes(
       return true;
     }
     if (options.allowBlockedCorrection && isAgentBlockedCorrectionForActiveExecutionStage(req, issue)) {
+      return true;
+    }
+    if (
+      options.allowExecutionStageParticipantDecision &&
+      isAgentExecutionStageParticipantDecision(req, issue)
+    ) {
       return true;
     }
     if (issue.assigneeAgentId !== actorAgentId) {
@@ -8713,6 +8751,7 @@ export function issueRoutes(
         allowBlockedCorrection: true,
         allowScopedRecoveryOwnerSourceMutation,
         allowCoordinationMetadata: coordinationMetadataDecision !== null,
+        allowExecutionStageParticipantDecision: true,
         // BLO-18797: the delegate-recovery path. The helper additionally
         // requires a blocked -> todo patch containing only status and
         // blockedByIssueIds.
