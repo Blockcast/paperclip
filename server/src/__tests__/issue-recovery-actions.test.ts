@@ -1976,6 +1976,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
   it("refunds a suppressed non-assignee wake when the source issue has no assignee fallback", async () => {
     const { managerId, coderId, sourceIssueId } = await seedCompany();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
+
     const queuedRun = { id: randomUUID() } as never;
     const enqueueWakeup = vi.fn(async () => queuedRun);
     const recovery = recoveryService(db, { enqueueWakeup });
