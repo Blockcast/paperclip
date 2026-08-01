@@ -3903,12 +3903,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     });
   }
 
+  // Backstop only — NOT the primary guard.
+  //
+  // The real enforcement for BLO-18643 lives in `issueService.update()`, which
+  // takes a row lock and rewrites a lock-less `blocked -> in_progress` back to
+  // `blocked` at the moment the woken agent attempts the transition. This helper
+  // runs immediately after the escalation transaction has already CAS'd the row
+  // to `blocked`, so its `status = "in_progress"` predicate is expected to match
+  // zero rows on every call. It is retained purely to catch a row that raced back
+  // to `in_progress` between the escalation commit and the wake being enqueued.
+  //
+  // A non-zero match therefore means the primary guard was bypassed — log it
+  // rather than letting it heal silently and read as active protection.
   async function reassertSourceScopedRecoveryBlockedAfterWake(input: {
     sourceIssueId: string;
     recoveryActionId: string;
     agentId: string;
   }) {
-    await db
+    const reasserted = await db
       .update(issues)
       .set({
         status: "blocked",
@@ -3938,7 +3950,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               ),
           ),
         ),
+      )
+      .returning({ id: issues.id });
+
+    if (reasserted.length > 0) {
+      logger.warn(
+        {
+          issueId: input.sourceIssueId,
+          recoveryActionId: input.recoveryActionId,
+          agentId: input.agentId,
+        },
+        "post-wake backstop reasserted blocked status; the issueService.update guard was bypassed",
       );
+    }
   }
 
   function readProviderQuotaRetryAt(latestRun: LatestIssueRun, now: Date) {

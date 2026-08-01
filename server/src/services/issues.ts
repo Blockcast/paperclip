@@ -8471,7 +8471,14 @@ export function issueService(db: Db) {
               ]),
         ];
 
-        if (issueData.status === "in_progress" && actorAgentId) {
+        // A caller that is taking a run lock in this same patch can never trip the
+        // guard below (`nextCheckoutRunId`/`nextExecutionRunId` fall back to the
+        // patch first, so the `!next... && !next...` test is already false). Check
+        // that cheaply up front so the normal checkout path — the hot transition —
+        // skips the `for update` round trip and the recovery-action join entirely.
+        const patchTakesRunLock = Boolean(patch.checkoutRunId) || Boolean(patch.executionRunId);
+
+        if (issueData.status === "in_progress" && actorAgentId && !patchTakesRunLock) {
           await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`);
           const recoveryGuard = await tx
             .select({
