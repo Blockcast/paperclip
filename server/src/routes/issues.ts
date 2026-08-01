@@ -9817,6 +9817,10 @@ export function issueRoutes(
                 existing.executionState && typeof existing.executionState === "object"
                   ? existing.executionState
                   : null,
+              expectedCurrentExecutionPolicy:
+                existing.executionPolicy && typeof existing.executionPolicy === "object"
+                  ? existing.executionPolicy
+                  : null,
               ...(delegateRecoveryPatchInFlight
                 ? {
                     expectedCurrentStatus: "blocked",
@@ -12272,6 +12276,10 @@ export function issueRoutes(
               expectedCurrentExecutionState:
                 currentIssue.executionState && typeof currentIssue.executionState === "object"
                   ? currentIssue.executionState
+                  : null,
+              expectedCurrentExecutionPolicy:
+                currentIssue.executionPolicy && typeof currentIssue.executionPolicy === "object"
+                  ? currentIssue.executionPolicy
                   : null,
             }, tx);
             if (!updated) throw new AutoApprovalIssueMissingError();
