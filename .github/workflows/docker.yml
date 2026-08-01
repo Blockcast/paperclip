@@ -1,9 +1,8 @@
 name: Docker
 
 on:
-  # Urgent path: manual dispatch deploys an approved immutable master commit,
-  # bypassing the 6h debounce below. Commit messages containing "[deploy]" do
-  # the same on push.
+  # Production deployment is manual-only. Pushes build immutable images but
+  # cannot use the production environment or cluster credential.
   workflow_dispatch:
     inputs:
       target_sha:
@@ -15,12 +14,6 @@ on:
       - "master"
     tags:
       - "v*"
-  # Batched deploy window (BLO-12563): per-merge pushes only BUILD; the
-  # deploy job debounces rollouts to at most one per 6h so the worker STS
-  # stops churning and stranding in-flight agent runs (process_lost).
-  # This cron is the catch-up that rolls out whatever master accumulated.
-  schedule:
-    - cron: "37 */6 * * *"
 
 permissions:
   contents: read
@@ -35,14 +28,16 @@ env:
 
 jobs:
   build-and-push:
-    # Pushes and manual recovery dispatches build the selected ref. Scheduled
-    # runs remain deploy-only and consume a tag published by an earlier build.
+    # Pushes publish immutable images; manual releases rebuild the approved SHA
+    # so the deploy job can bind Helm to this run's recorded digest.
     if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     runs-on: arc-dind
     timeout-minutes: 90
     concurrency:
-      group: docker-${{ github.ref }}
-      cancel-in-progress: true
+      # A master push may supersede another publish build, but it must never
+      # cancel a protected workflow_dispatch build before its deploy job runs.
+      group: docker-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && 'deploy' || 'publish' }}
+      cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
     outputs:
       target_sha: ${{ steps.target.outputs.full }}
       image_digest: ${{ steps.build.outputs.digest }}
@@ -259,9 +254,9 @@ jobs:
   deploy:
     needs: build-and-push
     runs-on: arc-deploy
-    # !cancelled() lets this run when build-and-push was SKIPPED
-    # (schedule); the result check still blocks deploys after a FAILED build.
-    if: ${{ !cancelled() && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && (needs.build-and-push.result == 'success' || needs.build-and-push.result == 'skipped') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' }}
+    environment:
+      name: paperclip-production
     # Must exceed helm upgrade's --timeout 30m below, plus checkout/cleanup margin.
     timeout-minutes: 40
     concurrency:
@@ -319,97 +314,7 @@ jobs:
           kubectl auth whoami -o yaml
           kubectl -n "$NS" get statefulset paperclip -o jsonpath='{.spec.replicas}{"\n"}'
 
-      - name: Login to Harbor (scheduled gate)
-        if: ${{ github.event_name == 'schedule' }}
-        uses: docker/login-action@v4
-        with:
-          registry: harbor.blockcast.net
-          username: ${{ secrets.HARBOR_USERNAME }}
-          password: ${{ secrets.HARBOR_PASSWORD }}
-
-      - name: Set up Docker Buildx
-        if: ${{ github.event_name == 'schedule' }}
-        uses: docker/setup-buildx-action@v4
-
-      # Debounce (BLO-12563): on plain push events, skip the rollout while
-      # paperclip-0 is younger than 6h — per-merge deploys were recreating
-      # the worker ~hourly and every roll strands whatever agent run is
-      # mid-setup (process_lost). Scheduled/dispatch windows (and "[deploy]"
-      # in the head commit message) bypass the debounce; debounced commits
-      # are picked up by the next 6h window since deploy always targets tip.
-      - name: Deploy gate (6h debounce on push)
-        id: gate
-        env:
-          NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
-          TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            # BLO-12563: the 6h catch-up window must not double-roll a pod that a
-            # recent push already rolled to tip. Skip only when paperclip-0 is
-            # <6h old AND already running the tip digest; otherwise deploy (a
-            # debounced commit is still waiting for this window).
-            CREATED=$(kubectl -n "$NS" get pod paperclip-0 -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null || true)
-            RUNNING_IMG=$(kubectl -n "$NS" get sts paperclip -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
-            image="harbor.blockcast.net/paperclip/paperclip:${TAG}"
-            digest=""
-            for i in 1 2 3; do
-              if digest=$(docker buildx imagetools inspect "${image}" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"') \
-                && [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-                break
-              fi
-              digest=""
-              echo "tag ${TAG} not resolvable (attempt $i) — retrying in 60s (a push build may still be running)"
-              sleep 60
-            done
-            if [ -z "${digest}" ]; then
-              echo "tag ${TAG} missing after retries; failing this window — the next one retries" >&2
-              exit 1
-            fi
-            EXPECTED_IMG="harbor.blockcast.net/paperclip/paperclip@${digest}"
-            if [ -n "$CREATED" ]; then
-              AGE=$(( $(date +%s) - $(date -d "$CREATED" +%s) ))
-              if [ "$AGE" -lt 21600 ] && [ "$RUNNING_IMG" = "$EXPECTED_IMG" ]; then
-                echo "schedule window: paperclip-0 ${AGE}s old and already running tip (${EXPECTED_IMG}) — skipping catch-up roll"
-                echo "proceed=false" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-            fi
-            echo "schedule window — deploying tip"
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [ "${{ github.event_name }}" != "push" ]; then
-            echo "manual dispatch / tag — deploying"
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if git log -1 --pretty=%B | grep -qF "[deploy]"; then
-            echo "head commit requests immediate deploy via [deploy]"
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          CREATED=$(kubectl -n "$NS" get pod paperclip-0 -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null || true)
-          if [ -z "$CREATED" ]; then
-            echo "paperclip-0 not found — deploying"
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          AGE=$(( $(date +%s) - $(date -d "$CREATED" +%s) ))
-          if [ "$AGE" -ge 21600 ]; then
-            echo "paperclip-0 is ${AGE}s old (>=6h) — deploying"
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "paperclip-0 is ${AGE}s old (<6h) — debounced; the next 6h window deploys this commit"
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # Schedule/dispatch runs deploy a tag built by an earlier push run.
-      # Verify it actually exists in Harbor before helm rolls the STS —
-      # protects against a window firing between a merge and its build
-      # finishing.
       - name: Login to Harbor (artifact check)
-        if: ${{ steps.gate.outputs.proceed == 'true' && github.event_name != 'schedule' }}
         uses: docker/login-action@v4
         with:
           registry: harbor.blockcast.net
@@ -417,11 +322,9 @@ jobs:
           password: ${{ secrets.HARBOR_PASSWORD }}
 
       - name: Set up Docker Buildx
-        if: ${{ steps.gate.outputs.proceed == 'true' && github.event_name != 'schedule' }}
         uses: docker/setup-buildx-action@v4
 
       - name: Verify image tag exists
-        if: ${{ steps.gate.outputs.proceed == 'true' && github.event_name != 'push' }}
         env:
           TAG: sha-${{ steps.target.outputs.short }}-k8s-vendored
         run: |
@@ -439,7 +342,6 @@ jobs:
 
       - name: Resolve deploy artifact
         id: artifact
-        if: ${{ steps.gate.outputs.proceed == 'true' }}
         env:
           BUILD_RESULT: ${{ needs.build-and-push.result }}
           EXPECTED_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
@@ -449,28 +351,14 @@ jobs:
           image="harbor.blockcast.net/paperclip/paperclip:${TAG}"
           digest=$(docker buildx imagetools inspect "${image}" --format '{{json .Manifest.Digest}}' | tr -d '"')
           [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
-          case "${BUILD_RESULT}" in
-            success)
-              if [[ ! "${EXPECTED_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-                echo "Successful build did not provide a valid image digest: ${EXPECTED_DIGEST:-<empty>}" >&2
-                exit 1
-              fi
-              if [ "${digest}" != "${EXPECTED_DIGEST}" ]; then
-                echo "Tag ${image} resolved to ${digest}, expected build digest ${EXPECTED_DIGEST}" >&2
-                exit 1
-              fi
-              ;;
-            skipped)
-              if [ "${{ github.event_name }}" != "schedule" ] || [ -n "${EXPECTED_DIGEST}" ]; then
-                echo "An empty build digest is allowed only for a scheduled deploy-only run" >&2
-                exit 1
-              fi
-              ;;
-            *)
-              echo "Unexpected build result: ${BUILD_RESULT}" >&2
-              exit 1
-              ;;
-          esac
+          if [ "${BUILD_RESULT}" != "success" ] || [[ ! "${EXPECTED_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Manual deploy requires a successful build with a valid digest: result=${BUILD_RESULT} digest=${EXPECTED_DIGEST:-<empty>}" >&2
+            exit 1
+          fi
+          if [ "${digest}" != "${EXPECTED_DIGEST}" ]; then
+            echo "Tag ${image} resolved to ${digest}, expected build digest ${EXPECTED_DIGEST}" >&2
+            exit 1
+          fi
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
           {
             echo "### Paperclip deploy target"
@@ -482,7 +370,6 @@ jobs:
       # approved commit is exactly the image Kubernetes pulls. The committed
       # tag remains the readable source reference for non-CI deploys.
       - name: helm upgrade
-        if: ${{ steps.gate.outputs.proceed == 'true' }}
         env:
           DIGEST: ${{ steps.artifact.outputs.digest }}
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}

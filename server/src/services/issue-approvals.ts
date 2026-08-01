@@ -2,7 +2,7 @@ import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvals, issueApprovals, issues } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
-import { redactEventPayload } from "../redaction.js";
+import { redactApprovalPayloadByType } from "../redaction.js";
 
 interface LinkActor {
   agentId?: string | null;
@@ -66,7 +66,7 @@ export function issueApprovalService(db: Db) {
         .orderBy(desc(issueApprovals.createdAt));
       return result.map((approval) => ({
         ...approval,
-        payload: redactEventPayload(approval.payload) ?? {},
+        payload: redactApprovalPayloadByType(approval.type, approval.payload),
       }));
     },
 

@@ -507,12 +507,6 @@ function AuthExpiredListener() {
 
   useEffect(() => {
     function handleAuthExpired() {
-      // Drop the cached session so CloudAccessGate's session check re-resolves
-      // (and any in-flight queries that fanned out behind the missing cookie
-      // are not retried with the stale assumption that we are signed in).
-      queryClient.setQueryData(queryKeys.auth.session, null);
-      queryClient.cancelQueries();
-      // Avoid redirecting away from public auth flows that should remain visible.
       const path = location.pathname;
       const isAlreadyOnAuthFlow =
         path === "/auth" ||
@@ -520,7 +514,18 @@ function AuthExpiredListener() {
         path.startsWith("/board-claim/") ||
         path.startsWith("/cli-auth/") ||
         path.startsWith("/invite/");
+
+      // Drop the cached session so CloudAccessGate's session check re-resolves
+      // (and any in-flight queries that fanned out behind the missing cookie
+      // are not retried with the stale assumption that we are signed in).
+      queryClient.setQueryData(queryKeys.auth.session, null);
+      // Public auth flows need their unauthenticated health/config queries to
+      // finish. A background protected query can still emit auth-expired here;
+      // cancelling every query would strand the sign-in page without its OIDC
+      // provider configuration.
       if (isAlreadyOnAuthFlow) return;
+
+      queryClient.cancelQueries();
       const next = encodeURIComponent(`${location.pathname}${location.search}`);
       navigate(`/auth?next=${next}`, { replace: true });
     }

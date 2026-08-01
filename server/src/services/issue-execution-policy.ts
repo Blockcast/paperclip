@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   IssueExecutionDecision,
   IssueExecutionMonitorClearReason,
@@ -8,9 +8,15 @@ import type {
   IssueExecutionStage,
   IssueExecutionStagePrincipal,
   IssueExecutionState,
+  IssueMonitorGateSource,
   IssueMonitorScheduledBy,
 } from "@paperclipai/shared";
-import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
+import {
+  DEFAULT_ISSUE_MONITOR_CONVERGENCE_THRESHOLD,
+  MAX_ISSUE_MONITOR_CONVERGENCE_THRESHOLD,
+  issueExecutionPolicySchema,
+  issueExecutionStateSchema,
+} from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 
 type AssigneeLike = {
@@ -52,6 +58,14 @@ type TransitionInput = {
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   monitorExplicitlyUpdated?: boolean;
   /**
+   * BLO-18294: the issue's currently-unresolved blocker issue ids, supplied by
+   * the caller (the transition layer has no DB access). These are folded into
+   * the monitor's gate fingerprint alongside any declared `gateSignals`.
+   */
+  unresolvedBlockerIssueIds?: readonly string[] | null;
+  /** BLO-18294: override for the consecutive-identical-recheck ceiling. */
+  monitorConvergenceThreshold?: number | null;
+  /**
    * BLO-15942: an operator/adjudicator override (`tasks:override_execution_stage`,
    * checked by the caller before this is set — never derived here) that lets an
    * actor above the stage's mandate-bound participant force-complete or
@@ -67,6 +81,12 @@ type TransitionResult = {
   patch: Record<string, unknown>;
   decision?: Pick<IssueExecutionDecision, "stageId" | "stageType" | "outcome" | "body">;
   workflowControlledAssignment?: boolean;
+  /**
+   * BLO-18294: set whenever an arm was evaluated by the convergence guard.
+   * `converged: true` means the arm was refused and the patch escalates the
+   * issue to `blocked`; callers surface the blocker set as unblock owners.
+   */
+  monitorConvergence?: IssueMonitorConvergence | null;
 };
 
 const COMPLETED_STATUS: IssueExecutionState["status"] = "completed";
@@ -74,6 +94,8 @@ const PENDING_STATUS: IssueExecutionState["status"] = "pending";
 const CHANGES_REQUESTED_STATUS: IssueExecutionState["status"] = "changes_requested";
 const MONITOR_INVALID_MESSAGE = "Monitor can only be scheduled on issues assigned to an agent in in_progress or in_review";
 const MONITOR_BOUNDS_EXHAUSTED_MESSAGE = "Monitor bounds are already exhausted";
+const MONITOR_CONVERGENCE_RESET_REQUIRES_NON_ASSIGNEE_MESSAGE =
+  "A monitor cleared for convergence_stalled must be re-armed by a non-assignee actor";
 export const REDACTED_ISSUE_MONITOR_EXTERNAL_REF = "[redacted]";
 
 function normalizeMonitorNotes(notes: string | null | undefined) {
@@ -111,6 +133,52 @@ function monitorMetadataFromState(state: IssueExecutionMonitorState | null | und
     timeoutAt: state?.timeoutAt ?? null,
     maxAttempts: state?.maxAttempts ?? null,
     recoveryPolicy: state?.recoveryPolicy ?? null,
+  };
+}
+
+/**
+ * BLO-18294: the convergence bookkeeping a monitor state carries forward.
+ * `previous` is the state we are superseding; `monitor`/`convergence` are only
+ * present on an arm, where a freshly computed fingerprint replaces the old one.
+ */
+function monitorConvergenceFields(
+  previous: IssueExecutionMonitorState | null | undefined,
+  monitor?: IssueExecutionMonitorPolicy | null,
+  convergence?: IssueMonitorConvergence | null,
+  options: { preservePrevious?: boolean } = {},
+) {
+  if (options.preservePrevious) {
+    return {
+      gateSignals: previous?.gateSignals ?? null,
+      gateFingerprint: previous?.gateFingerprint ?? null,
+      gateSource: previous?.gateSource ?? null,
+      convergenceCount: previous?.convergenceCount ?? 0,
+      convergenceStallCount: previous?.convergenceStallCount ?? 0,
+      convergenceStalledAssigneeAgentId: previous?.convergenceStalledAssigneeAgentId ?? null,
+    };
+  }
+  return {
+    gateSignals: monitor
+      ? normalizeIssueMonitorGateSignals(monitor.gateSignals)
+      : previous?.gateSignals ?? null,
+    gateFingerprint: convergence?.fingerprint ?? previous?.gateFingerprint ?? null,
+    gateSource: convergence?.source ?? previous?.gateSource ?? null,
+    convergenceCount: convergence?.count ?? previous?.convergenceCount ?? 0,
+    convergenceStallCount: previous?.convergenceStallCount ?? 0,
+    convergenceStalledAssigneeAgentId: previous?.convergenceStalledAssigneeAgentId ?? null,
+  };
+}
+
+function resetMonitorConvergenceFields(
+  state: IssueExecutionMonitorState | null,
+): IssueExecutionMonitorState | null {
+  if (!state) return null;
+  return {
+    ...state,
+    gateSignals: null,
+    gateFingerprint: null,
+    gateSource: null,
+    convergenceCount: 0,
   };
 }
 
@@ -152,7 +220,7 @@ function executionStateWithMonitor(
   };
 }
 
-function derivePersistedMonitorState(input: {
+export function derivePersistedMonitorState(input: {
   issue: IssueLike;
   state: IssueExecutionState | null;
   policy: IssueExecutionPolicy | null;
@@ -167,6 +235,9 @@ function derivePersistedMonitorState(input: {
   const scheduledBy =
     scheduledByRaw === "assignee" || scheduledByRaw === "board" ? scheduledByRaw : null;
   const metadata = scheduledMonitor ? monitorMetadataFromPolicy(scheduledMonitor) : monitorMetadataFromState(fromState);
+  // BLO-18294: convergence bookkeeping has no dedicated columns, so it only
+  // survives via executionState. Carry it across every derived shape.
+  const convergence = monitorConvergenceFields(fromState, scheduledMonitor);
 
   if (nextCheckAt) {
     return {
@@ -177,6 +248,7 @@ function derivePersistedMonitorState(input: {
       notes,
       scheduledBy,
       ...metadata,
+      ...convergence,
       clearedAt: null,
       clearReason: null,
     };
@@ -190,6 +262,7 @@ function derivePersistedMonitorState(input: {
       attemptCount,
       lastTriggeredAt,
       ...metadata,
+      ...convergence,
     };
   }
 
@@ -202,6 +275,7 @@ function derivePersistedMonitorState(input: {
       notes,
       scheduledBy,
       ...metadata,
+      ...convergence,
       clearedAt: null,
       clearReason: null,
     };
@@ -213,6 +287,8 @@ function derivePersistedMonitorState(input: {
 function buildScheduledMonitorState(
   previous: IssueExecutionMonitorState | null,
   monitor: IssueExecutionMonitorPolicy,
+  convergence?: IssueMonitorConvergence | null,
+  options: { preserveConvergence?: boolean } = {},
 ): IssueExecutionMonitorState {
   return {
     status: "scheduled",
@@ -222,6 +298,9 @@ function buildScheduledMonitorState(
     notes: monitor.notes ?? null,
     scheduledBy: monitor.scheduledBy,
     ...monitorMetadataFromPolicy(monitor),
+    ...monitorConvergenceFields(previous, monitor, convergence, {
+      preservePrevious: options.preserveConvergence === true,
+    }),
     clearedAt: null,
     clearReason: null,
   };
@@ -239,6 +318,7 @@ function buildTriggeredMonitorState(input: {
     notes: input.previous?.notes ?? null,
     scheduledBy: input.previous?.scheduledBy ?? null,
     ...monitorMetadataFromState(input.previous),
+    ...monitorConvergenceFields(input.previous),
     clearedAt: null,
     clearReason: null,
   };
@@ -248,6 +328,8 @@ function buildClearedMonitorState(input: {
   previous: IssueExecutionMonitorState | null;
   clearReason: IssueExecutionMonitorClearReason;
   clearedAt: Date;
+  convergence?: IssueMonitorConvergence | null;
+  assigneeAgentId?: string | null;
 }): IssueExecutionMonitorState {
   return {
     status: "cleared",
@@ -257,6 +339,15 @@ function buildClearedMonitorState(input: {
     notes: input.previous?.notes ?? null,
     scheduledBy: input.previous?.scheduledBy ?? null,
     ...monitorMetadataFromState(input.previous),
+    ...monitorConvergenceFields(input.previous, null, input.convergence),
+    convergenceStallCount:
+      input.clearReason === "convergence_stalled"
+        ? (input.previous?.convergenceStallCount ?? 0) + 1
+        : input.previous?.convergenceStallCount ?? 0,
+    convergenceStalledAssigneeAgentId:
+      input.clearReason === "convergence_stalled"
+        ? input.assigneeAgentId ?? input.previous?.convergenceStalledAssigneeAgentId ?? null
+        : input.previous?.convergenceStalledAssigneeAgentId ?? null,
     clearedAt: input.clearedAt.toISOString(),
     clearReason: input.clearReason,
   };
@@ -278,6 +369,122 @@ function monitorClearReasonForIssue(
     return "invalid_status";
   }
   return null;
+}
+
+/**
+ * BLO-18294 — monitor convergence guard.
+ *
+ * A timer-based monitor only earns its cost if each re-check narrows what the
+ * issue is waiting on. BLO-13266 re-armed a 30-minute monitor ~52 times over
+ * ~30h (~$197) without the blocker set ever moving, because nothing compared
+ * one re-check to the last: the recorded signature mixed in an unrelated
+ * staging CrashLoopBackOff, so incidental churn read as "state changed".
+ *
+ * The fix is to fingerprint the *declared gates* — the issue's unresolved
+ * blocker edges plus the monitor's own `gateSignals` — and count how many
+ * consecutive re-check cycles produce the same fingerprint. Free-form `notes`
+ * is deliberately excluded whenever anything structured exists, which is what
+ * makes unrelated churn stop resetting the counter.
+ */
+function normalizeGateToken(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().replace(/\s+/gu, " ").toLowerCase();
+  return normalized.length > 0 ? normalized : null;
+}
+
+export function normalizeIssueMonitorGateSignals(signals: readonly unknown[] | null | undefined): string[] {
+  if (!Array.isArray(signals)) return [];
+  const unique = new Set<string>();
+  for (const raw of signals) {
+    const token = normalizeGateToken(raw);
+    if (token) unique.add(token);
+  }
+  return [...unique].sort();
+}
+
+export function computeIssueMonitorGateFingerprint(input: {
+  gateSignals?: readonly unknown[] | null;
+  unresolvedBlockerIssueIds?: readonly unknown[] | null;
+  notes?: string | null;
+}): { fingerprint: string; source: IssueMonitorGateSource } {
+  const declared = normalizeIssueMonitorGateSignals(input.gateSignals);
+  const blockers = normalizeIssueMonitorGateSignals(input.unresolvedBlockerIssueIds);
+  const structured = declared.length > 0 || blockers.length > 0;
+  // When gates are declared (or the issue graph models them), the fingerprint is
+  // built from those alone — this is the AC2 property: churn in a signal that is
+  // not a declared gate cannot reset the convergence counter.
+  const material = structured
+    ? `b:${blockers.join(",")}|g:${declared.join(",")}`
+    : `n:${normalizeGateToken(input.notes ?? null) ?? ""}`;
+  return {
+    source: structured ? "gates" : "notes",
+    fingerprint: createHash("sha256").update(material).digest("hex").slice(0, 32),
+  };
+}
+
+export function normalizeIssueMonitorConvergenceThreshold(value: number | null | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return DEFAULT_ISSUE_MONITOR_CONVERGENCE_THRESHOLD;
+  }
+  const rounded = Math.floor(value);
+  if (rounded < 1) return 1;
+  return Math.min(rounded, MAX_ISSUE_MONITOR_CONVERGENCE_THRESHOLD);
+}
+
+export type IssueMonitorConvergence = {
+  fingerprint: string;
+  source: IssueMonitorGateSource;
+  count: number;
+  threshold: number;
+  converged: boolean;
+};
+
+/**
+ * Returns null when the guard does not apply to this monitor — the caller then
+ * records no convergence bookkeeping at all, so an unrelated PATCH that merely
+ * carries an existing monitor forward does not rewrite `executionState`.
+ */
+export function evaluateIssueMonitorConvergence(input: {
+  monitor: IssueExecutionMonitorPolicy;
+  previous: IssueExecutionMonitorState | null;
+  unresolvedBlockerIssueIds?: readonly string[] | null;
+  threshold?: number | null;
+}): IssueMonitorConvergence | null {
+  // Only assignee-scheduled monitors are guarded. A board user arming a monitor
+  // has made a deliberate human decision to keep polling; that is not the
+  // guaranteed-waste shape this guard exists to stop.
+  if (input.monitor.scheduledBy !== "assignee") return null;
+  // Recovery-owned external checks (provider quota, CI, and similar services)
+  // can legitimately re-arm against the same external condition until the
+  // provider window moves. They are bounded by their own recovery policy.
+  if (input.monitor.kind === "external_service") return null;
+
+  const threshold = normalizeIssueMonitorConvergenceThreshold(input.threshold);
+  const { fingerprint, source } = computeIssueMonitorGateFingerprint({
+    gateSignals: input.monitor.gateSignals,
+    unresolvedBlockerIssueIds: input.unresolvedBlockerIssueIds,
+    notes: input.monitor.notes,
+  });
+
+  const previousFingerprint = input.previous?.gateFingerprint ?? null;
+  const previousCount = input.previous?.convergenceCount ?? 0;
+
+  let count: number;
+  if (!previousFingerprint || previousFingerprint !== fingerprint) {
+    // Something the monitor is actually waiting on moved: this is the first
+    // observation of the new gate set.
+    count = 1;
+  } else if (input.previous?.status === "triggered") {
+    // A full re-check cycle elapsed (the monitor fired, the assignee looked)
+    // and nothing narrowed.
+    count = previousCount + 1;
+  } else {
+    // Re-arm without an intervening fire — the assignee is adjusting the
+    // schedule, not completing another re-check. Do not advance the counter.
+    count = Math.max(previousCount, 1);
+  }
+
+  return { fingerprint, source, count, threshold, converged: count > threshold };
 }
 
 function parseMonitorDate(value: string | null | undefined) {
@@ -396,6 +603,9 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
       maxAttempts: parsed.data.monitor.maxAttempts ?? null,
       recoveryPolicy: parsed.data.monitor.recoveryPolicy ?? null,
       productivityReviewDisabled: parsed.data.monitor.productivityReviewDisabled ?? false,
+      // BLO-18294: normalized here so two arms that declare the same gates in a
+      // different order or casing produce the same convergence fingerprint.
+      gateSignals: normalizeIssueMonitorGateSignals(parsed.data.monitor.gateSignals),
     }
     : null;
 
@@ -902,8 +1112,12 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
   };
 }
 
-function applyMonitorTransition(input: TransitionInput, stagePatch: Record<string, unknown>) {
+function applyMonitorTransition(
+  input: TransitionInput,
+  stagePatch: Record<string, unknown>,
+): { patch: Record<string, unknown>; convergence: IssueMonitorConvergence | null } {
   const patch: Record<string, unknown> = {};
+  let convergence: IssueMonitorConvergence | null = null;
   const previousPolicy = input.previousPolicy ?? normalizeIssueExecutionPolicy(input.issue.executionPolicy ?? null);
   const existingState = parseIssueExecutionState(input.issue.executionState);
   const currentMonitorState = derivePersistedMonitorState({
@@ -942,6 +1156,24 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
     : null;
 
   let targetMonitorState = currentMonitorState;
+  const resetConvergenceAfterStalledClear = Boolean(
+    input.monitorExplicitlyUpdated &&
+    input.policy?.monitor &&
+    currentMonitorState?.status === "cleared" &&
+    currentMonitorState.clearReason === "convergence_stalled" &&
+    !invalidReason,
+  );
+  const convergenceBaseMonitorState = resetConvergenceAfterStalledClear
+    ? resetMonitorConvergenceFields(currentMonitorState)
+    : currentMonitorState;
+  const sameAssigneeResetAfterPriorStall = Boolean(
+    resetConvergenceAfterStalledClear &&
+    (currentMonitorState?.convergenceStallCount ?? 0) > 0 &&
+    input.actor.agentId &&
+    input.actor.agentId === (
+      currentMonitorState?.convergenceStalledAssigneeAgentId ?? input.issue.assigneeAgentId ?? null
+    ),
+  );
 
   if (input.policy?.monitor) {
     if (invalidReason) {
@@ -975,11 +1207,52 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
           clearedAt: new Date(),
         });
       } else {
-        patch.monitorNextCheckAt = new Date(input.policy.monitor.nextCheckAt);
-        patch.monitorWakeRequestedAt = null;
-        patch.monitorNotes = input.policy.monitor.notes ?? null;
-        patch.monitorScheduledBy = input.policy.monitor.scheduledBy;
-        targetMonitorState = buildScheduledMonitorState(currentMonitorState, input.policy.monitor);
+        // BLO-18294: refuse to re-arm a monitor that has re-checked the same gate
+        // set `threshold` times running. Polling cannot move a gate that polling
+        // has already failed to move; escalate to `blocked` so the blocker set
+        // becomes visible work for named owners instead of billable silence.
+        // Only an explicit arm/re-arm is evaluated. Transitions that merely carry
+        // an existing monitor forward (a status-only return, a stage auto-approval)
+        // are not re-checks, and those call sites do not supply blocker edges —
+        // scoring them would reset the counter against an empty gate set.
+        // Provider-quota recovery scheduling passes no actor agent id, so this
+        // same-assignee guard cannot block that recovery-owned monitor path.
+        const preserveConvergence = input.monitorExplicitlyUpdated && input.unresolvedBlockerIssueIds === null;
+        if (sameAssigneeResetAfterPriorStall) {
+          throw unprocessable(MONITOR_CONVERGENCE_RESET_REQUIRES_NON_ASSIGNEE_MESSAGE);
+        }
+        convergence = input.monitorExplicitlyUpdated && input.unresolvedBlockerIssueIds !== null
+          ? evaluateIssueMonitorConvergence({
+            monitor: input.policy.monitor,
+            previous: convergenceBaseMonitorState,
+            unresolvedBlockerIssueIds: input.unresolvedBlockerIssueIds ?? [],
+            threshold: input.monitorConvergenceThreshold ?? null,
+          })
+          : null;
+        if (convergence?.converged) {
+          patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
+          patch.monitorNextCheckAt = null;
+          patch.monitorWakeRequestedAt = null;
+          patch.status = "blocked";
+          targetMonitorState = buildClearedMonitorState({
+            previous: currentMonitorState,
+            clearReason: "convergence_stalled",
+            clearedAt: new Date(),
+            convergence,
+            assigneeAgentId: input.actor.agentId ?? assigneeAgentId,
+          });
+        } else {
+          patch.monitorNextCheckAt = new Date(input.policy.monitor.nextCheckAt);
+          patch.monitorWakeRequestedAt = null;
+          patch.monitorNotes = input.policy.monitor.notes ?? null;
+          patch.monitorScheduledBy = input.policy.monitor.scheduledBy;
+          targetMonitorState = buildScheduledMonitorState(
+            convergenceBaseMonitorState,
+            input.policy.monitor,
+            convergence,
+            { preserveConvergence },
+          );
+        }
       }
     }
   } else if (previousPolicy?.monitor) {
@@ -999,7 +1272,7 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
     patch.executionState = executionStateWithMonitor(stageState, targetMonitorState);
   }
 
-  return patch;
+  return { patch, convergence };
 }
 
 export function buildInitialIssueMonitorFields(input: {
@@ -1087,11 +1360,12 @@ export function buildIssueMonitorClearedPatch(input: {
 
 export function applyIssueExecutionPolicyTransition(input: TransitionInput): TransitionResult {
   const stageResult = applyIssueExecutionStageTransition(input);
-  const monitorPatch = applyMonitorTransition(input, stageResult.patch);
-  Object.assign(stageResult.patch, monitorPatch);
-  return stageResult;
+  const monitor = applyMonitorTransition(input, stageResult.patch);
+  Object.assign(stageResult.patch, monitor.patch);
+  return { ...stageResult, monitorConvergence: monitor.convergence };
 }
 
 export function applyIssueMonitorPolicyTransition(input: TransitionInput): TransitionResult {
-  return { patch: applyMonitorTransition(input, {}) };
+  const monitor = applyMonitorTransition(input, {});
+  return { patch: monitor.patch, monitorConvergence: monitor.convergence };
 }

@@ -1,3 +1,54 @@
+{{/*
+  READ BEFORE ADDING AN ALERT HERE — this file does not deploy on Blockcast.
+
+  `prometheusRule.enabled` is false in values.blockcast.yaml (BLO-14032 /
+  BLO-14556): the paperclip-ci-deploy ServiceAccount running `helm upgrade` has
+  no RBAC grant on prometheusrules.monitoring.coreos.com, so turning it on does
+  not merely skip this resource — it 403s the whole release. A regression test
+  (tests/prometheus-rule.test.mjs) fails CI if the flag flips back on.
+
+  So a rule added ONLY here is dead code on the cluster it is meant to protect.
+  The live alerting surface is Blockcast/onprem-k8s, and it is itself a pair:
+
+    1. monitoring/prometheus-configmap.yaml, key `paperclip-runtime-alerts.rules.yml`
+       — AUTHORITATIVE. The cluster runs a vanilla Prometheus StatefulSet that
+       loads rules from this static ConfigMap. This is the copy that fires.
+    2. paperclip/paperclip-runtime-alerts-prometheusrule.yaml
+       — a documentation copy of the same rules as a PrometheusRule CRD. No
+       prometheus-operator runs on this cluster, so the CRD is an orphaned
+       no-op, kept so a future operator install picks it up.
+
+  Those two are lockstep-enforced by onprem-k8s scripts/check-prometheus-rules-lockstep.sh
+  (edit both or CI fails). Nothing enforces lockstep with THIS chart file.
+
+  Groups below are therefore mirrors, kept so the chart stays coherent for a
+  cluster that does grant the RBAC. When you change a rule here, change it in
+  both onprem-k8s files too — see BLO-18859 for the review that caught an alert
+  landing here and nowhere else.
+
+  STATUS of the BLO-18859 dead-letter alert, so this head is auditable on its
+  own (a reviewer cannot see the other repo from here):
+
+    - Landed on both authoritative onprem-k8s files by Blockcast/onprem-k8s#1784,
+      merged 2026-07-30T13:01:18Z as 423e32bc76c1bcdfa88c02bfce722a2ee71c22ef.
+      Verify:
+        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
+          --jq '.content' | base64 -d | grep PaperclipGithubReviewRequestDeadLettered
+
+    - LIVE as of 2026-07-31T01:10Z after manually syncing the monitoring-rules
+      Argo app to onprem-k8s revision 942d8154ebdda34ccdd61255d0ac891becfc5b9d.
+      The live monitoring/prometheus-config ConfigMap and Prometheus /api/v1/rules
+      both include PaperclipGithubReviewRequestDeadLettered and
+      PaperclipGithubReviewRequestSuppressionOutage.
+
+      The cluster ConfigMap monitoring/prometheus-config is still Argo-tracked
+      (argocd.argoproj.io/tracking-id: monitoring-rules:/ConfigMap:monitoring/prometheus-config)
+      and the `monitoring-rules` app syncs manually, so a merge does not deploy.
+      That sync gate is a standing repo-wide hazard — it once sat 8 days and
+      stranded 15 merged alerts — and is tracked on BLO-19095, not here. Merging
+      an alert is not deploying it; confirm the live ConfigMap before treating
+      any rule in this family as production observability.
+*/}}
 {{- if .Values.prometheusRule.enabled }}
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
@@ -72,6 +123,68 @@ spec:
           annotations:
             summary: "Paperclip reaper is blind to kube Job liveness"
             description: "The reaper hit more than {{ .Values.prometheusRule.processLostLivenessNullWindowCount }} null kube Job-status lists in 15m, so it is falling back to the staleness heuristic while blind (BLO-16184 denominator guard). Any concurrent LOW process_lost count is UNRELIABLE — a 0 means 'could not see', not 'healthy'; a spike may be kube-outage-driven. Check the K8s API and the paperclip ServiceAccount RBAC."
+    - name: paperclip-github-delivery
+      rules:
+        - alert: PaperclipGithubReviewRequestDeadLettered
+          # BLO-18859: keys on the dead_lettered state of the delivery funnel
+          # counter, which is zero-initialized at process start — so an absent
+          # series means a broken scrape, not a healthy fleet, and a 0 here is a
+          # real 0. increase() over the window catches a single dead-letter
+          # (threshold > 0) because one lost @ally review request is already a
+          # user-visible failure: the PR sits with a posted trigger and no
+          # review, which is the BLO-18847 symptom. Deliberately NOT rate()-per-
+          # second — that rounds a lone event toward zero on a wide window.
+          #
+          # BLO-18859 review follow-up: the counter arm alone has two blind
+          # spots, both of which hide a REAL terminal loss:
+          #   1. First scrape. increase() needs two samples in the window. A
+          #      dead letter recorded before the process is first scraped has no
+          #      pre-increment baseline, so its step is never measured.
+          #   2. Pod replacement. sum() aggregates the instance label away, but
+          #      the underlying per-pod series still retires when the pod goes.
+          #      Once the old series falls out of the lookback it contributes
+          #      nothing, and the replacement starts at 0 — so a dead letter can
+          #      vanish from the range before this rule's `for` has elapsed.
+          # The gauge arm closes both: it is recomputed from committed
+          # agent_wakeup_requests rows on every wake-dispatch reconcile pass, so
+          # it is republished by whatever process is alive and does not depend on
+          # a delta between two samples. It is an OR rather than a replacement
+          # because the gauge cannot see the one dead-letter path that leaves no
+          # row at all (the durable safety-net insert itself failing) — that path
+          # is counter-only, and it is the more alarming of the two.
+          expr: >-
+            (sum(increase(paperclip_github_review_request_delivery_total{state="dead_lettered"}[{{ .Values.prometheusRule.githubDeliveryDeadLetterWindow }}])) > 0)
+            or (sum(paperclip_github_review_request_dead_letter_unresolved) > 0)
+          for: {{ .Values.prometheusRule.githubDeliveryDeadLetterFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip GitHub review-request delivery dead-lettered (an @ally review will never run)"
+            description: "At least one GitHub review-request reviewer wake was dead-lettered in the last {{ .Values.prometheusRule.githubDeliveryDeadLetterWindow }}, or is still sitting unresolved in the durable dispatch_failed_exhausted state (BLO-18859). Dead-lettered is TERMINAL — the reconciler never re-arms it, so the affected PR has a posted review trigger and will never get a review until someone re-triggers it. Two paths reach this state: a durable agent_wakeup_requests row exhausted DISPATCH_RETRY_MAX_ATTEMPTS (query `select id, agent_id, reason, error from agent_wakeup_requests where status = 'dispatch_failed_exhausted' order by updated_at desc`), or wakeupWithDispatchRetry could not persist its safety-net row at all — the latter leaves NO row and is visible only in the logs ('dropping without a durable record' / 'failed to persist durable wake-dispatch-failed record') and on the counter arm of this rule, never on the gauge arm. Break down by the `reason` label to see which event type is failing. Read alongside the received/queued/retried states of the same counter: a rising `retried` with no dead-letters is dispatch flakiness absorbed by the retry chain, not loss."
+        - alert: PaperclipGithubReviewRequestSuppressionOutage
+          # BLO-18859 review follow-up: dead_lettered is not the only terminal
+          # state. `suppressed` is also terminal (no reconciler pass re-arms a
+          # skipped or superseded row) but it is NOT uniformly a fault, so it
+          # cannot be alerted on as a whole: an inactive company, a cooldown, a
+          # blocked budget and wake-on-demand-off are the fleet correctly
+          # declining, and paging on those would force the rule off entirely --
+          # leaving a stuck global scheduling-suppression flag free to eat every
+          # @ally review while the dead-letter alert above stays green.
+          #
+          # So this keys on the cause breakdown counter and selects only the
+          # outage-like causes. `other` is in the default set on purpose: it is
+          # the bucket for a skip reason not yet in the server's allow-list, and
+          # an untriaged cause has not been shown to be an expected decline.
+          # Widen/narrow via githubDeliverySuppressionOutageCauses rather than
+          # editing this expr, and remember Prometheus fully anchors =~ (so the
+          # unescaped dots here can only over-match within a listed name).
+          expr: sum(increase(paperclip_github_review_request_suppression_total{cause=~{{ .Values.prometheusRule.githubDeliverySuppressionOutageCauses | quote }}}[{{ .Values.prometheusRule.githubDeliverySuppressionWindow }}])) > 0
+          for: {{ .Values.prometheusRule.githubDeliverySuppressionFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip GitHub review-request wakes suppressed by an outage-like cause (reviews are being dropped)"
+            description: "At least one GitHub review-request reviewer wake was terminally suppressed in the last {{ .Values.prometheusRule.githubDeliverySuppressionWindow }} with an outage-like cause ({{ .Values.prometheusRule.githubDeliverySuppressionOutageCauses }}) (BLO-18859). Suppressed means the wake was declined rather than dispatched: no run exists and nothing will re-arm it, so the PR has a posted trigger and no review — the same user-visible outcome as a dead-letter. Check the `cause` label first. `heartbeat.scheduling_suppressed` means the fleet-wide scheduling-suppression flag is on: if that is not a deliberate maintenance window, clear it (this is the mode that silently strands every review). `dispatch_rejected` means the dispatch path threw a business-rule HttpError with no durable skipped row — an unresolvable agent or responsible user; waiting will not fix it. `other` means the server emitted a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES in services/metrics.ts: find it with `select reason, count(*) from agent_wakeup_requests where status = 'skipped' and created_at > now() - interval '1 hour' group by 1 order by 2 desc`, then either add it to the allow-list as an expected decline or fix the cause. Expected declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded from this selector by default and are visible on the same counter for context."
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

@@ -14,6 +14,7 @@ import {
   ISSUE_COMMENT_PRESENTATION_TONES,
   ISSUE_HARNESS_KINDS,
   ISSUE_MONITOR_SCHEDULED_BY,
+  ISSUE_MONITOR_GATE_SOURCES,
   ISSUE_PRIORITIES,
   ISSUE_RECOVERY_ACTION_KINDS,
   ISSUE_RECOVERY_ACTION_OUTCOMES,
@@ -189,6 +190,15 @@ export const issueExecutionMonitorPolicySchema = z.object({
   nextCheckAt: z.string().datetime(),
   notes: z.string().max(500).optional().nullable().default(null),
   scheduledBy: z.enum(ISSUE_MONITOR_SCHEDULED_BY).optional().default("assignee"),
+  gateSignals: z
+    .array(z.string().trim().min(1).max(200))
+    .max(20)
+    .optional()
+    .nullable()
+    .default(null)
+    .describe(
+      "BLO-18294: the gates this monitor is actually waiting on, as short stable tokens (e.g. \"pr:Blockcast/paperclip#814:checks\", \"deploy:paperclip-api\"). Declaring them makes the convergence guard compare re-checks against THESE and ignore free-form `notes` churn, so an unrelated signal you happened to mention cannot read as progress and keep the loop alive. Unresolved `blockedBy` edges are folded in automatically — declare gateSignals for anything the issue graph does not already model.",
+    ),
   kind: z.enum(ISSUE_EXECUTION_MONITOR_KINDS).optional().nullable().default(null),
   serviceName: z.string().trim().min(1).max(120).optional().nullable().default(null),
   externalRef: z.string().trim().min(1).max(500).optional().nullable().default(null),
@@ -206,7 +216,7 @@ export const issueExecutionPolicySchema = z.object({
     .optional()
     .nullable()
     .describe(
-      "The ONLY accepted way to arm, re-arm, or clear an issue monitor (wake) is this nested field, `executionPolicy.monitor`. There is no top-level `monitor` / `monitorNextCheckAt` / `monitorNotes` input — those keys are rejected, because they used to be silently discarded (BLO-18790). Carry a re-check signature in `monitor.notes`. Every write REPLACES the whole `executionPolicy` rather than merging into it, and that applies to arming and re-arming exactly as much as to clearing: read the issue's current `executionPolicy` first, then re-send it complete with `monitor` set (arm/re-arm) or omitted (clear). The short {\"executionPolicy\":{\"monitor\":{…}}} body is safe ONLY on an issue whose policy has nothing else in it — on any other issue it erases `stages`, `reviewPreset` and `authorizationPolicy`, and a bare {\"executionPolicy\":{}} normalizes to null and erases them along with the monitor. Re-arming supersedes a `triggered` monitor, which is how you reset a wedged one — but `attemptCount` is preserved across re-arm, so re-sending a `maxAttempts` at or below that count (or a `timeoutAt` already in the past) is rejected 422 as exhausted instead of re-arming; omit `maxAttempts` when resetting a wedged monitor. Monitors only hold on an `in_progress`/`in_review` issue assigned to an agent, and an unresolved `blockedBy` edge suppresses the wake even while it reads as `scheduled` — so ALWAYS re-read `monitorNextCheckAt` in the same run and treat `null` as failure rather than reporting success off a 200.",
+      "The ONLY accepted way to arm, re-arm, or clear an issue monitor (wake) is this nested field, `executionPolicy.monitor`. There is no top-level `monitor` / `monitorNextCheckAt` / `monitorNotes` input — those keys are rejected, because they used to be silently discarded (BLO-18790). Carry a re-check signature in `monitor.notes`. Every write REPLACES the whole `executionPolicy` rather than merging into it, and that applies to arming and re-arming exactly as much as to clearing: read the issue's current `executionPolicy` first, then re-send it complete with `monitor` set (arm/re-arm) or omitted (clear). The short {\"executionPolicy\":{\"monitor\":{…}}} body is safe ONLY on an issue whose policy has nothing else in it — on any other issue it erases `stages`, `reviewPreset` and `authorizationPolicy`, and a bare {\"executionPolicy\":{}} normalizes to null and erases them along with the monitor. Re-arming supersedes a `triggered` monitor, which is how you reset a wedged one — but `attemptCount` is preserved across re-arm, so re-sending a `maxAttempts` at or below that count (or a `timeoutAt` already in the past) is rejected 422 as exhausted instead of re-arming; omit `maxAttempts` when resetting a wedged monitor. Monitors only hold on an `in_progress`/`in_review` issue assigned to an agent, and an unresolved `blockedBy` edge suppresses the wake even while it reads as `scheduled` — so ALWAYS re-read `monitorNextCheckAt` in the same run and treat `null` as failure rather than reporting success off a 200. BLO-18294: an assignee-scheduled monitor that re-checks the SAME unresolved gate set 3 times running stops re-arming — the 4th arm is refused, the monitor is cleared with reason `convergence_stalled`, and the issue is moved to `blocked` with its blocker set posted as named unblock owners. Moving the issue back to `in_progress` can clear the stale consecutive count, but the same assignee cannot grant itself another monitor budget after a convergence stall; a non-assignee actor must make that re-arm decision. Declare `gateSignals` so that comparison runs against what you are actually waiting on; otherwise it falls back to the `notes` signature, and an unchanged signature converges. Polling never moves a human-only gate (approval, credential grant, another team's sign-off) — escalate those instead of arming a monitor on them.",
 
     ),
   reviewPreset: lowTrustReviewPresetPolicySchema.optional(),
@@ -220,6 +230,12 @@ export const issueExecutionMonitorStateSchema = z.object({
   attemptCount: z.number().int().nonnegative().default(0),
   notes: z.string().max(500).nullable(),
   scheduledBy: z.enum(ISSUE_MONITOR_SCHEDULED_BY).nullable(),
+  gateSignals: z.array(z.string().trim().min(1).max(200)).max(20).nullable().optional().default(null),
+  gateFingerprint: z.string().max(200).nullable().optional().default(null),
+  gateSource: z.enum(ISSUE_MONITOR_GATE_SOURCES).nullable().optional().default(null),
+  convergenceCount: z.number().int().nonnegative().optional().default(0),
+  convergenceStallCount: z.number().int().nonnegative().optional().default(0),
+  convergenceStalledAssigneeAgentId: z.string().uuid().nullable().optional().default(null),
   kind: z.enum(ISSUE_EXECUTION_MONITOR_KINDS).nullable().optional().default(null),
   serviceName: z.string().trim().min(1).max(120).nullable().optional().default(null),
   externalRef: z.string().trim().min(1).max(500).nullable().optional().default(null),
@@ -634,12 +650,21 @@ export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
 
 export const addIssueCommentSchema = z.object({
   body: multilineTextSchema.pipe(z.string().min(1)),
+  idempotencyKey: z.string().trim().min(1).max(255).optional(),
   authorType: issueCommentAuthorTypeSchema.optional(),
   presentation: issueCommentPresentationSchema.nullable().optional(),
   metadata: issueCommentMetadataSchema.nullable().optional(),
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
+}).superRefine((value, ctx) => {
+  if (value.idempotencyKey && (value.reopen || value.resume || value.interrupt)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Idempotent comments cannot reopen, resume, or interrupt issues",
+      path: ["idempotencyKey"],
+    });
+  }
 });
 
 export type AddIssueComment = z.infer<typeof addIssueCommentSchema>;

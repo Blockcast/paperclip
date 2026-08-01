@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "packageName": "@paperclipai/skills-catalog",
   "packageVersion": "0.3.1",
-  "generatedAt": "2026-07-30T16:16:43.215Z",
+  "generatedAt": "2026-07-31T17:24:55.472Z",
   "skills": [
     {
       "id": "paperclipai:bundled:docs:doc-maintenance",
@@ -409,11 +409,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 8453,
-          "sha256": "debe3765844710d3833c031169c0e0af91711827c5f9c2926662d575e50f3d97"
+          "sizeBytes": 20481,
+          "sha256": "55297b8f2ade03cb0a9fdfc8c86615e5c54331beb2087bfb7b7c34f1bffb9143"
         }
       ],
-      "contentHash": "sha256:73061ea63d4db627f2809d848661dacd922c395358d44d2c7cd633c240f0feb5"
+      "contentHash": "sha256:79a09d45acf80031cf7d9db69f3f637508a81f16986435d9f711c055df8f280f"
     },
     {
       "id": "paperclipai:optional:browser:agent-browser",
@@ -1075,7 +1075,8 @@
         "ref": "v3.3.0",
         "commit": "daca71f89eb71d0d56d01a43ed7627aa919dba4f",
         "path": "skills/last30days",
-        "url": "https://github.com/mvanhorn/last30days-skill/tree/v3.3.0/skills/last30days"
+        "url": "https://github.com/mvanhorn/last30days-skill/tree/v3.3.0/skills/last30days",
+        "descriptorSha256": "dc27aa8500e402d0dae63949052da966626c6e227e980ae597a51774bd92d0e5"
       }
     }
   ]

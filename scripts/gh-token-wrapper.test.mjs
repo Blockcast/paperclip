@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -25,15 +25,36 @@ function withTempDir(fn) {
   }
 }
 
+// Every credential input the wrapper reads. A test that means to exercise one
+// branch has to clear all of them, because the wrapper's whole job is to pick a
+// branch based on which are set — inheriting one from the ambient environment
+// silently re-points the test at a different branch than it names. This is not
+// hypothetical: these tests run inside agent pods, and PAPERCLIP_GITHUB_TOKEN_VALUE
+// is exactly what the scoped secret-binding path (BLO-18927) exports there.
+const WRAPPER_CREDENTIAL_ENV_VARS = [
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "PAPERCLIP_GITHUB_TOKEN_FILE",
+  "PAPERCLIP_GITHUB_TOKEN_VALUE",
+];
+
+// The single way any test in this file builds an environment. Starts from a
+// copy of process.env with every credential input stripped, then applies only
+// what the caller asked for, so each test states its full credential premise.
+function sanitizedEnv(overrides = {}) {
+  const env = { ...process.env };
+  for (const name of WRAPPER_CREDENTIAL_ENV_VARS) {
+    delete env[name];
+  }
+  return Object.assign(env, overrides);
+}
+
 function runWrapper(dir, { tokenFileContent, tokenValue, args = ["api", "user"] } = {}) {
   const stubGhPath = path.join(dir, "gh.real");
   writeFileSync(stubGhPath, STUB_GH_SOURCE);
   chmodSync(stubGhPath, 0o755);
 
-  const env = { ...process.env, GH_TOKEN_WRAPPER_REAL_GH: stubGhPath };
-  delete env.GH_TOKEN;
-  delete env.GITHUB_TOKEN;
-  delete env.PAPERCLIP_GITHUB_TOKEN_VALUE;
+  const env = sanitizedEnv({ GH_TOKEN_WRAPPER_REAL_GH: stubGhPath });
 
   if (tokenValue !== undefined) {
     env.PAPERCLIP_GITHUB_TOKEN_VALUE = tokenValue;
@@ -103,13 +124,12 @@ test("overrides a pre-existing GH_TOKEN/GITHUB_TOKEN in the caller's env (BLO-13
     const tokenFilePath = path.join(dir, "token");
     writeFileSync(tokenFilePath, "ghs_livebottoken\n");
 
-    const env = {
-      ...process.env,
+    const env = sanitizedEnv({
       GH_TOKEN_WRAPPER_REAL_GH: stubGhPath,
       PAPERCLIP_GITHUB_TOKEN_FILE: tokenFilePath,
       GH_TOKEN: "user_supplied_override",
       GITHUB_TOKEN: "user_supplied_override",
-    };
+    });
     const out = execFileSync("sh", [WRAPPER, "api", "user"], { env, encoding: "utf8" });
     const result = Object.fromEntries(
       out
@@ -141,13 +161,10 @@ test("logs a diagnostic to stderr and falls back when the token file exists but 
     writeFileSync(tokenFilePath, "ghs_unreadable\n");
     chmodSync(tokenFilePath, 0o000);
 
-    const env = {
-      ...process.env,
+    const env = sanitizedEnv({
       GH_TOKEN_WRAPPER_REAL_GH: stubGhPath,
       PAPERCLIP_GITHUB_TOKEN_FILE: tokenFilePath,
-    };
-    delete env.GH_TOKEN;
-    delete env.GITHUB_TOKEN;
+    });
 
     const proc = spawnSync("sh", [WRAPPER, "auth", "status"], { env, encoding: "utf8" });
     assert.equal(proc.status, 0);
@@ -212,14 +229,13 @@ function runMalformedValue(dir, tokenValue) {
 
   return spawnSync("sh", [WRAPPER, "api", "user"], {
     encoding: "utf8",
-    env: {
-      ...process.env,
+    env: sanitizedEnv({
       GH_TOKEN_WRAPPER_REAL_GH: stubGhPath,
       PAPERCLIP_GITHUB_TOKEN_FILE: tokenFilePath,
       PAPERCLIP_GITHUB_TOKEN_VALUE: tokenValue,
       GH_TOKEN: "user_supplied_override",
       GITHUB_TOKEN: "user_supplied_override",
-    },
+    }),
   });
 }
 
@@ -276,13 +292,12 @@ test("a token supplied by value overrides a pre-existing GH_TOKEN in the caller'
     writeFileSync(stubGhPath, STUB_GH_SOURCE);
     chmodSync(stubGhPath, 0o755);
 
-    const env = {
-      ...process.env,
+    const env = sanitizedEnv({
       GH_TOKEN_WRAPPER_REAL_GH: stubGhPath,
       PAPERCLIP_GITHUB_TOKEN_VALUE: "ghu_userseat",
       GH_TOKEN: "user_supplied_override",
       GITHUB_TOKEN: "user_supplied_override",
-    };
+    });
     const out = execFileSync("sh", [WRAPPER, "api", "user"], { env, encoding: "utf8" });
     const result = Object.fromEntries(
       out
@@ -297,3 +312,77 @@ test("a token supplied by value overrides a pre-existing GH_TOKEN in the caller'
     assert.equal(result.GITHUB_TOKEN, "ghu_userseat");
   });
 });
+
+// BLO-18484: the wrapper injects the token into `gh`'s process env only, so the
+// git CLI had no credential of its own. Against a *private* repo every push and
+// fetch failed with "Invalid username or token" — an authentication-absence
+// error that reads like a permissions problem, which is what sent BLO-18481
+// down a spurious access-escalation path. Public repos masked it by cloning
+// anonymously. These two tests pin the halves of the fix: that the wrapper
+// serves the credential-helper invocation, and that the image asks the wrapper
+// (not gh.real) for it.
+test("injects the token when invoked as a git credential helper (BLO-18484)", () => {
+  withTempDir((dir) => {
+    const result = runWrapper(dir, {
+      tokenFileContent: "ghs_credentialhelper\n",
+      args: ["auth", "git-credential", "get"],
+    });
+    assert.equal(result.GH_TOKEN, "ghs_credentialhelper");
+    assert.equal(result.ARGS, "auth git-credential get");
+  });
+});
+
+test("Dockerfile.runtime points git's credential helper at the wrapper, not gh.real (BLO-18484)", () => {
+  const dockerfile = readFileSync(path.join(import.meta.dirname, "..", "Dockerfile.runtime"), "utf8");
+
+  const helper = dockerfile.match(
+    /git config --system credential\.https:\/\/github\.com\.helper\s*\\?\s*'([^']+)'/,
+  );
+  assert.ok(helper, "Dockerfile.runtime must configure a system-level github.com credential helper");
+
+  // The trap this test exists for: `gh auth setup-git` writes a gh.real helper
+  // (gh resolves its own argv[0] after the wrapper exec's it), and gh.real never
+  // reads the token file — so that helper returns nothing and git silently falls
+  // through to prompting for a username.
+  assert.equal(helper[1], "!/usr/bin/gh auth git-credential");
+  assert.doesNotMatch(helper[1], /gh\.real/);
+});
+
+// Pins the isolation the helper above provides, by re-running this whole file
+// in a child process with every credential input already set in the ambient
+// environment. Before the sanitized-env helper, that run failed two tests: the
+// GH_TOKEN-override test authenticated as the inherited value instead of the
+// file's, and the unreadable-file test never emitted its diagnostic, because
+// the inherited PAPERCLIP_GITHUB_TOKEN_VALUE sent both down the value branch.
+// A plain assertion inside a single test cannot catch that class of bug — the
+// leak is in how each test builds its environment, so the check has to be a
+// second run of every test under a dirty one.
+if (!process.env.GH_TOKEN_WRAPPER_TEST_NESTED) {
+  test("the suite is hermetic against inherited credential env vars", () => {
+    const nestedEnv = {
+      ...process.env,
+      // Stops the child from spawning its own child, forever.
+      GH_TOKEN_WRAPPER_TEST_NESTED: "1",
+      GH_TOKEN: "ambient_caller_token",
+      GITHUB_TOKEN: "ambient_caller_token",
+      PAPERCLIP_GITHUB_TOKEN_FILE: path.join(os.tmpdir(), "ambient-token-does-not-exist"),
+      PAPERCLIP_GITHUB_TOKEN_VALUE: "ghu_ambient_scoped_binding",
+    };
+    // node:test sets NODE_TEST_CONTEXT=child-v8 in every test-file subprocess.
+    // Inheriting it makes the nested run report through the v8 serializer to a
+    // parent that is not listening, and — the part that matters — exit 0 even
+    // with failing tests, which silently makes this assertion vacuous. Verified
+    // on node v24.16: same nested run exits 1 without it, 0 with it.
+    delete nestedEnv.NODE_TEST_CONTEXT;
+
+    const proc = spawnSync(process.execPath, ["--test", import.meta.filename], {
+      encoding: "utf8",
+      env: nestedEnv,
+    });
+    assert.equal(
+      proc.status,
+      0,
+      `suite is not hermetic — it passes clean but fails with credential env vars inherited:\n${proc.stdout}\n${proc.stderr}`,
+    );
+  });
+}
