@@ -12010,18 +12010,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * `process.on("uncaughtException")` with the process already dying, so it is
    * deliberately the smallest thing that fixes the attribution problem:
    *
-   *   1. one guarded bulk UPDATE flipping this worker's still-`running` runs to
-   *      `interrupted` with `errorCode: "worker_crashed"`, and
-   *   2. `finalizeAgentStatus` per affected agent.
+   *   1. one guarded bulk UPDATE flipping this worker's still-`running`,
+   *      non-external-lifecycle runs to `interrupted` with
+   *      `errorCode: "worker_crashed"`, and
+   *   2. the same bounded retry / lock-release cleanup the graceful drain uses.
    *
-   * Step 2 costs a few queries per agent rather than one bulk statement, which
-   * is the deliberate trade: `finalizeAgentStatus` holds nuance we must not
-   * duplicate in ad-hoc SQL (paused/terminated agents are skipped, quota
-   * exhaustion stays idle rather than latching to error, the running-count
-   * decides the next status). The caller races this whole function against a
-   * timeout and exits regardless, and anything we fail to mark is still caught
-   * by the pre-existing reaper — so a partial pass is strictly better than
-   * today's zero-pass, and a slow-but-correct pass beats a fast wrong one.
+   * The per-run cleanup costs several queries rather than one bulk statement,
+   * which is the deliberate trade: retry enqueue, issue-lock release, and
+   * `finalizeAgentStatus` all carry nuance we must not duplicate in ad-hoc SQL.
+   * The caller races this whole function against a timeout and exits
+   * regardless, and anything we fail to mark is still caught by the
+   * pre-existing reaper — so a partial pass is strictly better than today's
+   * zero-pass, and a slow-but-correct pass beats a fast wrong one.
    *
    * Without this, every run the crash orphaned stayed `running` until a reaper
    * noticed minutes later and reconciled it as `job_missing` — "External
@@ -12029,9 +12029,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * names the symptom (a Job we can no longer see) and hides the cause (this
    * process died). Operators then chase Kubernetes for a fault that was ours.
    *
-   * Runs are marked `interrupted`, matching how the graceful path already
-   * treats work cut short by the server going away, so restart-recovery retry
-   * semantics are inherited rather than reinvented.
+   * Runs with an external runtime id stay `running`: their Kubernetes Job may
+   * still be healthy, and the existing reattach / missing-Job reconcilers are
+   * the only paths that can preserve or correctly classify that work.
    */
   async function markRunsInterruptedByWorkerCrash(input: {
     reason: string;
@@ -12046,7 +12046,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const message = `Interrupted by worker process crash (${input.reason})`;
 
     // Gated on status='running' so we never overwrite a run that already
-    // reached a terminal state on its way out.
+    // reached a terminal state on its way out, and on external_run_id IS NULL
+    // so live Kubernetes Jobs remain visible to the restart reattach path.
     const marked = await db
       .update(heartbeatRuns)
       .set({
@@ -12056,12 +12057,71 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         errorCode: "worker_crashed",
         updatedAt: now,
       })
-      .where(and(inArray(heartbeatRuns.id, runIds), eq(heartbeatRuns.status, "running")))
-      .returning({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId });
+      .where(and(
+        inArray(heartbeatRuns.id, runIds),
+        eq(heartbeatRuns.status, "running"),
+        isNull(heartbeatRuns.externalRunId),
+      ))
+      .returning();
+
+    const retryRunIds: string[] = [];
 
     for (const run of marked) {
       // Best-effort per agent: one agent failing to finalize must not strand
       // the rest, and we are on a clock.
+      let retry: typeof heartbeatRuns.$inferSelect | null = null;
+      try {
+        await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+          finishedAt: now,
+          error: null,
+        });
+      } catch (error) {
+        logger.warn({ err: error, runId: run.id }, "failed to cancel wakeup for crash-interrupted run");
+      }
+      await releaseEnvironmentLeasesForRun({
+        runId: run.id,
+        companyId: run.companyId,
+        agentId: run.agentId,
+        status: run.status,
+        failureReason: run.error ?? undefined,
+      });
+
+      let agent: typeof agents.$inferSelect | null = null;
+      try {
+        agent = await getAgent(run.agentId);
+      } catch (error) {
+        logger.warn({ err: error, agentId: run.agentId, runId: run.id }, "failed to load crash-interrupted run agent");
+      }
+      try {
+        if (agent) retry = await enqueueProcessLossRetry(run, agent, now);
+      } catch (error) {
+        logger.warn({ err: error, runId: run.id }, "failed to enqueue crash-interrupted run retry");
+      }
+      if (retry) {
+        retryRunIds.push(retry.id);
+      } else {
+        try {
+          await releaseIssueExecutionAndPromote(run);
+        } catch (error) {
+          logger.warn({ err: error, runId: run.id }, "failed to release crash-interrupted issue execution lock");
+        }
+      }
+
+      try {
+        await appendRunEvent(run, await nextRunEventSeq(run.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message,
+          payload: {
+            reason: input.reason,
+            ...(retry ? { retryRunId: retry.id } : {}),
+          },
+        });
+      } catch (error) {
+        logger.warn({ err: error, runId: run.id }, "failed to append crash-interrupted run event");
+      }
+
       try {
         await finalizeAgentStatus(run.agentId, "interrupted", message, {
           errorCode: "worker_crashed",
@@ -12070,6 +12130,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       } catch {
         /* keep going; the reaper remains the backstop */
       }
+    }
+
+    if (marked.length > 0) {
+      logger.warn(
+        { markedRunIds: marked.map((run) => run.id), retryRunIds },
+        "marked local heartbeat runs interrupted by worker crash",
+      );
     }
 
     return { markedRunIds: marked.map((run) => run.id) };

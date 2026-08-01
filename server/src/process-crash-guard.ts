@@ -82,6 +82,7 @@ export interface InstallCrashGuardOptions {
   timeoutMs?: number;
   /** Seams for tests; default to the real process. */
   exit?: (code: number) => void;
+  setExitCode?: (code: number) => void;
   processRef?: Pick<NodeJS.Process, "on" | "off">;
 }
 
@@ -150,6 +151,9 @@ export function installProcessCrashGuard(options: InstallCrashGuardOptions): () 
     onCrash,
     timeoutMs = DEFAULT_CRASH_GUARD_TIMEOUT_MS,
     exit = (code: number) => process.exit(code),
+    setExitCode = (code: number) => {
+      process.exitCode = code;
+    },
     processRef = process,
   } = options;
 
@@ -169,6 +173,11 @@ export function installProcessCrashGuard(options: InstallCrashGuardOptions): () 
       return;
     }
     handling = true;
+    try {
+      setExitCode(CRASH_GUARD_EXIT_CODE);
+    } catch {
+      /* exit() below remains authoritative */
+    }
 
     const causeChain = serializeCauseChain(error);
 

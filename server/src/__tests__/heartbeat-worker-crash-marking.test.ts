@@ -26,9 +26,10 @@ if (!embeddedPostgresSupport.supported) {
 // the symptom (a Job we can no longer see) and hides the cause (this process
 // died), sending operators to look at Kubernetes for our fault.
 //
-// These tests pin the crash-time marking: the runs this worker owned end up
-// terminal, attributed to the crash, and the agent is released rather than
-// latched to `error` for something it did not do.
+// These tests pin the crash-time marking: local runs this worker owned end up
+// terminal, attributed to the crash, and retried through the process-loss path.
+// External-lifecycle runs stay `running` so restart recovery can reattach to a
+// still-healthy Kubernetes Job instead of discarding live work.
 describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -95,11 +96,10 @@ describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
     });
   }
 
-  it("marks an in-flight external-lifecycle run terminal with a reason naming the crash, not job_missing", async () => {
+  it("marks an in-flight local run terminal with a reason naming the crash and queues a retry", async () => {
     const heartbeat = heartbeatService(db);
     const { runId, agentId } = await seedRun({
-      adapterType: "claude_k8s",
-      externalRunId: "paperclip-run-abc123",
+      adapterType: "codex_local",
     });
     markLiveInThisWorker(runId);
 
@@ -120,6 +120,11 @@ describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
     expect(run!.error).not.toContain("job_missing");
     expect(run!.error).not.toContain("Job is missing");
 
+    const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(retry).toBeTruthy();
+    expect(retry!.status).toBe("queued");
+    expect(retry!.wakeupRequestId).toBeTruthy();
+
     const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
     // A worker crash is not the agent's fault. Releasing it to `idle` is the
     // same treatment the graceful SIGTERM drain gives an interrupted run
@@ -136,6 +141,26 @@ describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
     expect(agent!.status).toBe("idle");
     expect(agent!.errorReason ?? "").not.toContain("job_missing");
     expect(agent!.errorReason ?? "").not.toContain("Job is missing");
+  });
+
+  it("leaves in-flight external-lifecycle runs running for restart reattach", async () => {
+    const heartbeat = heartbeatService(db);
+    const { runId } = await seedRun({
+      adapterType: "claude_k8s",
+      externalRunId: "paperclip-run-abc123",
+    });
+    markLiveInThisWorker(runId);
+
+    const result = await heartbeat.markRunsInterruptedByWorkerCrash({
+      reason: "uncaughtException: TypeError: Cannot read properties of null (reading 'write')",
+    });
+
+    expect(result.markedRunIds).toEqual([]);
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run!.status).toBe("running");
+    expect(run!.errorCode).toBeNull();
+    expect(run!.finishedAt).toBeNull();
   });
 
   it("leaves runs this worker did not own untouched", async () => {

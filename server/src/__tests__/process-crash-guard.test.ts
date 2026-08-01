@@ -111,6 +111,26 @@ describe("installProcessCrashGuard (BLO-19722)", () => {
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(CRASH_GUARD_EXIT_CODE), { timeout: 2_000 });
   });
 
+  it("sets process exitCode immediately while crash bookkeeping is pending", () => {
+    const processRef = fakeProcess();
+    const exit = vi.fn();
+    const setExitCode = vi.fn();
+    const onCrash = vi.fn().mockReturnValue(new Promise<void>(() => {}));
+
+    installProcessCrashGuard({
+      logger: fakeLogger(),
+      onCrash,
+      exit,
+      setExitCode,
+      processRef,
+      timeoutMs: 10_000,
+    });
+    processRef.emit("uncaughtException", new Error("db gone"));
+
+    expect(setExitCode).toHaveBeenCalledWith(CRASH_GUARD_EXIT_CODE);
+    expect(exit).not.toHaveBeenCalled();
+  });
+
   it("exits even when crash bookkeeping throws", async () => {
     const processRef = fakeProcess();
     const exit = vi.fn();

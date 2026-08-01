@@ -312,9 +312,10 @@ workerProbes:
     timeoutSeconds: 10
     failureThreshold: 6
   # -- Worker readiness probe.
-  # Readiness only gates Service endpoints, and the worker serves no
-  # user-facing traffic, so a flap here is nearly free — keep it tighter than
-  # liveness so a genuinely stuck worker still de-registers promptly.
+  # Readiness gates the API-to-worker Service endpoint. Keep it tighter than
+  # liveness so API callers stop routing to a worker whose event loop is not
+  # answering promptly; during a long-but-recoverable stall the pod may stay
+  # alive while temporarily leaving the Service endpoints.
   readiness:
     httpGet:
       path: /healthz
