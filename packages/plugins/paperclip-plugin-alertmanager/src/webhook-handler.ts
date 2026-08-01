@@ -14,7 +14,7 @@ import {
   WEBHOOK_KEYS,
   alertStateRef,
 } from "./constants.js";
-import { readAlertState } from "./alert-state.js";
+import { readAlertState, writeAlertState } from "./alert-state.js";
 import {
   alertMatchesLabelFilter,
   buildIssueDescription,
@@ -144,7 +144,7 @@ export async function handleFiring(
     );
     return;
   }
-  const { ref: stateRef, record: stateRecord } = await readAlertState(
+  const stateHandle = await readAlertState(
     ctx,
     companyId,
     alert.fingerprint,
@@ -159,7 +159,8 @@ export async function handleFiring(
   //
   // This is the same `state ?? recover-from-issue` fallback the resolved path
   // has always used; only the firing path was missing it.
-  const existing = stateRecord ?? (await recoverStateFromIssue(ctx, config, alert));
+  const existing =
+    stateHandle.record ?? (await recoverStateFromIssue(ctx, config, alert));
   const nowIso = new Date().toISOString();
   const alertname = alert.labels.alertname ?? "UnnamedAlert";
   const severity = alert.labels.severity ?? "unknown";
@@ -218,7 +219,7 @@ export async function handleFiring(
         ? escalationDeadlineMs(alert, config)
         : (existing.escalationIntervalMs ?? escalationDeadlineMs(alert, config)),
     };
-    await ctx.state.set(stateRef, updated);
+    await writeAlertState(ctx, stateHandle, updated);
 
     await ctx.events.emit(
       "alertmanager.alert.firing",
@@ -326,7 +327,7 @@ export async function handleFiring(
     escalationComplete: false,
     escalationIntervalMs: escalationDeadlineMs(alert, config),
   };
-  await ctx.state.set(stateRef, record);
+  await writeAlertState(ctx, stateHandle, record);
 
   await ctx.events.emit("alertmanager.alert.firing", companyId, {
     fingerprint: alert.fingerprint,
@@ -390,12 +391,12 @@ export async function handleResolved(
     );
     return;
   }
-  const { ref: stateRef, record: stateRecord } = await readAlertState(
+  const resolveHandle = await readAlertState(
     ctx,
     companyId,
     alert.fingerprint,
   );
-  const existing = stateRecord ?? (await recoverStateFromIssue(ctx, config, alert));
+  const existing = resolveHandle.record ?? (await recoverStateFromIssue(ctx, config, alert));
   if (!existing) {
     ctx.logger.info(
       `Alertmanager: resolved for unknown fingerprint ${alert.fingerprint}, dropping`,
@@ -441,7 +442,7 @@ export async function handleResolved(
     nextEscalationAt: null,
     escalationComplete: true,
   };
-  await ctx.state.set(stateRef, updated);
+  await writeAlertState(ctx, resolveHandle, updated);
 
   await ctx.events.emit(
     "alertmanager.alert.resolved",

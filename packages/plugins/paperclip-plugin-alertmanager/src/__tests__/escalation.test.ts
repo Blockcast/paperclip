@@ -766,4 +766,101 @@ describe("BLO-20467 sweep reads legacy instance state through the migration path
       expect.objectContaining({ escalationAttempt: 3 }),
     );
   });
+
+  /**
+   * BLO-20467 round 5 — adoption must not be a write of its own.
+   *
+   * An earlier build copied the legacy row to the company key inside the READ.
+   * That made adoption a second, independent write of a verbatim pre-migration
+   * snapshot, which could land on top of a scoped row another caller had
+   * already advanced or resolved. `ctx.state` has no CAS to guard it with, so
+   * the write was removed rather than guarded: the row now moves scope as a
+   * side effect of the caller's own update.
+   *
+   * The general last-write-wins of two concurrent read-modify-writes is NOT
+   * fixed by this and is not claimed to be — it predates the tenancy work and
+   * applies to every escalation write. Tracked in BLO-20650.
+   */
+  describe("legacy adoption performs no write of its own", () => {
+    it("does not touch state at all when the sweep decides not to act", async () => {
+      // The sharpest case: a sweep that reads a not-yet-due legacy row and
+      // returns without acting. Under the old read-migrates build this STILL
+      // wrote the snapshot to the company key — so merely looking at an alert
+      // could clobber a resolution a webhook had just written. A caller that
+      // changes nothing must write nothing.
+      const notDue = { ...dueState("company-1"), nextEscalationAt: "2026-07-11T06:00:00Z" };
+      const { ctx, mocks, state } = mapBackedSweepContext([
+        ["instance/-/alert:fp-1", notDue],
+      ]);
+
+      await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+      expect(mocks.state.set).not.toHaveBeenCalled();
+      expect(mocks.state.delete).not.toHaveBeenCalled();
+      expect(state.has("company/company-1/alert:fp-1")).toBe(false);
+      // still there for whoever does act on it next
+      expect(state.get("instance/-/alert:fp-1")).toEqual(
+        expect.objectContaining({ escalationAttempt: 0 }),
+      );
+    });
+
+    it("migrates with exactly one write, carrying the advance rather than a snapshot", async () => {
+      // Pins the write COUNT, not just the end state: the old build wrote twice
+      // (verbatim snapshot, then the advance), and it is the first of those two
+      // that was the clobber. One write means there is no moment at which the
+      // company key holds a pre-migration copy.
+      const { ctx, mocks, state } = mapBackedSweepContext([
+        ["instance/-/alert:fp-1", dueState("company-1")],
+      ]);
+
+      await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+      const scopedWrites = mocks.state.set.mock.calls.filter(
+        ([ref]: [any, AlertStateRecord]) => ref.scopeKind === "company" && ref.stateKey === "alert:fp-1",
+      );
+      expect(scopedWrites).toHaveLength(1);
+      expect(scopedWrites[0][1]).toEqual(expect.objectContaining({ escalationAttempt: 1 }));
+      expect(state.has("instance/-/alert:fp-1")).toBe(false);
+    });
+
+    it("keeps a resolution written mid-migration by an interleaved webhook", async () => {
+      // The controlled interleaving from the review: sweep and webhook both see
+      // an empty company scope and read the same legacy snapshot; the webhook
+      // resolves; the sweep's write lands afterwards.
+      //
+      // The sweep here is the not-due case — the one where the two callers
+      // genuinely do not conflict, and where the old build lost the resolution
+      // anyway purely because of the adoption write.
+      const notDue = { ...dueState("company-1"), nextEscalationAt: "2026-07-11T06:00:00Z" };
+      const { ctx, state } = mapBackedSweepContext([
+        ["instance/-/alert:fp-1", notDue],
+      ]);
+
+      // Interleave: the webhook resolves the alert part-way through the sweep,
+      // between the sweep's read of the legacy row and anything it does after.
+      const resolvedByWebhook = {
+        ...notDue,
+        resolvedAt: "2026-07-11T00:30:00Z",
+        escalationComplete: true,
+        nextEscalationAt: null,
+      };
+      const originalGet = ctx.state.get as unknown as (ref: any) => Promise<unknown>;
+      let injected = false;
+      (ctx.state as any).get = vi.fn(async (ref: any) => {
+        const value = await originalGet(ref);
+        if (!injected && ref.scopeKind === "instance") {
+          injected = true;
+          state.set("company/company-1/alert:fp-1", resolvedByWebhook as AlertStateRecord);
+          state.delete("instance/-/alert:fp-1");
+        }
+        return value;
+      });
+
+      await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+      expect(state.get("company/company-1/alert:fp-1")).toEqual(
+        expect.objectContaining({ resolvedAt: "2026-07-11T00:30:00Z", escalationComplete: true }),
+      );
+    });
+  });
 });
