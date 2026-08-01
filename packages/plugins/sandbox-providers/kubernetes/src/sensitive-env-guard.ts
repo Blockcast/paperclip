@@ -25,20 +25,30 @@
 //      though the value was never a path.
 //
 // So the rule is inverted: a literal `value` is refused unless it is
-// affirmatively known to be safe — either an explicitly allowlisted non-secret
-// name, or a `*_FILE` pointer whose value really is a mounted-secret path.
+// affirmatively known to be safe — either an explicitly allowlisted
+// name=value pair, or a `*_FILE` pointer whose value really is a
+// mounted-secret path. Note the allowlist binds the *pair*: allowlisting a bare
+// name would leave the same hole one variable wide (`HOME=<credential>`).
 // Adding a new literal env var therefore requires a deliberate edit here, which
 // is exactly the review checkpoint a credential-disclosure defect warrants.
 
 /**
- * Env names permitted to carry a literal value, each of which must be
- * self-evidently non-secret. Keep this list short and justify every addition —
- * an entry here is an assertion that a read-only `GET Pod` may disclose it.
+ * Env vars permitted to carry a literal value, keyed by name and constrained to
+ * an exact set of permitted values. Keep this list short and justify every
+ * addition — an entry here is an assertion that a read-only `GET Pod` may
+ * disclose that exact string.
+ *
+ * The value set is not decoration. Allowlisting by *name* alone would reproduce
+ * the denylist flaw this guard exists to remove, just narrowed to one variable:
+ * `{ name: "HOME", value: "<credential>" }` would sail through while the header
+ * above claims every accepted literal is affirmatively known safe. Binding the
+ * name to its value keeps that claim true.
  */
-const SAFE_LITERAL_ENV_NAMES = new Set<string>([
+const SAFE_LITERAL_ENV_VALUES = new Map<string, ReadonlySet<string>>([
   // Filesystem home for the agent user. Not secret, and needed before any
-  // secret material is mounted.
-  "HOME",
+  // secret material is mounted. Both builders emit exactly this value
+  // (pod-spec-builder.ts, sandbox-cr-builder.ts).
+  ["HOME", new Set(["/home/paperclip"])],
 ]);
 
 /**
@@ -54,8 +64,19 @@ const PATH_POINTER_ENV_NAME = /_FILE$/;
  * Roots under which mounted secrets legitimately appear. A pointer outside
  * these is refused: not because a path elsewhere is necessarily a credential,
  * but because the entire value of this check is that it stays narrow.
+ *
+ * `/paperclip/.secrets/` rather than `/paperclip/`: the latter is the whole
+ * persistent data volume (`persistence.mountPath`), so it would admit every
+ * workspace path under `/paperclip/instances/…`. The mounted-secret convention
+ * is the `.secrets` subtree — see the `PAPERCLIP_GITHUB_TOKEN_FILE` default in
+ * deploy/helm/paperclip/templates/statefulset.yaml.
  */
-const SECRET_MOUNT_ROOTS = ["/paperclip/", "/var/run/secrets/", "/run/secrets/", "/etc/paperclip/"];
+const SECRET_MOUNT_ROOTS = [
+  "/paperclip/.secrets/",
+  "/var/run/secrets/",
+  "/run/secrets/",
+  "/etc/paperclip/",
+];
 
 /**
  * True when `value` is a credible mounted-secret path rather than an inlined
@@ -73,11 +94,13 @@ export function isMountedSecretPath(value: unknown): boolean {
 /**
  * True when `name`/`value` may appear as a literal `env[].value` in a pod spec.
  *
- * Note this takes the *pair*: a `*_FILE` name is safe only in combination with
- * a value that is genuinely a path.
+ * Always takes the *pair*, never the name alone: an allowlisted name is safe
+ * only with an allowlisted value, and a `*_FILE` name only with a value that is
+ * genuinely a path.
  */
 export function isSafeLiteralEnv(name: string, value: unknown): boolean {
-  if (SAFE_LITERAL_ENV_NAMES.has(name)) return true;
+  const permittedValues = SAFE_LITERAL_ENV_VALUES.get(name);
+  if (permittedValues) return typeof value === "string" && permittedValues.has(value);
   if (PATH_POINTER_ENV_NAME.test(name)) return isMountedSecretPath(value);
   return false;
 }
@@ -86,7 +109,7 @@ export interface LiteralSensitiveEnvVar {
   container: string;
   envName: string;
   /** Why it was refused — never includes the value itself. */
-  reason: "not-allowlisted" | "file-pointer-not-a-path";
+  reason: "not-allowlisted" | "value-not-allowlisted" | "file-pointer-not-a-path";
 }
 
 interface ContainerLike {
@@ -138,7 +161,11 @@ export function findLiteralSensitiveEnvVars(podSpec: unknown): LiteralSensitiveE
       findings.push({
         container: containerName,
         envName,
-        reason: PATH_POINTER_ENV_NAME.test(envName) ? "file-pointer-not-a-path" : "not-allowlisted",
+        reason: SAFE_LITERAL_ENV_VALUES.has(envName)
+          ? "value-not-allowlisted"
+          : PATH_POINTER_ENV_NAME.test(envName)
+            ? "file-pointer-not-a-path"
+            : "not-allowlisted",
       });
     }
   }
@@ -157,14 +184,16 @@ export function assertNoLiteralSensitiveEnv(podSpec: unknown, manifestDescriptio
   const findings = findLiteralSensitiveEnvVars(podSpec);
   if (findings.length === 0) return;
   const detail = findings.map((f) => `${f.container}.env[${f.envName}] (${f.reason})`).join(", ");
-  const allowlisted = [...SAFE_LITERAL_ENV_NAMES].join(", ");
+  const allowlisted = [...SAFE_LITERAL_ENV_VALUES]
+    .map(([name, values]) => [...values].map((v) => `${name}=${v}`).join(", "))
+    .join(", ");
   throw new Error(
     `${manifestDescription}: refusing to build a pod spec with a literal env value that is not known ` +
       `to be non-secret (${detail}). A read-only GET Pod would expose these. Route the value through ` +
       `envFrom.secretRef, valueFrom.secretKeyRef, or a mounted secret volume. If it is a pointer to a ` +
       `mounted secret, name it *_FILE and set it to an absolute path under one of ` +
-      `${SECRET_MOUNT_ROOTS.join(", ")}. If it is genuinely not secret, add the name to ` +
-      `SAFE_LITERAL_ENV_NAMES in sensitive-env-guard.ts (currently: ${allowlisted}) with a comment ` +
+      `${SECRET_MOUNT_ROOTS.join(", ")}. If it is genuinely not secret, add the exact name=value to ` +
+      `SAFE_LITERAL_ENV_VALUES in sensitive-env-guard.ts (currently: ${allowlisted}) with a comment ` +
       `saying why it is safe to disclose.`,
   );
 }

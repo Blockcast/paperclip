@@ -71,6 +71,26 @@ describe("createSandboxCr", () => {
     );
     expect(create).not.toHaveBeenCalled();
   });
+
+  // The allowlist is keyed on name *and* value. Allowlisting `HOME` by name
+  // alone would let a credential ride in under an approved name.
+  it("refuses an allowlisted env name carrying a non-allowlisted value", async () => {
+    const create = vi.fn().mockResolvedValue({ metadata: { uid: "test-uid" } });
+    const clients = { custom: { createNamespacedCustomObject: create } };
+    const leaking = {
+      apiVersion: "agents.x-k8s.io/v1alpha1",
+      kind: "Sandbox",
+      spec: {
+        podTemplate: {
+          spec: { containers: [{ name: "agent", env: [{ name: "HOME", value: "sk-ant-leak" }] }] },
+        },
+      },
+    };
+    await expect(createSandboxCr(clients as never, "ns", leaking)).rejects.toThrow(
+      /agent\.env\[HOME\] \(value-not-allowlisted\)/,
+    );
+    expect(create).not.toHaveBeenCalled();
+  });
 });
 
 describe("getSandboxCrStatus", () => {

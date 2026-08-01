@@ -49,6 +49,26 @@ describe("createJob", () => {
     await expect(createJob(clients as never, "ns", leaking)).rejects.toThrow(/init\.env\[MCP_CONFIG\]/);
     expect(create).not.toHaveBeenCalled();
   });
+
+  // The allowlist is keyed on name *and* value. Allowlisting `HOME` by name
+  // alone would let a credential ride in under an approved name.
+  it("refuses an allowlisted env name carrying a non-allowlisted value", async () => {
+    const create = vi.fn();
+    const clients = { batch: { createNamespacedJob: create } };
+    const leaking = {
+      apiVersion: "batch/v1",
+      kind: "Job",
+      spec: {
+        template: {
+          spec: { containers: [{ name: "agent", env: [{ name: "HOME", value: "sk-ant-leak" }] }] },
+        },
+      },
+    };
+    await expect(createJob(clients as never, "ns", leaking)).rejects.toThrow(
+      /agent\.env\[HOME\] \(value-not-allowlisted\)/,
+    );
+    expect(create).not.toHaveBeenCalled();
+  });
 });
 
 describe("getJobStatus", () => {

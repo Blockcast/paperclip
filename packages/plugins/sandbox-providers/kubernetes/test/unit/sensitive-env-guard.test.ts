@@ -29,6 +29,9 @@ describe("isMountedSecretPath", () => {
       "ghp_0123456789abcdef",
       "relative/path/token",
       "/tmp/token", // absolute, but outside the allowed roots
+      // `/paperclip` is the whole persistent data volume, so only the
+      // `.secrets` subtree counts as a mount root.
+      "/paperclip/instances/default/data/notes.md",
       "/paperclip/../etc/shadow", // traversal
       "/paperclip/.secrets/a b", // whitespace
       "",
@@ -43,6 +46,22 @@ describe("isMountedSecretPath", () => {
 describe("isSafeLiteralEnv", () => {
   it("permits explicitly allowlisted non-secret names", () => {
     expect(isSafeLiteralEnv("HOME", "/home/paperclip")).toBe(true);
+  });
+
+  // An allowlist keyed on the name alone would be the same unsound policy as
+  // the denylist it replaced, narrowed to one variable: the name says nothing
+  // about what the value carries.
+  it("permits an allowlisted name only with its exact allowlisted value", () => {
+    for (const value of [
+      "sk-ant-the-actual-token", // the bypass this pairing exists to close
+      "/home/someone-else",
+      "/home/paperclip ", // trailing space
+      "",
+      undefined,
+      42,
+    ]) {
+      expect(isSafeLiteralEnv("HOME", value), String(value)).toBe(false);
+    }
   });
 
   // This is the inversion. Under the previous denylist these all passed purely
@@ -163,7 +182,9 @@ describe("assertNoLiteralSensitiveEnv", () => {
     } catch (err) {
       message = (err as Error).message;
     }
-    expect(message).toContain("SAFE_LITERAL_ENV_NAMES");
+    expect(message).toContain("SAFE_LITERAL_ENV_VALUES");
+    // The escape hatch must name the pair, so nobody re-adds a bare name.
+    expect(message).toContain("HOME=/home/paperclip");
     expect(message).toContain("secretKeyRef");
   });
 
