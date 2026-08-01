@@ -226,4 +226,99 @@ describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
       heartbeat.markRunsInterruptedByWorkerCrash({ reason: "uncaughtException: boom" }),
     ).resolves.toEqual({ markedRunIds: [] });
   });
+
+  // The crash handler exits on a fixed budget, so the marking pass can be cut
+  // off partway. Claim-then-recover is interleaved per run precisely so that a
+  // run we never reach stays `running` and the orphan reaper still owns it —
+  // the reaper only scans `running`, so a bulk pre-flip would have left every
+  // unreached run terminal with no retry, no lock release and nothing able to
+  // find it. `reconcileWorkerCrashedRuns` closes the one remaining window:
+  // a run claimed just before the budget expired, whose cleanup never ran.
+  describe("reconcileWorkerCrashedRuns (crash cut short mid-cleanup)", () => {
+    /** A run the crash guard claimed but never got to recover. */
+    async function seedClaimedButUnrecovered(overrides: { finishedAt?: Date } = {}) {
+      const seeded = await seedRun({ adapterType: "codex_local", status: "interrupted" });
+      await db
+        .update(heartbeatRuns)
+        .set({
+          errorCode: "worker_crashed",
+          error: "Interrupted by worker process crash (uncaughtException: TypeError)",
+          finishedAt: overrides.finishedAt ?? new Date(),
+        })
+        .where(eq(heartbeatRuns.id, seeded.runId));
+      return seeded;
+    }
+
+    it("finishes recovery for a crash-marked run whose cleanup never ran", async () => {
+      const heartbeat = heartbeatService(db);
+      const { runId, agentId } = await seedClaimedButUnrecovered();
+
+      const result = await heartbeat.reconcileWorkerCrashedRuns();
+
+      expect(result.reconciledRunIds).toEqual([runId]);
+
+      // The load-bearing repair: without it this run is terminal, retry-less
+      // and invisible to the reaper — dropped work, not just mis-attributed.
+      const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+      expect(retry).toBeTruthy();
+      expect(retry!.status).toBe("queued");
+      expect(result.retryRunIds).toEqual([retry!.id]);
+
+      // Attribution is preserved, not rewritten to the reaper's symptom.
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(run!.status).toBe("interrupted");
+      expect(run!.errorCode).toBe("worker_crashed");
+      expect(run!.error).not.toContain("Job is missing");
+
+      const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+      expect(agent!.status).toBe("idle");
+    });
+
+    it("does not queue a second retry for a run whose cleanup did complete", async () => {
+      const heartbeat = heartbeatService(db);
+      const { runId } = await seedClaimedButUnrecovered();
+
+      // First pass stands in for the crash-time cleanup having succeeded.
+      await heartbeat.reconcileWorkerCrashedRuns();
+      const afterFirst = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+      expect(afterFirst).toHaveLength(1);
+
+      // Re-running must be inert. This is what makes the pass safe to run at
+      // every worker start without persisting a completion marker.
+      const second = await heartbeat.reconcileWorkerCrashedRuns();
+      expect(second.reconciledRunIds).toEqual([]);
+      const afterSecond = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+      expect(afterSecond.map((row) => row.id)).toEqual(afterFirst.map((row) => row.id));
+    });
+
+    it("ignores crash-marked runs older than the lookback window", async () => {
+      const heartbeat = heartbeatService(db);
+      const { runId } = await seedClaimedButUnrecovered({
+        finishedAt: new Date(Date.now() - 48 * 60 * 60 * 1000),
+      });
+
+      const result = await heartbeat.reconcileWorkerCrashedRuns();
+
+      expect(result.reconciledRunIds).toEqual([]);
+      const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+      expect(retries).toHaveLength(0);
+    });
+
+    it("ignores terminal runs that were not attributed to a worker crash", async () => {
+      const heartbeat = heartbeatService(db);
+      // Another writer's terminal run — e.g. the reaper's process_lost mint,
+      // which owns its own retry decision and must not be re-driven here.
+      const { runId } = await seedRun({ adapterType: "codex_local", status: "failed" });
+      await db
+        .update(heartbeatRuns)
+        .set({ errorCode: "process_lost", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, runId));
+
+      const result = await heartbeat.reconcileWorkerCrashedRuns();
+
+      expect(result.reconciledRunIds).toEqual([]);
+      const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+      expect(retries).toHaveLength(0);
+    });
+  });
 });

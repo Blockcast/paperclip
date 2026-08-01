@@ -1006,6 +1006,15 @@ const EXTERNAL_LIFECYCLE_ADAPTERS = new Set([
 // threshold. Issue/worktree ownership stays more conservative: a running row
 // holds its issue until it reaches a terminal/missing lifecycle state.
 const EXTERNAL_LIFECYCLE_STALE_MS = RUN_STALE_SILENCE_MS;
+// BLO-19722: how far back `reconcileWorkerCrashedRuns` looks for runs whose
+// worker-crash recovery never finished. A crash-marked run is only interesting
+// until something recovers it, and the pass runs at every worker start, so a
+// day is generous — it spans a weekend of restarts without letting the scan
+// grow unbounded over the table's history.
+const WORKER_CRASH_RECONCILE_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+// Bounded so a pathological backlog cannot stall startup recovery ahead of the
+// reattach and reaper passes; the next start picks up whatever is left.
+const WORKER_CRASH_RECONCILE_MAX_RUNS = 200;
 // External-lifecycle adapters create a DB run before the adapter.invoke event
 // is appended. Startup and periodic reapers can overlap that setup window;
 // give slow pre-run hooks and kube Job creation time to reach adapter.invoke.
@@ -12009,19 +12018,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * A SIGTERM drain gets seconds and a healthy process; this runs from inside
    * `process.on("uncaughtException")` with the process already dying, so it is
    * deliberately the smallest thing that fixes the attribution problem:
-   *
-   *   1. one guarded bulk UPDATE flipping this worker's still-`running`,
-   *      non-external-lifecycle runs to `interrupted` with
-   *      `errorCode: "worker_crashed"`, and
-   *   2. the same bounded retry / lock-release cleanup the graceful drain uses.
+   * per run, one guarded claim flipping this worker's still-`running`,
+   * non-external-lifecycle run to `interrupted` with
+   * `errorCode: "worker_crashed"`, followed immediately by the same bounded
+   * retry / lock-release cleanup the graceful drain uses.
    *
    * The per-run cleanup costs several queries rather than one bulk statement,
    * which is the deliberate trade: retry enqueue, issue-lock release, and
    * `finalizeAgentStatus` all carry nuance we must not duplicate in ad-hoc SQL.
-   * The caller races this whole function against a timeout and exits
-   * regardless, and anything we fail to mark is still caught by the
-   * pre-existing reaper — so a partial pass is strictly better than today's
-   * zero-pass, and a slow-but-correct pass beats a fast wrong one.
+   *
+   * Claim-then-recover is deliberately interleaved per run rather than run as
+   * one bulk UPDATE followed by a serial cleanup loop. The caller races this
+   * whole function against a fixed budget and exits regardless, so a bulk
+   * pre-flip would leave every run the loop never reached `interrupted` with no
+   * retry, no lock release and no agent finalization — and terminal rows are
+   * invisible to the reaper, which only scans `running`. That is a *worse*
+   * outcome than today's zero-pass: unrecoverable rather than merely
+   * mis-attributed. Interleaving keeps the invariant that a run is only
+   * terminalized once it has been recovered, so a run we never reach stays
+   * `running` and the pre-existing reaper genuinely remains its backstop.
+   *
+   * The residual window is one run wide: claimed, budget expires mid-cleanup.
+   * {@link reconcileWorkerCrashedRuns} closes it durably at next startup by
+   * re-running the (idempotent) cleanup for recent `worker_crashed` runs.
    *
    * Without this, every run the crash orphaned stayed `running` until a reaper
    * noticed minutes later and reconciled it as `job_missing` — "External
@@ -12045,101 +12064,193 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const message = `Interrupted by worker process crash (${input.reason})`;
 
-    // Gated on status='running' so we never overwrite a run that already
-    // reached a terminal state on its way out, and on external_run_id IS NULL
-    // so live Kubernetes Jobs remain visible to the restart reattach path.
-    const marked = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "interrupted",
-        finishedAt: now,
-        error: message,
-        errorCode: "worker_crashed",
-        updatedAt: now,
-      })
-      .where(and(
-        inArray(heartbeatRuns.id, runIds),
-        eq(heartbeatRuns.status, "running"),
-        isNull(heartbeatRuns.externalRunId),
-      ))
-      .returning();
-
+    const markedRunIds: string[] = [];
     const retryRunIds: string[] = [];
 
-    for (const run of marked) {
-      // Best-effort per agent: one agent failing to finalize must not strand
-      // the rest, and we are on a clock.
-      let retry: typeof heartbeatRuns.$inferSelect | null = null;
-      try {
-        await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+    for (const runId of runIds) {
+      // Claim one run at a time. Gated on status='running' so we never overwrite
+      // a run that already reached a terminal state on its way out, and on
+      // external_run_id IS NULL so live Kubernetes Jobs remain visible to the
+      // restart reattach path.
+      const claimed = await db
+        .update(heartbeatRuns)
+        .set({
+          status: "interrupted",
           finishedAt: now,
-          error: null,
-        });
-      } catch (error) {
-        logger.warn({ err: error, runId: run.id }, "failed to cancel wakeup for crash-interrupted run");
-      }
-      await releaseEnvironmentLeasesForRun({
-        runId: run.id,
-        companyId: run.companyId,
-        agentId: run.agentId,
-        status: run.status,
-        failureReason: run.error ?? undefined,
-      });
-
-      let agent: typeof agents.$inferSelect | null = null;
-      try {
-        agent = await getAgent(run.agentId);
-      } catch (error) {
-        logger.warn({ err: error, agentId: run.agentId, runId: run.id }, "failed to load crash-interrupted run agent");
-      }
-      try {
-        if (agent) retry = await enqueueProcessLossRetry(run, agent, now);
-      } catch (error) {
-        logger.warn({ err: error, runId: run.id }, "failed to enqueue crash-interrupted run retry");
-      }
-      if (retry) {
-        retryRunIds.push(retry.id);
-      } else {
-        try {
-          await releaseIssueExecutionAndPromote(run);
-        } catch (error) {
-          logger.warn({ err: error, runId: run.id }, "failed to release crash-interrupted issue execution lock");
-        }
-      }
-
-      try {
-        await appendRunEvent(run, await nextRunEventSeq(run.id), {
-          eventType: "lifecycle",
-          stream: "system",
-          level: "warn",
-          message,
-          payload: {
-            reason: input.reason,
-            ...(retry ? { retryRunId: retry.id } : {}),
-          },
-        });
-      } catch (error) {
-        logger.warn({ err: error, runId: run.id }, "failed to append crash-interrupted run event");
-      }
-
-      try {
-        await finalizeAgentStatus(run.agentId, "interrupted", message, {
+          error: message,
           errorCode: "worker_crashed",
-          runId: run.id,
-        });
-      } catch {
-        /* keep going; the reaper remains the backstop */
-      }
+          updatedAt: now,
+        })
+        .where(and(
+          eq(heartbeatRuns.id, runId),
+          eq(heartbeatRuns.status, "running"),
+          isNull(heartbeatRuns.externalRunId),
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!claimed) continue;
+
+      markedRunIds.push(claimed.id);
+      const { retryRunId } = await recoverCrashInterruptedRun(claimed, {
+        reason: input.reason,
+        message,
+        now,
+      });
+      if (retryRunId) retryRunIds.push(retryRunId);
     }
 
-    if (marked.length > 0) {
+    if (markedRunIds.length > 0) {
       logger.warn(
-        { markedRunIds: marked.map((run) => run.id), retryRunIds },
+        { markedRunIds, retryRunIds },
         "marked local heartbeat runs interrupted by worker crash",
       );
     }
 
-    return { markedRunIds: marked.map((run) => run.id) };
+    return { markedRunIds };
+  }
+
+  /**
+   * The retry / lock-release / finalize half of worker-crash recovery for a
+   * single already-claimed run (BLO-19722).
+   *
+   * Every step is idempotent, which is what lets
+   * {@link reconcileWorkerCrashedRuns} safely re-run it after a crash that
+   * died mid-cleanup: `enqueueProcessLossRetry` dedupes on `retryOfRunId`,
+   * `releaseIssueExecutionAndPromote` only clears locks still pointing at this
+   * run, and `finalizeAgentStatus` is a set-by-id. Each step is also
+   * individually guarded — one agent failing to finalize must not strand the
+   * rest, and the crash caller is on a clock.
+   */
+  async function recoverCrashInterruptedRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    context: { reason: string; message: string; now: Date },
+  ): Promise<{ retryRunId: string | null }> {
+    const { reason, message, now } = context;
+    let retry: typeof heartbeatRuns.$inferSelect | null = null;
+
+    try {
+      await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+        finishedAt: now,
+        error: null,
+      });
+    } catch (error) {
+      logger.warn({ err: error, runId: run.id }, "failed to cancel wakeup for crash-interrupted run");
+    }
+    await releaseEnvironmentLeasesForRun({
+      runId: run.id,
+      companyId: run.companyId,
+      agentId: run.agentId,
+      status: run.status,
+      failureReason: run.error ?? undefined,
+    });
+
+    let agent: typeof agents.$inferSelect | null = null;
+    try {
+      agent = await getAgent(run.agentId);
+    } catch (error) {
+      logger.warn({ err: error, agentId: run.agentId, runId: run.id }, "failed to load crash-interrupted run agent");
+    }
+    try {
+      if (agent) retry = await enqueueProcessLossRetry(run, agent, now);
+    } catch (error) {
+      logger.warn({ err: error, runId: run.id }, "failed to enqueue crash-interrupted run retry");
+    }
+    if (!retry) {
+      try {
+        await releaseIssueExecutionAndPromote(run);
+      } catch (error) {
+        logger.warn({ err: error, runId: run.id }, "failed to release crash-interrupted issue execution lock");
+      }
+    }
+
+    try {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message,
+        payload: {
+          reason,
+          ...(retry ? { retryRunId: retry.id } : {}),
+        },
+      });
+    } catch (error) {
+      logger.warn({ err: error, runId: run.id }, "failed to append crash-interrupted run event");
+    }
+
+    try {
+      await finalizeAgentStatus(run.agentId, "interrupted", message, {
+        errorCode: "worker_crashed",
+        runId: run.id,
+      });
+    } catch {
+      /* keep going; reconcileWorkerCrashedRuns remains the backstop */
+    }
+
+    return { retryRunId: retry?.id ?? null };
+  }
+
+  /**
+   * Startup reconciliation for runs that {@link markRunsInterruptedByWorkerCrash}
+   * claimed but could not finish recovering before the crash budget expired
+   * (BLO-19722).
+   *
+   * Such a run is `interrupted` / `worker_crashed` with no retry queued and
+   * possibly still holding its issue execution lock. Being terminal, it is
+   * invisible to the orphan reaper, so without this pass it would never be
+   * recovered by anything.
+   *
+   * We do not try to distinguish "cleanup finished" from "cleanup interrupted":
+   * {@link recoverCrashInterruptedRun} is idempotent, so re-running it for
+   * every recent crash-marked run is both cheaper and less error-prone than
+   * persisting a completion marker. The `retryOfRunId` pre-filter keeps the
+   * common case (recovery completed normally) to a single indexed query that
+   * returns nothing.
+   */
+  async function reconcileWorkerCrashedRuns(options: { lookbackMs?: number; now?: Date } = {}): Promise<{
+    reconciledRunIds: string[];
+    retryRunIds: string[];
+  }> {
+    const now = options.now ?? new Date();
+    const lookbackMs = options.lookbackMs ?? WORKER_CRASH_RECONCILE_LOOKBACK_MS;
+    const since = new Date(now.getTime() - lookbackMs);
+
+    const candidates = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.status, "interrupted"),
+        eq(heartbeatRuns.errorCode, "worker_crashed"),
+        gte(heartbeatRuns.finishedAt, since),
+        // No retry child => cleanup never reached the retry step for this run.
+        sql`not exists (
+          select 1 from heartbeat_runs retry
+          where retry.retry_of_run_id = ${heartbeatRuns.id}
+        )`,
+      ))
+      .limit(WORKER_CRASH_RECONCILE_MAX_RUNS);
+
+    const reconciledRunIds: string[] = [];
+    const retryRunIds: string[] = [];
+
+    for (const run of candidates) {
+      reconciledRunIds.push(run.id);
+      const { retryRunId } = await recoverCrashInterruptedRun(run, {
+        reason: "worker crash recovery incomplete at previous exit",
+        message: run.error ?? "Interrupted by worker process crash",
+        now,
+      });
+      if (retryRunId) retryRunIds.push(retryRunId);
+    }
+
+    if (reconciledRunIds.length > 0) {
+      logger.warn(
+        { reconciledRunIds, retryRunIds },
+        "completed interrupted worker-crash recovery for runs left unrecovered by a previous crash",
+      );
+    }
+
+    return { reconciledRunIds, retryRunIds };
   }
 
   async function drainRunningRunsForShutdown(signal: "SIGINT" | "SIGTERM", now = new Date()) {
@@ -16823,7 +16934,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // once the mint is committed (so a failed/aborted setRunStatus never
       // over-counts). Split by adapter + error-string bucket + the durable
       // classification, all bounded.
-      let finalizedRun = await setRunStatus(run.id, "failed", {
+      //
+      // BLO-19722: status-guarded rather than set-by-id. This branch selected
+      // `run` while it was `running` and then awaited several liveness probes,
+      // so the row may have been claimed by someone else in the meantime — most
+      // notably `markRunsInterruptedByWorkerCrash`, which flips it to
+      // `interrupted` / `worker_crashed`. An unconditional write would replace
+      // that attribution with `process_lost`, defeating the whole point of the
+      // crash guard, and would then queue a second retry alongside the one the
+      // crash path already enqueued. Losing the claim means another writer owns
+      // this run's terminal state and its cleanup: skip the mint and every
+      // process-loss side effect below.
+      const processLostClaim = await setRunStatusIfRunning(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
         finishedAt: now,
@@ -16846,12 +16968,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : result;
         })(),
       });
+      // BLO-19722: the claim check comes before the wakeup write. Losing the
+      // claim means another writer (the crash guard) already terminalized this
+      // run and owns its wakeup + retry + lock cleanup; marking the wakeup
+      // `failed` here would stomp the `cancelled` it just wrote. There is
+      // deliberately no `getRun` re-read fallback on this path: under
+      // `setRunStatusIfRunning` a null means "the row was not `running`", not
+      // "the write was lost", so re-reading would resurrect exactly the
+      // stale-snapshot overwrite this guard exists to prevent.
+      if (!processLostClaim.updated || !processLostClaim.run) {
+        logger.info(
+          {
+            runId: run.id,
+            agentId: run.agentId,
+            observedStatus: processLostClaim.run?.status ?? null,
+            observedErrorCode: processLostClaim.run?.errorCode ?? null,
+          },
+          "reapOrphanedRuns: skipping process_lost mint; run was no longer `running` when the write landed (BLO-19722)",
+        );
+        continue;
+      }
+      let finalizedRun = processLostClaim.run;
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
       });
-      if (!finalizedRun) finalizedRun = await getRun(run.id);
-      if (!finalizedRun) continue;
       // BLO-16184: the process_lost mint is now committed for this run -- count it
       // (bounded adapter + error-string bucket + durable classification).
       recordProcessLost({
@@ -25028,6 +25169,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     resolveSchedulingSuppression: getSchedulingSuppression,
     drainRunningRunsForShutdown,
     markRunsInterruptedByWorkerCrash,
+    reconcileWorkerCrashedRuns,
 
     promoteDueScheduledRetries,
     retryScheduledRetryNow,

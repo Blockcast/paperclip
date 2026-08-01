@@ -1154,6 +1154,29 @@ export async function startServer(): Promise<StartedServer> {
     } else {
       heartbeatStartupRecoveryPending = true;
       const startupHeartbeatRecovery = (async () => {
+        // BLO-19722: run this before the reattach/reap passes. A run the crash
+        // guard claimed but could not finish recovering is already terminal, so
+        // it is invisible to the orphan reaper and nothing else will ever pick
+        // it up. Completing its retry / lock release first also means the reaper
+        // below sees the issue lock already free.
+        try {
+          const crashRecovered = await heartbeat.reconcileWorkerCrashedRuns();
+          if (crashRecovered.reconciledRunIds.length > 0) {
+            logger.warn(
+              {
+                reconciledRunIds: crashRecovered.reconciledRunIds,
+                retryRunIds: crashRecovered.retryRunIds,
+              },
+              "completed worker-crash recovery left unfinished by a previous crash",
+            );
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup worker-crash run reconciliation failed - crash-orphaned runs may hold issue locks until the next restart",
+          );
+        }
+
         try {
           const reattachedExternalRuns = await heartbeat.resumeRunningExternalRuntimeRuns();
           if (reattachedExternalRuns > 0) {
