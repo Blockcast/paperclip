@@ -1397,6 +1397,58 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       });
     });
 
+    it("does not accept same-run checkout ownership behind a divergent live execution owner", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const liveExecutionRunId = randomUUID();
+      const issueId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: liveExecutionRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "assignment",
+        startedAt: new Date(),
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Same checkout owner behind live execution owner",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: currentRunId,
+        executionRunId: liveExecutionRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const app = createApp(agentActor(companyId, agentId, currentRunId));
+      const checkoutResponse = await request(app)
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId, expectedStatuses: ["in_progress"] });
+      expect(checkoutResponse.status, JSON.stringify(checkoutResponse.body)).toBe(409);
+
+      const patchResponse = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Must not land" });
+      expect(patchResponse.status, JSON.stringify(patchResponse.body)).toBe(409);
+
+      const row = await db
+        .select({
+          title: issues.title,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        title: "Same checkout owner behind live execution owner",
+        checkoutRunId: currentRunId,
+        executionRunId: liveExecutionRunId,
+      });
+    });
+
     it("reaps divergent never-started owners when checking out a todo issue", async () => {
       const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
       const queuedCheckoutRunId = await seedNeverStartedOwnerRun({
