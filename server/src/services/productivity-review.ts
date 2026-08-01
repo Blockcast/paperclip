@@ -89,6 +89,14 @@ type ProductivityReviewEvidence = {
   commentCountLastHour: number;
   commentCountLastSixHours: number;
   elapsedMs: number | null;
+  monitorGating: {
+    gatedMs: number;
+    unattendedMs: number;
+    lapsedAt: Date | null;
+    priorLapseAt: Date | null;
+    armedUntil: Date | null;
+    gatedIsUpperBound: boolean;
+  } | null;
   latestRuns: HeartbeatRunRow[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
@@ -204,6 +212,96 @@ function deliberateFutureMonitor(issue: IssueRow, now: Date) {
   if (!monitorNextCheckAt || monitorNextCheckAt.getTime() <= now.getTime()) return null;
   if (!monitorScheduledBy || !MONITOR_SCHEDULED_SUPPRESSION_ACTORS.has(monitorScheduledBy)) return null;
   return { monitorNextCheckAt, monitorScheduledBy };
+}
+
+/**
+ * Splits an active episode into the portion an armed monitor was accounting for
+ * and the portion nobody was watching, so a manager adjudicating a
+ * `long_active_duration` review can tell a deliberate monitor-gated wait from an
+ * unattended stall without cross-checking the source issue.
+ *
+ * Derived from the server-owned monitor columns rather than a full monitor
+ * history, so `gatedMs` is an upper bound: re-arm gaps inside the covered span
+ * are counted as gated. Where that bound is the whole episode — a monitor still
+ * armed, whose arm time no column records — the result sets
+ * `gatedIsUpperBound` so the manager-facing line carries the qualifier too.
+ * This is reporting only — it does not gate whether the review fires.
+ */
+function monitorGatingBreakdown(issue: IssueRow, activeStartedAt: Date | null, elapsedMs: number | null, now: Date) {
+  if (elapsedMs === null || !activeStartedAt) return null;
+  const armedUntil = coerceDate(issue.monitorNextCheckAt);
+  const lastTriggeredAt = coerceDate(issue.monitorLastTriggeredAt);
+
+  // Still armed for a future check. There is no arm-time column, so a monitor
+  // armed seconds ago is indistinguishable from one armed at `activeStartedAt`
+  // and the whole episode is attributed to gating — flagged as an upper bound,
+  // because reporting it flat would tell a manager that a 15h stall was fully
+  // accounted for when only the last 90s provably was.
+  if (armedUntil && armedUntil.getTime() > now.getTime()) {
+    return {
+      gatedMs: elapsedMs,
+      unattendedMs: 0,
+      lapsedAt: null,
+      priorLapseAt: null,
+      armedUntil,
+      gatedIsUpperBound: true,
+    };
+  }
+
+  // A monitor ran at some point and has since lapsed. Coverage ended at the
+  // later of its last trigger and its last scheduled check.
+  const lapseCandidates = [lastTriggeredAt, armedUntil].filter((d): d is Date => Boolean(d));
+  if (lapseCandidates.length === 0) {
+    return {
+      gatedMs: 0,
+      unattendedMs: elapsedMs,
+      lapsedAt: null,
+      priorLapseAt: null,
+      armedUntil: null,
+      gatedIsUpperBound: false,
+    };
+  }
+  const lapsedAt = new Date(Math.max(...lapseCandidates.map((d) => d.getTime())));
+
+  // Coverage that ended before this episode began belongs to a prior episode:
+  // none of this episode was gated, and calling it an in-episode lapse would
+  // print a timestamp from before `activeStartedAt`.
+  if (lapsedAt.getTime() <= activeStartedAt.getTime()) {
+    return {
+      gatedMs: 0,
+      unattendedMs: elapsedMs,
+      lapsedAt: null,
+      priorLapseAt: lapsedAt,
+      armedUntil: null,
+      gatedIsUpperBound: false,
+    };
+  }
+
+  const gatedMs = Math.min(elapsedMs, lapsedAt.getTime() - activeStartedAt.getTime());
+  return {
+    gatedMs,
+    unattendedMs: Math.max(0, elapsedMs - gatedMs),
+    lapsedAt,
+    priorLapseAt: null,
+    armedUntil: null,
+    gatedIsUpperBound: false,
+  };
+}
+
+function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["monitorGating"]>) {
+  // An upper-bound gated figure implies a lower-bound unattended figure; both
+  // carry a qualifier so neither half of the split reads as measured.
+  const gated = `${gating.gatedIsUpperBound ? "≤" : ""}${msToHuman(gating.gatedMs)} monitor-gated`;
+  const unattended = `${gating.gatedIsUpperBound ? "≥" : ""}${msToHuman(gating.unattendedMs)} unattended`;
+  const split = `${gated}, ${unattended}`;
+  if (gating.armedUntil) {
+    return `${split} (monitor armed until ${gating.armedUntil.toISOString()}; arm time is not recorded, so monitor-gated time is an upper bound)`;
+  }
+  if (gating.lapsedAt) return `${split} (monitor lapsed at ${gating.lapsedAt.toISOString()}, never re-armed)`;
+  if (gating.priorLapseAt) {
+    return `${split} (no monitor armed during this episode; previous monitor lapsed at ${gating.priorLapseAt.toISOString()}, before it began)`;
+  }
+  return `${split} (no monitor armed during this episode)`;
 }
 
 function isMonitorScheduledSuppression(
@@ -888,6 +986,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       commentCountLastHour: assigneeRunCommentCountLastHour,
       commentCountLastSixHours: assigneeRunCommentCountLastSixHours,
       elapsedMs,
+      monitorGating: monitorGatingBreakdown(sourceIssue, activeStartedAt, elapsedMs, now),
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -996,6 +1095,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
+      ...(evidence.monitorGating
+        ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
+        : []),
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
@@ -1044,6 +1146,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Reasons: ${evidence.triggerReasons.join("; ")}`,
       `- No-comment streak: ${evidence.noCommentStreak}`,
       `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
+      ...(evidence.monitorGating
+        ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
+        : []),
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
     ].join("\n");
   }

@@ -1881,12 +1881,6 @@ async function withIssueLabels(dbOrTx: any, rows: IssueRow[]): Promise<IssueWith
 }
 
 /**
- * Evidence-gate fetcher (BLO-4824 / BLO-4461). Loads the data the pure
- * evaluator needs: issue labels, the 10 most-recent comments, any recent
- * operator overrides, and any work_products. Caller supplies the description
- * (already on the existing row in the PATCH handler, no need to re-select).
- */
-/**
  * Shapes that record a DURABLE fact ("a PR/commit was attached to this issue"),
  * as opposed to a fact about the current comment window.
  */
@@ -1924,12 +1918,24 @@ function preserveDurableLandingEvidence<T extends { allDetected?: unknown }>(
   return { ...fresh, allDetected: [...freshDetected, ...carried] };
 }
 
+/**
+ * Evidence-gate fetcher (BLO-4824 / BLO-4461). Loads the data the pure
+ * evaluator needs: issue labels, the 10 most-recent comments, any recent
+ * operator overrides, and any work_products. Caller supplies the description
+ * (already on the existing row in the PATCH handler, no need to re-select).
+ *
+ * `effectiveLabelNames` overrides the labels read from the DB. A PATCH may
+ * carry `labelIds` alongside the status change, and `syncIssueLabels` only runs
+ * later inside the update transaction — so the stored rows are the PRE-patch
+ * labels and evaluating against them applies the wrong policy. (BLO-19047)
+ */
 async function fetchEvidenceForIssue(
   dbOrTx: any,
   issueId: string,
   description: string | null,
   previousDescription: string | null = description,
   now: Date = new Date(),
+  effectiveLabelNames: Array<{ name: string }> | null = null,
 ): Promise<EvidenceFetchResult> {
   const [recentComments, operatorOverrideComments, workProductRows, labelsByIssueId, descriptionHistory] = await Promise.all([
     dbOrTx
@@ -1991,7 +1997,7 @@ async function fetchEvidenceForIssue(
     description,
     doneWhenBulletsRemoved:
       countDoneWhenBullets(description ?? "") === 0 && hadPriorDoneWhenBullets,
-    labels: issueLabels.map((l: { name: string }) => ({ name: l.name })),
+    labels: effectiveLabelNames ?? issueLabels.map((l: { name: string }) => ({ name: l.name })),
     comments: recentComments as EvidenceFetchResult["comments"],
     operatorOverrideComments: operatorOverrideComments as EvidenceFetchResult["operatorOverrideComments"],
     workProducts: workProductRows as EvidenceFetchResult["workProducts"],
@@ -4874,6 +4880,33 @@ export function issueService(db: Db) {
         companyId,
       })),
     );
+  }
+
+  /**
+   * Label NAMES for an explicit `labelIds` patch, validated against the company.
+   *
+   * The evidence gate keys its policy off label names, and it runs before the
+   * update transaction that calls `syncIssueLabels`. Reading names from the DB
+   * at gate time therefore yields the labels the issue is moving AWAY from.
+   * Validation is duplicated from `assertValidLabelIds` deliberately: it has to
+   * happen before the gate so an invalid-label patch reports the label error
+   * rather than a misleading `missing-evidence`. (BLO-19047)
+   */
+  async function resolveLabelNames(
+    dbOrTx: any,
+    companyId: string,
+    labelIds: string[],
+  ): Promise<Array<{ name: string }>> {
+    const deduped = [...new Set(labelIds)];
+    if (deduped.length === 0) return [];
+    const rows = await dbOrTx
+      .select({ name: labels.name })
+      .from(labels)
+      .where(and(eq(labels.companyId, companyId), inArray(labels.id, deduped)));
+    if (rows.length !== deduped.length) {
+      throw unprocessable("One or more labels are invalid for this company");
+    }
+    return rows.map((row: { name: string }) => ({ name: row.name }));
   }
 
   async function getIssueRelationSummaryMap(
@@ -8072,6 +8105,31 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        /**
+         * BLO-18797: optimistic-concurrency guard. When set, the row must still
+         * carry this status at write time or the update is rejected with 409.
+         * Callers that authorized a mutation *because of* the row's current
+         * status must pass it — the authorization check reads a snapshot loaded
+         * by the route, and READ COMMITTED lets a concurrent writer (an
+         * assignee checkout, say) land between that read and this write. The
+         * status equality is repeated in the UPDATE's WHERE clause, not just
+         * asserted against `existing`, because only the WHERE is re-evaluated
+         * against the latest row version when the statement blocks on a
+         * concurrent transaction.
+         */
+        expectedCurrentStatus?: string;
+        /**
+         * BLO-18797: the same optimistic-concurrency guard for the assignee.
+         * `allow_manager_chain` is granted *because* the row's assignee is a
+         * report of the actor, so the assignee is an authorization-relevant
+         * snapshot field exactly like the status: a reassignment that lands
+         * between the route's read and this write would leave the actor
+         * clearing an unrelated agent's blockers under a grant that no longer
+         * holds. Pinned in the UPDATE's WHERE clause for the same reason as
+         * the status — only the WHERE is re-evaluated against the latest row
+         * version when the statement blocks on a concurrent transaction.
+         */
+        expectedCurrentAssigneeAgentId?: string | null;
       },
       dbOrTx: any = db,
     ) => {
@@ -8087,8 +8145,28 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        expectedCurrentStatus,
+        expectedCurrentAssigneeAgentId,
         ...issueData
       } = data;
+
+      if (expectedCurrentStatus !== undefined && existing.status !== expectedCurrentStatus) {
+        throw conflict("Issue status changed before the update could be applied", {
+          issueId: id,
+          expectedStatus: expectedCurrentStatus,
+          currentStatus: existing.status,
+        });
+      }
+      if (
+        expectedCurrentAssigneeAgentId !== undefined &&
+        existing.assigneeAgentId !== expectedCurrentAssigneeAgentId
+      ) {
+        throw conflict("Issue assignee changed before the update could be applied", {
+          issueId: id,
+          expectedAssigneeAgentId: expectedCurrentAssigneeAgentId,
+          currentAssigneeAgentId: existing.assigneeAgentId,
+        });
+      }
       const experimental = await instanceSettings.getExperimental();
       const isolatedWorkspacesEnabled = experimental.enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
@@ -8100,6 +8178,19 @@ export function issueService(db: Db) {
       if (issueData.status) {
         assertTransition(existing.status, issueData.status);
       }
+
+      // Labels the issue will HAVE once this patch lands. Both gates below run
+      // before `runUpdate`'s transaction, and `syncIssueLabels` runs inside it,
+      // so a combined `{ status: "in_review", labelIds: [frontend] }` on an
+      // unlabeled issue would otherwise be judged under the unlabeled fallback
+      // and only then acquire the stricter frontend policy — recording a
+      // pass/warn against a policy the issue no longer has, and letting a
+      // single call sidestep the requirements its new labels demand.
+      // (BLO-19047 review)
+      const effectiveLabelNames =
+        nextLabelIds === undefined
+          ? null
+          : await resolveLabelNames(dbOrTx, existing.companyId, nextLabelIds);
 
       // Done-execution gate (narrated-completion hardening, instance flag
       // `enableDoneExecutionGate`, default off). Blocks an agent self-marking
@@ -8125,6 +8216,7 @@ export function issueService(db: Db) {
               issueData.description !== undefined ? issueData.description : existing.description,
               existing.description,
               now,
+              effectiveLabelNames,
             ),
             id,
           );
@@ -8267,8 +8359,11 @@ export function issueService(db: Db) {
       // already-in_review issue refreshes the recorded verdict but never
       // rejects the patch, so unrelated edits (labels, description, assignee)
       // to an in_review issue cannot start failing with a 422.
-      if (issueData.status === "in_review") {
-        const isInReviewTransition = existing.status !== "in_review";
+      const shouldRunInReviewEvidenceGate =
+        issueData.status === "in_review" ||
+        (nextLabelIds !== undefined && existing.status === "in_review");
+      if (shouldRunInReviewEvidenceGate) {
+        const isInReviewTransition = issueData.status === "in_review" && existing.status !== "in_review";
         let inReviewVerdict: Awaited<ReturnType<typeof runEvidenceGate>> | null = null;
         try {
           const verdict = await runEvidenceGate(
@@ -8278,6 +8373,7 @@ export function issueService(db: Db) {
               issueData.description !== undefined ? issueData.description : existing.description,
               existing.description,
               now,
+              effectiveLabelNames,
             ),
             id,
           );
@@ -8364,13 +8460,42 @@ export function issueService(db: Db) {
           projectGoalId: nextProjectGoalId,
           defaultGoalId: defaultCompanyGoal?.id ?? null,
         });
+        const writePreconditions = [
+          ...(expectedCurrentStatus === undefined ? [] : [eq(issues.status, expectedCurrentStatus)]),
+          ...(expectedCurrentAssigneeAgentId === undefined
+            ? []
+            : [
+                expectedCurrentAssigneeAgentId === null
+                  ? isNull(issues.assigneeAgentId)
+                  : eq(issues.assigneeAgentId, expectedCurrentAssigneeAgentId),
+              ]),
+        ];
         const updated = await tx
           .update(issues)
           .set(patch)
-          .where(eq(issues.id, id))
+          .where(
+            writePreconditions.length === 0
+              ? eq(issues.id, id)
+              : and(eq(issues.id, id), ...writePreconditions),
+          )
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
-        if (!updated) return null;
+        if (!updated) {
+          // With a precondition set, zero matched rows means a concurrent writer
+          // changed an authorization-relevant field after the snapshot check
+          // above — the precondition genuinely failed, so surface 409 rather
+          // than the 404 that a bare `return null` would produce.
+          if (writePreconditions.length > 0) {
+            throw conflict("Issue changed before the update could be applied", {
+              issueId: id,
+              ...(expectedCurrentStatus === undefined ? {} : { expectedStatus: expectedCurrentStatus }),
+              ...(expectedCurrentAssigneeAgentId === undefined
+                ? {}
+                : { expectedAssigneeAgentId: expectedCurrentAssigneeAgentId }),
+            });
+          }
+          return null;
+        }
         if (
           (updated.status === "done" || updated.status === "cancelled") &&
           existing.status !== updated.status

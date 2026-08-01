@@ -67,6 +67,7 @@ export type AuthorizationAction =
   | "agent:wake"
   | "company_scope:read"
   | "issue:comment"
+  | "issue:coordination_metadata"
   | "issue:mutate"
   | "issue:read"
   | "project:read"
@@ -158,6 +159,12 @@ function permissionForAction(action: AuthorizationAction): PermissionKey | null 
     return null;
   }
   if (action === "issue:comment" || action === "issue:mutate") return null;
+  // BLO-18289: coordination-metadata is deliberately unmapped so it can never
+  // be satisfied by the generic `permissionKey` grant fallback at the bottom of
+  // decideBase. A bare `tasks:assign` grant is necessary but NOT sufficient —
+  // the dedicated branch also requires the actor to manage the issue assignee.
+  // Mapping it here would silently drop that second half of the check.
+  if (action === "issue:coordination_metadata") return null;
   return action;
 }
 
@@ -489,7 +496,15 @@ function activeResponsibleUserCanAuthorizeIssueAction(
     membership &&
     membership.status === "active" &&
     membership.membershipRole !== "viewer" &&
-    (action === "issue:comment" || action === "issue:mutate")
+    // BLO-18289: issue:coordination_metadata belongs here for the same reason
+    // as issue:mutate — there is no board permission mapping for it, so the
+    // responsible-user intersection would otherwise deny it as an unsupported
+    // action and the agent-side decision would never be reached. It is a
+    // strict subset of issue:mutate, so it cannot be gated more loosely by
+    // sharing that action's active-non-viewer bar.
+    (action === "issue:comment"
+      || action === "issue:mutate"
+      || action === "issue:coordination_metadata")
   );
 }
 
@@ -2020,6 +2035,51 @@ export function authorizationService(db: Db) {
         reason: "allow_simple_company_member",
         explanation: "Allowed by simple mode company-wide task assignment default.",
       });
+    }
+
+    // BLO-18289: coordination metadata (blocker edges, priority, project,
+    // parent, milestone) on an issue assigned to SOMEBODY ELSE. This is the
+    // narrow slice BLO-18163 asked for: the actor curating the dependency
+    // graph is structurally not the actor holding the issue, so `allow_self`
+    // never fires and the graph can only ever be curated by its own subjects.
+    //
+    // Two conditions, BOTH required:
+    //   1. an explicit `tasks:assign` / `tasks:assign_scope` grant, and
+    //   2. the actor manages the assignee in the reporting chain.
+    //
+    // (2) is not redundant. BLO-18163 keyed this on `tasks:assign` on the
+    // stated rationale that it is "board-granted, and grantable to you for
+    // your subtree". In practice the grant is issued to essentially every
+    // agent (12 of 13 active agents in the founding company hold it, all
+    // unscoped), so the grant alone would hand every agent write access to
+    // every other agent's coordination metadata — the opposite of the
+    // "no widening for ordinary agents" requirement. The manager-chain
+    // condition restores the subtree semantics the rationale assumed: a
+    // manager curates its reports' graph, a peer curates nothing.
+    //
+    // Callers must still enforce the FIELD allowlist; this decides only
+    // "may this actor touch coordination metadata on this issue at all".
+    if (input.action === "issue:coordination_metadata") {
+      const resource = input.resource.type === "issue" ? input.resource : null;
+      const assigneeAgentId = resource?.assigneeAgentId ?? null;
+      if (!assigneeAgentId || assigneeAgentId === actorAgentId) {
+        // Ordinary issue:mutate already covers self-owned and unassigned
+        // issues; this action exists purely for the cross-assignee case.
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation: "Coordination-metadata authority applies only to issues assigned to another agent.",
+        });
+      }
+      if (!(await isManagerOf(companyId, actorAgentId, assigneeAgentId))) {
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation: "Actor does not manage the issue assignee in the reporting chain.",
+        });
+      }
+      const grantDecision = await decideWithTaskAssignmentGrants("agent", actorAgentId);
+      return grantDecision;
     }
 
     if (input.action === "issue:comment" || input.action === "issue:mutate") {

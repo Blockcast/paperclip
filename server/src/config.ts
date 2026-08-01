@@ -160,6 +160,14 @@ export interface Config {
   // GitHub login of the PR-reviewer bot (the GitHub App's bot user, e.g.
   // "allyblockcast[bot]") used to filter reviews/comments during verification.
   prReviewerBotLogin: string;
+  // Commit-status context to fail when a PR-review run exhausts its bounded
+  // retry chain (e.g. "review/ally-complete"). A required status that is never
+  // posted shows as "Expected — waiting for status" forever, so an exhausted
+  // reviewer chain silently wedges the PR with no signal that nothing is
+  // coming. Empty (the default) means the server posts no status at all —
+  // the feature is opt-in per deployment because the context name belongs to
+  // whoever owns the branch-protection rule, not to this server.
+  prReviewGateStatusContext: string;
   telemetryEnabled: boolean;
 }
 
@@ -483,6 +491,7 @@ export function loadConfig(): Config {
     githubAppInstallationId: process.env.GITHUB_APP_INSTALLATION_ID ?? "",
     githubAppPrivateKey: (process.env.GITHUB_APP_PRIVATE_KEY ?? "").replace(/\\n/g, "\n"),
     prReviewerBotLogin: process.env.PAPERCLIP_PR_REVIEWER_BOT_LOGIN ?? "allyblockcast[bot]",
+    prReviewGateStatusContext: (process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT ?? "").trim(),
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };
 }
