@@ -8836,7 +8836,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
 
   async function seedOwnershipIssue(params: {
     checkoutStatus: "running" | "failed" | "timed_out";
-    actorRunStatus?: "running" | "failed" | "timed_out" | "succeeded";
+    actorRunStatus?: "queued" | "running" | "failed" | "timed_out" | "succeeded";
     assigneeMatchesActor?: boolean;
   }) {
     const companyId = randomUUID();
@@ -8896,7 +8896,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
         status: actorRunStatus,
         invocationSource: "manual",
         startedAt: actorRunStatus === "running" ? new Date() : null,
-        finishedAt: actorRunStatus === "running" ? null : new Date(),
+        finishedAt: actorRunStatus === "queued" || actorRunStatus === "running" ? null : new Date(),
       },
     ]);
     await db.insert(issues).values({
@@ -8952,6 +8952,27 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
 
   it("does not let terminal actor runs adopt stale checkout ownership", async () => {
     const seeded = await seedOwnershipIssue({ checkoutStatus: "failed", actorRunStatus: "succeeded" });
+
+    await expect(
+      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+    ).rejects.toMatchObject({ status: 409 });
+
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+  });
+
+  it("does not let queued actor runs adopt stale checkout ownership", async () => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "failed", actorRunStatus: "queued" });
 
     await expect(
       svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),

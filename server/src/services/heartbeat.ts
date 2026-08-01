@@ -11424,16 +11424,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
       await tx
-        .update(issues)
-        .set({
-          executionRunId: queuedRun.id,
-          executionAgentNameKey: normalizeAgentNameKey(agent.name),
-          executionLockedAt: now,
-          updatedAt: now,
-        })
-        .where(eq(issues.id, issue.id));
-
-      await tx
         .update(heartbeatRuns)
         .set({
           issueCommentStatus: "retry_queued",
@@ -11686,9 +11676,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .update(issues)
           .set({
             checkoutRunId: null,
-            executionRunId: retryRun.id,
-            executionAgentNameKey: normalizeAgentNameKey(agent.name),
-            executionLockedAt: now,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
             updatedAt: now,
           })
           .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
@@ -13543,9 +13533,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await tx
           .update(issues)
           .set({
-            executionRunId: scheduledRun.id,
-            executionAgentNameKey: normalizeAgentNameKey(agent.name),
-            executionLockedAt: now,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
             ...(detachWorkspaceFromIssue
               ? {
                   executionWorkspaceId: null,
@@ -14300,26 +14290,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const issueLockRequired = !allowsIssueInteractionWake(claimedContext);
       let claimedIssueLock: Pick<typeof issues.$inferSelect, "id" | "executionRunId"> | null = null;
       try {
-        claimedIssueLock = await db
-          .update(issues)
-          .set({
-            executionRunId: claimed.id,
-            executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
-            executionLockedAt: claimedAt,
-            updatedAt: claimedAt,
-          })
-          .where(
-            and(
-              eq(issues.id, claimedIssueId),
-              eq(issues.companyId, claimed.companyId),
-              // Mention/context runs can touch an issue, but only the current assignee
-              // owns the issue execution lock shown as the active run.
-              eq(issues.assigneeAgentId, claimed.agentId),
-              or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
-            ),
-          )
-          .returning({ id: issues.id, executionRunId: issues.executionRunId })
-          .then((rows) => rows[0] ?? null);
+        claimedIssueLock = await db.transaction(async (tx) => {
+          const lockedRun = await tx
+            .select({ status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, claimed.id))
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+          if (lockedRun?.status !== "running") return null;
+
+          return tx
+            .update(issues)
+            .set({
+              executionRunId: claimed.id,
+              executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
+              executionLockedAt: claimedAt,
+              updatedAt: claimedAt,
+            })
+            .where(
+              and(
+                eq(issues.id, claimedIssueId),
+                eq(issues.companyId, claimed.companyId),
+                // Mention/context runs can touch an issue, but only the current assignee
+                // owns the issue execution lock shown as the active run.
+                eq(issues.assigneeAgentId, claimed.agentId),
+                or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
+              ),
+            )
+            .returning({ id: issues.id, executionRunId: issues.executionRunId })
+            .then((rows) => rows[0] ?? null);
+        });
       } catch (error) {
         if (!isOpenRoutineExecutionUniqueViolation(error)) throw error;
         const racedLockOwner = await findOpenRoutineExecutionLockOwnerForIssue(claimed.companyId, claimedIssueId);
@@ -21037,8 +21037,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const recoverySessionBefore = recoveryAgentInvokable
       ? await resolveSessionBeforeForWakeup(recoveryAgent, taskKey)
       : null;
-    const recoveryAgentNameKey = normalizeAgentNameKey(recoveryAgent?.name);
-
     const promotionResult = await db.transaction(async (tx) => {
       // Lock the context issue (if any) AND every issue that still references this run.
       //
@@ -21407,17 +21405,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
           .where(eq(agentWakeupRequests.id, deferred.id));
 
-        await tx
-          .update(issues)
-          .set({
-            executionRunId: newRun.id,
-            executionAgentNameKey: normalizeAgentNameKey(deferredAgent.name),
-            executionLockedAt: now,
-            updatedAt: now,
-          })
-          // Promoted mention wakes are issue-scoped, not issue ownership transfers.
-          .where(and(eq(issues.id, issue.id), eq(issues.assigneeAgentId, deferredAgent.id)));
-
         return {
           kind: "promoted" as const,
           run: newRun,
@@ -21567,16 +21554,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
           .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
-        await tx
-          .update(issues)
-          .set({
-            executionRunId: queuedRun.id,
-            executionAgentNameKey: recoveryAgentNameKey,
-            executionLockedAt: now,
-            updatedAt: now,
-          })
-          .where(eq(issues.id, issue.id));
-
         return {
           kind: "queued_recovery" as const,
           run: queuedRun,
@@ -21722,16 +21699,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           updatedAt: now,
         })
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
-
-      await tx
-        .update(issues)
-        .set({
-          executionRunId: queuedRun.id,
-          executionAgentNameKey: recoveryAgentNameKey,
-          executionLockedAt: now,
-          updatedAt: now,
-        })
-        .where(eq(issues.id, issue.id));
 
       return {
         kind: "queued_recovery" as const,
@@ -22577,20 +22544,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               activeExecutionRun = null;
             } else {
               activeExecutionRun = legacyRun;
-              const legacyAgent = await tx
-                .select({ name: agents.name })
-                .from(agents)
-                .where(eq(agents.id, legacyRun.agentId))
-                .then((rows) => rows[0] ?? null);
-              await tx
-                .update(issues)
-                .set({
-                  executionRunId: legacyRun.id,
-                  executionAgentNameKey: normalizeAgentNameKey(legacyAgent?.name),
-                  executionLockedAt: new Date(),
-                  updatedAt: new Date(),
-                })
-                .where(eq(issues.id, issue.id));
+              if (legacyRun.status === "running") {
+                const legacyAgent = await tx
+                  .select({ name: agents.name })
+                  .from(agents)
+                  .where(eq(agents.id, legacyRun.agentId))
+                  .then((rows) => rows[0] ?? null);
+                await tx
+                  .update(issues)
+                  .set({
+                    executionRunId: legacyRun.id,
+                    executionAgentNameKey: normalizeAgentNameKey(legacyAgent?.name),
+                    executionLockedAt: new Date(),
+                    updatedAt: new Date(),
+                  })
+                  .where(eq(issues.id, issue.id));
+              }
             }
           }
         }
@@ -22845,15 +22814,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .update(agentWakeupRequests)
             .set({ runId: scheduledRun.id, updatedAt: now })
             .where(eq(agentWakeupRequests.id, wakeupRequest.id));
-          await tx
-            .update(issues)
-            .set({
-              executionRunId: scheduledRun.id,
-              executionAgentNameKey: agentNameKey,
-              executionLockedAt: now,
-              updatedAt: now,
-            })
-            .where(eq(issues.id, issue.id));
           incrementDepBlockedMetric("dep_blocked_scheduled");
           return { kind: "dep_blocked_scheduled" as const, run: scheduledRun };
         }

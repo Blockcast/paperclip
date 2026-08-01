@@ -106,6 +106,7 @@ export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 // the run — it only stops subsequent wakes for the issue from being parked
 // behind a holder that may never start.
 export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
+export const ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT = 5;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 // BLO-7113: re-fire suppression for `stale_active_run_evaluation` wrappers.
 // When the underlying `runs.status='running'` row is the canonical
@@ -5007,6 +5008,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             sql`${issues.assigneeAgentId} is not null`,
             eq(issues.status, "in_review"),
           ),
+          sql`not exists (
+            select 1
+            from ${heartbeatRuns} live_execution_run
+            where live_execution_run.id = ${issues.executionRunId}
+              and live_execution_run.status in ('queued', 'running', 'scheduled_retry')
+          )`,
           opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
         ),
       );
@@ -5029,6 +5036,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       recentProgressExempted: 0,
       skipped: 0,
       issueIds: [] as string[],
+    };
+    const assignmentRecoveryEnqueuesByAgent = new Map<string, number>();
+
+    const hasAssignmentRecoveryCapacity = (agentId: string) =>
+      (assignmentRecoveryEnqueuesByAgent.get(agentId) ?? 0) <
+      ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT;
+    const recordAssignmentRecoveryEnqueue = (agentId: string) => {
+      assignmentRecoveryEnqueuesByAgent.set(
+        agentId,
+        (assignmentRecoveryEnqueuesByAgent.get(agentId) ?? 0) + 1,
+      );
     };
 
     for (const issue of candidates) {
@@ -5446,6 +5464,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
       if (issue.status === "todo") {
         if (!latestRun) {
+          if (!hasAssignmentRecoveryCapacity(agentId)) {
+            result.skipped += 1;
+            continue;
+          }
           if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
             result.skipped += 1;
             continue;
@@ -5458,6 +5480,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
           const queued = await enqueueInitialAssignedTodoDispatch(issue, agentId);
           if (queued) {
+            recordAssignmentRecoveryEnqueue(agentId);
             result.assignmentDispatched += 1;
             result.issueIds.push(issue.id);
           } else {
@@ -5557,6 +5580,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        if (!hasAssignmentRecoveryCapacity(agentId)) {
+          result.skipped += 1;
+          continue;
+        }
+
         const queued = await enqueueStrandedIssueRecovery({
           issueId: issue.id,
           agentId,
@@ -5566,6 +5594,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           retryOfRunId: latestRun.id,
         });
         if (queued) {
+          recordAssignmentRecoveryEnqueue(agentId);
           result.dispatchRequeued += 1;
           result.issueIds.push(issue.id);
         } else {
@@ -7408,20 +7437,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
     };
 
-    // BLO-18995: a lock can also be held by a run that never started. Four
-    // enqueue paths stamp executionRunId/executionLockedAt at *enqueue* time
-    // alongside a freshly-inserted `queued` run (enqueueMissingIssueCommentRetry,
-    // enqueueProcessLossRetry, and the two recovery-wake inserts), rather than
-    // lazily at claim time the way claimQueuedRun does. `queued` is neither
-    // missing nor terminal, so isCleanable() above returns false forever and
-    // this sweeper — the designated backstop — never clears it. Meanwhile
-    // enqueueWakeup parks every subsequent wake for that issue as
-    // `deferred_issue_execution` behind the apparent live holder, and those
-    // deferred wakes are only promoted by releaseIssueExecutionAndPromote when
-    // the holding run finishes. A run that is never claimed therefore strands
-    // them indefinitely, with no timeout anywhere in the path. Observed in
-    // production: BLO-18939 held executionLockedAt for a run still `queued`
-    // with startedAt null.
+    // BLO-18995: older deployments stamped executionRunId/executionLockedAt at
+    // enqueue time. Keep cleaning those persisted pre-claim locks after the
+    // writer paths move to claim-time locking; otherwise an upgraded instance
+    // can retain a queued lock indefinitely.
     //
     // Bound it: once a pre-claim lock has been held longer than
     // STALE_PRE_CLAIM_ISSUE_LOCK_MS, treat it as cleanable. Clearing is safe
@@ -7693,16 +7712,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             skippedDeferredWakeIds.push(deferred.id);
             continue;
           }
-
-          await tx
-            .update(issues)
-            .set({
-              executionRunId: newRun.id,
-              executionAgentNameKey: normalizeAgentNameKey(deferredAgent.name),
-              executionLockedAt: now,
-              updatedAt: now,
-            })
-            .where(and(eq(issues.id, updated.id), eq(issues.assigneeAgentId, deferredAgent.id)));
 
           return {
             updated,

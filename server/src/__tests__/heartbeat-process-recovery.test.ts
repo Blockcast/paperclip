@@ -270,6 +270,7 @@ import {
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
 } from "../services/recovery/index.ts";
+import { ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT } from "../services/recovery/service.ts";
 import type { PluginEventBus, ScopedPluginEventBus } from "../services/plugin-event-bus.js";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import {
@@ -2105,7 +2106,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+    expect(issue?.executionRunId).toBeNull();
     expect(issue?.checkoutRunId).toBeNull();
   });
 
@@ -2466,7 +2467,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue?.checkoutRunId).toBeNull();
-    expect(issue?.executionRunId).toBe(retryRun?.id);
+    expect(issue?.executionRunId).toBeNull();
   });
 
   it("does not overwrite a run that is no longer running during graceful shutdown drain", async () => {
@@ -2608,7 +2609,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue?.checkoutRunId).toBeNull();
-    expect(issue?.executionRunId).toBe(secondRetry?.id);
+    expect(issue?.executionRunId).toBeNull();
   });
 
   it("releases active environment leases when an orphaned run is reaped", async () => {
@@ -2686,7 +2687,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+    expect(issue?.executionRunId).toBeNull();
   });
 
   it("blocks the issue when process-loss retry is exhausted and the immediate continuation recovery also fails", async () => {
@@ -3100,7 +3101,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("in_progress");
-    expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+    expect(issue?.executionRunId).toBeNull();
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(0);
@@ -3238,7 +3239,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(issue).toEqual({
       status: "in_review",
-      executionRunId: retryRun?.id ?? null,
+      executionRunId: null,
     });
 
     const comments = await waitForValue(async () => {
@@ -5022,6 +5023,131 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     if (runs[0]?.id) {
       await waitForRunToSettle(heartbeat, runs[0].id);
     }
+  });
+
+  it("caps assignment recovery per agent and skips issues with live execution locks", async () => {
+    const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture({
+      agentStatus: "running",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const activeRunId = randomUUID();
+    const secondAgentId = randomUUID();
+    const secondActiveRunId = randomUUID();
+    const lockedIssueId = randomUUID();
+    const additionalIssueIds = Array.from(
+      { length: ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT + 1 },
+      () => randomUUID(),
+    );
+    const secondAgentIssueIds = Array.from(
+      { length: ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT + 1 },
+      () => randomUUID(),
+    );
+
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, agentId));
+
+    await db.insert(agents).values({
+      id: secondAgentId,
+      companyId,
+      name: "SecondCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: activeRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        status: "running",
+        startedAt: new Date(),
+        contextSnapshot: {},
+      },
+      {
+        id: secondActiveRunId,
+        companyId,
+        agentId: secondAgentId,
+        invocationSource: "automation",
+        status: "running",
+        startedAt: new Date(),
+        contextSnapshot: {},
+      },
+    ]);
+    await db.insert(issues).values([
+      ...additionalIssueIds.map((id, index) => ({
+        id,
+        companyId,
+        title: `Recovery candidate ${index + 2}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: index + 2,
+        identifier: `${issuePrefix}-${index + 2}`,
+      })),
+      {
+        id: lockedIssueId,
+        companyId,
+        title: "Already running recovery candidate",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+        executionRunId: activeRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+        issueNumber: additionalIssueIds.length + 2,
+        identifier: `${issuePrefix}-${additionalIssueIds.length + 2}`,
+      },
+      ...secondAgentIssueIds.map((id, index) => ({
+        id,
+        companyId,
+        title: `Second-agent recovery candidate ${index + 1}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+        assigneeAgentId: secondAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: additionalIssueIds.length + index + 3,
+        identifier: `${issuePrefix}-${additionalIssueIds.length + index + 3}`,
+      })),
+    ]);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.assignmentDispatched).toBe(ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT * 2);
+    const firstAgentQueuedRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued")));
+    expect(firstAgentQueuedRuns).toHaveLength(ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT);
+    expect(firstAgentQueuedRuns.every((run) => run.contextSnapshot &&
+      (run.contextSnapshot as Record<string, unknown>).issueId !== lockedIssueId)).toBe(true);
+    const secondAgentQueuedRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, secondAgentId), eq(heartbeatRuns.status, "queued")));
+    expect(secondAgentQueuedRuns).toHaveLength(ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT);
+
+    const candidateRows = await db
+      .select({ id: issues.id, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(inArray(issues.id, [issueId, ...additionalIssueIds, ...secondAgentIssueIds]));
+    expect(candidateRows).toHaveLength(additionalIssueIds.length + secondAgentIssueIds.length + 1);
+    expect(candidateRows.every((issue) => issue.executionRunId === null)).toBe(true);
+
+    const lockedIssue = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, lockedIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(lockedIssue?.executionRunId).toBe(activeRunId);
   });
 
   it("does not duplicate initial assigned todo dispatch when a queued wake already exists", async () => {

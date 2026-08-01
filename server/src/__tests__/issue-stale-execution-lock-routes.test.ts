@@ -270,6 +270,52 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     });
   });
 
+  it("allows an assigned agent PATCH while another wake is only queued", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Queued wake without execution ownership",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionRunId: null,
+    });
+    const queuedWakeupId = randomUUID();
+    const queuedRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: queuedWakeupId,
+      companyId,
+      agentId,
+      source: "assignment",
+      status: "queued",
+      runId: queuedRunId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "assignment",
+      wakeupRequestId: queuedWakeupId,
+      contextSnapshot: { issueId },
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Assignee can still update" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.title).toBe("Assignee can still update");
+    const queuedRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(queuedRun?.status).not.toBe("running");
+  });
+
   it("allows a same-agent current run to close an issue owned by a stale adapter_failed checkout run", async () => {
     const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns({
       staleRunStatus: "adapter_failed",
