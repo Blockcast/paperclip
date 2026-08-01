@@ -3834,6 +3834,7 @@ export function issueRoutes(
   const DENIED_ISSUE_WRITE_MAX_ENTRIES = 25;
   const DENIED_ISSUE_WRITE_MAX_TOTAL_BYTES = 16000;
   const DENIED_ISSUE_WRITE_DEDUPE_WINDOW_MS = 5 * 60_000;
+  const DENIED_ISSUE_WRITE_AGGREGATE_MAX_RECORDS = 5;
   type IssueAccessDecision = Awaited<ReturnType<typeof decideIssueAccess>>;
   // Review fix: only the `deny_*` half of the decision union is a denial
   // reason. Unioning the whole set let `allow_company_agent` / `allow_issue_creator`
@@ -3990,9 +3991,9 @@ export function issueRoutes(
   //
   // So the key also carries the response status, the run, and a fingerprint of
   // the bounded payload. The payload is the load-bearing one: two denials with
-  // differing content are two distinct pieces of recoverable evidence, and
-  // preserving content is the whole point of the record. What collapses is only
-  // a true repeat — same run, same target, same reason, same status, same body.
+  // differing content are two distinct pieces of recoverable evidence. Exact
+  // repeats collapse here; distinct payloads are still capped by the aggregate
+  // actor/issue/window bound before anything is recorded.
   function deniedIssueWritePayloadFingerprint(payload: unknown) {
     let serialized = "";
     try {
@@ -4034,6 +4035,27 @@ export function issueRoutes(
       ))
       .limit(1);
     return Boolean(existing);
+  }
+
+  async function countRecentDeniedIssueWriteLogsForActorIssue(input: {
+    issue: { id: string; companyId: string };
+    actorId: string;
+  }) {
+    const windowStart = new Date(Date.now() - DENIED_ISSUE_WRITE_DEDUPE_WINDOW_MS);
+    const rows = await db
+      .select({ deniedWriteId: activityLog.id })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, input.issue.companyId),
+        eq(activityLog.actorType, "agent"),
+        eq(activityLog.actorId, input.actorId),
+        eq(activityLog.action, "issue_write_denied"),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, input.issue.id),
+        gte(activityLog.createdAt, windowStart),
+      ))
+      .limit(DENIED_ISSUE_WRITE_AGGREGATE_MAX_RECORDS);
+    return rows.length;
   }
 
   // BLO-18614 AC3: a denied issue:comment/issue:mutate write previously left
@@ -4082,6 +4104,19 @@ export function issueRoutes(
         );
       }
       if (recentDuplicate) return;
+
+      try {
+        const recentActorIssueRecords = await countRecentDeniedIssueWriteLogsForActorIssue({
+          issue,
+          actorId: req.actor.agentId,
+        });
+        if (recentActorIssueRecords >= DENIED_ISSUE_WRITE_AGGREGATE_MAX_RECORDS) return;
+      } catch (err) {
+        logger.warn(
+          { err, issueId: issue.id, action, reason: denial.reason },
+          "BLO-18614: failed to check denied issue write aggregate bound for recovery",
+        );
+      }
 
       const untrusted = isUntrustedDenialReason(denial.reason);
       const details = boundDeniedIssueWriteDetails({

@@ -299,23 +299,24 @@ function makeRecoveryAction(overrides: Record<string, unknown> = {}) {
   };
 }
 
-// `hasRecentDeniedIssueWriteLog` (server/src/routes/issues.ts) is the only
-// `.where(...).limit(1)` lookup these routes issue: it selects `{ entityId }`
-// from activity_log to find a recent `issue_write_denied` row for the same
-// actor + run + target + action + reason + responseStatus + payload fingerprint,
-// and short-circuits recording when one exists.
+// Denied-write recovery issues two bounded activity-log lookups from the route:
+// an exact duplicate probe selecting `{ entityId }`, then an aggregate probe
+// selecting `{ deniedWriteId }` to cap varied payloads per actor/issue/window.
 //
 // The stub used to resolve `[]` unconditionally, which meant the dedupe
 // early-return never executed in CI at all. Because the lookup deliberately
 // fails open (a throw is caught and recording proceeds), a regression that broke
-// dedupe outright — a renamed `details` key, a wrong column — would have stayed
-// green while silently recording without bound. `recentRows` drives the
-// duplicate branch; `onLookup` captures the predicate so a test can assert the
-// discriminators it keys on.
+// the exact or aggregate bounds — a renamed `details` key, a wrong column —
+// would have stayed green while silently recording without bound. `recentRows`
+// drives the exact duplicate branch; `aggregateRows` drives the varied-payload
+// cap branch; `onLookup` captures predicates so tests can assert the
+// discriminators they key on.
+type DeniedWriteLookupKind = "exact" | "aggregate";
 type DeniedWriteLookupStub = {
   recentRows?: unknown[];
-  rowsFor?: (where: unknown) => unknown[];
-  onLookup?: (where: unknown) => void;
+  aggregateRows?: unknown[];
+  rowsFor?: (where: unknown, kind: DeniedWriteLookupKind) => unknown[];
+  onLookup?: (where: unknown, kind: DeniedWriteLookupKind) => void;
 };
 
 function deniedWriteLookupLimitStub(
@@ -323,12 +324,18 @@ function deniedWriteLookupLimitStub(
   where: unknown,
   stub: DeniedWriteLookupStub,
 ) {
-  const isDeniedWriteLookup = Object.keys(selection).includes("entityId");
+  const selectionKeys = Object.keys(selection);
+  const lookupKind: DeniedWriteLookupKind | null = selectionKeys.includes("entityId")
+    ? "exact"
+    : selectionKeys.includes("deniedWriteId")
+    ? "aggregate"
+    : null;
   return vi.fn((count: number) => ({
     then: async (resolve: (rows: unknown[]) => unknown) => {
-      if (!isDeniedWriteLookup) return resolve([]);
-      stub.onLookup?.(where);
-      const rows = stub.rowsFor ? stub.rowsFor(where) : (stub.recentRows ?? []);
+      if (!lookupKind) return resolve([]);
+      stub.onLookup?.(where, lookupKind);
+      const fallbackRows = lookupKind === "exact" ? stub.recentRows ?? [] : stub.aggregateRows ?? [];
+      const rows = stub.rowsFor ? stub.rowsFor(where, lookupKind) : fallbackRows;
       return resolve(rows.slice(0, count));
     },
   }));
@@ -340,7 +347,12 @@ function deniedWriteLookupLimitStub(
 // the recorded row exposes — if the two sides ever drift (one renamed, the other
 // not) dedupe silently stops matching, and only comparing them catches it.
 function collectSqlParams(node: unknown, out: unknown[] = []): unknown[] {
-  if (typeof node === "string" || typeof node === "number") {
+  if (typeof node === "string") {
+    out.push(node);
+    for (const match of node.matchAll(/'([^']+)'/g)) out.push(match[1]);
+    return out;
+  }
+  if (typeof node === "number" || node instanceof Date) {
     out.push(node);
     return out;
   }
@@ -355,7 +367,13 @@ function collectSqlParams(node: unknown, out: unknown[] = []): unknown[] {
     return out;
   }
   const value = (node as { value?: unknown }).value;
-  if (typeof value === "string" || typeof value === "number") out.push(value);
+  if (Array.isArray(value)) {
+    for (const child of value) collectSqlParams(child, out);
+    return out;
+  }
+  if (typeof value === "string" || typeof value === "number" || value instanceof Date) {
+    collectSqlParams(value, out);
+  }
   return out;
 }
 
@@ -2026,36 +2044,63 @@ describe("agent issue mutation checkout ownership", () => {
   // applying the same discriminators its SQL predicate does: a stored row counts
   // as a duplicate only when every value the predicate binds is present. So if
   // the route stops keying on one of them, it stops suppressing here too — which
-  // is what makes these regression tests for the dedupe *key*, not merely for
-  // the early-return.
-  function cheapRecoveryDedupeHarness() {
+  // is what makes these regression tests for the dedupe *key* and aggregate
+  // bound, not merely for the early-return.
+  function cheapRecoveryDedupeHarness(seedRows: Partial<{
+    id: string;
+    attemptedAction: string;
+    reason: string;
+    responseStatus: number;
+    payloadFingerprint: string;
+    createdAt: Date;
+  }>[] = []) {
     const recorded: {
+      id: string;
       attemptedAction: string;
       reason: string;
       responseStatus: number;
       payloadFingerprint: string;
-    }[] = [];
-    const lookups: unknown[][] = [];
+      createdAt: Date;
+    }[] = seedRows.map((row, index) => ({
+      id: row.id ?? `seed-denied-write-${index}`,
+      attemptedAction: row.attemptedAction ?? "issue:mutate",
+      reason: row.reason ?? "deny_cheap_recovery_profile",
+      responseStatus: row.responseStatus ?? 403,
+      payloadFingerprint: row.payloadFingerprint ?? `seed-payload-fingerprint-${index}`,
+      createdAt: row.createdAt ?? new Date(),
+    }));
+    const lookups: { kind: DeniedWriteLookupKind; params: unknown[] }[] = [];
     mockLogActivity.mockImplementation((async (_db: unknown, entry: unknown) => {
       const typed = entry as { action?: string; details?: Record<string, unknown> };
       if (typed.action === "issue_write_denied" && typed.details) {
         recorded.push({
+          id: `recorded-denied-write-${recorded.length}`,
           attemptedAction: String(typed.details.attemptedAction),
           reason: String(typed.details.reason),
           responseStatus: Number(typed.details.responseStatus),
           payloadFingerprint: String(typed.details.payloadFingerprint),
+          createdAt: new Date(),
         });
       }
       return undefined;
     }) as never);
+    const recentRows = (where: unknown) => {
+      const params = collectSqlParams(where);
+      const windowStart = params.find((param): param is Date => param instanceof Date) ?? new Date(0);
+      return recorded.filter((row) => row.createdAt >= windowStart);
+    };
     const deniedWriteLookup: DeniedWriteLookupStub = {
-      onLookup: (where) => lookups.push(collectSqlParams(where)),
-      rowsFor: (where) => {
+      onLookup: (where, kind) => lookups.push({ kind, params: collectSqlParams(where) }),
+      rowsFor: (where, kind) => {
         const params = collectSqlParams(where);
+        if (kind === "aggregate") {
+          return recentRows(where).map((row) => ({ deniedWriteId: row.id }));
+        }
         const duplicate = recorded.some((row) => params.includes(row.attemptedAction)
           && params.includes(row.reason)
           && params.includes(String(row.responseStatus))
-          && params.includes(row.payloadFingerprint));
+          && params.includes(row.payloadFingerprint)
+          && recentRows(where).includes(row));
         return duplicate ? [{ entityId: issueId }] : [];
       },
     };
@@ -2113,14 +2158,44 @@ describe("agent issue mutation checkout ownership", () => {
     // values. Comparing them is the only thing that catches a rename on one
     // side: the lookup fails open, so a predicate that silently matches nothing
     // records without bound instead of erroring.
-    expect(lookups).toHaveLength(1);
-    const [params] = lookups;
+    const exactLookup = lookups.find((lookup) => lookup.kind === "exact");
+    expect(exactLookup).toBeTruthy();
+    const params = exactLookup!.params;
+    expect(params).toContain("attemptedAction");
+    expect(params).toContain("reason");
+    expect(params).toContain("responseStatus");
+    expect(params).toContain("payloadFingerprint");
     expect(params).toContain(row.attemptedAction);
     expect(params).toContain(row.reason);
     expect(params).toContain(String(row.responseStatus));
     expect(params).toContain(row.payloadFingerprint);
     expect(params, "dedupe must be scoped to the acting run").toContain(ownerRunId);
     expect(params).toContain(issueId);
+  });
+
+  it("caps varied denied-write recovery rows for the same actor and issue inside the window", async () => {
+    const { recorded, denyPatch } = cheapRecoveryDedupeHarness();
+
+    for (let index = 0; index < 7; index += 1) {
+      await denyPatch(`distinct denied diagnosis ${index}`);
+    }
+
+    expect(recorded).toHaveLength(5);
+    expect(new Set(recorded.map((row) => row.payloadFingerprint)).size).toBe(5);
+  });
+
+  it("does not let out-of-window denied-write rows trip the aggregate cap", async () => {
+    const staleCreatedAt = new Date(Date.now() - (5 * 60_000) - 1_000);
+    const seedRows = Array.from({ length: 5 }, (_, index) => ({
+      id: `stale-denied-write-${index}`,
+      createdAt: staleCreatedAt,
+    }));
+    const { recorded, denyPatch } = cheapRecoveryDedupeHarness(seedRows);
+
+    await denyPatch("fresh denied diagnosis after stale aggregate rows");
+
+    expect(recorded).toHaveLength(6);
+    expect(recorded.at(-1)?.createdAt.getTime()).toBeGreaterThan(staleCreatedAt.getTime());
   });
 
   it("defaults agent-created root follow-up issues to inherit the current run workspace", async () => {
