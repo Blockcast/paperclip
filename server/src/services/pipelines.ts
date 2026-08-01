@@ -3045,6 +3045,46 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     });
   }
 
+  async function retireStageAutomationForExitedStage(
+    tx: PipelineDb,
+    input: {
+      companyId: string;
+      caseId: string;
+      caseTitle: string;
+      caseKey: string;
+      stageId: string;
+      stageName: string;
+    },
+  ) {
+    const stageAutomationLinks = await tx
+      .select({ linkId: pipelineCaseIssueLinks.id })
+      .from(pipelineCaseIssueLinks)
+      .innerJoin(
+        pipelineAutomationExecutions,
+        and(
+          eq(pipelineCaseIssueLinks.automationAttemptId, pipelineAutomationExecutions.id),
+          eq(pipelineCaseIssueLinks.issueId, pipelineAutomationExecutions.executionIssueId),
+        ),
+      )
+      .innerJoin(pipelineCaseEvents, eq(pipelineAutomationExecutions.triggeringEventId, pipelineCaseEvents.id))
+      .where(and(
+        eq(pipelineCaseIssueLinks.companyId, input.companyId),
+        eq(pipelineCaseIssueLinks.caseId, input.caseId),
+        eq(pipelineCaseIssueLinks.role, "automation"),
+        isNull(pipelineCaseIssueLinks.retiredAt),
+        eq(pipelineCaseEvents.toStageId, input.stageId),
+      ));
+    for (const row of stageAutomationLinks) {
+      await retireStageAutomationLink(tx, {
+        companyId: input.companyId,
+        linkId: row.linkId,
+        caseTitle: input.caseTitle,
+        caseKey: input.caseKey,
+        stageName: input.stageName,
+      });
+    }
+  }
+
   async function validateStageTargets(companyId: string, pipelineId: string, kind: PipelineStageKind | string, config: PipelineStageConfig) {
     if (kind !== "review") return;
     const rows = await db
@@ -3157,7 +3197,23 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       const updated = await db.transaction(async (tx) => {
         const txDb = tx as unknown as PipelineDb;
         const current = await getCaseWithStageForUpdateOrThrow(txDb, execution.companyId, execution.caseId);
-        await txDb.execute(sql`select id from ${issues} where ${issues.id} = ${executionIssueId} for update`);
+        const lockedIssue = await txDb
+          .select({
+            status: issues.status,
+            originKind: issues.originKind,
+            originId: issues.originId,
+          })
+          .from(issues)
+          .where(and(eq(issues.id, executionIssueId), eq(issues.companyId, execution.companyId)))
+          .limit(1)
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!lockedIssue || ["done", "cancelled"].includes(lockedIssue.status)) {
+          throw new Error(`Routine run ${run.id} returned an execution issue that became terminal before attachment`);
+        }
+        if (lockedIssue.originKind !== "routine_execution" || lockedIssue.originId !== execution.routineId) {
+          throw new Error(`Routine run ${run.id} returned an execution issue that was repurposed before attachment`);
+        }
         const [updatedExecution] = await txDb
           .update(pipelineAutomationExecutions)
           .set({
@@ -3168,6 +3224,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           })
           .where(eq(pipelineAutomationExecutions.id, execution.id))
           .returning();
+        const linkNow = nowDate();
         const [link] = await txDb
           .insert(pipelineCaseIssueLinks)
           .values({
@@ -3178,10 +3235,24 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             createdByRunId: null,
             automationAttemptId: execution.id,
           })
-          .onConflictDoNothing({ target: [pipelineCaseIssueLinks.caseId, pipelineCaseIssueLinks.issueId] })
+          .onConflictDoUpdate({
+            target: [pipelineCaseIssueLinks.caseId, pipelineCaseIssueLinks.issueId],
+            set: {
+              role: "automation",
+              createdByRunId: null,
+              automationAttemptId: execution.id,
+              retiredAt: null,
+              retiredByAttemptId: null,
+              retiredReason: null,
+              updatedAt: linkNow,
+            },
+            setWhere: eq(pipelineCaseIssueLinks.role, "automation"),
+          })
           .returning({ id: pipelineCaseIssueLinks.id });
+        if (!link) {
+          throw new Error(`Routine run ${run.id} returned an execution issue whose case link was repurposed`);
+        }
         if (
-          link &&
           (current.case.stageId !== detail.stage.id || current.case.version !== detail.case.version)
         ) {
           await retireStageAutomationLink(txDb, {
@@ -3469,35 +3540,14 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       },
     });
     if (fromStage.id !== toStage.id) {
-      const stageAutomationLinks = await tx
-        .select({
-          linkId: pipelineCaseIssueLinks.id,
-        })
-        .from(pipelineCaseIssueLinks)
-        .innerJoin(
-          pipelineAutomationExecutions,
-          and(
-            eq(pipelineCaseIssueLinks.automationAttemptId, pipelineAutomationExecutions.id),
-            eq(pipelineCaseIssueLinks.issueId, pipelineAutomationExecutions.executionIssueId),
-          ),
-        )
-        .innerJoin(pipelineCaseEvents, eq(pipelineAutomationExecutions.triggeringEventId, pipelineCaseEvents.id))
-        .where(and(
-          eq(pipelineCaseIssueLinks.companyId, input.companyId),
-          eq(pipelineCaseIssueLinks.caseId, current.id),
-          eq(pipelineCaseIssueLinks.role, "automation"),
-          isNull(pipelineCaseIssueLinks.retiredAt),
-          eq(pipelineCaseEvents.toStageId, fromStage.id),
-        ));
-      for (const row of stageAutomationLinks) {
-        await retireStageAutomationLink(tx, {
-          companyId: input.companyId,
-          linkId: row.linkId,
-          caseTitle: current.title,
-          caseKey: current.caseKey,
-          stageName: fromStage.name,
-        });
-      }
+      await retireStageAutomationForExitedStage(tx, {
+        companyId: input.companyId,
+        caseId: current.id,
+        caseTitle: current.title,
+        caseKey: current.caseKey,
+        stageId: fromStage.id,
+        stageName: fromStage.name,
+      });
     }
     if (forcedTransition) {
       await writeCaseEvent(tx, {
@@ -4039,6 +4089,14 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
                 previousVersion: previous?.version ?? movedCase.version - 1,
                 version: movedCase.version,
               },
+            });
+            await retireStageAutomationForExitedStage(tx, {
+              companyId: input.companyId,
+              caseId: movedCase.id,
+              caseTitle: movedCase.title,
+              caseKey: movedCase.caseKey,
+              stageId: stage.id,
+              stageName: stage.name,
             });
             if (!wasTerminal && movedCase.terminalKind === "done") {
               await handleBlockersResolved(tx, input.companyId, movedCase.id);
@@ -4879,6 +4937,14 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
               targetStageId: plan.targetStageRow.id,
               targetStageKey: plan.targetStageRow.key,
             },
+          });
+          await retireStageAutomationForExitedStage(tx, {
+            companyId: input.companyId,
+            caseId: detail.case.id,
+            caseTitle: detail.case.title,
+            caseKey: detail.case.caseKey,
+            stageId: detail.stage.id,
+            stageName: detail.stage.name,
           });
         }
         await writeCaseEvent(tx, {
