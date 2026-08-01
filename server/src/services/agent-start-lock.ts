@@ -106,16 +106,26 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
   nextHeld.add(agentId);
 
   const startedAtMs = Date.now();
+  // Publish the lock BEFORE `fn` is invoked. The wrapper below runs `fn`'s
+  // synchronous prefix immediately, so a call that re-enters dispatch within
+  // that prefix would find no entry in `runningByAgent` and conclude the lock
+  // was free — and the re-entrancy guard's fallback would then start a SECOND
+  // critical section for this agent, concurrently with this one. That is the
+  // exact property this module exists to guarantee, so the window is closed
+  // structurally rather than left to every caller's first statement being an
+  // `await`.
+  let settleMarker!: () => void;
+  const marker = new Promise<void>((resolve) => {
+    settleMarker = resolve;
+  });
+  runningByAgent.set(agentId, marker);
+
   // Wrap so a synchronous throw from `fn` surfaces as a rejection rather than
   // escaping before the lock bookkeeping below is installed.
   const execution = (async () => heldAgentIds.run(nextHeld, fn))();
-  // Track a settled-either-way marker so a failing section still releases the
-  // lock and still lets the coalesced follow-up run.
-  const marker = execution.then(
-    () => undefined,
-    () => undefined,
-  );
-  runningByAgent.set(agentId, marker);
+  // Settle the marker either way, so a failing section still releases the lock
+  // and still lets the coalesced follow-up run.
+  void execution.then(settleMarker, settleMarker);
 
   const warnTimer = setTimeout(() => {
     logger.warn(
@@ -145,11 +155,14 @@ export async function withAgentStartLock<T>(
       "agent start lock already held on this path; coalescing nested queued-run dispatch",
     );
     options.onCoalescedDemand?.();
+    // Re-entrant, so this agent's section is by definition already running and
+    // `runningByAgent` holds it (published before `fn` is invoked). Chain the
+    // follow-up onto it. Never fall back to `runExclusively` here the way the
+    // depth guard below does: for the *same* agent that would run a second
+    // critical section alongside the one we are nested inside.
     const running = runningByAgent.get(agentId);
-    const followUp = running
-      ? ensureCoalescedFollowUp(agentId, fn, running)
-      : heldAgentIds.exit(() => runExclusively(agentId, fn));
-    trackDetachedFollowUp(agentId, followUp);
+    if (running) trackDetachedFollowUp(agentId, ensureCoalescedFollowUp(agentId, fn, running));
+    else logger.error({ agentId }, "re-entrant queued-run dispatch found no running section to fold into");
     return options.onCoalesced();
   }
   if (held && held.size >= MAX_NESTED_DISPATCH_DEPTH) {

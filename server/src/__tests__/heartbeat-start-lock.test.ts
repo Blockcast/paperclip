@@ -193,6 +193,77 @@ describe("heartbeat agent start lock (BLO-20396)", () => {
     expect(inner).toHaveBeenCalledTimes(1);
   });
 
+  it("never starts a second section when the re-entrant call happens before the first awaits", async () => {
+    // The lock is published when a section STARTS, not when it first awaits —
+    // `runExclusively` runs `fn`'s synchronous prefix immediately. A re-entrant
+    // dispatch made in that prefix used to find `runningByAgent` empty, so the
+    // re-entrancy guard's fallback started a second critical section for the
+    // same agent, concurrently with the one it was nested inside.
+    const agentId = randomUUID();
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    let innerCallsWhileOuterHeld = 0;
+
+    const inner = vi.fn(async () => {
+      concurrent += 1;
+      maxConcurrent = Math.max(maxConcurrent, concurrent);
+      try {
+        await Promise.resolve();
+        return "inner";
+      } finally {
+        concurrent -= 1;
+      }
+    });
+
+    const result = await withAgentStartLock(
+      agentId,
+      async () => {
+        concurrent += 1;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        try {
+          // No await before re-entering: this is the synchronous prefix.
+          const nested = withAgentStartLock(agentId, inner, coalesced);
+          innerCallsWhileOuterHeld = inner.mock.calls.length;
+          return await nested;
+        } finally {
+          concurrent -= 1;
+        }
+      },
+      coalesced,
+    );
+
+    expect(result).toBe("coalesced");
+    expect(innerCallsWhileOuterHeld).toBe(0);
+    expect(maxConcurrent).toBe(1);
+
+    // Deferred, not dropped.
+    await _settleDetachedAgentStartLockWorkForTesting();
+    expect(inner).toHaveBeenCalledTimes(1);
+    expect(maxConcurrent).toBe(1);
+  });
+
+  it("shares one follow-up across repeated re-entry so N promotions cost one extra pass", async () => {
+    // Claim-time cancellation can re-enter once per cancelled row. They must
+    // collapse into the single shared follow-up rather than queueing a pass
+    // each — that amplification is what this ticket removed.
+    const agentId = randomUUID();
+    const inner = vi.fn(async () => "inner");
+
+    await withAgentStartLock(
+      agentId,
+      async () => {
+        for (let i = 0; i < 5; i += 1) {
+          await withAgentStartLock(agentId, inner, coalesced);
+        }
+        return "outer";
+      },
+      coalesced,
+    );
+
+    await _settleDetachedAgentStartLockWorkForTesting();
+    expect(inner).toHaveBeenCalledTimes(1);
+  });
+
   it("caps nesting depth by detaching the deepest call instead of dropping it", async () => {
     const ids = Array.from({ length: 6 }, () => randomUUID());
     const calls: string[] = [];

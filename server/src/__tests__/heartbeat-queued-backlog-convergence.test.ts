@@ -837,4 +837,305 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     );
     expect(cancellationEvents).toHaveLength(1);
   }, 60_000);
+
+  /**
+   * Shared fixture for the two traversal regressions below.
+   *
+   * Both need a queue deeper than one pass may read (SCAN_LIMIT *
+   * MAX_SCAN_BATCHES = 2,000 rows) whose rows are all *claimable*. The earlier
+   * ceiling fixture made its deep prefix dependency-blocked, which is exactly
+   * why it could not catch either bug: nothing was ever claimed, so the
+   * claim-time cursor handling was never exercised.
+   *
+   * The head window is issue-less runs — the shape every GitHub PR-review wake
+   * has, and the shape of the production backlog this ticket came from. It also
+   * keeps the fixture cheap: no issue rows to seed and no dependency-readiness
+   * resolution per batch.
+   */
+  async function seedDeepClaimableBacklog(options: {
+    maxConcurrentRuns: number;
+    issuelessRows: number;
+  }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issuePrefix = `D${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "DeepCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "DeepAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: { wakeOnDemand: true, maxConcurrentRuns: options.maxConcurrentRuns },
+      },
+      permissions: {},
+    });
+
+    // Every row is old enough to have passed the starvation escalation floor,
+    // so ranking is decided by issue priority rather than by age.
+    const baseTime = Date.now() - 12 * 60 * 60 * 1000;
+    let issueNumber = 0;
+
+    const addIssueBackedRun = async (priority: string, ageMs: number) => {
+      issueNumber += 1;
+      const issueId = randomUUID();
+      const runId = randomUUID();
+      const wakeId = randomUUID();
+      const at = new Date(baseTime + ageMs);
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: `Issue ${issueNumber} (${priority})`,
+        status: "todo",
+        priority,
+        assigneeAgentId: agentId,
+        issueNumber,
+        identifier: `${issuePrefix}-${issueNumber}`,
+      });
+      await db.insert(agentWakeupRequests).values({
+        id: wakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId },
+        status: "queued",
+        runId,
+        requestedAt: at,
+        updatedAt: at,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: wakeId,
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+        createdAt: at,
+        updatedAt: at,
+      });
+      return runId;
+    };
+
+    const wakeRows: Array<typeof agentWakeupRequests.$inferInsert> = [];
+    const runRows: Array<typeof heartbeatRuns.$inferInsert> = [];
+    for (let i = 0; i < options.issuelessRows; i += 1) {
+      const runId = randomUUID();
+      const wakeId = randomUUID();
+      const at = new Date(baseTime + i * 1000);
+      wakeRows.push({
+        id: wakeId,
+        companyId,
+        agentId,
+        source: "timer",
+        triggerDetail: "system",
+        reason: "heartbeat_timer",
+        payload: {},
+        status: "queued",
+        runId,
+        requestedAt: at,
+        updatedAt: at,
+      });
+      runRows.push({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "timer",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: wakeId,
+        contextSnapshot: { wakeReason: "heartbeat_timer" },
+        createdAt: at,
+        updatedAt: at,
+      });
+    }
+    // Chunked: one statement for thousands of rows would blow past Postgres'
+    // 65,535 bind-parameter limit.
+    for (let i = 0; i < wakeRows.length; i += 500) {
+      await db.insert(agentWakeupRequests).values(wakeRows.slice(i, i + 500));
+    }
+    for (let i = 0; i < runRows.length; i += 500) {
+      await db.insert(heartbeatRuns).values(runRows.slice(i, i + 500));
+    }
+
+    return {
+      companyId,
+      agentId,
+      /** Issue-less run ids, oldest first. Index is queue position. */
+      issuelessRunIds: runRows.map((row) => row.id as string),
+      addIssueBackedRun,
+      /** Ages that sort after every issue-less row. */
+      pastWindowAgeMs: (n: number) => options.issuelessRows * 1000 + n * 1000,
+      /** An age that lands inside the head window, behind a boundary cursor. */
+      insideWindowAgeMs: (n: number) => n * 1000 + 500,
+    };
+  }
+
+  /** Hold every adapter execution open until the test releases it. */
+  function gateAdapterExecutions() {
+    const result = {
+      exitCode: 0,
+      signal: null as string | null,
+      timedOut: false,
+      errorMessage: null as string | null,
+      resultJson: { exitCode: 0 },
+      provider: "test",
+      model: "test-model",
+    };
+    const started: string[] = [];
+    const releases: Array<() => void> = [];
+    const releaseAll = () => {
+      while (releases.length > 0) releases.shift()!();
+    };
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      started.push(args.runId);
+      await new Promise<void>((resolve) => releases.push(resolve));
+      return result;
+    });
+    return {
+      started,
+      releaseAll,
+      /** Stop holding executions, so any straggler can finish and the suite can drain. */
+      disarm: () => {
+        mockAdapterExecute.mockImplementation(async () => result);
+        releaseAll();
+      },
+      waitForStarted: async (count: number, timeoutMs = 60_000) => {
+        const deadline = Date.now() + timeoutMs;
+        while (started.length < count && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        return started.length;
+      },
+    };
+  }
+
+  /** Cancel whatever is still queued so the backlog cannot keep draining. */
+  async function stopBacklog(agentId: string) {
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled" })
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued")));
+  }
+
+  it("ranks a critical row globally, not just within the bounded scan window", async () => {
+    // BLO-20396 (fourth review follow-up). Priority must not be scoped to the
+    // SCAN_LIMIT * MAX_SCAN_BATCHES rows one pass may read. Collection walks the
+    // queue oldest-first, so a `critical` row sitting behind more than that many
+    // CLAIMABLE rows was never even ranked against them, and under a replenished
+    // backlog it could wait indefinitely.
+    const { agentId, addIssueBackedRun, pastWindowAgeMs } = await seedDeepClaimableBacklog({
+      maxConcurrentRuns: 1,
+      issuelessRows: 2_000,
+    });
+    const adapter = gateAdapterExecutions();
+
+    for (let i = 0; i < 5; i += 1) await addIssueBackedRun("low", pastWindowAgeMs(i));
+    const criticalRunId = await addIssueBackedRun("critical", pastWindowAgeMs(5));
+
+    await heartbeat.resumeQueuedRuns();
+    expect(await adapter.waitForStarted(1)).toBe(1);
+    expect(adapter.started[0]).toBe(criticalRunId);
+
+    await stopBacklog(agentId);
+    adapter.disarm();
+    await heartbeat.drainInFlightExecutions(60_000);
+  }, 600_000);
+
+  it("resumes forward after a claim instead of restarting the scan at the head", async () => {
+    // BLO-20396 (fourth review follow-up). A claim used to clear the resume
+    // cursor, so the next pass restarted at the head and re-ranked the same
+    // window. The queue then drained one slot at a time from the front and
+    // never advanced, which is what kept work behind a deep backlog unreachable
+    // even when priority was equal.
+    //
+    // Every row here is issue-less and equal-ranked: no priority lane, no
+    // completion-triggered issue continuation. Position is the only variable,
+    // so what the second pass claims says exactly where it started scanning.
+    const { agentId, issuelessRunIds } = await seedDeepClaimableBacklog({
+      maxConcurrentRuns: 1,
+      issuelessRows: 4_100,
+    });
+    const adapter = gateAdapterExecutions();
+    const windowRows = 2_000;
+
+    // The first pass reads the first 2,000 rows and claims the oldest.
+    await heartbeat.resumeQueuedRuns();
+    expect(await adapter.waitForStarted(1)).toBe(1);
+    expect(adapter.started[0]).toBe(issuelessRunIds[0]);
+
+    // Free the slot. The next pass must continue from the scan boundary, so it
+    // claims the oldest row PAST the window — not the head's second row.
+    adapter.releaseAll();
+    expect(await adapter.waitForStarted(2)).toBe(2);
+    const claimedPosition = issuelessRunIds.indexOf(adapter.started[1]);
+    expect(claimedPosition).toBeGreaterThanOrEqual(windowRows);
+
+    await stopBacklog(agentId);
+    adapter.disarm();
+    await heartbeat.drainInFlightExecutions(60_000);
+  }, 600_000);
+
+  it("reaches a critical row behind the cursor while earlier claims are still executing", async () => {
+    // BLO-20396 (fourth review follow-up). The dangerous shape is a row that
+    // becomes eligible BEHIND the scan cursor — a deferral or promotion
+    // re-queues with its ORIGINAL createdAt — while the runs already claimed
+    // are long-running, so no completion is coming to re-enter dispatch at the
+    // head. It must still be reached, off the back of a slot freeing up rather
+    // than off the back of a completion.
+    const { agentId, addIssueBackedRun, pastWindowAgeMs, insideWindowAgeMs } =
+      await seedDeepClaimableBacklog({ maxConcurrentRuns: 2, issuelessRows: 2_000 });
+    const adapter = gateAdapterExecutions();
+
+    // Fill both slots and install a resume cursor at the window boundary. The
+    // claim loop stops at the slot limit, so the rest of the window is left
+    // queued and untouched.
+    await heartbeat.resumeQueuedRuns();
+    expect(await adapter.waitForStarted(2)).toBe(2);
+
+    // A row that becomes eligible behind the cursor, plus one ahead of it for
+    // the resumed pass to claim.
+    const strandedRunId = await addIssueBackedRun("critical", insideWindowAgeMs(500));
+    await addIssueBackedRun("low", pastWindowAgeMs(0));
+
+    // A top-level wake now records head-rescan demand: dispatch is mid-queue,
+    // so the pass this wake folds into will not look at the head. Both slots
+    // are full, so it claims nothing.
+    await heartbeat.resumeQueuedRuns();
+    expect(adapter.started).toHaveLength(2);
+
+    // Free both slots WITHOUT completing the runs — they are still executing,
+    // which is exactly the "claimed run is long-running" case. Silence past the
+    // staleness floor drops them out of the slot gate.
+    const longSilence = new Date(Date.now() - 60 * 60 * 1000);
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt: longSilence, lastOutputAt: longSilence, lastUsefulActionAt: longSilence })
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")));
+
+    await heartbeat.resumeQueuedRuns();
+
+    // That pass resumed past the cursor and claimed the row it found there, and
+    // the stranded row is still picked up in the same round — neither of the
+    // two long-running claims will ever complete to trigger a pass for it.
+    expect(await adapter.waitForStarted(4)).toBe(4);
+    expect(adapter.started).toContain(strandedRunId);
+
+    await stopBacklog(agentId);
+    adapter.disarm();
+    await heartbeat.drainInFlightExecutions(60_000);
+  }, 600_000);
 });
