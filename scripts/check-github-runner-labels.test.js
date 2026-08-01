@@ -18,7 +18,7 @@ test("runner-label guard accepts only ARC workflows", async (t) => {
     await mkdir(path.join(root, ".github/workflows"), { recursive: true });
     await writeFile(
       path.join(root, ".github/workflows/arc.yml"),
-      "jobs:\n  check:\n    runs-on: default\n  aggregate:\n    runs-on: arc-light\n  image:\n    runs-on: arc-dind\n  release:\n    runs-on: arc-deploy\n  browser:\n    runs-on: arc-e2e\n",
+      "jobs:\n  check:\n    runs-on: default\n  quoted:\n    runs-on: \"default\"\n  aggregate:\n    runs-on: [arc-light, arc-dind]\n  release:\n    runs-on:\n      group: arc-deploy\n  browser:\n    runs-on:\n      - arc-e2e\n",
     );
 
     const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
@@ -35,6 +35,19 @@ test("runner-label guard accepts only ARC workflows", async (t) => {
     assert.equal(result.status, 1);
     assert.match(result.stderr, /hosted\.yml:3: runs-on: ubuntu-latest/);
     assert.match(result.stderr, /hosted\.yml:5: runs-on: self-hosted/);
+  });
+
+  await t.test("rejects forbidden labels in YAML block forms", async () => {
+    await writeFile(
+      path.join(root, ".github/workflows/block.yml"),
+      "jobs:\n  hosted:\n    runs-on:\n      - self-hosted\n      - linux\n  grouped:\n    runs-on:\n      group: ubuntu-hosted\n",
+    );
+
+    const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /block\.yml:4: - self-hosted/);
+    assert.match(result.stderr, /block\.yml:5: - linux/);
+    assert.match(result.stderr, /block\.yml:8: group: ubuntu-hosted/);
   });
 
   await t.test("rejects unknown runner labels", async () => {

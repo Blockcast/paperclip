@@ -8,15 +8,116 @@ const workflowFiles = (await readdir(workflowsDir))
 const ALLOWED_RUNNERS = new Set(["default", "arc-light", "arc-dind", "arc-deploy", "arc-e2e"]);
 const violations = [];
 
+function stripInlineComment(value) {
+  let quote = null;
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if ((char === '"' || char === "'") && value[index - 1] !== "\\") {
+      quote = quote === char ? null : quote ?? char;
+      continue;
+    }
+    if (char === "#" && quote === null) {
+      return value.slice(0, index);
+    }
+  }
+  return value;
+}
+
+function unquote(value) {
+  const trimmed = stripInlineComment(value).trim();
+  if (trimmed.length >= 2) {
+    const first = trimmed[0];
+    const last = trimmed[trimmed.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      return trimmed.slice(1, -1);
+    }
+  }
+  return trimmed;
+}
+
+function splitInlineList(value) {
+  const trimmed = stripInlineComment(value).trim();
+  if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) return null;
+  const body = trimmed.slice(1, -1);
+  const entries = [];
+  let quote = null;
+  let current = "";
+  for (let index = 0; index < body.length; index += 1) {
+    const char = body[index];
+    if ((char === '"' || char === "'") && body[index - 1] !== "\\") {
+      quote = quote === char ? null : quote ?? char;
+    }
+    if (char === "," && quote === null) {
+      if (current.trim()) entries.push(unquote(current));
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  if (current.trim()) entries.push(unquote(current));
+  return entries;
+}
+
+function valuesFromScalar(value) {
+  const inlineList = splitInlineList(value);
+  if (inlineList) return inlineList;
+  const scalar = unquote(value);
+  return scalar ? [scalar] : [];
+}
+
+function leadingSpaces(line) {
+  return line.match(/^ */)?.[0].length ?? 0;
+}
+
+function extractRunsOnEntries(lines, runsOnLineIndex, rawValue) {
+  const sourceLine = lines[runsOnLineIndex].trim();
+  const inlineValues = valuesFromScalar(rawValue);
+  if (inlineValues.length > 0) {
+    return inlineValues.map((value) => ({ value, lineNumber: runsOnLineIndex + 1, sourceLine }));
+  }
+
+  const entries = [];
+  const runsOnIndent = leadingSpaces(lines[runsOnLineIndex]);
+  for (let index = runsOnLineIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = stripInlineComment(line).trim();
+    if (!trimmed) continue;
+    const indent = leadingSpaces(line);
+    if (indent <= runsOnIndent) break;
+
+    if (trimmed.startsWith("- ")) {
+      for (const value of valuesFromScalar(trimmed.slice(2))) {
+        entries.push({ value, lineNumber: index + 1, sourceLine: line.trim() });
+      }
+      continue;
+    }
+
+    const mapMatch = trimmed.match(/^[A-Za-z0-9_-]+:\s*(.*)$/);
+    if (mapMatch) {
+      const mapValue = mapMatch[1] ?? "";
+      for (const value of valuesFromScalar(mapValue)) {
+        entries.push({ value, lineNumber: index + 1, sourceLine: line.trim() });
+      }
+    }
+  }
+
+  return entries.length > 0
+    ? entries
+    : [{ value: "", lineNumber: runsOnLineIndex + 1, sourceLine }];
+}
+
 for (const file of workflowFiles) {
   const lines = (await readFile(path.join(workflowsDir, file), "utf8")).split("\n");
 
   for (const [index, line] of lines.entries()) {
-    const runner = line.match(/^\s*runs-on:\s*(.*?)\s*(?:#.*)?$/)?.[1];
-    if (!runner) continue;
+    const match = line.match(/^\s*runs-on:\s*(.*)$/);
+    if (!match) continue;
 
-    if (!ALLOWED_RUNNERS.has(runner)) {
-      violations.push(`${file}:${index + 1}: ${line.trim()}`);
+    const entries = extractRunsOnEntries(lines, index, match[1] ?? "");
+    for (const entry of entries) {
+      if (!entry.value || !ALLOWED_RUNNERS.has(entry.value)) {
+        violations.push(`${file}:${entry.lineNumber}: ${entry.sourceLine}`);
+      }
     }
   }
 }
