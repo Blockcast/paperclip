@@ -31,7 +31,8 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
 export const DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS = 6;
 // How long a linked `pending` approval may suppress the `long_active_duration` trigger.
 // Must stay comfortably above the long-active threshold or the gate would expire before it
-// ever engages. Past this age the gate has itself become the stuck thing: an approval nobody
+// ever engages — `buildThresholds` clamps overrides up to `longActiveMs` to enforce that.
+// Past this age the gate has itself become the stuck thing: an approval nobody
 // has decided in a day is exactly the condition the detector exists to surface, so the
 // suppression lapses and reviews resume.
 export const DEFAULT_PRODUCTIVITY_REVIEW_APPROVAL_GATE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -250,19 +251,32 @@ function isRoutineOriginRun(run: HeartbeatRunRow): boolean {
 }
 
 function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): ProductivityReviewThresholds {
+  const longActiveMs = readPositiveInteger(
+    overrides?.longActiveMs ?? DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS * 60 * 60 * 1000,
+    DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS * 60 * 60 * 1000,
+  );
+  const requestedApprovalGateMaxAgeMs = readPositiveInteger(
+    overrides?.approvalGateMaxAgeMs ?? DEFAULT_PRODUCTIVITY_REVIEW_APPROVAL_GATE_MAX_AGE_MS,
+    DEFAULT_PRODUCTIVITY_REVIEW_APPROVAL_GATE_MAX_AGE_MS,
+  );
+  // The gate is only reachable while it outlives the trigger it suppresses: a gate that expires
+  // at or before `longActiveMs` is already stale by the time the first long-active review would
+  // fire, silently disabling the feature. The two are read independently above, so an override
+  // pair can violate the invariant the constant's comment states — clamp instead of trusting it.
+  const approvalGateMaxAgeMs = Math.max(requestedApprovalGateMaxAgeMs, longActiveMs);
+  if (approvalGateMaxAgeMs !== requestedApprovalGateMaxAgeMs) {
+    logger.warn(
+      { requestedApprovalGateMaxAgeMs, longActiveMs, approvalGateMaxAgeMs },
+      "productivity review approvalGateMaxAgeMs was at or below longActiveMs; clamped so the approval gate can engage",
+    );
+  }
   return {
     noCommentStreakRuns: readPositiveInteger(
       overrides?.noCommentStreakRuns ?? DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
       DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
     ),
-    longActiveMs: readPositiveInteger(
-      overrides?.longActiveMs ?? DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS * 60 * 60 * 1000,
-      DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS * 60 * 60 * 1000,
-    ),
-    approvalGateMaxAgeMs: readPositiveInteger(
-      overrides?.approvalGateMaxAgeMs ?? DEFAULT_PRODUCTIVITY_REVIEW_APPROVAL_GATE_MAX_AGE_MS,
-      DEFAULT_PRODUCTIVITY_REVIEW_APPROVAL_GATE_MAX_AGE_MS,
-    ),
+    longActiveMs,
+    approvalGateMaxAgeMs,
     highChurnHourly: readPositiveInteger(
       overrides?.highChurnHourly ?? DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
       DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,

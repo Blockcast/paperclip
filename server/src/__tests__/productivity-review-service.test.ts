@@ -699,6 +699,34 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.approvalGatedSuppressed).toBe(0);
   });
 
+  // `longActiveMs` and `approvalGateMaxAgeMs` are read independently from overrides, so a
+  // config pair can put the gate's expiry at or below the trigger it suppresses — the gate
+  // would then always be stale by the time a long-active review is considered, silently
+  // disabling the feature. `buildThresholds` clamps the gate up to `longActiveMs`.
+  it("clamps an approval gate max age below the long-active threshold so the gate still engages", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    // Two hours old: stale against the requested 1h gate, fresh against the 6h clamp.
+    await linkApproval(seeded.companyId, seeded.issueId, "pending", {
+      createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: {
+        longActiveMs: 6 * 60 * 60 * 1000,
+        approvalGateMaxAgeMs: 60 * 60 * 1000,
+      },
+    });
+
+    expect(result.approvalGatedSuppressed).toBe(1);
+    expect(result.created).toBe(0);
+  });
+
   it("does not suppress no-comment productivity reviews when an approval is pending", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({ status: "in_progress" });
