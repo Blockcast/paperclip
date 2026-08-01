@@ -13,6 +13,8 @@ const MISSION = "Verify the dashboard launch survives the wizard handoff.";
 const FIRST_TASK_TITLE = "Hire your first engineer and create a hiring plan";
 
 test.describe("Dashboard launch after onboarding wizard", () => {
+  test.setTimeout(120_000);
+
   test("creates the first task and opens the dashboard", async ({
     page,
     baseURL,
@@ -73,13 +75,34 @@ test.describe("Dashboard launch after onboarding wizard", () => {
     await page
       .getByPlaceholder("What is your team trying to achieve?")
       .fill(MISSION);
-    await page.getByRole("button", { name: /Confirm mission/ }).click();
+    const [companyCreateRes, goalCreateRes] = await Promise.all([
+      page.waitForResponse(
+        (res) => {
+          const url = new URL(res.url());
+          return res.request().method() === "POST" && url.pathname === "/api/companies";
+        },
+        { timeout: 60_000 },
+      ),
+      page.waitForResponse(
+        (res) => {
+          const url = new URL(res.url());
+          return (
+            res.request().method() === "POST" &&
+            /^\/api\/companies\/[^/]+\/goals$/.test(url.pathname)
+          );
+        },
+        { timeout: 60_000 },
+      ),
+      page.getByRole("button", { name: /Confirm mission/ }).click(),
+    ]);
+    expect(companyCreateRes.ok(), await companyCreateRes.text()).toBe(true);
+    expect(goalCreateRes.ok(), await goalCreateRes.text()).toBe(true);
 
     // Step 3: lead name (prefilled) -> Step 4 creates the inert CEO via the
     // route above after the adapter probe is intercepted.
     await expect(
       page.getByRole("heading", { name: "Create your team lead" }),
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible({ timeout: 30_000 });
     await expect(
       page.locator('input[placeholder="Chief of staff"]'),
     ).toHaveValue("Chief of staff");

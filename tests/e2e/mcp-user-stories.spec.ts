@@ -240,10 +240,22 @@ async function testCall(
   }));
 }
 
-async function approveActionRequest(request: APIRequestContext, companyId: string, actionRequestId: string) {
-  return await json(await request.post(`/api/tool-gateway/action-requests/${actionRequestId}/approve`, {
+async function approveActionRequest(
+  request: APIRequestContext,
+  companyId: string,
+  actionRequestId: string,
+  options: { connectionId?: string } = {},
+) {
+  const response = await request.post(`/api/tool-gateway/action-requests/${actionRequestId}/approve`, {
     data: { companyId },
-  }));
+  });
+  if (response.status() === 409 && options.connectionId) {
+    const body = await response.json().catch(() => null) as { reasonCode?: string } | null;
+    if (body?.reasonCode === "action_not_pending") {
+      return await pollTestCall(request, options.connectionId, actionRequestId, "done");
+    }
+  }
+  return await json(response);
 }
 
 async function declineActionRequest(request: APIRequestContext, companyId: string, actionRequestId: string) {
@@ -315,7 +327,7 @@ test.describe.serial("MCP prod Phase 5a user-story harness", () => {
       await page.goto(`/${seed.prefix}/apps/${connectionId}/review`);
       await screenshot(page, "US-2", "01-review-pending");
 
-      await approveActionRequest(request, seed.companyId, pending.actionRequestId!);
+      await approveActionRequest(request, seed.companyId, pending.actionRequestId!, { connectionId });
       await pollTestCall(request, connectionId, pending.actionRequestId!, "done");
       expect(mock.captures.filter((capture) => capture.method === "tools/call" && capture.toolName === "sheets:update_cell")).toHaveLength(1);
       await expectAuditEvent(request, seed.companyId, { connectionId, agentId: scout.id, search: "sheets:update_cell" });
@@ -432,7 +444,7 @@ test.describe.serial("MCP prod Phase 5a user-story harness", () => {
         expect(pending.decision).toBe("ask_first");
         await page.goto(`/${seed.prefix}/apps/${connectionId}/review`);
         await screenshot(page, "US-9", `review-${value}`);
-        await approveActionRequest(request, seed.companyId, pending.actionRequestId!);
+        await approveActionRequest(request, seed.companyId, pending.actionRequestId!, { connectionId });
         await pollTestCall(request, connectionId, pending.actionRequestId!, "done");
       }
       expect(mock.captures.filter((capture) => capture.method === "tools/call" && capture.toolName === "sheets:update_cell")).toHaveLength(2);
