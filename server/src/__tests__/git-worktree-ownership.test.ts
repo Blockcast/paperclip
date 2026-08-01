@@ -370,6 +370,25 @@ describe("concurrent runs sharing one worktree registry (BLO-19607)", () => {
     expect(calls).not.toContainEqual(["worktree", "unlock", "/missing-owned"]);
   });
 
+  it("refuses to prune a stale registration when the worktree registry cannot be read", async () => {
+    const calls: string[][] = [];
+    const result = await pruneOwnStaleGitWorktree({
+      git: async (args) => {
+        calls.push(args);
+        if (args.join(" ") === "worktree list --porcelain") throw new Error("registry unavailable");
+        throw new Error(`unexpected git call: ${args.join(" ")}`);
+      },
+      repoRoot: "/repo",
+      worktreePath: "/missing-owned",
+      token: { branchName: "run-a", executionWorkspaceId: "workspace-a", runId: "run-a-2" },
+      normalizePath: async (value) => value,
+    });
+
+    expect(result.removed).toBe(false);
+    expect(result.warnings.join(" ")).toContain("registry unavailable");
+    expect(calls).toEqual([["worktree", "list", "--porcelain"]]);
+  });
+
   it("refuses to clean up a worktree owned by another run and reports why", async () => {
     const repo = createRepo();
     const runAPath = path.join(path.dirname(repo), "run-a");
@@ -395,6 +414,47 @@ describe("concurrent runs sharing one worktree registry (BLO-19607)", () => {
     const entry = parseGitWorktreeRegistrations(git(["worktree", "list", "--porcelain"], repo))
       .find((candidate) => normalizePathSync(candidate.worktree) === normalizePathSync(runAPath));
     expect(entry?.locked).toBe(true);
+  });
+
+  it("refuses cleanup authorization when the worktree registry cannot be read", async () => {
+    const authorization = await authorizeOwnedGitWorktreeCleanup({
+      git: async (args) => {
+        if (args.join(" ") === "worktree list --porcelain") throw new Error("registry unavailable");
+        throw new Error(`unexpected git call: ${args.join(" ")}`);
+      },
+      repoRoot: "/repo",
+      worktreePath: "/possibly-foreign",
+      token: { branchName: "run-a", executionWorkspaceId: "workspace-a", runId: "run-a" },
+      normalizePath: async (value) => value,
+    });
+
+    expect(authorization.authorized).toBe(false);
+    expect(authorization.warnings.join(" ")).toContain("registry unavailable");
+  });
+
+  it("keeps cleanup single-force when no registration matches the path", async () => {
+    const authorization = await authorizeOwnedGitWorktreeCleanup({
+      git: async (args) => {
+        if (args.join(" ") === "worktree list --porcelain") {
+          return [
+            "worktree /repo",
+            "branch refs/heads/main",
+            "",
+            "worktree /other",
+            "branch refs/heads/other",
+            "locked paperclip-owned branch=other workspace=workspace-other run=run-other",
+            "",
+          ].join("\n");
+        }
+        throw new Error(`unexpected git call: ${args.join(" ")}`);
+      },
+      repoRoot: "/repo",
+      worktreePath: "/missing-registration",
+      token: { branchName: "run-a", executionWorkspaceId: "workspace-a", runId: "run-a" },
+      normalizePath: async (value) => value,
+    });
+
+    expect(authorization).toEqual({ authorized: true, warnings: [], removeForce: "single" });
   });
 
   it("does not report a claim when the worktree is already locked by another owner", async () => {
@@ -494,7 +554,7 @@ describe("concurrent runs sharing one worktree registry (BLO-19607)", () => {
       normalizePath,
     });
 
-    expect(authorization).toEqual({ authorized: true, warnings: [] });
+    expect(authorization).toEqual({ authorized: true, warnings: [], removeForce: "single" });
   });
 });
 
@@ -516,6 +576,14 @@ describe("worktree ownership tokens", () => {
 
   it("does not claim ownership of a foreign lock", () => {
     expect(parseWorktreeOwnerLockReason("mounted on a usb stick")).toBeNull();
+  });
+
+  it("parses a workspace-owned lock even when the branch field is blank", () => {
+    expect(parseWorktreeOwnerLockReason("paperclip-owned branch=- workspace=ws-a run=run-a")).toEqual({
+      branchName: "",
+      executionWorkspaceId: "ws-a",
+      runId: "run-a",
+    });
   });
 
   it("parses locked and prunable attributes from porcelain output", () => {

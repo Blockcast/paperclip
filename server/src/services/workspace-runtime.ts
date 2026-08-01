@@ -4289,15 +4289,19 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         warnings.push(...authorization.warnings);
         if (authorization.authorized) {
           try {
+            const removeForceArgs = authorization.removeForce === "double"
+              ? ["--force", "--force"]
+              : ["--force"];
             await recordGitOperation(input.recorder, {
               phase: "worktree_cleanup",
-              args: ["worktree", "remove", "--force", "--force", workspacePath],
+              args: ["worktree", "remove", ...removeForceArgs, workspacePath],
               cwd: repoRoot,
               metadata: {
                 workspaceId: input.workspace.id,
                 workspacePath,
                 branchName: input.workspace.branchName,
                 cleanupAction: "worktree_remove",
+                removeForce: authorization.removeForce,
               },
               successMessage: `Removed git worktree ${workspacePath}\n`,
               failureLabel: `git worktree remove ${workspacePath}`,

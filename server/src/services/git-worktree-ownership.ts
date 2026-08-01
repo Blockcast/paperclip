@@ -88,12 +88,13 @@ export function parseWorktreeOwnerLockReason(reason: string | null | undefined):
     return value && value !== "-" ? value : null;
   };
 
-  const branchName = read("branch");
-  if (!branchName) return null;
+  const branchName = read("branch") ?? "";
+  const executionWorkspaceId = read("workspace");
+  if (!branchName && !executionWorkspaceId) return null;
 
   return {
     branchName,
-    executionWorkspaceId: read("workspace"),
+    executionWorkspaceId,
     runId: read("run"),
   };
 }
@@ -235,10 +236,19 @@ async function refreshOwnedGitWorktreeLockReason(input: {
 }
 
 function describeOwner(owner: GitWorktreeOwnerToken): string {
-  const parts = [`branch ${owner.branchName}`];
+  const parts = owner.branchName ? [`branch ${owner.branchName}`] : [];
   if (owner.executionWorkspaceId) parts.push(`execution workspace ${owner.executionWorkspaceId}`);
   if (owner.runId) parts.push(`run ${owner.runId}`);
-  return parts.join(", ");
+  return parts.join(", ") || "unknown owner";
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function describeUnreadableRegistry(action: string, worktreePath: string, error: unknown): string {
+  return `Refusing to ${action} git worktree "${worktreePath}": `
+    + `the git worktree registry could not be read (${getErrorMessage(error)}).`;
 }
 
 /**
@@ -297,7 +307,18 @@ export async function lockGitWorktreeForOwner(input: {
 
     // Git refuses to re-lock, so confirm the existing lock is ours rather than
     // reporting someone else's claim as our own.
-    const registration = await findGitWorktreeRegistration(input);
+    let registration: GitWorktreeRegistration | null = null;
+    try {
+      registration = await findGitWorktreeRegistration(input);
+    } catch (registrationError) {
+      return {
+        locked: false,
+        warnings: [
+          `Git worktree "${input.worktreePath}" is already locked, but its existing ownership `
+          + `metadata could not be read (${getErrorMessage(registrationError)}); this run did not claim it.`,
+        ],
+      };
+    }
     const verdict = registration
       ? classifyWorktreeOwnership(registration, input.token)
       : ({ kind: "unowned" } as const);
@@ -326,8 +347,8 @@ export async function readGitWorktreeRegistrations(input: {
   git: GitRunner;
   repoRoot: string;
 }): Promise<GitWorktreeRegistration[]> {
-  const raw = await input.git(["worktree", "list", "--porcelain"], input.repoRoot).catch(() => null);
-  return raw ? parseGitWorktreeRegistrations(raw) : [];
+  const raw = await input.git(["worktree", "list", "--porcelain"], input.repoRoot);
+  return parseGitWorktreeRegistrations(raw);
 }
 
 export async function findGitWorktreeRegistration(input: {
@@ -367,7 +388,15 @@ export async function pruneOwnStaleGitWorktree(input: {
   token: GitWorktreeOwnerToken;
   normalizePath: (value: string) => Promise<string>;
 }): Promise<WorktreeCleanupOutcome> {
-  const registration = await findGitWorktreeRegistration(input);
+  let registration: GitWorktreeRegistration | null = null;
+  try {
+    registration = await findGitWorktreeRegistration(input);
+  } catch (error) {
+    return {
+      removed: false,
+      warnings: [describeUnreadableRegistry("prune stale", input.worktreePath, error)],
+    };
+  }
   if (!registration) return { removed: true, warnings: [] };
 
   const verdict = classifyWorktreeOwnership(registration, input.token);
@@ -392,16 +421,26 @@ export async function pruneOwnStaleGitWorktree(input: {
   }
 
   try {
-    await input.git(["worktree", "remove", "--force", "--force", input.worktreePath], input.repoRoot);
+    const forceArgs = registration.locked ? ["--force", "--force"] : ["--force"];
+    await input.git(["worktree", "remove", ...forceArgs, input.worktreePath], input.repoRoot);
     return { removed: true, warnings: [] };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
     return {
       removed: false,
-      warnings: [`Could not clear stale git worktree registration "${input.worktreePath}" (${message}).`],
+      warnings: [`Could not clear stale git worktree registration "${input.worktreePath}" (${getErrorMessage(error)}).`],
     };
   }
 }
+
+export type WorktreeCleanupAuthorization = {
+  authorized: false;
+  warnings: string[];
+} | {
+  authorized: true;
+  warnings: string[];
+  /** Locked owned registrations need double-force; ambiguous/missing entries keep git's lock refusal as a backstop. */
+  removeForce: "single" | "double";
+};
 
 /**
  * Ownership check for teardown. Returns whether this run may destroy the
@@ -418,16 +457,26 @@ export async function authorizeOwnedGitWorktreeCleanup(input: {
   worktreePath: string;
   token: GitWorktreeOwnerToken;
   normalizePath: (value: string) => Promise<string>;
-}): Promise<{ authorized: boolean; warnings: string[] }> {
-  const registration = await findGitWorktreeRegistration(input);
+}): Promise<WorktreeCleanupAuthorization> {
+  let registration: GitWorktreeRegistration | null = null;
+  try {
+    registration = await findGitWorktreeRegistration(input);
+  } catch (error) {
+    return {
+      authorized: false,
+      warnings: [describeUnreadableRegistry("clean up", input.worktreePath, error)],
+    };
+  }
   // Nothing registered at this path: leave the decision to the caller, which
-  // still needs to clear the directory itself.
-  if (!registration) return { authorized: true, warnings: [] };
+  // still needs to clear the directory itself. Use only single-force so a
+  // foreign lock remains a git-enforced backstop if the path comparison missed
+  // a registration.
+  if (!registration) return { authorized: true, warnings: [], removeForce: "single" };
 
   const verdict = classifyWorktreeOwnership(registration, input.token);
   if (verdict.kind !== "owned") {
     return { authorized: false, warnings: [describeDeclinedCleanup("clean up", input.worktreePath, verdict)] };
   }
 
-  return { authorized: true, warnings: [] };
+  return { authorized: true, warnings: [], removeForce: registration.locked ? "double" : "single" };
 }
