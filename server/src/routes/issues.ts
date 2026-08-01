@@ -482,6 +482,16 @@ function readObject(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
+/**
+ * The withdrawal reason lives under a different key per interaction kind:
+ * `cancellationReason` on the question/task kinds, `reason` on the confirmation
+ * kinds. Read whichever the row carries so activity logs stay uniform.
+ */
+function readInteractionWithdrawalReason(interaction: { result?: unknown }): string | null {
+  const result = readObject(interaction.result);
+  return readNonEmptyString(result.cancellationReason) ?? readNonEmptyString(result.reason);
+}
+
 function hasOwn(record: Record<string, unknown>, key: string) {
   return Object.prototype.hasOwnProperty.call(record, key);
 }
@@ -10696,7 +10706,7 @@ export function issueRoutes(
       assertBoard(req);
 
       const actor = getActorInfo(req);
-      const interaction = await issueThreadInteractionService(db).cancelQuestions(issue, interactionId, req.body, {
+      const interaction = await issueThreadInteractionService(db).withdrawInteraction(issue, interactionId, req.body, {
         agentId: actor.agentId,
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
@@ -10715,10 +10725,7 @@ export function issueRoutes(
           interactionId: interaction.id,
           interactionKind: interaction.kind,
           interactionStatus: interaction.status,
-          cancellationReason:
-            interaction.kind === "ask_user_questions"
-              ? (interaction.result?.cancellationReason ?? null)
-              : null,
+          cancellationReason: readInteractionWithdrawalReason(interaction),
         },
       });
 
@@ -10729,6 +10736,100 @@ export function issueRoutes(
         actor,
         source: "issue.interaction.cancel",
       });
+
+      res.json(interaction);
+    },
+  );
+
+  // Agent-reachable withdrawal. Deliberately a separate route from /cancel so
+  // the five board-only resolution routes (accept, reject, respond, verdicts,
+  // cancel) keep calling rejectAgentIssueThreadInteractionResolution unchanged —
+  // widening that shared guard would leak agent access into all five.
+  router.post(
+    "/issues/:id/interactions/:interactionId/withdraw",
+    // Same body as /cancel: an optional free-text reason.
+    validate(cancelIssueThreadInteractionSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const interactionId = req.params.interactionId as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+
+      const actor = getActorInfo(req);
+      let requireCreatedByAgentId: string | null = null;
+      if (req.actor.type === "agent") {
+        // Task-watchdog runs stay confined to their watched subtree; this is the
+        // same scoping the board-only routes apply before rejecting agents.
+        if (!(await assertTaskWatchdogIssueMutationAllowed(req, res, issue, { allowWatchdogIssue: false }))) return;
+        // Interactions are control-plane state, so a low-trust-review agent that
+        // cannot create them must not be able to withdraw them either.
+        if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
+        // Creator ownership limits which card can be withdrawn, but does not
+        // replace the issue-level trust boundary. Check that boundary without
+        // applying checkout ownership: stale-card cleanup must remain possible
+        // after another agent has taken over the issue.
+        const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
+        if (!boundaryDecision.allowed) {
+          respondIssueBoundaryDenied(res, boundaryDecision);
+          return;
+        }
+        // Without a run id the watchdog scope above resolves to "none" and
+        // silently stops confining the caller, so require one exactly as the
+        // create route does. It also keeps the activity row run-attributed.
+        if (!requireAgentRunId(req, res)) return;
+        if (!actor.agentId) {
+          res.status(403).json({
+            error: "Agent actors must resolve to an agent id to withdraw an issue-thread interaction",
+          });
+          return;
+        }
+        // Ownership is re-checked inside the service against createdByAgentId,
+        // including in the UPDATE ... WHERE, so this cannot be raced.
+        requireCreatedByAgentId = actor.agentId;
+      } else {
+        assertBoard(req);
+      }
+
+      const interaction = await issueThreadInteractionService(db).withdrawInteraction(
+        issue,
+        interactionId,
+        req.body,
+        {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+        { requireCreatedByAgentId },
+      );
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.thread_interaction_withdrawn",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          interactionId: interaction.id,
+          interactionKind: interaction.kind,
+          interactionStatus: interaction.status,
+          cancellationReason: readInteractionWithdrawalReason(interaction),
+        },
+      });
+
+      // Self-withdrawal must not re-enter the active assignee run. A board user
+      // (or any future non-assignee actor) still has to resume the waiting agent.
+      if (actor.agentId !== issue.assigneeAgentId) {
+        queueResolvedInteractionContinuationWakeup({
+          heartbeat,
+          issue,
+          interaction,
+          actor,
+          source: "issue.interaction.withdraw",
+        });
+      }
 
       res.json(interaction);
     },
