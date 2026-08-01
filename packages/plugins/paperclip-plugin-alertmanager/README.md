@@ -17,11 +17,13 @@ See `docs/specs/2026-04-29-alertmanager-plugin-spec.md` for the full design.
   delivery (constant-time compare).
 - Parses the AM v2 envelope, drops malformed / unsupported-version payloads
   with a 200 (so AM doesn't retry-storm).
-- Deduplicates by `alert.fingerprint` per spec §5.3 — re-fires bump the
-  state row and refresh the issue body, they don't create a second issue.
-- Re-opens issues the plugin auto-cancelled on resolve when the same
-  fingerprint re-fires (§8.3 option A), while preserving operator-cancelled
-  suppressions.
+- Drops `severity=info` before issue or state mutation and honors
+  `paperclip_issue: "false"` at every severity.
+- Aggregates firing series by alert name into one issue, with durable member
+  state so one resolved series cannot close an issue while another is firing.
+- Assigns a configured named fallback agent when email/owner-map routing does
+  not resolve; missing or ambiguous fallback configuration fails closed.
+- Re-opens a terminal shared issue when any member series re-fires.
 - Resolves issues per `autoCloseOnResolve`: either close the issue (status
   → cancelled) or post an `Alert resolved at <ts>` comment.
 - Renders observability drill-in links (Grafana / Tempo / Pyroscope / Hubble
@@ -59,6 +61,7 @@ Configured per-instance via the host's plugin settings UI. Schema lives in
 | `autoCloseOnResolve` | boolean | no       | Defaults to true (status → cancelled). Set false for comment-only. |
 | `ownerMap`           | object  | no       | `{ <labelKey>: { <labelValue>: <email> } }`. |
 | `issueRouteMap`      | object  | no       | `{ <labelKey>: { <labelValue>: { projectId, goalId, assigneeAgentId, status } } }`. |
+| `fallbackAgentName`  | string  | conditionally | Exact agent name used when no user owner resolves. Ownerless creation is refused if this is missing or ambiguous. |
 
 ### Example `AlertmanagerConfig` YAML
 
@@ -124,6 +127,7 @@ issueRouteMap:
       goalId: 94c9f942-7067-4fde-a313-b3ee30d72f70
       assigneeAgentId: d2ade02d-112c-4da2-b61f-2301254a154c
       status: todo
+fallbackAgentName: Alert Triage
 ```
 
 The bundled Blockcast plugin ships these `class` routes as defaults so fresh
@@ -162,7 +166,10 @@ First hit wins:
 1. `alert.labels.paperclip_assignee_email`
 2. `ownerMap[<label>][<value>]` matched against `alert.labels`
 3. `alert.annotations.paperclip_assignee_email`
-4. unassigned
+4. the exact configured `fallbackAgentName`
+
+If no mapped user or unique fallback agent resolves, the delivery emits
+`alertmanager.owner.fallback_failed` and creates no issue.
 
 Resolved emails are looked up against `ctx.users.findByEmail` and cached
 per email in plugin state (`owner-by-email:<email>`). Negative results are
@@ -176,6 +183,38 @@ cached too (empty string) so a missing user doesn't cause repeated lookups.
 | warning  | high     |
 | info     | medium   |
 | (other)  | medium   |
+
+`info` remains explicit in the mapping for compatibility, but the creation
+floor runs first, so it creates no issue. Accepted `critical`, `warning`, and
+custom severities continue through this mapping.
+
+### Aggregate identity and lifecycle
+
+The canonical issue key is
+`alert-aggregate:v1:[<alertname>,<paperclip_dedupe_domain-or-null>]` and is
+stored as `originId`. Without an explicit domain, all simultaneous series for
+one alert name share one issue. Set the `paperclip_dedupe_domain` label or
+annotation to a stable resource identity when an alert rule intentionally
+requires resource-level issues, preserving the contract established by
+[BLO-10274](/BLO/issues/BLO-10274) instead of silently discarding it.
+
+Aggregate/member rows live in the plugin-owned database namespace. A partial
+unique index on Paperclip issues makes concurrent first deliveries converge on
+one issue; an atomic final-resolution claim applies the configured close/comment
+policy once, only after no members remain firing. Re-fires mark the member
+firing again and reopen a completed shared issue.
+
+### Channel precision policy
+
+The post-change target is at least 70% actionable issues, measured as a 14-day
+cancellation rate at or below 30%. The pre-change baseline from
+[BLO-20576](/BLO/issues/BLO-20576) is 73.6% cancelled. If the first 14-day
+cohort remains above 36.8% cancelled (less than a 50% improvement), opt the
+noisiest rules out with `paperclip_issue: "false"`, review their thresholds and
+dedupe domains, and require a calibrated replay before re-enabling issue
+creation. Two CEO sweeps independently filed [BLO-20576](/BLO/issues/BLO-20576)
+and [BLO-20589](/BLO/issues/BLO-20589) within 36 minutes; reducing duplicate
+intake also removes that redundant-triage amplification.
 
 ### Observability drill-in links
 

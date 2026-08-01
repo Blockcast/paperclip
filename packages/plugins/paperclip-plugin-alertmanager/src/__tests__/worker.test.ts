@@ -78,6 +78,7 @@ const baseConfig = (
   severityToPriority: { critical: "critical", warning: "high", info: "medium" },
   autoCloseOnResolve: false,
   ownerMap: { team: { platform: "alice@example.com" } },
+  fallbackAgentName: "Alert Fallback",
   ...overrides,
 });
 
@@ -98,6 +99,7 @@ const baseInput = (
 // ---------------------------------------------------------------------------
 
 interface MockClients {
+  db: { query: ReturnType<typeof vi.fn>; execute: ReturnType<typeof vi.fn>; namespace: string };
   state: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn>; delete: ReturnType<typeof vi.fn> };
   users: { get: ReturnType<typeof vi.fn>; findByEmail: ReturnType<typeof vi.fn> };
   issues: {
@@ -107,6 +109,7 @@ interface MockClients {
     update: ReturnType<typeof vi.fn>;
     createComment: ReturnType<typeof vi.fn>;
   };
+  agents: { list: ReturnType<typeof vi.fn> };
   events: { emit: ReturnType<typeof vi.fn> };
   metrics: { write: ReturnType<typeof vi.fn> };
   activity: { log: ReturnType<typeof vi.fn> };
@@ -119,11 +122,94 @@ interface MockClients {
 }
 
 const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
+  const aggregates = new Map<string, Record<string, unknown>>();
+  const members = new Map<string, { firing: boolean }>();
+  const stateValues = new Map<string, unknown>();
   const mocks: MockClients = {
+    db: {
+      namespace: "alertmanager_test",
+      execute: vi.fn(async (sql: string, params: unknown[] = []) => {
+        if (sql.includes("INSERT INTO alert_aggregates")) {
+          const [key, companyId, alertname, severity] = params as string[];
+          const current = aggregates.get(key);
+          aggregates.set(key, {
+            aggregate_key: key,
+            company_id: companyId,
+            paperclip_issue_id: current?.paperclip_issue_id ?? null,
+            alertname,
+            severity,
+            assignee_user_id: current?.assignee_user_id ?? null,
+            assignee_agent_id: current?.assignee_agent_id ?? null,
+            final_resolved_at: null,
+            resolution_claim: null,
+          });
+          return { rowCount: 1 };
+        }
+        if (sql.includes("INSERT INTO alert_members")) {
+          const [key, fingerprint] = params as string[];
+          members.set(`${key}:${fingerprint}`, { firing: true });
+          return { rowCount: 1 };
+        }
+        if (sql.includes("SET paperclip_issue_id")) {
+          const [key, issueId, userId, agentId] = params as string[];
+          const aggregate = aggregates.get(key);
+          if (aggregate) {
+            aggregate.paperclip_issue_id ??= issueId;
+            aggregate.assignee_user_id ??= userId;
+            aggregate.assignee_agent_id ??= agentId;
+          }
+          return { rowCount: aggregate ? 1 : 0 };
+        }
+        if (sql.includes("UPDATE alert_members")) {
+          const [key, fingerprint] = params as string[];
+          const member = members.get(`${key}:${fingerprint}`);
+          if (!member?.firing) return { rowCount: 0 };
+          member.firing = false;
+          return { rowCount: 1 };
+        }
+        if (sql.includes("SET resolution_claim =")) {
+          const [key, claim] = params as string[];
+          const aggregate = aggregates.get(key);
+          const hasFiring = [...members.entries()].some(
+            ([memberKey, member]) => memberKey.startsWith(`${key}:`) && member.firing,
+          );
+          if (!aggregate || hasFiring || aggregate.resolution_claim || aggregate.final_resolved_at) {
+            return { rowCount: 0 };
+          }
+          aggregate.resolution_claim = claim;
+          return { rowCount: 1 };
+        }
+        if (sql.includes("SET final_resolved_at")) {
+          const [key, claim, resolvedAt] = params as string[];
+          const aggregate = aggregates.get(key);
+          if (!aggregate || aggregate.resolution_claim !== claim) return { rowCount: 0 };
+          aggregate.final_resolved_at = resolvedAt;
+          aggregate.resolution_claim = null;
+          return { rowCount: 1 };
+        }
+        return { rowCount: 0 };
+      }),
+      query: vi.fn(async (sql: string, params: unknown[] = []) => {
+        const [key, fingerprint] = params as string[];
+        if (sql.includes("FROM alert_aggregates")) {
+          const aggregate = aggregates.get(key);
+          return aggregate ? [aggregate] : [];
+        }
+        if (sql.includes("FROM alert_members")) {
+          const member = members.get(`${key}:${fingerprint}`);
+          return member ? [member] : [];
+        }
+        return [];
+      }),
+    },
     state: {
-      get: vi.fn(async () => null),
-      set: vi.fn(async () => {}),
-      delete: vi.fn(async () => {}),
+      get: vi.fn(async ({ stateKey }: { stateKey: string }) => stateValues.get(stateKey) ?? null),
+      set: vi.fn(async ({ stateKey }: { stateKey: string }, value: unknown) => {
+        stateValues.set(stateKey, value);
+      }),
+      delete: vi.fn(async ({ stateKey }: { stateKey: string }) => {
+        stateValues.delete(stateKey);
+      }),
     },
     users: {
       get: vi.fn(async () => null),
@@ -135,6 +221,11 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
       create: vi.fn(async () => ({ id: "issue-1" })),
       update: vi.fn(async () => ({ id: "issue-1" })),
       createComment: vi.fn(async () => ({ id: "comment-1" })),
+    },
+    agents: {
+      list: vi.fn(async () => [
+        { id: "agent-fallback", name: "Alert Fallback", status: "idle" },
+      ]),
     },
     events: { emit: vi.fn(async () => {}) },
     metrics: { write: vi.fn(async () => {}) },
@@ -277,7 +368,9 @@ describe("handleWebhook — firing first time", () => {
     expect(createArgs.title).toBe("[critical] CiliumPolicyDropsHigh · platform");
     expect(createArgs.priority).toBe("critical");
     expect(createArgs.originKind).toBe(ORIGIN_KIND);
-    expect(createArgs.originId).toBe("9a3b1e4c5f6d7890");
+    expect(createArgs.originId).toBe(
+      'alert-aggregate:v1:["CiliumPolicyDropsHigh",null]',
+    );
     expect(createArgs.assigneeUserId).toBe("user-42");
     expect(createArgs.description).toContain("[Dashboard](https://grafana/d/cilium)");
     expect(createArgs.description).toContain("[Runbook](https://wiki/runbooks/cilium-drops)");
@@ -315,13 +408,14 @@ describe("handleWebhook — firing first time", () => {
     );
   });
 
-  it("creates the issue unassigned when no owner resolves", async () => {
+  it("assigns the named fallback agent when no owner resolves", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ ownerMap: {} });
     await handleWebhook(ctx, config, TOKEN, baseInput());
     expect(mocks.issues.create).toHaveBeenCalledTimes(1);
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.assigneeUserId).toBeUndefined();
+    expect(createArgs.assigneeAgentId).toBe("agent-fallback");
   });
 
   it("forwards billing_code label to ctx.issues.create", async () => {
@@ -330,7 +424,7 @@ describe("handleWebhook — firing first time", () => {
     const alert = baseAlert({
       labels: {
         alertname: "X",
-        severity: "info",
+        severity: "warning",
         billing_code: "cost-ctr-7",
       },
       annotations: {},
@@ -846,7 +940,7 @@ describe("handleWebhook — acceptOnlyLabels filter", () => {
     const alert = baseAlert({
       labels: {
         alertname: "Watchdog",
-        severity: "info",
+        severity: "warning",
         paperclip: "true",
       },
     });
@@ -936,7 +1030,7 @@ describe("handleWebhook — owner resolution fallback chain", () => {
     const alert = baseAlert({
       labels: {
         alertname: "X",
-        severity: "info",
+        severity: "warning",
         team: "platform",
         paperclip_assignee_email: "bob@example.com",
       },
@@ -971,7 +1065,7 @@ describe("handleWebhook — owner resolution fallback chain", () => {
       name: "Carol",
     });
     const alert = baseAlert({
-      labels: { alertname: "X", severity: "info" },
+      labels: { alertname: "X", severity: "warning" },
       annotations: { paperclip_assignee_email: "carol@example.com" },
     });
     const envelope = baseEnvelope({ alerts: [alert] });
@@ -980,11 +1074,11 @@ describe("handleWebhook — owner resolution fallback chain", () => {
     expect(createArgs.assigneeUserId).toBe("user-carol");
   });
 
-  it("creates the issue unassigned when nothing resolves", async () => {
+  it("uses the configured fallback agent when nothing resolves", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ ownerMap: {} });
     const alert = baseAlert({
-      labels: { alertname: "X", severity: "info" },
+      labels: { alertname: "X", severity: "warning" },
       annotations: {},
     });
     const envelope = baseEnvelope({ alerts: [alert] });
@@ -992,5 +1086,200 @@ describe("handleWebhook — owner resolution fallback chain", () => {
     expect(mocks.users.findByEmail).not.toHaveBeenCalled();
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.assigneeUserId).toBeUndefined();
+    expect(createArgs.assigneeAgentId).toBe("agent-fallback");
+  });
+});
+
+describe("handleWebhook — issue creation floor", () => {
+  it("creates no issue and writes no state for severity=info", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alert = baseAlert({
+      labels: { alertname: "HindsightConsolidationStalled", severity: "info" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.db.execute).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.below_issue_floor",
+      1,
+      { alertname: "HindsightConsolidationStalled", severity: "info" },
+    );
+  });
+
+  it("honors paperclip_issue=false before side effects at any severity", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alert = baseAlert({
+      labels: {
+        alertname: "SuppressedCritical",
+        severity: "critical",
+        paperclip_issue: "false",
+      },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.db.execute).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.issue_opt_out",
+      1,
+      { alertname: "SuppressedCritical" },
+    );
+  });
+
+  it("fails closed when fallback configuration cannot resolve", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockResolvedValueOnce([]);
+    const alert = baseAlert({
+      labels: { alertname: "NoOwner", severity: "warning" },
+      annotations: {},
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: {}, fallbackAgentName: "Missing Agent" }),
+      TOKEN,
+      baseInput({ parsedBody: envelope }),
+    );
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.fallback_failed",
+      1,
+      { alertname: "NoOwner", severity: "warning" },
+    );
+  });
+});
+
+describe("handleWebhook — aggregate lifecycle", () => {
+  const aggregateAlerts = () =>
+    ["fp-a", "fp-b", "fp-c"].map((fingerprint, index) =>
+      baseAlert({
+        fingerprint,
+        labels: {
+          alertname: "HindsightConsolidationStalled",
+          severity: "warning",
+          instance: `worker-${index}`,
+        },
+        annotations: {},
+      }),
+    );
+
+  it("consolidates three label sets for one alertname into one issue", async () => {
+    const { ctx, mocks } = mkCtx();
+    const envelope = baseEnvelope({ alerts: aggregateAlerts() });
+
+    await handleWebhook(ctx, baseConfig({ ownerMap: {} }), TOKEN, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.aggregate.joined",
+      1,
+      expect.objectContaining({ alertname: "HindsightConsolidationStalled" }),
+    );
+  });
+
+  it("allows only one durable issue across concurrent first deliveries", async () => {
+    const { ctx, mocks } = mkCtx();
+    const issuesByOrigin = new Map<string, { id: string; status: string }>();
+    mocks.issues.create.mockImplementation(async (input: { originId: string }) => {
+      if (issuesByOrigin.has(input.originId)) throw new Error("unique violation");
+      const issue = { id: "aggregate-issue", status: "todo" };
+      issuesByOrigin.set(input.originId, issue);
+      await Promise.resolve();
+      return issue;
+    });
+    mocks.issues.list.mockImplementation(async (input: { originId: string }) => {
+      const issue = issuesByOrigin.get(input.originId);
+      return issue ? [issue] : [];
+    });
+    const [first, second] = aggregateAlerts();
+
+    await Promise.all(
+      [first, second].map((alert) => {
+        const envelope = baseEnvelope({ alerts: [alert] });
+        return handleWebhook(
+          ctx,
+          baseConfig({ ownerMap: {} }),
+          TOKEN,
+          baseInput({ parsedBody: envelope }),
+        );
+      }),
+    );
+
+    expect(issuesByOrigin).toHaveLength(1);
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.list).not.toHaveBeenCalled();
+  });
+
+  it("applies resolution only after the final firing member resolves", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alerts = aggregateAlerts();
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: {}, autoCloseOnResolve: true }),
+      TOKEN,
+      baseInput({ parsedBody: baseEnvelope({ alerts }) }),
+    );
+    mocks.issues.update.mockClear();
+    mocks.issues.get.mockResolvedValue({ id: "issue-1", status: "todo" });
+
+    for (const [index, alert] of alerts.entries()) {
+      const resolved = {
+        ...alert,
+        status: "resolved" as const,
+        endsAt: `2026-04-29T10:0${index}:00Z`,
+      };
+      await handleWebhook(
+        ctx,
+        baseConfig({ ownerMap: {}, autoCloseOnResolve: true }),
+        TOKEN,
+        baseInput({
+          parsedBody: baseEnvelope({ status: "resolved", alerts: [resolved] }),
+        }),
+      );
+      expect(mocks.issues.update).toHaveBeenCalledTimes(index === 2 ? 1 : 0);
+    }
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.aggregate.final_resolved",
+      1,
+      expect.objectContaining({ alertname: "HindsightConsolidationStalled" }),
+    );
+  });
+
+  it("keeps explicit dedupe domains as distinct issues", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alerts = ["node-a", "node-b"].map((node, index) =>
+      baseAlert({
+        fingerprint: `domain-${index}`,
+        labels: {
+          alertname: "NodeDiskPressure",
+          severity: "warning",
+          paperclip_dedupe_domain: node,
+        },
+      }),
+    );
+
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      TOKEN,
+      baseInput({ parsedBody: baseEnvelope({ alerts }) }),
+    );
+
+    expect(mocks.issues.create).toHaveBeenCalledTimes(2);
+    expect(
+      mocks.issues.create.mock.calls.map(([input]) => input.originId),
+    ).toEqual([
+      'alert-aggregate:v1:["NodeDiskPressure","node-a"]',
+      'alert-aggregate:v1:["NodeDiskPressure","node-b"]',
+    ]);
   });
 });

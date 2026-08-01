@@ -198,6 +198,7 @@ export const DEFAULT_CONFIG: AlertmanagerPluginConfig = {
   issueRouteMap: DEFAULT_ISSUE_ROUTE_MAP,
   escalationDeadlineMinutes: DEFAULT_ESCALATION_DEADLINE_MINUTES,
   coverDedupWindowMinutes: DEFAULT_COVER_DEDUP_WINDOW_MINUTES,
+  fallbackAgentName: "",
 };
 
 /**

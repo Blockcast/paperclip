@@ -148,6 +148,12 @@ const manifest: PaperclipPluginManifestV1 = {
         default: DEFAULT_ESCALATION_DEADLINE_MINUTES,
         additionalProperties: { type: "number", minimum: 1 },
       },
+      fallbackAgentName: {
+        type: "string",
+        title: "Fallback agent name",
+        description:
+          "Exact agent name assigned when no label, annotation, or owner-map route resolves. Missing or ambiguous configuration fails closed.",
+      },
     },
     // No fields are schema-required: the bootstrap auto-config endpoint
     // posts a partial config (e.g. only webhookTokenRef) and the worker

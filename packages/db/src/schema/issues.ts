@@ -218,6 +218,13 @@ export const issues = pgTable(
           and ${table.originId} is not null
           and ${table.hiddenAt} is null
           and ${table.status} not in ('done', 'cancelled')`,
+       ),
+    alertmanagerAggregateIdx: uniqueIndex("issues_alertmanager_aggregate_uq")
+      .on(table.companyId, table.originKind, table.originId)
+      .where(
+        sql`${table.originKind} = 'plugin:paperclip-plugin-alertmanager'
+          and ${table.originId} is not null
+          and ${table.hiddenAt} is null`,
       ),
     // BLO-15982: cross-issue dedup for alertmanager board covers. originId
     // stays the specific triggering alert issue's id (so resolve-time cover

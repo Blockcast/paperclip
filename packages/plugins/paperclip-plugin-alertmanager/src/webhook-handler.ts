@@ -18,8 +18,16 @@ import {
   severityToPriority,
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
-import { resolveAssigneeUserId } from "./owner-resolver.js";
+import { resolveAssigneeUserId, resolveFallbackAgentId } from "./owner-resolver.js";
 import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
+import {
+  aggregateKeyForAlert,
+  bindAggregateIssue,
+  completeAggregateResolution,
+  getAggregate,
+  joinAggregate,
+  resolveAggregateMember,
+} from "./aggregate-store.js";
 import {
   ORIGIN_KIND,
   type AlertStateRecord,
@@ -39,6 +47,29 @@ function nonEmptyString(value: string | null | undefined): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   return trimmed ? trimmed : undefined;
+}
+
+const aggregateQueues = new Map<string, Promise<void>>();
+
+async function withAggregateLock(
+  alert: AlertmanagerAlert,
+  work: () => Promise<void>,
+): Promise<void> {
+  const key = aggregateKeyForAlert(alert);
+  const previous = aggregateQueues.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const queued = previous.then(() => gate);
+  aggregateQueues.set(key, queued);
+  await previous;
+  try {
+    await work();
+  } finally {
+    release();
+    if (aggregateQueues.get(key) === queued) aggregateQueues.delete(key);
+  }
 }
 
 /**
@@ -106,6 +137,14 @@ export async function handleFiring(
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
 ): Promise<void> {
+  const companyId = config.defaultCompanyId;
+  if (!companyId) {
+    ctx.logger.warn(
+      `Cannot create issue for alert ${alert.fingerprint}: defaultCompanyId not configured`,
+    );
+    return;
+  }
+
   const stateRef = {
     scopeKind: "instance" as const,
     stateKey: STATE_KEYS.alert(alert.fingerprint),
@@ -114,25 +153,43 @@ export async function handleFiring(
   const nowIso = new Date().toISOString();
   const alertname = alert.labels.alertname ?? "UnnamedAlert";
   const severity = alert.labels.severity ?? "unknown";
+  const aggregate = (ctx as Partial<PluginContext>).db
+    ? await joinAggregate(ctx, companyId, alert)
+    : {
+        aggregateKey: alert.fingerprint,
+        companyId,
+        paperclipIssueId: existing?.paperclipIssueId ?? null,
+        alertname,
+        severity,
+        assigneeUserId: existing?.assigneeUserId ?? null,
+        assigneeAgentId: existing?.assigneeAgentId ?? null,
+      };
 
-  if (existing && existing.paperclipIssueId) {
-    // Re-fire: refresh body (drill-in URLs may carry a fresh time range) and
-    // re-open if the plugin previously auto-cancelled it on resolve.
+  const existingIssueId =
+    aggregate.paperclipIssueId ?? existing?.paperclipIssueId ?? null;
+  const existingCompanyId = existing?.paperclipCompanyId ?? aggregate.companyId;
+  if (existingIssueId) {
+    if (!aggregate.paperclipIssueId) {
+      await bindAggregateIssue(ctx, aggregate.aggregateKey, existingIssueId, {
+        assigneeUserId: existing?.assigneeUserId ?? undefined,
+      });
+    }
+    // Re-fire: refresh body and reopen a terminal aggregate issue.
     const newDescription = buildIssueDescription(alert);
     try {
       const issue = await ctx.issues.get(
-        existing.paperclipIssueId,
-        existing.paperclipCompanyId,
+        existingIssueId,
+        existingCompanyId,
       );
       if (
         issue &&
         (issue.status === "done" || issue.status === "cancelled") &&
-        existing.resolvedAt
+        existing?.resolvedAt
       ) {
         await ctx.issues.update(
-          existing.paperclipIssueId,
+          existingIssueId,
           { status: "todo", description: newDescription },
-          existing.paperclipCompanyId,
+          existingCompanyId,
         );
         await ctx.metrics.write("alertmanager.firing.reopened", 1, {
           alertname,
@@ -140,49 +197,54 @@ export async function handleFiring(
         });
       } else if (issue && issue.status !== "done" && issue.status !== "cancelled") {
         await ctx.issues.update(
-          existing.paperclipIssueId,
+          existingIssueId,
           { description: newDescription },
-          existing.paperclipCompanyId,
+          existingCompanyId,
         );
       }
     } catch (err) {
       ctx.logger.warn(
-        `Failed to re-sync existing issue ${existing.paperclipIssueId} on re-fire: ${String(err)}`,
+        `Failed to re-sync existing issue ${existingIssueId} on re-fire: ${String(err)}`,
       );
     }
 
     const updated: AlertStateRecord = {
-      ...existing,
+      paperclipIssueId: existingIssueId,
+      paperclipCompanyId: existingCompanyId,
+      assigneeUserId: existing?.assigneeUserId ?? aggregate.assigneeUserId,
+      firstSeenAt: existing?.firstSeenAt ?? alert.startsAt ?? nowIso,
       alertname,
       severity,
       lastFiredAt: nowIso,
       resolvedAt: null,
-      nextEscalationAt: existing.resolvedAt
+      nextEscalationAt: existing?.resolvedAt
         ? (() => {
             const delay = escalationDeadlineMs(alert, config);
             return delay === null ? null : new Date(Date.now() + delay).toISOString();
           })()
-        : existing.nextEscalationAt,
-      escalationAttempt: existing.resolvedAt ? 0 : existing.escalationAttempt,
-      escalationComplete: existing.resolvedAt ? false : existing.escalationComplete,
-      escalationIntervalMs: existing.resolvedAt
+        : existing?.nextEscalationAt,
+      escalationAttempt: existing?.resolvedAt ? 0 : existing?.escalationAttempt,
+      escalationComplete: existing?.resolvedAt ? false : existing?.escalationComplete,
+      escalationIntervalMs: existing?.resolvedAt
         ? escalationDeadlineMs(alert, config)
-        : (existing.escalationIntervalMs ?? escalationDeadlineMs(alert, config)),
+        : (existing?.escalationIntervalMs ?? escalationDeadlineMs(alert, config)),
+      aggregateKey: aggregate.aggregateKey,
+      assigneeAgentId: existing?.assigneeAgentId ?? aggregate.assigneeAgentId,
     };
     await ctx.state.set(stateRef, updated);
 
     await ctx.events.emit(
       "alertmanager.alert.firing",
-      existing.paperclipCompanyId,
+      existingCompanyId,
       {
         fingerprint: alert.fingerprint,
         alertname,
         severity,
         labels: alert.labels,
         annotations: alert.annotations,
-        paperclipIssueId: existing.paperclipIssueId,
-        assigneeUserId: existing.assigneeUserId,
-        assigneeAgentId: existing.assigneeAgentId ?? null,
+        paperclipIssueId: existingIssueId,
+        assigneeUserId: existing?.assigneeUserId ?? aggregate.assigneeUserId,
+        assigneeAgentId: existing?.assigneeAgentId ?? aggregate.assigneeAgentId,
         reFired: true,
       },
     );
@@ -190,15 +252,15 @@ export async function handleFiring(
       alertname,
       severity,
     });
-    return;
-  }
-
-  // First time we've seen this fingerprint — create a new issue.
-  const companyId = config.defaultCompanyId;
-  if (!companyId) {
-    ctx.logger.warn(
-      `Cannot create issue for alert ${alert.fingerprint}: defaultCompanyId not configured`,
-    );
+    if ((ctx as Partial<PluginContext>).db) {
+      ctx.logger.info(
+        `Alertmanager: joined ${alert.fingerprint} to aggregate ${aggregate.aggregateKey}`,
+      );
+      await ctx.metrics.write("alertmanager.aggregate.joined", 1, {
+        alertname,
+        severity,
+      });
+    }
     return;
   }
 
@@ -217,10 +279,10 @@ export async function handleFiring(
   const routeAssigneeUserId = routeHasAssigneeUserId
     ? nonEmptyString(issueRoute?.assigneeUserId ?? undefined)
     : undefined;
-  const createAssigneeAgentId = ownerOverride
+  let createAssigneeAgentId = ownerOverride
     ? assigneeAgentId
     : routeAssigneeAgentId ?? assigneeAgentId;
-  const createAssigneeUserId = createAssigneeAgentId
+  let createAssigneeUserId = createAssigneeAgentId
     ? undefined
     : ownerOverride
       ? assigneeUserId
@@ -234,8 +296,24 @@ export async function handleFiring(
     resolution.agentId
       ? `agent:${resolution.agentId}`
       : resolution.email ?? "(none)";
-  const resolvedAssignee =
-    createAssigneeAgentId ?? createAssigneeUserId ?? "(no assignee)";
+  if (!createAssigneeAgentId && !createAssigneeUserId) {
+    createAssigneeAgentId = await resolveFallbackAgentId(
+      ctx,
+      companyId,
+      config.fallbackAgentName,
+    );
+  }
+  if (!createAssigneeAgentId && !createAssigneeUserId) {
+    ctx.logger.warn(
+      `Cannot create issue for aggregate ${aggregate.aggregateKey}: no owner resolved and fallbackAgentName is missing or invalid`,
+    );
+    await ctx.metrics.write("alertmanager.owner.fallback_failed", 1, {
+      alertname,
+      severity,
+    });
+    return;
+  }
+  const resolvedAssignee = createAssigneeAgentId ?? createAssigneeUserId;
   ctx.logger.debug(
     `Owner resolution for ${alertname}: ${resolution.source} → ${resolvedTarget} → ${resolvedAssignee}`,
   );
@@ -251,20 +329,40 @@ export async function handleFiring(
 
   const billingCode = alert.labels.billing_code ?? null;
 
-  const issue = await ctx.issues.create({
-    companyId,
-    title,
-    description,
-    priority,
-    originKind: ORIGIN_KIND,
-    originId: alert.fingerprint,
-    ...(routeProjectId ? { projectId: routeProjectId } : {}),
-    ...(routeGoalId ? { goalId: routeGoalId } : {}),
-    ...(routeStatus ? { status: routeStatus } : {}),
-    ...(createAssigneeUserId ? { assigneeUserId: createAssigneeUserId } : {}),
-    ...(createAssigneeAgentId ? { assigneeAgentId: createAssigneeAgentId } : {}),
-    ...(billingCode ? { billingCode } : {}),
-  });
+  let issue;
+  let created = true;
+  try {
+    issue = await ctx.issues.create({
+      companyId,
+      title,
+      description,
+      priority,
+      originKind: ORIGIN_KIND,
+      originId: aggregate.aggregateKey,
+      ...(routeProjectId ? { projectId: routeProjectId } : {}),
+      ...(routeGoalId ? { goalId: routeGoalId } : {}),
+      ...(routeStatus ? { status: routeStatus } : {}),
+      ...(createAssigneeUserId ? { assigneeUserId: createAssigneeUserId } : {}),
+      ...(createAssigneeAgentId ? { assigneeAgentId: createAssigneeAgentId } : {}),
+      ...(billingCode ? { billingCode } : {}),
+    });
+  } catch (err) {
+    const [winner] = await ctx.issues.list({
+      companyId,
+      originKind: ORIGIN_KIND,
+      originId: aggregate.aggregateKey,
+      limit: 1,
+    });
+    if (!winner) throw err;
+    issue = winner;
+    created = false;
+  }
+  if ((ctx as Partial<PluginContext>).db) {
+    await bindAggregateIssue(ctx, aggregate.aggregateKey, issue.id, {
+      assigneeUserId: createAssigneeUserId,
+      assigneeAgentId: createAssigneeAgentId,
+    });
+  }
 
   const record: AlertStateRecord = {
     paperclipIssueId: issue.id,
@@ -283,6 +381,7 @@ export async function handleFiring(
     escalationAttempt: 0,
     escalationComplete: false,
     escalationIntervalMs: escalationDeadlineMs(alert, config),
+    aggregateKey: aggregate.aggregateKey,
   };
   await ctx.state.set(stateRef, record);
 
@@ -295,7 +394,7 @@ export async function handleFiring(
     paperclipIssueId: issue.id,
     assigneeUserId: createAssigneeUserId ?? null,
     assigneeAgentId: createAssigneeAgentId ?? null,
-    reFired: false,
+    reFired: !created,
   });
 
   await ctx.activity.log({
@@ -305,6 +404,7 @@ export async function handleFiring(
     entityId: issue.id,
     metadata: {
       fingerprint: alert.fingerprint,
+      aggregateKey: aggregate.aggregateKey,
       assigneeResolutionSource: resolution.source,
       issueRouteSource: issueRouteResolution.source
         ? `${issueRouteResolution.source.labelKey}=${issueRouteResolution.source.labelValue}`
@@ -316,6 +416,12 @@ export async function handleFiring(
     alertname,
     severity,
   });
+  if (!created) {
+    await ctx.metrics.write("alertmanager.aggregate.joined", 1, {
+      alertname,
+      severity,
+    });
+  }
 }
 
 /**
@@ -333,79 +439,136 @@ export async function handleResolved(
   };
   const stateRecord = (await ctx.state.get(stateRef)) as AlertStateRecord | null;
   const existing = stateRecord ?? (await recoverStateFromIssue(ctx, config, alert));
-  if (!existing) {
+  const resolvedAt = alert.endsAt || new Date().toISOString();
+  const aggregateKey = existing?.aggregateKey ?? aggregateKeyForAlert(alert);
+  const resolution = (ctx as Partial<PluginContext>).db
+    ? await resolveAggregateMember(
+        ctx,
+        aggregateKey,
+        alert.fingerprint,
+        resolvedAt,
+      )
+    : { memberKnown: false, finalResolutionClaim: null };
+  const aggregate = (ctx as Partial<PluginContext>).db
+    ? await getAggregate(ctx, aggregateKey)
+    : null;
+  if (!existing && !resolution.memberKnown) {
     ctx.logger.info(
       `Alertmanager: resolved for unknown fingerprint ${alert.fingerprint}, dropping`,
     );
     return;
   }
+  const issueId = aggregate?.paperclipIssueId ?? existing?.paperclipIssueId;
+  const companyId = aggregate?.companyId ?? existing?.paperclipCompanyId;
+  const alertname =
+    aggregate?.alertname ?? existing?.alertname ?? alert.labels.alertname ?? "unknown";
+  const severity = aggregate?.severity ?? existing?.severity ?? alert.labels.severity ?? "unknown";
+  if (!issueId || !companyId) {
+    ctx.logger.warn(`Alertmanager: aggregate ${aggregateKey} has no bound issue`);
+    return;
+  }
+  if (resolution.memberKnown && !resolution.finalResolutionClaim) {
+    if (existing) {
+      await ctx.state.set(stateRef, {
+        ...existing,
+        resolvedAt,
+        nextEscalationAt: null,
+        escalationComplete: true,
+      });
+    }
+    await ctx.events.emit(
+      "alertmanager.alert.resolved",
+      companyId,
+      {
+        fingerprint: alert.fingerprint,
+        alertname,
+        paperclipIssueId: issueId,
+        resolvedAt,
+        aggregateStillFiring: true,
+      },
+    );
+    await ctx.metrics.write("alertmanager.aggregate.member_resolved", 1, {
+      alertname,
+    });
+    return;
+  }
 
-  const resolvedAt = alert.endsAt || new Date().toISOString();
-  const alertname = existing.alertname;
-
+  let resolutionApplied = false;
   try {
     if (config.autoCloseOnResolve !== false) {
       const issue = await ctx.issues.get(
-        existing.paperclipIssueId,
-        existing.paperclipCompanyId,
+        issueId,
+        companyId,
       );
       if (issue && issue.status !== "done" && issue.status !== "cancelled") {
         await ctx.issues.update(
-          existing.paperclipIssueId,
+          issueId,
           { status: "cancelled" },
-          existing.paperclipCompanyId,
+          companyId,
         );
       }
     } else {
       await ctx.issues.createComment(
-        existing.paperclipIssueId,
+        issueId,
         `Alert resolved at ${resolvedAt}.`,
-        existing.paperclipCompanyId,
+        companyId,
       );
     }
+    resolutionApplied = true;
   } catch (err) {
     ctx.logger.warn(
-      `Failed to apply resolution to issue ${existing.paperclipIssueId}: ${String(err)}`,
+      `Failed to apply resolution to issue ${issueId}: ${String(err)}`,
     );
   }
 
-  // BLO-16120: mark this source resolved within every cover it's a member
-  // of, and close each cover only once its last unresolved member resolves.
-  // Runs unconditionally (independent of autoCloseOnResolve) — the ladder
-  // exhausted because the alert kept firing, not because the underlying
-  // issue's status policy says so, so a resolved alert means its membership
-  // in the shared cover is done either way.
-  try {
-    await recordSourceResolvedAndCloseCovers(ctx, existing.paperclipCompanyId, existing.paperclipIssueId);
-  } catch (err) {
-    ctx.logger.warn(
-      `Failed to record resolution against escalation covers for issue ${existing.paperclipIssueId}: ${String(err)}`,
-    );
+  if (resolutionApplied) {
+    try {
+      await recordSourceResolvedAndCloseCovers(ctx, companyId, issueId);
+    } catch (err) {
+      ctx.logger.warn(
+        `Failed to record resolution against escalation covers for issue ${issueId}: ${String(err)}`,
+      );
+    }
   }
 
-  const updated: AlertStateRecord = {
-    ...existing,
-    resolvedAt,
-    nextEscalationAt: null,
-    escalationComplete: true,
-  };
-  await ctx.state.set(stateRef, updated);
+  if (existing) {
+    const updated: AlertStateRecord = {
+      ...existing,
+      resolvedAt,
+      nextEscalationAt: null,
+      escalationComplete: true,
+    };
+    await ctx.state.set(stateRef, updated);
+  }
 
   await ctx.events.emit(
     "alertmanager.alert.resolved",
-    existing.paperclipCompanyId,
+    companyId,
     {
       fingerprint: alert.fingerprint,
       alertname,
-      paperclipIssueId: existing.paperclipIssueId,
+      paperclipIssueId: issueId,
       resolvedAt,
     },
   );
 
   await ctx.metrics.write("alertmanager.resolved.handled", 1, {
     alertname,
-    severity: existing.severity,
+    severity,
   });
+  if (resolution.finalResolutionClaim && resolutionApplied) {
+    await completeAggregateResolution(
+      ctx,
+      aggregateKey,
+      resolution.finalResolutionClaim,
+      resolvedAt,
+    );
+    ctx.logger.info(`Alertmanager: final resolution for aggregate ${aggregateKey}`);
+    await ctx.metrics.write("alertmanager.aggregate.final_resolved", 1, {
+      alertname,
+      severity,
+    });
+  }
 }
 
 async function recoverStateFromIssue(
@@ -493,17 +656,40 @@ export async function handleWebhook(
       continue;
     }
 
+    const alertname = alert.labels.alertname ?? "unknown";
+    const optedOut =
+      (alert.labels.paperclip_issue ?? alert.annotations.paperclip_issue)
+        ?.trim()
+        .toLowerCase() === "false";
+    if (optedOut) {
+      ctx.logger.info(`Alertmanager: ${alertname} opted out via paperclip_issue=false`);
+      await ctx.metrics.write("alertmanager.webhook.issue_opt_out", 1, {
+        alertname,
+      });
+      continue;
+    }
+    if ((alert.labels.severity ?? "").trim().toLowerCase() === "info") {
+      ctx.logger.info(`Alertmanager: ${alertname} suppressed by info creation floor`);
+      await ctx.metrics.write("alertmanager.webhook.below_issue_floor", 1, {
+        alertname,
+        severity: "info",
+      });
+      continue;
+    }
+
     const status = effectiveAlertStatus(alert, body);
     try {
-      if (status === "firing") {
-        await handleFiring(ctx, config, alert);
-      } else if (status === "resolved") {
-        await handleResolved(ctx, config, alert);
-      } else {
-        ctx.logger.warn(
-          `paperclip-plugin-alertmanager: unknown alert status "${status}" for fingerprint ${alert.fingerprint}`,
-        );
-      }
+      await withAggregateLock(alert, async () => {
+        if (status === "firing") {
+          await handleFiring(ctx, config, alert);
+        } else if (status === "resolved") {
+          await handleResolved(ctx, config, alert);
+        } else {
+          ctx.logger.warn(
+            `paperclip-plugin-alertmanager: unknown alert status "${status}" for fingerprint ${alert.fingerprint}`,
+          );
+        }
+      });
     } catch (err) {
       // Spec §5.2 step 3: log + 200 on schema mismatch; same principle
       // here — don't let a single bad alert poison the whole batch.
