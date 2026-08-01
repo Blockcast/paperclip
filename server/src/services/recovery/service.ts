@@ -1483,6 +1483,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => Boolean(rows[0]));
   }
 
+  const OUTSTANDING_ISSUE_WAKE_STATUSES = ["queued", "deferred_issue_execution", "claimed", "running"] as const;
+
   async function hasQueuedIssueWake(companyId: string, issueId: string, agentId?: string | null) {
     return db
       .select({ id: agentWakeupRequests.id })
@@ -1490,7 +1492,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .where(
         and(
           eq(agentWakeupRequests.companyId, companyId),
-          eq(agentWakeupRequests.status, "queued"),
+          inArray(agentWakeupRequests.status, [...OUTSTANDING_ISSUE_WAKE_STATUSES]),
           sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
           agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
         ),
@@ -4358,6 +4360,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       const reserved = await recoveryActionsSvc.reserveWakeAttempt({
         companyId: candidate.issue.companyId,
         actionId: action.id,
+        sourceIssueId: candidate.issue.id,
+        ownerAgentId: action.ownerAgentId,
+        wakePolicyType: "wake_owner",
+        requireBlockedSourceIssue: true,
+        requireNoOutstandingIssueWake: true,
       });
       if (!reserved) continue;
 

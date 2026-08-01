@@ -1,6 +1,6 @@
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, exists, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueRecoveryActions } from "@paperclipai/db";
+import { agentWakeupRequests, issueRecoveryActions, issues } from "@paperclipai/db";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -403,7 +403,15 @@ export function issueRecoveryActionService(db: Db) {
       );
   }
 
-  async function reserveWakeAttempt(input: { companyId: string; actionId: string }): Promise<IssueRecoveryAction | null> {
+  async function reserveWakeAttempt(input: {
+    companyId: string;
+    actionId: string;
+    sourceIssueId?: string;
+    ownerAgentId?: string;
+    wakePolicyType?: string;
+    requireBlockedSourceIssue?: boolean;
+    requireNoOutstandingIssueWake?: boolean;
+  }): Promise<IssueRecoveryAction | null> {
     const now = new Date();
     const [updated] = await db
       .update(issueRecoveryActions)
@@ -416,7 +424,38 @@ export function issueRecoveryActionService(db: Db) {
         and(
           eq(issueRecoveryActions.id, input.actionId),
           eq(issueRecoveryActions.companyId, input.companyId),
+          input.sourceIssueId ? eq(issueRecoveryActions.sourceIssueId, input.sourceIssueId) : undefined,
+          input.ownerAgentId ? eq(issueRecoveryActions.ownerAgentId, input.ownerAgentId) : undefined,
+          input.wakePolicyType
+            ? sql`${issueRecoveryActions.wakePolicy} ->> 'type' = ${input.wakePolicyType}`
+            : undefined,
           inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+          sql`(${issueRecoveryActions.maxAttempts} is null or ${issueRecoveryActions.attemptCount} < ${issueRecoveryActions.maxAttempts})`,
+          sql`(${issueRecoveryActions.timeoutAt} is null or ${issueRecoveryActions.timeoutAt} > ${now})`,
+          input.requireBlockedSourceIssue && input.sourceIssueId
+            ? exists(
+              db
+                .select({ id: issues.id })
+                .from(issues)
+                .where(and(
+                  eq(issues.companyId, input.companyId),
+                  eq(issues.id, input.sourceIssueId),
+                  eq(issues.status, "blocked"),
+                  isNull(issues.assigneeUserId),
+                  isNull(issues.hiddenAt),
+                )),
+            )
+            : undefined,
+          input.requireNoOutstandingIssueWake && input.sourceIssueId && input.ownerAgentId
+            ? sql`not exists (
+                select 1
+                from ${agentWakeupRequests}
+                where ${agentWakeupRequests.companyId} = ${input.companyId}
+                  and ${agentWakeupRequests.agentId} = ${input.ownerAgentId}
+                  and ${agentWakeupRequests.status} in ('queued', 'deferred_issue_execution', 'claimed', 'running')
+                  and ${agentWakeupRequests.payload} ->> 'issueId' = ${input.sourceIssueId}
+              )`
+            : undefined,
         ),
       )
       .returning();

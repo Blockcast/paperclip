@@ -597,9 +597,26 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
 
     let enqueueDrops = true;
-    const enqueueWakeup = vi.fn(async () => {
+    let deliveredWakeupId: string | null = null;
+    const enqueueWakeup = vi.fn(async (
+      agentId: string,
+      opts?: { reason?: string | null; payload?: Record<string, unknown> | null },
+    ) => {
       if (enqueueDrops) return null;
-      return { id: randomUUID() };
+      deliveredWakeupId = randomUUID();
+      await db.insert(agentWakeupRequests).values({
+        id: deliveredWakeupId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: opts?.reason ?? "source_scoped_recovery_action",
+        payload: opts?.payload ?? null,
+        status: "queued",
+        requestedByActorType: "system",
+        requestedByActorId: "recovery",
+      });
+      return { id: deliveredWakeupId };
     });
     const recovery = recoveryService(db, { enqueueWakeup });
 
@@ -656,6 +673,129 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(blockersAfterRetry).toHaveLength(1);
     expect(blockersAfterRetry[0]?.issueId).toBe(blockerIssueId);
     expect(enqueueWakeup).toHaveBeenCalledTimes(2);
+
+    expect(deliveredWakeupId).toBeTruthy();
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "running" })
+      .where(eq(agentWakeupRequests.id, deliveredWakeupId!));
+    const suppressed = await recovery.reconcileStrandedAssignedIssues();
+    expect(suppressed.recoveryWakeDeliveryRetried).toBe(0);
+    const [unchangedAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(unchangedAction).toMatchObject({
+      id: refundedAction!.id,
+      ownerAgentId: managerId,
+      attemptCount: 1,
+    });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not reserve a source-scoped wake retry once the attempt budget is spent", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    const svc = issueRecoveryActionService(db);
+    const action = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "source-scoped:fingerprint:budget-boundary",
+      evidence: { latestRunId: "run-budget-boundary" },
+      nextAction: "Wake the recovery owner.",
+      wakePolicy: { type: "wake_owner" },
+      maxAttempts: 1,
+      timeoutAt: new Date(Date.now() + STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS),
+    });
+
+    const reserved = await svc.reserveWakeAttempt({
+      companyId,
+      actionId: action.id,
+      sourceIssueId,
+      ownerAgentId: managerId,
+      wakePolicyType: "wake_owner",
+      requireBlockedSourceIssue: true,
+      requireNoOutstandingIssueWake: true,
+    });
+
+    expect(reserved).toBeNull();
+    const [unchangedAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(unchangedAction).toMatchObject({
+      attemptCount: 1,
+      maxAttempts: 1,
+    });
+  });
+
+  it("revalidates source issue state and outstanding wakes while reserving a retry", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    const svc = issueRecoveryActionService(db);
+    const action = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "source-scoped:fingerprint:reservation-gates",
+      evidence: { latestRunId: "run-reservation-gates" },
+      nextAction: "Wake the recovery owner.",
+      wakePolicy: { type: "wake_owner" },
+      maxAttempts: 3,
+      timeoutAt: new Date(Date.now() + STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS),
+    });
+
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, sourceIssueId));
+    const staleSourceReservation = await svc.reserveWakeAttempt({
+      companyId,
+      actionId: action.id,
+      sourceIssueId,
+      ownerAgentId: managerId,
+      wakePolicyType: "wake_owner",
+      requireBlockedSourceIssue: true,
+      requireNoOutstandingIssueWake: true,
+    });
+    expect(staleSourceReservation).toBeNull();
+
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId,
+      agentId: managerId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "source_scoped_recovery_action",
+      payload: { issueId: sourceIssueId },
+      status: "claimed",
+      requestedByActorType: "system",
+      requestedByActorId: "recovery",
+    });
+    const outstandingWakeReservation = await svc.reserveWakeAttempt({
+      companyId,
+      actionId: action.id,
+      sourceIssueId,
+      ownerAgentId: managerId,
+      wakePolicyType: "wake_owner",
+      requireBlockedSourceIssue: true,
+      requireNoOutstandingIssueWake: true,
+    });
+
+    expect(outstandingWakeReservation).toBeNull();
+    const [unchangedAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(unchangedAction).toMatchObject({
+      attemptCount: 1,
+      maxAttempts: 3,
+    });
   });
 
   it.each([
