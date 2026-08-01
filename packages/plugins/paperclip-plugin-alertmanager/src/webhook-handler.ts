@@ -183,11 +183,22 @@ export async function handleFiring(
     );
     return;
   }
-  const { ref: stateRef, record: existing } = await readAlertState(
+  const { ref: stateRef, record: stateRecord } = await readAlertState(
     ctx,
     companyId,
     alert.fingerprint,
   );
+  // BLO-20467: `issues.create` below commits before its `state.set`, so a
+  // state-store failure in between leaves a real issue with no state row. That
+  // delivery now fails (rather than being acknowledged), so Alertmanager
+  // retries it — and a retry that trusted the state miss would file a *second*
+  // issue for the same fingerprint, turning a repeating state-store outage into
+  // a duplicate-issue storm. Reconciling against the issue the previous attempt
+  // already created is what makes the retry idempotent.
+  //
+  // This is the same `state ?? recover-from-issue` fallback the resolved path
+  // has always used; only the firing path was missing it.
+  const existing = stateRecord ?? (await recoverStateFromIssue(ctx, config, alert));
   const nowIso = new Date().toISOString();
   const alertname = alert.labels.alertname ?? "UnnamedAlert";
   const severity = alert.labels.severity ?? "unknown";
@@ -515,6 +526,21 @@ async function recoverStateFromIssue(
     firstSeenAt: alert.startsAt || new Date().toISOString(),
     lastFiredAt: alert.startsAt || new Date().toISOString(),
     resolvedAt: null,
+    // BLO-20467: arm the ladder on the recovered record. The firing path now
+    // adopts this when state was lost, and the re-fire branch carries these
+    // fields through unchanged for a still-firing alert — so leaving them unset
+    // would silently disarm escalation for exactly the alert whose state we
+    // just had to reconstruct. Ladder progress made before the state loss is
+    // not recoverable from the issue, so this restarts the ladder rather than
+    // resuming it: a late page beats no page. Inert on the resolved path, which
+    // overwrites both fields.
+    nextEscalationAt: (() => {
+      const delay = escalationDeadlineMs(alert, config);
+      return delay === null ? null : new Date(Date.now() + delay).toISOString();
+    })(),
+    escalationAttempt: 0,
+    escalationComplete: false,
+    escalationIntervalMs: escalationDeadlineMs(alert, config),
   };
 }
 

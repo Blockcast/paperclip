@@ -593,7 +593,12 @@ describe("BLO-15982 pod_pending route: 240-minute escalation deadline end-to-end
     };
     const firingMocks = {
       state: { get: vi.fn(async () => null), set: vi.fn(async () => undefined) },
-      issues: { create: vi.fn(async () => ({ id: "issue-1" })) },
+      issues: {
+        create: vi.fn(async () => ({ id: "issue-1" })),
+        // handleFiring reconciles against an existing issue on a state miss
+        // (BLO-20467 retry idempotency); empty = "no prior attempt".
+        list: vi.fn(async () => []),
+      },
       events: { emit: vi.fn() },
       activity: { log: vi.fn() },
       metrics: { write: vi.fn() },

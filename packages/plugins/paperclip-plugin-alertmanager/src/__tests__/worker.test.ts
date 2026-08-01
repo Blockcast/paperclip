@@ -1264,3 +1264,90 @@ describe("handleWebhook — delivery acknowledgement", () => {
     ]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// BLO-20467 — a retried delivery must not duplicate the issue the failed
+// attempt already created.
+//
+// `issues.create` commits before its `state.set`. Once a lost alert stopped
+// being acknowledged, a state-store failure between those two calls started
+// producing a *retry* — and a retry that trusted the state miss would file a
+// second issue for the same fingerprint. Under a repeating state-store outage
+// that is an unbounded duplicate-issue storm, so this is a regression guard on
+// the fix for silent loss, not an independent nicety.
+//
+// Both tests drive the handler TWICE; a single invocation cannot observe the
+// duplicate at all. They also fail only the `alert:` write rather than "the
+// first state.set" — the firing path writes an owner-email cache entry first
+// and swallows its failure, so a blanket `mockRejectedValueOnce` is absorbed
+// there, the delivery succeeds, and the test passes against unfixed code.
+// ---------------------------------------------------------------------------
+describe("BLO-20467 — firing retries are idempotent across create/state-write", () => {
+  /** Stateful ctx whose *alert-state* writes fail while `fail.on` is true. */
+  const mkFlakyStateCtx = () => {
+    const { ctx, mocks, store } = mkStatefulCtx();
+    const fail = { on: true };
+    const prior = mocks.state.set.getMockImplementation()!;
+    mocks.state.set.mockImplementation(async (ref: { stateKey: string }, value: unknown) => {
+      if (fail.on && ref.stateKey.startsWith("alert:")) {
+        throw new Error("plugin state store unavailable");
+      }
+      return prior(ref, value);
+    });
+    return { ctx, mocks, store, fail };
+  };
+
+  const liveIssue = [
+    { id: "issue-from-attempt-1", status: "todo", assigneeUserId: null, assigneeAgentId: null },
+  ];
+
+  it("adopts the issue the failed attempt created instead of filing a second one", async () => {
+    const { ctx, mocks, fail } = mkFlakyStateCtx();
+    const input = baseInput({ parsedBody: baseEnvelope({ alerts: [baseAlert()] }) });
+    mocks.issues.create.mockResolvedValue({ id: "issue-from-attempt-1" });
+
+    // Attempt 1: the issue commits, then its state write fails.
+    await expect(handleWebhook(ctx, baseConfig(), TOKEN, input)).rejects.toBeInstanceOf(
+      AlertDeliveryIncompleteError,
+    );
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+
+    // Attempt 2 is Alertmanager's retry. The state store is still empty — the
+    // write that would have populated it is exactly what failed — so the only
+    // way to avoid a duplicate is to reconcile against the existing issue.
+    fail.on = false;
+    mocks.issues.list.mockResolvedValue(liveIssue);
+    await handleWebhook(ctx, baseConfig(), TOKEN, input);
+
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    // The retry must also leave durable state behind, or every later delivery
+    // repeats this reconciliation and the ladder never arms.
+    expect(mocks.state.set).toHaveBeenLastCalledWith(
+      expect.objectContaining({ scopeKind: "company", stateKey: "alert:9a3b1e4c5f6d7890" }),
+      expect.objectContaining({ paperclipIssueId: "issue-from-attempt-1", resolvedAt: null }),
+    );
+  });
+
+  it("arms the escalation ladder on the adopted record", async () => {
+    // Recovery rebuilds the record from the issue, which carries no ladder
+    // fields, and the re-fire branch passes them through unchanged. Leaving
+    // them unset would silently disarm escalation for exactly the alert whose
+    // state was lost — dedup still works, so the assertions above pass either
+    // way and cannot catch this.
+    const { ctx, mocks, fail } = mkFlakyStateCtx();
+    const input = baseInput({ parsedBody: baseEnvelope({ alerts: [baseAlert()] }) });
+    mocks.issues.create.mockResolvedValue({ id: "issue-from-attempt-1" });
+
+    await handleWebhook(ctx, baseConfig(), TOKEN, input).catch(() => {});
+    fail.on = false;
+    mocks.issues.list.mockResolvedValue(liveIssue);
+    await handleWebhook(ctx, baseConfig(), TOKEN, input);
+
+    const persisted = mocks.state.set.mock.calls.at(-1)?.[1] as {
+      nextEscalationAt: string | null;
+      escalationComplete?: boolean;
+    };
+    expect(persisted.nextEscalationAt).toEqual(expect.any(String));
+    expect(persisted.escalationComplete).toBe(false);
+  });
+});
