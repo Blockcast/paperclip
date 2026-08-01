@@ -6,6 +6,7 @@ import {
   agents,
   companies,
   createDb,
+  externalRuntimeReservations,
   heartbeatRunEvents,
   heartbeatRuns,
 } from "@paperclipai/db";
@@ -49,10 +50,12 @@ describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
   afterEach(async () => {
     // runningProcesses is module-level and shared across service instances.
     runningProcesses.clear();
-    // FK order: events reference runs reference agents reference companies.
-    // Crash marking appends a lifecycle event and enqueues a retry, so both
-    // events and wakeup requests exist by the time a test finishes.
+    // FK order: events reference runs reference agents reference companies,
+    // and reservations reference runs. Crash marking appends a lifecycle event
+    // and enqueues a retry, so both events and wakeup requests exist by the
+    // time a test finishes.
     await db.delete(heartbeatRunEvents);
+    await db.delete(externalRuntimeReservations);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agents);
@@ -63,7 +66,13 @@ describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedRun(input: { adapterType: string; status?: string; externalRunId?: string | null }) {
+  async function seedRun(input: {
+    adapterType: string;
+    status?: string;
+    externalRunId?: string | null;
+    agentStatus?: string;
+    responsibleUserId?: string | null;
+  }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     await db.insert(companies).values({
@@ -77,7 +86,7 @@ describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
       companyId,
       name: "CrashTestAgent",
       role: "engineer",
-      status: "running",
+      status: input.agentStatus ?? "running",
       adapterType: input.adapterType,
       adapterConfig: {},
       runtimeConfig: {},
@@ -95,11 +104,23 @@ describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
         // A dispatched run always carries this; the process-loss retry path
         // refuses to re-queue without it (`responsible_user_unresolved`), so
         // omitting it here would make the retry assertion vacuous.
-        responsibleUserId: "crash-test-user",
+        responsibleUserId: input.responsibleUserId === undefined ? "crash-test-user" : input.responsibleUserId,
         contextSnapshot: {},
       })
       .returning();
     return { companyId, agentId, runId: run!.id };
+  }
+
+  /** An active external-runtime reservation, the way a dispatch would leave one. */
+  async function seedActiveReservation(input: { companyId: string; agentId: string; runId: string }) {
+    await db.insert(externalRuntimeReservations).values({
+      companyId: input.companyId,
+      agentId: input.agentId,
+      runId: input.runId,
+      slotId: 0,
+      state: "launched",
+      releasedAt: null,
+    });
   }
 
   /** Registers a run as live in this worker, the way a dispatch would. */
@@ -230,6 +251,51 @@ describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
     expect(retries).toHaveLength(0);
   });
 
+  it("leaves a run holding an external runtime reservation running even when its agent now reads as local", async () => {
+    const heartbeat = heartbeatService(db);
+    // Lifecycle ownership must come from the run, not from the agent's current
+    // adapterType — that column is mutable and read here long after dispatch,
+    // while executeRun made its decision from the agent record it loaded at
+    // launch. Reconfigure a busy K8s agent to a local adapter (or let a
+    // migration/UI edit do it) and an adapter-only test classifies its live,
+    // unstamped Job as local and terminalizes it, queueing a duplicate against
+    // a healthy Job. The run-scoped reservation cannot drift that way: it is
+    // keyed to this run and always exists before executeRun proceeds.
+    const seeded = await seedRun({ adapterType: "codex_local", externalRunId: null });
+    await seedActiveReservation(seeded);
+    markLiveInThisWorker(seeded.runId);
+
+    const result = await heartbeat.markRunsInterruptedByWorkerCrash({ reason: "uncaughtException: boom" });
+
+    expect(result.markedRunIds).toEqual([]);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(run!.status).toBe("running");
+    expect(run!.errorCode).toBeNull();
+    const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, seeded.runId));
+    expect(retries).toHaveLength(0);
+  });
+
+  it("still marks a local run whose external runtime reservation was already released", async () => {
+    const heartbeat = heartbeatService(db);
+    // The reservation signal must not latch: a released reservation describes
+    // finished external work, not a live Job, so it cannot be a reason to keep
+    // leaving this worker's local run orphaned.
+    const seeded = await seedRun({ adapterType: "codex_local" });
+    await db.insert(externalRuntimeReservations).values({
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      runId: seeded.runId,
+      slotId: 0,
+      state: "released",
+      releasedAt: new Date(),
+    });
+    markLiveInThisWorker(seeded.runId);
+
+    const result = await heartbeat.markRunsInterruptedByWorkerCrash({ reason: "uncaughtException: boom" });
+
+    expect(result.markedRunIds).toEqual([seeded.runId]);
+  });
+
   it("marks every in-flight run the worker owned, not just the first", async () => {
     const heartbeat = heartbeatService(db);
     const first = await seedRun({ adapterType: "claude_local" });
@@ -279,8 +345,14 @@ describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
   // a run claimed just before the budget expired, whose cleanup never ran.
   describe("reconcileWorkerCrashedRuns (crash cut short mid-cleanup)", () => {
     /** A run the crash guard claimed but never got to recover. */
-    async function seedClaimedButUnrecovered(overrides: { finishedAt?: Date } = {}) {
-      const seeded = await seedRun({ adapterType: "codex_local", status: "interrupted" });
+    async function seedClaimedButUnrecovered(
+      overrides: { finishedAt?: Date; agentStatus?: string } = {},
+    ) {
+      const seeded = await seedRun({
+        adapterType: "codex_local",
+        status: "interrupted",
+        agentStatus: overrides.agentStatus,
+      });
       await db
         .update(heartbeatRuns)
         .set({
@@ -390,6 +462,102 @@ describeEmbeddedPostgres("heartbeat crash-time run marking (BLO-19722)", () => {
       expect(result.reconciledRunIds).toEqual([]);
       const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
       expect(retries).toHaveLength(0);
+    });
+
+    // Completion is a persisted marker, never inferred from "does a retry child
+    // exist". The two tests below are the reason: a retry is neither necessary
+    // nor sufficient evidence that recovery finished.
+    it("stops replaying a run whose recovery completed without queueing a retry", async () => {
+      const heartbeat = heartbeatService(db);
+      // enqueueProcessLossRetry deliberately completes cleanup *without* a
+      // retry when the agent is not invokable — it releases the issue lock
+      // instead. Inferring "unrecovered" from the missing retry would leave
+      // this row in the oldest-first candidate set forever: replayed at every
+      // startup, permanently consuming one of the batch slots, and liable to
+      // finally enqueue the very retry the original recovery suppressed if the
+      // agent ever became invokable again.
+      const { runId } = await seedClaimedButUnrecovered({ agentStatus: "terminated" });
+
+      const first = await heartbeat.reconcileWorkerCrashedRuns();
+      expect(first.reconciledRunIds).toEqual([runId]);
+      expect(first.retryRunIds).toEqual([]);
+
+      const [recovered] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(recovered!.crashRecoveryCompletedAt).not.toBeNull();
+
+      // The load-bearing assertion: no retry, yet the row is done being worked.
+      const second = await heartbeat.reconcileWorkerCrashedRuns();
+      expect(second.reconciledRunIds).toEqual([]);
+      const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+      expect(retries).toHaveLength(0);
+    });
+
+    it("still recovers a run whose retry was committed before the rest of cleanup ran", async () => {
+      const heartbeat = heartbeatService(db);
+      // The retry is inserted in its own transaction, ahead of the lifecycle
+      // event and agent finalization that follow it. A crash in that gap used
+      // to make the row vanish from this candidate set while those steps were
+      // still unfinished — a silently half-recovered run. The marker is what
+      // distinguishes "retry exists" from "recovery finished".
+      const { runId, companyId, agentId } = await seedClaimedButUnrecovered();
+      const [orphanedRetry] = await db
+        .insert(heartbeatRuns)
+        .values({
+          companyId,
+          agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "queued",
+          retryOfRunId: runId,
+          responsibleUserId: "crash-test-user",
+          contextSnapshot: {},
+        })
+        .returning();
+
+      const result = await heartbeat.reconcileWorkerCrashedRuns();
+
+      expect(result.reconciledRunIds).toEqual([runId]);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(run!.crashRecoveryCompletedAt).not.toBeNull();
+      // Finishing the cleanup must adopt the existing retry, not mint a rival.
+      const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+      expect(retries.map((row) => row.id)).toEqual([orphanedRetry!.id]);
+      const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+      expect(agent!.status).toBe("idle");
+    });
+
+    it("queues exactly one retry when several workers reconcile the same run at once", async () => {
+      const heartbeat = heartbeatService(db);
+      // This pass now runs on every replica at startup, suppressed or not, so
+      // concurrent recovery of the same crash row is reachable in normal
+      // operation (worker StatefulSet + 2 API pods rolling together). Without
+      // serialization the select-then-insert dedupe races and one failed
+      // execution earns two retries — two wakeup requests, two invocations.
+      //
+      // Honest scope: this is a concurrency smoke check, not a deterministic
+      // regression test — the pre-fix select-then-insert does not lose reliably
+      // under an in-process harness, so it passed against the unserialized
+      // version too. The deterministic guard for "one parent, one retry" is
+      // "still recovers a run whose retry was committed before the rest of
+      // cleanup ran" above, which does fail without the fix. This test's job is
+      // to catch a gross regression of the advisory-lock serialization.
+      const { runId } = await seedClaimedButUnrecovered();
+
+      const passes = await Promise.all(
+        Array.from({ length: 6 }, () => heartbeat.reconcileWorkerCrashedRuns()),
+      );
+
+      const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+      expect(retries).toHaveLength(1);
+      // And exactly one wakeup request was minted for it.
+      const wakeups = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.runId, retries[0]!.id));
+      expect(wakeups).toHaveLength(1);
+      // Several passes may legitimately report the run and adopt the same retry
+      // (they raced the marker), but between them they created exactly one.
+      expect([...new Set(passes.flatMap((pass) => pass.retryRunIds))]).toEqual([retries[0]!.id]);
     });
   });
 });

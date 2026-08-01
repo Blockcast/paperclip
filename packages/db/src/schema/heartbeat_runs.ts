@@ -44,6 +44,14 @@ export const heartbeatRuns = pgTable(
       onDelete: "set null",
     }),
     processLossRetryCount: integer("process_loss_retry_count").notNull().default(0),
+    // BLO-19722: set once worker-crash recovery has run every cleanup step for
+    // this run (retry enqueue, issue-lock release, agent finalization). It is
+    // the durable completion marker for `reconcileWorkerCrashedRuns`, which
+    // cannot infer completion from the existence of a retry child: recovery
+    // deliberately completes *without* a retry when the agent is not invokable,
+    // and conversely commits the retry before the finalization steps that
+    // follow it. Only ever written by that recovery path.
+    crashRecoveryCompletedAt: timestamp("crash_recovery_completed_at", { withTimezone: true }),
     scheduledRetryAt: timestamp("scheduled_retry_at", { withTimezone: true }),
     scheduledRetryAttempt: integer("scheduled_retry_attempt").notNull().default(0),
     scheduledRetryReason: text("scheduled_retry_reason"),
@@ -114,5 +122,14 @@ export const heartbeatRuns = pgTable(
       table.companyId,
       table.createdAt.desc(),
     ),
+    // BLO-19722: serves the startup crash-recovery candidate scan, which is
+    // bounded by batch size and ordered oldest-first rather than by wall time.
+    // The partial predicate keeps this index near-empty in steady state — only
+    // crash-marked runs whose recovery has not completed are members, and every
+    // recovered run leaves the index — so the common "nothing to reconcile"
+    // start is an empty index probe. See migration 0208.
+    crashRecoveryPendingIdx: index("heartbeat_runs_crash_recovery_pending_idx")
+      .on(table.finishedAt, table.id)
+      .where(sql`${table.errorCode} = 'worker_crashed' and ${table.crashRecoveryCompletedAt} is null`),
   }),
 );
