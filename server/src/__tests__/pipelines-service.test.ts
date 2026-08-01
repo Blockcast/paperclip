@@ -1680,7 +1680,10 @@ describeEmbeddedPostgres("pipelineService", () => {
       ],
     });
 
-    for (const [caseKey, targetStage] of [["review-exit", "review"], ["terminal-exit", "done"]] as const) {
+    for (const [caseKey, targetStage, heartbeatStatus] of [
+      ["review-exit", "review", "queued"],
+      ["terminal-exit", "done", "scheduled_retry"],
+    ] as const) {
       const created = await svc.ingestCase({
         companyId: company.id,
         pipelineId: pipeline.id,
@@ -1712,7 +1715,7 @@ describeEmbeddedPostgres("pipelineService", () => {
         id: heartbeatRunId,
         companyId: company.id,
         agentId: routine.assigneeAgentId!,
-        status: "queued",
+        status: heartbeatStatus,
         invocationSource: "assignment",
         wakeupRequestId,
         contextSnapshot: { issueId },
@@ -1810,6 +1813,222 @@ describeEmbeddedPostgres("pipelineService", () => {
       .from(pipelineCaseIssueLinks)
       .where(eq(pipelineCaseIssueLinks.issueId, issueId!));
     expect(issue!.status).toBe("todo");
+    expect(link!.retiredReason).toBe("stage_exited");
+  });
+
+  it("preserves a coalesced automation issue until its last case link retires", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Shared stage issue");
+    const pipeline = await svc.createPipeline({
+      companyId: company.id,
+      key: "shared-stage-issue",
+      name: "Shared stage issue",
+      actor: userActor,
+      stages: [
+        { key: "intake", name: "Intake", kind: "open" },
+        { key: "drafting", name: "Drafting", kind: "working", config: { onEnter: { type: "run_routine", routineId: routine.id } } },
+        { key: "review", name: "Review", kind: "working" },
+        { key: "done", name: "Done", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    });
+    const enteredCases = [];
+    for (const caseKey of ["first-owner", "second-owner"]) {
+      const created = await svc.ingestCase({
+        companyId: company.id,
+        pipelineId: pipeline.id,
+        caseKey,
+        title: caseKey,
+        actor: userActor,
+      });
+      enteredCases.push(await svc.transitionCase({
+        companyId: company.id,
+        caseId: created.case.id,
+        toStageKey: "drafting",
+        expectedVersion: created.case.version,
+        actor: userActor,
+      }));
+    }
+    const firstIssueId = enteredCases[0]!.automationExecution.status === "succeeded"
+      ? enteredCases[0]!.automationExecution.execution.executionIssueId!
+      : "";
+    const secondIssueId = enteredCases[1]!.automationExecution.status === "succeeded"
+      ? enteredCases[1]!.automationExecution.execution.executionIssueId!
+      : "";
+    const secondAttemptId = enteredCases[1]!.automationLedger!.id;
+    await db.update(pipelineAutomationExecutions)
+      .set({ executionIssueId: firstIssueId })
+      .where(eq(pipelineAutomationExecutions.id, secondAttemptId));
+    await db.update(pipelineCaseIssueLinks)
+      .set({ issueId: firstIssueId })
+      .where(eq(pipelineCaseIssueLinks.automationAttemptId, secondAttemptId));
+    await db.delete(issues).where(eq(issues.id, secondIssueId));
+
+    await svc.transitionCase({
+      companyId: company.id,
+      caseId: enteredCases[0]!.case.id,
+      toStageKey: "review",
+      expectedVersion: enteredCases[0]!.case.version,
+      actor: userActor,
+    });
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, firstIssueId));
+    const links = await db.select().from(pipelineCaseIssueLinks).where(eq(pipelineCaseIssueLinks.issueId, firstIssueId));
+    expect(issue!.status).toBe("todo");
+    expect(links.filter((link) => link.retiredAt === null)).toHaveLength(1);
+    expect(links.filter((link) => link.retiredReason === "stage_exited")).toHaveLength(1);
+  });
+
+  it("retires a delayed automation attachment after the case leaves its stage", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Delayed stage issue");
+    let releaseWake!: () => void;
+    let markWakeStarted!: () => void;
+    const wakeStarted = new Promise<void>((resolve) => { markWakeStarted = resolve; });
+    const wakeReleased = new Promise<void>((resolve) => { releaseWake = resolve; });
+    const delayedSvc = pipelineService(db, {
+      heartbeat: {
+        wakeup: async () => {
+          markWakeStarted();
+          await wakeReleased;
+          return null;
+        },
+      },
+    });
+    const pipeline = await delayedSvc.createPipeline({
+      companyId: company.id,
+      key: "delayed-stage-issue",
+      name: "Delayed stage issue",
+      actor: userActor,
+      stages: [
+        { key: "intake", name: "Intake", kind: "open" },
+        { key: "drafting", name: "Drafting", kind: "working", config: { onEnter: { type: "run_routine", routineId: routine.id } } },
+        { key: "review", name: "Review", kind: "working" },
+        { key: "done", name: "Done", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    });
+    const created = await delayedSvc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "delayed",
+      title: "Delayed case",
+      actor: userActor,
+    });
+    const entering = delayedSvc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "drafting",
+      expectedVersion: created.case.version,
+      actor: userActor,
+    });
+    await wakeStarted;
+    const [draftingCase] = await db.select().from(pipelineCases).where(eq(pipelineCases.id, created.case.id));
+    await svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "review",
+      expectedVersion: draftingCase!.version,
+      actor: userActor,
+    });
+    releaseWake();
+    const entered = await entering;
+    const issueId = entered.automationExecution.status === "succeeded"
+      ? entered.automationExecution.execution.executionIssueId!
+      : "";
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [link] = await db.select().from(pipelineCaseIssueLinks).where(eq(pipelineCaseIssueLinks.issueId, issueId));
+    expect(issue!.status).toBe("cancelled");
+    expect(link).toMatchObject({ retiredReason: "stage_exited" });
+  });
+
+  it("does not cancel a replacement execution generation", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Replacement generation");
+    const pipeline = await svc.createPipeline({
+      companyId: company.id,
+      key: "replacement-generation",
+      name: "Replacement generation",
+      actor: userActor,
+      stages: [
+        { key: "intake", name: "Intake", kind: "open" },
+        { key: "drafting", name: "Drafting", kind: "working", config: { onEnter: { type: "run_routine", routineId: routine.id } } },
+        { key: "review", name: "Review", kind: "working" },
+        { key: "done", name: "Done", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    });
+    const created = await svc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "replacement",
+      title: "Replacement case",
+      actor: userActor,
+    });
+    const entered = await svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "drafting",
+      expectedVersion: created.case.version,
+      actor: userActor,
+    });
+    const issueId = entered.automationExecution.status === "succeeded"
+      ? entered.automationExecution.execution.executionIssueId!
+      : "";
+    const replacementExecutionRunId = randomUUID();
+    const replacementCheckoutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      {
+        id: replacementExecutionRunId,
+        companyId: company.id,
+        agentId: routine.assigneeAgentId!,
+        status: "running",
+        invocationSource: "assignment",
+        contextSnapshot: { issueId },
+      },
+      {
+        id: replacementCheckoutRunId,
+        companyId: company.id,
+        agentId: routine.assigneeAgentId!,
+        status: "queued",
+        invocationSource: "assignment",
+        contextSnapshot: { issueId },
+      },
+    ]);
+    await db.execute(sql`
+      create function test_replace_pipeline_issue_generation() returns trigger as $$
+      begin
+        update issues
+        set execution_run_id = '${sql.raw(replacementExecutionRunId)}', checkout_run_id = '${sql.raw(replacementCheckoutRunId)}'
+        where id = new.issue_id;
+        return new;
+      end;
+      $$ language plpgsql;
+      create trigger test_replace_pipeline_issue_generation
+      after update of retired_at on pipeline_case_issue_links
+      for each row execute function test_replace_pipeline_issue_generation();
+    `);
+    try {
+      await svc.transitionCase({
+        companyId: company.id,
+        caseId: created.case.id,
+        toStageKey: "review",
+        expectedVersion: entered.case.version,
+        actor: userActor,
+      });
+    } finally {
+      await db.execute(sql`drop trigger if exists test_replace_pipeline_issue_generation on pipeline_case_issue_links`);
+      await db.execute(sql`drop function if exists test_replace_pipeline_issue_generation()`);
+    }
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [link] = await db.select().from(pipelineCaseIssueLinks).where(eq(pipelineCaseIssueLinks.issueId, issueId));
+    expect(issue).toMatchObject({
+      status: "todo",
+      executionRunId: replacementExecutionRunId,
+      checkoutRunId: replacementCheckoutRunId,
+    });
     expect(link!.retiredReason).toBe("stage_exited");
   });
 
