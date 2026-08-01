@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -131,7 +131,9 @@ describe("issueRecoveryActionService", () => {
       })),
       insert: vi.fn(() => ({
         values: vi.fn(() => ({
-          returning: vi.fn(async () => [createdRow]),
+          onConflictDoNothing: vi.fn(() => ({
+            returning: vi.fn(async () => [createdRow]),
+          })),
         })),
       })),
     };
@@ -393,6 +395,86 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await svc.getActiveForIssue(randomUUID(), sourceIssueId)).toBeNull();
   });
 
+  it("reuses a concurrent active action conflict without aborting the caller transaction", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const racedActionId = randomUUID();
+    const svc = issueRecoveryActionService(db);
+
+    let releaseContender!: () => void;
+    const releaseContenderPromise = new Promise<void>((resolve) => {
+      releaseContender = resolve;
+    });
+    let signalContenderInserted!: () => void;
+    const contenderInsertedPromise = new Promise<void>((resolve) => {
+      signalContenderInserted = resolve;
+    });
+
+    const contenderTx = db.transaction(async (tx) => {
+      await tx.insert(issueRecoveryActions).values({
+        id: racedActionId,
+        companyId,
+        sourceIssueId,
+        recoveryIssueId: null,
+        kind: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "recovery:fingerprint",
+        evidence: { latestRunId: "run-1" },
+        nextAction: "Restore a live execution path.",
+        wakePolicy: { type: "wake_owner" },
+        attemptCount: 1,
+      });
+      signalContenderInserted();
+      await releaseContenderPromise;
+    });
+    await contenderInsertedPromise;
+
+    let upsertSettled = false;
+    const upsertPromise = db.transaction(async (tx) => {
+      const result = await svc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "recovery:fingerprint",
+        evidence: { latestRunId: "run-2" },
+        nextAction: "Restore a live execution path.",
+        wakePolicy: { type: "wake_owner" },
+      }, tx);
+      await tx.execute(sql`select 1`);
+      return result;
+    }).finally(() => {
+      upsertSettled = true;
+    });
+
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(upsertSettled).toBe(false);
+      releaseContender();
+
+      const result = await upsertPromise;
+      await contenderTx;
+
+      expect(result).toMatchObject({
+        id: racedActionId,
+        attemptCount: 2,
+        evidence: { latestRunId: "run-2" },
+      });
+      const [row] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, racedActionId));
+      expect(row).toMatchObject({ attemptCount: 2, evidence: { latestRunId: "run-2" } });
+    } finally {
+      releaseContender();
+      await contenderTx.catch(() => undefined);
+    }
+  });
+
   it("escalates stranded assigned work into a source action instead of a recovery issue", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     // A DELIVERED wake returns the queued run. Null models one of `enqueueWakeup`'s
@@ -457,6 +539,98 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       sourceIssueId: sourceIssue.id,
       recoveryCause: "stranded_assigned_issue",
     });
+  });
+
+  it("restores a source issue for the next sweep when the recovery wake enqueue throws", async () => {
+    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+    const runId = randomUUID();
+    const latestRun = {
+      id: runId,
+      agentId: coderId,
+      status: "failed",
+      error: "adapter exited before making progress",
+      errorCode: "adapter_exit_code",
+      contextSnapshot: { issueId: sourceIssue.id, retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date("2026-05-13T18:00:00.000Z"),
+    } as const;
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      contextSnapshot: {
+        issueId: sourceIssue.id,
+        taskId: sourceIssue.id,
+        wakeReason: "issue_continuation_needed",
+        retryReason: "issue_continuation_needed",
+      },
+      startedAt: new Date("2026-05-13T18:00:00.000Z"),
+      finishedAt: new Date("2026-05-13T18:01:00.000Z"),
+      updatedAt: new Date("2026-05-13T18:01:00.000Z"),
+      errorCode: "adapter_exit_code",
+      error: "adapter exited before making progress",
+      livenessState: "needs_followup",
+      resultJson: null,
+    });
+
+    let enqueueFails = true;
+    const enqueueWakeup = vi.fn(async () => {
+      if (enqueueFails) throw new Error("transient wakeup enqueue failure");
+      return { id: randomUUID() };
+    });
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    await expect(recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    })).rejects.toThrow("transient wakeup enqueue failure");
+
+    const [restoredIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(restoredIssue).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: coderId,
+    });
+    const blockersAfterRestore = await db
+      .select()
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, sourceIssue.id));
+    expect(blockersAfterRestore).toHaveLength(0);
+    const [refundedAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(refundedAction).toMatchObject({
+      ownerAgentId: managerId,
+      attemptCount: 0,
+    });
+
+    enqueueFails = false;
+    const result = await recovery.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toContain(sourceIssue.id);
+
+    const [blockedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(blockedIssue).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: managerId,
+    });
+    const [deliveredAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(deliveredAction).toMatchObject({
+      id: refundedAction!.id,
+      ownerAgentId: managerId,
+      attemptCount: 1,
+    });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
   });
 
   it.each([

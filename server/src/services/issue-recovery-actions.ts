@@ -353,7 +353,11 @@ export function issueRecoveryActionService(db: Db) {
           timeoutAt: input.timeoutAt ?? null,
           lastAttemptAt: input.lastAttemptAt ?? now,
         })
+        .onConflictDoNothing()
         .returning();
+      if (!created) {
+        return retryUpsertSourceScoped(input, retryCount, dbOrTx);
+      }
       return toReadModel(created!);
     } catch (error) {
       if (!isUniqueRecoveryActionConflict(error)) throw error;

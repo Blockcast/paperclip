@@ -28,7 +28,7 @@ import {
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
-import { forbidden, notFound } from "../../errors.js";
+import { HttpError, forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
@@ -4430,6 +4430,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   // escalation, same as before BLO-18643).
   type ReviewWaitingParkOutcome = "parked" | "already_parked" | "failed";
 
+  function isMissingEvidenceGateRejection(error: unknown) {
+    if (!(error instanceof HttpError) || error.status !== 422 || error.message !== "missing-evidence") {
+      return false;
+    }
+    const details = parseObject(error.details);
+    return details.code === "missing-evidence";
+  }
+
   async function parkReviewWaitingContinuationIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: "in_progress";
@@ -4453,6 +4461,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       try {
         updated = await issuesSvc.update(fresh.id, { status: "in_review" }, tx);
       } catch (err) {
+        if (!isMissingEvidenceGateRejection(err)) throw err;
         logger.warn(
           { err, issueId: fresh.id, identifier: fresh.identifier },
           "parkReviewWaitingContinuationIssue: in_review park rejected; escalating instead",
@@ -4536,6 +4545,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       try {
         updated = await issuesSvc.update(fresh.id, { status: "in_review" }, tx);
       } catch (err) {
+        if (!isMissingEvidenceGateRejection(err)) throw err;
         logger.warn(
           { err, issueId: fresh.id, identifier: fresh.identifier },
           "parkNoDependencyReviewWaitingIssue: in_review park rejected; escalating instead",
@@ -4880,6 +4890,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // function did NOT produce -- e.g. `in_review` from a park that raced it -- is a signal
       // that some other terminal action already claimed this issue for this cause.
       if (fresh.status !== input.previousStatus && fresh.status !== "blocked") return null;
+      const restoreOnWakeFailure = fresh.status === input.previousStatus
+        ? {
+          issueId: fresh.id,
+          companyId: fresh.companyId,
+          previousStatus: input.previousStatus,
+          assigneeAgentId: fresh.assigneeAgentId,
+          assigneeUserId: fresh.assigneeUserId,
+        }
+        : null;
 
       const claimed = await issuesSvc.update(
         input.issue.id,
@@ -4940,7 +4959,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         hasNewActivitySinceLastAttempt,
       };
       if (isProviderQuotaWait) {
-        return { updated, pendingWake, activity: null, humanDecisionEvent: null };
+        return { updated, pendingWake, activity: null, humanDecisionEvent: null, restoreOnWakeFailure };
       }
 
       const prefix = await getCompanyIssuePrefix(fresh.companyId);
@@ -5183,12 +5202,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         };
       }
 
-      return { updated, pendingWake, activity, humanDecisionEvent };
+      return { updated, pendingWake, activity, humanDecisionEvent, restoreOnWakeFailure };
     });
     if (!outcome) return null;
 
     if (outcome.pendingWake) {
-      await enqueueSourceScopedStrandedRecoveryWake(outcome.pendingWake);
+      try {
+        await enqueueSourceScopedStrandedRecoveryWake(outcome.pendingWake);
+      } catch (err) {
+        if (outcome.restoreOnWakeFailure) {
+          await restoreSourceIssueForRecoveryWakeRetry({
+            ...outcome.restoreOnWakeFailure,
+            recoveryActionId: outcome.pendingWake.action.id,
+            err,
+          });
+        }
+        throw err;
+      }
     }
     if (outcome.activity) {
       await logActivity(db, outcome.activity);
@@ -5198,6 +5228,73 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     return outcome.updated;
+  }
+
+  async function restoreSourceIssueForRecoveryWakeRetry(input: {
+    issueId: string;
+    companyId: string;
+    previousStatus: StrandedPreviousStatus;
+    assigneeAgentId: string | null;
+    assigneeUserId: string | null;
+    recoveryActionId: string;
+    err: unknown;
+  }) {
+    try {
+      const now = new Date();
+      const restored = await db.transaction(async (tx) => {
+        const rows = await tx
+          .update(issues)
+          .set({
+            status: input.previousStatus,
+            assigneeAgentId: input.assigneeAgentId,
+            assigneeUserId: input.assigneeUserId,
+            checkoutRunId: null,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: now,
+          })
+          .where(and(
+            eq(issues.id, input.issueId),
+            eq(issues.companyId, input.companyId),
+            eq(issues.status, "blocked"),
+          ))
+          .returning({ id: issues.id });
+        if (rows.length === 0) return false;
+        await tx
+          .delete(issueRelations)
+          .where(and(
+            eq(issueRelations.companyId, input.companyId),
+            eq(issueRelations.relatedIssueId, input.issueId),
+            eq(issueRelations.type, "blocks"),
+          ));
+        return true;
+      });
+      if (!restored) {
+        logger.warn(
+          {
+            err: input.err,
+            companyId: input.companyId,
+            issueId: input.issueId,
+            recoveryActionId: input.recoveryActionId,
+            previousStatus: input.previousStatus,
+          },
+          "source-scoped recovery wake failed after issue was no longer restorable for retry",
+        );
+      }
+    } catch (restoreErr) {
+      logger.warn(
+        {
+          err: restoreErr,
+          enqueueErr: input.err,
+          companyId: input.companyId,
+          issueId: input.issueId,
+          recoveryActionId: input.recoveryActionId,
+          previousStatus: input.previousStatus,
+        },
+        "source-scoped recovery wake failed and source issue retry restoration also failed",
+      );
+    }
   }
 
   function buildZeroTokenStartupFailureComment(input: {
