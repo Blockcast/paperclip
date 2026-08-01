@@ -442,17 +442,15 @@ const QUEUED_RUN_DISPATCH_SCAN_LIMIT = 200;
 const QUEUED_RUN_DISPATCH_MAX_SCAN_BATCHES = 10;
 /**
  * BLO-20396 (review follow-up): how many consecutive resumed passes one wake
- * may chain before giving up and restarting from the head of the queue.
+ * may chain before yielding the lock and continuing from the last scan boundary
+ * after a delay.
  *
  * Each resumed pass advances strictly forward through a finite queue, so the
- * chain terminates on its own once the scan exhausts. This cap only bounds the
- * pathological case where the queue is deeper than
- * `SCAN_LIMIT * MAX_SCAN_BATCHES * MAX_RESUME_PASSES` (20k rows) and every row
- * in it is unclaimable. Restarting from the head is the right fallback there:
- * by then the blocked rows nearest the head are the likeliest to have become
- * ready.
+ * chain terminates on its own once the scan exhausts. This cap only prevents one
+ * wake from spinning immediately through an extremely deep unclaimable backlog.
  */
 const QUEUED_RUN_DISPATCH_MAX_RESUME_PASSES = 10;
+const QUEUED_RUN_DISPATCH_RESUME_CAP_RETRY_DELAY_MS = 1_000;
 /**
  * Issue statuses that make any queued run targeting them pointless. Matches the
  * convention used by execution-workspaces / issue-tree-control / routines.
@@ -17601,6 +17599,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     string,
     { createdAt: Date; id: string; passes: number }
   >();
+  const dispatchResumeCapRetryTimersByAgent = new Map<string, ReturnType<typeof setTimeout>>();
 
   /** Run one more dispatch pass for `agentId`, detached from this critical section. */
   function scheduleDetachedDispatchPass(agentId: string, reason: string) {
@@ -17613,6 +17612,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }));
     inFlightExecutions.add(pass);
     void pass.finally(() => inFlightExecutions.delete(pass));
+  }
+
+  function clearDelayedResumeCapRetry(agentId: string) {
+    const timer = dispatchResumeCapRetryTimersByAgent.get(agentId);
+    if (!timer) return;
+    clearTimeout(timer);
+    dispatchResumeCapRetryTimersByAgent.delete(agentId);
+  }
+
+  function scheduleDelayedResumeCapRetry(agentId: string) {
+    if (dispatchResumeCapRetryTimersByAgent.has(agentId)) return;
+    const timer = setTimeout(() => {
+      dispatchResumeCapRetryTimersByAgent.delete(agentId);
+      scheduleDetachedDispatchPass(agentId, "resume_bounded_scan_after_cap");
+    }, QUEUED_RUN_DISPATCH_RESUME_CAP_RETRY_DELAY_MS);
+    const maybeNodeTimer = timer as { unref?: () => void };
+    if (typeof maybeNodeTimer.unref === "function") maybeNodeTimer.unref();
+    dispatchResumeCapRetryTimersByAgent.set(agentId, timer);
   }
 
   async function startNextQueuedRunForAgent(agentId: string) {
@@ -17893,9 +17910,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
        * no prune means the prune-triggered follow-up does not fire either.
        *
        * The chain terminates. Each resumed pass advances the keyset cursor
-       * strictly forward through a finite queue, so it either reaches runnable
-       * work, exhausts the scan, or trips the resume cap — and all three clear
-       * the cursor so the following pass restarts from the head.
+       * strictly forward through a finite queue. When a single wake hits the
+       * resume cap, the next pass is delayed and starts from the last scan
+       * boundary with the pass counter reset. That yields the lock instead of
+       * spinning immediately, while still letting a deep finite backlog make
+       * progress without waiting for an unrelated wake.
        *
        * Returns whether it scheduled a continuation, so the caller does not
        * also schedule the prune follow-up and double up.
@@ -17903,6 +17922,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const advanceOrClearResumeCursor = (claimedCount: number): boolean => {
         if (scanExhausted || claimedCount > 0 || !scanCursor) {
           dispatchResumeCursorByAgent.delete(agentId);
+          clearDelayedResumeCapRetry(agentId);
           return false;
         }
         const passes = (resumeState?.passes ?? 0) + 1;
@@ -17915,10 +17935,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               scannedRows: passes * QUEUED_RUN_DISPATCH_SCAN_LIMIT
                 * QUEUED_RUN_DISPATCH_MAX_SCAN_BATCHES,
             },
-            "startNextQueuedRunForAgent: queued backlog still unclaimable after the resume cap; restarting from the head of the queue",
+            "startNextQueuedRunForAgent: queued backlog still unclaimable after the resume cap; delaying bounded scan continuation",
           );
-          dispatchResumeCursorByAgent.delete(agentId);
-          return false;
+          dispatchResumeCursorByAgent.set(agentId, { ...scanCursor, passes: 0 });
+          scheduleDelayedResumeCapRetry(agentId);
+          return true;
         }
         dispatchResumeCursorByAgent.set(agentId, { ...scanCursor, passes });
         scheduleDetachedDispatchPass(agentId, "resume_bounded_scan");

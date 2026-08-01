@@ -31,6 +31,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issueRelations,
   issues,
 } from "@paperclipai/db";
 import {
@@ -1402,4 +1403,164 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
 
     expect(dispatchedRunIds[0]).toBe(freshRunId);
   });
+
+  it("continues after the resume cap so deep dependency-blocked queues do not strand later runnable work", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerIssueId = randomUUID();
+    const runnableIssueId = randomUUID();
+    const runnableWakeId = randomUUID();
+    const runnableRunId = randomUUID();
+    const issuePrefix = `D${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const baseCreatedAt = new Date(Date.now() - 90 * 60 * 1000);
+    const blockedCount = 20_000;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "DeepBlockedQueueCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "DeepBlockedQueueAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Unresolved blocker",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      startedAt: baseCreatedAt,
+    });
+
+    const chunkSize = 500;
+    for (let offset = 0; offset < blockedCount; offset += chunkSize) {
+      const issueRows: Array<typeof issues.$inferInsert> = [];
+      const relationRows: Array<typeof issueRelations.$inferInsert> = [];
+      const wakeRows: Array<typeof agentWakeupRequests.$inferInsert> = [];
+      const runRows: Array<typeof heartbeatRuns.$inferInsert> = [];
+      for (let index = offset; index < Math.min(offset + chunkSize, blockedCount); index += 1) {
+        const issueId = randomUUID();
+        const wakeId = randomUUID();
+        const runId = randomUUID();
+        const createdAt = new Date(baseCreatedAt.getTime() + index);
+        issueRows.push({
+          id: issueId,
+          companyId,
+          title: `Dependency-blocked queued issue ${index}`,
+          status: "todo",
+          priority: "low",
+          assigneeAgentId: agentId,
+          issueNumber: index + 2,
+          identifier: `${issuePrefix}-${index + 2}`,
+        });
+        relationRows.push({
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: issueId,
+          type: "blocks",
+        });
+        wakeRows.push({
+          id: wakeId,
+          companyId,
+          agentId,
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: { issueId },
+          status: "queued",
+          runId,
+          requestedAt: createdAt,
+          updatedAt: createdAt,
+        });
+        runRows.push({
+          id: runId,
+          companyId,
+          agentId,
+          invocationSource: "assignment",
+          triggerDetail: "system",
+          status: "queued",
+          wakeupRequestId: wakeId,
+          contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+          createdAt,
+          updatedAt: createdAt,
+        });
+      }
+      await db.insert(issues).values(issueRows);
+      await db.insert(issueRelations).values(relationRows);
+      await db.insert(agentWakeupRequests).values(wakeRows);
+      await db.insert(heartbeatRuns).values(runRows);
+    }
+
+    const runnableCreatedAt = new Date(baseCreatedAt.getTime() + blockedCount);
+    await db.insert(issues).values({
+      id: runnableIssueId,
+      companyId,
+      title: "Runnable work behind the resume cap",
+      status: "todo",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      issueNumber: blockedCount + 2,
+      identifier: `${issuePrefix}-${blockedCount + 2}`,
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: runnableWakeId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: runnableIssueId },
+      status: "queued",
+      runId: runnableRunId,
+      requestedAt: runnableCreatedAt,
+      updatedAt: runnableCreatedAt,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runnableRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: runnableWakeId,
+      contextSnapshot: { issueId: runnableIssueId, taskId: runnableIssueId, wakeReason: "issue_assigned" },
+      createdAt: runnableCreatedAt,
+      updatedAt: runnableCreatedAt,
+    });
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await heartbeat.resumeQueuedRuns();
+    const runnableRun = await waitForRunToSettle(heartbeat, runnableRunId, 120_000);
+
+    expect(dispatchedRunIds).toContain(runnableRunId);
+    expect(runnableRun?.status).not.toBe("queued");
+  }, 180_000);
 });
