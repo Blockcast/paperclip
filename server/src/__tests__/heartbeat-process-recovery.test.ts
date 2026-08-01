@@ -837,6 +837,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     runError?: string | null;
     resultJson?: Record<string, unknown> | null;
     monitorNextCheckAt?: Date | null;
+    runUsageJson?: Record<string, unknown> | null;
+    adapterType?: string;
+    agentStatus?: "idle" | "error";
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -860,8 +863,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       companyId,
       name: "CodexCoder",
       role: "engineer",
-      status: "idle",
-      adapterType: "codex_local",
+      status: input.agentStatus ?? "idle",
+      errorReason: input.agentStatus === "error" ? input.runError ?? "run failed before issue advanced" : null,
+      adapterType: input.adapterType ?? "codex_local",
       adapterConfig: {},
       runtimeConfig: {},
       permissions: {},
@@ -7440,6 +7444,40 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("zero-token startup wedge");
     expect(comments[0]?.body).toContain("reset");
+  });
+
+  it("startup reconciliation clears a stale opencode_k8s session and queues immediate recovery", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "adapter_failed",
+      runError: "Session unavailable",
+      adapterType: "opencode_k8s",
+      agentStatus: "error",
+    });
+
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "opencode_k8s",
+      taskKey: issueId,
+      sessionParamsJson: { sessionId: "stale-opencode-session" },
+      sessionDisplayId: "stale-opencode-session",
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(1);
+    expect(result.escalated).toBe(0);
+    await expect(
+      db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId)),
+    ).resolves.toHaveLength(0);
+
+    const wakeRows = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeRows.some((row) => row.reason === "issue_zero_token_session_reset")).toBe(true);
   });
 
   // BLO-10889: if the reset-and-retry attempt ALSO fails with the same

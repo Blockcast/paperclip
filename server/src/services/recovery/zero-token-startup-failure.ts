@@ -15,8 +15,11 @@
 export const ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES = new Set<string>([
   "context_overflow",
   "context_length_exceeded",
+  "session_unavailable",
   "startup_error_pre_model",
 ]);
+
+const LEGACY_SESSION_UNAVAILABLE_ERROR_RE = /\bsession\s+unavailable\b/i;
 
 // Heartbeat-run terminal statuses that represent an unsuccessful outcome.
 // Mirrors UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES in heartbeat.ts /
@@ -31,6 +34,7 @@ const UNSUCCESSFUL_TERMINAL_STATUSES = new Set<string>([
 export type ZeroTokenStartupFailureRunInput =
   | {
     status?: string | null;
+    error?: string | null;
     errorCode?: string | null;
     usageJson?: Record<string, unknown> | null;
   }
@@ -76,7 +80,13 @@ export function isZeroTokenStartupFailureRun(
   if (!run) return false;
   if (!run.status || !UNSUCCESSFUL_TERMINAL_STATUSES.has(run.status)) return false;
   const errorCode = typeof run.errorCode === "string" ? run.errorCode.trim() : "";
-  if (!errorCode || !ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has(errorCode)) return false;
+  const isLegacySessionUnavailable =
+    errorCode === "adapter_failed" &&
+    typeof run.error === "string" &&
+    LEGACY_SESSION_UNAVAILABLE_ERROR_RE.test(run.error);
+  if (!isLegacySessionUnavailable && (!errorCode || !ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has(errorCode))) {
+    return false;
+  }
   const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
   return inputTokens === 0 && outputTokens === 0;
 }
@@ -102,4 +112,3 @@ export function isZeroTokenSessionResetRetryRun(
   const retryReason = context.retryReason;
   return typeof retryReason === "string" && retryReason === ZERO_TOKEN_SESSION_RESET_RETRY_REASON;
 }
-

@@ -32,6 +32,8 @@ import {
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
   isRetryableInteractionContinuationInfrastructureFailure,
+  SESSION_UNAVAILABLE_HEARTBEAT_RETRY_DELAY_MS,
+  SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
 
@@ -1567,6 +1569,18 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         },
       }),
     ).toBe(false);
+  });
+
+  it("retries session-unavailable failures independent of the heartbeat interval", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "session_unavailable",
+        resultJson: {},
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(true);
+    expect(SESSION_UNAVAILABLE_HEARTBEAT_RETRY_DELAY_MS).toBeLessThanOrEqual(2 * 60 * 1000);
+    expect(SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBe(2);
   });
 
   // BLO-9147 AC1 — thin-snapshot adapter_failed retry gate

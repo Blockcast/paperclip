@@ -89,6 +89,8 @@ describe("parseOpenCodeJsonl", () => {
   it("detects unknown session errors", () => {
     expect(isOpenCodeUnknownSessionError("Session not found: s_123", "")).toBe(true);
     expect(isOpenCodeUnknownSessionError("", "unknown session id")).toBe(true);
+    expect(isOpenCodeUnknownSessionError("", "Session unavailable")).toBe(true);
     expect(isOpenCodeUnknownSessionError("all good", "")).toBe(false);
+    expect(isOpenCodeUnknownSessionError("Provider unavailable", "")).toBe(false);
   });
 });

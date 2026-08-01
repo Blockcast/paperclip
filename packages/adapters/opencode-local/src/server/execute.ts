@@ -808,6 +808,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
       const rawExitCode = attempt.proc.exitCode;
       const synthesizedExitCode = parsedError && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
+      const sessionUnavailable =
+        (synthesizedExitCode ?? 0) !== 0 &&
+        isOpenCodeUnknownSessionError(attempt.proc.stdout, attempt.rawStderr);
       const fallbackErrorMessage =
         parsedError ||
         stderrLine ||
@@ -830,6 +833,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: synthesizedExitCode,
         signal: attempt.proc.signal,
         timedOut: false,
+        errorCode: sessionUnavailable ? "session_unavailable" : undefined,
         errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
         usage: {
           inputTokens: attempt.parsed.usage.inputTokens,

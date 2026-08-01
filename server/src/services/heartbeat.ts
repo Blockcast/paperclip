@@ -630,6 +630,12 @@ export const CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS = 20;
 export const JOB_FAILED_HEARTBEAT_RETRY_REASON = "job_failed";
 export const JOB_FAILED_HEARTBEAT_RETRY_WAKE_REASON = "job_failed_retry";
 export const JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS = 4;
+// The adapter already makes one fresh-session attempt in-process. These are a
+// bounded backstop for control-plane/process loss around that transition.
+const SESSION_UNAVAILABLE_HEARTBEAT_RETRY_REASON = "session_unavailable";
+const SESSION_UNAVAILABLE_HEARTBEAT_RETRY_WAKE_REASON = "session_unavailable_retry";
+export const SESSION_UNAVAILABLE_HEARTBEAT_RETRY_DELAY_MS = 30 * 1000;
+export const SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS = 2;
 export const DEP_BLOCKED_RETRY_REASON = "dependency_blocked";
 export const DEP_BLOCKED_BASE_DELAY_MS = 5 * 60 * 1000;
 export const DEP_BLOCKED_MAX_DELAY_MS = 60 * 60 * 1000;
@@ -930,6 +936,8 @@ export function shouldScheduleAutomaticRunRetry(
     return isPrReviewRetryContext(parseObject(run.contextSnapshot));
   }
 
+  if (run.errorCode === "session_unavailable") return true;
+
   if (run.errorCode !== "adapter_failed" && run.errorCode !== "process_lost") return false;
 
   // BLO-9147 AC1: gate on wakeReason/reviewKind/taskKey from the persisted
@@ -1000,6 +1008,14 @@ function resolveAutomaticRunRetryOpts(
       retryReason: JOB_FAILED_HEARTBEAT_RETRY_REASON,
       wakeReason: JOB_FAILED_HEARTBEAT_RETRY_WAKE_REASON,
       maxAttempts: JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+    };
+  }
+  if (run.errorCode === "session_unavailable") {
+    return {
+      retryReason: SESSION_UNAVAILABLE_HEARTBEAT_RETRY_REASON,
+      wakeReason: SESSION_UNAVAILABLE_HEARTBEAT_RETRY_WAKE_REASON,
+      maxAttempts: SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+      delayMs: SESSION_UNAVAILABLE_HEARTBEAT_RETRY_DELAY_MS,
     };
   }
   return undefined;
