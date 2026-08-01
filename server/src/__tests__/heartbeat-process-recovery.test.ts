@@ -266,6 +266,7 @@ import {
 } from "../services/hot-restart.ts";
 import { secretService } from "../services/secrets.ts";
 import {
+  STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
@@ -1264,7 +1265,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       returnOwnerAgentId: input.returnOwnerAgentId ?? input.agentId,
       cause: input.cause ?? "stranded_assigned_issue",
       attemptCount: 1,
-      maxAttempts: null,
+      // BLO-18996: owner-wake recovery actions now carry a wake budget so a named owner
+      // who cannot discharge the action stops being re-woken forever. Only the causes
+      // that never wake an owner (provider-quota waits, manual-repair holds) stay null.
+      maxAttempts: STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS,
     });
 
     expect(action.evidence).toMatchObject({
