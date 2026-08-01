@@ -1138,4 +1138,165 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     adapter.disarm();
     await heartbeat.drainInFlightExecutions(60_000);
   }, 600_000);
+
+  it("honours dispatch demand that arrived before the first pass installed its cursor", async () => {
+    // BLO-20396 (fifth review follow-up). `onCoalescedDemand` recorded
+    // head-rescan demand only when a resume cursor ALREADY existed. The cursor
+    // is installed at the very END of a pass, so every wake that folded into
+    // the FIRST bounded pass was dropped on the floor. That pass then installed
+    // a cursor and scheduled a resume chain which started PAST the head and ran
+    // to exhaustion, so a row at the head was never revisited and sat waiting
+    // for an unrelated wake — the starvation class this ticket exists to remove.
+    //
+    // The shape that isolates it: a queue deeper than one pass, arranged so the
+    // pass that finally exhausts the scan prunes NOTHING. That matters — a pass
+    // that prunes even one terminal row calls scheduleFollowUpDispatchAfterPrune,
+    // which schedules a head-start pass and rescues the stranded row for an
+    // unrelated reason. An earlier version of this test put terminal rows in the
+    // tail and passed against the bug for exactly that reason.
+    //
+    //   rows 0..1999   target an already-`done` issue -> pruned by the first
+    //                  pass, which therefore claims nothing, installs a cursor
+    //                  and schedules the resume chain.
+    //   rows 2000..2399 are dependency-blocked -> the claim gate cancels them,
+    //                  which is NOT counted as a terminal prune, so the pass
+    //                  that exhausts the scan schedules no prune follow-up.
+    //                  Cancelling them is also slow, which is what gives the
+    //                  insert below a wide margin over the resume chain.
+    //
+    // A claimable row is then inserted at the HEAD, behind the cursor, WITHOUT
+    // a dispatch call of its own — only a head rescan can reach it.
+    //
+    // Nothing here may call `resumeQueuedRuns` after the coalesced pair: a
+    // top-level call re-arms the marker via the entry guard (a cursor exists by
+    // then) and would mask the bug entirely.
+    const { companyId, agentId, addIssueBackedRun, insideWindowAgeMs, pastWindowAgeMs } =
+      await seedDeepClaimableBacklog({ maxConcurrentRuns: 2, issuelessRows: 2_000 });
+    const adapter = gateAdapterExecutions();
+
+    const doneIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: doneIssueId,
+      companyId,
+      title: "Already-finished issue",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 90_000,
+      identifier: `${companyId.slice(0, 4).toUpperCase()}-90000`,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId: doneIssueId, wakeReason: "issue_assigned" } })
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued")));
+
+    // One never-resolving blocker holds every tail row unclaimable.
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Never-done blocker",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 91_000,
+      identifier: `${companyId.slice(0, 4).toUpperCase()}-91000`,
+      startedAt: new Date(),
+    });
+    const tailIssues: Array<typeof issues.$inferInsert> = [];
+    const tailRelations: Array<typeof issueRelations.$inferInsert> = [];
+    const tailWakes: Array<typeof agentWakeupRequests.$inferInsert> = [];
+    const tailRuns: Array<typeof heartbeatRuns.$inferInsert> = [];
+    for (let i = 0; i < 400; i += 1) {
+      const issueId = randomUUID();
+      const runId = randomUUID();
+      const wakeId = randomUUID();
+      const at = new Date(Date.now() - 12 * 60 * 60 * 1000 + pastWindowAgeMs(i));
+      tailIssues.push({
+        id: issueId,
+        companyId,
+        title: `Blocked ${i}`,
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: 92_000 + i,
+        identifier: `${companyId.slice(0, 4).toUpperCase()}-${92_000 + i}`,
+      });
+      tailRelations.push({
+        companyId,
+        issueId: blockerIssueId,
+        relatedIssueId: issueId,
+        type: "blocks",
+      });
+      tailWakes.push({
+        id: wakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId },
+        status: "queued",
+        runId,
+        requestedAt: at,
+        updatedAt: at,
+      });
+      tailRuns.push({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: wakeId,
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+        createdAt: at,
+        updatedAt: at,
+      });
+    }
+    for (let i = 0; i < tailIssues.length; i += 200) {
+      await db.insert(issues).values(tailIssues.slice(i, i + 200));
+    }
+    for (let i = 0; i < tailRelations.length; i += 200) {
+      await db.insert(issueRelations).values(tailRelations.slice(i, i + 200));
+    }
+    for (let i = 0; i < tailWakes.length; i += 200) {
+      await db.insert(agentWakeupRequests).values(tailWakes.slice(i, i + 200));
+    }
+    for (let i = 0; i < tailRuns.length; i += 200) {
+      await db.insert(heartbeatRuns).values(tailRuns.slice(i, i + 200));
+    }
+
+    // Both calls in ONE tick. The lock is published before the callback body
+    // runs, so the second call finds it held and coalesces while the first pass
+    // is still scanning — precisely the window in which no cursor exists yet.
+    const firstPass = heartbeat.resumeQueuedRuns();
+    const coalescedPass = heartbeat.resumeQueuedRuns();
+    await Promise.all([firstPass, coalescedPass]);
+
+    // Lands behind the scan boundary the first pass just installed. Inserting a
+    // row does not dispatch, so this is demand-free: the head rescan is the
+    // only thing that can pick it up. `medium` keeps it out of the priority
+    // lane, which would otherwise reach it regardless of the cursor.
+    const headRunId = await addIssueBackedRun("medium", insideWindowAgeMs(0));
+
+    expect(await adapter.waitForStarted(1)).toBe(1);
+    expect(adapter.started[0]).toBe(headRunId);
+
+    // Sanity that the fixture did what the scenario needs: the chain really did
+    // walk the whole backlog, rather than stalling early for some other reason.
+    const stillQueuedTerminal = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.agentId, agentId),
+        eq(heartbeatRuns.status, "queued"),
+        eq(heartbeatRuns.contextIssueId, doneIssueId),
+      ));
+    expect(stillQueuedTerminal).toHaveLength(0);
+
+    await stopBacklog(agentId);
+    adapter.disarm();
+    await heartbeat.drainInFlightExecutions(60_000);
+  }, 600_000);
 });
