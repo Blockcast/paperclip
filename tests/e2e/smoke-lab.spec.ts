@@ -302,10 +302,10 @@ async function gatewayFetch(request: APIRequestContext, path: string, token: str
 
 test.describe.serial("Smoke Lab scenario catalog mirror", () => {
   // This CI-safe mirror records eight screenshot-backed lifecycle steps for
-  // each of P1-P7. On a cold ARC runner the full 56-step pass can approach ten
-  // minutes while still progressing normally; keep margin within the PR job's
-  // 30-minute ceiling without truncating scenario coverage.
-  test.setTimeout(900_000);
+  // each of P1-P7. On a cold dedicated e2e ARC runner the full 56-step pass can
+  // exceed fifteen minutes while still progressing normally; preserve half of
+  // the PR e2e job's 60-minute ceiling without truncating scenario coverage.
+  test.setTimeout(1_800_000);
 
   test("records the P1-P7 CI-safe Smoke Lab lifecycle into the results API @smoke-lab", async ({ page, request }) => {
     const seed = await newCompany(request, "catalog");
