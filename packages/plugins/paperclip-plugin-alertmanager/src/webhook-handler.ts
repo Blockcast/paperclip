@@ -9,7 +9,12 @@
 
 import { timingSafeEqual } from "node:crypto";
 import type { PluginContext, PluginWebhookInput } from "@paperclipai/plugin-sdk";
-import { ACCEPTED_SCHEMA_VERSIONS, STATE_KEYS, WEBHOOK_KEYS } from "./constants.js";
+import {
+  ACCEPTED_SCHEMA_VERSIONS,
+  WEBHOOK_KEYS,
+  alertStateRef,
+  legacyInstanceAlertStateRef,
+} from "./constants.js";
 import {
   alertMatchesLabelFilter,
   buildIssueDescription,
@@ -97,6 +102,45 @@ export function isAlertmanagerPayload(
 }
 
 /**
+ * Read a fingerprint's dedup row from its owning company's scope, migrating a
+ * pre-BLO-20467 instance-scoped row on first sight.
+ *
+ * The migration is gated on `paperclipCompanyId`: a legacy row is adopted only
+ * by the company whose issue it actually tracks. A row belonging to another
+ * tenant is ignored (and left in place), which is precisely the cross-tenant
+ * reuse this change exists to stop. Without the read-through, every alert
+ * firing at upgrade time would look new — duplicating live issues and orphaning
+ * the originals so their resolution could never close them.
+ */
+async function readAlertState(
+  ctx: PluginContext,
+  companyId: string,
+  fingerprint: string,
+): Promise<{ ref: ReturnType<typeof alertStateRef>; record: AlertStateRecord | null }> {
+  const ref = alertStateRef(companyId, fingerprint);
+  const scoped = (await ctx.state.get(ref)) as AlertStateRecord | null;
+  if (scoped) return { ref, record: scoped };
+
+  const legacyRef = legacyInstanceAlertStateRef(fingerprint);
+  const legacy = (await ctx.state.get(legacyRef)) as AlertStateRecord | null;
+  if (legacy && legacy.paperclipCompanyId === companyId) {
+    await ctx.state.set(ref, legacy);
+    try {
+      await ctx.state.delete(legacyRef);
+    } catch (err) {
+      // The scoped copy is already durable, so the migration has taken effect;
+      // a stale legacy row is inert (only this company could ever adopt it, and
+      // it will never be read again now that the scoped row exists).
+      ctx.logger.warn(
+        `paperclip-plugin-alertmanager: migrated alert ${fingerprint} to company scope but could not remove the legacy row: ${String(err)}`,
+      );
+    }
+    return { ref, record: legacy };
+  }
+  return { ref, record: null };
+}
+
+/**
  * §8.1 — first time we see a fingerprint, create an issue. On re-fire, just
  * bump `lastFiredAt` and re-emit the firing event. On re-fire after a manual
  * close, re-open the existing issue (§8.3 option A).
@@ -106,11 +150,22 @@ export async function handleFiring(
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
 ): Promise<void> {
-  const stateRef = {
-    scopeKind: "instance" as const,
-    stateKey: STATE_KEYS.alert(alert.fingerprint),
-  };
-  const existing = (await ctx.state.get(stateRef)) as AlertStateRecord | null;
+  // Resolved up front because it now scopes the state read, not just issue
+  // creation. Without it there is no namespace to look in, so a delivery that
+  // could not have created an issue anyway is dropped here instead of after a
+  // guaranteed-miss lookup.
+  const companyId = config.defaultCompanyId;
+  if (!companyId) {
+    ctx.logger.warn(
+      `Cannot track alert ${alert.fingerprint}: defaultCompanyId not configured`,
+    );
+    return;
+  }
+  const { ref: stateRef, record: existing } = await readAlertState(
+    ctx,
+    companyId,
+    alert.fingerprint,
+  );
   const nowIso = new Date().toISOString();
   const alertname = alert.labels.alertname ?? "UnnamedAlert";
   const severity = alert.labels.severity ?? "unknown";
@@ -193,15 +248,8 @@ export async function handleFiring(
     return;
   }
 
-  // First time we've seen this fingerprint — create a new issue.
-  const companyId = config.defaultCompanyId;
-  if (!companyId) {
-    ctx.logger.warn(
-      `Cannot create issue for alert ${alert.fingerprint}: defaultCompanyId not configured`,
-    );
-    return;
-  }
-
+  // First time we've seen this fingerprint — create a new issue. `companyId` is
+  // already resolved and non-empty; it scoped the state read above.
   const { assigneeUserId, assigneeAgentId, resolution } =
     await resolveAssigneeUserId(ctx, alert, config.ownerMap);
   const issueRouteResolution = resolveIssueRoute(alert, config.issueRouteMap);
@@ -327,11 +375,20 @@ export async function handleResolved(
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
 ): Promise<void> {
-  const stateRef = {
-    scopeKind: "instance" as const,
-    stateKey: STATE_KEYS.alert(alert.fingerprint),
-  };
-  const stateRecord = (await ctx.state.get(stateRef)) as AlertStateRecord | null;
+  // Same scoping rule as handleFiring: without a company there is no namespace
+  // to look in, and `recoverStateFromIssue` could not query either.
+  const companyId = config.defaultCompanyId;
+  if (!companyId) {
+    ctx.logger.warn(
+      `Cannot resolve alert ${alert.fingerprint}: defaultCompanyId not configured`,
+    );
+    return;
+  }
+  const { ref: stateRef, record: stateRecord } = await readAlertState(
+    ctx,
+    companyId,
+    alert.fingerprint,
+  );
   const existing = stateRecord ?? (await recoverStateFromIssue(ctx, config, alert));
   if (!existing) {
     ctx.logger.info(

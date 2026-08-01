@@ -115,6 +115,25 @@ export interface CompanyScope {
 }
 
 /**
+ * Raised when this delivery's company scope could not be established for a
+ * reason that may not still hold on a retry — a failed config RPC, or a company
+ * with no stored config yet.
+ *
+ * It must propagate out of `onWebhook`. Returning normally makes the host record
+ * the delivery `success` and answer HTTP 200 (`server/src/routes/plugins.ts`
+ * "Step 8: Update delivery record to success"), which tells Alertmanager the
+ * alert was accepted and suppresses its retry — so a transient config-RPC blip
+ * would silently destroy the alert instead of delaying it. Throwing lands in the
+ * host's catch, records `failed`, and returns 502, which Alertmanager retries.
+ */
+export class CompanyScopeUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CompanyScopeUnavailableError";
+  }
+}
+
+/**
  * Load the config + bearer token for the company that owns this delivery.
  *
  * The delivering company's own config row is the ONLY acceptable source, and
@@ -131,12 +150,18 @@ export interface CompanyScope {
  *     bearer token and then file the resulting issues under the wrong tenant's
  *     `defaultCompanyId`.
  *
- * So an empty read or a read error yields `null`, and the caller drops the
- * delivery, rather than falling open onto another tenant's credentials.
+ * Failure modes are split by whether a retry could succeed. A read error or an
+ * empty config throws `CompanyScopeUnavailableError` so Alertmanager retries and
+ * the alert survives an operator fixing the config. A delivery with no
+ * `companyId` at all returns `null`: no retry can add one, so it is dropped.
+ * Neither ever falls open onto another tenant's credentials.
  */
 export async function resolveCompanyScope(
   ctx: PluginContext,
-  companyId: string | undefined,
+  // `PluginWebhookInput.companyId` is a required `string`, so this keeps the SDK
+  // guarantee intact. The falsy check below is ingress defense against a host
+  // that violates it, not an admission that `undefined` is expected.
+  companyId: string,
 ): Promise<CompanyScope | null> {
   if (!companyId) {
     ctx.logger.error(
@@ -154,13 +179,17 @@ export async function resolveCompanyScope(
     ctx.logger.error(
       `paperclip-plugin-alertmanager: failed to load config for company ${companyId}: ${String(err)}`,
     );
-    return null;
+    throw new CompanyScopeUnavailableError(
+      `could not load config for company ${companyId}: ${String(err)}`,
+    );
   }
   if (isEmptyConfig(raw)) {
     ctx.logger.error(
-      `paperclip-plugin-alertmanager: no stored config for company ${companyId} — rejecting delivery`,
+      `paperclip-plugin-alertmanager: no stored config for company ${companyId} — failing delivery so Alertmanager retries`,
     );
-    return null;
+    throw new CompanyScopeUnavailableError(
+      `no stored config for company ${companyId}`,
+    );
   }
   const config = buildConfig(raw as unknown as AlertmanagerPluginConfig);
   return {
