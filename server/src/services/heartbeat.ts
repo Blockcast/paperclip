@@ -17910,7 +17910,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           issues,
           and(
             eq(issues.companyId, agent.companyId),
-            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issues.id}`,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = cast(${issues.id} as text)`,
           ),
         )
         .where(and(
