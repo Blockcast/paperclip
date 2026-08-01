@@ -4959,6 +4959,126 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).resolves.toHaveLength(0);
   });
 
+  it("BLO-18643: active source-scoped recovery prevents a plain in_progress status update without a run lock", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "adapter_exit_code",
+      runError: "Adapter failed before the issue advanced",
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const recoveryResult = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(recoveryResult.escalated).toBe(1);
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(action).toMatchObject({
+      status: "active",
+      ownerAgentId: agentId,
+    });
+
+    const [blockedBeforeUpdate] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(blockedBeforeUpdate).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    const originalStartedAt = blockedBeforeUpdate!.startedAt;
+    expect(originalStartedAt).not.toBeNull();
+
+    const updated = await issueService(db).update(issueId, {
+      status: "in_progress",
+      actorAgentId: agentId,
+    });
+    expect(updated).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    expect(updated!.startedAt?.toISOString()).toBe(originalStartedAt!.toISOString());
+
+    const [blockedAfterUpdate] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(blockedAfterUpdate).toMatchObject({
+      status: "blocked",
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    expect(blockedAfterUpdate!.startedAt?.toISOString()).toBe(originalStartedAt!.toISOString());
+  });
+
+  it("BLO-18643: active source-scoped recovery also blocks a plain assignee update when owner differs", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "adapter_exit_code",
+      runError: "Adapter failed before the issue advanced",
+    });
+    const managerId = randomUUID();
+    await db.insert(agents).values({
+      id: managerId,
+      companyId,
+      name: "RecoveryManager",
+      role: "cto",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const recoveryResult = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(recoveryResult.escalated).toBe(1);
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(action).toBeTruthy();
+    await db
+      .update(issueRecoveryActions)
+      .set({ ownerAgentId: managerId })
+      .where(eq(issueRecoveryActions.id, action!.id));
+
+    const [blockedBeforeUpdate] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(blockedBeforeUpdate).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    const originalStartedAt = blockedBeforeUpdate!.startedAt;
+    expect(originalStartedAt).not.toBeNull();
+
+    const updated = await issueService(db).update(issueId, {
+      status: "in_progress",
+      actorAgentId: agentId,
+    });
+    expect(updated).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    expect(updated!.startedAt?.toISOString()).toBe(originalStartedAt!.toISOString());
+
+    const [blockedAfterUpdate] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(blockedAfterUpdate).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    expect(blockedAfterUpdate!.startedAt?.toISOString()).toBe(originalStartedAt!.toISOString());
+  });
+
   // BLO-16182: process_lost is reclassified as transient_infra (3 attempts +
   // 60s backoff). These two guard the COMBINED attempt cap end-to-end through
   // reconcileStrandedAssignedIssues: the continuation sweep and the in-reaper

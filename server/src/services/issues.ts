@@ -8924,6 +8924,70 @@ export function issueService(db: Db) {
                   : eq(issues.assigneeAgentId, expectedCurrentAssigneeAgentId),
               ]),
         ];
+
+        if (issueData.status === "in_progress" && actorAgentId) {
+          await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`);
+          const recoveryGuard = await tx
+            .select({
+              recoveryActionId: issueRecoveryActions.id,
+              status: issues.status,
+              assigneeAgentId: issues.assigneeAgentId,
+              checkoutRunId: issues.checkoutRunId,
+              executionRunId: issues.executionRunId,
+              startedAt: issues.startedAt,
+            })
+            .from(issues)
+            .innerJoin(
+              issueRecoveryActions,
+              and(
+                eq(issueRecoveryActions.companyId, issues.companyId),
+                eq(issueRecoveryActions.sourceIssueId, issues.id),
+                inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+              ),
+            )
+            .where(and(eq(issues.id, id), eq(issues.assigneeAgentId, actorAgentId)))
+            .limit(1)
+            .then((rows: Array<{
+              recoveryActionId: string;
+              status: string;
+              assigneeAgentId: string | null;
+              checkoutRunId: string | null;
+              executionRunId: string | null;
+              startedAt: Date | null;
+            }>) => rows[0] ?? null);
+
+          if (recoveryGuard && (recoveryGuard.status === "blocked" || recoveryGuard.status === "in_progress")) {
+            const nextCheckoutRunId = patch.checkoutRunId !== undefined
+              ? patch.checkoutRunId
+              : recoveryGuard.checkoutRunId;
+            const nextExecutionRunId = patch.executionRunId !== undefined
+              ? patch.executionRunId
+              : recoveryGuard.executionRunId;
+
+            if (!nextCheckoutRunId && !nextExecutionRunId) {
+              patch.status = "blocked";
+              patch.checkoutRunId = null;
+              patch.executionRunId = null;
+              patch.executionAgentNameKey = null;
+              patch.executionLockedAt = null;
+              patch.updatedAt = new Date();
+              if (issueData.startedAt === undefined) {
+                delete patch.startedAt;
+              }
+              logger.info(
+                {
+                  issueId: id,
+                  companyId: existing.companyId,
+                  actorAgentId,
+                  recoveryActionId: recoveryGuard.recoveryActionId,
+                  currentStatus: recoveryGuard.status,
+                },
+                "source-scoped recovery guard reasserted blocked status during plain issue update",
+              );
+            }
+          }
+        }
+
         const updated = await tx
           .update(issues)
           .set(patch)

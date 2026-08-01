@@ -4252,7 +4252,6 @@ export function recoveryService(
                 and(
                   eq(issueRecoveryActions.id, input.recoveryActionId),
                   eq(issueRecoveryActions.sourceIssueId, issues.id),
-                  eq(issueRecoveryActions.ownerAgentId, input.agentId),
                   inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
                 ),
               ),
