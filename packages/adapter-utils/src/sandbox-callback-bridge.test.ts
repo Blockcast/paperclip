@@ -292,11 +292,18 @@ describe("sandbox callback bridge", () => {
       "utf8",
     );
 
+    let responseRaw: string | null = null;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      responseRaw = await readFile(path.posix.join(directories.responsesDir, "req-1.json"), "utf8")
+        .catch(() => null);
+      if (responseRaw) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
     await worker.stop({ drainTimeoutMs: 1_000 });
 
-    const response = JSON.parse(
-      await readFile(path.posix.join(directories.responsesDir, "req-1.json"), "utf8"),
-    ) as { status: number; body: string };
+    expect(responseRaw).toBeTruthy();
+    const response = JSON.parse(responseRaw!) as { status: number; body: string };
     expect(handled).toBe(0);
     expect(response.status).toBe(403);
     expect(JSON.parse(response.body)).toEqual({
@@ -1068,8 +1075,110 @@ describe("sandbox callback bridge", () => {
     const scripts = runner.execute.mock.calls
       .map(([input]) => input.args?.join("\n") ?? "")
       .join("\n---\n");
-    expect(scripts).toContain("/workspace/queue/000000000001.json.paperclip-upload.tmp");
-    expect(scripts).toContain("mv -f '/workspace/queue/000000000001.json.paperclip-upload.tmp' '/workspace/queue/000000000001.json'");
+    // Staging names carry a per-invocation token, so match the shape rather
+    // than a literal path.
+    expect(scripts).toMatch(
+      /\/workspace\/queue\/000000000001\.json\.[0-9a-f-]{36}\.paperclip-upload\.tmp/,
+    );
+    expect(scripts).toMatch(
+      /mv -f '\/workspace\/queue\/000000000001\.json\.[0-9a-f-]{36}\.paperclip-upload\.tmp' '\/workspace\/queue\/000000000001\.json'/,
+    );
     expect(scripts).not.toContain("> '/workspace/queue/000000000001.json'");
+  });
+
+  it("gives concurrent writes to the same destination distinct staging files", async () => {
+    const runner = {
+      execute: vi.fn(async (_input: {
+        command: string;
+        args?: string[];
+        cwd?: string;
+        env?: Record<string, string>;
+        stdin?: string;
+        timeoutMs?: number;
+      }): Promise<RunProcessResult> => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+        pid: null,
+        startedAt: new Date().toISOString(),
+      })),
+    };
+
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({
+      runner,
+      remoteCwd: "/workspace",
+      timeoutMs: 30_000,
+    });
+
+    const target = "/workspace/queue/000000000001.json";
+    await Promise.all([
+      client.writeTextFile(target, "{\"writer\":\"a\"}\n"),
+      client.writeTextFile(target, "{\"writer\":\"b\"}\n"),
+    ]);
+
+    const scripts = runner.execute.mock.calls
+      .map(([input]) => input.args?.join("\n") ?? "")
+      .join("\n---\n");
+
+    const stagingPaths = new Set(
+      [...scripts.matchAll(/000000000001\.json\.([0-9a-f-]{36})\.paperclip-upload\.b64/g)].map(
+        (match) => match[1],
+      ),
+    );
+    // Two concurrent writers to one destination must not share a scratch file,
+    // or one decode clobbers the other's half-appended base64.
+    expect(stagingPaths.size).toBe(2);
+  });
+
+  it("removes both staging files when a chunk append aborts mid-upload", async () => {
+    // Per-invocation tokens mean the next attempt picks a fresh name and can
+    // never sweep this one's scratch files, so a failed upload that skips
+    // cleanup leaks them permanently.
+    const runner = {
+      execute: vi.fn(async (input: {
+        command: string;
+        args?: string[];
+        cwd?: string;
+        env?: Record<string, string>;
+        stdin?: string;
+        timeoutMs?: number;
+      }): Promise<RunProcessResult> => {
+        const script = input.args?.join("\n") ?? "";
+        const failed = script.includes("printf '%s'");
+        return {
+          exitCode: failed ? 1 : 0,
+          signal: null,
+          timedOut: false,
+          stdout: "",
+          stderr: failed ? "disk full" : "",
+          pid: null,
+          startedAt: new Date().toISOString(),
+        };
+      }),
+    };
+
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({
+      runner,
+      remoteCwd: "/workspace",
+      timeoutMs: 30_000,
+    });
+
+    const target = "/workspace/queue/000000000001.json";
+    await expect(client.writeTextFile(target, "{\"ok\":true}\n")).rejects.toThrow();
+
+    const scripts = runner.execute.mock.calls.map(([input]) => input.args?.join("\n") ?? "");
+    const token = scripts
+      .join("\n")
+      .match(/000000000001\.json\.([0-9a-f-]{36})\.paperclip-upload\.b64/)?.[1];
+    expect(token).toBeDefined();
+
+    // The finalize script (which carries the happy-path rm) never ran, so the
+    // only cleanup available is the failure-path sweep.
+    expect(scripts.some((script) => script.includes("base64 -d <"))).toBe(false);
+    const cleanup = scripts.at(-1) ?? "";
+    expect(cleanup).toContain(`rm -f '${target}.${token}.paperclip-upload.b64'`);
+    expect(cleanup).toContain(`'${target}.${token}.paperclip-upload.tmp'`);
   });
 });
