@@ -637,7 +637,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipWithdrawInteraction",
-      "Withdraw a still-pending issue-thread interaction you created (ask_user_questions, request_confirmation, request_checkbox_confirmation, suggest_tasks). Marks it cancelled so it leaves the board's actionable queue while staying visible in issue history. You can only withdraw cards you created, and only while they are still pending.",
+      "Withdraw a still-pending issue-thread interaction you created (ask_user_questions, request_confirmation, request_checkbox_confirmation, suggest_tasks). Marks it cancelled so it leaves the board's actionable queue while staying visible in issue history. You can only withdraw cards you created, and only while they are still pending. Tool-action confirmations are the human approval gate in front of a write/destructive tool call and can never be withdrawn — accept or reject those instead.",
       withdrawInteractionToolSchema,
       async ({ issueId, interactionId, ...body }) =>
         client.requestJson(
