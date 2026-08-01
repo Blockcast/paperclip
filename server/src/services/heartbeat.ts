@@ -993,6 +993,26 @@ export function shouldScheduleAutomaticRunRetry(
     return isPrReviewRetryContext(parseObject(run.contextSnapshot));
   }
 
+  // BLO-18030: a hard-stale-kill force-terminates a Job that was claimed but
+  // silent past EXTERNAL_LIFECYCLE_HARD_STALE_MS. That left pr_review wakes with
+  // no recovery whatsoever: the run is terminal with no bounded retry, and the
+  // `agent_wakeup_requests` row is set to `failed`, which
+  // reconcileFailedWakeDispatches does not select (it only covers
+  // `dispatch_failed`). Net effect observed 2026-07-25 on PR #1758: the review
+  // simply never happened and nothing surfaced it.
+  //
+  // Unlike job_missing/k8s_pod_schedule_failed (where the pod provably never
+  // ran), a stale-killed run WAS running, so it may have already posted. Gate on
+  // the same shape of durable proof used for job_failed: retry only when the
+  // reconciler's GitHub probe definitively found no reviewer evidence at this
+  // head. A probe error or a found review records no flag / `true` and stays
+  // terminal, so this can never double-post a review.
+  if (run.errorCode === "external_lifecycle_stale_killed") {
+    const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
+    if (recovery.reviewEvidenceFound !== false) return false;
+    return isPrReviewRetryContext(parseObject(run.contextSnapshot));
+  }
+
   if (run.errorCode !== "adapter_failed" && run.errorCode !== "process_lost") return false;
 
   // BLO-9147 AC1: gate on wakeReason/reviewKind/taskKey from the persisted
@@ -16309,6 +16329,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       errorCode: string;
       errorMessage: string;
     } | null = null;
+    // BLO-18030: for a hard-stale-kill we do not change the terminal verdict (a
+    // force-terminated silent Job is still a failure), but we DO need to know
+    // whether a review actually landed before the kill, because that is what
+    // makes the bounded retry below safe. `null` means "could not prove either
+    // way" (no PR context, or the GitHub probe errored) and stays terminal.
+    let staleKillReviewEvidenceFound: boolean | null = null;
+    if (input.staleKill) {
+      try {
+        const prReview = derivePaperclipPrReview(parseObject(input.run.contextSnapshot));
+        if (prReview?.repoFullName && prReview.prNumber !== null) {
+          const verified = await githubHasReviewerEvidenceForPr({
+            repoFullName: prReview.repoFullName,
+            prNumber: prReview.prNumber,
+            headSha: prReview.headSha,
+          });
+          if ("found" in verified) staleKillReviewEvidenceFound = verified.found;
+        }
+      } catch {
+        // Probe failure must not resurrect a possibly-completed review: leaving
+        // this null keeps the run terminal rather than risking a double review.
+      }
+    }
     if (!input.staleKill && !input.jobStatus) {
       let reviewEvidence = evaluatePrReviewCompletionEvidence(
         parseObject(input.run.contextSnapshot),
@@ -16405,6 +16447,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             jobMessage: terminalOutcome.jobMessage,
             ...(adapterInvocationStarted !== null ? { adapterInvocationStarted } : {}),
             ...(containerDiagnostics ? { containerDiagnostics } : {}),
+            ...(staleKillReviewEvidenceFound !== null
+              ? { reviewEvidenceFound: staleKillReviewEvidenceFound }
+              : {}),
           },
         },
         errorCode: terminalOutcome.errorCode,
