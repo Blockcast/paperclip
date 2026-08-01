@@ -14,6 +14,7 @@
  */
 
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { DEFAULT_ISSUE_ROUTE_MAP, DEFAULT_OWNER_MAP } from "./constants.js";
 import type {
   AlertmanagerPluginConfig,
@@ -224,4 +225,88 @@ export async function resolveCompanyScope(
     config,
     token: await resolveWebhookToken(ctx, config, companyId),
   };
+}
+
+/**
+ * True when a host call failed because this invocation carries no company
+ * scope (or the wrong one).
+ *
+ * Matched on the JSON-RPC code rather than the message so it survives wording
+ * changes; the `name` check covers a direct (non-RPC) handler call in tests.
+ */
+function isInvocationScopeDenied(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (code === PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED) return true;
+  return (err as { name?: unknown } | null)?.name === "InvocationScopeDeniedError";
+}
+
+/**
+ * Resolve the company scope for one escalation-sweep tick.
+ *
+ * The scope comes from the HOST's invocation scope, not from a module global
+ * populated by `onConfigChanged`. That distinction is the whole point:
+ *
+ *  - `onConfigChanged` does not say which company saved, so a global populated
+ *    from it holds "whichever company saved last" — and is empty until the
+ *    first save after every restart. That is last-writer-wins plus a silent
+ *    post-restart hole.
+ *  - An unscoped `ctx.config.get()` *after* initialization is an RPC the host
+ *    answers from the current invocation's scope
+ *    (`worker-rpc-host.ts` → `config.get`). For a job tick the host derives
+ *    that scope in `deriveCallInvocationScope`
+ *    (`server/src/services/plugin-worker-manager.ts`), which returns
+ *    `bootstrapCompanyId` — set by `plugin-loader.ts` only when EXACTLY ONE
+ *    company has configured the plugin.
+ *
+ * So the behaviour is decided by the host, deterministically:
+ *
+ *  - One configured company → the tick is scoped to it, and we read that
+ *    company's live config straight from the host. No dependence on
+ *    `onConfigChanged`, so the sweep is correct immediately after a restart.
+ *  - Two or more → the tick has no scope and the host denies every
+ *    company-scoped call. This is not a limitation we can code around: the
+ *    sweep's own `ctx.issues.list({ companyId })` would be denied too, whatever
+ *    company id we passed it. We stop here deliberately and say so, rather than
+ *    proceeding into a guaranteed `InvocationScopeDeniedError` per tick.
+ *
+ * Enumerating a plugin's configured companies needs a host API that the worker
+ * protocol does not expose (the host has `registry.listConfigCompanyIds`, but
+ * there is no worker-facing method for it) — tracked in BLO-20595. Until that
+ * lands, multi-company escalation cannot work, and this returns `null`.
+ */
+export async function resolveSweepScope(
+  ctx: PluginContext,
+): Promise<AlertmanagerPluginConfig | null> {
+  let raw: Record<string, unknown> | null | undefined;
+  try {
+    raw = (await ctx.config.get()) as
+      | Record<string, unknown>
+      | null
+      | undefined;
+  } catch (err) {
+    if (isInvocationScopeDenied(err)) {
+      ctx.logger.warn(
+        "paperclip-plugin-alertmanager: escalation sweep skipped — this instance has more than one company configured, so the host gives scheduled jobs no company scope and denies every company-scoped call. Alert escalation ladders are NOT advancing for any tenant. Needs host enumeration of configured companies (BLO-20595). Webhook deliveries are unaffected: they carry their own company scope.",
+      );
+      return null;
+    }
+    ctx.logger.error(
+      `paperclip-plugin-alertmanager: escalation sweep skipped — could not load config for this tick: ${String(err)}`,
+    );
+    return null;
+  }
+  if (isEmptyConfig(raw)) {
+    ctx.logger.warn(
+      "paperclip-plugin-alertmanager: escalation sweep skipped — the scoped company has no stored plugin config yet",
+    );
+    return null;
+  }
+  const config = buildConfig(raw as unknown as AlertmanagerPluginConfig);
+  if (!config.defaultCompanyId) {
+    ctx.logger.warn(
+      "paperclip-plugin-alertmanager: escalation sweep skipped — defaultCompanyId is not set in the scoped company's config",
+    );
+    return null;
+  }
+  return config;
 }
