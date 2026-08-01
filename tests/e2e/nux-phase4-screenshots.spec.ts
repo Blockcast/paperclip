@@ -26,6 +26,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Write under the gitignored test-results dir so re-runs leave no untracked
 // noise; screenshots are uploaded to the issue as QA evidence, not committed.
 const SHOT_DIR = path.join(__dirname, "test-results", "nux-phase4-shots");
+const COMPANY_NAME = `QA Robotics ${Date.now().toString(36)}`;
 
 function shot(name: string) {
   fs.mkdirSync(SHOT_DIR, { recursive: true });
@@ -103,7 +104,7 @@ test.describe("NUX Phase 4 visual QA", () => {
     await expect(
       page.getByRole("heading", { name: "Name your company" }),
     ).toBeVisible({ timeout: 15_000 });
-    await page.getByPlaceholder("Acme Corp").fill("QA Robotics");
+    await page.getByPlaceholder("Acme Corp").fill(COMPANY_NAME);
     await page.screenshot({ path: shot("01-company-setup.png") });
 
     await page.getByRole("button", { name: /^Next/ }).click();
@@ -115,10 +116,30 @@ test.describe("NUX Phase 4 visual QA", () => {
       .fill("Build affordable home robots that handle household chores.");
     await page.screenshot({ path: shot("02-define-mission.png") });
 
+    const companyCreated = page.waitForResponse(
+      (response) => {
+        const url = new URL(response.url());
+        return response.request().method() === "POST" && url.pathname === "/api/companies";
+      },
+      { timeout: 30_000 },
+    );
+    const goalCreated = page.waitForResponse(
+      (response) => {
+        const url = new URL(response.url());
+        return response.request().method() === "POST" &&
+          /^\/api\/companies\/[^/]+\/goals$/.test(url.pathname);
+      },
+      { timeout: 30_000 },
+    );
     await page.getByRole("button", { name: /Confirm mission/ }).click();
+    expect((await companyCreated).ok()).toBe(true);
+    expect((await goalCreated).ok()).toBe(true);
     await expect(
       page.getByRole("heading", { name: "Create your team lead" }),
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible({ timeout: 30_000 });
+    await expect(
+      page.locator('input[placeholder="Chief of staff"]'),
+    ).toHaveValue("Chief of staff");
     await page.screenshot({ path: shot("03-create-lead.png") });
 
     await page.getByRole("button", { name: /^Next/ }).click();
@@ -132,9 +153,9 @@ test.describe("NUX Phase 4 visual QA", () => {
     expect(companiesRes.ok()).toBe(true);
     const companies = await companiesRes.json();
     const qaCompany = (Array.isArray(companies) ? companies : []).find(
-      (c: { name: string }) => c.name === "QA Robotics",
+      (c: { name: string }) => c.name === COMPANY_NAME,
     );
-    expect(qaCompany, "wizard should have created QA Robotics").toBeTruthy();
+    expect(qaCompany, `wizard should have created ${COMPANY_NAME}`).toBeTruthy();
     const prefix: string = qaCompany.issuePrefix;
 
     await page.getByRole("button", { name: /Give it a heartbeat/ }).click();
