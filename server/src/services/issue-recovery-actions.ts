@@ -403,6 +403,26 @@ export function issueRecoveryActionService(db: Db) {
       );
   }
 
+  async function reserveWakeAttempt(input: { companyId: string; actionId: string }): Promise<IssueRecoveryAction | null> {
+    const now = new Date();
+    const [updated] = await db
+      .update(issueRecoveryActions)
+      .set({
+        attemptCount: sql`${issueRecoveryActions.attemptCount} + 1`,
+        lastAttemptAt: now,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(issueRecoveryActions.id, input.actionId),
+          eq(issueRecoveryActions.companyId, input.companyId),
+          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+        ),
+      )
+      .returning();
+    return updated ? toReadModel(updated) : null;
+  }
+
   async function resolveActiveForIssue(
     input: ResolveIssueRecoveryActionInput,
     dbOrTx: DbOrTransaction = db,
@@ -447,5 +467,6 @@ export function issueRecoveryActionService(db: Db) {
     resolveActiveForIssue,
     upsertSourceScoped,
     releaseWakeAttempt,
+    reserveWakeAttempt,
   };
 }

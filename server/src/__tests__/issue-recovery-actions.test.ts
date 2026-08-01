@@ -541,8 +541,26 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
-  it("restores a source issue for the next sweep when the recovery wake enqueue throws", async () => {
-    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+  it("retries blocked source-scoped wake delivery after a null enqueue without dropping blockers", async () => {
+    const { companyId, managerId, coderId, sourceIssue, prefix } = await seedCompany();
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Legitimate blocker",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: managerId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: sourceIssue.id,
+      type: "blocks",
+    });
+
     const runId = randomUUID();
     const latestRun = {
       id: runId,
@@ -578,30 +596,31 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       resultJson: null,
     });
 
-    let enqueueFails = true;
+    let enqueueDrops = true;
     const enqueueWakeup = vi.fn(async () => {
-      if (enqueueFails) throw new Error("transient wakeup enqueue failure");
+      if (enqueueDrops) return null;
       return { id: randomUUID() };
     });
     const recovery = recoveryService(db, { enqueueWakeup });
 
-    await expect(recovery.escalateStrandedAssignedIssue({
+    await recovery.escalateStrandedAssignedIssue({
       issue: sourceIssue,
       previousStatus: "in_progress",
       latestRun,
       comment: "Automatic continuation recovery failed.",
-    })).rejects.toThrow("transient wakeup enqueue failure");
-
-    const [restoredIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
-    expect(restoredIssue).toMatchObject({
-      status: "in_progress",
-      assigneeAgentId: coderId,
     });
-    const blockersAfterRestore = await db
+
+    const [blockedAfterDrop] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(blockedAfterDrop).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: managerId,
+    });
+    const blockersAfterDrop = await db
       .select()
       .from(issueRelations)
       .where(eq(issueRelations.relatedIssueId, sourceIssue.id));
-    expect(blockersAfterRestore).toHaveLength(0);
+    expect(blockersAfterDrop).toHaveLength(1);
+    expect(blockersAfterDrop[0]?.issueId).toBe(blockerIssueId);
     const [refundedAction] = await db
       .select()
       .from(issueRecoveryActions)
@@ -611,10 +630,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       attemptCount: 0,
     });
 
-    enqueueFails = false;
+    enqueueDrops = false;
     const result = await recovery.reconcileStrandedAssignedIssues();
-    expect(result.escalated).toBe(1);
-    expect(result.issueIds).toContain(sourceIssue.id);
+    expect(result.recoveryWakeDeliveryRetried).toBe(1);
+    expect(result.escalated).toBe(0);
 
     const [blockedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
     expect(blockedIssue).toMatchObject({
@@ -630,6 +649,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       ownerAgentId: managerId,
       attemptCount: 1,
     });
+    const blockersAfterRetry = await db
+      .select()
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, sourceIssue.id));
+    expect(blockersAfterRetry).toHaveLength(1);
+    expect(blockersAfterRetry[0]?.issueId).toBe(blockerIssueId);
     expect(enqueueWakeup).toHaveBeenCalledTimes(2);
   });
 

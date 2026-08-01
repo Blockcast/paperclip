@@ -4324,6 +4324,68 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return createMonitor(dbOrTx);
   }
 
+  async function reconcileBlockedSourceScopedRecoveryWakeDeliveries() {
+    const candidates = await db
+      .select({
+        issue: issues,
+        actionId: issueRecoveryActions.id,
+      })
+      .from(issueRecoveryActions)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.companyId, issueRecoveryActions.companyId),
+          eq(issues.id, issueRecoveryActions.sourceIssueId),
+        ),
+      )
+      .where(and(
+        visibleIssueCondition(),
+        eq(issues.status, "blocked"),
+        isNull(issues.assigneeUserId),
+        inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+        sql`${issueRecoveryActions.wakePolicy} ->> 'type' = 'wake_owner'`,
+      ))
+      .orderBy(asc(issueRecoveryActions.updatedAt), asc(issueRecoveryActions.id))
+      .limit(100);
+
+    let retried = 0;
+    for (const candidate of candidates) {
+      const action = await recoveryActionsSvc.getActiveForIssue(candidate.issue.companyId, candidate.issue.id);
+      if (!action || action.id !== candidate.actionId || !action.ownerAgentId) continue;
+      if (strandedRecoveryWakeAttemptsExhausted(action)) continue;
+      if (await hasQueuedIssueWake(candidate.issue.companyId, candidate.issue.id, action.ownerAgentId)) continue;
+
+      const reserved = await recoveryActionsSvc.reserveWakeAttempt({
+        companyId: candidate.issue.companyId,
+        actionId: action.id,
+      });
+      if (!reserved) continue;
+
+      try {
+        await enqueueSourceScopedStrandedRecoveryWake({
+          action: reserved,
+          issue: candidate.issue,
+          latestRun: await getLatestIssueRun(candidate.issue.companyId, candidate.issue.id),
+          recoveryCause: reserved.cause as StrandedRecoveryCause,
+          hasNewActivitySinceLastAttempt: false,
+        });
+        retried += 1;
+      } catch (err) {
+        logger.warn(
+          {
+            err,
+            companyId: candidate.issue.companyId,
+            issueId: candidate.issue.id,
+            recoveryActionId: reserved.id,
+            ownerAgentId: reserved.ownerAgentId,
+          },
+          "blocked source-scoped recovery wake retry failed; leaving action active for a later sweep",
+        );
+      }
+    }
+    return { retried };
+  }
+
   function buildRecoveryIssueInPlaceEscalationComment(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
@@ -4890,16 +4952,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // function did NOT produce -- e.g. `in_review` from a park that raced it -- is a signal
       // that some other terminal action already claimed this issue for this cause.
       if (fresh.status !== input.previousStatus && fresh.status !== "blocked") return null;
-      const restoreOnWakeFailure = fresh.status === input.previousStatus
-        ? {
-          issueId: fresh.id,
-          companyId: fresh.companyId,
-          previousStatus: input.previousStatus,
-          assigneeAgentId: fresh.assigneeAgentId,
-          assigneeUserId: fresh.assigneeUserId,
-        }
-        : null;
-
       const claimed = await issuesSvc.update(
         input.issue.id,
         {
@@ -4959,7 +5011,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         hasNewActivitySinceLastAttempt,
       };
       if (isProviderQuotaWait) {
-        return { updated, pendingWake, activity: null, humanDecisionEvent: null, restoreOnWakeFailure };
+        return { updated, pendingWake, activity: null, humanDecisionEvent: null };
       }
 
       const prefix = await getCompanyIssuePrefix(fresh.companyId);
@@ -5202,23 +5254,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         };
       }
 
-      return { updated, pendingWake, activity, humanDecisionEvent, restoreOnWakeFailure };
+      return { updated, pendingWake, activity, humanDecisionEvent };
     });
     if (!outcome) return null;
 
     if (outcome.pendingWake) {
-      try {
-        await enqueueSourceScopedStrandedRecoveryWake(outcome.pendingWake);
-      } catch (err) {
-        if (outcome.restoreOnWakeFailure) {
-          await restoreSourceIssueForRecoveryWakeRetry({
-            ...outcome.restoreOnWakeFailure,
-            recoveryActionId: outcome.pendingWake.action.id,
-            err,
-          });
-        }
-        throw err;
-      }
+      await enqueueSourceScopedStrandedRecoveryWake(outcome.pendingWake);
     }
     if (outcome.activity) {
       await logActivity(db, outcome.activity);
@@ -5228,73 +5269,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     return outcome.updated;
-  }
-
-  async function restoreSourceIssueForRecoveryWakeRetry(input: {
-    issueId: string;
-    companyId: string;
-    previousStatus: StrandedPreviousStatus;
-    assigneeAgentId: string | null;
-    assigneeUserId: string | null;
-    recoveryActionId: string;
-    err: unknown;
-  }) {
-    try {
-      const now = new Date();
-      const restored = await db.transaction(async (tx) => {
-        const rows = await tx
-          .update(issues)
-          .set({
-            status: input.previousStatus,
-            assigneeAgentId: input.assigneeAgentId,
-            assigneeUserId: input.assigneeUserId,
-            checkoutRunId: null,
-            executionRunId: null,
-            executionAgentNameKey: null,
-            executionLockedAt: null,
-            updatedAt: now,
-          })
-          .where(and(
-            eq(issues.id, input.issueId),
-            eq(issues.companyId, input.companyId),
-            eq(issues.status, "blocked"),
-          ))
-          .returning({ id: issues.id });
-        if (rows.length === 0) return false;
-        await tx
-          .delete(issueRelations)
-          .where(and(
-            eq(issueRelations.companyId, input.companyId),
-            eq(issueRelations.relatedIssueId, input.issueId),
-            eq(issueRelations.type, "blocks"),
-          ));
-        return true;
-      });
-      if (!restored) {
-        logger.warn(
-          {
-            err: input.err,
-            companyId: input.companyId,
-            issueId: input.issueId,
-            recoveryActionId: input.recoveryActionId,
-            previousStatus: input.previousStatus,
-          },
-          "source-scoped recovery wake failed after issue was no longer restorable for retry",
-        );
-      }
-    } catch (restoreErr) {
-      logger.warn(
-        {
-          err: restoreErr,
-          enqueueErr: input.err,
-          companyId: input.companyId,
-          issueId: input.issueId,
-          recoveryActionId: input.recoveryActionId,
-          previousStatus: input.previousStatus,
-        },
-        "source-scoped recovery wake failed and source issue retry restoration also failed",
-      );
-    }
   }
 
   function buildZeroTokenStartupFailureComment(input: {
@@ -5590,10 +5564,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       zeroTokenSessionResetRetried: 0,
       waitingOnReviewResolved: 0,
       providerQuotaMonitored: 0,
+      recoveryWakeDeliveryRetried: 0,
       recentProgressExempted: 0,
       skipped: 0,
       issueIds: [] as string[],
     };
+
+    const blockedWakeDeliveries = await reconcileBlockedSourceScopedRecoveryWakeDeliveries();
+    result.recoveryWakeDeliveryRetried += blockedWakeDeliveries.retried;
 
     for (const issue of candidates) {
       const executionState = issue.status === "in_review"
