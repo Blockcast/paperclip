@@ -29,13 +29,12 @@ async function directoryExists(value: string): Promise<boolean> {
 }
 
 /**
- * Ownership is keyed on the branch, not on the run or the execution workspace
- * row. Git already refuses to check the same branch out in two linked
- * worktrees, so a branch names exactly one registration — and unlike a run id
- * it is available in all three code paths that touch the registry (create,
- * restore, teardown), including at create time when the workspace row does not
- * exist yet. The workspace and run ids ride along as audit metadata so an
- * operator reading a lock can tell who took it.
+ * Ownership is keyed on branch when no persisted execution workspace id is
+ * available: git already refuses to check the same branch out in two linked
+ * worktrees, so a branch names exactly one registration. When the workspace id
+ * is known, it is also accepted as ownership proof so cleanup survives branch
+ * drift or missing branch metadata. The run id rides along as audit metadata so
+ * an operator reading a lock can tell who took it.
  */
 export type GitWorktreeOwnerToken = {
   branchName: string;
@@ -77,8 +76,15 @@ export function parseWorktreeOwnerLockReason(reason: string | null | undefined):
   const trimmed = (reason ?? "").trim();
   if (!trimmed.startsWith(`${WORKTREE_OWNER_LOCK_PREFIX} `)) return null;
 
+  const fields = new Map<string, string>();
+  for (const token of trimmed.slice(WORKTREE_OWNER_LOCK_PREFIX.length + 1).split(/\s+/)) {
+    const separatorIndex = token.indexOf("=");
+    if (separatorIndex <= 0) continue;
+    fields.set(token.slice(0, separatorIndex), token.slice(separatorIndex + 1));
+  }
+
   const read = (field: string): string | null => {
-    const value = new RegExp(`\\b${field}=(\\S+)`).exec(trimmed)?.[1] ?? "";
+    const value = fields.get(field) ?? "";
     return value && value !== "-" ? value : null;
   };
 
@@ -159,7 +165,8 @@ export function classifyWorktreeOwnership(
   expected: GitWorktreeOwnerToken,
 ): WorktreeOwnershipVerdict {
   const expectedBranch = sanitizeTokenField(expected.branchName);
-  if (!expectedBranch) return { kind: "indeterminate" };
+  const expectedWorkspaceId = sanitizeTokenField(expected.executionWorkspaceId ?? "");
+  if (!expectedBranch && !expectedWorkspaceId) return { kind: "indeterminate" };
 
   if (!registration.locked) {
     // Worktrees created before ownership stamping carry no lock. Refusing to
@@ -168,13 +175,63 @@ export function classifyWorktreeOwnership(
     // caller has already matched it by path, and git permits a branch in only
     // one worktree, so path plus branch is sufficient evidence.
     const branch = (registration.branch ?? "").replace(/^refs\/heads\//, "");
-    return branch && branch === expectedBranch ? { kind: "owned" } : { kind: "unowned" };
+    if (expectedBranch && branch === expectedBranch) return { kind: "owned" };
+    return expectedBranch ? { kind: "unowned" } : { kind: "indeterminate" };
   }
 
   const owner = parseWorktreeOwnerLockReason(registration.lockReason);
   if (!owner) return { kind: "foreign_lock", lockReason: registration.lockReason };
-  if (owner.branchName !== expectedBranch) return { kind: "owned_by_other", owner };
-  return { kind: "owned" };
+  if (expectedWorkspaceId && owner.executionWorkspaceId === expectedWorkspaceId) return { kind: "owned" };
+  if (expectedBranch && owner.branchName === expectedBranch) return { kind: "owned" };
+  return { kind: "owned_by_other", owner };
+}
+
+async function refreshOwnedGitWorktreeLockReason(input: {
+  git: GitRunner;
+  repoRoot: string;
+  worktreePath: string;
+  newReason: string;
+  previousReason: string | null;
+}): Promise<{ locked: boolean; warnings: string[] }> {
+  try {
+    await input.git(["worktree", "unlock", input.worktreePath], input.repoRoot);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      locked: true,
+      warnings: [
+        `Git worktree "${input.worktreePath}" is owned, but its ownership metadata could not be refreshed (${message}).`,
+      ],
+    };
+  }
+
+  try {
+    await input.git(["worktree", "lock", "--reason", input.newReason, input.worktreePath], input.repoRoot);
+    return { locked: true, warnings: [] };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    let relocked = false;
+    let relockMessage: string | null = null;
+    try {
+      if (input.previousReason) {
+        await input.git(["worktree", "lock", "--reason", input.previousReason, input.worktreePath], input.repoRoot);
+      } else {
+        await input.git(["worktree", "lock", input.worktreePath], input.repoRoot);
+      }
+      relocked = true;
+    } catch (relockError) {
+      relockMessage = relockError instanceof Error ? relockError.message : String(relockError);
+    }
+
+    return {
+      locked: relocked,
+      warnings: [
+        relocked
+          ? `Git worktree "${input.worktreePath}" is owned, but its ownership metadata could not be refreshed (${message}); kept the previous lock reason.`
+          : `Git worktree "${input.worktreePath}" is owned, but its ownership metadata could not be refreshed (${message}) and the previous lock could not be restored (${relockMessage ?? "unknown error"}). Another run's prune may reclaim its registration.`,
+      ],
+    };
+  }
 }
 
 function describeOwner(owner: GitWorktreeOwnerToken): string {
@@ -244,7 +301,16 @@ export async function lockGitWorktreeForOwner(input: {
     const verdict = registration
       ? classifyWorktreeOwnership(registration, input.token)
       : ({ kind: "unowned" } as const);
-    if (verdict.kind === "owned") return { locked: true, warnings: [] };
+    if (verdict.kind === "owned") {
+      if (registration?.lockReason === reason) return { locked: true, warnings: [] };
+      return await refreshOwnedGitWorktreeLockReason({
+        git: input.git,
+        repoRoot: input.repoRoot,
+        worktreePath: input.worktreePath,
+        newReason: reason,
+        previousReason: registration?.lockReason ?? null,
+      });
+    }
     return {
       locked: false,
       warnings: [
@@ -305,27 +371,28 @@ export async function pruneOwnStaleGitWorktree(input: {
   if (!registration) return { removed: true, warnings: [] };
 
   const verdict = classifyWorktreeOwnership(registration, input.token);
+  const worktreePathExists = await directoryExists(input.worktreePath);
   if (verdict.kind !== "owned") {
-    // A missing working directory is indistinguishable from a live worktree on
-    // a path this process cannot see — precisely the state that made concurrent
-    // runs delete each other's registrations. Anything we cannot positively
-    // claim is reported, not removed.
-    return { removed: false, warnings: [describeDeclinedCleanup("prune stale", input.worktreePath, verdict)] };
+    // An unlocked missing entry has no claim protecting it and is removed by
+    // exact path, preserving the restore path's pre-BLO-19607 self-healing
+    // without reintroducing repo-global prune. Locked or visible ambiguities
+    // are still reported, not removed.
+    if (verdict.kind !== "unowned" || worktreePathExists) {
+      return { removed: false, warnings: [describeDeclinedCleanup("prune stale", input.worktreePath, verdict)] };
+    }
   }
 
   // Ask the filesystem rather than trusting git's `prunable` marker: git
   // suppresses that marker for locked worktrees, and ours are always locked, so
   // our own stale entries never advertise themselves as prunable.
-  if (await directoryExists(input.worktreePath)) {
+  if (worktreePathExists) {
     // Still materialized — reuse and validation own this case; removing it here
     // would discard a working tree that may hold uncommitted work.
     return { removed: false, warnings: [] };
   }
 
-  await input.git(["worktree", "unlock", input.worktreePath], input.repoRoot).catch(() => {});
-
   try {
-    await input.git(["worktree", "remove", "--force", input.worktreePath], input.repoRoot);
+    await input.git(["worktree", "remove", "--force", "--force", input.worktreePath], input.repoRoot);
     return { removed: true, warnings: [] };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -341,9 +408,9 @@ export async function pruneOwnStaleGitWorktree(input: {
  * registration, rather than destroying it, so the caller keeps its own
  * operation instrumentation around the actual `git worktree remove`.
  *
- * When authorized, the ownership lock is released first: a locked worktree is
- * refused by a single-`--force` remove, which is exactly the protection we want
- * against *other* runs.
+ * When authorized, the caller removes with `git worktree remove --force
+ * --force` so the ownership lock is released atomically with successful
+ * removal. Failed removals leave the lock in place.
  */
 export async function authorizeOwnedGitWorktreeCleanup(input: {
   git: GitRunner;
@@ -362,6 +429,5 @@ export async function authorizeOwnedGitWorktreeCleanup(input: {
     return { authorized: false, warnings: [describeDeclinedCleanup("clean up", input.worktreePath, verdict)] };
   }
 
-  await input.git(["worktree", "unlock", input.worktreePath], input.repoRoot).catch(() => {});
   return { authorized: true, warnings: [] };
 }

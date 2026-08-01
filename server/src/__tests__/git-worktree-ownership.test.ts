@@ -32,13 +32,22 @@ function git(args: string[], cwd: string): string {
 }
 
 const asyncGit = async (args: string[], cwd: string) => git(args, cwd);
-const normalizePath = async (value: string) => {
-  try {
-    return path.resolve(fs.realpathSync(value));
-  } catch {
-    return path.resolve(value);
+function normalizePathSync(value: string) {
+  const resolved = path.resolve(value);
+  const missingSegments: string[] = [];
+  let current = resolved;
+  while (true) {
+    try {
+      return path.resolve(fs.realpathSync(current), ...missingSegments);
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return resolved;
+      missingSegments.unshift(path.basename(current));
+      current = parent;
+    }
   }
-};
+}
+const normalizePath = async (value: string) => normalizePathSync(value);
 
 function createRepo(): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-ownership-"));
@@ -79,7 +88,7 @@ async function createOwnedWorktree(input: {
 
 function registeredWorktreePaths(repo: string): string[] {
   return parseGitWorktreeRegistrations(git(["worktree", "list", "--porcelain"], repo))
-    .map((entry) => path.resolve(entry.worktree));
+    .map((entry) => normalizePathSync(entry.worktree));
 }
 
 /**
@@ -157,15 +166,54 @@ describe("concurrent runs sharing one worktree registry (BLO-19607)", () => {
 
     // Run B repaired itself.
     expect(realized?.worktreePath).toBe(runBPath);
-    expect(registeredWorktreePaths(repo)).toContain(path.resolve(runBPath));
+    expect(registeredWorktreePaths(repo)).toContain(normalizePathSync(runBPath));
 
     // Run A survived: registration, edits, and the ability to commit them.
-    expect(registeredWorktreePaths(repo)).toContain(path.resolve(runAPath));
+    expect(registeredWorktreePaths(repo)).toContain(normalizePathSync(runAPath));
     expect(fs.readFileSync(path.join(runAPath, "evidence.sql"), "utf8")).toBe("select 1;\n");
 
     git(["add", "."], runAPath);
     git(["commit", "-qm", "run A commits after a concurrent repair"], runAPath);
     expect(git(["log", "-1", "--pretty=%s"], runAPath)).toBe("run A commits after a concurrent repair");
+  });
+
+  it("restores through an unlocked stale registration whose branch no longer matches", async () => {
+    const repo = createRepo();
+    const worktreePath = path.join(path.dirname(repo), "run-branch-drift");
+
+    git(["worktree", "add", "-q", "-b", "blo-19607-old-branch", worktreePath, "main"], repo);
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      db: null,
+      base: {
+        baseCwd: repo,
+        source: "task_session",
+        projectId: null,
+        workspaceId: null,
+        repoUrl: null,
+        repoRef: "main",
+      },
+      workspace: {
+        id: "workspace-drift",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: worktreePath,
+        providerRef: worktreePath,
+        projectId: null,
+        projectWorkspaceId: null,
+        repoUrl: null,
+        baseRef: "main",
+        branchName: "blo-19607-new-branch",
+      },
+      issue: null,
+      agent: { id: "agent-drift", name: "Runner Drift", companyId: "company-1" },
+      heartbeatRunId: "run-drift-repair",
+    });
+
+    expect(restored?.worktreePath).toBe(worktreePath);
+    expect(registeredWorktreePaths(repo)).toContain(normalizePathSync(worktreePath));
+    expect(git(["branch", "--show-current"], worktreePath)).toBe("blo-19607-new-branch");
   });
 
   it("keeps a live run's registration and uncommitted edits when a concurrent run tears its own workspace down", async () => {
@@ -212,11 +260,11 @@ describe("concurrent runs sharing one worktree registry (BLO-19607)", () => {
       }));
 
     // Run B's own teardown still succeeds.
-    expect(registeredWorktreePaths(repo)).not.toContain(path.resolve(runBPath));
+    expect(registeredWorktreePaths(repo)).not.toContain(normalizePathSync(runBPath));
     expect(result.warnings.filter((warning) => warning.includes("run-a"))).toEqual([]);
 
     // Run A survived: registration, edits, and the ability to commit them.
-    expect(registeredWorktreePaths(repo)).toContain(path.resolve(runAPath));
+    expect(registeredWorktreePaths(repo)).toContain(normalizePathSync(runAPath));
     expect(fs.readFileSync(path.join(runAPath, "evidence.sql"), "utf8")).toBe("select 1;\n");
 
     git(["add", "."], runAPath);
@@ -234,7 +282,7 @@ describe("concurrent runs sharing one worktree registry (BLO-19607)", () => {
       git(["worktree", "prune"], repo);
     });
 
-    expect(registeredWorktreePaths(repo)).not.toContain(path.resolve(runAPath));
+    expect(registeredWorktreePaths(repo)).not.toContain(normalizePathSync(runAPath));
   });
 
   it("leaves a concurrent run registered when a run clears its own stale entry", async () => {
@@ -270,8 +318,56 @@ describe("concurrent runs sharing one worktree registry (BLO-19607)", () => {
       }));
 
     expect(outcome.removed).toBe(true);
-    expect(registeredWorktreePaths(repo)).not.toContain(path.resolve(runBPath));
-    expect(registeredWorktreePaths(repo)).toContain(path.resolve(runAPath));
+    expect(registeredWorktreePaths(repo)).not.toContain(normalizePathSync(runBPath));
+    expect(registeredWorktreePaths(repo)).toContain(normalizePathSync(runAPath));
+  });
+
+  it("clears an unlocked stale registration by exact path even when the branch drifted", async () => {
+    const repo = createRepo();
+    const stalePath = path.join(path.dirname(repo), "stale-unowned");
+    git(["worktree", "add", "-q", "-b", "stale-old-branch", stalePath, "main"], repo);
+    fs.rmSync(stalePath, { recursive: true, force: true });
+
+    const outcome = await pruneOwnStaleGitWorktree({
+      git: asyncGit,
+      repoRoot: repo,
+      worktreePath: stalePath,
+      token: { branchName: "stale-new-branch", executionWorkspaceId: "workspace-stale", runId: "run-stale" },
+      normalizePath,
+    });
+
+    expect(outcome).toEqual({ removed: true, warnings: [] });
+    expect(registeredWorktreePaths(repo)).not.toContain(normalizePathSync(stalePath));
+  });
+
+  it("leaves an owned stale registration locked when path-scoped removal fails", async () => {
+    const calls: string[][] = [];
+    const result = await pruneOwnStaleGitWorktree({
+      git: async (args) => {
+        calls.push(args);
+        if (args.join(" ") === "worktree list --porcelain") {
+          return [
+            "worktree /missing-owned",
+            "branch refs/heads/run-a",
+            "locked paperclip-owned branch=run-a workspace=workspace-a run=run-a",
+            "",
+          ].join("\n");
+        }
+        if (args[0] === "worktree" && args[1] === "remove") {
+          throw new Error("simulated remove failure");
+        }
+        throw new Error(`unexpected git call: ${args.join(" ")}`);
+      },
+      repoRoot: "/repo",
+      worktreePath: "/missing-owned",
+      token: { branchName: "run-a", executionWorkspaceId: "workspace-a", runId: "run-a-2" },
+      normalizePath: async (value) => value,
+    });
+
+    expect(result.removed).toBe(false);
+    expect(result.warnings.join(" ")).toContain("simulated remove failure");
+    expect(calls).toContainEqual(["worktree", "remove", "--force", "--force", "/missing-owned"]);
+    expect(calls).not.toContainEqual(["worktree", "unlock", "/missing-owned"]);
   });
 
   it("refuses to clean up a worktree owned by another run and reports why", async () => {
@@ -297,7 +393,7 @@ describe("concurrent runs sharing one worktree registry (BLO-19607)", () => {
     expect(authorization.warnings.join(" ")).toContain("blo-19607-run-a");
     // The refusal is non-destructive: the lock is still held by its owner.
     const entry = parseGitWorktreeRegistrations(git(["worktree", "list", "--porcelain"], repo))
-      .find((candidate) => path.resolve(candidate.worktree) === path.resolve(runAPath));
+      .find((candidate) => normalizePathSync(candidate.worktree) === normalizePathSync(runAPath));
     expect(entry?.locked).toBe(true);
   });
 
@@ -346,9 +442,46 @@ describe("concurrent runs sharing one worktree registry (BLO-19607)", () => {
     });
 
     expect(result).toEqual({ locked: true, warnings: [] });
+    const entry = parseGitWorktreeRegistrations(git(["worktree", "list", "--porcelain"], repo))
+      .find((candidate) => normalizePathSync(candidate.worktree) === normalizePathSync(runAPath));
+    expect(entry?.lockReason).toContain("run=run-a-2");
   });
 
-  it("still tears down a worktree created before ownership stamping", async () => {    const repo = createRepo();
+  it("cleans up a locked worktree by workspace id when the branch name is missing", async () => {
+    const repo = createRepo();
+    const runAPath = path.join(path.dirname(repo), "run-a");
+    await createOwnedWorktree({
+      repo,
+      worktreePath: runAPath,
+      branchName: "blo-19607-run-a",
+      executionWorkspaceId: "workspace-a",
+      runId: "run-a",
+    });
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      workspace: {
+        id: "workspace-a",
+        cwd: runAPath,
+        providerType: "git_worktree",
+        providerRef: runAPath,
+        branchName: null,
+        repoUrl: null,
+        baseRef: "main",
+        projectId: null,
+        projectWorkspaceId: null,
+        sourceIssueId: null,
+        metadata: { createdByRuntime: true },
+      },
+      projectWorkspace: { cwd: repo, cleanupCommand: null },
+    });
+
+    expect(cleanup.cleaned).toBe(true);
+    expect(cleanup.warnings).toEqual([]);
+    expect(registeredWorktreePaths(repo)).not.toContain(normalizePathSync(runAPath));
+  });
+
+  it("still tears down a worktree created before ownership stamping", async () => {
+    const repo = createRepo();
     const legacyPath = path.join(path.dirname(repo), "legacy");
     // Pre-fix registration: no lock at all.
     git(["worktree", "add", "-q", "-b", "legacy-branch", legacyPath, "main"], repo);
@@ -420,10 +553,14 @@ describe("worktree ownership tokens", () => {
   it("classifies ownership so only a provable claim authorizes removal", () => {
     const expected = { branchName: "run-a", executionWorkspaceId: "ws-a", runId: "r2" };
     const owned = { locked: true, lockReason: "paperclip-owned branch=run-a workspace=ws-a run=r1", branch: null };
+    const driftedBranch = { locked: true, lockReason: "paperclip-owned branch=old-run-a workspace=ws-a run=r1", branch: null };
     const other = { locked: true, lockReason: "paperclip-owned branch=run-b workspace=ws-b run=r9", branch: null };
 
     // A later run of the same workspace still owns its own branch.
     expect(classifyWorktreeOwnership(owned, expected).kind).toBe("owned");
+    // Workspace id survives branch drift and missing branch metadata.
+    expect(classifyWorktreeOwnership(driftedBranch, expected).kind).toBe("owned");
+    expect(classifyWorktreeOwnership(driftedBranch, { ...expected, branchName: "" }).kind).toBe("owned");
     expect(classifyWorktreeOwnership(other, expected).kind).toBe("owned_by_other");
     expect(classifyWorktreeOwnership({ locked: true, lockReason: "held by hand", branch: null }, expected).kind)
       .toBe("foreign_lock");
@@ -434,6 +571,17 @@ describe("worktree ownership tokens", () => {
     expect(classifyWorktreeOwnership({ locked: false, lockReason: null, branch: "refs/heads/run-a" }, expected).kind)
       .toBe("owned");
     // No branch identity at all: nothing can be asserted.
-    expect(classifyWorktreeOwnership(owned, { ...expected, branchName: "" }).kind).toBe("indeterminate");
+    expect(classifyWorktreeOwnership(owned, { branchName: "", executionWorkspaceId: null, runId: "r2" }).kind)
+      .toBe("indeterminate");
+  });
+
+  it("parses ownership fields without matching field names inside the branch", () => {
+    const reason = "paperclip-owned branch=feature/workspace=not-ws/run=not-run workspace=ws-a run=run-a";
+
+    expect(parseWorktreeOwnerLockReason(reason)).toEqual({
+      branchName: "feature/workspace=not-ws/run=not-run",
+      executionWorkspaceId: "ws-a",
+      runId: "run-a",
+    });
   });
 });

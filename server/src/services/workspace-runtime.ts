@@ -3066,7 +3066,19 @@ function deriveRepoNameFromRepoUrlForRuntime(repoUrl: string | null | undefined)
 
 async function resolvePathForWorktreeComparison(value: string): Promise<string> {
   const resolved = path.resolve(value);
-  return fs.realpath(resolved).then((realPath) => path.resolve(realPath)).catch(() => resolved);
+  const missingSegments: string[] = [];
+  let current = resolved;
+  while (true) {
+    try {
+      const realPath = await fs.realpath(current);
+      return path.resolve(realPath, ...missingSegments);
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return resolved;
+      missingSegments.unshift(path.basename(current));
+      current = parent;
+    }
+  }
 }
 
 async function listLinkedGitWorktreePaths(repoRoot: string): Promise<Set<string>> {
@@ -3590,6 +3602,7 @@ export async function realizeExecutionWorkspace(input: {
   config: Record<string, unknown>;
   issue: ExecutionWorkspaceIssueRef | null;
   agent: ExecutionWorkspaceAgentRef;
+  executionWorkspaceId?: string | null;
   heartbeatRunId?: string | null;
   enableWorkspaceBranchReconcileForward?: boolean;
   enableWorkspaceDirtyQuarantineRepair?: boolean;
@@ -3704,6 +3717,7 @@ export async function realizeExecutionWorkspace(input: {
       repoRoot,
       worktreePath: reusablePath,
       branchName: effectiveBranchName,
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
       runId: input.heartbeatRunId ?? null,
     });
     const submoduleWarnings = await ensureGitSubmodulesReady({
@@ -3857,6 +3871,7 @@ export async function realizeExecutionWorkspace(input: {
     repoRoot,
     worktreePath,
     branchName,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
     runId: input.heartbeatRunId ?? null,
   });
   const submoduleWarnings = await ensureGitSubmodulesReady({
@@ -4276,7 +4291,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
           try {
             await recordGitOperation(input.recorder, {
               phase: "worktree_cleanup",
-              args: ["worktree", "remove", "--force", workspacePath],
+              args: ["worktree", "remove", "--force", "--force", workspacePath],
               cwd: repoRoot,
               metadata: {
                 workspaceId: input.workspace.id,
