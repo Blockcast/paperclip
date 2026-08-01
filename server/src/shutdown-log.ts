@@ -1,5 +1,5 @@
 /**
- * Synchronous shutdown breadcrumbs.
+ * Shutdown breadcrumbs with bounded fatal-path flushing.
  *
  * The SIGTERM handler in {@link ./index.ts} uses pino for everything else,
  * but pino runs an async transport — on `process.exit(0)` the queued log
@@ -29,15 +29,11 @@
  * with stderr piped: of three breadcrumbs totalling ~200 KB, the first landed
  * and the final `exiting 1 after uncaughtException` line was lost.
  *
- * So the breadcrumb goes through `fs.writeSync` on the raw stderr fd, which is
- * a real `write(2)` and has completed by the time it returns. Partial writes
- * are looped; `EAGAIN`/`EINTR` (stderr can be a non-blocking pipe) are retried
- * under a deadline. The deadline matters as much as the write: this is the
- * fatal path, and a breadcrumb that blocks forever on a full pipe would wedge
- * the crash handler — converting a fast crash-and-restart into a silent hang
- * that only the liveness probe catches. Losing the line is bad; hanging the
- * process to guarantee it is worse. On give-up we fall back to the async
- * `process.stderr.write`, which is no worse than the old behaviour.
+ * A raw synchronous write is safe only when stderr is a regular file. A
+ * blocking pipe/socket write cannot be bounded by a JavaScript deadline: the
+ * event loop never regains control to check it. Pipe/socket breadcrumbs use
+ * Node's non-blocking stream path instead. Fatal callers use the bounded async
+ * helper below, which waits for the stream callback or a timer before exiting.
  *
  * Pair with the existing `logger.info(...)` calls in the SIGTERM handler;
  * these are the "did we even get here" breadcrumbs, not a replacement for
@@ -52,24 +48,7 @@ import * as nodeFs from "node:fs";
 /** POSIX `STDERR_FILENO`; used when `process.stderr.fd` is unavailable. */
 const STDERR_FD = 2;
 
-/**
- * Upper bound on how long one breadcrumb may block retrying a would-block fd.
- * Small on purpose — see the header: the crash path must stay bounded.
- */
 const MAX_WRITE_WAIT_MS = 100;
-
-/**
- * Genuinely synchronous sleep. `Atomics.wait` is permitted on Node's main
- * thread and yields the CPU, unlike a spin loop — which on a full pipe would
- * burn a core for the whole deadline while the reader tries to drain it.
- */
-function sleepSync(ms: number): void {
-  try {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-  } catch {
-    /* SharedArrayBuffer unavailable under some flags; fall through to retry */
-  }
-}
 
 /**
  * Writes the whole buffer to `fd` with a real `write(2)`.
@@ -79,26 +58,34 @@ function sleepSync(ms: number): void {
  */
 function writeAllSync(fd: number, text: string): boolean {
   const buf = Buffer.from(text, "utf8");
-  const deadline = Date.now() + MAX_WRITE_WAIT_MS;
   let offset = 0;
 
   while (offset < buf.length) {
     try {
-      // A short write is normal on a pipe near capacity, not an error.
-      offset += nodeFs.writeSync(fd, buf, offset, buf.length - offset);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EAGAIN" && code !== "EINTR") return false;
-      if (Date.now() >= deadline) return false;
-      sleepSync(1);
+      const written = nodeFs.writeSync(fd, buf, offset, buf.length - offset);
+      if (written <= 0) return false;
+      offset += written;
+    } catch {
+      return false;
     }
   }
 
   return true;
 }
 
+function isRegularFile(fd: number): boolean {
+  try {
+    return nodeFs.fstatSync(fd).isFile();
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Writes a single `[shutdown] <line>\n` breadcrumb to stderr synchronously.
+ * Writes a single `[shutdown] <line>\n` breadcrumb to stderr.
+ *
+ * Regular-file stderr is written synchronously. Pipe/socket stderr uses Node's
+ * non-blocking stream path; fatal callers must use the bounded helper below.
  *
  * The `[shutdown]` prefix matches the existing `logShutdownSignal` line so
  * a single `kubectl logs … | grep '^\[shutdown\]'` recipe lists every
@@ -108,16 +95,48 @@ export function writeShutdownBreadcrumb(line: string): void {
   const text = `[shutdown] ${line}\n`;
   const fd = typeof process.stderr?.fd === "number" ? process.stderr.fd : STDERR_FD;
 
-  if (writeAllSync(fd, text)) return;
+  if (isRegularFile(fd) && writeAllSync(fd, text)) return;
 
-  // Degraded path: the fd would block past our deadline, or is not writable
-  // as a raw fd at all. Queue it and hope — strictly no worse than the
-  // behaviour this function replaced.
+  // Never issue a blocking raw write to a pipe or socket. Normal shutdown does
+  // not force an immediate exit, so its stream write drains with the process.
   try {
     process.stderr.write(text);
   } catch {
     /* stderr is gone; there is nothing left to say */
   }
+}
+
+/**
+ * Writes fatal-path breadcrumbs without allowing stalled stderr to stall exit.
+ */
+export function writeShutdownBreadcrumbsBounded(
+  lines: string[],
+  timeoutMs = MAX_WRITE_WAIT_MS,
+): Promise<void> {
+  const text = lines.map((line) => `[shutdown] ${line}\n`).join("");
+  const fd = typeof process.stderr?.fd === "number" ? process.stderr.fd : STDERR_FD;
+
+  if (isRegularFile(fd)) {
+    writeAllSync(fd, text);
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+
+    try {
+      process.stderr.write(text, finish);
+    } catch {
+      finish();
+    }
+  });
 }
 
 /**

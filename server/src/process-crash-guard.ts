@@ -26,12 +26,12 @@
  *
  * Two properties matter more than they look:
  *
- * 1. **The first write is synchronous stderr, not pino.** BLO-4137 established
- *    that pino's async transport races libuv on `process.exit` and silently
- *    drops queued lines — which is precisely how the original crash reached us
- *    as an uncontextualised stack. A crash handler whose own diagnosis gets
- *    dropped is worse than none, because it also suppresses Node's default
- *    printer. See {@link ./shutdown-log.ts} for the same reasoning.
+ * 1. **The first write bypasses pino and is flushed under a deadline.**
+ *    BLO-4137 established that pino's async transport races `process.exit` and
+ *    silently drops queued lines. Raw `writeSync`, however, can wedge forever
+ *    on a full blocking pipe. The breadcrumb therefore uses Node's non-blocking
+ *    stderr stream and races its callback against a timer. See
+ *    {@link ./shutdown-log.ts} for the transport details.
  *
  * 2. **Exit is guaranteed, on a timer we control.** `onCrash` touches the
  *    database, and the most likely reason we are here is that the database
@@ -41,7 +41,7 @@
  *    catches at the liveness probe — strictly worse than the bug it replaces.
  */
 
-import { writeShutdownBreadcrumb } from "./shutdown-log.js";
+import { writeShutdownBreadcrumb, writeShutdownBreadcrumbsBounded } from "./shutdown-log.js";
 
 /** Exit code used when the guard terminates the process deliberately. */
 export const CRASH_GUARD_EXIT_CODE = 1;
@@ -215,15 +215,14 @@ export function installProcessCrashGuard(options: InstallCrashGuardOptions): () 
       causeChain = [];
     }
 
-    // Synchronous first, always — see the module header. If everything after
-    // this line fails, this one line still reaches `kubectl logs --previous`.
-    try {
-      writeShutdownBreadcrumb(renderBreadcrumb(kind, causeChain));
-      const stack = causeChain[0]?.stack;
-      if (stack) writeShutdownBreadcrumb(stack);
-    } catch {
-      /* ignore */
-    }
+    // Start the pipe-safe write immediately. `finish` waits for either its
+    // callback or the helper's deadline, so a stalled stderr reader can never
+    // prevent the deliberate exit.
+    const stack = causeChain[0]?.stack;
+    const initialBreadcrumb = writeShutdownBreadcrumbsBounded([
+      renderBreadcrumb(kind, causeChain),
+      ...(stack ? [stack] : []),
+    ]);
 
     try {
       logger.error({ kind, causeChain, err: error }, `Fatal ${kind} — worker exiting deliberately`);
@@ -231,18 +230,24 @@ export function installProcessCrashGuard(options: InstallCrashGuardOptions): () 
       /* a broken logger must not preempt the exit */
     }
 
+    const finalBreadcrumbs: string[] = [];
     const finish = () => {
       try {
         logger.flush?.();
       } catch {
         /* ignore */
       }
-      try {
-        writeShutdownBreadcrumb(`exiting ${CRASH_GUARD_EXIT_CODE} after ${kind}`);
-      } catch {
-        /* ignore */
-      }
-      exit(CRASH_GUARD_EXIT_CODE);
+      void (async () => {
+        try {
+          await initialBreadcrumb;
+          await writeShutdownBreadcrumbsBounded([
+            ...finalBreadcrumbs,
+            `exiting ${CRASH_GUARD_EXIT_CODE} after ${kind}`,
+          ]);
+        } finally {
+          exit(CRASH_GUARD_EXIT_CODE);
+        }
+      })();
     };
 
     if (!onCrash) {
@@ -254,13 +259,7 @@ export function installProcessCrashGuard(options: InstallCrashGuardOptions): () 
     const settleOnce = (note?: string) => {
       if (settled) return;
       settled = true;
-      if (note) {
-        try {
-          writeShutdownBreadcrumb(note);
-        } catch {
-          /* ignore */
-        }
-      }
+      if (note) finalBreadcrumbs.push(note);
       finish();
     };
 

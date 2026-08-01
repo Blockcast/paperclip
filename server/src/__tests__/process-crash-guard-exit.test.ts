@@ -36,6 +36,11 @@ interface CrashResult {
   stderr: string;
 }
 
+interface StalledCrashResult {
+  code: number | null;
+  elapsedMs: number;
+}
+
 function runFixture(kind: "throw" | "reject", padBytes: number): Promise<CrashResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(tsx, [fixture, kind, String(padBytes)], {
@@ -51,6 +56,28 @@ function runFixture(kind: "throw" | "reject", padBytes: number): Promise<CrashRe
     child.on("error", reject);
     child.on("close", (code) => {
       resolve({ code, stderr });
+    });
+  });
+}
+
+function runFixtureWithStalledStderr(): Promise<StalledCrashResult> {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const child = spawn(tsx, [fixture, "throw", String(PIPE_PRESSURE_BYTES)], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    child.stderr.pause();
+
+    const watchdog = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("crash guard did not exit while stderr was stalled"));
+    }, 2_000);
+
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      clearTimeout(watchdog);
+      child.stderr.destroy();
+      resolve({ code, elapsedMs: Date.now() - startedAt });
     });
   });
 }
@@ -86,4 +113,11 @@ describe("process crash guard — real process exit", () => {
       expect(stderr).toContain(`[shutdown] exiting 1 after ${label}`);
     },
   );
+
+  it("still exits when stderr is not drained", async () => {
+    const { code, elapsedMs } = await runFixtureWithStalledStderr();
+
+    expect(code).toBe(1);
+    expect(elapsedMs).toBeLessThan(1_500);
+  });
 });
