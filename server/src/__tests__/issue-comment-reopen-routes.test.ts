@@ -764,7 +764,7 @@ describe.sequential("issue comment reopen routes", () => {
     ]);
   });
 
-  it("collapses repeated denied-write audit rows for the same actor, issue, action, and reason", async () => {
+  it("collapses exact repeated denied-write audit rows with the same payload", async () => {
     const outsideAgentId = "55555555-5555-4555-8555-555555555555";
     mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
     mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
@@ -774,10 +774,16 @@ describe.sequential("issue comment reopen routes", () => {
       explanation: "Peer agent is outside this low-trust boundary.",
     }));
     mockDbSelectLimit
+      // First request: exact-dedupe miss, then aggregate-count under the cap.
       .mockImplementationOnce(() => ({
         then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
           Promise.resolve([]).then(onFulfilled, onRejected),
       }))
+      .mockImplementationOnce(() => ({
+        then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve([]).then(onFulfilled, onRejected),
+      }))
+      // Second request: exact-dedupe hit, so aggregate-count is not queried.
       .mockImplementationOnce(() => ({
         then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
           Promise.resolve([{ entityId: "11111111-1111-4111-8111-111111111111" }]).then(onFulfilled, onRejected),
@@ -789,7 +795,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ comment: "first denied write" });
     const second = await request(app)
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
-      .send({ comment: "second denied write" });
+      .send({ comment: "first denied write" });
 
     expect(first.status, JSON.stringify(first.body)).toBe(403);
     expect(second.status, JSON.stringify(second.body)).toBe(403);
