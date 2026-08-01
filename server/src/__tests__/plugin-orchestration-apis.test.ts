@@ -355,6 +355,11 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     }
 
     expect(emitted).toHaveLength(3);
+    expect(emitted.map((event) => event.eventType)).toEqual([
+      "issue.created",
+      "issue.updated",
+      "approval.created",
+    ]);
     expect(emitted).toEqual(expect.arrayContaining([
       expect.objectContaining({
         eventType: "issue.created",
