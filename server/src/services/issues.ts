@@ -8488,7 +8488,6 @@ export function issueService(db: Db) {
               and(
                 eq(issueRecoveryActions.companyId, issues.companyId),
                 eq(issueRecoveryActions.sourceIssueId, issues.id),
-                eq(issueRecoveryActions.ownerAgentId, actorAgentId),
                 inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
               ),
             )
@@ -8518,7 +8517,7 @@ export function issueService(db: Db) {
               patch.executionAgentNameKey = null;
               patch.executionLockedAt = null;
               patch.updatedAt = new Date();
-              if (issueData.startedAt === undefined && !recoveryGuard.startedAt) {
+              if (issueData.startedAt === undefined) {
                 delete patch.startedAt;
               }
               logger.info(

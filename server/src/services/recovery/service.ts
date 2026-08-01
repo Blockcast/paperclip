@@ -3933,7 +3933,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
                 and(
                   eq(issueRecoveryActions.id, input.recoveryActionId),
                   eq(issueRecoveryActions.sourceIssueId, issues.id),
-                  eq(issueRecoveryActions.ownerAgentId, input.agentId),
                   inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
                 ),
               ),
