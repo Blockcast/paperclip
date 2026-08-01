@@ -9537,6 +9537,9 @@ export function issueService(db: Db) {
         checkoutRunId &&
         current.executionRunId &&
         current.executionRunId !== checkoutRunId &&
+        (current.checkoutRunId == null ||
+          current.checkoutRunId === checkoutRunId ||
+          current.checkoutRunId === current.executionRunId) &&
         (current.assigneeAgentId === agentId || current.assigneeAgentId == null)
       ) {
         const stale = await isTerminalOrMissingHeartbeatRun(current.executionRunId);
@@ -9562,6 +9565,9 @@ export function issueService(db: Db) {
                 eq(issues.id, id),
                 inArray(issues.status, expectedStatuses),
                 eq(issues.executionRunId, current.executionRunId),
+                current.checkoutRunId
+                  ? eq(issues.checkoutRunId, current.checkoutRunId)
+                  : isNull(issues.checkoutRunId),
                 or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
               ),
             )
