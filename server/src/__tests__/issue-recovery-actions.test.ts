@@ -24,6 +24,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
+import { computeIssueMonitorGateFingerprint } from "../services/issue-execution-policy.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { issueService } from "../services/issues.js";
 import { recoveryService } from "../services/recovery/service.js";
@@ -445,7 +446,46 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
   it("schedules another provider-quota monitor after a prior quota monitor fired", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
-    await db.update(issues).set({ monitorAttemptCount: 1 }).where(eq(issues.id, sourceIssueId));
+    const previousQuotaNotes = "Provider usage quota reached; retry the original assignee after the default recovery backoff.";
+    const { fingerprint, source } = computeIssueMonitorGateFingerprint({ notes: previousQuotaNotes });
+    await db.update(issues).set({
+      monitorAttemptCount: 1,
+      monitorLastTriggeredAt: new Date("2026-07-15T20:30:00.000Z"),
+      monitorNotes: previousQuotaNotes,
+      monitorScheduledBy: "assignee",
+      executionState: {
+        status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: {
+          status: "triggered",
+          nextCheckAt: null,
+          lastTriggeredAt: "2026-07-15T20:30:00.000Z",
+          attemptCount: 1,
+          notes: previousQuotaNotes,
+          scheduledBy: "assignee",
+          kind: "external_service",
+          serviceName: "AI provider quota",
+          externalRef: "previous-run",
+          timeoutAt: null,
+          maxAttempts: null,
+          recoveryPolicy: "wake_owner",
+          gateSignals: null,
+          gateFingerprint: fingerprint,
+          gateSource: source,
+          convergenceCount: 3,
+          clearedAt: null,
+          clearReason: null,
+        },
+      },
+    }).where(eq(issues.id, sourceIssueId));
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({
       id: runId,
@@ -465,6 +505,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     expect(result.providerQuotaMonitored).toBe(1);
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue?.status).toBe("in_progress");
+    expect(updatedIssue?.monitorNextCheckAt).toBeInstanceOf(Date);
     expect(updatedIssue?.executionPolicy).toMatchObject({
       monitor: {
         maxAttempts: null,

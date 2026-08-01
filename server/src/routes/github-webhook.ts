@@ -168,6 +168,24 @@ function hasPrReviewerRequestMention(body: string | null | undefined): boolean {
   return typeof body === "string" && PR_REVIEWER_COMMENT_MENTION_PATTERN.test(body);
 }
 
+// A DELIBERATE request addresses the reviewer by the bare `@ally` alias — the
+// form the agent instructions tell agents to write. The pattern above also
+// matches `@allyblockcast[bot]`, which is how the commitperclip template gate
+// greets the bot account ("Hey @allyblockcast[bot]! Before this PR can be
+// reviewed...") — the very body that drove the #583 loop. Those are correct
+// suppressions, not lost handoffs, and they repeat: a sweep on 2026-07-31
+// found 7 on Blockcast/paperclip#812 and 3 on #820. Reporting them would bury
+// the real signal, so the drop report (BLO-18273) keys on the bare alias only.
+//
+// `(?![-\w])` is what excludes the longer login: for `@allyblockcast[bot]` the
+// character after `@ally` is `b`, a word char, so this cannot match — whereas
+// the pattern above backtracks to its `allyblockcast` alternative and does.
+const PR_REVIEWER_BARE_ALIAS_MENTION_PATTERN = /(^|[^\w])@ally(?![-\w])/i;
+
+function hasPrReviewerBareAliasMention(body: string | null | undefined): boolean {
+  return typeof body === "string" && PR_REVIEWER_BARE_ALIAS_MENTION_PATTERN.test(body);
+}
+
 const DEFAULT_PR_REVIEWER_BOT_LOGIN = "allyblockcast[bot]";
 
 function normalizeGithubLogin(login: string): string {
@@ -510,7 +528,20 @@ function clampReviewBody(value: string | null | undefined): string | null {
 function resolveEventContext(
   eventName: string,
   payload: Record<string, unknown>,
-  options: { prReviewerBotLogin?: string | null } = {},
+  options: {
+    prReviewerBotLogin?: string | null;
+    // Invoked when a review request was RECOGNIZED as one but deliberately
+    // dropped, so the caller can make the suppression observable (BLO-18273).
+    // A callback rather than a logger call inline keeps this function pure and
+    // lets the suppression be asserted directly in tests.
+    onSuppressedReviewRequest?: (info: {
+      repoFullName: string | null;
+      prNumber: number | null;
+      commentId: number | null;
+      commentAuthorLogin: string | null;
+      commentUrl: string | null;
+    }) => void;
+  } = {},
 ): ResolvedEventContext | null {
   const repository = payload.repository as Record<string, unknown> | undefined;
   const repoFullName = (repository?.full_name as string | undefined) ?? null;
@@ -677,6 +708,35 @@ function resolveEventContext(
         commentAuthorLogin,
         options.prReviewerBotLogin,
       );
+      // BLO-18273: the drop above is the one failure mode in this file that is
+      // completely invisible. A markerless agent request matches the @ally
+      // mention, fails the author guard, is not review feedback either, and
+      // falls out of here as `null` — no context, no wake, and (until this
+      // callback) not one log line. The requesting agent believes it handed
+      // off and ends its run, so the PR waits forever. Report it instead.
+      //
+      // Scoped narrowly so it stays a signal rather than noise: only a
+      // reviewer-bot-authored body that addresses Ally by the BARE `@ally`
+      // alias, carries no valid marker, and is NOT the reviewer's own
+      // consolidated review output. See PR_REVIEWER_BARE_ALIAS_MENTION_PATTERN
+      // for why the bare alias (and not the general mention pattern) is the
+      // discriminator: the general one also matches the commitperclip gate's
+      // `@allyblockcast[bot]` nudge, whose suppression is correct.
+      if (
+        !reviewerRequest &&
+        !reviewFeedback &&
+        commentAuthorIsReviewerBot &&
+        hasPrReviewerBareAliasMention(commentBody) &&
+        !hasAllyConsolidatedReviewHeading(commentBody)
+      ) {
+        options.onSuppressedReviewRequest?.({
+          repoFullName,
+          prNumber: (issue.number as number | undefined) ?? null,
+          commentId: (comment?.id as number | undefined) ?? null,
+          commentAuthorLogin,
+          commentUrl: readStringField(comment, "html_url"),
+        });
+      }
       if (!reviewerRequest && !reviewFeedback) return null;
       // BLO-9293: on a PR's issue_comment payload, `issue.user.login` is the PR
       // author (the comment author is `comment.user.login`, captured separately).
@@ -919,13 +979,23 @@ function buildDependabotAlertIssueBody(input: {
     ...(alert.summary ? ["", alert.summary] : []),
     "",
     "## Acceptance criteria",
-    `- The vulnerable ${alert.packageName ?? "dependency"} in \`${repoFullName}\` is bumped to ${alert.patchedVersion ?? "a patched version"} (or the alert is explicitly dismissed with a documented reason), landed via a merged PR.`,
-    "- The Dependabot alert's state on GitHub moves to `fixed` or `dismissed`.",
+    `- Remediation path: the vulnerable ${alert.packageName ?? "dependency"} in \`${repoFullName}\` is bumped to ${alert.patchedVersion ?? "a patched version"} and lands via a merged PR.`,
+    "- Dismissal path: the Dependabot alert is explicitly dismissed with a documented reason.",
+    "- For the remediation path, the Dependabot alert's state on GitHub moves to `fixed`. GitHub does this on its own once the remediation lands; observing it directly is optional — see **Verifying signal**.",
+    "- For the dismissal path, the Dependabot alert's state on GitHub is `dismissed`, together with the documented dismissal reason.",
     "",
     "## Verifying signal",
-    `- ${alertUrl} shows \`state: fixed\` or \`state: dismissed\`, or the remediation PR merges into the default branch.`,
+    "Any ONE of the following is sufficient and complete evidence. You do not need all of them, and none of them is mandatory on its own:",
+    `1. The remediation PR merges into the default branch of \`${repoFullName}\`, AND the default-branch manifest${alert.manifestPath ? ` \`${alert.manifestPath}\`` : ""} resolves ${alert.packageName ?? "the dependency"} at ${alert.patchedVersion ?? "a patched version"} or newer.`,
+    `2. ${alertUrl} shows \`state: fixed\`.`,
+    `3. ${alertUrl} shows \`state: dismissed\`, together with the documented dismissal reason.`,
     "",
-    "All fields above come directly from the GitHub webhook payload for this delivery — do NOT call the GitHub Dependabot Alerts REST API to re-derive them. Some repositories return `403 Dependabot alerts are disabled for this repository` on that endpoint even though the webhook still fires; treat that 403 as expected and work from this issue instead of chasing the API.",
+    "Branch 1 is fully agent-executable through the repository contents API and is the expected path. Do NOT require a screenshot of the alert page, and do NOT treat an authenticated-UI observation as the only admissible evidence: branches 2 and 3 are alternatives to branch 1, never prerequisites for it.",
+    "",
+    "## Note on the Dependabot Alerts REST API (operational, not evidentiary)",
+    "Every field under **Alert** above comes from this delivery's GitHub webhook payload. Do NOT call the GitHub Dependabot Alerts REST API to re-derive them: some repositories return `403 Dependabot alerts are disabled for this repository` on that endpoint even though the webhook still fires. Treat that 403 as expected and work from this issue instead of chasing the API.",
+    "",
+    "This note is scoped to re-deriving the metadata fields above. It is NOT an evidentiary standard: it does not restrict which **Verifying signal** branch you may use, and it does not forbid the repository contents API or GraphQL.",
   ].join("\n");
 }
 
@@ -1279,6 +1349,65 @@ function buildPrReviewerWakeIdempotencyKey(
 function buildPrReviewerTaskKey(context: ResolvedEventContext & { prNumber: number }) {
   const repo = context.repoFullName ?? "unknown";
   return `pr_review:${repo}:${context.prNumber}`;
+}
+
+type PrReviewerWakeupOptions = NonNullable<Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1]> & {
+  payload: Record<string, unknown> & { taskKey: string };
+  contextSnapshot: Record<string, unknown> & { taskKey: string };
+  idempotencyKey: string;
+};
+
+function buildPrReviewerWakeupOptions(
+  context: ResolvedEventContext & { prNumber: number },
+  eventName: string,
+  deliveryId: string | null,
+): PrReviewerWakeupOptions {
+  const reviewerTaskKey = buildPrReviewerTaskKey(context);
+  const idempotencyKey = buildPrReviewerWakeIdempotencyKey(context, deliveryId);
+
+  return {
+    source: "automation",
+    triggerDetail: "system",
+    reason: context.wakeReason,
+    payload: {
+      taskKey: reviewerTaskKey,
+      source: "github",
+      event: eventName,
+      deliveryId,
+      prNumber: context.prNumber,
+      repoFullName: context.repoFullName,
+      prUrl: context.prUrl,
+      eventUrl: context.eventUrl,
+      headSha: context.headSha,
+      paperclipIdentifiers: context.identifiers,
+      commentId: context.commentId,
+      commentAuthorLogin: context.commentAuthorLogin,
+      reviewKind: "pr_review",
+    },
+    contextSnapshot: {
+      taskKey: reviewerTaskKey,
+      wakeReason: context.wakeReason,
+      wakeSource: "automation",
+      wakeTriggerDetail: "system",
+      commentSource: "github",
+      githubEvent: eventName,
+      githubDeliveryId: deliveryId,
+      githubPrNumber: context.prNumber,
+      githubRepoFullName: context.repoFullName,
+      ...githubContextMetadata(context),
+      ...(context.commentId ? { githubCommentId: context.commentId } : {}),
+      ...(context.commentAuthorLogin
+        ? { githubPrReviewRequestAuthorLogin: context.commentAuthorLogin }
+        : {}),
+      ...(context.commentBody ? { githubPrReviewRequestBody: context.commentBody } : {}),
+      reviewKind: "pr_review",
+      prRole: "reviewer",
+    },
+    // Open/ready/review-submitted events stay one wake per PR+reason.
+    // @ally comment requests are scoped to the GitHub comment id so a
+    // later explicit re-review comment can wake Ally again.
+    idempotencyKey,
+  };
 }
 
 function configuredPrReviewerAgentIds(config: GithubWebhookConfig): string[] {
@@ -1731,6 +1860,27 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     const payload = (req.body ?? {}) as Record<string, unknown>;
     const context = resolveEventContext(eventName, payload, {
       prReviewerBotLogin: config.prReviewerBotLogin,
+      // BLO-18273: surface the one silent drop in this handler. An agent that
+      // asks for review without the `<!-- paperclip:review-request -->` marker
+      // gets no wake and no error; this is the only trace it ever leaves, so
+      // it names the fix in the message rather than just the symptom.
+      onSuppressedReviewRequest: (info) => {
+        logger.warn(
+          {
+            event: eventName,
+            deliveryId,
+            repoFullName: info.repoFullName,
+            prNumber: info.prNumber,
+            commentId: info.commentId,
+            commentAuthorLogin: info.commentAuthorLogin,
+            commentUrl: info.commentUrl,
+            suppressionReason: "reviewer_bot_authored_request_missing_marker",
+          },
+          "github webhook reviewer wake skipped: @ally request authored by the reviewer bot login carries no " +
+            "start-of-body <!-- paperclip:review-request --> marker, so it is indistinguishable from the " +
+            "reviewer's own output (BLO-18865/BLO-18273); no review was requested",
+        );
+      },
     });
 
     // A closed or newly-drafted PR cannot produce useful reviewer work. Retire
@@ -1849,10 +1999,11 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           pluginWorkerManager: config.pluginWorkerManager,
           ...config.heartbeatOptions,
         });
-        const reviewerTaskKey = buildPrReviewerTaskKey(context);
+        const reviewerWakeupOptions = buildPrReviewerWakeupOptions(context, eventName, deliveryId);
+        const reviewerTaskKey = reviewerWakeupOptions.payload.taskKey;
+        const idempotencyKey = reviewerWakeupOptions.idempotencyKey;
         // taskKey scopes active-run coalescing; idempotencyKey scopes duplicate
         // request rows for the same PR+reason before enqueueing.
-        const idempotencyKey = buildPrReviewerWakeIdempotencyKey(context, deliveryId);
         // Request-scoped keys also dedup terminal completed/cancelled rows, so a
         // GitHub redelivery of one event cannot re-run work that already ran or
         // was retired by converted_to_draft (BLO-18953).
@@ -1917,49 +2068,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           // no-ops and would otherwise swamp that gap in steady state.
           recordGithubReviewRequestDelivery({ state: "received", reason: context.wakeReason });
 
-          const wakeResult = await heartbeat.wakeup(reviewerAgentId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: context.wakeReason,
-            payload: {
-              taskKey: reviewerTaskKey,
-              source: "github",
-              event: eventName,
-              deliveryId,
-              prNumber: context.prNumber,
-              repoFullName: context.repoFullName,
-              prUrl: context.prUrl,
-              eventUrl: context.eventUrl,
-              headSha: context.headSha,
-              paperclipIdentifiers: context.identifiers,
-              commentId: context.commentId,
-              commentAuthorLogin: context.commentAuthorLogin,
-              reviewKind: "pr_review",
-            },
-            contextSnapshot: {
-              taskKey: reviewerTaskKey,
-              wakeReason: context.wakeReason,
-              wakeSource: "automation",
-              wakeTriggerDetail: "system",
-              commentSource: "github",
-              githubEvent: eventName,
-              githubDeliveryId: deliveryId,
-              githubPrNumber: context.prNumber,
-              githubRepoFullName: context.repoFullName,
-              ...githubContextMetadata(context),
-              ...(context.commentId ? { githubCommentId: context.commentId } : {}),
-              ...(context.commentAuthorLogin
-                ? { githubPrReviewRequestAuthorLogin: context.commentAuthorLogin }
-                : {}),
-              ...(context.commentBody ? { githubPrReviewRequestBody: context.commentBody } : {}),
-              reviewKind: "pr_review",
-              prRole: "reviewer",
-            },
-            // Open/ready/review-submitted events stay one wake per PR+reason.
-            // @ally comment requests are scoped to the GitHub comment id so a
-            // later explicit re-review comment can wake Ally again.
-            idempotencyKey,
-          });
+          const wakeResult = await heartbeat.wakeup(reviewerAgentId, reviewerWakeupOptions);
           // A truthy result means the durable agent_wakeup_requests row is
           // committed AND a run was enqueued/coalesced; from here the wake
           // survives this process dying. Any transient dispatch failure inside
@@ -2551,6 +2660,9 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             githubRepoFullName: context.repoFullName,
             ...(wakeCommentId ? { wakeCommentId, commentId: wakeCommentId } : {}),
             ...githubContextMetadata(context),
+            ...(actionableReviewFeedback && wakeCommentId
+              ? { githubReviewFeedbackCommentId: wakeCommentId }
+              : {}),
             ...(isPrWake ? { prRole: "author" as const } : {}),
             ...(reviewBody ? { githubPrReviewBody: reviewBody } : {}),
             ...(context.reviewState ? { githubPrReviewState: context.reviewState } : {}),
@@ -2627,6 +2739,7 @@ export const __test_buildPrReviewerWakeIdempotencyKey = buildPrReviewerWakeIdemp
 export const __test_prReviewerWakeIdempotencyScope = prReviewerWakeIdempotencyScope;
 export const __test_idempotentWakeStatuses = idempotentWakeStatuses;
 export const __test_buildPrReviewerTaskKey = buildPrReviewerTaskKey;
+export const __test_buildDependabotAlertIssueBody = buildDependabotAlertIssueBody;
 export const __test_resolveDependabotAlertContext = resolveDependabotAlertContext;
 export const __test_hasActionablePrReviewFeedback = hasActionablePrReviewFeedback;
 export const __test_buildPrReviewFeedbackComment = buildPrReviewFeedbackComment;

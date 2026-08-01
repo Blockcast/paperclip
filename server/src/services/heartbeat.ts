@@ -80,7 +80,7 @@ import {
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
-import { runWithTransientDbRetry } from "../lib/db-retry.js";
+import { describeDbError, isDbError, runWithTransientDbRetry } from "../lib/db-retry.js";
 import { publishLiveEvent } from "./live-events.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
@@ -168,6 +168,8 @@ import {
 } from "./issue-rewake-throttle.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
 import { githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
+import { loadConfig } from "../config.js";
+import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
 import {
   ensureReferencedSharedDocsMaterialized,
   normalizeInstructionsEntryFile,
@@ -679,6 +681,11 @@ function readHeartbeatRunErrorFamily(
   if (run.errorCode === "codex_transient_upstream" || run.errorCode === "claude_transient_upstream") {
     return "transient_upstream";
   }
+  // BLO-18285: the server-side classification of a hint-less provider 503/529
+  // on the k8s adapters, which never run the local adapters' transient parser.
+  if (run.errorCode === "provider_transient_upstream") {
+    return "transient_upstream";
+  }
   if (run.errorCode === "k8s_concurrent_run_blocked") {
     return "capacity_blocked";
   }
@@ -1014,8 +1021,8 @@ const EXTERNAL_LIFECYCLE_PRE_ADAPTER_STALE_MS = 5 * 60 * 1000;
 // every tick. Aging closes this in two bounded steps: after
 // STARVATION_STATUS_BOOST_MS waited, forgive the todo/in_progress status
 // penalty (lets it tie same-priority in_progress work); after
-// STARVATION_FULL_ESCALATION_MS, force top-of-queue so it cannot be starved
-// indefinitely regardless of what else is queued.
+// STARVATION_FULL_ESCALATION_MS, promote it ahead of routine work while
+// preserving ranks 0-1 for explicit critical issues.
 const STARVATION_STATUS_BOOST_MS = 30 * 60 * 1000;
 const STARVATION_FULL_ESCALATION_MS = 2 * 60 * 60 * 1000;
 // BLO-16253 follow-up: a recovery/wake_owner run (contextSnapshot.recoveryActionId
@@ -3109,6 +3116,84 @@ export function isRateLimitExhausted(
 
 function looksLikeRetryableDeadlineExceeded(value: unknown): boolean {
   return typeof value === "string" && /(?:deadline[_\s-]*exceeded|upstream request timeout|gateway timeout|504\b)/i.test(value);
+}
+
+// BLO-18285: a transient provider fault that carries NO reset hint — gateway
+// 503 / "Service temporarily unavailable" / `server_error` / 529 overloaded.
+// There is no retry-after or capacity-reset horizon to honor, so the fix is
+// the retry horizon itself: the in-process SDK burns all 10 attempts in ~4
+// minutes, which is far short of a real gateway brownout (tens of minutes to
+// hours). Untagged, such a run finalizes as a plain `adapter_failed` with a
+// null errorFamily, so readTransientRecoveryContractFromRun returns null,
+// shouldScheduleAutomaticRunRetry returns false, no `scheduled_retry` row is
+// written, `hasActiveExecutionPath` finds nothing on the next sweep, and the
+// issue is escalated to `stranded_assigned_issue` and flipped to `blocked`.
+// (Live proof: BLO-18138 run 05d8c03e — 10/10 retries, error_status 503,
+// error "server_error", no hint, permanent strand.)
+//
+// The local adapters already classify this shape (claude-local's
+// CLAUDE_TRANSIENT_UPSTREAM_RE, codex-local's CODEX_TRANSIENT_UPSTREAM_RE),
+// but the k8s adapters do not run that parser server-side, so on claude_k8s /
+// opencode_k8s the fault reaches heartbeat finalization untagged. Recognizing
+// it here tags it `transient_upstream`, which routes it into the bounded
+// exponential curve (2m/10m/30m/2h ≈ 2h42m) and parks the issue in an explicit
+// `scheduled_retry` waiting posture that the strand sweep skips.
+//
+// Deliberately narrower than the adapter regexes: rate-limit / 429 / quota text
+// is excluded because isRateLimitExhausted already owns that family, and its
+// flat 90s curve is the correct schedule there (the ccrotate gate, not backoff,
+// decides when a closed account window reopens). Only no-hint server-fault
+// shapes land here.
+const TRANSIENT_UPSTREAM_STATUS_CODES = new Set(["503", "529"]);
+const TRANSIENT_UPSTREAM_TEXT_PATTERNS = [
+  /API Error:\s*(?:503|529)\b/i,
+  /service\s+(?:is\s+)?(?:temporarily\s+)?unavailable/i,
+  /temporarily\s+unavailable/i,
+  /server\s+overloaded/i,
+  /overloaded_error/i,
+  /\bserver_error\b/i,
+];
+
+function looksLikeTransientUpstreamText(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  return TRANSIENT_UPSTREAM_TEXT_PATTERNS.some((re) => re.test(value));
+}
+
+function normalizeHttpStatusCode(value: unknown): string | null {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim().length > 0
+        ? Number(value.trim())
+        : NaN;
+  if (!Number.isInteger(parsed) || parsed < 100 || parsed > 599) return null;
+  return String(parsed);
+}
+
+export function isHintlessTransientUpstreamFault(
+  resultJson: Record<string, unknown> | null | undefined,
+  opts?: { errorMessage?: string | null },
+): boolean {
+  // Two status surfaces: the Claude SDK's final result event uses
+  // `api_error_status`, while the per-attempt `api_retry` events that precede
+  // an exhausted retry budget use `error_status` — the latter is the field the
+  // BLO-18138 run actually carried, so matching only the former misses it.
+  let hasAuthoritativeStatus = false;
+  for (const key of ["api_error_status", "error_status"] as const) {
+    const status = normalizeHttpStatusCode(resultJson?.[key]);
+    if (status == null) continue;
+    if (TRANSIENT_UPSTREAM_STATUS_CODES.has(status)) return true;
+    hasAuthoritativeStatus = true;
+  }
+  if (hasAuthoritativeStatus) return false;
+
+  if (resultJson) {
+    for (const key of ["result", "message", "error", "summary"] as const) {
+      if (looksLikeTransientUpstreamText(resultJson[key])) return true;
+    }
+  }
+
+  return looksLikeTransientUpstreamText(opts?.errorMessage);
 }
 
 function retryNotBeforeDelayMs(value: unknown, now = Date.now()): number | null {
@@ -5948,6 +6033,89 @@ function normalizeInteractionContinuationWakeContext(
   clearInteractionContinuationWakeContext(contextSnapshot);
 }
 
+// BLO-19118: the GitHub PR block describes ONE pull request. It is not a bag of
+// independent fields — `githubPrReviewBody` only means anything alongside the
+// `githubPrNumber`/`githubHeadSha` it arrived with. Coalescing merges snapshots
+// field-by-field, so any key the incoming wake does not re-supply survives from
+// the previous one; for two wakes about *different* PRs that silently welds one
+// PR's review onto another PR's identity.
+//
+// That is not hypothetical: a wake is routed to an issue by the BLO- refs in the
+// PR body, so two PRs that both mention BLO-x resolve to the same issue, hence
+// the same coalescing task key. Observed 2026-07-30 — a `ready_for_review` for
+// #837 inherited #824's review body (head bfc470e, a different branch entirely)
+// because `ready_for_review` carries no review fields of its own. The agent is
+// then told "the findings are on YOUR pull request" about a review of someone
+// else's diff.
+const GITHUB_PR_CONTEXT_KEYS = [
+  "githubPrNumber",
+  "githubRepoFullName",
+  "githubPrTitle",
+  "githubPrUrl",
+  "githubEventUrl",
+  "githubHeadSha",
+  "githubEvent",
+  "githubDeliveryId",
+  "githubCommentId",
+  "githubCommentUrl",
+  "githubReviewUrl",
+  "githubReviewFeedbackCommentId",
+  "githubPrAuthorLogin",
+  "githubPaperclipIdentifiers",
+  "githubPrReviewBody",
+  "githubPrReviewState",
+  "githubPrReviewAuthorLogin",
+  "githubPrReviewRequestBody",
+  "githubPrReviewRequestAuthorLogin",
+  "githubReviewFeedbackActionable",
+  "prRole",
+  "reviewKind",
+] as const;
+
+function readGithubPrIdentity(contextSnapshot: Record<string, unknown>) {
+  const raw = contextSnapshot.githubPrNumber;
+  const prNumber =
+    typeof raw === "number" && Number.isFinite(raw)
+      ? raw
+      : typeof raw === "string" && raw.trim().length > 0 && Number.isFinite(Number(raw))
+        ? Number(raw)
+        : null;
+  if (prNumber === null) return null;
+  return `${readNonEmptyString(contextSnapshot.githubRepoFullName) ?? "unknown-repo"}#${prNumber}`;
+}
+
+function readGithubPrScopedWakeCommentIds(contextSnapshot: Record<string, unknown>) {
+  const ids = new Set<string>();
+  const githubCommentId = readNonEmptyString(contextSnapshot.githubCommentId);
+  if (githubCommentId) ids.add(githubCommentId);
+  const reviewFeedbackCommentId = readNonEmptyString(contextSnapshot.githubReviewFeedbackCommentId);
+  if (reviewFeedbackCommentId) ids.add(reviewFeedbackCommentId);
+
+  const paperclipWake = parseObject(contextSnapshot[PAPERCLIP_WAKE_PAYLOAD_KEY]);
+  const comments = Array.isArray(paperclipWake.comments) ? paperclipWake.comments : [];
+  const identity = readGithubPrIdentity(contextSnapshot);
+  for (const rawComment of comments) {
+    const comment = parseObject(rawComment);
+    const metadata = parseObject(comment.metadata);
+    if (readNonEmptyString(metadata.kind) !== "github_pr_review_feedback") continue;
+    const metadataIdentity = readGithubPrIdentity({
+      githubRepoFullName: metadata.repoFullName,
+      githubPrNumber: metadata.prNumber,
+    });
+    if (identity !== null && metadataIdentity !== null && metadataIdentity !== identity) continue;
+    const commentId = readNonEmptyString(comment.id);
+    if (commentId) ids.add(commentId);
+  }
+
+  return ids;
+}
+
+function preserveNonGithubPrWakeCommentIds(contextSnapshot: Record<string, unknown>) {
+  const githubPrScopedCommentIds = readGithubPrScopedWakeCommentIds(contextSnapshot);
+  if (githubPrScopedCommentIds.size === 0) return extractWakeCommentIds(contextSnapshot);
+  return extractWakeCommentIds(contextSnapshot).filter((commentId) => !githubPrScopedCommentIds.has(commentId));
+}
+
 type AcceptedPlanWakeRoutingDecision = {
   otherActiveClaimIssueId: string;
   otherActiveClaimIdentifier: string | null;
@@ -6010,6 +6178,25 @@ export function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
+  // BLO-19118: when the incoming wake names a different pull request, every
+  // inherited GitHub field describes the wrong artifact. Drop the block as a
+  // unit instead of letting the spread above carry over whichever keys the
+  // incoming wake happens not to re-supply. Keys the incoming wake DID supply
+  // are its own and stay. Same PR — or a non-PR wake, which leaves the block
+  // untouched — keeps the previous behaviour.
+  // NOTE: `parseObject` returns `existingRaw` itself when it is already an
+  // object, so this must edit `merged` (freshly created) and never `existing`.
+  const incomingPrIdentity = readGithubPrIdentity(incoming);
+  const existingPrIdentity = readGithubPrIdentity(existing);
+  const isDifferentGithubPr =
+    incomingPrIdentity !== null &&
+    existingPrIdentity !== null &&
+    incomingPrIdentity !== existingPrIdentity;
+  if (isDifferentGithubPr) {
+    for (const key of GITHUB_PR_CONTEXT_KEYS) {
+      if (!(key in incoming)) delete merged[key];
+    }
+  }
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
   }
@@ -6017,7 +6204,9 @@ export function mergeCoalescedContextSnapshot(
   for (const key of ["issueId", "taskId", "taskKey"] as const) {
     merged[key] = readNonEmptyString(incoming[key]) ?? readNonEmptyString(existing[key]) ?? merged[key];
   }
-  const mergedCommentIds = mergeWakeCommentIds(existing, incoming);
+  const mergedCommentIds = isDifferentGithubPr
+    ? mergeWakeCommentIds(preserveNonGithubPrWakeCommentIds(existing), incoming)
+    : mergeWakeCommentIds(existing, incoming);
   if (mergedCommentIds.length > 0) {
     const latestCommentId = mergedCommentIds[mergedCommentIds.length - 1];
     merged[WAKE_COMMENT_IDS_KEY] = mergedCommentIds;
@@ -6025,6 +6214,11 @@ export function mergeCoalescedContextSnapshot(
     merged.wakeCommentId = latestCommentId;
     // The merged context should carry canonical comment ids; the next wake will
     // regenerate any structured payload from those ids.
+    delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
+  } else if (isDifferentGithubPr) {
+    delete merged[WAKE_COMMENT_IDS_KEY];
+    delete merged.commentId;
+    delete merged.wakeCommentId;
     delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
   }
   if (!hasInteractionContinuationWakeContext(incoming)) {
@@ -6631,6 +6825,39 @@ export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown>
     // before accepting a "skipped as self-review" summary.
     prAuthorLogin: readNonEmptyString(contextSnapshot.githubPrAuthorLogin),
   };
+}
+
+/**
+ * Resolve where to post the "reviewer never finished" commit status for a run
+ * whose bounded retry chain just exhausted, or null when no status should be
+ * written. (BLO-17456)
+ *
+ * A required status context that is never posted renders as "Expected —
+ * waiting for status to be reported" indefinitely: branch protection blocks the
+ * PR and nothing signals the result is never coming. Failing the context turns
+ * that silent wedge into a visible red check. GitHub keeps the latest status
+ * per (sha, context), so a later real result from the context owner overwrites
+ * it — this is not terminal for the PR.
+ *
+ * Returns null unless ALL of the following hold, because a status posted to the
+ * wrong place is worse than one not posted at all:
+ *  - an operator opted in by configuring a context name (this server does not
+ *    own the branch-protection rule, so it must not invent one);
+ *  - the run is a PR-review run (`derivePaperclipPrReview`);
+ *  - the wake carried a repo AND an exact head SHA — statuses are per-commit,
+ *    so a guessed SHA would fail an unrelated commit.
+ */
+export function resolvePrReviewGateStatusTarget(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  gateContext: string,
+): { repoFullName: string; sha: string; context: string; prNumber: number; prUrl: string | null } | null {
+  const context = gateContext.trim();
+  if (!context) return null;
+  const prReview = derivePaperclipPrReview(contextSnapshot);
+  if (!prReview) return null;
+  const { repoFullName, headSha, prNumber, prUrl } = prReview;
+  if (!repoFullName || !headSha) return null;
+  return { repoFullName, sha: headSha, context, prNumber, prUrl: prUrl ?? null };
 }
 
 const PR_REVIEW_OUTPUT_EVIDENCE_MAX_CHARS = 240_000;
@@ -7327,7 +7554,13 @@ export function buildPaperclipTaskMarkdown(input: {
     if (prReview.eventUrl && prReview.eventUrl !== prReview.prUrl) {
       lines.push(`- GitHub event URL: ${quoteTaskScalar(prReview.eventUrl)}`);
     }
-    if (prReview.headSha) lines.push(`- Head SHA: ${quoteTaskScalar(prReview.headSha)}`);
+    // BLO-19118: this is the head GitHub reported when the webhook fired, not
+    // the head now. A wake can sit queued for tens of minutes (observed: 30+),
+    // and the author may push in that window — trusting it verbatim makes the
+    // agent diff a superseded commit. Say so, so the run re-resolves.
+    if (prReview.headSha) {
+      lines.push(`- Head SHA at wake time: ${quoteTaskScalar(prReview.headSha)} (may be superseded — confirm the current head before diffing or checking out)`);
+    }
     if (prReview.event) lines.push(`- GitHub event: ${quoteTaskScalar(prReview.event)}`);
     if (prReview.prRole === "author") {
       const reviewerLabel = prReview.reviewAuthorLogin ?? "A reviewer";
@@ -8122,6 +8355,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }),
     });
     return interaction.id;
+  }
+
+  /**
+   * Queue the configured PR-review gate status failure for a run whose bounded
+   * retry chain just exhausted, so a never-arriving required check stops reading
+   * as "still waiting". The outbox owns evidence re-checks, retry, and final
+   * delivery logging; the heartbeat lifecycle only records that the work was
+   * durably queued. (BLO-17456)
+   */
+  async function queueExhaustedPrReviewGateStatus(
+    run: typeof heartbeatRuns.$inferSelect,
+    contextSnapshot: Record<string, unknown>,
+  ) {
+    const target = resolvePrReviewGateStatusTarget(
+      contextSnapshot,
+      loadConfig().prReviewGateStatusContext,
+    );
+    if (!target) return;
+
+    const delivery = await enqueueGithubCommitStatusDelivery(db, {
+      companyId: run.companyId,
+      sourceRunId: run.id,
+      repoFullName: target.repoFullName,
+      sha: target.sha,
+      context: target.context,
+      state: "failure",
+      description: "Paperclip reviewer run exhausted its automatic retries; no review was posted.",
+      targetUrl: target.prUrl,
+      prNumber: target.prNumber,
+      prUrl: target.prUrl,
+    });
+    await appendRunEvent(run, await nextRunEventSeq(run.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message:
+        delivery.status === "queued" || delivery.status === "processing"
+          ? `Queued PR-review gate status failure delivery for ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)} after retry exhaustion`
+          : `PR-review gate status failure delivery for ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)} is already ${delivery.status}`,
+      payload: {
+        deliveryId: delivery.id,
+        deliveryStatus: delivery.status,
+        statusContext: target.context,
+        repoFullName: target.repoFullName,
+        prNumber: target.prNumber,
+        headSha: target.sha,
+      },
+    });
   }
 
   async function escalatePlanApprovalResumeFailureNeedsAttention(input: {
@@ -12770,6 +13051,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         });
       }
+      // BLO-17456: a PR-review chain that exhausts here leaves its required
+      // status context unposted, so the PR sits on "Expected — waiting for
+      // status" with nothing signalling that no result is coming. Queue a
+      // durable status delivery so stale writes are guarded by a final
+      // GitHub-evidence read and transient GitHub/token failures can retry.
+      // Opt-in and swallowed so status delivery can never alter exhaustion
+      // handling.
+      await queueExhaustedPrReviewGateStatus(run, contextSnapshot).catch((error) => {
+        logger.warn(
+          { err: error, runId: run.id },
+          "failed to queue exhausted PR-review gate status",
+        );
+      });
       return {
         outcome: "retry_exhausted" as const,
         attempt: nextAttempt,
@@ -14536,6 +14830,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return trimmed.length > 500 ? `${trimmed.slice(0, 499)}…` : trimmed;
   }
 
+  /**
+   * Last-resort reason for an agent we are about to latch into `error` with
+   * nothing to say about why (BLO-19085).
+   *
+   * `status: error` + `errorReason: null` is the worst state this service can
+   * produce: the agent stops, and the record carries no diagnosis, so nothing
+   * surfaces the cause and no operator can act. OCMBackendEngineer sat that way
+   * for ~15h on 2026-07-30 because the external-runtime reconciler dropped a
+   * reason it was already holding. Callers passing a real reason is the fix;
+   * this is the floor under them, so a future caller that forgets still leaves
+   * a trail back to the run.
+   */
+  function fallbackAgentErrorReason(
+    outcome: "failed" | "timed_out" | string,
+    options?: { errorCode?: string | null; runId?: string | null },
+  ): string {
+    const parts = [`unknown ${outcome} failure: the finalizing path supplied no reason`];
+    if (options?.errorCode) parts.push(`errorCode ${options.errorCode}`);
+    parts.push(options?.runId ? `see run ${options.runId}` : "no run id was supplied either");
+    return parts.join("; ");
+  }
+
   async function finalizeAgentStatus(
     agentId: string,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
@@ -14544,6 +14860,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       keepIdleOnFailure?: boolean;
       errorCode?: string | null;
       retryNotBefore?: Date | null;
+      /** Run that drove this transition, so a fallback reason can point at it. */
+      runId?: string | null;
     },
   ) {
     const existing = await getAgent(agentId);
@@ -14590,7 +14908,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Persist a human-readable reason on the agent record when it enters
         // error so operators see it on the agent page without digging into run
         // events; clear it whenever the agent leaves error.
-        errorReason: nextStatus === "error" ? truncateAgentErrorReason(failureReason) : null,
+        //
+        // BLO-19085: never write `error` with a null reason. If the caller gave
+        // us nothing usable, synthesize one that names the outcome and points at
+        // the run, so the agent page always answers "why did this stop?".
+        errorReason:
+          nextStatus === "error"
+            ? (truncateAgentErrorReason(failureReason) ??
+              truncateAgentErrorReason(
+                fallbackAgentErrorReason(outcome, {
+                  errorCode: options?.errorCode,
+                  runId: options?.runId,
+                }),
+              ))
+            : null,
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
@@ -15121,7 +15452,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         reason: terminalOutcome.errorCode ?? terminalOutcome.status,
       });
     }
-    await finalizeAgentStatus(input.run.agentId, terminalOutcome.status);
+    // BLO-19085: pass the reason we already computed. Omitting it latched the
+    // agent into `error` with `errorReason: null` while the very same
+    // `terminalOutcome` (e.g. "External lifecycle Job is missing while heartbeat
+    // run is still running" / job_missing) sat on the run record one frame away.
+    await finalizeAgentStatus(input.run.agentId, terminalOutcome.status, terminalOutcome.error, {
+      errorCode: terminalOutcome.errorCode,
+      runId: input.run.id,
+    });
     const promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun);
     await handleRunLivenessContinuation(finalizedRun);
     if (finalizationAgent) {
@@ -16410,7 +16748,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         status: finalizedRun.status,
         failureReason: finalizedRun.error ?? undefined,
       });
-      await finalizeAgentStatus(run.agentId, "failed");
+      // BLO-19085: `baseMessage` is the process_lost diagnosis already written
+      // to the run record; pass it through so the agent record carries it too
+      // instead of latching into `error` with a null reason.
+      await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
+        errorCode: "process_lost",
+        runId: run.id,
+      });
 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
       let promotedRunDispatched = false;
@@ -17108,8 +17452,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const escalationFloorMs = isRecoveryWake
             ? STARVATION_RECOVERY_ESCALATION_MS
             : STARVATION_FULL_ESCALATION_MS;
-          if (waitedMs >= escalationFloorMs) return 0;
           const priorityRank = issueRunPriorityRank(issue?.priority);
+          // Aging must guarantee progress without erasing the emergency lane.
+          // Aged non-critical issue work joins rank 2 alongside aged issue-less
+          // work, ahead of routine medium/low work but behind critical ranks
+          // 0-1. Critical work itself still ages to rank 0 for FIFO ordering
+          // within that tier.
+          if (waitedMs >= escalationFloorMs) return priorityRank === 0 ? 0 : 2;
           const statusBonus =
             issue?.status === "in_progress" || waitedMs >= STARVATION_STATUS_BOOST_MS ? 0 : 1;
           return priorityRank * 2 + statusBonus;
@@ -19729,6 +20078,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       } else if (outcome === "failed" && looksRateLimited) {
         rateLimitExhaustedOverride = true;
       }
+      // BLO-18285: hint-less provider 503/529. Only ever downgrades an already
+      // -failed run — unlike the rate-limit overrides above it never flips
+      // `succeeded` to `failed`, because a run that finished its work while a
+      // 503 merely appeared in tool output did do the work and must not be
+      // re-dispatched. Yields to the rate-limit families (429 owns its own flat
+      // curve) and to any adapter that already tagged a family itself, so the
+      // local adapters' richer verdict always wins.
+      const transientUpstreamOverride =
+        outcome === "failed" &&
+        !rateLimitExhaustedOverride &&
+        !providerThrottledNoProgressOverride &&
+        !adapterResult.errorFamily &&
+        isHintlessTransientUpstreamFault(adapterResult.resultJson, {
+          errorMessage: adapterResult.errorMessage,
+        });
       let prReviewCompletionEvidence = outcome === "succeeded"
         ? evaluatePrReviewCompletionEvidence(context, {
           resultJson: adapterResult.resultJson ?? null,
@@ -19838,6 +20202,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? "provider_throttled_no_progress"
           : prReviewIncompleteOverride
             ? prReviewIncompleteOverride.errorCode
+            // BLO-18285: name the fault only where the code would otherwise be
+            // the anonymous "adapter_failed" fallback. A specific adapter code
+            // (or a silent-failure verdict) is the more precise diagnosis and
+            // is left intact — the errorFamily tag below is what actually
+            // drives the retry, so the schedule is unaffected either way.
+            : transientUpstreamOverride && !adapterResult.errorCode && !silentFailureMessage
+              ? "provider_transient_upstream"
             : outcome === "timed_out"
           ? "timeout"
           : outcome === "cancelled"
@@ -19939,8 +20310,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               // right schedule curve. rate_limit_exhausted -> flat 90s retry
               // (gate decides if pool has capacity); generic adapter-reported
               // transient_upstream -> exponential backoff.
+              // BLO-18285: a hint-less provider 503/529 on a k8s adapter also
+              // gets transient_upstream, so it takes the exponential curve
+              // (2m/10m/30m/2h) instead of finalizing untagged and stranding.
               errorFamily: rateLimitExhaustedOverride || providerThrottledNoProgressOverride
                 ? "rate_limit_exhausted"
+                : transientUpstreamOverride
+                  ? "transient_upstream"
                 : (adapterResult.errorFamily ?? null),
               retryNotBefore: adapterResult.retryNotBefore ?? null,
               ...(providerThrottledNoProgressOverride ? { providerThrottleNoProgress: true } : {}),
@@ -20173,7 +20549,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     } catch (err) {
       const message = redactCurrentUserText(
-        err instanceof Error ? err.message : "Unknown adapter failure",
+        // BLO-19085: a drizzle write failure's `message` is the "Failed query"
+        // wrapper with every bind param inlined — the agent's whole stdout
+        // stream — while the SQLSTATE that actually explains it hangs off
+        // `.cause`. Persisting `err.message` stored 605KB of params and no
+        // diagnosis. describeDbError keeps the cause and drops the params;
+        // non-database errors fall through to their own message unchanged.
+        isDbError(err)
+          ? describeDbError(err, "run finalization db write failed")
+          : err instanceof Error
+            ? err.message
+            : "Unknown adapter failure",
         await getCurrentUserRedactionOptions(),
       );
       const workspaceValidationFailure = isWorkspaceValidationFailure(err) ? err : null;
@@ -20315,7 +20701,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
           // The inner catch did not fire, so we must record the failure here.
           const message = redactCurrentUserText(
-            outerErr instanceof Error ? outerErr.message : "Unknown setup failure",
+            // BLO-19085: same db-write-failure shaping as the inner catch.
+            isDbError(outerErr)
+              ? describeDbError(outerErr, "run setup db write failed")
+              : outerErr instanceof Error
+                ? outerErr.message
+                : "Unknown setup failure",
             await getCurrentUserRedactionOptions(),
           );
           // A missing secret/env binding is a known pre-dispatch configuration gap,
