@@ -1976,6 +1976,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
   it("refunds a suppressed non-assignee wake when the source issue has no assignee fallback", async () => {
     const { managerId, coderId, sourceIssueId } = await seedCompany();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
+
     const queuedRun = { id: randomUUID() } as never;
     const enqueueWakeup = vi.fn(async () => queuedRun);
     const recovery = recoveryService(db, { enqueueWakeup });
@@ -2019,7 +2021,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         assigneeAgentId: null,
         // Establish the unchanged-state precondition explicitly. The first escalation's
         // system comment otherwise counts as new activity and correctly permits another wake.
-        lastActivityAt: afterFirst!.lastAttemptAt,
+        lastActivityAt: new Date(afterFirst!.lastAttemptAt as Date | string),
       })
       .where(eq(issues.id, sourceIssueId));
 
