@@ -629,3 +629,121 @@ describe("BLO-15982 pod_pending route: 240-minute escalation deadline end-to-end
     );
   });
 });
+
+/**
+ * BLO-20467 — the sweep must read alert state through the same legacy
+ * migration path the webhook uses.
+ *
+ * These use a Map keyed by the FULL scope ref (kind + scopeId + key), not a
+ * stubbed `state.get` that returns one record for every ref: the whole point is
+ * that a scoped read and a legacy instance read are different lookups, which a
+ * single-record stub cannot express.
+ */
+describe("BLO-20467 sweep reads legacy instance state through the migration path", () => {
+  const keyOf = (ref: { scopeKind: string; scopeId?: string; stateKey: string }) =>
+    `${ref.scopeKind}/${ref.scopeId ?? "-"}/${ref.stateKey}`;
+
+  const dueState = (companyId: string): AlertStateRecord => ({
+    paperclipIssueId: "issue-1",
+    paperclipCompanyId: companyId,
+    assigneeUserId: null,
+    assigneeAgentId: "engineer",
+    alertname: "SyntheticAlert",
+    severity: "critical",
+    firstSeenAt: "x",
+    lastFiredAt: "x",
+    resolvedAt: null,
+    nextEscalationAt: "2026-07-11T00:00:00Z",
+    escalationAttempt: 0,
+  });
+
+  function mapBackedSweepContext(seed: Array<[string, AlertStateRecord]>) {
+    const store = buildFakeAlertmanagerStore();
+    const state = new Map<string, AlertStateRecord>(seed);
+    const issue = {
+      id: "issue-1", identifier: "BLO-1", title: "Alert", status: "todo", priority: "critical",
+      originId: "fp-1", assigneeAgentId: "engineer", projectId: null, goalId: null,
+    };
+    const mocks = {
+      state: {
+        get: vi.fn(async (ref: any) => state.get(keyOf(ref)) ?? null),
+        set: vi.fn(async (ref: any, value: AlertStateRecord) => { state.set(keyOf(ref), value); }),
+        delete: vi.fn(async (ref: any) => { state.delete(keyOf(ref)); }),
+      },
+      issues: {
+        list: vi.fn(async (input: { originKind?: string }) => input.originKind?.endsWith(":escalation") ? store.issuesList(input as any) : [issue]),
+        listComments: vi.fn(async () => []),
+        createComment: vi.fn(async () => ({})),
+        requestWakeup: vi.fn(async () => ({})),
+        update: vi.fn(async () => issue),
+        create: vi.fn(store.issuesCreate as any),
+        get: vi.fn(async () => issue),
+      },
+      db: store.db,
+      agents: { get: vi.fn(async (id: string) => ({ id, name: "Engineer", reportsTo: "cto" })) },
+      access: { members: { list: vi.fn(async () => []) } },
+      logger: { info: vi.fn(), warn: vi.fn() },
+    };
+    return { ctx: mocks as unknown as PluginContext, mocks, state };
+  }
+
+  it("advances a due ladder whose row is still in the pre-upgrade instance scope", async () => {
+    // The upgrade-window case: the alert was firing before this version shipped,
+    // so its row is instance-scoped and no webhook has arrived to migrate it.
+    // Reading only the company key would see `null` and skip the rung silently.
+    const { ctx, mocks, state } = mapBackedSweepContext([
+      ["instance/-/alert:fp-1", dueState("company-1")],
+    ]);
+
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+    expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    // and the row was migrated into company scope as a side effect
+    expect(state.get("company/company-1/alert:fp-1")).toEqual(
+      expect.objectContaining({ escalationAttempt: 1 }),
+    );
+    expect(state.has("instance/-/alert:fp-1")).toBe(false);
+  });
+
+  it("adopts a legacy row only for its owning tenant, not for a same-fingerprint neighbour", async () => {
+    // Both halves matter, and the pairing is what makes this test non-vacuous:
+    // asserting only that company-1 does nothing would also pass on a sweep that
+    // never reads legacy state at all. The company-2 half proves the row IS
+    // reachable, so company-1's refusal is a real ownership decision.
+    const owner = mapBackedSweepContext([["instance/-/alert:fp-1", dueState("company-2")]]);
+    await runAlertEscalationSweep(owner.ctx, config({ defaultCompanyId: "company-2" }), new Date("2026-07-11T01:00:00Z"));
+    expect(owner.mocks.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(owner.state.get("company/company-2/alert:fp-1")).toEqual(
+      expect.objectContaining({ escalationAttempt: 1 }),
+    );
+
+    const neighbour = mapBackedSweepContext([["instance/-/alert:fp-1", dueState("company-2")]]);
+    await runAlertEscalationSweep(neighbour.ctx, config(), new Date("2026-07-11T01:00:00Z"));
+    expect(neighbour.mocks.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(neighbour.mocks.issues.createComment).not.toHaveBeenCalled();
+    // untouched and un-migrated — still available to its real owner
+    expect(neighbour.state.get("instance/-/alert:fp-1")).toEqual(
+      expect.objectContaining({ paperclipCompanyId: "company-2", escalationAttempt: 0 }),
+    );
+    expect(neighbour.state.has("company/company-1/alert:fp-1")).toBe(false);
+  });
+
+  it("prefers an existing company-scoped row over a stale legacy one", async () => {
+    // Precedence pin: guards the inverse bug of letting a leftover legacy copy
+    // shadow the migrated row, which would replay an already-advanced rung.
+    const { ctx, mocks } = mapBackedSweepContext([
+      ["company/company-1/alert:fp-1", { ...dueState("company-1"), escalationAttempt: 2 }],
+      ["instance/-/alert:fp-1", dueState("company-1")],
+    ]);
+
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1",
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.objectContaining({ scopeKind: "company", scopeId: "company-1" }),
+      expect.objectContaining({ escalationAttempt: 3 }),
+    );
+  });
+});

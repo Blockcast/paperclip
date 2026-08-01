@@ -15,6 +15,7 @@ import {
   CompanyScopeUnavailableError,
   isEmptyConfig,
   resolveCompanyScope,
+  resolveSweepScope,
   resolveWebhookToken,
 } from "../config-scope.js";
 import type { AlertmanagerPluginConfig } from "../types.js";
@@ -187,5 +188,79 @@ describe("resolveCompanyScope", () => {
 
     expect(scope?.config.ownerMap).toBeDefined();
     expect(Object.keys(scope?.config.issueRouteMap ?? {}).length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * BLO-20467 — the escalation sweep's tenant scope must come from the HOST's
+ * per-invocation scope, never from a module global fed by `onConfigChanged`.
+ *
+ * The distinction these pin down:
+ *  - unscoped `ctx.config.get()` inside a job tick is an RPC the host answers
+ *    from `deriveCallInvocationScope`, which supplies `bootstrapCompanyId` only
+ *    when exactly one company has the plugin configured;
+ *  - with two or more, the tick has no scope and the host denies every
+ *    company-scoped call, so the sweep must stop deliberately rather than walk
+ *    into a guaranteed error per tick.
+ */
+describe("BLO-20467 escalation sweep scope resolution", () => {
+  const sweepCtx = (configGet: () => Promise<unknown>) => {
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    return {
+      ctx: { config: { get: vi.fn(configGet) }, logger } as unknown as PluginContext,
+      logger,
+    };
+  };
+
+  const scopeDenied = () => Object.assign(new Error("company context is required"), {
+    code: -32005, // PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED
+    name: "JsonRpcCallError",
+  });
+
+  it("reads the host-scoped company's live config on a single-company instance", async () => {
+    // No onConfigChanged has fired — this is the state a freshly restarted
+    // worker is in, and the sweep must work anyway.
+    const { ctx } = sweepCtx(async () => ({ defaultCompanyId: COMPANY_A, autoCloseOnResolve: true }));
+    const config = await resolveSweepScope(ctx);
+    expect(config?.defaultCompanyId).toBe(COMPANY_A);
+    // defaults merged in, so the sweep gets the same shape the webhook path does
+    expect(config?.issueRouteMap).toBeDefined();
+    expect(ctx.config.get).toHaveBeenCalledWith();
+  });
+
+  it("skips deterministically when the host denies scope (multi-company instance)", async () => {
+    const { ctx, logger } = sweepCtx(async () => { throw scopeDenied(); });
+    await expect(resolveSweepScope(ctx)).resolves.toBeNull();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("BLO-20595"));
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("more than one company"));
+  });
+
+  it("recognises a scope denial surfaced as a bare InvocationScopeDeniedError", async () => {
+    // Direct (non-RPC) handler path: no numeric code, only the error name.
+    const { ctx, logger } = sweepCtx(async () => {
+      throw Object.assign(new Error("company context is required"), { name: "InvocationScopeDeniedError" });
+    });
+    await expect(resolveSweepScope(ctx)).resolves.toBeNull();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("BLO-20595"));
+  });
+
+  it("distinguishes an ordinary config failure from a scope denial", async () => {
+    // A transient RPC failure is an error, not the documented multi-company
+    // limitation — logging it as the latter would send an operator to the wrong
+    // issue.
+    const { ctx, logger } = sweepCtx(async () => { throw new Error("connection reset"); });
+    await expect(resolveSweepScope(ctx)).resolves.toBeNull();
+    expect(logger.error).toHaveBeenCalledWith(expect.stringContaining("connection reset"));
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it("skips when the scoped company has no stored config, or none naming a company", async () => {
+    const empty = sweepCtx(async () => ({}));
+    await expect(resolveSweepScope(empty.ctx)).resolves.toBeNull();
+    expect(empty.logger.warn).toHaveBeenCalledWith(expect.stringContaining("no stored plugin config"));
+
+    const noCompany = sweepCtx(async () => ({ autoCloseOnResolve: true }));
+    await expect(resolveSweepScope(noCompany.ctx)).resolves.toBeNull();
+    expect(noCompany.logger.warn).toHaveBeenCalledWith(expect.stringContaining("defaultCompanyId is not set"));
   });
 });
