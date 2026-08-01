@@ -88,6 +88,7 @@ import {
   deleteAgentJobExact,
   deleteAgentJobsForRun,
   deleteAgentPodExact,
+  captureAgentJobFailureDiagnostics,
   hasActiveJobForAgent,
   indexUniqueAgentJobRunStatuses,
   listAgentJobRunStatuses,
@@ -15398,6 +15399,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
+  /**
+   * Best-effort capture of the failed Job's pod-level terminal state.
+   *
+   * The Job `Failed` condition only ever says "backoff limit reached" — it names
+   * no container and carries no exit code — so without this a recurrence leaves
+   * no evidence once the pod is GC'd. Never throws and never blocks
+   * finalization; a null result simply means the run record keeps the
+   * Job-level fields it always had.
+   */
+  async function captureFailedJobContainerDiagnostics(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id">,
+    jobStatus: AgentJobRunStatus | null,
+  ) {
+    try {
+      const jobName = readNonEmptyString(jobStatus?.name) ??
+        readNonEmptyString((await getActiveExternalRuntimeReservation(db, run.id))?.jobName);
+      if (!jobName) return null;
+      return await captureAgentJobFailureDiagnostics(jobName);
+    } catch (error) {
+      logger.warn(
+        { runId: run.id, error: error instanceof Error ? error.message : String(error) },
+        "failed-Job container diagnostics capture failed; finalizing without them",
+      );
+      return null;
+    }
+  }
+
   async function finalizeExternalLifecycleTerminalRun(input: {
     run: typeof heartbeatRuns.$inferSelect;
     adapterType: string;
@@ -15488,6 +15516,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ? await hasAdapterInvocationEvent(input.run.id)
       : null;
 
+    // Read the pod's terminal container state while the pod still exists. This
+    // is the only point in the lifecycle where it is still available.
+    const containerDiagnostics = terminalOutcome.errorCode === "job_failed"
+      ? await captureFailedJobContainerDiagnostics(input.run, input.jobStatus)
+      : null;
+
     const resultJson = mergeRunStopMetadataForAgent(
       { adapterType: input.adapterType, adapterConfig: parseObject(input.adapterConfig) },
       terminalOutcome.status,
@@ -15500,6 +15534,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             jobReason: terminalOutcome.jobReason,
             jobMessage: terminalOutcome.jobMessage,
             ...(adapterInvocationStarted !== null ? { adapterInvocationStarted } : {}),
+            ...(containerDiagnostics ? { containerDiagnostics } : {}),
           },
         },
         errorCode: terminalOutcome.errorCode,
