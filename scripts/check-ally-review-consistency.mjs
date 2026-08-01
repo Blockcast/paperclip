@@ -28,6 +28,14 @@
  *
  * "Operative" excludes DISMISSED and PENDING: a dismissed review is disposed,
  * not a standing attestation.
+ *
+ * Do not replace this with the obvious shell one-liner that groups reviews by
+ * commit_id and flags a group when its states differ. That formulation misses
+ * two of the three invariants: identical duplicate verdicts (two APPROVEDs at
+ * one head) have one unique state and slip through, and it has no notion of I3
+ * at all. It also counts DISMISSED as a live divergent state, so it fires on
+ * PRs that were correctly dispositioned. On the run that motivated this file it
+ * found 1 instance where this script found 4.
  */
 
 import { execFileSync } from "node:child_process";
