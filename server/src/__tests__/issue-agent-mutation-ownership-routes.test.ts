@@ -261,6 +261,7 @@ function makeAgent(id: string, overrides: Record<string, unknown> = {}) {
     id,
     companyId,
     role: "engineer",
+    status: "active",
     reportsTo: null,
     permissions: { canCreateAgents: false },
     ...overrides,
@@ -412,6 +413,78 @@ function allowStandardAgentRootIssueCreation() {
     reason: "allow_test_default",
     explanation: "Allowed by test default.",
   }));
+}
+
+function createAuthorizationDecisionDb(input: { actor?: { agentId?: string | null } }, agentRows: Record<string, unknown>[]) {
+  const rowsForSelection = (selection: Record<string, unknown>) => {
+    const keys = Object.keys(selection);
+    if (keys.includes("contextSnapshot")) return [];
+    if (keys.includes("reportsTo") && keys.length <= 2) return agentRows;
+    if (keys.includes("role") && keys.includes("permissions")) {
+      return agentRows.filter((agent) => agent.id === input.actor?.agentId);
+    }
+    return [];
+  };
+  return {
+    select: vi.fn((selection: Record<string, unknown> = {}) => ({
+      from: vi.fn(() => ({
+        where: vi.fn(() => {
+          const settle = (
+            onFulfilled: (rows: unknown[]) => unknown,
+            onRejected?: (reason: unknown) => unknown,
+          ) => Promise.resolve(rowsForSelection(selection)).then(onFulfilled, onRejected);
+          // BLO-19094: the productivity-review source grant terminates its
+          // query with `.limit(1)` rather than awaiting the where() thenable
+          // directly, so the double has to offer both endings. Without this the
+          // whole issue:mutate branch throws "limit is not a function" and every
+          // route test using this double reports 500 instead of its real status.
+          return {
+            then: settle,
+            limit: vi.fn(() => ({ then: settle })),
+          };
+        }),
+      })),
+    })),
+  };
+}
+
+function useProductionIssueAuthorization(agentRows: Record<string, unknown>[]) {
+  mockAccessService.decide.mockImplementation(async (input: { actor?: { agentId?: string | null }; action: string }) => {
+    const { authorizationService } =
+      await vi.importActual<typeof import("../services/authorization.js")>("../services/authorization.js");
+    return authorizationService(createAuthorizationDecisionDb(input, agentRows) as never).decide(input as never);
+  });
+}
+
+async function makePendingReviewIssueForAgent(agentId: string, overrides: Record<string, unknown> = {}) {
+  const { normalizeIssueExecutionPolicy } = await vi.importActual<typeof import("../services/issue-execution-policy.js")>(
+    "../services/issue-execution-policy.js",
+  );
+  const policy = normalizeIssueExecutionPolicy({
+    stages: [
+      {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        type: "review",
+        participants: [{ type: "agent", agentId }],
+      },
+    ],
+  })!;
+  return makeIssue({
+    status: "in_review",
+    executionPolicy: policy,
+    executionState: {
+      status: "pending",
+      currentStageId: policy.stages[0].id,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId },
+      returnAssignee: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    },
+    ...overrides,
+  });
 }
 
 describe("agent issue mutation checkout ownership", () => {
@@ -1297,6 +1370,99 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
+  // BLO-19087: an @-mention fires an `issue_comment_mentioned` wake with no gate
+  // on who authored it, but the grant only lands when the mention's author is
+  // the issue's own assignee. The mentioned agent was therefore invited onto a
+  // thread it could not post to, and the 403 named the boundary ("grant")
+  // without naming the one act that clears it. These pin the deny as
+  // *actionable* rather than widening it.
+  describe("mention-wake reply guidance (BLO-19087)", () => {
+    const denyCommentGrant = async (input: { action: string }) => ({
+      allowed: input.action === "issue:read",
+      action: input.action,
+      reason: input.action === "issue:read" ? "allow_explicit_grant" : "deny_missing_grant",
+      explanation: input.action === "issue:read" ? "Allowed by test read grant." : "Missing permission.",
+    });
+
+    it("tells a mentioned non-assignee agent who can grant the reply and how", async () => {
+      mockAccessService.decide.mockImplementation(denyCommentGrant);
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Replying to the FYI that woke me." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      const remediation = res.body.details?.remediation;
+      expect(remediation, JSON.stringify(res.body)).toBeTruthy();
+      // Names the assignee as the only agent who can grant...
+      expect(remediation).toContain(`agent://${ownerAgentId}`);
+      // ...and the exact token they must write to do it.
+      expect(remediation).toContain(`agent://${peerAgentId}`);
+      // Corrects the specific false inference that caused the loop.
+      expect(remediation).toMatch(/does not grant you comment access/i);
+      // Names somewhere to respond instead, so the wake is not a dead end.
+      expect(remediation).toMatch(/respond on an issue you are assigned to/i);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    // The manager-chain case. `allow_manager_chain` is gated to
+    // `tasks:manage_active_checkouts`/`tasks:override_execution_stage`, so
+    // managing the assignee confers no `issue:comment` right. That is the
+    // intended least-privilege posture — assert the deny, and assert it still
+    // arrives with guidance rather than silently.
+    it("denies a managing agent the same way, but with actionable guidance", async () => {
+      mockAccessService.decide.mockImplementation(denyCommentGrant);
+      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
+
+      const managerActor = peerActor({ agentId: staleAgentId });
+      const res = await request(await createApp(managerActor))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "I manage the assignee." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+      expect(res.body.details.remediation).toContain(`agent://${staleAgentId}`);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    // Guidance must not be attached to denials it cannot explain. A
+    // trust-boundary rejection is not fixed by getting mentioned, and saying so
+    // would send the agent chasing a grant that would not help.
+    it("omits mention guidance when a different boundary fired", async () => {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: false,
+        action: input.action,
+        reason: "deny_low_trust_boundary",
+        explanation: "Issue is outside this low-trust boundary.",
+      }));
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Wrong boundary." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).not.toHaveProperty("remediation");
+    });
+
+    // The mention grant genuinely works when the assignee is the author; this
+    // change must not narrow it.
+    it("still allows the comment when the mention grant does apply", async () => {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action === "issue:read" || input.action === "issue:comment",
+        action: input.action,
+        reason: input.action === "issue:comment" ? "allow_issue_mention_grant" : "allow_explicit_grant",
+        explanation: "Allowed by a mention-scoped issue comment grant.",
+      }));
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Mentioned by the assignee, so this lands." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("rejects peer agents from listing comments when issue read is outside their boundary", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: false,
@@ -2129,6 +2295,314 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status).toBe(200);
     expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
     expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("allows the creator of a delegated child issue to post comments through production authorization (BLO-18113)", async () => {
+    useProductionIssueAuthorization([
+      makeAgent(peerAgentId),
+      makeAgent(ownerAgentId),
+    ]);
+    mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId, createdByAgentId: peerAgentId }));
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Correction from the delegating creator" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "Correction from the delegating creator",
+      expect.any(Object),
+      expect.any(Object),
+    );
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("allows a manager-chain agent to post comments through production authorization (BLO-18113)", async () => {
+    useProductionIssueAuthorization([
+      makeAgent(peerAgentId),
+      makeAgent(ownerAgentId, { reportsTo: peerAgentId }),
+    ]);
+    mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId, createdByAgentId: ownerAgentId }));
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Manager guidance for the delegated issue" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "Manager guidance for the delegated issue",
+      expect.any(Object),
+      expect.any(Object),
+    );
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  const commentOnlyAutoApprovalCases: Array<[string, Record<string, unknown>[], Record<string, unknown>]> = [
+    ["creator", [makeAgent(peerAgentId), makeAgent(ownerAgentId)], { createdByAgentId: peerAgentId }],
+    ["manager-chain", [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })], { createdByAgentId: ownerAgentId }],
+  ];
+
+  it.each(commentOnlyAutoApprovalCases)(
+    "does not let a %s comment grant auto-approve an in_review issue",
+    async (_kind, agentRows, issueOverrides) => {
+      const reviewBody = "## Review: APPROVED";
+      useProductionIssueAuthorization(agentRows);
+      mockIssueService.getById.mockResolvedValue(
+        await makePendingReviewIssueForAgent(peerAgentId, {
+          assigneeAgentId: ownerAgentId,
+          ...issueOverrides,
+        }),
+      );
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-comment-grant-approval",
+        issueId,
+        companyId,
+        body: reviewBody,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        authorAgentId: peerAgentId,
+        authorUserId: null,
+      });
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: reviewBody });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    },
+  );
+
+  const commentOnlyTransitionCases: Array<[
+    string,
+    Record<string, unknown>[],
+    Record<string, unknown>,
+    "done" | "blocked",
+    Record<string, boolean>,
+    string,
+  ]> = [
+    [
+      "creator",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId)],
+      { createdByAgentId: peerAgentId },
+      "done",
+      { reopen: true },
+      "allow_issue_creator",
+    ],
+    [
+      "creator",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId)],
+      { createdByAgentId: peerAgentId },
+      "done",
+      { resume: true },
+      "allow_issue_creator",
+    ],
+    [
+      "creator",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId)],
+      { createdByAgentId: peerAgentId },
+      "blocked",
+      { reopen: true },
+      "allow_issue_creator",
+    ],
+    [
+      "creator",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId)],
+      { createdByAgentId: peerAgentId },
+      "blocked",
+      { resume: true },
+      "allow_issue_creator",
+    ],
+    [
+      "manager-chain",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })],
+      { createdByAgentId: ownerAgentId },
+      "done",
+      { reopen: true },
+      "allow_manager_chain",
+    ],
+    [
+      "manager-chain",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })],
+      { createdByAgentId: ownerAgentId },
+      "done",
+      { resume: true },
+      "allow_manager_chain",
+    ],
+    [
+      "manager-chain",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })],
+      { createdByAgentId: ownerAgentId },
+      "blocked",
+      { reopen: true },
+      "allow_manager_chain",
+    ],
+    [
+      "manager-chain",
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })],
+      { createdByAgentId: ownerAgentId },
+      "blocked",
+      { resume: true },
+      "allow_manager_chain",
+    ],
+  ];
+
+  it.each(commentOnlyTransitionCases)(
+    "refuses %s comment grants with %s transition flags on %s issues",
+    async (_kind, agentRows, issueOverrides, status, transition, expectedReason) => {
+      useProductionIssueAuthorization(agentRows);
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status, assigneeAgentId: ownerAgentId, ...issueOverrides }),
+      );
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Delegated guidance plus an attempted status transition.", ...transition });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Creator/manager comment grant is comment-only");
+      expect(res.body.details).toMatchObject({ reason: expectedReason });
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    },
+  );
+
+  const commentGrantMutationDenialCases: Array<[string, Record<string, unknown>[], Record<string, unknown>]> = [
+    ["creator", [makeAgent(peerAgentId), makeAgent(ownerAgentId)], { createdByAgentId: peerAgentId }],
+    ["manager-chain", [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId })], { createdByAgentId: ownerAgentId }],
+  ];
+
+  it.each(commentGrantMutationDenialCases)("keeps generic issue mutations denied for a %s comment grant holder", async (_kind, agentRows, issueOverrides) => {
+    useProductionIssueAuthorization(agentRows);
+    mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId, ...issueOverrides }));
+
+    const patchRes = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Not just a comment" });
+
+    expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(403);
+    expect(patchRes.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId, ...issueOverrides }));
+
+    const deleteRes = await request(await createApp(peerActor()))
+      .delete(`/api/issues/${issueId}`);
+
+    expect(deleteRes.status, JSON.stringify(deleteRes.body)).toBe(403);
+    expect(deleteRes.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+    expect(mockIssueService.remove).not.toHaveBeenCalled();
+  });
+
+  it.each(commentGrantMutationDenialCases)(
+    "lets an exact blocked-to-todo delegate recovery patch proceed for a %s comment grant holder",
+    async (_kind, agentRows, issueOverrides) => {
+      useProductionIssueAuthorization(agentRows);
+      const stored = makeIssue({
+        status: "blocked",
+        assigneeAgentId: ownerAgentId,
+        ...issueOverrides,
+      });
+      mockIssueService.getById.mockResolvedValue(stored);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...stored,
+        ...patch,
+      }));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", blockedByIssueIds: [] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+      expect(mockIssueService.update).toHaveBeenCalled();
+      const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
+      expect(patch).toMatchObject({
+        status: "todo",
+        expectedCurrentStatus: "blocked",
+        expectedCurrentAssigneeAgentId: ownerAgentId,
+      });
+      expect(patch.blockedByIssueIds).toEqual([]);
+    },
+  );
+
+  it.each([
+    { status: "done", blockedByIssueIds: [] },
+    { status: "cancelled", blockedByIssueIds: [] },
+    { status: "todo", blockedByIssueIds: ["99999999-9999-4999-8999-999999999999"] },
+    { status: "todo", blockedByIssueIds: [], description: "Too broad" },
+  ])("keeps non-exact delegate recovery patches denied: %o", async (body) => {
+    useProductionIssueAuthorization([
+      makeAgent(peerAgentId),
+      makeAgent(ownerAgentId, { reportsTo: peerAgentId }),
+    ]);
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId, createdByAgentId: ownerAgentId }),
+    );
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send(body);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("surfaces 409 when the issue stops being blocked before the delegate recovery write lands", async () => {
+    useProductionIssueAuthorization([
+      makeAgent(peerAgentId),
+      makeAgent(ownerAgentId, { reportsTo: peerAgentId }),
+    ]);
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({
+        status: "blocked",
+        assigneeAgentId: ownerAgentId,
+        createdByAgentId: ownerAgentId,
+      }),
+    );
+    const { conflict } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+    mockIssueService.update.mockRejectedValue(
+      conflict("Issue status changed before the update could be applied", {
+        issueId,
+        expectedStatus: "blocked",
+        currentStatus: "in_progress",
+      }),
+    );
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo", blockedByIssueIds: [] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toContain("status changed");
+  });
+
+  it("does not pin expectedCurrentStatus on an ordinary assignee patch", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: true,
+      action: input.action,
+      reason: "allow_self",
+      explanation: "Assignee.",
+    }));
+    const stored = makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId });
+    mockIssueService.getById.mockResolvedValue(stored);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...stored,
+      ...patch,
+    }));
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo", blockedByIssueIds: [] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
+    expect(patch.expectedCurrentStatus).toBeUndefined();
+    expect(patch.expectedCurrentAssigneeAgentId).toBeUndefined();
   });
 
   it.each([

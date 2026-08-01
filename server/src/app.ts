@@ -86,11 +86,13 @@ import { buildHostServices, flushPluginLogBuffer } from "./services/plugin-host-
 import { createPluginEventBus } from "./services/plugin-event-bus.js";
 import { setPluginEventBus, setPluginEventOutboxDb } from "./services/activity-log.js";
 import { startPluginEventOutbox } from "./services/plugin-event-outbox.js";
+import { startGitHubCommitStatusDeliveryOutbox } from "./services/github-status-delivery-outbox.js";
 import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
+import type { AuthCapabilities } from "./auth/capabilities.js";
 import { createCachedViteHtmlRenderer } from "./vite-html-renderer.js";
 import { registerBodyParsers } from "./http/body-parsers.js";
 import { apiCompression } from "./middleware/api-compression.js";
@@ -276,6 +278,7 @@ export async function createApp(
     allowedHostnames: string[];
     bindHost: string;
     authReady: boolean;
+    authCapabilities?: AuthCapabilities;
     companyDeletionEnabled: boolean;
     authPublicBaseUrl?: string | null;
     instanceId?: string;
@@ -449,6 +452,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
       deploymentMode: opts.deploymentMode,
       deploymentExposure: opts.deploymentExposure,
       authReady: opts.authReady,
+      authCapabilities: opts.authCapabilities,
       companyDeletionEnabled: opts.companyDeletionEnabled,
       databaseBackupHealth: opts.databaseBackupHealth,
     }),
@@ -994,12 +998,14 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // in server/src/index.ts so plugin lifecycle only runs on the tier that
   // can host workers.
   let stopPluginEventOutbox: (() => void) | null = null;
+  let stopGitHubStatusDeliveryOutbox: (() => void) | null = null;
   if (appConfig.paperclipNodeRole === "api") {
     logger.info(
       { role: appConfig.paperclipNodeRole },
       "skipping plugin loadAll on startup (API tier — workers tier owns plugin lifecycle)",
     );
   } else {
+    stopGitHubStatusDeliveryOutbox = startGitHubCommitStatusDeliveryOutbox(db);
     void ensureBundledKubernetesPlugin()
       .then(() => retireLegacyCcrotatePlugin())
       .then(() => retireIncompatiblePluginUpdater())
@@ -1025,6 +1031,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     if (appServicesShutdown) return;
     appServicesShutdown = true;
     stopPluginEventOutbox?.();
+    stopGitHubStatusDeliveryOutbox?.();
     disableFeedbackExportFlushes();
     devWatcher?.close();
     viteHtmlRenderer?.dispose();

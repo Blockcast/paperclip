@@ -34,8 +34,10 @@ jobs:
     runs-on: arc-dind
     timeout-minutes: 90
     concurrency:
-      group: docker-${{ github.ref }}
-      cancel-in-progress: true
+      # A master push may supersede another publish build, but it must never
+      # cancel a protected workflow_dispatch build before its deploy job runs.
+      group: docker-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && 'deploy' || 'publish' }}
+      cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
     outputs:
       target_sha: ${{ steps.target.outputs.full }}
       image_digest: ${{ steps.build.outputs.digest }}

@@ -1032,4 +1032,147 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(reservation.jobName).toBeNull();
     expect(reservation.jobUid).toBeNull();
   }, 120_000);
+
+  // BLO-18995: `drainRunningRunsForShutdown` marks in-flight runs `interrupted`
+  // on SIGTERM but never releases their runtime slot reservation. The row keeps
+  // `released_at IS NULL`, and the partial unique index
+  // `external_runtime_reservations_active_slot_idx (agent_id, slot_id) WHERE
+  // released_at IS NULL` then blocks that slot permanently — so every worker
+  // restart with a run in flight ratchets the agent's effective concurrency
+  // down by one, silently and cumulatively. Found in production with four
+  // agents each holding a dead slot for 1-5 days (Ally 4/5 slots, Release
+  // Engineer 1/2).
+  //
+  // The reconcile sweeper could not see these rows: its WHERE matched only
+  // `release_pending`, or `reserved`/`launching` with a NULL job name. A
+  // shutdown-interrupted reservation is `launched` WITH a job name.
+  async function seedLaunchedReservationForTerminalRun(input: {
+    runStatus: "interrupted" | "failed" | "cancelled";
+    slotId?: number;
+  }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const jobName = `agent-claude-shutdown-leak-${runId.slice(0, 8)}`;
+    const jobUid = `uid-${runId.slice(0, 8)}`;
+    const issuePrefix = `L${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "ShutdownSlotLeakCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "ShutdownSlotLeakAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 5, concurrencyEnabled: true } },
+      permissions: {},
+    });
+
+    const finishedAt = new Date(Date.now() - 60 * 60 * 1000);
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: input.runStatus,
+      startedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+      finishedAt,
+      error: "Interrupted by graceful server shutdown (SIGTERM); retry queued for restart recovery",
+      errorCode: "server_shutdown_interrupted",
+      contextSnapshot: {},
+      createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+      updatedAt: finishedAt,
+    });
+
+    // Exactly the shape SIGTERM leaves behind: launched, identified, unreleased.
+    await db.insert(externalRuntimeReservations).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      runId,
+      slotId: input.slotId ?? 1,
+      state: "launched",
+      expectedJobName: jobName,
+      jobName,
+      jobUid,
+      reservedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+      launchedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+      releasedAt: null,
+      // external_runtime_reservations_isolation_binding_check requires all three
+      // isolation columns to be set together, or all three NULL.
+      isolationMode: "run",
+      isolationKey: `run:${runId}`,
+      isolationBoundAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+    });
+
+    return { companyId, agentId, runId, jobName, jobUid };
+  }
+
+  it("releases a launched reservation left behind by a shutdown-interrupted run once its Job is gone (BLO-18995)", async () => {
+    const { runId, jobName, jobUid } = await seedLaunchedReservationForTerminalRun({
+      runStatus: "interrupted",
+    });
+
+    // The Job is genuinely gone (the k8s NotFound path returns phase "missing").
+    mockReadAgentJobRunStatusByName.mockImplementation(async (name: string) => ({
+      phase: "missing" as const,
+      reason: "NotFound",
+      message: `Kubernetes Job ${name} was not found`,
+      name,
+    }));
+
+    await heartbeat.reapOrphanedRuns();
+
+    const reservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, runId))
+      .then((rows) => rows[0]);
+
+    // REGRESSION GUARD: the slot must be reclaimed, not held forever.
+    expect(reservation.releasedAt).not.toBeNull();
+    expect(reservation.state).toBe("released");
+    expect(reservation.releaseReason).toBe("job_terminal_or_missing");
+    expect(mockReadAgentJobRunStatusByName).toHaveBeenCalledWith(jobName);
+    expect(jobUid).toBeTruthy();
+  }, 120_000);
+
+  it("keeps the slot reserved while a shutdown-interrupted run's Job is still active (BLO-18995)", async () => {
+    // The other half of the fix: widening the sweeper's WHERE must not release
+    // a slot whose Job outlived the worker, or the agent would over-allocate
+    // and two Jobs could share one slot. Selection is not release — the
+    // per-row Job-phase check still has to gate it.
+    const { runId } = await seedLaunchedReservationForTerminalRun({
+      runStatus: "interrupted",
+      slotId: 2,
+    });
+
+    mockReadAgentJobRunStatusByName.mockImplementation(async (name: string) => ({
+      phase: "active" as const,
+      reason: null,
+      message: null,
+      name,
+    }));
+
+    await heartbeat.reapOrphanedRuns();
+
+    const reservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, runId))
+      .then((rows) => rows[0]);
+
+    expect(reservation.releasedAt).toBeNull();
+    expect(reservation.state).toBe("launched");
+  }, 120_000);
 });

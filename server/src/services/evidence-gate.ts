@@ -251,6 +251,43 @@ const DONE_WHEN_HEADING_SOURCE =
 const LINE_BREAK_RE = /\r?\n|\r/;
 
 /**
+ * A candidate fence line: at most three leading spaces (four or more is an
+ * indented code block, not a fence), the run of fence characters, then the
+ * remainder of the line. Group 1 is the run, group 2 the remainder.
+ */
+const FENCE_LINE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+
+/**
+ * True when a candidate line opens a fence.
+ *
+ * The remainder is the info string. CommonMark forbids a backtick inside a
+ * backtick fence's info string, which is what keeps an inline code span such
+ * as ```` ```code``` is inline ```` from being read as an opener.
+ */
+function isOpeningFence(match: RegExpExecArray): boolean {
+  return !(match[1][0] === "`" && match[2].includes("`"));
+}
+
+/**
+ * True when a candidate line closes the currently-open fence.
+ *
+ * A closer must use the same fence character, be at least as long as the
+ * opener, and carry NOTHING but trailing whitespace. Accepting a closer with
+ * trailing text (the pre-BLO-19047 behaviour, which reused the opener pattern
+ * for both roles) ended the block early, so the rest of a pasted template —
+ * headings and placeholder bullets included — leaked out of the fence and fed
+ * the criteria count.
+ */
+function isClosingFence(match: RegExpExecArray | null, fence: string): boolean {
+  if (!match) return false;
+  return (
+    match[1][0] === fence[0] &&
+    match[1].length >= fence.length &&
+    match[2].trim() === ""
+  );
+}
+
+/**
  * Blank out fenced-code-block CONTENT, preserving line structure.
  *
  * Without this, a heading inside a pasted template or example fence counts as
@@ -258,22 +295,22 @@ const LINE_BREAK_RE = /\r?\n|\r/;
  * issue-creation policy ships a fenced `## Acceptance criteria` template, so a
  * description that quotes the template would have its criteria count taken from
  * the template's placeholder bullets. (BLO-19047)
+ *
+ * An unterminated fence runs to the end of the document, per CommonMark.
  */
 function stripFencedCodeBlocks(markdown: string): string {
   let fence: string | null = null;
   return markdown
     .split(LINE_BREAK_RE)
     .map((line) => {
-      const opener = /^\s*(`{3,}|~{3,})/.exec(line);
+      const match = FENCE_LINE_RE.exec(line);
       if (fence !== null) {
-        // A closing fence must use the same char and be at least as long.
-        if (opener && opener[1][0] === fence[0] && opener[1].length >= fence.length) {
-          fence = null;
-        }
+        if (isClosingFence(match, fence)) fence = null;
+        // Blank the closer too: it is part of the block, not content.
         return "";
       }
-      if (opener) {
-        fence = opener[1];
+      if (match && isOpeningFence(match)) {
+        fence = match[1];
         return "";
       }
       return line;
@@ -281,50 +318,103 @@ function stripFencedCodeBlocks(markdown: string): string {
     .join("\n");
 }
 
+/** A recognized criteria section and the span it occupies in the scrubbed text. */
+type CriteriaSection = { start: number; end: number; body: string };
+
 /**
- * Bodies of every recognized criteria section, outermost-first.
+ * Every recognized criteria section, in document order.
  *
  * A section runs to the next heading of the SAME depth or shallower, so
  * `### Functional` sub-groups under `## Acceptance criteria` stay inside the
  * section instead of truncating it.
  */
-function doneWhenSectionBodies(description: string): string[] {
+function doneWhenSections(description: string): CriteriaSection[] {
   const scrubbed = stripFencedCodeBlocks(description);
   const headingRe = new RegExp(DONE_WHEN_HEADING_SOURCE, "gim");
-  const bodies: string[] = [];
+  const sections: CriteriaSection[] = [];
   let match: RegExpExecArray | null;
   while ((match = headingRe.exec(scrubbed)) !== null) {
     const depth = match[1].length;
     const rest = scrubbed.slice(match.index);
     const headingLineEnd = rest.search(LINE_BREAK_RE);
     // A heading on the final line with nothing after it has an empty body.
-    const body = headingLineEnd === -1 ? "" : rest.slice(headingLineEnd + 1);
-    const nextSiblingHeading = body.search(new RegExp(`^#{1,${depth}}[ \\t]`, "m"));
-    bodies.push(nextSiblingHeading === -1 ? body : body.slice(0, nextSiblingHeading));
+    const bodyStart =
+      headingLineEnd === -1 ? scrubbed.length : match.index + headingLineEnd + 1;
+    const nextSiblingHeading = scrubbed
+      .slice(bodyStart)
+      .search(new RegExp(`^#{1,${depth}}[ \\t]`, "m"));
+    const bodyEnd =
+      nextSiblingHeading === -1 ? scrubbed.length : bodyStart + nextSiblingHeading;
+    sections.push({ start: match.index, end: bodyEnd, body: scrubbed.slice(bodyStart, bodyEnd) });
     // Zero-length matches are impossible here (the pattern requires a `#`), but
     // guard anyway so a future edit cannot spin this loop forever.
     if (headingRe.lastIndex <= match.index) headingRe.lastIndex = match.index + 1;
   }
-  return bodies;
+  return sections;
+}
+
+/**
+ * Recognized sections that are not nested inside another recognized section.
+ *
+ * A deeper synonym heading under a shallower one (`### Success criteria` inside
+ * `## Acceptance criteria`) describes the SAME criteria the outer section
+ * already contains, so counting both would double it.
+ */
+function outermostDoneWhenSections(description: string): CriteriaSection[] {
+  const sections = doneWhenSections(description);
+  return sections.filter(
+    (section, index) =>
+      !sections.some(
+        (other, otherIndex) =>
+          otherIndex !== index && other.start < section.start && section.end <= other.end,
+      ),
+  );
 }
 
 /** True when the description carries a criteria heading the gate recognizes. */
 export function hasDoneWhenHeading(description: string): boolean {
-  return doneWhenSectionBodies(description).length > 0;
+  return doneWhenSections(description).length > 0;
+}
+
+function doneWhenBulletKeys(body: string): string[] {
+  return Array.from(
+    body.matchAll(/^[-*]\s+(.*)$/gm),
+    (match, index) => {
+      const normalized = (match[1] ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+      return normalized ? `text:${normalized}` : `empty:${index}`;
+    },
+  );
 }
 
 export function countDoneWhenBullets(description: string): number {
-  // First section that actually carries bullets wins. Taking the FIRST heading
-  // unconditionally (a plain `search()`) broke descriptions where an
-  // `## Acceptance criteria` section only points at the real list — it counted
-  // zero and made the shape unsatisfiable, and on an issue that previously had
-  // bullets it also tripped `doneWhenBulletsRemoved`, reporting a policy-aligned
-  // description edit as deliberate gate-dodging. (BLO-19047)
-  for (const body of doneWhenSectionBodies(description)) {
-    const bullets = body.match(/^[-*]\s+/gm);
-    if (bullets && bullets.length > 0) return bullets.length;
+  // SUM every top-level recognized section rather than taking the first one
+  // that has bullets. Taking the first non-empty section under-counted a
+  // description carrying more than one real criteria list, and the count was
+  // not monotonic: prepending `## Acceptance criteria\n- placeholder` to an
+  // existing multi-item `## Done when` dropped the required evidence-row count
+  // to one without tripping the `doneWhenBulletsRemoved` tamper signal, so the
+  // checklist passed while most criteria stayed unverified. Summing cannot
+  // decrease when another non-empty synonym section is added. (BLO-19047)
+  //
+  // A section with no bullets contributes 0, which is what keeps a pointer
+  // section ("## Acceptance criteria / See the Done when list below.") from
+  // shadowing the real list — the original reason for the first-non-empty rule.
+  //
+  // Sibling synonym sections can repeat the same checklist under another name
+  // (`## Acceptance criteria` followed by `## Success criteria`). Count each
+  // normalized bullet text once so the synonym does not inflate the required
+  // evidence-row count, while still counting genuinely distinct criteria across
+  // multiple sections.
+  let total = 0;
+  const seen = new Set<string>();
+  for (const { body } of outermostDoneWhenSections(description)) {
+    for (const key of doneWhenBulletKeys(body)) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+      total += 1;
+    }
   }
-  return 0;
+  return total;
 }
 
 function detectTestOutput(text: string): boolean {

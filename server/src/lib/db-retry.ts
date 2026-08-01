@@ -54,6 +54,178 @@ export function isTransientDbError(error: unknown): boolean {
   return false;
 }
 
+/**
+ * Compact, diagnosable description of a failed database write (BLO-19085).
+ *
+ * Drizzle throws with `message` = `Failed query: <sql>\nparams: <every bind
+ * param inlined>`, and the real PostgreSQL error — SQLSTATE, detail,
+ * constraint — hangs off `.cause`. Callers that persisted `err.message`
+ * therefore stored the *least* useful half of the error and inlined the
+ * agent's entire stdout stream while doing it: two `heartbeat_runs.error`
+ * values of 605,891 and 338,507 characters on 2026-07-30, neither naming the
+ * SQLSTATE that caused them.
+ *
+ * This keeps the SQLSTATE and the statement shape, and drops the params.
+ */
+
+/** Max characters of SQL text kept when describing a failed query. */
+const DB_ERROR_SQL_EXCERPT_CHARS = 240;
+/** Max characters kept from individual PostgreSQL error fields. */
+const DB_ERROR_FIELD_CHARS = 160;
+/** Max characters kept from a non-drizzle error message. */
+const DB_ERROR_MESSAGE_CHARS = 400;
+/** Hard cap for the persisted database-error description. */
+const DB_ERROR_DESCRIPTION_CHARS = 900;
+
+const POSTGRES_SQLSTATE_CLASSES = new Set([
+  "00",
+  "01",
+  "02",
+  "03",
+  "08",
+  "09",
+  "0A",
+  "0B",
+  "0F",
+  "0L",
+  "0P",
+  "0Z",
+  "20",
+  "21",
+  "22",
+  "23",
+  "24",
+  "25",
+  "26",
+  "27",
+  "28",
+  "2B",
+  "2D",
+  "2F",
+  "34",
+  "38",
+  "39",
+  "3B",
+  "3D",
+  "3F",
+  "40",
+  "42",
+  "44",
+  "53",
+  "54",
+  "55",
+  "57",
+  "58",
+  "72",
+  "F0",
+  "HV",
+  "P0",
+  "XX",
+]);
+
+interface PgErrorFields {
+  code: string;
+  detail?: string;
+  constraint?: string;
+  table?: string;
+  column?: string;
+  message?: string;
+}
+
+function readString(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  if (typeof value !== "string") return undefined;
+  const normalized = compactErrorText(value, DB_ERROR_FIELD_CHARS);
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function compactErrorText(value: string, maxChars: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length > maxChars ? `${normalized.slice(0, maxChars)}…` : normalized;
+}
+
+function isPostgresSqlState(code: string): boolean {
+  const normalized = code.toUpperCase();
+  return /^[0-9A-Z]{5}$/.test(normalized) && POSTGRES_SQLSTATE_CLASSES.has(normalized.slice(0, 2));
+}
+
+/**
+ * Walk the `.cause` chain for the first object carrying a PostgreSQL SQLSTATE.
+ * Same traversal and depth bound as `isTransientDbError`.
+ */
+export function findPgError(error: unknown): PgErrorFields | null {
+  let current: unknown = error;
+  for (let depth = 0; depth < 6; depth += 1) {
+    if (!current || typeof current !== "object") return null;
+    const record = current as Record<string, unknown>;
+    const code = record.code;
+    // PostgreSQL SQLSTATEs are exactly five alphanumeric characters, but Node's
+    // own syscall codes also use this field (`EPIPE`, `EPERM`). Require a
+    // recognized PostgreSQL class prefix so adapter/process failures are not
+    // relabeled as database writes.
+    if (typeof code === "string" && isPostgresSqlState(code)) {
+      return {
+        code: code.toUpperCase(),
+        detail: readString(record, "detail"),
+        constraint: readString(record, "constraint"),
+        table: readString(record, "table"),
+        column: readString(record, "column"),
+        message: readString(record, "message"),
+      };
+    }
+    current = record.cause;
+  }
+  return null;
+}
+
+/**
+ * True when `error` looks like a database write failure worth routing through
+ * `describeDbError` — either it carries a PostgreSQL SQLSTATE, or it is a
+ * drizzle "Failed query" wrapper (which may hide its cause behind a driver that
+ * did not attach one).
+ */
+export function isDbError(error: unknown): boolean {
+  if (findPgError(error)) return true;
+  const message = error instanceof Error ? error.message : "";
+  return message.startsWith("Failed query:");
+}
+
+/**
+ * Render `error` as a single compact line safe to persist in an error column.
+ * Never throws, and never returns an empty string.
+ */
+export function describeDbError(error: unknown, context?: string): string {
+  const prefix = context ? `${context}: ` : "";
+  const raw = error instanceof Error ? error.message : String(error ?? "");
+  const pg = findPgError(error);
+
+  const parts: string[] = [];
+  if (pg) {
+    parts.push(`SQLSTATE ${pg.code}`);
+    if (pg.message) parts.push(pg.message);
+    if (pg.detail) parts.push(`detail: ${pg.detail}`);
+    if (pg.constraint) parts.push(`constraint: ${pg.constraint}`);
+    const relation = [pg.table, pg.column].filter(Boolean).join(".");
+    if (relation) parts.push(`relation: ${relation}`);
+  }
+
+  // Drizzle inlines every bind param after the SQL. Keep a short excerpt of the
+  // statement so the failing write is identifiable, and drop the params — that
+  // is the part that turns an error string into hundreds of kilobytes.
+  const failedQuery = /^Failed query:\s*([\s\S]*?)(?:\n\s*params:|$)/.exec(raw);
+  if (failedQuery) {
+    parts.push(`query: ${compactErrorText(failedQuery[1], DB_ERROR_SQL_EXCERPT_CHARS)}`);
+    parts.push("(bind params omitted)");
+  } else if (!pg && raw) {
+    parts.push(compactErrorText(raw, DB_ERROR_MESSAGE_CHARS));
+  }
+
+  return compactErrorText(
+    `${prefix}${parts.length ? parts.join(" | ") : "unknown database error"}`,
+    DB_ERROR_DESCRIPTION_CHARS,
+  );
+}
+
 export interface TransientDbRetryOptions {
   /** Total attempts including the first. Defaults to 4. */
   maxAttempts?: number;

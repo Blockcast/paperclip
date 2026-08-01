@@ -178,6 +178,9 @@ import {
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
+import type { IssueMonitorConvergence } from "../services/issue-execution-policy.js";
+import { monitorConvergenceComment } from "../services/issue-monitor-convergence-message.js";
+import type { IssueUnblockOwner } from "../services/issue-monitor-convergence-message.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import {
@@ -2785,6 +2788,61 @@ export function issueRoutes(
       });
   }
 
+  /**
+   * BLO-18294: the unresolved blocker edges that feed the monitor convergence
+   * fingerprint. A readiness-query hiccup must not 500 an otherwise valid
+   * re-arm, but it also must not rewrite the convergence signature as "no
+   * declared blockers"; return null so this PATCH skips scoring entirely.
+   */
+  async function loadUnresolvedBlockerIssueIds(companyId: string, issueId: string): Promise<string[] | null> {
+    try {
+      const readiness = await svc.listDependencyReadiness(companyId, [issueId]);
+      return readiness.get(issueId)?.unresolvedBlockerIssueIds ?? [];
+    } catch (err) {
+      logger.warn({ err, companyId, issueId }, "failed to load blocker edges for monitor convergence guard");
+      return null;
+    }
+  }
+
+  /**
+   * BLO-18294: resolve the blocker issue ids the convergence guard recorded into
+   * named owners for the escalation comment. Best-effort: a rendering failure
+   * must not fail the PATCH that already committed.
+   */
+  async function loadIssueUnblockOwners(
+    companyId: string,
+    blockerIssueIds: readonly string[],
+  ): Promise<IssueUnblockOwner[]> {
+    if (blockerIssueIds.length === 0) return [];
+    try {
+      const rows = await db
+        .select({
+          issueId: issueRows.id,
+          identifier: issueRows.identifier,
+          title: issueRows.title,
+          status: issueRows.status,
+          assigneeAgentId: issueRows.assigneeAgentId,
+          assigneeUserId: issueRows.assigneeUserId,
+          assigneeAgentName: agents.name,
+        })
+        .from(issueRows)
+        .leftJoin(agents, eq(agents.id, issueRows.assigneeAgentId))
+        .where(and(eq(issueRows.companyId, companyId), inArray(issueRows.id, [...blockerIssueIds])));
+      return rows.map((row) => ({
+        issueId: row.issueId,
+        identifier: row.identifier ?? null,
+        title: row.title ?? null,
+        status: row.status,
+        assigneeAgentId: row.assigneeAgentId ?? null,
+        assigneeAgentName: row.assigneeAgentName ?? null,
+        assigneeUserId: row.assigneeUserId ?? null,
+      }));
+    } catch (err) {
+      logger.warn({ err, companyId, blockerIssueIds }, "failed to resolve monitor convergence unblock owners");
+      return [];
+    }
+  }
+
   async function hasIssueCommentAddedActivity(input: { issueId: string; commentId: string }) {
     if (typeof (db as { select?: unknown }).select !== "function") return false;
     try {
@@ -3476,6 +3534,20 @@ export function issueRoutes(
     parentIssueId?: string | null;
     assigneeAgentId?: string | null;
     assigneeUserId?: string | null;
+    /**
+     * BLO-19094: the row's own origin kind, so the `tasks:assign` self-claim
+     * guard can refuse self-appointment onto a shell whose ownership confers a
+     * grant elsewhere. Pass it wherever the caller has already loaded the
+     * issue; omitting it is safe but makes the guard reload the row.
+     */
+    originKind?: string | null;
+    /**
+     * BLO-19094: the assignee the row currently carries, as distinct from
+     * `assigneeAgentId`, which is the assignment *target*. The self-claim
+     * guard needs both to tell "claiming an unowned shell" from "an agent
+     * being handed work by someone else".
+     */
+    currentAssigneeAgentId?: string | null;
   };
 
   async function resolveAssignmentProjectId(input: {
@@ -3507,6 +3579,12 @@ export function issueRoutes(
         parentIssueId: assignmentScope?.parentIssueId ?? null,
         assigneeAgentId: assignmentScope?.assigneeAgentId ?? null,
         assigneeUserId: assignmentScope?.assigneeUserId ?? null,
+        currentAssigneeAgentId: assignmentScope?.currentAssigneeAgentId ?? null,
+        // BLO-19094: `originKind` is left `undefined` (not `??`-collapsed to
+        // null) when the caller did not supply it, so the self-claim guard can
+        // tell "no origin kind" from "not looked up" and reload only in the
+        // latter case. See recoveryOrReviewIssueBlocksUnassignedAgentClaim.
+        originKind: assignmentScope?.originKind,
       },
       scope: assignmentScope ?? null,
     });
@@ -3546,6 +3624,7 @@ export function issueRoutes(
       parentId: string | null;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      createdByAgentId?: string | null;
       status: string;
       originKind?: string | null;
       originId?: string | null;
@@ -3563,6 +3642,7 @@ export function issueRoutes(
         parentIssueId: issue.parentId,
         assigneeAgentId: issue.assigneeAgentId,
         assigneeUserId: issue.assigneeUserId,
+        createdByAgentId: issue.createdByAgentId ?? null,
         status: issue.status,
         // Deliberately NOT `?? null`: authorization distinguishes "caller did
         // not look it up" (undefined -> reload the row) from "row has no
@@ -3583,15 +3663,249 @@ export function issueRoutes(
     });
   }
 
+  // BLO-19087: an @-mention wakes the mentioned agent (`issue_comment_mentioned`,
+  // fired below) but does not by itself authorize it to reply. The wake path
+  // applies no gate on who wrote the mention; the grant path
+  // (`agentHasMentionGrantOnIssue`) only grants `issue:comment` when the
+  // mentioning comment's author is that issue's own assignee, or a board user.
+  // A mention written by anyone else therefore wakes an agent onto a thread it
+  // provably cannot post to. That author gate is deliberate — it stops mention
+  // grants chaining agent-to-agent — so the fix is not to widen it but to stop
+  // the invitation being silent about its own terms.
+  //
+  // This names the one action that actually clears the denial. BLO-18152 got as
+  // far as labelling the boundary "grant" and its own note suggests "retry with
+  // a mention", which is a trap: the mention has to come from a *specific*
+  // author, and a mention from anyone else leaves the agent looping.
+  function issueCommentGrantRemediation(input: {
+    actorAgentId: string;
+    assigneeAgentId: string | null;
+    reason: Awaited<ReturnType<typeof decideIssueAccess>>["reason"];
+  }): string | null {
+    if (input.reason !== "deny_missing_grant") return null;
+    if (!input.assigneeAgentId) return null;
+    if (input.assigneeAgentId === input.actorAgentId) return null;
+    return (
+      `Being @-mentioned here does not grant you comment access. Only this issue's assignee ` +
+      `(agent://${input.assigneeAgentId}) or a board user can grant it, by posting a comment on ` +
+      `this issue containing agent://${input.actorAgentId}. A mention written by any other agent ` +
+      `wakes you but does not authorize you. Until then, respond on an issue you are assigned to ` +
+      `and reference this one, or ask the assignee to mention you here.`
+    );
+  }
+
+  function readAgentRunId(req: Request) {
+    return req.actor.type === "agent" ? req.actor.runId?.trim() || null : null;
+  }
+
+  type IssueCommentAuthorizationIssue = {
+    id: string;
+    companyId: string;
+    projectId: string | null;
+    parentId: string | null;
+    status: string;
+    assigneeAgentId: string | null;
+    assigneeUserId: string | null;
+    createdByAgentId?: string | null;
+    checkoutRunId?: string | null;
+    executionRunId?: string | null;
+  };
+
+  type IssueCommentAuthorizationResult =
+    | { allowed: true; decision: true | Awaited<ReturnType<typeof decideIssueAccess>>; reason: string }
+    | { allowed: false; kind: "agent_auth_required"; status: 403; error: string; reason: "deny_agent_auth_required" }
+    | {
+        allowed: false;
+        kind: "watchdog_denied";
+        status: 403 | 409;
+        error: string;
+        reason: "deny_task_watchdog_scope";
+        boundary: "watchdog";
+        details: Record<string, unknown>;
+      }
+    | {
+        allowed: false;
+        kind: "boundary_denied";
+        status: 403;
+        decision: Awaited<ReturnType<typeof decideIssueAccess>>;
+        reason: Awaited<ReturnType<typeof decideIssueAccess>>["reason"];
+        boundary: string;
+        remediation: string | null;
+      }
+    | {
+        allowed: false;
+        kind: "missing_run_id";
+        status: 401;
+        error: "Agent run id required";
+        reason: "deny_missing_run_id";
+        boundary: "run";
+        remediation: string;
+      };
+
+  async function evaluateFreshTaskWatchdogSourceMutation(
+    scope: Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
+    issue: { id: string },
+  ) {
+    if (scope.kind !== "watchdog") return { allowed: true as const };
+    if (scope.watchdogIssueId && issue.id === scope.watchdogIssueId) return { allowed: true as const };
+
+    const revalidated = await taskWatchdogsSvc.revalidateMutationScope(scope);
+    if (revalidated.allowed) return { allowed: true as const };
+    return {
+      allowed: false as const,
+      status: 409 as const,
+      error: revalidated.reason,
+      details: {
+        watchedIssueId: scope.watchedIssueId,
+        watchdogId: scope.watchdogId,
+        runStopFingerprint: scope.stopFingerprint,
+        currentState: revalidated.classification?.state ?? null,
+        currentStopFingerprint:
+          revalidated.classification && "stopFingerprint" in revalidated.classification
+            ? revalidated.classification.stopFingerprint
+            : null,
+      },
+    };
+  }
+
+  async function evaluateTaskWatchdogScopedIssueCommentAuthorization(
+    req: Request,
+    issue: IssueCommentAuthorizationIssue,
+  ): Promise<IssueCommentAuthorizationResult | null> {
+    if (req.actor.type !== "agent") return null;
+    const scope = await resolveTaskWatchdogMutationScope(db, req.actor);
+    if (scope.kind === "none") return null;
+    const result = await taskWatchdogScopeAllowsIssueMutation(db, scope, issue);
+    if (result.kind === "invalid") {
+      return {
+        allowed: false,
+        kind: "watchdog_denied",
+        status: 403,
+        error: result.detail,
+        reason: "deny_task_watchdog_scope",
+        boundary: "watchdog",
+        details: {
+          issueId: issue.id,
+          securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+        },
+      };
+    }
+    const fresh = await evaluateFreshTaskWatchdogSourceMutation(scope, issue);
+    if (!fresh.allowed) {
+      return {
+        allowed: false,
+        kind: "watchdog_denied",
+        status: fresh.status,
+        error: fresh.error,
+        reason: "deny_task_watchdog_scope",
+        boundary: "watchdog",
+        details: fresh.details,
+      };
+    }
+    return { allowed: true, decision: true, reason: "allow_task_watchdog_scope" };
+  }
+
+  async function evaluateAgentIssueCommentAuthorization(
+    req: Request,
+    issue: IssueCommentAuthorizationIssue,
+  ): Promise<IssueCommentAuthorizationResult> {
+    if (req.actor.type !== "agent") return { allowed: true, decision: true, reason: "allow_non_agent" };
+    const actorAgentId = req.actor.agentId;
+    if (!actorAgentId) {
+      return {
+        allowed: false,
+        kind: "agent_auth_required",
+        status: 403,
+        error: "Agent authentication required",
+        reason: "deny_agent_auth_required",
+      };
+    }
+
+    const watchdogDecision = await evaluateTaskWatchdogScopedIssueCommentAuthorization(req, issue);
+    if (watchdogDecision) return watchdogDecision;
+
+    if (isCurrentIssueExecutionRun(req, issue)) {
+      if (issue.status === "in_progress" && issue.assigneeAgentId === actorAgentId && !readAgentRunId(req)) {
+        return missingAgentRunIdCommentAuthorization();
+      }
+      return { allowed: true, decision: true, reason: "allow_current_issue_execution_run" };
+    }
+
+    const boundaryDecision = await decideIssueAccess(req, issue, "issue:comment");
+    if (!boundaryDecision.allowed) {
+      const remediation = issueCommentGrantRemediation({
+        actorAgentId,
+        assigneeAgentId: issue.assigneeAgentId,
+        reason: boundaryDecision.reason,
+      });
+      return {
+        allowed: false,
+        kind: "boundary_denied",
+        status: 403,
+        decision: boundaryDecision,
+        reason: boundaryDecision.reason,
+        boundary: authorizationBoundaryLabel(boundaryDecision.reason),
+        remediation,
+      };
+    }
+
+    if (issue.status === "in_progress" && issue.assigneeAgentId === actorAgentId && !readAgentRunId(req)) {
+      return missingAgentRunIdCommentAuthorization();
+    }
+    return { allowed: true, decision: boundaryDecision, reason: boundaryDecision.reason };
+  }
+
+  function missingAgentRunIdCommentAuthorization(): IssueCommentAuthorizationResult {
+    return {
+      allowed: false,
+      kind: "missing_run_id",
+      status: 401,
+      error: "Agent run id required",
+      reason: "deny_missing_run_id",
+      boundary: "run",
+      remediation:
+        "This in-progress issue is assigned to you, so comment writes require the active agent run id. Retry with the run id attached to this heartbeat.",
+    };
+  }
+
+  // BLO-19087: the read-side counterpart of the denial above. Reports whether
+  // this actor could actually post to the thread it was just woken onto, using
+  // the same side-effect-free evaluator the comment route enforces with, so the
+  // advertised verdict cannot drift from the enforced one.
+  async function resolveHeartbeatReplyAuthorization(
+    req: Request,
+    issue: IssueCommentAuthorizationIssue,
+  ) {
+    if (req.actor.type !== "agent") return null;
+    const authorization = await evaluateAgentIssueCommentAuthorization(req, issue);
+    if (authorization.allowed) {
+      return { canComment: true as const, reason: authorization.reason, remediation: null };
+    }
+    if (authorization.kind === "agent_auth_required") return null;
+    return {
+      canComment: false as const,
+      reason: authorization.reason,
+      boundary: authorization.boundary,
+      remediation: "remediation" in authorization ? authorization.remediation : null,
+    };
+  }
+
   // BLO-18152: every "Issue is outside this actor's authorization boundary"
   // response (issue:read, issue:comment, issue:mutate) renders through this
   // one function so the message always names which boundary fired instead of
   // leaving the caller to guess whether it was a scope, trust-boundary,
   // membership, or company-mismatch rejection.
-  function respondIssueBoundaryDenied(res: Response, decision: Awaited<ReturnType<typeof decideIssueAccess>>) {
+  function respondIssueBoundaryDenied(
+    res: Response,
+    decision: Awaited<ReturnType<typeof decideIssueAccess>>,
+    remediation?: string | null,
+  ) {
     res.status(403).json({
       error: `Issue is outside this actor's authorization boundary (${authorizationBoundaryLabel(decision.reason)})`,
-      details: authorizationDeniedDetails(decision),
+      details: {
+        ...authorizationDeniedDetails(decision),
+        ...(remediation ? { remediation } : {}),
+      },
     });
   }
 
@@ -3605,53 +3919,44 @@ export function issueRoutes(
   async function assertAgentIssueCommentAllowed(
     req: Request,
     res: Response,
-    issue: {
-      id: string;
-      companyId: string;
-      projectId: string | null;
-      parentId: string | null;
-      status: string;
-      assigneeAgentId: string | null;
-      assigneeUserId: string | null;
-      checkoutRunId?: string | null;
-      executionRunId?: string | null;
-    },
+    issue: IssueCommentAuthorizationIssue,
   ) {
-    if (req.actor.type !== "agent") return true;
-    const actorAgentId = req.actor.agentId;
-    if (!actorAgentId) {
-      res.status(403).json({ error: "Agent authentication required" });
+    const authorization = await evaluateAgentIssueCommentAuthorization(req, issue);
+    if (authorization.allowed) return authorization.decision;
+    if (authorization.kind === "agent_auth_required" || authorization.kind === "missing_run_id") {
+      res.status(authorization.status).json({ error: authorization.error });
       return false;
     }
-    const watchdogDecision = await assertTaskWatchdogScopedIssueMutationAllowed(req, res, issue);
-    if (watchdogDecision !== null) return watchdogDecision;
-    // BLO-18152: parity with assertAgentIssueMutationAllowed below — an agent
-    // whose run currently holds this issue's checkout/execution lock may
-    // always write to it, regardless of a narrower per-request trust
-    // boundary (e.g. a source_scoped_recovery_action wake) that
-    // decideIssueAccess would otherwise apply. Before this fix, only the
-    // PATCH mutate path granted this bypass, so the same actor+issue+run
-    // could get a 200 from PATCH {comment} and a 403 from this endpoint
-    // seconds apart.
-    if (isCurrentIssueExecutionRun(req, issue)) {
-      if (issue.status === "in_progress" && issue.assigneeAgentId === actorAgentId) {
-        if (!requireAgentRunId(req, res)) return false;
-      }
-      return true;
-    }
-    const boundaryDecision = await decideIssueAccess(req, issue, "issue:comment");
-    if (!boundaryDecision.allowed) {
-      respondIssueBoundaryDenied(res, boundaryDecision);
+    if (authorization.kind === "watchdog_denied") {
+      res.status(authorization.status).json({ error: authorization.error, details: authorization.details });
       return false;
     }
-    if (issue.status === "in_progress" && issue.assigneeAgentId === actorAgentId) {
-      if (!requireAgentRunId(req, res)) return false;
-    }
-    return boundaryDecision;
+    respondIssueBoundaryDenied(res, authorization.decision, authorization.remediation);
+    return false;
   }
 
   function isIssueMentionGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
     return decision !== true && decision.reason === "allow_issue_mention_grant";
+  }
+
+  // BLO-18797: the creator / manager-chain allow-paths are a *comment* grant.
+  // They exist so a manager or the delegating creator can deliver a handoff
+  // onto a delegate's issue; the only status change they buy is the narrow
+  // blocked -> todo PATCH gated by isCreatorOrManagerChainRecoveryPatch.
+  // POST /issues/:id/comments also accepts `reopen` / `resume`, and the
+  // follow-up gate below it (assertExplicitResumeIntentAllowed) independently
+  // admits the same reporting chain via hasActiveCheckoutManagementOverride —
+  // a path that was unreachable while the comment boundary denied these actors
+  // outright. Left alone, admitting them here would hand a manager a reopen of
+  // any terminal issue through what this PR documents and tests as a
+  // comment-only grant. The comment route re-runs the mutation gate for these
+  // actors when a control field is present, so the request fails closed with an
+  // explicit 403 rather than silently dropping the caller's stated intent.
+  function isCreatorOrManagerChainDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    return (
+      decision !== true &&
+      (decision.reason === "allow_issue_creator" || decision.reason === "allow_manager_chain")
+    );
   }
 
   // A recovery-handoff grant (BLO-18906) is comment-only by construction: it
@@ -3662,6 +3967,10 @@ export function issueRoutes(
   // `blocked`, and on a blocked issue `reopen: true` would move it to `todo`.
   function isRecoveryHandoffGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
     return decision !== true && decision.reason === "allow_recovery_handoff_grant";
+  }
+
+  function isCreatorOrManagerCommentGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    return decision !== true && (decision.reason === "allow_issue_creator" || decision.reason === "allow_manager_chain");
   }
 
   // The decision reason alone is not a sufficient test for "this caller is a
@@ -3725,7 +4034,7 @@ export function issueRoutes(
 
   function requireAgentRunId(req: Request, res: Response) {
     if (req.actor.type !== "agent") return null;
-    const runId = req.actor.runId?.trim();
+    const runId = readAgentRunId(req);
     if (runId) return runId;
     res.status(401).json({ error: "Agent run id required" });
     return null;
@@ -3819,6 +4128,22 @@ export function issueRoutes(
     );
   }
 
+  function isCreatorOrManagerChainRecoveryPatch(
+    issue: { status: string },
+    body: Record<string, unknown>,
+  ) {
+    if (issue.status !== "blocked") return false;
+    const keys = Object.keys(body);
+    return (
+      keys.length === 2 &&
+      keys.includes("status") &&
+      keys.includes("blockedByIssueIds") &&
+      body.status === "todo" &&
+      Array.isArray(body.blockedByIssueIds) &&
+      body.blockedByIssueIds.length === 0
+    );
+  }
+
   async function assertAgentIssueMutationAllowed(
     req: Request,
     res: Response,
@@ -3830,6 +4155,7 @@ export function issueRoutes(
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      createdByAgentId?: string | null;
       checkoutRunId?: string | null;
       executionRunId?: string | null;
       executionState?: unknown;
@@ -3844,6 +4170,17 @@ export function issueRoutes(
         previousAssigneeAgentId: string | null;
         issueStatus: string;
       }) => void;
+      /**
+       * BLO-18797: opt in to the allow_issue_creator / allow_manager_chain
+       * ownership bypass below. Off by default and deliberately so — this
+       * helper backs ~25 routes, including DELETE /issues/:id, the document
+       * delete/lock paths, work-product mutation and approval unlinking.
+       * Honouring the bypass unconditionally would hand every one of those to
+       * any issue creator, which is a far wider grant than the
+       * delegate-recovery PATCH this was written for. Pass it only from a
+       * route whose blast radius you have actually checked.
+       */
+      allowCreatorOrManagerChainOwnership?: boolean;
     } = {},
   ) {
     if (req.actor.type !== "agent") return true;
@@ -3866,12 +4203,58 @@ export function issueRoutes(
       return activeRecoveryAction?.ownerAgentId === actorAgentId;
     };
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
+    let creatorOrManagerChainDecision =
+      boundaryDecision.allowed && isCreatorOrManagerChainDecision(boundaryDecision)
+        ? boundaryDecision
+        : null;
     if (!boundaryDecision.allowed) {
       if (await isActiveRecoveryActionOwner()) return true;
-      respondIssueBoundaryDenied(res, boundaryDecision);
-      return false;
+      if (
+        options.allowCreatorOrManagerChainOwnership &&
+        isCreatorOrManagerChainRecoveryPatch(issue, req.body as Record<string, unknown>)
+      ) {
+        const commentDecision = await decideIssueAccess(req, issue, "issue:comment");
+        if (isCreatorOrManagerChainDecision(commentDecision)) {
+          creatorOrManagerChainDecision = commentDecision;
+        } else {
+          respondIssueBoundaryDenied(res, boundaryDecision);
+          return false;
+        }
+      } else {
+        respondIssueBoundaryDenied(res, boundaryDecision);
+        return false;
+      }
     }
     if (await isActiveRecoveryActionOwner()) return true;
+    // BLO-18113 / BLO-18797: creator / manager-chain grants are comment-only
+    // in authorization.ts. The one mutation they may carry is a tightly-shaped
+    // blocked -> todo delegate recovery PATCH, derived from a matching
+    // issue:comment decision when the normal issue:mutate boundary denies.
+    //
+    // Opt-in per route and patch shape. This helper guards ~25 routes; only the
+    // blocked -> todo delegate-recovery PATCH passes the bypass. Every other
+    // caller — most pointedly DELETE /issues/:id — fails closed before the
+    // checkout-management override below can widen the boundary decision.
+    if (
+      options.allowCreatorOrManagerChainOwnership &&
+      creatorOrManagerChainDecision &&
+      isCreatorOrManagerChainRecoveryPatch(issue, req.body as Record<string, unknown>)
+    ) {
+      return true;
+    }
+    if (creatorOrManagerChainDecision && !options.allowCreatorOrManagerChainOwnership) {
+      res.status(403).json({
+        error: "Agent cannot mutate another agent's issue outside delegate recovery",
+        details: {
+          issueId: issue.id,
+          assigneeAgentId: issue.assigneeAgentId,
+          actorAgentId,
+          status: issue.status,
+          securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+        },
+      });
+      return false;
+    }
     if (issue.assigneeAgentId === null) {
       return true;
     }
@@ -3901,7 +4284,9 @@ export function issueRoutes(
       // predicate lives in exactly one place (authorization.ts). If some other
       // allow-path matched first the reason differs and the override does not
       // fire — fail-closed, and the actor was authorized by that other path
-      // anyway.
+      // anyway. This is checked before the creator/manager-chain deny below;
+      // the two are mutually exclusive by reason, so the order is for clarity
+      // rather than correctness.
       if (
         options.allowProductivityReviewOwner &&
         boundaryDecision.reason === "allow_productivity_review_grant"
@@ -3912,6 +4297,19 @@ export function issueRoutes(
           issueStatus: issue.status,
         });
         return true;
+      }
+      if (creatorOrManagerChainDecision) {
+        res.status(403).json({
+          error: "Agent cannot mutate another agent's issue outside delegate recovery",
+          details: {
+            issueId: issue.id,
+            assigneeAgentId: issue.assigneeAgentId,
+            actorAgentId,
+            status: issue.status,
+            securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+          },
+        });
+        return false;
       }
       if (issue.status === "in_progress") {
         res.status(409).json({
@@ -5570,7 +5968,16 @@ export function issueRoutes(
       includeForIssueComment: wakeCommentId !== null,
     });
 
+    // BLO-19087: a mention wake tells an agent to go read this thread, and the
+    // heartbeat procedure tells it to "respond in comments if useful" — but on
+    // an issue assigned to someone else that reply is usually a 403. Resolve
+    // the same decision the comment route enforces (never a re-derived copy of
+    // the rule, which is how the wake/grant split arose in the first place) so
+    // the agent knows before it writes, and knows where to go instead.
+    const replyAuthorization = await resolveHeartbeatReplyAuthorization(req, issue);
+
     res.json({
+      replyAuthorization,
       issue: {
         id: issue.id,
         identifier: issue.identifier,
@@ -5794,6 +6201,7 @@ export function issueRoutes(
       activeRecoveryAction,
       linkedCases,
       inboxArchiveFields,
+      activeRun,
     ] = await Promise.all([
       resolveIssueProjectAndGoal(issue),
       svc.getAncestors(issue.id),
@@ -5808,6 +6216,13 @@ export function issueRoutes(
       recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
       listIssueLinkedCases(db, issue.companyId, issue.id),
       inboxArchiveFieldsPromise,
+      // BLO-19001: agents compare their own $PAPERCLIP_RUN_ID against the run
+      // holding this issue before touching a shared worktree. `executionRunId`
+      // alone cannot answer that — it can point at a run that already finished
+      // — so ship the run's lifecycle status with it. Same shape `inbox-lite`
+      // returns, and null (no run, or the recorded run is terminal) means the
+      // issue is not held.
+      svc.getActiveRun(issue),
     ]);
     const recoveryActionsByRelationIssue = await relationRecoveryActionMap(
       recoveryActionsSvc,
@@ -5836,6 +6251,7 @@ export function issueRoutes(
       ...inboxArchiveFields,
       goalId: goal?.id ?? issue.goalId,
       ancestors,
+      activeRun,
       ...(blockerAttention ? { blockerAttention } : {}),
       productivityReview,
       successfulRunHandoff: successfulRunHandoffStates.get(issue.id) ?? null,
@@ -8146,8 +8562,27 @@ export function issueRoutes(
         onProductivityReviewOwnerMutationAllowed: (audit) => {
           productivityReviewSourceMutationAudit.current = audit;
         },
+        // BLO-18797: the delegate-recovery path. The helper additionally
+        // requires a blocked -> todo patch containing only status and
+        // blockedByIssueIds.
+        allowCreatorOrManagerChainOwnership: true,
       },
     ))) return;
+    // BLO-18797: the delegate-recovery bypass authorized this patch *because*
+    // the snapshot said `blocked` — an issue nobody is actively running. That
+    // read happened before any of the work below, so a concurrent assignee
+    // checkout can land in between and leave us clearing blockers and writing
+    // `todo` over a live run, which is exactly the active-run protection the
+    // narrow patch shape exists to preserve. Re-assert the status at write time
+    // (see `expectedCurrentStatus` in issues service `update`) and 409 instead.
+    // Deliberately keyed off the patch shape rather than the decision reason:
+    // the checkout-management override and recovery-action-owner paths reach
+    // this same mutation on someone else's issue and want the same guard.
+    const delegateRecoveryPatchInFlight =
+      req.actor.type === "agent" &&
+      !!existing.assigneeAgentId &&
+      existing.assigneeAgentId !== req.actor.agentId &&
+      isCreatorOrManagerChainRecoveryPatch(existing, req.body as Record<string, unknown>);
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);
@@ -8385,11 +8820,19 @@ export function issueRoutes(
       requestedExecutionStageStatus,
     );
 
+    // BLO-18294: the convergence guard fingerprints the gates this issue is
+    // actually waiting on, so it needs the live blocker edges. Only fetch them
+    // when an arm is on the table — every other PATCH skips the query.
+    const unresolvedBlockerIssueIds = nextExecutionPolicy?.monitor
+      ? await loadUnresolvedBlockerIssueIds(existing.companyId, existing.id)
+      : [];
+
     const transition = applyIssueExecutionPolicyTransition({
       issue: existing,
       policy: nextExecutionPolicy,
       previousPolicy: previousExecutionPolicy,
       requestedStatus: requestedExecutionStageStatus,
+      unresolvedBlockerIssueIds,
       requestedAssigneePatch: {
         assigneeAgentId: normalizedAssigneeAgentId,
         assigneeUserId:
@@ -8502,6 +8945,16 @@ export function issueRoutes(
               ...updateFields,
               actorAgentId: actor.agentId ?? null,
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
+              ...(delegateRecoveryPatchInFlight
+                ? {
+                    expectedCurrentStatus: "blocked",
+                    // BLO-18797: allow_manager_chain was granted because this
+                    // assignee is a report of the actor. Pin it too, or a
+                    // reassignment to an unrelated agent that keeps the row
+                    // blocked would still satisfy an id+status predicate.
+                    expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
+                  }
+                : {}),
             },
             tx,
           );
@@ -8527,6 +8980,14 @@ export function issueRoutes(
           ...updateFields,
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
+          ...(delegateRecoveryPatchInFlight
+            ? {
+                expectedCurrentStatus: "blocked",
+                // See the transactional branch above: the assignee is an
+                // authorization-relevant snapshot field for allow_manager_chain.
+                expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
+              }
+            : {}),
         });
       }
     } catch (err) {
@@ -8555,6 +9016,46 @@ export function issueRoutes(
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;
+    }
+
+    // BLO-18294: the re-arm was refused because N consecutive re-checks reported
+    // the same gate set. The issue is now `blocked`; name who can actually
+    // unblock it so the blocker set becomes routed work rather than a stalled
+    // timer nobody reads.
+    if (transition.monitorConvergence?.converged) {
+      try {
+        const blockerIssueIds = unresolvedBlockerIssueIds ?? [];
+        const unblockOwners = await loadIssueUnblockOwners(existing.companyId, blockerIssueIds);
+        await svc.addComment(issue.id, monitorConvergenceComment({
+          convergence: transition.monitorConvergence,
+          unblockOwners,
+        }), {
+          runId: actor.runId,
+        }, {
+          authorType: "system",
+        });
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.monitor_convergence_stalled",
+          entityType: "issue",
+          entityId: issue.id,
+          issueId: issue.id,
+          details: {
+            gateSource: transition.monitorConvergence.source,
+            convergenceCount: transition.monitorConvergence.count,
+            threshold: transition.monitorConvergence.threshold,
+            unresolvedBlockerIssueIds: blockerIssueIds,
+            unblockOwners,
+          },
+        });
+      } catch (err) {
+        logger.warn({ err, issueId: issue.id }, "failed to record monitor convergence escalation side effects");
+      }
     }
 
     let cancelledStatusRunId: string | null = null;
@@ -9427,6 +9928,11 @@ export function issueRoutes(
           parentIssueId: issue.parentId ?? null,
           assigneeAgentId: req.body.agentId,
           assigneeUserId: null,
+          // BLO-19094: this is the self-appointment door. Supplying both lets
+          // the `tasks:assign` guard refuse a claim on a review/recovery shell
+          // the actor was not assigned, without reloading the row.
+          originKind: issue.originKind ?? null,
+          currentAssigneeAgentId: issue.assigneeAgentId ?? null,
         });
       } catch (err) {
         if (recoveryCheckoutLookupError) {
@@ -10375,21 +10881,38 @@ export function issueRoutes(
       req.actor.type === "agent" &&
       (isRecoveryHandoffGrantDecision(commentAccessDecision) ||
         await isRecoveryHandoffPreviousOwner(req, issue));
-    if (recoveryHandoffGrantedCommentOnly && (reopenRequested || resumeRequested)) {
+    const creatorOrManagerGrantedCommentOnly =
+      req.actor.type === "agent" &&
+      isCreatorOrManagerCommentGrantDecision(commentAccessDecision);
+    if (
+      (recoveryHandoffGrantedCommentOnly || creatorOrManagerGrantedCommentOnly) &&
+      (reopenRequested || resumeRequested)
+    ) {
+      const commentOnlyReason = recoveryHandoffGrantedCommentOnly
+        ? "allow_recovery_handoff_grant"
+        : commentAccessDecision !== true && isCreatorOrManagerCommentGrantDecision(commentAccessDecision)
+        ? commentAccessDecision.reason
+        : "allow_comment_only_grant";
       res.status(403).json({
-        error: "Recovery handoff grant is comment-only",
+        error: recoveryHandoffGrantedCommentOnly
+          ? "Recovery handoff grant is comment-only"
+          : "Creator/manager comment grant is comment-only",
         details: {
           issueId: issue.id,
           assigneeAgentId: issue.assigneeAgentId,
           actorAgentId: req.actor.agentId,
-          reason: "allow_recovery_handoff_grant",
-          hint: "Post the handoff evidence as a plain comment; the recovery owner controls status.",
+          reason: commentOnlyReason,
+          hint: recoveryHandoffGrantedCommentOnly
+            ? "Post the handoff evidence as a plain comment; the recovery owner controls status."
+            : "Post the delegated-issue guidance as a plain comment; the assignee or normal mutation owner controls status.",
         },
       });
       return;
     }
     const commentOnlyGrantedPeerAgent =
-      mentionGrantedPeerAgentCommentOnly || recoveryHandoffGrantedCommentOnly;
+      mentionGrantedPeerAgentCommentOnly ||
+      recoveryHandoffGrantedCommentOnly ||
+      creatorOrManagerGrantedCommentOnly;
     const effectiveReopenRequested = commentOnlyGrantedPeerAgent ? false : reopenRequested;
     const effectiveResumeRequested = commentOnlyGrantedPeerAgent ? false : resumeRequested;
     if (
@@ -10609,16 +11132,17 @@ export function issueRoutes(
       const shouldAutoApproveReviewComment =
         currentIssue.status === "in_review" &&
         currentExecutionState?.status === "pending" &&
-        // A recovery-handoff caller is comment-only, so its comment must never
-        // be read as a review decision (BLO-18906). Without this, an approval-
-        // shaped comment from a previous owner who happens to still be named as
-        // the pending stage participant would transition the issue to `done` and
-        // insert an execution decision — a state mutation the grant does not
-        // confer, reached without ever passing an `issue:mutate` check.
+        // Comment-only grants must never be read as review decisions. Without
+        // this, an approval-shaped comment from a previous owner, creator, or
+        // manager-chain actor who happens to still be named as the pending stage
+        // participant would transition the issue to `done` and insert an
+        // execution decision — a state mutation the grant does not confer,
+        // reached without ever passing an `issue:mutate` check.
         // Deliberately NOT extended to `mentionGrantedPeerAgentCommentOnly`: a
         // mentioned non-assignee reviewer approving its own stage is the
         // established path this branch exists to serve.
         !recoveryHandoffGrantedCommentOnly &&
+        !creatorOrManagerGrantedCommentOnly &&
         actorMatchesExecutionParticipant(actor, currentExecutionState.currentParticipant ?? null) &&
         isApprovalReviewComment(req.body.body);
 

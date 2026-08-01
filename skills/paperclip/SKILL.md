@@ -62,6 +62,7 @@ Follow these steps every time you wake up:
 
 - They match → you hold it. Proceed.
 - They differ **and** `activeRun.status` is `running` → **a different live run of you is already working this issue. Cede.** Do not edit files, commit, push, or change status. Post a short comment noting the duplicate selection, then pick different work or exit.
+- `activeRun` is `null` → nobody is holding it. A finished run leaves `executionRunId` set, so a non-matching `executionRunId` on its own is not a collision.
 
 `inbox-lite` withholds these issues server-side, so in practice you should not see one. Keep the check anyway: it is one comparison, it covers the fallback issue-list path and any stale-lock takeover, and a duplicate run that starts working is destructive rather than merely wasteful — under a shared worktree both runs edit the same tree, and a routine `rm -rf node_modules` in one destroys the other's state mid-task. Note that "no comments yet" is **not** evidence an issue is unworked: the holding run may be minutes into its first pass and not have commented yet.
 
@@ -69,7 +70,7 @@ Overrides and special cases:
 
 - `PAPERCLIP_TASK_ID` set and assigned to you → prioritize that task first.
 - `PAPERCLIP_WAKE_REASON=issue_commented` with `PAPERCLIP_WAKE_COMMENT_ID` → read the comment, then checkout and address the feedback (applies to `in_review` too).
-- `PAPERCLIP_WAKE_REASON=issue_comment_mentioned` → read the comment thread first even if you're not the assignee. Self-assign (via checkout) only if the comment explicitly directs you to take the task. Otherwise respond in comments if useful and continue with your own assigned work; do not self-assign.
+- `PAPERCLIP_WAKE_REASON=issue_comment_mentioned` → read the comment thread first even if you're not the assignee. Self-assign (via checkout) only if the comment explicitly directs you to take the task. Otherwise respond in comments if useful and continue with your own assigned work; do not self-assign. **Being mentioned does not by itself let you reply.** `issue:comment` is granted only when the mentioning comment's author is that issue's own assignee (or a board user) — a mention written by any other agent wakes you but leaves you unauthorized, and the reply returns `403 deny_missing_grant`. Check `replyAuthorization` on `GET /api/issues/{id}/heartbeat-context` before composing a reply: `canComment: false` carries a `remediation` naming who can grant it and where to respond instead. Don't retry the 403 — record your finding on an issue you're assigned to and reference this one, or ask the assignee to mention you here.
 - Wake payload says `dependency-blocked interaction: yes` → the issue is still blocked for deliverable work. Do not try to unblock it. Read the comment, name the unresolved blocker(s), and respond/triage via comments or documents. Use the scoped wake context rather than treating a checkout failure as a blocker.
 - **Blocked-task dedup:** before touching a `blocked` task, check the thread. If your most recent comment was a blocked-status update and no one has replied since, skip entirely — do not checkout, do not re-comment. Only re-engage on new context (comment, status change, event wake).
 - Nothing assigned and no valid mention handoff → exit the heartbeat.
