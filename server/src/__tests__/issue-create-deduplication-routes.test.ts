@@ -87,11 +87,11 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     await tempDb?.cleanup();
   });
 
-  function createApp() {
+  function createApp(opts: Parameters<typeof issueRoutes>[2] = {}) {
     const app = express();
     app.use(express.json());
     app.use(actorMiddleware(db, { deploymentMode: "local_trusted" }));
-    app.use("/api", issueRoutes(db, {} as any));
+    app.use("/api", issueRoutes(db, {} as any, opts));
     app.use(errorHandler);
     return app;
   }
@@ -336,6 +336,93 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     });
     expect(activityEvents.find((event) => event.action === "issue.created")?.details)
       .not.toHaveProperty("duplicateCandidates");
+  });
+
+  it("keeps the create successful when advisory consumption telemetry fails", async () => {
+    const companyId = await seedCompany();
+    const candidate = monitorFilings[0]!;
+    await db.insert(issues).values({
+      companyId,
+      identifier: candidate.identifier,
+      title: candidate.title,
+      description: candidate.description,
+      status: "todo",
+      priority: "medium",
+    });
+    const app = createApp({
+      createIssueDuplicateCandidateActivityWriter: async () => {
+        throw new Error("telemetry unavailable");
+      },
+    });
+
+    const subject = monitorFilings[1]!;
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: subject.title, description: subject.description })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).not.toEqual([]);
+    expect(await db.select().from(issues).where(eq(issues.id, response.body.id))).toHaveLength(1);
+  });
+
+  it("returns 201 without advisories when the route lookup stalls", async () => {
+    const companyId = await seedCompany();
+    const app = createApp({
+      createIssueDuplicateCandidateLookup: () => new Promise<never>(() => {}),
+    });
+    const startedAt = performance.now();
+
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Create remains available while advisory lookup stalls" })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).toEqual([]);
+    expect(performance.now() - startedAt).toBeLessThan(ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS);
+    const activityEvents = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    expect(activityEvents.filter((event) => event.action === "issue.duplicate_candidates_shown")).toHaveLength(0);
+  });
+
+  it("continues past 200 newer unreadable rows to collect readable candidates", async () => {
+    const companyId = await seedCompany();
+    const allowedProject = await seedProject(companyId, "Allowed project");
+    const deniedProject = await seedProject(companyId, "Denied project");
+    const candidate = monitorFilings[0]!;
+    await db.insert(issues).values({
+      companyId,
+      projectId: allowedProject.id,
+      identifier: candidate.identifier,
+      title: candidate.title,
+      description: candidate.description,
+      status: "todo",
+      priority: "medium",
+      createdAt: new Date(Date.now() - 60_000),
+    });
+    await db.insert(issues).values(Array.from(
+      { length: ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP },
+      (_, index) => ({
+        companyId,
+        projectId: deniedProject.id,
+        title: `Newer inaccessible issue ${index}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+      }),
+    ));
+    const app = createApp({
+      createIssueDuplicateCandidateCorpusFilter: async (rows) => (
+        rows.filter((row) => row.projectId === allowedProject.id)
+      ),
+    });
+    const subject = monitorFilings[1]!;
+
+    const response = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ projectId: allowedProject.id, title: subject.title, description: subject.description })
+      .expect(201);
+
+    expect(response.body.duplicateCandidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ identifier: candidate.identifier }),
+    ]));
   });
 
   it("returns no advisory and records no consumption payload for a distinct issue", async () => {
