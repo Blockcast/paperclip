@@ -68,14 +68,18 @@ test("master pushes cannot cancel protected manual deploy builds", () => {
   );
 });
 
-test("Docker deploy job provisions Buildx before inspecting the artifact", () => {
+test("Docker deploy job verifies registry tooling before inspecting the artifact", () => {
   const deployJob = getDeployJobBlock();
   const setup = deployJob.indexOf("uses: docker/setup-buildx-action@v4");
+  const toolCheck = deployJob.indexOf("name: Verify Docker registry tooling");
+  const buildxVersion = deployJob.indexOf("docker buildx version");
   const inspect = deployJob.indexOf("docker buildx imagetools inspect");
 
-  assert.notEqual(setup, -1, "deploy job must provision Buildx");
+  assert.equal(setup, -1, "deploy job must not boot a BuildKit builder");
+  assert.notEqual(toolCheck, -1, "deploy job must verify Docker registry tooling");
+  assert.notEqual(buildxVersion, -1, "deploy job must verify docker buildx is available");
   assert.notEqual(inspect, -1, "deploy job must inspect the deploy artifact");
-  assert.ok(setup < inspect, "deploy job must provision Buildx before artifact inspection");
+  assert.ok(buildxVersion < inspect, "deploy job must verify buildx before artifact inspection");
 });
 
 test("deploy job assertions cannot match a later job", () => {
