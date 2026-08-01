@@ -137,6 +137,17 @@ Before ending any heartbeat, apply this final-disposition checklist:
 - Delegated follow-up: create the follow-up issue directly, link it with `parentId`/`goalId`, and use blockers when the current issue must wait for that work.
 - Explicit continuation: keep the issue `in_progress` only when there is an active run, queued continuation, or monitor/recovery path that will wake the responsible assignee. Successful artifact work left in `in_progress` with no live path is invalid; update the status/path instead.
 
+**Closing to `done` may be gated.** When the instance runs with `enableDoneExecutionGate`, `PATCH {status: "done"}` from an agent is rejected `422` with `details.reason: "no_execution_run_and_no_pr_evidence"` unless one of three things holds: the issue is still holding an execution run, `pr-link` evidence was recorded, or the issue carries a **run-attributed durable artifact**. Produce the artifact *before* you attempt the close rather than discovering the gate at 422.
+
+If your work produces no commit — an investigation, config archaeology, a premise audit, an operational receipt — promote the deliverable out of the comment thread into an issue document first:
+
+```
+PUT /api/issues/{issueId}/documents/findings
+{ "title": "Findings", "body": "## Findings\n..." }
+```
+
+A comment body never satisfies the gate, no matter how well sourced; neither does the `plan` document (it is intent, not deliverable). Write the artifact from inside the run that closes the issue, so the server can attribute it. See the **paperclip-evidence-before-in-review** skill, "Closing to `done`", for the full rule set (BLO-19081).
+
 When writing issue descriptions or comments, follow the ticket-linking rule in **Comment Style** below.
 
 ```json

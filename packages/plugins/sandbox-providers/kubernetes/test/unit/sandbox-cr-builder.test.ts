@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { buildSandboxCrManifest } from "../../src/sandbox-cr-builder.js";
+import { findLiteralSensitiveEnvVars } from "../../src/sensitive-env-guard.js";
 
 const baseInput = {
   namespace: "paperclip-acme",
@@ -133,5 +134,20 @@ describe("buildSandboxCrManifest", () => {
   it("does not set imagePullSecrets when not provided", () => {
     const cr = buildSandboxCrManifest(baseInput);
     expect(cr.spec.podTemplate.spec.imagePullSecrets).toBeUndefined();
+  });
+
+  // BLO-17973/BLO-17980: a read-only GET Pod returns every literal env value,
+  // so credential material must never appear in one.
+  it("emits no credential material in literal env values", () => {
+    const cr = buildSandboxCrManifest(baseInput);
+    expect(findLiteralSensitiveEnvVars(cr.spec.podTemplate.spec)).toEqual([]);
+  });
+
+  it("passes credentials via envFrom.secretRef rather than literal env entries", () => {
+    const cr = buildSandboxCrManifest(baseInput);
+    const container = cr.spec.podTemplate.spec.containers[0];
+    expect(container.envFrom).toEqual([{ secretRef: { name: baseInput.envSecretName } }]);
+    // Pin the literal allowlist: anything added here must be non-secret.
+    expect(container.env).toEqual([{ name: "HOME", value: "/home/paperclip" }]);
   });
 });
