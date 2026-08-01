@@ -925,6 +925,102 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     });
   });
 
+  it("does not let agent checkout seize an in_review issue assigned to a human reviewer", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const reviewerUserId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Human review handoff",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: null,
+      assigneeUserId: reviewerUserId,
+      checkoutRunId: null,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({
+        agentId,
+        expectedStatuses: ["todo", "backlog", "blocked", "in_review"],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toBe("Issue checkout conflict");
+
+    const row = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: reviewerUserId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+  });
+
+  it("clears but does not adopt a stale execution lock on an in_review issue assigned to a human reviewer", async () => {
+    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const reviewerUserId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Human review stale execution lock",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: null,
+      assigneeUserId: reviewerUserId,
+      checkoutRunId: null,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date("2026-01-01T00:00:30.000Z"),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({
+        agentId,
+        expectedStatuses: ["todo", "backlog", "blocked", "in_review"],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toBe("Issue checkout conflict");
+
+    const row = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: reviewerUserId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+  });
+
   it("preserves pending execution-policy review status through checkout so approval comments apply", async () => {
     const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
     const issueId = randomUUID();
