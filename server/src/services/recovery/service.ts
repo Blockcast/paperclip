@@ -7787,11 +7787,36 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // BLO-19941: in the wedge shape both columns point at the SAME wedged run
       // (checkout and execution are claimed together), so the checkout guard
       // below would `continue` before the execution check ever ran, making this
-      // sweep a no-op for exactly the case it needs to cover. Allow the checkout
-      // guard to be satisfied only by the `running`-silent branch and only when
-      // it is literally the same run id — a *different* live checkout holder
-      // still keeps its lock, and a pre-claim expiry never bypasses it.
-      const checkoutHeldBySameSilentRun = runningLockSilent
+      // sweep a no-op for exactly the case it needs to cover.
+      //
+      // BLO-19566 extends that allowance from `running`-silent to the pre-claim
+      // (`queued`) case, which BLO-19941 deliberately left out. The exclusion
+      // made the BLO-18995 pre-claim path dead code for every issue checked out
+      // the normal way, because checkout stamps both columns at once. Measured
+      // on the live fleet 2026-08-01T05:32Z (81 issues holding a `queued` pin):
+      // of the 55 with a null checkoutRunId — where the guard already passes —
+      // none had held a lock past the 6h bound, while both of the only two pins
+      // in the fleet that *had* (BLO-19999 at 8.6h, BLO-20042 at 6.8h) sat in
+      // the 25-issue same-run population the guard skips.
+      //
+      // Safety is the same argument BLO-18995 made for the execution column,
+      // and it extends to the checkout column: claimQueuedRun stamps only
+      // executionRunId/executionAgentNameKey/executionLockedAt and neither reads
+      // nor requires checkoutRunId (heartbeat.ts), and its `or(isNull(
+      // executionRunId), eq(executionRunId, claimed.id))` guard is satisfied by
+      // the swept state, so a late claim still succeeds. Ownership checks that
+      // gate a run's work are disjunctions over both columns
+      // (isCurrentIssueExecutionRun, routes/issues.ts), so a null checkout does
+      // not 409 the run or block its comments, and canAdoptUnownedCheckout /
+      // adoptUnownedCheckoutRun re-stamp it on the next checkout. The resulting
+      // shape (null checkoutRunId + non-null executionRunId on a queued run) is
+      // already produced on purpose by enqueueProcessLossRetry and the orphan
+      // reaper's per-issue self-heal.
+      //
+      // The same-run-id restriction is what keeps this narrow: a *different*
+      // live checkout holder still keeps its lock no matter how stale the
+      // execution lock is.
+      const checkoutHeldBySameWedgedRun = executionLockExpired
         && issue.checkoutRunId != null
         && issue.checkoutRunId === issue.executionRunId;
       // Guards are kept separate on purpose. The update below nulls the
@@ -7799,7 +7824,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // allowance must not become a blanket bypass of the checkout check: an
       // issue whose checkoutRunId points at a live (non-terminal) run keeps its
       // checkout lock no matter how stale the execution lock is.
-      if (!isCleanable(issue.checkoutRunId) && !checkoutHeldBySameSilentRun) continue;
+      if (!isCleanable(issue.checkoutRunId) && !checkoutHeldBySameWedgedRun) continue;
       if (!isCleanable(issue.executionRunId) && !executionLockExpired) continue;
 
       const sweepOutcome = await db.transaction(async (tx) => {
