@@ -677,6 +677,28 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.approvalGatedSuppressed).toBe(0);
   });
 
+  it("does not reset the issue gate window with a newer pending approval", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await linkApproval(seeded.companyId, seeded.issueId, "pending", {
+      createdAt: new Date(now.getTime() - 25 * 60 * 60 * 1000),
+    });
+    await linkApproval(seeded.companyId, seeded.issueId, "pending", {
+      createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.approvalGatedSuppressed).toBe(0);
+  });
+
   it("does not suppress no-comment productivity reviews when an approval is pending", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({ status: "in_progress" });

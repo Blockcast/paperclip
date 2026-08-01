@@ -638,19 +638,21 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
 
   // A gate only suppresses while it is still plausibly live. `deliberateFutureMonitor` gets this
   // for free (a monitor whose `nextCheckAt` has passed stops suppressing); approvals carry no
-  // expiry column, so the bound is applied here against `createdAt`.
+  // expiry column, so the bound is applied to the oldest pending linked approval. New pending
+  // approvals do not reset the source issue's gate window while an older gate is still open.
   async function findOpenApprovalGate(
     companyId: string,
     issueId: string,
     now: Date,
     maxAgeMs: number,
   ) {
-    const freshestAllowedCreatedAt = new Date(now.getTime() - maxAgeMs);
+    const oldestAllowedCreatedAt = new Date(now.getTime() - maxAgeMs);
     const rows = await db
       .select({
         approvalId: approvals.id,
         approvalStatus: approvals.status,
         approvalType: approvals.type,
+        approvalCreatedAt: approvals.createdAt,
       })
       .from(issueApprovals)
       .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
@@ -659,12 +661,13 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           eq(issueApprovals.companyId, companyId),
           eq(issueApprovals.issueId, issueId),
           inArray(approvals.status, [...APPROVAL_GATE_SUPPRESSION_STATUSES]),
-          gte(approvals.createdAt, freshestAllowedCreatedAt),
         ),
       )
       .orderBy(asc(approvals.createdAt), asc(approvals.id))
       .limit(1);
-    return rows[0] ?? null;
+    const oldestPending = rows[0] ?? null;
+    if (!oldestPending) return null;
+    return oldestPending.approvalCreatedAt >= oldestAllowedCreatedAt ? oldestPending : null;
   }
 
   async function recordApprovalGatedSuppression(suppression: ApprovalGatedSuppression) {
