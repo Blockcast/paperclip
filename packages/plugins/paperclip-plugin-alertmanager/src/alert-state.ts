@@ -65,17 +65,27 @@ export interface AlertStateHandle {
  * of reverting to a snapshot, so the ordering of two racing callers can no
  * longer lose a resolution outright.
  *
+ * The second migration-specific hazard — a concurrent adopter deleting the
+ * legacy row between this function's two reads, making a tracked alert look
+ * new — is closed by the confirming re-read at the end. See the comment there
+ * for why `writeAlertState`'s ordering makes that conclusive.
+ *
  * What remains is the ordinary last-write-wins of any read-modify-write over a
- * store without CAS — identical for a migrated row and a long-scoped one, and
- * neither introduced nor removed by this module. Serializing that fully needs
+ * store without CAS: a sweep that reads a record, decides to act, and writes an
+ * advanced rung can still land on top of a resolution a webhook wrote in
+ * between. That hazard is NOT introduced here and is not specific to adoption —
+ * it is identical for a row that has been company-scoped since it was created
+ * and never went near the legacy key, which `escalation.test.ts` asserts
+ * directly so the claim is checked rather than argued. Serializing it needs
  * either CAS on `ctx.state` or the contended key moved into the plugin's own
  * namespace (where `ctx.db.execute` can do a guarded upsert, as `escalation.ts`
- * already does for cover membership). Tracked in BLO-20650 — deliberately out of
- * scope here because it applies to every escalation write, not to migration.
+ * already does for cover membership). Tracked in BLO-20650 — deliberately out
+ * of scope here because it applies to every escalation write, not to migration.
  *
- * The narrower thing this DOES buy: a reader that decides to take no action now
- * writes nothing at all, so it can no longer destroy a concurrent resolution
- * just by having looked.
+ * The narrower things this DOES buy: a reader that decides to take no action
+ * now writes nothing at all, so it can no longer destroy a concurrent
+ * resolution just by having looked; and adoption can no longer duplicate an
+ * issue for an alert another caller has already migrated.
  */
 export async function readAlertState(
   ctx: PluginContext,
@@ -88,9 +98,31 @@ export async function readAlertState(
 
   const legacyRef = legacyInstanceAlertStateRef(fingerprint);
   const legacy = (await ctx.state.get(legacyRef)) as AlertStateRecord | null;
-  if (legacy && legacy.paperclipCompanyId === companyId) {
-    return { ref, record: legacy, legacyRef };
+  if (legacy) {
+    return legacy.paperclipCompanyId === companyId
+      ? { ref, record: legacy, legacyRef }
+      : { ref, record: null, legacyRef: null };
   }
+
+  // No scoped row and no legacy row. That reads as "this fingerprint is new",
+  // but during migration it has a second cause: a concurrent caller adopted the
+  // legacy row between our two reads, so it deleted the row we just missed.
+  //
+  // Confirm before declaring the alert new. `writeAlertState` migrates in a
+  // fixed order — scoped row written FIRST, legacy row deleted second — so the
+  // only way the legacy row can have vanished under us is that its scoped
+  // successor already exists. Re-reading the scoped key therefore SETTLES the
+  // question rather than merely narrowing the window: either we find the row
+  // the other caller published, or there genuinely never was one.
+  //
+  // Without this, that interleaving makes `readAlertState` return
+  // `record: null` for an alert we are already tracking, and `handleFiring`
+  // takes its create path — filing a duplicate issue and orphaning the original
+  // so its resolution can never close it. That is the exact failure the
+  // read-through fallback exists to prevent, reintroduced by a race.
+  const adopted = (await ctx.state.get(ref)) as AlertStateRecord | null;
+  if (adopted) return { ref, record: adopted, legacyRef: null };
+
   return { ref, record: null, legacyRef: null };
 }
 
