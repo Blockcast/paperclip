@@ -2053,6 +2053,7 @@ const SYSTEM_HARNESS_CHILD_ORIGIN_KINDS: string[] = [
 const PRODUCTIVITY_REVIEW_TERMINAL_STATUSES = ["done", "cancelled"];
 const PRODUCTIVITY_REVIEW_ACTIVITY_ACTIONS = [
   "issue.productivity_review_created",
+  "issue.productivity_review_source_mutation",
   "issue.productivity_review_updated",
 ];
 const PRODUCTIVITY_REVIEW_TRIGGERS: readonly IssueProductivityReviewTrigger[] = [

@@ -1265,6 +1265,23 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     }
 
     const ownerAgentId = await resolveReviewOwnerAgentId(evidence.sourceIssue, evidence.sourceAgent);
+    // Never open an unassigned review. It was already a dead row — the wake
+    // below is gated on `ownerAgentId`, so nothing would ever work it — and
+    // since BLO-19094 it is also a privilege-escalation hook: an open review
+    // grants its assignee issue:comment/issue:mutate on the SOURCE issue, and
+    // an issue with no agent assignee is mutable by any company agent
+    // (`allow_company_agent`). Together those let any agent self-assign the
+    // dangling review and inherit mutation rights on an issue it has no
+    // relationship to. Skipping creation keeps the grant reachable only by the
+    // reviewer the harness actually chose.
+    if (!ownerAgentId) {
+      logger.warn({
+        companyId: evidence.sourceIssue.companyId,
+        issueId: evidence.sourceIssue.id,
+        trigger: evidence.trigger,
+      }, "productivity review skipped: no invokable, in-budget review owner could be resolved");
+      return { kind: "skipped" as const, reviewIssueId: null };
+    }
     let review: Awaited<ReturnType<typeof issuesSvc.create>>;
     try {
       review = await issuesSvc.create(evidence.sourceIssue.companyId, {

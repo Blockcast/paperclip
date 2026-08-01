@@ -3587,6 +3587,20 @@ export function issueRoutes(
     parentIssueId?: string | null;
     assigneeAgentId?: string | null;
     assigneeUserId?: string | null;
+    /**
+     * BLO-19094: the row's own origin kind, so the `tasks:assign` self-claim
+     * guard can refuse self-appointment onto a shell whose ownership confers a
+     * grant elsewhere. Pass it wherever the caller has already loaded the
+     * issue; omitting it is safe but makes the guard reload the row.
+     */
+    originKind?: string | null;
+    /**
+     * BLO-19094: the assignee the row currently carries, as distinct from
+     * `assigneeAgentId`, which is the assignment *target*. The self-claim
+     * guard needs both to tell "claiming an unowned shell" from "an agent
+     * being handed work by someone else".
+     */
+    currentAssigneeAgentId?: string | null;
   };
 
   async function resolveAssignmentProjectId(input: {
@@ -3618,6 +3632,12 @@ export function issueRoutes(
         parentIssueId: assignmentScope?.parentIssueId ?? null,
         assigneeAgentId: assignmentScope?.assigneeAgentId ?? null,
         assigneeUserId: assignmentScope?.assigneeUserId ?? null,
+        currentAssigneeAgentId: assignmentScope?.currentAssigneeAgentId ?? null,
+        // BLO-19094: `originKind` is left `undefined` (not `??`-collapsed to
+        // null) when the caller did not supply it, so the self-claim guard can
+        // tell "no origin kind" from "not looked up" and reload only in the
+        // latter case. See recoveryOrReviewIssueBlocksUnassignedAgentClaim.
+        originKind: assignmentScope?.originKind,
       },
       scope: assignmentScope ?? null,
     });
@@ -3659,6 +3679,8 @@ export function issueRoutes(
       assigneeUserId: string | null;
       createdByAgentId?: string | null;
       status: string;
+      originKind?: string | null;
+      originId?: string | null;
     },
     action: "issue:comment" | "issue:read" | "issue:mutate",
   ) {
@@ -3675,6 +3697,12 @@ export function issueRoutes(
         assigneeUserId: issue.assigneeUserId,
         createdByAgentId: issue.createdByAgentId ?? null,
         status: issue.status,
+        // Deliberately NOT `?? null`: authorization distinguishes "caller did
+        // not look it up" (undefined -> reload the row) from "row has no
+        // origin kind" (null -> trust it and skip the reload). Collapsing them
+        // here would make every origin-less issue pay an extra SELECT.
+        originKind: issue.originKind,
+        originId: issue.originId ?? null,
       },
       scope: {
         issueId: issue.id,
@@ -3682,6 +3710,8 @@ export function issueRoutes(
         parentIssueId: issue.parentId,
         assigneeAgentId: issue.assigneeAgentId,
         assigneeUserId: issue.assigneeUserId,
+        originKind: issue.originKind ?? null,
+        originId: issue.originId ?? null,
       },
     });
   }
@@ -4343,6 +4373,12 @@ export function issueRoutes(
       allowBlockedCorrection?: boolean;
       allowScopedRecoveryOwnerSourceMutation?: boolean;
       allowRecoveryActionOwner?: boolean;
+      allowProductivityReviewOwner?: boolean;
+      onProductivityReviewOwnerMutationAllowed?: (input: {
+        reviewerAgentId: string;
+        previousAssigneeAgentId: string | null;
+        issueStatus: string;
+      }) => void;
       allowCoordinationMetadata?: boolean;
       /**
        * BLO-18797: opt in to the allow_issue_creator / allow_manager_chain
@@ -4448,6 +4484,39 @@ export function issueRoutes(
     }
     if (issue.assigneeAgentId !== actorAgentId) {
       if (await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)) {
+        return true;
+      }
+      // The actor owns an open productivity review OF this issue (BLO-19094).
+      // Every remedy such a review can order is a mutation here, so without
+      // this the reviewer bounces off the 409/403 below and the review can
+      // detect but never fix — including the case it exists for, an issue
+      // pinned open by a paused or errored assignee that will never run to
+      // release it.
+      //
+      // Deliberately placed INSIDE this branch and next to the checkout
+      // override rather than at the top of the function: an early return above
+      // would also skip the run-ownership checks below, which is the bypass
+      // that sank an earlier attempt at a related widening (PR #814). It is
+      // also opt-in per route — only `PATCH /issues/:id` passes the flag, so
+      // destructive routes sharing this helper (`DELETE /issues/:id`,
+      // attachment and comment deletion) stay closed to a reviewer.
+      //
+      // `boundaryDecision` is reused rather than re-queried so the grant
+      // predicate lives in exactly one place (authorization.ts). If some other
+      // allow-path matched first the reason differs and the override does not
+      // fire — fail-closed, and the actor was authorized by that other path
+      // anyway. This is checked before the creator/manager-chain deny below;
+      // the two are mutually exclusive by reason, so the order is for clarity
+      // rather than correctness.
+      if (
+        options.allowProductivityReviewOwner &&
+        boundaryDecision.reason === "allow_productivity_review_grant"
+      ) {
+        options.onProductivityReviewOwnerMutationAllowed?.({
+          reviewerAgentId: actorAgentId,
+          previousAssigneeAgentId: issue.assigneeAgentId,
+          issueStatus: issue.status,
+        });
         return true;
       }
       if (creatorOrManagerChainDecision) {
@@ -8696,6 +8765,13 @@ export function issueRoutes(
         req.body as Record<string, unknown>,
       )
       : false;
+    const productivityReviewSourceMutationAudit: {
+      current: {
+        reviewerAgentId: string;
+        previousAssigneeAgentId: string | null;
+        issueStatus: string;
+      } | null;
+    } = { current: null };
     // BLO-18289: coordination-metadata allowlist. Evaluated before the boundary
     // check so a manager holding tasks:assign can curate the dependency graph
     // on a report's issue; null whenever the body is not exclusively
@@ -8722,6 +8798,10 @@ export function issueRoutes(
       {
         allowBlockedCorrection: true,
         allowScopedRecoveryOwnerSourceMutation,
+        allowProductivityReviewOwner: true,
+        onProductivityReviewOwnerMutationAllowed: (audit) => {
+          productivityReviewSourceMutationAudit.current = audit;
+        },
         allowCoordinationMetadata: coordinationMetadataDecision !== null,
         // BLO-18797: the delegate-recovery path. The helper additionally
         // requires a blocked -> todo patch containing only status and
@@ -9419,6 +9499,28 @@ export function issueRoutes(
       },
     });
 
+    const productivityReviewAudit = productivityReviewSourceMutationAudit.current;
+    if (productivityReviewAudit && hasFieldChanges) {
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.productivity_review_source_mutation",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          reviewerAgentId: productivityReviewAudit.reviewerAgentId,
+          previousAssigneeAgentId: productivityReviewAudit.previousAssigneeAgentId,
+          issueStatus: productivityReviewAudit.issueStatus,
+          changedFields: Object.keys(previous),
+        },
+      });
+    }
+
     const explicitlyRecordedSuccessfulRunDisposition =
       actor.actorType === "user" && req.body.status !== undefined && issue.status !== "in_progress";
     if (explicitlyRecordedSuccessfulRunDisposition) {
@@ -10094,6 +10196,11 @@ export function issueRoutes(
           parentIssueId: issue.parentId ?? null,
           assigneeAgentId: req.body.agentId,
           assigneeUserId: null,
+          // BLO-19094: this is the self-appointment door. Supplying both lets
+          // the `tasks:assign` guard refuse a claim on a review/recovery shell
+          // the actor was not assigned, without reloading the row.
+          originKind: issue.originKind ?? null,
+          currentAssigneeAgentId: issue.assigneeAgentId ?? null,
         });
       } catch (err) {
         if (recoveryCheckoutLookupError) {
