@@ -1656,6 +1656,133 @@ describeEmbeddedPostgres("pipelineService", () => {
     expect(events.filter((event) => event.type === "automation_failed")).toHaveLength(1);
   });
 
+  it("retires stage automation issues when cases leave their originating stage", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Stage exit retirement");
+    const pipeline = await svc.createPipeline({
+      companyId: company.id,
+      key: "stage-exit-retirement",
+      name: "Stage exit retirement",
+      actor: userActor,
+      stages: [
+        { key: "intake", name: "Intake", kind: "open" },
+        {
+          key: "drafting",
+          name: "Drafting",
+          kind: "working",
+          config: { onEnter: { type: "run_routine", routineId: routine.id } },
+        },
+        { key: "review", name: "Review", kind: "working" },
+        { key: "done", name: "Done", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    });
+
+    for (const [caseKey, targetStage] of [["review-exit", "review"], ["terminal-exit", "done"]] as const) {
+      const created = await svc.ingestCase({
+        companyId: company.id,
+        pipelineId: pipeline.id,
+        caseKey,
+        title: `Case ${caseKey}`,
+        actor: userActor,
+      });
+      const entered = await svc.transitionCase({
+        companyId: company.id,
+        caseId: created.case.id,
+        toStageKey: "drafting",
+        expectedVersion: created.case.version,
+        actor: userActor,
+      });
+      expect(entered.automationExecution.status).toBe("succeeded");
+      const issueId = entered.automationExecution.status === "succeeded"
+        ? entered.automationExecution.execution.executionIssueId
+        : null;
+
+      await svc.transitionCase({
+        companyId: company.id,
+        caseId: created.case.id,
+        toStageKey: targetStage,
+        expectedVersion: entered.case.version,
+        actor: userActor,
+      });
+
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId!));
+      const [link] = await db
+        .select()
+        .from(pipelineCaseIssueLinks)
+        .where(eq(pipelineCaseIssueLinks.issueId, issueId!));
+      const comments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId!));
+      expect(issue!.status).toBe("cancelled");
+      expect(issue!.cancelledAt).not.toBeNull();
+      expect(issue!.executionRunId).toBeNull();
+      expect(link!.retiredAt).not.toBeNull();
+      expect(link!.retiredReason).toBe("stage_exited");
+      expect(comments.map((comment) => comment.body)).toContain(
+        `Pipeline case "Case ${caseKey}" (${caseKey}) left stage "Drafting". This stage-entry automation issue was cancelled because its work is no longer current.`,
+      );
+    }
+  });
+
+  it("retires the automation link without cancelling a repurposed issue", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Repurposed stage issue");
+    const pipeline = await svc.createPipeline({
+      companyId: company.id,
+      key: "repurposed-stage-issue",
+      name: "Repurposed stage issue",
+      actor: userActor,
+      stages: [
+        { key: "intake", name: "Intake", kind: "open" },
+        {
+          key: "drafting",
+          name: "Drafting",
+          kind: "working",
+          config: { onEnter: { type: "run_routine", routineId: routine.id } },
+        },
+        { key: "review", name: "Review", kind: "working" },
+        { key: "done", name: "Done", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    });
+    const created = await svc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "repurposed",
+      title: "Repurposed case",
+      actor: userActor,
+    });
+    const entered = await svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "drafting",
+      expectedVersion: created.case.version,
+      actor: userActor,
+    });
+    const issueId = entered.automationExecution.status === "succeeded"
+      ? entered.automationExecution.execution.executionIssueId
+      : null;
+    await db.update(issues).set({ originKind: "manual", originId: null }).where(eq(issues.id, issueId!));
+
+    await svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "review",
+      expectedVersion: entered.case.version,
+      actor: userActor,
+    });
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId!));
+    const [link] = await db
+      .select()
+      .from(pipelineCaseIssueLinks)
+      .where(eq(pipelineCaseIssueLinks.issueId, issueId!));
+    expect(issue!.status).toBe("todo");
+    expect(link!.retiredReason).toBe("stage_exited");
+  });
+
   it("auto-advances after retry creates a fresh terminal child rollup", async () => {
     const company = await seedCompany();
     const routine = await seedRoutine(company.id, "Retry child cleanup");
