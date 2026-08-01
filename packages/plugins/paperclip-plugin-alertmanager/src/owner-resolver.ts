@@ -174,15 +174,28 @@ export async function resolveFallbackAgentId(
 ): Promise<string | undefined> {
   const target = fallbackAgentName?.trim().toLowerCase();
   if (!target) return undefined;
-  const agents = await ctx.agents.list({ companyId, limit: 200, offset: 0 });
-  const matches = agents.filter((agent) => agent.name.trim().toLowerCase() === target);
-  if (matches.length !== 1) {
+  const limit = 200;
+  let offset = 0;
+  let matchId: string | undefined;
+  let matchCount = 0;
+  do {
+    const agents = await ctx.agents.list({ companyId, limit, offset });
+    for (const agent of agents) {
+      if (agent.name.trim().toLowerCase() !== target) continue;
+      matchCount += 1;
+      matchId = agent.id;
+      if (matchCount > 1) break;
+    }
+    if (matchCount > 1 || agents.length < limit) break;
+    offset += limit;
+  } while (true);
+  if (matchCount !== 1) {
     ctx.logger.warn(
-      `Fallback agent "${fallbackAgentName}" resolved to ${matches.length} agents; refusing ownerless issue creation`,
+      `Fallback agent "${fallbackAgentName}" resolved to ${matchCount} agents; refusing ownerless issue creation`,
     );
     return undefined;
   }
-  return matches[0]?.id;
+  return matchId;
 }
 
 function normalizeEmail(email: string): string {

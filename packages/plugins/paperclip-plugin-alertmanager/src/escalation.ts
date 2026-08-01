@@ -375,8 +375,17 @@ async function advanceIssueLadder(
   now: Date,
 ): Promise<void> {
   if (["done", "cancelled"].includes(issue.status) || !issue.originId) return;
-  const ref = { scopeKind: "instance" as const, stateKey: STATE_KEYS.alert(issue.originId) };
-  const state = await ctx.state.get(ref) as AlertStateRecord | null;
+  const aggregateRef = {
+    scopeKind: "instance" as const,
+    stateKey: STATE_KEYS.aggregate(companyId, issue.originId),
+  };
+  const aggregateState = await ctx.state.get(aggregateRef) as AlertStateRecord | null;
+  const legacyRef = {
+    scopeKind: "instance" as const,
+    stateKey: STATE_KEYS.alert(issue.originId),
+  };
+  const ref = aggregateState ? aggregateRef : legacyRef;
+  const state = aggregateState ?? await ctx.state.get(legacyRef) as AlertStateRecord | null;
   if (!state || state.resolvedAt || state.escalationComplete || !state.nextEscalationAt || Date.parse(state.nextEscalationAt) > now.getTime()) return;
   const hold = holdUntil(await ctx.issues.listComments(issue.id, companyId));
   if (hold && hold > now.getTime()) {

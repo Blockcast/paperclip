@@ -200,9 +200,12 @@ requires resource-level issues, preserving the contract established by
 
 Aggregate/member rows live in the plugin-owned database namespace. A partial
 unique index on Paperclip issues makes concurrent first deliveries converge on
-one issue; an atomic final-resolution claim applies the configured close/comment
-policy once, only after no members remain firing. Re-fires mark the member
-firing again and reopen a completed shared issue.
+one issue. The aggregate row's company-scoped `active_fingerprints` array is the
+atomic lifecycle authority; member rows retain per-series audit and retry
+history. A generation-fenced final-resolution claim applies the configured
+close/comment policy once, only after the active array is empty. Re-fires join
+the active array, invalidate any pending claim, and reopen a completed shared
+issue.
 
 ### Channel precision policy
 

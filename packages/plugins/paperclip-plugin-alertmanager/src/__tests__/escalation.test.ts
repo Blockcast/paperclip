@@ -171,7 +171,7 @@ function buildFakeAlertmanagerStore() {
 function sweepContext(state: AlertStateRecord, reportsTo: string | null = "cto", store = buildFakeAlertmanagerStore()) {
   const issue = {
     id: "issue-1", identifier: "BLO-1", title: "Alert", status: "todo", priority: "critical",
-    originId: "fp-1", assigneeAgentId: "engineer", projectId: null, goalId: null,
+    originId: state.aggregateKey ?? "fp-1", assigneeAgentId: "engineer", projectId: null, goalId: null,
   };
   const mocks = {
     state: { get: vi.fn(async () => state), set: vi.fn(async () => undefined) },
@@ -212,6 +212,33 @@ describe("alert escalation", () => {
     const second = sweepContext({ ...due, escalationAttempt: 1 });
     await runAlertEscalationSweep(second.ctx, config(), new Date("2026-07-11T01:00:00Z"));
     expect(second.mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
+  });
+
+  it("reads aggregate-owned state for aggregate issue origins", async () => {
+    const aggregateKey = 'alert-aggregate:v1:["SyntheticAlert",null]';
+    const due = {
+      paperclipIssueId: "issue-1",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: "engineer",
+      alertname: "SyntheticAlert",
+      severity: "critical",
+      firstSeenAt: "x",
+      lastFiredAt: "x",
+      resolvedAt: null,
+      nextEscalationAt: "2026-07-11T00:00:00Z",
+      escalationAttempt: 0,
+      aggregateKey,
+    };
+    const { ctx, mocks } = sweepContext(due);
+
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+    expect(mocks.state.get).toHaveBeenCalledWith({
+      scopeKind: "instance",
+      stateKey: `alert-aggregate:company-1:${aggregateKey}`,
+    });
+    expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(1);
   });
 
   it("re-arms each rung a full deadline interval out, not one sweep tick", async () => {

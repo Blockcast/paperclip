@@ -22,6 +22,10 @@ interface AggregateRow {
   assignee_agent_id: string | null;
 }
 
+function table(ctx: Pick<PluginContext, "db">, name: string): string {
+  return `"${ctx.db.namespace}"."${name}"`;
+}
+
 export function aggregateKeyForAlert(alert: AlertmanagerAlert): string {
   const alertname = alert.labels.alertname ?? "UnnamedAlert";
   const domain =
@@ -40,35 +44,47 @@ export async function joinAggregate(
   const alertname = alert.labels.alertname ?? "UnnamedAlert";
   const severity = alert.labels.severity ?? "unknown";
   const firedAt = alert.startsAt || new Date().toISOString();
+  const aggregates = table(ctx, "alert_aggregates");
+  const members = table(ctx, "alert_members");
 
   await ctx.db.execute(
-    `INSERT INTO alert_aggregates (aggregate_key, company_id, alertname, severity)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (aggregate_key) DO UPDATE SET
+    `INSERT INTO ${aggregates} AS aggregate
+       (aggregate_key, company_id, alertname, severity, active_fingerprints)
+     VALUES ($1, $2, $3, $4, ARRAY[$5]::text[])
+     ON CONFLICT (company_id, aggregate_key) DO UPDATE SET
        severity = EXCLUDED.severity,
+       active_fingerprints = CASE
+         WHEN $5 = ANY(aggregate.active_fingerprints)
+           THEN aggregate.active_fingerprints
+         ELSE array_append(aggregate.active_fingerprints, $5)
+       END,
+       generation = aggregate.generation + 1,
        resolution_claim = NULL,
        resolution_claimed_at = NULL,
+       resolution_generation = NULL,
        final_resolved_at = NULL,
        updated_at = now()`,
-    [aggregateKey, companyId, alertname, severity],
+    [aggregateKey, companyId, alertname, severity, alert.fingerprint],
   );
+  // This table is retained for audit and retry recognition. The aggregate's
+  // active_fingerprints array above is the atomic lifecycle authority.
   await ctx.db.execute(
-    `INSERT INTO alert_members
-       (aggregate_key, fingerprint, firing, first_seen_at, last_fired_at, resolved_at)
-     VALUES ($1, $2, true, $3, now(), NULL)
-     ON CONFLICT (aggregate_key, fingerprint) DO UPDATE SET
+    `INSERT INTO ${members}
+       (company_id, aggregate_key, fingerprint, firing, first_seen_at, last_fired_at, resolved_at)
+     VALUES ($1, $2, $3, true, $4, now(), NULL)
+     ON CONFLICT (company_id, aggregate_key, fingerprint) DO UPDATE SET
        firing = true,
        last_fired_at = now(),
        resolved_at = NULL`,
-    [aggregateKey, alert.fingerprint, firedAt],
+    [companyId, aggregateKey, alert.fingerprint, firedAt],
   );
 
   const [row] = await ctx.db.query<AggregateRow>(
     `SELECT aggregate_key, company_id, paperclip_issue_id, alertname, severity,
             assignee_user_id, assignee_agent_id
-       FROM alert_aggregates
-      WHERE aggregate_key = $1`,
-    [aggregateKey],
+       FROM ${aggregates}
+       WHERE company_id = $1 AND aggregate_key = $2`,
+    [companyId, aggregateKey],
   );
   if (!row) throw new Error(`Aggregate disappeared after join: ${aggregateKey}`);
   return fromRow(row);
@@ -76,18 +92,21 @@ export async function joinAggregate(
 
 export async function bindAggregateIssue(
   ctx: Pick<PluginContext, "db">,
+  companyId: string,
   aggregateKey: string,
   issueId: string,
   assignee: { assigneeUserId?: string; assigneeAgentId?: string },
 ): Promise<void> {
+  const aggregates = table(ctx, "alert_aggregates");
   await ctx.db.execute(
-    `UPDATE alert_aggregates
-        SET paperclip_issue_id = COALESCE(paperclip_issue_id, $2),
-            assignee_user_id = COALESCE(assignee_user_id, $3),
-            assignee_agent_id = COALESCE(assignee_agent_id, $4),
+    `UPDATE ${aggregates}
+        SET paperclip_issue_id = COALESCE(paperclip_issue_id, $3),
+            assignee_user_id = COALESCE(assignee_user_id, $4),
+            assignee_agent_id = COALESCE(assignee_agent_id, $5),
             updated_at = now()
-      WHERE aggregate_key = $1`,
+      WHERE company_id = $1 AND aggregate_key = $2`,
     [
+      companyId,
       aggregateKey,
       issueId,
       assignee.assigneeUserId ?? null,
@@ -98,80 +117,130 @@ export async function bindAggregateIssue(
 
 export async function getAggregate(
   ctx: Pick<PluginContext, "db">,
+  companyId: string,
   aggregateKey: string,
 ): Promise<AlertAggregateRecord | null> {
+  const aggregates = table(ctx, "alert_aggregates");
   const [row] = await ctx.db.query<AggregateRow>(
     `SELECT aggregate_key, company_id, paperclip_issue_id, alertname, severity,
             assignee_user_id, assignee_agent_id
-       FROM alert_aggregates
-      WHERE aggregate_key = $1`,
-    [aggregateKey],
+       FROM ${aggregates}
+       WHERE company_id = $1 AND aggregate_key = $2`,
+    [companyId, aggregateKey],
   );
   return row ? fromRow(row) : null;
 }
 
 export async function resolveAggregateMember(
   ctx: Pick<PluginContext, "db">,
+  companyId: string,
   aggregateKey: string,
   fingerprint: string,
   resolvedAt: string,
 ): Promise<{ memberKnown: boolean; finalResolutionClaim: string | null }> {
-  const member = await ctx.db.execute(
-    `UPDATE alert_members
-        SET firing = false, resolved_at = $3
-      WHERE aggregate_key = $1 AND fingerprint = $2 AND firing = true`,
-    [aggregateKey, fingerprint, resolvedAt],
-  );
-  if (member.rowCount === 0) {
-    const rows = await ctx.db.query<{ firing: boolean }>(
-      `SELECT firing FROM alert_members
-        WHERE aggregate_key = $1 AND fingerprint = $2`,
-      [aggregateKey, fingerprint],
-    );
-    return { memberKnown: rows.length > 0, finalResolutionClaim: null };
-  }
-
+  const aggregates = table(ctx, "alert_aggregates");
+  const members = table(ctx, "alert_members");
   const claim = randomUUID();
   const elected = await ctx.db.execute(
-    `UPDATE alert_aggregates AS aggregate
-        SET resolution_claim = $2,
-            resolution_claimed_at = now(),
+    `UPDATE ${aggregates} AS aggregate
+        SET active_fingerprints = array_remove(aggregate.active_fingerprints, $3),
+            resolution_claim = CASE
+              WHEN cardinality(array_remove(aggregate.active_fingerprints, $3)) = 0
+                AND aggregate.paperclip_issue_id IS NOT NULL
+                AND aggregate.final_resolved_at IS NULL
+                AND (
+                  aggregate.resolution_claim IS NULL OR
+                  aggregate.resolution_claimed_at < now() - interval '5 minutes'
+                )
+                THEN $4
+              ELSE aggregate.resolution_claim
+            END,
+            resolution_claimed_at = CASE
+              WHEN cardinality(array_remove(aggregate.active_fingerprints, $3)) = 0
+                AND aggregate.paperclip_issue_id IS NOT NULL
+                AND aggregate.final_resolved_at IS NULL
+                AND (
+                  aggregate.resolution_claim IS NULL OR
+                  aggregate.resolution_claimed_at < now() - interval '5 minutes'
+                )
+                THEN now()
+              ELSE aggregate.resolution_claimed_at
+            END,
+            resolution_generation = CASE
+              WHEN cardinality(array_remove(aggregate.active_fingerprints, $3)) = 0
+                AND aggregate.paperclip_issue_id IS NOT NULL
+                AND aggregate.final_resolved_at IS NULL
+                AND (
+                  aggregate.resolution_claim IS NULL OR
+                  aggregate.resolution_claimed_at < now() - interval '5 minutes'
+                )
+                THEN aggregate.generation
+              ELSE aggregate.resolution_generation
+            END,
             updated_at = now()
-      WHERE aggregate.aggregate_key = $1
-        AND aggregate.paperclip_issue_id IS NOT NULL
-        AND aggregate.final_resolved_at IS NULL
+      WHERE aggregate.company_id = $1
+        AND aggregate.aggregate_key = $2
         AND (
-          aggregate.resolution_claim IS NULL OR
-          aggregate.resolution_claimed_at < now() - interval '5 minutes'
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM alert_members AS member
-           WHERE member.aggregate_key = aggregate.aggregate_key
-             AND member.firing
+          $3 = ANY(aggregate.active_fingerprints) OR
+          EXISTS (
+            SELECT 1 FROM ${members} AS member
+           WHERE member.company_id = aggregate.company_id
+             AND member.aggregate_key = aggregate.aggregate_key
+             AND member.fingerprint = $3
+          )
         )`,
-    [aggregateKey, claim],
+    [companyId, aggregateKey, fingerprint, claim],
+  );
+  if (elected.rowCount === 0) {
+    return { memberKnown: false, finalResolutionClaim: null };
+  }
+  await ctx.db.execute(
+    `UPDATE ${members}
+        SET firing = false, resolved_at = $4
+      WHERE company_id = $1 AND aggregate_key = $2 AND fingerprint = $3 AND firing`,
+    [companyId, aggregateKey, fingerprint, resolvedAt],
+  );
+  const [aggregate] = await ctx.db.query<{ resolution_claim: string | null }>(
+    `SELECT resolution_claim FROM ${aggregates}
+      WHERE company_id = $1 AND aggregate_key = $2`,
+    [companyId, aggregateKey],
   );
   return {
     memberKnown: true,
-    finalResolutionClaim: elected.rowCount === 1 ? claim : null,
+    finalResolutionClaim: aggregate?.resolution_claim === claim ? claim : null,
   };
 }
 
 export async function completeAggregateResolution(
   ctx: Pick<PluginContext, "db">,
+  companyId: string,
   aggregateKey: string,
   claim: string,
   resolvedAt: string,
-): Promise<void> {
-  await ctx.db.execute(
-    `UPDATE alert_aggregates
-        SET final_resolved_at = $3,
+): Promise<"completed" | "firing" | "superseded"> {
+  const aggregates = table(ctx, "alert_aggregates");
+  const completed = await ctx.db.execute(
+    `UPDATE ${aggregates}
+        SET final_resolved_at = $4,
             resolution_claim = NULL,
             resolution_claimed_at = NULL,
+            resolution_generation = NULL,
             updated_at = now()
-      WHERE aggregate_key = $1 AND resolution_claim = $2`,
-    [aggregateKey, claim, resolvedAt],
+      WHERE company_id = $1
+        AND aggregate_key = $2
+        AND resolution_claim = $3
+        AND resolution_generation = generation
+        AND cardinality(active_fingerprints) = 0`,
+    [companyId, aggregateKey, claim, resolvedAt],
   );
+  if (completed.rowCount === 1) return "completed";
+  const firing = await ctx.db.query<{ present: boolean }>(
+    `SELECT cardinality(active_fingerprints) > 0 AS present
+       FROM ${aggregates}
+      WHERE company_id = $1 AND aggregate_key = $2`,
+    [companyId, aggregateKey],
+  );
+  return firing[0]?.present ? "firing" : "superseded";
 }
 
 function fromRow(row: AggregateRow): AlertAggregateRecord {

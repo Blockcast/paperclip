@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   resolveAssigneeUserId,
+  resolveFallbackAgentId,
   resolveOwnerEmail,
   resolveOwnerUserId,
 } from "../owner-resolver.js";
@@ -363,6 +364,61 @@ describe("resolveOwnerUserId — caching behaviour", () => {
     expect(await resolveOwnerUserId(ctx, "   ")).toBeUndefined();
     expect(state.get).not.toHaveBeenCalled();
     expect(users.findByEmail).not.toHaveBeenCalled();
+  });
+});
+
+describe("resolveFallbackAgentId — exhaustive lookup", () => {
+  it("finds a sole exact-name match beyond the first page", async () => {
+    const firstPage = Array.from({ length: 200 }, (_, index) => ({
+      id: `other-${index}`,
+      name: `Other ${index}`,
+    }));
+    const agents = {
+      list: vi
+        .fn()
+        .mockResolvedValueOnce(firstPage)
+        .mockResolvedValueOnce([{ id: "fallback", name: "Alert Fallback" }]),
+    };
+    const logger = { warn: vi.fn() };
+
+    await expect(
+      resolveFallbackAgentId(
+        { agents, logger } as unknown as Parameters<typeof resolveFallbackAgentId>[0],
+        "company-1",
+        "Alert Fallback",
+      ),
+    ).resolves.toBe("fallback");
+    expect(agents.list).toHaveBeenNthCalledWith(2, {
+      companyId: "company-1",
+      limit: 200,
+      offset: 200,
+    });
+  });
+
+  it("fails closed when a duplicate exact-name match exists on a later page", async () => {
+    const firstPage = [
+      { id: "first", name: "Alert Fallback" },
+      ...Array.from({ length: 199 }, (_, index) => ({
+        id: `other-${index}`,
+        name: `Other ${index}`,
+      })),
+    ];
+    const agents = {
+      list: vi
+        .fn()
+        .mockResolvedValueOnce(firstPage)
+        .mockResolvedValueOnce([{ id: "second", name: "alert fallback" }]),
+    };
+    const logger = { warn: vi.fn() };
+
+    await expect(
+      resolveFallbackAgentId(
+        { agents, logger } as unknown as Parameters<typeof resolveFallbackAgentId>[0],
+        "company-1",
+        "Alert Fallback",
+      ),
+    ).resolves.toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("resolved to 2 agents"));
   });
 });
 

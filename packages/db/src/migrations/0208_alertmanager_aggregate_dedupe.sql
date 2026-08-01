@@ -1,3 +1,5 @@
+LOCK TABLE issues IN SHARE ROW EXCLUSIVE MODE;
+--> statement-breakpoint
 WITH ranked AS (
   SELECT id,
          row_number() OVER (
