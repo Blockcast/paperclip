@@ -327,6 +327,11 @@ describe("approval routes idempotent retries", () => {
   });
 
   it("lets agents create generic issue-linked board approval requests", async () => {
+    const payload = {
+      title: "Approve hosting spend",
+      env: { target: "production" },
+      colorChoice: { type: "plain", value: "blue" },
+    };
     mockApprovalService.create.mockResolvedValue({
       id: "approval-1",
       companyId: "company-1",
@@ -334,7 +339,7 @@ describe("approval routes idempotent retries", () => {
       requestedByAgentId: "agent-1",
       requestedByUserId: null,
       status: "pending",
-      payload: { title: "Approve hosting spend" },
+      payload,
       decisionNote: null,
       decidedByUserId: null,
       decidedAt: null,
@@ -347,7 +352,7 @@ describe("approval routes idempotent retries", () => {
       .send({
         type: "request_board_approval",
         issueIds: ["00000000-0000-0000-0000-000000000001"],
-        payload: { title: "Approve hosting spend" },
+        payload,
       });
 
     expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
@@ -357,7 +362,12 @@ describe("approval routes idempotent retries", () => {
       requestedByAgentId: "agent-1",
       requestedByUserId: null,
       status: "pending",
+      payload,
     });
+    expect(mockApprovalService.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({ type: "request_board_approval", payload }),
+    );
     expect(mockSecretService.normalizeHireApprovalPayloadForPersistence).not.toHaveBeenCalled();
     expect(mockIssueApprovalService.linkManyForApproval).toHaveBeenCalledWith(
       "approval-1",

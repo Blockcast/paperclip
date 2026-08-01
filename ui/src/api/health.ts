@@ -20,6 +20,10 @@ export type HealthStatus = {
   deploymentMode?: "local_trusted" | "authenticated";
   deploymentExposure?: "private" | "public";
   authReady?: boolean;
+  auth?: {
+    emailPasswordEnabled: boolean;
+    oidcProviders: string[];
+  };
   bootstrapStatus?: "ready" | "bootstrap_pending";
   bootstrapInviteActive?: boolean;
   publicUrl?: string | null;

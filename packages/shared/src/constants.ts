@@ -479,8 +479,29 @@ export const ISSUE_EXECUTION_MONITOR_CLEAR_REASONS = [
   "dispatch_skipped",
   "timeout_exceeded",
   "max_attempts_exhausted",
+  "convergence_stalled",
 ] as const;
 export type IssueExecutionMonitorClearReason = (typeof ISSUE_EXECUTION_MONITOR_CLEAR_REASONS)[number];
+
+/**
+ * BLO-18294: which signal the convergence guard fingerprinted for a re-arm.
+ *
+ * `gates` — the issue's unresolved blocker edges and/or the monitor's declared
+ * `gateSignals`. When either exists, free-form `notes` is excluded from the
+ * fingerprint entirely, so churn in an incidental signal the agent happened to
+ * mention (the BLO-13266 staging CrashLoopBackOff) cannot read as progress.
+ * `notes` — fallback when nothing structured was declared; the normalized
+ * notes signature is all we have to tell one re-check from the next.
+ */
+export const ISSUE_MONITOR_GATE_SOURCES = ["gates", "notes"] as const;
+export type IssueMonitorGateSource = (typeof ISSUE_MONITOR_GATE_SOURCES)[number];
+
+/**
+ * BLO-18294: how many consecutive re-checks may report the same gate set before
+ * the monitor stops re-arming and the issue is escalated to `blocked`.
+ */
+export const DEFAULT_ISSUE_MONITOR_CONVERGENCE_THRESHOLD = 3;
+export const MAX_ISSUE_MONITOR_CONVERGENCE_THRESHOLD = 50;
 
 export const ISSUE_EXECUTION_DECISION_OUTCOMES = ["approved", "changes_requested"] as const;
 export type IssueExecutionDecisionOutcome = (typeof ISSUE_EXECUTION_DECISION_OUTCOMES)[number];

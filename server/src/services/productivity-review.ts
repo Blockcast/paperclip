@@ -89,6 +89,14 @@ type ProductivityReviewEvidence = {
   commentCountLastHour: number;
   commentCountLastSixHours: number;
   elapsedMs: number | null;
+  monitorGating: {
+    gatedMs: number;
+    unattendedMs: number;
+    lapsedAt: Date | null;
+    priorLapseAt: Date | null;
+    armedUntil: Date | null;
+    gatedIsUpperBound: boolean;
+  } | null;
   latestRuns: HeartbeatRunRow[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
@@ -206,6 +214,96 @@ function deliberateFutureMonitor(issue: IssueRow, now: Date) {
   return { monitorNextCheckAt, monitorScheduledBy };
 }
 
+/**
+ * Splits an active episode into the portion an armed monitor was accounting for
+ * and the portion nobody was watching, so a manager adjudicating a
+ * `long_active_duration` review can tell a deliberate monitor-gated wait from an
+ * unattended stall without cross-checking the source issue.
+ *
+ * Derived from the server-owned monitor columns rather than a full monitor
+ * history, so `gatedMs` is an upper bound: re-arm gaps inside the covered span
+ * are counted as gated. Where that bound is the whole episode — a monitor still
+ * armed, whose arm time no column records — the result sets
+ * `gatedIsUpperBound` so the manager-facing line carries the qualifier too.
+ * This is reporting only — it does not gate whether the review fires.
+ */
+function monitorGatingBreakdown(issue: IssueRow, activeStartedAt: Date | null, elapsedMs: number | null, now: Date) {
+  if (elapsedMs === null || !activeStartedAt) return null;
+  const armedUntil = coerceDate(issue.monitorNextCheckAt);
+  const lastTriggeredAt = coerceDate(issue.monitorLastTriggeredAt);
+
+  // Still armed for a future check. There is no arm-time column, so a monitor
+  // armed seconds ago is indistinguishable from one armed at `activeStartedAt`
+  // and the whole episode is attributed to gating — flagged as an upper bound,
+  // because reporting it flat would tell a manager that a 15h stall was fully
+  // accounted for when only the last 90s provably was.
+  if (armedUntil && armedUntil.getTime() > now.getTime()) {
+    return {
+      gatedMs: elapsedMs,
+      unattendedMs: 0,
+      lapsedAt: null,
+      priorLapseAt: null,
+      armedUntil,
+      gatedIsUpperBound: true,
+    };
+  }
+
+  // A monitor ran at some point and has since lapsed. Coverage ended at the
+  // later of its last trigger and its last scheduled check.
+  const lapseCandidates = [lastTriggeredAt, armedUntil].filter((d): d is Date => Boolean(d));
+  if (lapseCandidates.length === 0) {
+    return {
+      gatedMs: 0,
+      unattendedMs: elapsedMs,
+      lapsedAt: null,
+      priorLapseAt: null,
+      armedUntil: null,
+      gatedIsUpperBound: false,
+    };
+  }
+  const lapsedAt = new Date(Math.max(...lapseCandidates.map((d) => d.getTime())));
+
+  // Coverage that ended before this episode began belongs to a prior episode:
+  // none of this episode was gated, and calling it an in-episode lapse would
+  // print a timestamp from before `activeStartedAt`.
+  if (lapsedAt.getTime() <= activeStartedAt.getTime()) {
+    return {
+      gatedMs: 0,
+      unattendedMs: elapsedMs,
+      lapsedAt: null,
+      priorLapseAt: lapsedAt,
+      armedUntil: null,
+      gatedIsUpperBound: false,
+    };
+  }
+
+  const gatedMs = Math.min(elapsedMs, lapsedAt.getTime() - activeStartedAt.getTime());
+  return {
+    gatedMs,
+    unattendedMs: Math.max(0, elapsedMs - gatedMs),
+    lapsedAt,
+    priorLapseAt: null,
+    armedUntil: null,
+    gatedIsUpperBound: false,
+  };
+}
+
+function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["monitorGating"]>) {
+  // An upper-bound gated figure implies a lower-bound unattended figure; both
+  // carry a qualifier so neither half of the split reads as measured.
+  const gated = `${gating.gatedIsUpperBound ? "≤" : ""}${msToHuman(gating.gatedMs)} monitor-gated`;
+  const unattended = `${gating.gatedIsUpperBound ? "≥" : ""}${msToHuman(gating.unattendedMs)} unattended`;
+  const split = `${gated}, ${unattended}`;
+  if (gating.armedUntil) {
+    return `${split} (monitor armed until ${gating.armedUntil.toISOString()}; arm time is not recorded, so monitor-gated time is an upper bound)`;
+  }
+  if (gating.lapsedAt) return `${split} (monitor lapsed at ${gating.lapsedAt.toISOString()}, never re-armed)`;
+  if (gating.priorLapseAt) {
+    return `${split} (no monitor armed during this episode; previous monitor lapsed at ${gating.priorLapseAt.toISOString()}, before it began)`;
+  }
+  return `${split} (no monitor armed during this episode)`;
+}
+
 function isMonitorScheduledSuppression(
   value: ProductivityReviewEvidence | MonitorScheduledSuppression,
 ): value is MonitorScheduledSuppression {
@@ -292,6 +390,13 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
   return "Long active duration";
 }
 
+/**
+ * Either the pooled handle or an open transaction. Helpers that participate in
+ * the BLO-3737 refresh-throttle critical section accept this so the read and the
+ * write land on the same connection (and therefore inside the same advisory lock).
+ */
+type DbOrTx = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+
 export function productivityReviewService(db: Db, deps?: ProductivityReviewServiceDeps) {
   const issuesSvc = issueService(db);
   const budgets = budgetService(db);
@@ -377,22 +482,6 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .orderBy(desc(issues.updatedAt))
       .limit(1)
       .then((rows) => rows[0] ?? null);
-  }
-
-  async function findLatestRefreshCommentAt(companyId: string, reviewIssueId: string) {
-    return db
-      .select({ createdAt: issueComments.createdAt })
-      .from(issueComments)
-      .where(
-        and(
-          eq(issueComments.companyId, companyId),
-          eq(issueComments.issueId, reviewIssueId),
-          sql`${issueComments.body} like ${`${PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX}%`}`,
-        ),
-      )
-      .orderBy(desc(issueComments.createdAt))
-      .limit(1)
-      .then((rows) => rows[0]?.createdAt ?? null);
   }
 
   async function findRecentResolvedProductivityReview(
@@ -532,8 +621,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     return streak;
   }
 
-  async function getRefreshCommentState(companyId: string, reviewIssueId: string) {
-    return db
+  async function getRefreshCommentState(companyId: string, reviewIssueId: string, executor: DbOrTx = db) {
+    return executor
       .select({
         count: sql<number>`count(*)::int`,
         latestCreatedAt: sql<Date | null>`max(${issueComments.createdAt})`,
@@ -555,13 +644,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       });
   }
 
-  async function addRefreshComment(reviewIssueId: string, body: string, generatedAt: Date) {
-    const comment = await issuesSvc.addComment(reviewIssueId, body, {});
-    await db
+  async function addRefreshComment(
+    reviewIssueId: string,
+    body: string,
+    generatedAt: Date,
+    executor: DbOrTx = db,
+  ) {
+    const comment = await issuesSvc.addComment(reviewIssueId, body, {}, undefined, executor);
+    await executor
       .update(issueComments)
       .set({ createdAt: generatedAt, updatedAt: generatedAt })
       .where(eq(issueComments.id, comment.id));
-    await db
+    await executor
       .update(issues)
       .set({ updatedAt: generatedAt })
       .where(eq(issues.id, reviewIssueId));
@@ -892,6 +986,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       commentCountLastHour: assigneeRunCommentCountLastHour,
       commentCountLastSixHours: assigneeRunCommentCountLastSixHours,
       elapsedMs,
+      monitorGating: monitorGatingBreakdown(sourceIssue, activeStartedAt, elapsedMs, now),
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -1000,6 +1095,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
+      ...(evidence.monitorGating
+        ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
+        : []),
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
@@ -1048,6 +1146,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Reasons: ${evidence.triggerReasons.join("; ")}`,
       `- No-comment streak: ${evidence.noCommentStreak}`,
       `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
+      ...(evidence.monitorGating
+        ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
+        : []),
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
     ].join("\n");
   }
@@ -1076,28 +1177,54 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // skip the addComment so the review thread doesn't accumulate
       // ~identical "evidence refreshed" comments. The previous run
       // is reused as the {kind:"existing"} outcome.
-      const refreshState = await getRefreshCommentState(evidence.sourceIssue.companyId, existing.id);
-      const lastRefreshAt = refreshState.latestCreatedAt ?? existing.createdAt;
+      //
+      // BLO-3737: read-then-write across two statements let concurrent
+      // reconciles (the 30s scheduler overlapping itself) both observe the
+      // pre-write state and both pass the gate — BLO-3277 accumulated 14
+      // refreshes in 6 minutes that way. Hold a transaction-scoped advisory
+      // lock keyed on the review issue for the whole check-then-append, so
+      // the second reconcile blocks until the first commits and then sees
+      // its comment. `pg_advisory_xact_lock` waits rather than failing and
+      // is released on commit/rollback, so no unlock bookkeeping is needed.
       const effectiveRefreshIntervalMs = Math.max(
         PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS,
         opts.thresholds.refreshIntervalMs,
       );
-      if (
-        refreshState.count >= opts.thresholds.maxRefreshComments ||
-        evidence.generatedAt.getTime() - lastRefreshAt.getTime() < effectiveRefreshIntervalMs
-      ) {
+      const refreshOutcome = await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${evidence.sourceIssue.companyId} || ':' || ${existing.id}, 0))`,
+        );
+
+        const refreshState = await getRefreshCommentState(evidence.sourceIssue.companyId, existing.id, tx);
+        const lastRefreshAt = refreshState.latestCreatedAt ?? existing.createdAt;
+        if (
+          refreshState.count >= opts.thresholds.maxRefreshComments ||
+          evidence.generatedAt.getTime() - lastRefreshAt.getTime() < effectiveRefreshIntervalMs
+        ) {
+          return { throttled: true as const, lastRefreshAt };
+        }
+
+        await addRefreshComment(
+          existing.id,
+          buildRefreshComment(evidence, opts.prefix),
+          evidence.generatedAt,
+          tx,
+        );
+        return { throttled: false as const, lastRefreshAt };
+      });
+
+      if (refreshOutcome.throttled) {
         logger.debug(
           {
             reviewIssueId: existing.id,
             sourceIssueId: evidence.sourceIssue.id,
-            lastRefreshAt: lastRefreshAt.toISOString(),
+            lastRefreshAt: refreshOutcome.lastRefreshAt.toISOString(),
             minIntervalMs: effectiveRefreshIntervalMs,
           },
           "productivity review refresh throttled: previous refresh within hard-floor window",
         );
         return { kind: "existing" as const, reviewIssueId: existing.id };
       }
-      await addRefreshComment(existing.id, buildRefreshComment(evidence, opts.prefix), evidence.generatedAt);
       await logActivity(db, {
         companyId: evidence.sourceIssue.companyId,
         actorType: "system",

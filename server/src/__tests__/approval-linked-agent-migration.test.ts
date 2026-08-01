@@ -12,7 +12,7 @@ import {
 import { eq, sql } from "drizzle-orm";
 import { approvalService } from "../services/approvals.js";
 
-const MIGRATION_FILE = "0207_approval_linked_agent.sql";
+const MIGRATION_FILE = "0208_approval_linked_agent.sql";
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
 

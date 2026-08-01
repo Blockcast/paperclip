@@ -79,6 +79,24 @@ const listIssuesSchema = z.object({
   originId: z.string().optional(),
   includeRoutineExecutions: z.boolean().optional(),
   includeLiveDescendantSummary: z.boolean().optional(),
+  parentId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe(
+      "Return the DIRECT children of this issue. There is no `children` field on any issue read — this filter is the only way to enumerate sub-issues. An epic that looks childless because you did not pass this has NOT been shown to be childless.",
+    ),
+  descendantOf: z
+    .string()
+    .uuid()
+    .optional()
+    .describe("Return the whole subtree under this issue (all descendants, not just direct children)."),
+  includeBlockedBy: z
+    .boolean()
+    .optional()
+    .describe(
+      "Hydrate `blockedBy` on every row. Default false, in which case the key is ABSENT (not `[]`) — do not read a missing key as 'no blockers'. `blocks` is never hydrated on list at any setting; use paperclipGetIssue for that.",
+    ),
   q: z.string().optional(),
 });
 
@@ -315,7 +333,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipListIssues",
-      "List issues for a company with optional filters (status, projectId, assigneeAgentId, labelId, q, ...). Omitting a filter does not scope it — pass status explicitly if you only want open work; unfiltered can return the full company backlog.",
+      "List issues for a company with optional filters (status, projectId, assigneeAgentId, labelId, q, ...). Omitting a filter does not scope it — pass status explicitly if you only want open work; unfiltered can return the full company backlog.\n\nRELATIONAL FIELDS ARE NOT HYDRATED HERE. `blockedBy` is absent unless you pass includeBlockedBy=true; `blocks` and `children` are NEVER present at any setting. An absent key is not an empty relation — never conclude 'this issue has no blockers' or 'this epic has no children' from a list row. To enumerate children pass parentId (direct) or descendantOf (subtree); to read `blocks`, call paperclipGetIssue.\n\n`blockerAttention` is a coarse triage signal, NOT a summary of `blockedBy`, and reading it as one is wrong in three ways: (1) it is only computed for rows whose status is literally `blocked` — on every other row it is all-zeros meaning NOT COMPUTED, not 'no blockers'; (2) `unresolvedBlockerCount` counts explicit blockers UNION open child issues, so it legitimately exceeds `blockedBy.length`; (3) `sampleBlockerIdentifier` is drawn from the transitive closure and often names an issue absent from `blockedBy`. Use it to rank attention, never to decide a specific issue is unblocked.",
       listIssuesSchema,
       async (input) => listIssues(client, input),
     ),
@@ -327,7 +345,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipGetIssue",
-      "Get a single issue by UUID or identifier. Cross-company identifiers (e.g. PEN-307) are routed by prefix; the optional company override takes precedence. Dependency edges appear under `blockedBy` (issues blocking this one) and `blocks` (issues this one blocks); the write-only `blockedByIssueIds` field is null here. Use `blockedBy`/`blocks` to read the dependency graph.",
+      "Get a single issue by UUID or identifier. Cross-company identifiers (e.g. PEN-307) are routed by prefix; the optional company override takes precedence. Dependency edges appear under `blockedBy` (issues blocking this one) and `blocks` (issues this one blocks); the write-only `blockedByIssueIds` field is null here. Use `blockedBy`/`blocks` to read the dependency graph — both are always hydrated on this call, which is why it is the authoritative blocker read.\n\nThere is NO `children` field here (despite older docs claiming one). To enumerate sub-issues call paperclipListIssues with parentId=<this issue id> for direct children, or descendantOf=<id> for the whole subtree.",
       z.object({ issueId: issueIdSchema, company: companyIdOptional }),
       async ({ issueId, company }) => {
         if (!company?.trim()) {

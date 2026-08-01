@@ -77,6 +77,7 @@ async function createIssue(
     projectId?: string | null;
     parentId?: string | null;
     assigneeAgentId?: string | null;
+    createdByAgentId?: string | null;
     originKind?: string | null;
     originId?: string | null;
   } = {},
@@ -92,6 +93,7 @@ async function createIssue(
       projectId: input.projectId ?? null,
       parentId: input.parentId ?? null,
       assigneeAgentId: input.assigneeAgentId ?? null,
+      createdByAgentId: input.createdByAgentId ?? null,
       originKind: input.originKind ?? "manual",
       originId: input.originId ?? null,
     })
@@ -1778,6 +1780,142 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  // BLO-18289 (decision on BLO-18163): coordination metadata on an issue
+  // assigned to someone else needs BOTH an explicit tasks:assign grant AND
+  // management of the assignee. The second condition is load-bearing: the
+  // grant is issued near-universally in practice (12 of 13 active agents in
+  // the founding company hold it, unscoped), so grant-only would hand every
+  // agent write access to every other agent's coordination metadata.
+  it("allows a managing tasks:assign holder to touch a report's coordination metadata", async () => {
+    const company = await createCompany(db, "CoordManager");
+    const managerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const reportAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: managerAgent.id });
+    await grantAgentPermission(db, company.id, managerAgent.id, "tasks:assign");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: managerAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:coordination_metadata",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: reportAgent.id },
+    });
+
+    expect(decision.allowed, decision.explanation).toBe(true);
+  });
+
+  it("denies coordination metadata to a tasks:assign holder who does not manage the assignee", async () => {
+    const company = await createCompany(db, "CoordPeer");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const peerAgent = await createAgent(db, company.id, { role: "engineer" });
+    await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:coordination_metadata",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: peerAgent.id },
+    });
+
+    expect(decision).toMatchObject({ allowed: false, reason: "deny_scope" });
+  });
+
+  it("denies coordination metadata to a manager without a tasks:assign grant", async () => {
+    const company = await createCompany(db, "CoordUngranted");
+    const managerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const reportAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: managerAgent.id });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: managerAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:coordination_metadata",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: reportAgent.id },
+    });
+
+    expect(decision.allowed, decision.explanation).toBe(false);
+  });
+
+  // The CEO sits above every agent, which is what makes the BLO-18163 sweep
+  // (curating blocker edges across the whole company) work end to end.
+  it("allows a company-root actor to reach an indirect report's coordination metadata", async () => {
+    const company = await createCompany(db, "CoordRoot");
+    const rootAgent = await createAgent(db, company.id, { role: "ceo" });
+    const midAgent = await createAgent(db, company.id, { role: "cto", reportsTo: rootAgent.id });
+    const leafAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: midAgent.id });
+    await grantAgentPermission(db, company.id, rootAgent.id, "tasks:assign");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: rootAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:coordination_metadata",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: leafAgent.id },
+    });
+
+    expect(decision.allowed, decision.explanation).toBe(true);
+  });
+
+  // Self-owned and unassigned issues already carry ordinary issue:mutate
+  // authority; this action must not become a second, weaker way in.
+  it("denies coordination metadata on an unassigned issue", async () => {
+    const company = await createCompany(db, "CoordUnassigned");
+    const actorAgent = await createAgent(db, company.id, { role: "ceo" });
+    await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:coordination_metadata",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: null },
+    });
+
+    expect(decision).toMatchObject({ allowed: false, reason: "deny_scope" });
+  });
+
+  // A legacy CEO-tier actor gets tasks:manage_active_checkouts without a
+  // grant row; coordination metadata deliberately does NOT inherit that
+  // shortcut, so the grant stays the thing an operator can revoke.
+  it("does not grant coordination metadata through legacy agent-creator authority alone", async () => {
+    const company = await createCompany(db, "CoordLegacy");
+    const ceoAgent = await createAgent(db, company.id, { role: "ceo" });
+    const reportAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: ceoAgent.id });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: ceoAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:coordination_metadata",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: reportAgent.id },
+    });
+
+    expect(decision.allowed, decision.explanation).toBe(false);
+  });
+
+  // A heartbeat run carries onBehalfOfUserId, so every real coordination PATCH
+  // goes through the responsible-user intersection. There is no board
+  // permission mapping for issue:coordination_metadata, so without an entry in
+  // activeResponsibleUserCanAuthorizeIssueAction the intersection denies it as
+  // an unsupported action and the agent-side allow is never reached — the
+  // whole feature would pass unit tests and fail in production.
+  it("does not let the responsible-user intersection deny coordination metadata as unsupported", async () => {
+    const company = await createCompany(db, "CoordResponsibleUser");
+    const managerAgent = await createAgent(db, company.id, { role: "ceo" });
+    const reportAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: managerAgent.id });
+    const responsibleUserId = await createUser(db);
+    await grantAgentPermission(db, company.id, managerAgent.id, "tasks:assign");
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: responsibleUserId,
+      status: "active",
+      membershipRole: "operator",
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: {
+        type: "agent",
+        agentId: managerAgent.id,
+        companyId: company.id,
+        onBehalfOfUserId: responsibleUserId,
+        source: "agent_jwt",
+      },
+      action: "issue:coordination_metadata",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: reportAgent.id },
+    });
+
+    expect(decision.allowed, decision.explanation).toBe(true);
+  });
+
   it("denies execution-stage override for an unrelated peer agent", async () => {
     const company = await createCompany(db, "UnrelatedOverride");
     const actorAgent = await createAgent(db, company.id, { role: "engineer" });
@@ -1812,6 +1950,234 @@ describeEmbeddedPostgres("authorization service", () => {
       reason: "deny_company_boundary",
     });
     expect(decision.explanation).toContain("another company");
+  });
+
+  it("allows an agent to comment on a child issue it created and assigned to someone else (BLO-18113)", async () => {
+    const company = await createCompany(db, "ChildDelegationCreator");
+    const managerAgent = await createAgent(db, company.id, { role: "ceo" });
+    const parentIssue = await createIssue(db, company.id, {
+      title: "Parent issue the manager is checked out against",
+      createdByAgentId: managerAgent.id,
+    });
+    const assigneeAgent = await createAgent(db, company.id, { role: "engineer" });
+    const childIssue = await createIssue(db, company.id, {
+      title: "Child issue delegated away",
+      parentId: parentIssue.id,
+      assigneeAgentId: assigneeAgent.id,
+      createdByAgentId: managerAgent.id,
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: managerAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:comment",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: childIssue.id,
+        parentIssueId: parentIssue.id,
+        assigneeAgentId: assigneeAgent.id,
+        createdByAgentId: childIssue.createdByAgentId,
+        status: childIssue.status,
+      },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      reason: "allow_issue_creator",
+    });
+
+    const mutateDecision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: managerAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: childIssue.id,
+        parentIssueId: parentIssue.id,
+        assigneeAgentId: assigneeAgent.id,
+        createdByAgentId: childIssue.createdByAgentId,
+        status: childIssue.status,
+      },
+    });
+
+    expect(mutateDecision).toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
+  it("allows an org-chain manager to comment on a report's issue even without creating or being mentioned on it", async () => {
+    const company = await createCompany(db, "ChildDelegationManagerChain");
+    const managerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const reportAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: managerAgent.id });
+    const issue = await createIssue(db, company.id, {
+      title: "Issue assigned to a direct report",
+      assigneeAgentId: reportAgent.id,
+      createdByAgentId: reportAgent.id,
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: managerAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:comment",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        assigneeAgentId: reportAgent.id,
+        createdByAgentId: issue.createdByAgentId,
+        status: issue.status,
+      },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      reason: "allow_manager_chain",
+    });
+
+    const mutateDecision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: managerAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        assigneeAgentId: reportAgent.id,
+        createdByAgentId: issue.createdByAgentId,
+        status: issue.status,
+      },
+    });
+
+    expect(mutateDecision).toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
+  it("allows a skip-level manager to comment on a grand-report's issue but not mutate it (BLO-18797)", async () => {
+    const company = await createCompany(db, "ChildDelegationSkipLevelManager");
+    const ceoAgent = await createAgent(db, company.id, { role: "ceo" });
+    const ctoAgent = await createAgent(db, company.id, { role: "cto", reportsTo: ceoAgent.id });
+    const reportAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: ctoAgent.id });
+    const issue = await createIssue(db, company.id, {
+      title: "Issue assigned to a grand-report",
+      assigneeAgentId: reportAgent.id,
+      createdByAgentId: reportAgent.id,
+    });
+
+    const commentDecision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: ceoAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:comment",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        assigneeAgentId: reportAgent.id,
+        createdByAgentId: issue.createdByAgentId,
+        status: issue.status,
+      },
+    });
+
+    expect(commentDecision).toMatchObject({
+      allowed: true,
+      reason: "allow_manager_chain",
+    });
+
+    const mutateDecision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: ceoAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        assigneeAgentId: reportAgent.id,
+        createdByAgentId: issue.createdByAgentId,
+        status: issue.status,
+      },
+    });
+
+    expect(mutateDecision).toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
+  it("does not let a report comment upward onto its own manager's issue (BLO-18797)", async () => {
+    const company = await createCompany(db, "ManagerChainDirection");
+    const managerAgent = await createAgent(db, company.id, { role: "cto" });
+    const reportAgent = await createAgent(db, company.id, {
+      role: "engineer",
+      reportsTo: managerAgent.id,
+    });
+    const managerIssue = await createIssue(db, company.id, {
+      assigneeAgentId: managerAgent.id,
+      createdByAgentId: managerAgent.id,
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: reportAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:comment",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: managerIssue.id,
+        assigneeAgentId: managerAgent.id,
+        createdByAgentId: managerIssue.createdByAgentId,
+        status: managerIssue.status,
+      },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
+  it("still denies comments on a genuinely unrelated issue (negative case, BLO-18113)", async () => {
+    const company = await createCompany(db, "ChildDelegationUnrelated");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const creatorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const assigneeAgent = await createAgent(db, company.id, { role: "engineer" });
+    const unrelatedIssue = await createIssue(db, company.id, {
+      title: "Issue the actor has no relationship to",
+      assigneeAgentId: assigneeAgent.id,
+      createdByAgentId: creatorAgent.id,
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:comment",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: unrelatedIssue.id,
+        assigneeAgentId: assigneeAgent.id,
+        createdByAgentId: unrelatedIssue.createdByAgentId,
+        status: unrelatedIssue.status,
+      },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+
+    const mutateDecision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: unrelatedIssue.id,
+        assigneeAgentId: assigneeAgent.id,
+        createdByAgentId: unrelatedIssue.createdByAgentId,
+        status: unrelatedIssue.status,
+      },
+    });
+
+    expect(mutateDecision).toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
   });
 
   it("allows scoped assignment inside a granted project and denies other projects", async () => {
