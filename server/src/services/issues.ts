@@ -924,6 +924,34 @@ export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set([
   "timed_out",
 ]);
 const STALE_ISSUE_CONTEXT_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
+// Same statuses, as a lookup set: these are the non-terminal statuses a run can
+// hold before it has ever executed.
+const NEVER_STARTED_HEARTBEAT_RUN_STATUSES = new Set<string>(STALE_ISSUE_CONTEXT_RUN_STATUSES);
+
+// BLO-20321: a run that exists but has never executed holds no real claim on an
+// issue. `queued` and `scheduled_retry` are non-terminal, so a terminal-only
+// staleness test read them as a live owner and answered the assignee's own write
+// with 409 "Issue run ownership conflict". That made WIP monotonic: checkout adds
+// WIP without a lock, while parking or closing needs the lock — and the lock was
+// held by the very queue backlog being drained.
+//
+// Reaping is gated on `startedAt == null` as well as status, so a run that has
+// actually begun is never reaped here even if its status column is momentarily
+// out of step. The race protection the guard exists for is preserved: a genuinely
+// `running` owner still conflicts.
+//
+// This is the single source of truth for "is this lock owner reapable". There are
+// two call sites that read the run row themselves (adoptStaleCheckoutRun, inside a
+// tx) and one that loads it (isReapableHeartbeatRun); they must not drift, because
+// adoptStaleCheckoutRun runs FIRST and a non-stale verdict there throws the 409
+// before the other is ever consulted.
+function isReapableHeartbeatRunRow(
+  run: { status: string; startedAt: Date | null } | null | undefined,
+): boolean {
+  if (!run) return true;
+  if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
+  return NEVER_STARTED_HEARTBEAT_RUN_STATUSES.has(run.status) && run.startedAt == null;
+}
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 
 function escapeLikePattern(value: string): string {
@@ -5110,6 +5138,16 @@ export function issueService(db: Db) {
     return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
   }
 
+  // BLO-20321: loads the run row and defers to isReapableHeartbeatRunRow.
+  async function isReapableHeartbeatRun(runId: string, dbOrTx: DbReader = db) {
+    const run = await dbOrTx
+      .select({ status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    return isReapableHeartbeatRunRow(run);
+  }
+
   async function isSameAgentRetryOfRun(input: {
     actorRunId: string;
     expectedCheckoutRunId: string;
@@ -5268,7 +5306,7 @@ export function issueService(db: Db) {
       ]);
       const [existingRun, actorRun] = await Promise.all([
         tx
-          .select({ status: heartbeatRuns.status })
+          .select({ status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, input.expectedCheckoutRunId))
           .then((rows) => rows[0] ?? null),
@@ -5282,7 +5320,11 @@ export function issueService(db: Db) {
           .where(eq(heartbeatRuns.id, input.actorRunId))
           .then((rows) => rows[0] ?? null),
       ]);
-      const stale = !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
+      // BLO-20321: same reapability rule as clearStaleExecutionLock. This test
+      // runs FIRST when checkoutRunId is set, so a divergence here would make the
+      // fix unreachable for the common shape (checkout and execution locks both
+      // pointing at one never-started run).
+      const stale = isReapableHeartbeatRunRow(existingRun);
       const actorLive = actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status);
       const sameAgentRetry =
         actorRun?.agentId === input.actorAgentId &&
@@ -5446,7 +5488,12 @@ export function issueService(db: Db) {
   }
 
   async function clearStaleExecutionLock(issueId: string, expectedExecutionRunId: string) {
-    const stale = await isTerminalOrMissingHeartbeatRun(expectedExecutionRunId);
+    // BLO-20321: reap never-started (`queued` / `scheduled_retry`) owners as well
+    // as terminal ones. Callers re-acquire the lock and then run
+    // cancelStaleIssueContextRuns(keepRunId: <actor run>), which cancels the
+    // superseded run — so it cannot start later against a status the assignee has
+    // since changed.
+    const stale = await isReapableHeartbeatRun(expectedExecutionRunId);
     if (!stale) return false;
 
     const cleared = await db
@@ -8846,6 +8893,13 @@ export function issueService(db: Db) {
       // Adopt stale executionRunId — if the execution lock points to a terminal/missing run, clear it and proceed.
       // Only adopts when the caller's expectedStatuses guard still holds; preserves any existing assigneeUserId
       // and preserves the original startedAt when the issue is already in_progress.
+      //
+      // BLO-20321 deliberately left this branch terminal-only. Checkout is not
+      // where the WIP defect bites (checkout adds WIP; it is parking/closing that
+      // was blocked), and widening here would change which branch handles a
+      // never-started owner — this one preserves startedAt, the
+      // clearStaleExecutionLock fallback below resets it. A never-started owner
+      // now falls through to that fallback and is adopted there.
       if (
         checkoutRunId &&
         current.executionRunId &&
@@ -9275,7 +9329,10 @@ export function issueService(db: Db) {
           existing.checkoutRunId &&
           !sameRunLock(existing.checkoutRunId, actorRunId ?? null)
         ) {
-          const stale = await isTerminalOrMissingHeartbeatRun(existing.checkoutRunId, tx);
+          // BLO-20321: mirror the PATCH guard — a never-started owner does not
+          // block the assignee's own release. The unconditional
+          // cancelStaleIssueContextRuns below reaps the superseded run.
+          const stale = await isReapableHeartbeatRun(existing.checkoutRunId, tx);
           if (!stale) {
             throw conflict("Only checkout run can release issue", {
               issueId: existing.id,
