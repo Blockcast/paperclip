@@ -70,7 +70,7 @@ Overrides and special cases:
 
 - `PAPERCLIP_TASK_ID` set and assigned to you → prioritize that task first.
 - `PAPERCLIP_WAKE_REASON=issue_commented` with `PAPERCLIP_WAKE_COMMENT_ID` → read the comment, then checkout and address the feedback (applies to `in_review` too).
-- `PAPERCLIP_WAKE_REASON=issue_comment_mentioned` → read the comment thread first even if you're not the assignee. Self-assign (via checkout) only if the comment explicitly directs you to take the task. Otherwise respond in comments if useful and continue with your own assigned work; do not self-assign.
+- `PAPERCLIP_WAKE_REASON=issue_comment_mentioned` → read the comment thread first even if you're not the assignee. Self-assign (via checkout) only if the comment explicitly directs you to take the task. Otherwise respond in comments if useful and continue with your own assigned work; do not self-assign. **Being mentioned does not by itself let you reply.** `issue:comment` is granted only when the mentioning comment's author is that issue's own assignee (or a board user) — a mention written by any other agent wakes you but leaves you unauthorized, and the reply returns `403 deny_missing_grant`. Check `replyAuthorization` on `GET /api/issues/{id}/heartbeat-context` before composing a reply: `canComment: false` carries a `remediation` naming who can grant it and where to respond instead. Don't retry the 403 — record your finding on an issue you're assigned to and reference this one, or ask the assignee to mention you here.
 - Wake payload says `dependency-blocked interaction: yes` → the issue is still blocked for deliverable work. Do not try to unblock it. Read the comment, name the unresolved blocker(s), and respond/triage via comments or documents. Use the scoped wake context rather than treating a checkout failure as a blocker.
 - **Blocked-task dedup:** before touching a `blocked` task, check the thread. If your most recent comment was a blocked-status update and no one has replied since, skip entirely — do not checkout, do not re-comment. Only re-engage on new context (comment, status change, event wake).
 - Nothing assigned and no valid mention handoff → exit the heartbeat.
@@ -136,6 +136,17 @@ Before ending any heartbeat, apply this final-disposition checklist:
 - `blocked`: work cannot continue until first-class `blockedByIssueIds` resolve or a named owner takes a concrete unblock action.
 - Delegated follow-up: create the follow-up issue directly, link it with `parentId`/`goalId`, and use blockers when the current issue must wait for that work.
 - Explicit continuation: keep the issue `in_progress` only when there is an active run, queued continuation, or monitor/recovery path that will wake the responsible assignee. Successful artifact work left in `in_progress` with no live path is invalid; update the status/path instead.
+
+**Closing to `done` may be gated.** When the instance runs with `enableDoneExecutionGate`, `PATCH {status: "done"}` from an agent is rejected `422` with `details.reason: "no_execution_run_and_no_pr_evidence"` unless one of three things holds: the issue is still holding an execution run, `pr-link` evidence was recorded, or the issue carries a **run-attributed durable artifact**. Produce the artifact *before* you attempt the close rather than discovering the gate at 422.
+
+If your work produces no commit — an investigation, config archaeology, a premise audit, an operational receipt — promote the deliverable out of the comment thread into an issue document first:
+
+```
+PUT /api/issues/{issueId}/documents/findings
+{ "title": "Findings", "body": "## Findings\n..." }
+```
+
+A comment body never satisfies the gate, no matter how well sourced; neither does the `plan` document (it is intent, not deliverable). Write the artifact from inside the run that closes the issue, so the server can attribute it. See the **paperclip-evidence-before-in-review** skill, "Closing to `done`", for the full rule set (BLO-19081).
 
 When writing issue descriptions or comments, follow the ticket-linking rule in **Comment Style** below.
 

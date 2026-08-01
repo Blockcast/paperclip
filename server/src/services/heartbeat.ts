@@ -88,6 +88,7 @@ import {
   deleteAgentJobExact,
   deleteAgentJobsForRun,
   deleteAgentPodExact,
+  captureAgentJobFailureDiagnostics,
   hasActiveJobForAgent,
   indexUniqueAgentJobRunStatuses,
   listAgentJobRunStatuses,
@@ -168,6 +169,8 @@ import {
 } from "./issue-rewake-throttle.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
 import { githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
+import { loadConfig } from "../config.js";
+import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
 import {
   ensureReferencedSharedDocsMaterialized,
   normalizeInstructionsEntryFile,
@@ -404,7 +407,7 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
  * misconfigured `maxConcurrentRuns` cannot alone blow past what the cluster
  * is provisioned to run for one agent concurrently.
  */
-const EXTERNAL_LIFECYCLE_SLOT_CAPACITY = 5;
+const EXTERNAL_LIFECYCLE_SLOT_CAPACITY = 8;
 const STALE_QUEUED_MAINTENANCE_WAKE_MAX_AGE_MS = 30 * 60 * 1000;
 const STALE_QUEUED_MAINTENANCE_WAKE_BATCH_SIZE = 250;
 const STALE_QUEUED_MAINTENANCE_WAKE_REASONS = [
@@ -771,7 +774,10 @@ export function shouldScheduleAutomaticRunRetry(
   // instead of the platform just trying again. Bounded-retry it like the other
   // pr_review-scoped recoverable failures above so a transient posting glitch
   // self-heals instead of silently stranding the exact-head gate.
-  if (run.errorCode === "pr_review_output_missing") {
+  if (
+    run.errorCode === "pr_review_output_missing" ||
+    run.errorCode === "pr_review_verification_unavailable"
+  ) {
     return isPrReviewRetryContext(parseObject(run.contextSnapshot));
   }
 
@@ -3143,6 +3149,7 @@ function looksLikeRetryableDeadlineExceeded(value: unknown): boolean {
 // decides when a closed account window reopens). Only no-hint server-fault
 // shapes land here.
 const TRANSIENT_UPSTREAM_STATUS_CODES = new Set(["503", "529"]);
+const TRANSIENT_UPSTREAM_TEXT_KEYS = ["result", "message", "error", "summary"] as const;
 const TRANSIENT_UPSTREAM_TEXT_PATTERNS = [
   /API Error:\s*(?:503|529)\b/i,
   /service\s+(?:is\s+)?(?:temporarily\s+)?unavailable/i,
@@ -3151,6 +3158,33 @@ const TRANSIENT_UPSTREAM_TEXT_PATTERNS = [
   /overloaded_error/i,
   /\bserver_error\b/i,
 ];
+
+// BLO-19879: the penstock gateway answers `400 {"code":"allocation_missing"}`
+// when it routes a request to a BYOS vault node that does not serve the
+// requested provider. Despite the 4xx status this is a *gateway-side routing*
+// fault, not a malformed request: the same payload succeeds as soon as a
+// provider-capable node is back in the active set. On 2026-07-31, while the
+// only anthropic-capable node (`blockcast-omar`, replicas: 1) was unavailable
+// 16:50–17:20Z, provider-blind failover sent anthropic traffic to
+// `blockcast-sfo12` (PENSTOCK_VAULT_PROVIDERS=openai,codex) and stranded 80
+// runs as terminal `adapter_failed` — 70.5% of all failed runs in the burst.
+//
+// This MUST be tested before the authoritative-status short-circuit in
+// isHintlessTransientUpstreamFault: these runs carry api_error_status=400, so
+// a TRANSIENT_UPSTREAM_TEXT_PATTERNS entry alone would never be reached and
+// would be a silent no-op.
+//
+// Matched on the machine-readable `code`, not the prose, so a reworded gateway
+// message cannot silently drop it back to terminal. Scoped to this one code
+// rather than 400s generally — a genuine bad request must still fail fast
+// instead of burning the full 2m/10m/30m/2h retry curve.
+const GATEWAY_ALLOCATION_FAULT_PATTERN = /^\s*(?:API Error:\s*400\b[^{]*)?\{[\s\S]*"code"\s*:\s*"allocation_missing"/i;
+const GATEWAY_ALLOCATION_FAULT_TEXT_KEYS = ["result", "error"] as const;
+
+function looksLikeGatewayAllocationFault(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  return GATEWAY_ALLOCATION_FAULT_PATTERN.test(value);
+}
 
 function looksLikeTransientUpstreamText(value: unknown): boolean {
   if (typeof value !== "string") return false;
@@ -3168,10 +3202,35 @@ function normalizeHttpStatusCode(value: unknown): string | null {
   return String(parsed);
 }
 
+function allocationFaultStatusGate(resultJson: Record<string, unknown> | null | undefined): "allow" | "deny" {
+  if (!resultJson) return "allow";
+  let hasAuthoritativeStatus = false;
+  for (const key of ["api_error_status", "error_status"] as const) {
+    const status = normalizeHttpStatusCode(resultJson[key]);
+    if (status == null) continue;
+    if (status === "400") return "allow";
+    hasAuthoritativeStatus = true;
+  }
+  return hasAuthoritativeStatus ? "deny" : "allow";
+}
+
 export function isHintlessTransientUpstreamFault(
   resultJson: Record<string, unknown> | null | undefined,
   opts?: { errorMessage?: string | null },
 ): boolean {
+  // BLO-19879: checked first, above the authoritative-status short-circuit
+  // below, because the gateway allocation fault carries a 400 and would
+  // otherwise be rejected before any text matching runs. Still require an
+  // actual 400 when resultJson carries an authoritative status, and match only
+  // gateway-shaped payload text so agent-authored prose that merely quotes the
+  // literal cannot turn terminal 401/403/etc. failures into scheduled retries.
+  if (allocationFaultStatusGate(resultJson) === "allow" && resultJson) {
+    for (const key of GATEWAY_ALLOCATION_FAULT_TEXT_KEYS) {
+      if (looksLikeGatewayAllocationFault(resultJson[key])) return true;
+    }
+  }
+  if (looksLikeGatewayAllocationFault(opts?.errorMessage)) return true;
+
   // Two status surfaces: the Claude SDK's final result event uses
   // `api_error_status`, while the per-attempt `api_retry` events that precede
   // an exhausted retry budget use `error_status` — the latter is the field the
@@ -3186,7 +3245,7 @@ export function isHintlessTransientUpstreamFault(
   if (hasAuthoritativeStatus) return false;
 
   if (resultJson) {
-    for (const key of ["result", "message", "error", "summary"] as const) {
+    for (const key of TRANSIENT_UPSTREAM_TEXT_KEYS) {
       if (looksLikeTransientUpstreamText(resultJson[key])) return true;
     }
   }
@@ -3205,6 +3264,83 @@ function retryAfterDelayMs(value: unknown): number | null {
   const parsed = typeof value === "number" ? value : typeof value === "string" ? Number.parseFloat(value) : NaN;
   if (!Number.isFinite(parsed) || parsed < 0) return null;
   return Math.ceil(parsed * 1000);
+}
+
+// BLO-18278: a provider capacity 429 tells us exactly when to come back, but on
+// the k8s adapters it says so in PROSE, inside the error message:
+//
+//   API Error: Request rejected (429) · BYOS provider capacity for 'anthropic'
+//   is temporarily unavailable; capacity may reset at 2026-07-26T21:29:59.782Z;
+//   retry in 9571s
+//
+// Nothing was reading that. claude-local/codex-local parse it adapter-side
+// (claude-local/src/server/parse.ts) and hand back a structured `retryNotBefore`,
+// but the shipped claude_k8s / opencode_k8s adapter bundles contain no
+// occurrence of `retryNotBefore`, `capacity may reset`, `resume_at`, or
+// `retry_after` at all — so on those adapters the horizon reached heartbeat
+// finalization as text and was dropped. `retryNotBefore` persisted null,
+// readTransientRetryNotBeforeFromRun returned null, and the hint-honoring
+// branch in scheduleBoundedRetryForRun (which already overrides `dueAt` with an
+// advertised reset, uncapped) was unreachable. The run therefore took the
+// rate-limit family's flat 90s hop — ~18x short of the 9571s the provider
+// asked for — so every attempt landed inside the same closed window until the
+// Job hit BackoffLimitExceeded and the issue was stranded. Live proof: run
+// 9727eaf0-9cea-461d-9101-f833f8de29fe.
+//
+// Parsing it here, server-side, is deliberately where the fix goes: it is the
+// one point every adapter's output funnels through, so it covers the k8s
+// bundles we do not build without duplicating the local adapters' parser.
+const PROVIDER_CAPACITY_RESET_AT_PATTERN =
+  /(?:\b(?:resume_at|retry_not_before|retryNotBefore)\b[\\'"\s]*[:=][\\'"\s]*|\b(?:capacity\s+)?may\s+reset\s+at\s+)(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))/i;
+const PROVIDER_CAPACITY_RETRY_IN_PATTERN = /\bretry\s+in\s+(\d+(?:\.\d+)?)\s*(?:s\b|secs?\b|seconds?\b)/i;
+
+// An advertised horizon further out than this is treated as unusable rather
+// than parked on: a bad parse (or a provider bug) must not silently sideline an
+// issue for days. 24h comfortably covers real capacity windows — the observed
+// fault asked for ~2h40m — while bounding the blast radius of a wrong read.
+const PROVIDER_CAPACITY_MAX_HORIZON_MS = 24 * 60 * 60 * 1000;
+
+export function parseProviderCapacityResetHorizon(
+  input: { resultJson?: Record<string, unknown> | null; errorMessage?: string | null },
+  now = Date.now(),
+): Date | null {
+  const resultJson = input.resultJson ?? null;
+  const candidates: unknown[] = [input.errorMessage];
+  if (resultJson) {
+    for (const key of ["result", "message", "error", "summary"] as const) {
+      candidates.push(resultJson[key]);
+    }
+  }
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+
+    // An absolute timestamp is authoritative when present: it survives any
+    // delay between the provider emitting the fault and us finalizing the run,
+    // whereas the relative "retry in Ns" is only correct at emission time.
+    const absolute = candidate.match(PROVIDER_CAPACITY_RESET_AT_PATTERN)?.[1];
+    if (absolute) {
+      const parsed = new Date(absolute).getTime();
+      if (Number.isFinite(parsed) && parsed > now && parsed - now <= PROVIDER_CAPACITY_MAX_HORIZON_MS) {
+        return new Date(parsed);
+      }
+      // A parsed-but-unusable absolute horizon (already elapsed, or absurdly
+      // far out) is a deliberate no-hint answer for THIS field rather than a
+      // reason to fall back to the relative form in the same string, which
+      // would disagree with it.
+      continue;
+    }
+
+    const relativeSeconds = candidate.match(PROVIDER_CAPACITY_RETRY_IN_PATTERN)?.[1];
+    if (relativeSeconds) {
+      const seconds = Number.parseFloat(relativeSeconds);
+      if (Number.isFinite(seconds) && seconds > 0 && seconds * 1000 <= PROVIDER_CAPACITY_MAX_HORIZON_MS) {
+        return new Date(now + Math.ceil(seconds * 1000));
+      }
+    }
+  }
+
+  return null;
 }
 
 function zeroTokenUsage(usage: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number } | undefined) {
@@ -6825,6 +6961,100 @@ export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown>
   };
 }
 
+type GithubReviewerEvidenceVerification =
+  | { status: "found"; via: "review" | "comment"; repoFullName: string; prNumber: number; headSha: string | null }
+  | { status: "not_found"; repoFullName: string; prNumber: number; headSha: string | null }
+  | { status: "unavailable"; reason: string; repoFullName: string | null; prNumber: number | null; headSha: string | null };
+
+async function verifyGithubReviewerEvidence(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+): Promise<GithubReviewerEvidenceVerification> {
+  const prReview = derivePaperclipPrReview(contextSnapshot);
+  if (!prReview?.repoFullName || prReview.prNumber === null) {
+    return {
+      status: "unavailable",
+      reason: "missing_pr_target",
+      repoFullName: prReview?.repoFullName ?? null,
+      prNumber: prReview?.prNumber ?? null,
+      headSha: prReview?.headSha ?? null,
+    };
+  }
+
+  try {
+    const verified = await githubHasReviewerEvidenceForPr({
+      repoFullName: prReview.repoFullName,
+      prNumber: prReview.prNumber,
+      headSha: prReview.headSha,
+    });
+    if ("error" in verified) {
+      return {
+        status: "unavailable",
+        reason: verified.error,
+        repoFullName: prReview.repoFullName,
+        prNumber: prReview.prNumber,
+        headSha: prReview.headSha,
+      };
+    }
+    return {
+      status: verified.found ? "found" : "not_found",
+      ...(verified.found ? { via: verified.via } : {}),
+      repoFullName: prReview.repoFullName,
+      prNumber: prReview.prNumber,
+      headSha: prReview.headSha,
+    } as GithubReviewerEvidenceVerification;
+  } catch {
+    return {
+      status: "unavailable",
+      reason: "verification_threw",
+      repoFullName: prReview.repoFullName,
+      prNumber: prReview.prNumber,
+      headSha: prReview.headSha,
+    };
+  }
+}
+
+function unavailablePrReviewVerification(reason: string) {
+  return {
+    status: "missing" as const,
+    errorCode: "pr_review_verification_unavailable",
+    errorMessage:
+      `PR reviewer evidence could not be verified with GitHub (${reason}); retrying without trusting the local completion claim`,
+  };
+}
+
+/**
+ * Resolve where to post the "reviewer never finished" commit status for a run
+ * whose bounded retry chain just exhausted, or null when no status should be
+ * written. (BLO-17456)
+ *
+ * A required status context that is never posted renders as "Expected —
+ * waiting for status to be reported" indefinitely: branch protection blocks the
+ * PR and nothing signals the result is never coming. Failing the context turns
+ * that silent wedge into a visible red check. GitHub keeps the latest status
+ * per (sha, context), so a later real result from the context owner overwrites
+ * it — this is not terminal for the PR.
+ *
+ * Returns null unless ALL of the following hold, because a status posted to the
+ * wrong place is worse than one not posted at all:
+ *  - an operator opted in by configuring a context name (this server does not
+ *    own the branch-protection rule, so it must not invent one);
+ *  - the run is a PR-review run (`derivePaperclipPrReview`);
+ *  - the wake carried a repo AND an exact head SHA — statuses are per-commit,
+ *    so a guessed SHA would fail an unrelated commit.
+ */
+export function resolvePrReviewGateStatusTarget(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  gateContext: string,
+): { repoFullName: string; sha: string; context: string; prNumber: number; prUrl: string | null } | null {
+  const context = gateContext.trim();
+  if (!context) return null;
+  const prReview = derivePaperclipPrReview(contextSnapshot);
+  if (!prReview) return null;
+  const { repoFullName, headSha, prNumber, prUrl } = prReview;
+  if (!repoFullName || !headSha) return null;
+  return { repoFullName, sha: headSha, context, prNumber, prUrl: prUrl ?? null };
+}
+
 const PR_REVIEW_OUTPUT_EVIDENCE_MAX_CHARS = 240_000;
 
 function appendReviewOutputEvidenceText(parts: string[], value: unknown, budget: { remaining: number }) {
@@ -8320,6 +8550,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }),
     });
     return interaction.id;
+  }
+
+  /**
+   * Queue the configured PR-review gate status failure for a run whose bounded
+   * retry chain just exhausted, so a never-arriving required check stops reading
+   * as "still waiting". The outbox owns evidence re-checks, retry, and final
+   * delivery logging; the heartbeat lifecycle only records that the work was
+   * durably queued. (BLO-17456)
+   */
+  async function queueExhaustedPrReviewGateStatus(
+    run: typeof heartbeatRuns.$inferSelect,
+    contextSnapshot: Record<string, unknown>,
+  ) {
+    const target = resolvePrReviewGateStatusTarget(
+      contextSnapshot,
+      loadConfig().prReviewGateStatusContext,
+    );
+    if (!target) return;
+
+    const delivery = await enqueueGithubCommitStatusDelivery(db, {
+      companyId: run.companyId,
+      sourceRunId: run.id,
+      repoFullName: target.repoFullName,
+      sha: target.sha,
+      context: target.context,
+      state: "failure",
+      description: "Paperclip reviewer run exhausted its automatic retries; no review was posted.",
+      targetUrl: target.prUrl,
+      prNumber: target.prNumber,
+      prUrl: target.prUrl,
+    });
+    await appendRunEvent(run, await nextRunEventSeq(run.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message:
+        delivery.status === "queued" || delivery.status === "processing"
+          ? `Queued PR-review gate status failure delivery for ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)} after retry exhaustion`
+          : `PR-review gate status failure delivery for ${target.context} on ${target.repoFullName}@${target.sha.slice(0, 7)} is already ${delivery.status}`,
+      payload: {
+        deliveryId: delivery.id,
+        deliveryStatus: delivery.status,
+        statusContext: target.context,
+        repoFullName: target.repoFullName,
+        prNumber: target.prNumber,
+        headSha: target.sha,
+      },
+    });
   }
 
   async function escalatePlanApprovalResumeFailureNeedsAttention(input: {
@@ -12968,6 +13246,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         });
       }
+      // BLO-17456: a PR-review chain that exhausts here leaves its required
+      // status context unposted, so the PR sits on "Expected — waiting for
+      // status" with nothing signalling that no result is coming. Queue a
+      // durable status delivery so stale writes are guarded by a final
+      // GitHub-evidence read and transient GitHub/token failures can retry.
+      // Opt-in and swallowed so status delivery can never alter exhaustion
+      // handling.
+      await queueExhaustedPrReviewGateStatus(run, contextSnapshot).catch((error) => {
+        logger.warn(
+          { err: error, runId: run.id },
+          "failed to queue exhausted PR-review gate status",
+        );
+      });
       return {
         outcome: "retry_exhausted" as const,
         attempt: nextAttempt,
@@ -15185,6 +15476,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
+  /**
+   * Best-effort capture of the failed Job's pod-level terminal state.
+   *
+   * The Job `Failed` condition only ever says "backoff limit reached" — it names
+   * no container and carries no exit code — so without this a recurrence leaves
+   * no evidence once the pod is GC'd. Never throws and never blocks
+   * finalization; a null result simply means the run record keeps the
+   * Job-level fields it always had.
+   */
+  async function captureFailedJobContainerDiagnostics(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id">,
+    jobStatus: AgentJobRunStatus | null,
+  ) {
+    try {
+      const jobName = readNonEmptyString(jobStatus?.name) ??
+        readNonEmptyString((await getActiveExternalRuntimeReservation(db, run.id))?.jobName);
+      if (!jobName) return null;
+      return await captureAgentJobFailureDiagnostics(jobName);
+    } catch (error) {
+      logger.warn(
+        { runId: run.id, error: error instanceof Error ? error.message : String(error) },
+        "failed-Job container diagnostics capture failed; finalizing without them",
+      );
+      return null;
+    }
+  }
+
   async function finalizeExternalLifecycleTerminalRun(input: {
     run: typeof heartbeatRuns.$inferSelect;
     adapterType: string;
@@ -15194,34 +15512,61 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     staleKill?: boolean;
   }) {
     let preserveRecordedOutcome = false;
+    let prReviewIncompleteOverride: {
+      errorCode: string;
+      errorMessage: string;
+    } | null = null;
     if (!input.staleKill && !input.jobStatus) {
       let reviewEvidence = evaluatePrReviewCompletionEvidence(
         parseObject(input.run.contextSnapshot),
         { resultJson: parseObject(input.run.resultJson) },
       );
-      if (reviewEvidence.status === "missing") {
-        try {
-          const prReview = derivePaperclipPrReview(parseObject(input.run.contextSnapshot));
-          if (prReview?.repoFullName && prReview.prNumber !== null) {
-            const verified = await githubHasReviewerEvidenceForPr({
-              repoFullName: prReview.repoFullName,
-              prNumber: prReview.prNumber,
-              headSha: prReview.headSha,
-            });
-            if ("found" in verified && verified.found) {
-              reviewEvidence = { status: "posted_review" };
-            }
-          }
-        } catch {
-          // GitHub verification is additive; failures retain the local missing verdict.
+      const claimedReview =
+        reviewEvidence.status === "posted_review" || reviewEvidence.status === "already_reviewed";
+      if (reviewEvidence.status === "missing" || claimedReview) {
+        const verification = await verifyGithubReviewerEvidence(
+          parseObject(input.run.contextSnapshot),
+        );
+        await appendRunEvent(input.run, await nextRunEventSeq(input.run.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: verification.status === "unavailable" ? "warn" : "info",
+          message:
+            verification.status === "found"
+              ? `GitHub-verified ${verification.via} by the reviewer App during missing-Job recovery`
+              : `GitHub reviewer-evidence check did not preserve missing-Job recovery: ${verification.status === "unavailable" ? verification.reason : "no_evidence_found"}`,
+          payload: {
+            repoFullName: verification.repoFullName,
+            prNumber: verification.prNumber,
+            headSha: verification.headSha,
+            outcome: verification.status,
+            ...(verification.status === "found" ? { via: verification.via } : {}),
+            ...(verification.status === "unavailable" ? { reason: verification.reason } : {}),
+          },
+        });
+        if (verification.status === "found") {
+          reviewEvidence = { status: "posted_review" };
+        } else if (verification.status === "unavailable") {
+          reviewEvidence = unavailablePrReviewVerification(verification.reason);
+        } else if (claimedReview) {
+          reviewEvidence = {
+            status: "missing",
+            errorCode: "pr_review_output_missing",
+            errorMessage:
+              "PR reviewer run claimed a posted review, but GitHub has no exact-head review from a trusted reviewer identity",
+          };
         }
       }
+      prReviewIncompleteOverride =
+        reviewEvidence.status === "missing" || reviewEvidence.status === "auth_expired"
+          ? reviewEvidence
+          : null;
       preserveRecordedOutcome = reviewEvidence.status === "posted_review" ||
         reviewEvidence.status === "already_reviewed" ||
         reviewEvidence.status === "archived_repo_skipped" ||
         reviewEvidence.status === "self_review_skipped";
     }
-    const terminalOutcome = input.staleKill
+    const baseTerminalOutcome = input.staleKill
       ? {
           status: "failed" as const,
           wakeupStatus: "failed" as const,
@@ -15234,10 +15579,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           jobMessage: input.jobStatus?.message ?? null,
         }
       : externalLifecycleTerminalOutcome(input.jobStatus, preserveRecordedOutcome);
+    const terminalOutcome =
+      baseTerminalOutcome && prReviewIncompleteOverride && !input.staleKill
+        ? {
+            ...baseTerminalOutcome,
+            errorCode: prReviewIncompleteOverride.errorCode,
+            error: prReviewIncompleteOverride.errorMessage,
+          }
+        : baseTerminalOutcome;
     if (!terminalOutcome) return false;
 
     const adapterInvocationStarted = terminalOutcome.errorCode === "job_failed"
       ? await hasAdapterInvocationEvent(input.run.id)
+      : null;
+
+    // Read the pod's terminal container state while the pod still exists. This
+    // is the only point in the lifecycle where it is still available.
+    const containerDiagnostics = terminalOutcome.errorCode === "job_failed"
+      ? await captureFailedJobContainerDiagnostics(input.run, input.jobStatus)
       : null;
 
     const resultJson = mergeRunStopMetadataForAgent(
@@ -15252,6 +15611,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             jobReason: terminalOutcome.jobReason,
             jobMessage: terminalOutcome.jobMessage,
             ...(adapterInvocationStarted !== null ? { adapterInvocationStarted } : {}),
+            ...(containerDiagnostics ? { containerDiagnostics } : {}),
           },
         },
         errorCode: terminalOutcome.errorCode,
@@ -16588,7 +16948,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // once the mint is committed (so a failed/aborted setRunStatus never
       // over-counts). Split by adapter + error-string bucket + the durable
       // classification, all bounded.
-      let finalizedRun = await setRunStatus(run.id, "failed", {
+      const finalizedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
         finishedAt: now,
@@ -16611,12 +16971,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : result;
         })(),
       });
+      if (!finalizedRunWrite.updated || !finalizedRunWrite.run) {
+        // Another reap invocation won the terminal transition for this run.
+        // Do not duplicate process_lost metrics, retries, wakeup finalization,
+        // run events, or issue-promotion side effects.
+        if (finalizedRunWrite.run?.status !== "running") {
+          runningProcesses.delete(run.id);
+          activeRunExecutions.delete(run.id);
+        }
+        continue;
+      }
+      let finalizedRun = finalizedRunWrite.run;
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
       });
-      if (!finalizedRun) finalizedRun = await getRun(run.id);
-      if (!finalizedRun) continue;
       // BLO-16184: the process_lost mint is now committed for this run -- count it
       // (bounded adapter + error-string bucket + durable classification).
       recordProcessLost({
@@ -18483,6 +18852,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             name: agent.name,
             companyId: agent.companyId,
           },
+          executionWorkspaceId: plannedExecutionWorkspaceId,
           heartbeatRunId: run.id,
           enableWorkspaceBranchReconcileForward:
             resolvedInstanceSettings.experimental.enableWorkspaceBranchReconcileForward,
@@ -19774,6 +20144,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ) {
                 break;
               }
+              // BLO-18278: if the provider advertised a reset the in-run loop
+              // cannot outlast, stop here instead of spending the remaining
+              // attempts inside a window that is still closed. The whole budget
+              // is MAX_ATTEMPTS x MAX_DELAY, and each attempt relaunches the
+              // agent Job — which is how the observed 9571s horizon became a
+              // BackoffLimitExceeded strand rather than a wait. Breaking out
+              // finalizes the run as rate_limit_exhausted carrying
+              // `retryNotBefore`, and scheduleBoundedRetryForRun then parks a
+              // `scheduled_retry` row AT the advertised reset (that override is
+              // uncapped, unlike this loop's 10-min clamp). `scheduled_retry` is
+              // a live execution path to hasActiveExecutionPath, so the strand
+              // sweep leaves the issue alone.
+              const inRunHorizonBudgetMs =
+                (K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS - ccrotateRetryAttempt) *
+                K8S_CCROTATE_IN_RUN_RETRY_MAX_DELAY_MS;
+              const advertisedResetAt = parseProviderCapacityResetHorizon({
+                resultJson: adapterResult.resultJson,
+                errorMessage: adapterResult.errorMessage,
+              });
+              if (advertisedResetAt && advertisedResetAt.getTime() - Date.now() > inRunHorizonBudgetMs) {
+                await appendRunEvent(currentRun, seq++, {
+                  eventType: "lifecycle",
+                  stream: "system",
+                  level: "warn",
+                  message:
+                    "provider advertised a capacity reset beyond the in-run retry budget; deferring to a scheduled retry at that reset",
+                  payload: {
+                    advertisedResetAt: advertisedResetAt.toISOString(),
+                    inRunHorizonBudgetMs,
+                    attemptsUsed: ccrotateRetryAttempt,
+                    maxAttempts: K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS,
+                  },
+                });
+                await onLog(
+                  "stderr",
+                  `[paperclip] Provider capacity resets at ${advertisedResetAt.toISOString()}, beyond this run's retry budget; deferring to a scheduled retry.\n`,
+                );
+                break;
+              }
               ccrotateRetryAttempt += 1;
               const retryDelayMs = k8sCcrotateRetryDelayMs(adapterResult);
               if (externalRuntimeReservation) {
@@ -19997,64 +20406,62 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         isHintlessTransientUpstreamFault(adapterResult.resultJson, {
           errorMessage: adapterResult.errorMessage,
         });
+      // BLO-18278: recover the capacity-reset horizon a throttle fault stated in
+      // prose. Only consulted when the adapter did not already hand back a
+      // structured `retryNotBefore` (claude-local/codex-local do), and only for
+      // the throttle families — a horizon quoted inside some unrelated failure's
+      // tool output must not push that failure's retry into next week.
+      const providerCapacityResetAt =
+        (rateLimitExhaustedOverride || providerThrottledNoProgressOverride) && !adapterResult.retryNotBefore
+          ? parseProviderCapacityResetHorizon({
+              resultJson: adapterResult.resultJson,
+              errorMessage: adapterResult.errorMessage,
+            })
+          : null;
+      const effectiveRetryNotBefore =
+        adapterResult.retryNotBefore ?? providerCapacityResetAt?.toISOString() ?? null;
       let prReviewCompletionEvidence = outcome === "succeeded"
         ? evaluatePrReviewCompletionEvidence(context, {
           resultJson: adapterResult.resultJson ?? null,
           summary: adapterResult.summary ?? null,
         })
         : { status: "not_applicable" as const };
-      // BLO-10448: the evidence guard above is a text heuristic over the agent's
-      // free-text summary and misfires on legitimate runs (idempotency skips,
-      // comment-mode reviews) — the PR WAS reviewed but the phrasing wasn't
-      // matched, flagging a false pr_review_output_missing. Before keeping that
-      // verdict, authoritatively check GitHub for a reviewer-bot review/comment at
-      // THIS head. Only rescues a false `missing`; any error / unconfigured creds /
-      // not-found leaves the heuristic verdict intact (safe, additive fallback).
-      if (prReviewCompletionEvidence.status === "missing") {
-        try {
-          const prReview = derivePaperclipPrReview(context);
-          if (prReview && prReview.repoFullName && prReview.prNumber !== null) {
-            const verified = await githubHasReviewerEvidenceForPr({
-              repoFullName: prReview.repoFullName,
-              prNumber: prReview.prNumber,
-              headSha: prReview.headSha,
-            });
-            if ("found" in verified && verified.found) {
-              await appendRunEvent(run, await nextRunEventSeq(run.id), {
-                eventType: "lifecycle",
-                stream: "system",
-                level: "info",
-                message: `GitHub-verified ${verified.via} by the reviewer bot on ${prReview.repoFullName}#${prReview.prNumber}; suppressing false pr_review_output_missing`,
-                payload: {
-                  repoFullName: prReview.repoFullName,
-                  prNumber: prReview.prNumber,
-                  headSha: prReview.headSha,
-                  via: verified.via,
-                },
-              });
-              prReviewCompletionEvidence = { status: "posted_review" as const };
-            } else {
-              // BLO-10878: the non-rescue path used to be silent, making residual
-              // false `pr_review_output_missing` unclassifiable. Record why the
-              // GitHub check did not rescue (a specific `{error}` code, or genuine
-              // not-found) so the remaining residual is diagnosable from events.
-              await appendRunEvent(run, await nextRunEventSeq(run.id), {
-                eventType: "lifecycle",
-                stream: "system",
-                level: "info",
-                message: `GitHub reviewer-evidence check kept pr_review_output_missing on ${prReview.repoFullName}#${prReview.prNumber}: ${"error" in verified ? verified.error : "no_evidence_found"}`,
-                payload: {
-                  repoFullName: prReview.repoFullName,
-                  prNumber: prReview.prNumber,
-                  headSha: prReview.headSha,
-                  outcome: "error" in verified ? verified.error : "not_found",
-                },
-              });
-            }
-          }
-        } catch {
-          // Verification is best-effort; on any unexpected fault we keep the
-          // heuristic `missing` verdict (unchanged pre-BLO-10448 behavior).
+      // BLO-10448/BLO-19573: GitHub is authoritative for both missing evidence
+      // and local "posted/already reviewed" claims. The latter must not complete
+      // a task when the side effect came from an ineligible user-seat identity.
+      const claimedReview =
+        prReviewCompletionEvidence.status === "posted_review" ||
+        prReviewCompletionEvidence.status === "already_reviewed";
+      if (prReviewCompletionEvidence.status === "missing" || claimedReview) {
+        const verification = await verifyGithubReviewerEvidence(context);
+        await appendRunEvent(run, await nextRunEventSeq(run.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: verification.status === "unavailable" ? "warn" : "info",
+          message:
+            verification.status === "found"
+              ? `GitHub-verified ${verification.via} by the reviewer App on ${verification.repoFullName}#${verification.prNumber}`
+              : `GitHub reviewer-evidence check rejected PR-review completion${verification.repoFullName && verification.prNumber !== null ? ` on ${verification.repoFullName}#${verification.prNumber}` : ""}: ${verification.status === "unavailable" ? verification.reason : "no_evidence_found"}`,
+          payload: {
+            repoFullName: verification.repoFullName,
+            prNumber: verification.prNumber,
+            headSha: verification.headSha,
+            outcome: verification.status,
+            ...(verification.status === "found" ? { via: verification.via } : {}),
+            ...(verification.status === "unavailable" ? { reason: verification.reason } : {}),
+          },
+        });
+        if (verification.status === "found") {
+          prReviewCompletionEvidence = { status: "posted_review" as const };
+        } else if (verification.status === "unavailable") {
+          prReviewCompletionEvidence = unavailablePrReviewVerification(verification.reason);
+        } else if (claimedReview) {
+          prReviewCompletionEvidence = {
+            status: "missing",
+            errorCode: "pr_review_output_missing",
+            errorMessage:
+              "PR reviewer run claimed a posted review, but GitHub has no exact-head review from a trusted reviewer identity",
+          };
         }
       }
       const prReviewIncompleteOverride =
@@ -20201,6 +20608,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               resultJson: {
                 ...parseObject(adapterResult.resultJson),
                 configFreshness: configFreshnessResultMetadata,
+                // BLO-18278: keep the provenance of a prose-recovered horizon so
+                // the strand comment can name the reset instant, and so a wrong
+                // parse is debuggable from the persisted run rather than only
+                // from the raw log. Set here, inside `resultJson`, because
+                // mergeAdapterRecoveryMetadata only forwards errorFamily and
+                // retryNotBefore — any other key passed alongside them is
+                // dropped.
+                ...(providerCapacityResetAt
+                  ? { providerCapacityResetAt: providerCapacityResetAt.toISOString() }
+                  : {}),
                 ...(prReviewIncompleteOverride
                   ? {
                     prReviewOutputGate: {
@@ -20222,7 +20639,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 : transientUpstreamOverride
                   ? "transient_upstream"
                 : (adapterResult.errorFamily ?? null),
-              retryNotBefore: adapterResult.retryNotBefore ?? null,
+              retryNotBefore: effectiveRetryNotBefore,
               ...(providerThrottledNoProgressOverride ? { providerThrottleNoProgress: true } : {}),
             }),
             modelProfileApplication,

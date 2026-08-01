@@ -1,5 +1,6 @@
 import type { KubeClients } from "./kube-client.js";
 import type { SandboxOrchestrator, SandboxStatus } from "./sandbox-orchestrator.js";
+import { assertManifestHasNoLiteralSensitiveEnv } from "./sensitive-env-guard.js";
 
 export class JobTimeoutError extends Error {
   constructor(namespace: string, name: string, timeoutMs: number) {
@@ -13,6 +14,9 @@ export async function createJob(
   namespace: string,
   manifest: Record<string, unknown>,
 ): Promise<{ uid: string }> {
+  // Choke point: this accepts an arbitrary manifest, so re-check here rather
+  // than trusting that it came from buildJobManifest.
+  assertManifestHasNoLiteralSensitiveEnv(manifest, `Job in ${namespace}`);
   const result = await clients.batch.createNamespacedJob({ namespace, body: manifest as never });
   const uid = (result as { metadata?: { uid?: string } }).metadata?.uid;
   if (!uid) throw new Error("Job created without a UID");

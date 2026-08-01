@@ -9,6 +9,7 @@ import type {
   IssueExecutionMonitorStateStatus,
   IssueExecutionDecisionOutcome,
   IssueMonitorScheduledBy,
+  IssueMonitorGateSource,
   IssueExecutionPolicyMode,
   IssueReferenceSourceKind,
   IssueExecutionStageType,
@@ -617,6 +618,13 @@ export interface IssueExecutionMonitorPolicy {
   maxAttempts?: number | null;
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
   productivityReviewDisabled?: boolean;
+  /**
+   * BLO-18294: the gates this monitor is waiting on. When present (or when the
+   * issue has unresolved blocker edges), the convergence guard fingerprints
+   * these instead of free-form `notes`, so unrelated churn cannot read as
+   * progress and keep a no-op poll loop alive.
+   */
+  gateSignals?: string[] | null;
 }
 
 export interface IssueExecutionPolicy {
@@ -641,6 +649,13 @@ export interface IssueExecutionMonitorState {
   timeoutAt?: string | null;
   maxAttempts?: number | null;
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
+  /** BLO-18294: convergence bookkeeping — see IssueExecutionMonitorPolicy.gateSignals. */
+  gateSignals?: string[] | null;
+  gateFingerprint?: string | null;
+  gateSource?: IssueMonitorGateSource | null;
+  convergenceCount?: number;
+  convergenceStallCount?: number;
+  convergenceStalledAssigneeAgentId?: string | null;
   clearedAt: string | null;
   clearReason: IssueExecutionMonitorClearReason | null;
 }
@@ -1013,6 +1028,8 @@ export interface SuggestTasksResult {
   createdTasks?: SuggestTasksResultCreatedTask[];
   skippedClientKeys?: string[];
   rejectionReason?: string | null;
+  cancelled?: true;
+  cancellationReason?: string | null;
 }
 
 export interface AskUserQuestionsQuestionOption {
@@ -1180,7 +1197,7 @@ export interface RequestItemVerdictsPayload {
 
 export interface RequestConfirmationResult {
   version: 1;
-  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target";
+  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target" | "cancelled";
   reason?: string | null;
   commentId?: string | null;
   staleTarget?: RequestConfirmationTarget | null;

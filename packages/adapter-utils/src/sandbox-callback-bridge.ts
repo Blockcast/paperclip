@@ -82,7 +82,7 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   // Issue-thread interactions (suggest tasks, ask questions, request confirmation)
   { method: "GET", path: /^\/api\/issues\/[^/]+\/interactions(?:\/[^/]+)?$/ },
   { method: "POST", path: /^\/api\/issues\/[^/]+\/interactions$/ },
-  { method: "POST", path: /^\/api\/issues\/[^/]+\/interactions\/[^/]+\/(?:accept|reject|respond)$/ },
+  { method: "POST", path: /^\/api\/issues\/[^/]+\/interactions\/[^/]+\/(?:accept|reject|respond|withdraw)$/ },
 
   // Subtasks / delegation
   { method: "POST", path: /^\/api\/companies\/[^/]+\/issues$/ },
@@ -520,32 +520,55 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
     },
     writeTextFile: async (remotePath, body) => {
       const remoteDir = path.posix.dirname(remotePath);
-      const uploadPath = `${remotePath}.paperclip-upload.b64`;
-      const decodedPath = `${remotePath}.paperclip-upload.tmp`;
-      await runChecked(
-        `prepare upload ${remotePath}`,
-        `mkdir -p ${shellQuote(remoteDir)} && rm -f ${shellQuote(uploadPath)} ${shellQuote(decodedPath)} && : > ${shellQuote(uploadPath)}`,
-      );
-      const base64Body = toBuffer(Buffer.from(body, "utf8")).toString("base64");
-      for (const chunk of base64Chunks(base64Body)) {
-        await runChecked(
-          `append upload chunk ${remotePath}`,
-          `printf '%s' ${shellQuote(chunk)} >> ${shellQuote(uploadPath)}`,
-        );
-      }
-      await runChecked(
-        `finalize upload ${remotePath}`,
-        [
-          `base64 -d < ${shellQuote(uploadPath)} > ${shellQuote(decodedPath)}`,
-          "status=$?",
-          'if [ "$status" -eq 0 ]; then',
-          `  mv -f ${shellQuote(decodedPath)} ${shellQuote(remotePath)}`,
-          "  status=$?",
-          "fi",
+      // Staging names are per-invocation: two callers writing the same
+      // destination concurrently must not share a scratch file, or one
+      // decode can clobber the other's half-appended base64.
+      const uploadToken = randomUUID();
+      const uploadPath = `${remotePath}.${uploadToken}.paperclip-upload.b64`;
+      const decodedPath = `${remotePath}.${uploadToken}.paperclip-upload.tmp`;
+      // Per-invocation names mean a later attempt picks a fresh token and can
+      // never sweep an earlier one's scratch files, so anything we abandon here
+      // leaks permanently. The happy path unlinks both inside the finalize
+      // script (one round trip instead of two); this catch covers every way out
+      // before that runs — most pointedly a failed chunk append.
+      const discardStagingFiles = async () => {
+        await runShell(
+          input.runner,
+          input.remoteCwd,
           `rm -f ${shellQuote(uploadPath)} ${shellQuote(decodedPath)}`,
-          'exit "$status"',
-        ].join("\n"),
-      );
+          timeoutMs,
+          shellCommand,
+        ).catch(() => undefined);
+      };
+      try {
+        await runChecked(
+          `prepare upload ${remotePath}`,
+          `mkdir -p ${shellQuote(remoteDir)} && rm -f ${shellQuote(uploadPath)} ${shellQuote(decodedPath)} && : > ${shellQuote(uploadPath)}`,
+        );
+        const base64Body = toBuffer(Buffer.from(body, "utf8")).toString("base64");
+        for (const chunk of base64Chunks(base64Body)) {
+          await runChecked(
+            `append upload chunk ${remotePath}`,
+            `printf '%s' ${shellQuote(chunk)} >> ${shellQuote(uploadPath)}`,
+          );
+        }
+        await runChecked(
+          `finalize upload ${remotePath}`,
+          [
+            `base64 -d < ${shellQuote(uploadPath)} > ${shellQuote(decodedPath)}`,
+            "status=$?",
+            'if [ "$status" -eq 0 ]; then',
+            `  mv -f ${shellQuote(decodedPath)} ${shellQuote(remotePath)}`,
+            "  status=$?",
+            "fi",
+            `rm -f ${shellQuote(uploadPath)} ${shellQuote(decodedPath)}`,
+            'exit "$status"',
+          ].join("\n"),
+        );
+      } catch (error) {
+        await discardStagingFiles();
+        throw error;
+      }
     },
     writeResponseFile: async (responsePath, body, options = {}) => {
       const responseDir = path.posix.dirname(responsePath);
@@ -648,6 +671,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
   let settled = false;
   let stopDeadline = Number.POSITIVE_INFINITY;
   let settleResolve: (() => void) | null = null;
+  let wakePoll: (() => void) | null = null;
   const settledPromise = new Promise<void>((resolve) => {
     settleResolve = resolve;
   });
@@ -655,6 +679,27 @@ export async function startSandboxCallbackBridgeWorker(input: {
     ((request: SandboxCallbackBridgeRequest) => authorizeSandboxCallbackBridgeRequestWithRoutes(request));
   const buildWorkerFailureMessage = (error: unknown) =>
     `Sandbox callback bridge worker failed: ${error instanceof Error ? error.message : String(error)}`;
+  const wakeWorker = () => {
+    const wake = wakePoll;
+    wakePoll = null;
+    wake?.();
+  };
+  const waitForNextPoll = async () => {
+    await new Promise<void>((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timeout);
+        if (wakePoll === finish) {
+          wakePoll = null;
+        }
+        resolve();
+      };
+      const timeout = setTimeout(finish, pollIntervalMs);
+      wakePoll = finish;
+    });
+  };
 
   const processRequestFile = async (fileName: string) => {
     const requestPath = path.posix.join(directories.requestsDir, fileName);
@@ -757,7 +802,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
           if (stopping) {
             break;
           }
-          await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+          await waitForNextPoll();
           continue;
         }
         for (const fileName of fileNames) {
@@ -798,6 +843,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       stopping = true;
       const drainMs = normalizeTimeoutMs(options.drainTimeoutMs, DEFAULT_BRIDGE_STOP_TIMEOUT_MS);
       stopDeadline = Date.now() + drainMs;
+      wakeWorker();
       if (!settled) {
         await Promise.race([
           settledPromise,

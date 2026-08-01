@@ -8,11 +8,14 @@ import {
   approvals,
   companies,
   createDb,
+  executionWorkspaces,
   heartbeatRuns,
   issueApprovals,
   issueRelations,
   issueThreadInteractions,
   issues,
+  projects,
+  workspaceOperations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -47,6 +50,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
   }, 120_000);
 
   afterEach(async () => {
+    await db.delete(workspaceOperations);
     await db.delete(issueThreadInteractions);
     await db.delete(issueApprovals);
     await db.delete(approvals);
@@ -55,6 +59,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(issueRelations);
     await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projects);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -105,6 +111,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     originId?: string | null;
     originFingerprint?: string | null;
     executionState?: Record<string, unknown> | null;
+    executionWorkspaceId?: string | null;
     description?: string | null;
     monitorNextCheckAt?: Date | null;
     monitorAttemptCount?: number | null;
@@ -125,6 +132,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       originId: input.originId ?? null,
       originFingerprint: input.originFingerprint ?? "default",
       executionState: input.executionState ?? null,
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
       description: input.description ?? null,
       ...(input.monitorNextCheckAt != null ? { monitorNextCheckAt: input.monitorNextCheckAt } : {}),
       ...(input.monitorAttemptCount != null ? { monitorAttemptCount: input.monitorAttemptCount } : {}),
@@ -180,6 +188,31 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       coveredBlockerCount: 1,
       attentionBlockerCount: 0,
       sampleBlockerIdentifier: "PBC-2",
+    });
+  });
+
+  it("classifies a blocked parent as covered when its child has a running path without an explicit blocks row", async () => {
+    const { companyId, agentId } = await createCompany("PCN");
+    const parentId = await insertIssue({ companyId, identifier: "PCN-1", title: "Parent", status: "blocked" });
+    const childId = await insertIssue({
+      companyId,
+      identifier: "PCN-2",
+      title: "Running child",
+      status: "todo",
+      parentId,
+      assigneeAgentId: agentId,
+    });
+    await activeRun({ companyId, agentId, issueId: childId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "covered",
+      reason: "active_child",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      attentionBlockerCount: 0,
+      sampleBlockerIdentifier: "PCN-2",
     });
   });
 
@@ -307,6 +340,171 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       attentionBlockerCount: 0,
     });
     expect(parent?.blockerAttention?.sampleBlockerIdentifier).not.toBe("PBD-4");
+  });
+
+  it("keeps blocker attention and dependency readiness counts in parity across blocker statuses", async () => {
+    const { companyId, agentId } = await createCompany("PBP");
+    const statuses = ["done", "cancelled", "blocked", "todo"] as const;
+    const dependentIds: string[] = [];
+
+    for (const [index, status] of statuses.entries()) {
+      const dependentId = await insertIssue({
+        companyId,
+        identifier: `PBP-${index * 2 + 1}`,
+        title: `${status} blocker dependent`,
+        status: "todo",
+        assigneeAgentId: agentId,
+      });
+      const blockerId = await insertIssue({
+        companyId,
+        identifier: `PBP-${index * 2 + 2}`,
+        title: `${status} blocker`,
+        status,
+        assigneeAgentId: agentId,
+      });
+      await block({ companyId, blockerIssueId: blockerId, blockedIssueId: dependentId });
+      dependentIds.push(dependentId);
+    }
+
+    const rows = (await svc.list(companyId, { status: "todo" })) as IssueListItem[];
+    const readiness = await svc.listDependencyReadiness(companyId, dependentIds);
+
+    for (const [index, dependentId] of dependentIds.entries()) {
+      const expectedCount = statuses[index] === "done" ? 0 : 1;
+      const row = rows.find((issue) => issue.id === dependentId);
+      expect(row?.blockerAttention?.unresolvedBlockerCount).toBe(expectedCount);
+      expect(readiness.get(dependentId)?.unresolvedBlockerCount).toBe(expectedCount);
+      expect(readiness.get(dependentId)?.isDependencyReady).toBe(expectedCount === 0);
+    }
+
+    const cancelledDependent = rows.find((issue) => issue.id === dependentIds[1]);
+    expect(cancelledDependent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 1,
+      attentionBlockerCount: 1,
+    });
+  });
+
+  it("counts pending-finalize blockers as covered dependencies", async () => {
+    const { companyId, agentId } = await createCompany("PBF");
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId, name: "Finalize parity" });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Finalize parity workspace",
+    });
+
+    const pendingOnlyDependentId = await insertIssue({
+      companyId,
+      identifier: "PBF-1",
+      title: "Pending-finalize dependent",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    const mixedDependentId = await insertIssue({
+      companyId,
+      identifier: "PBF-2",
+      title: "Mixed blocker dependent",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    const doneBlockerId = await insertIssue({
+      companyId,
+      identifier: "PBF-3",
+      title: "Done blocker awaiting finalize",
+      status: "done",
+      executionWorkspaceId,
+    });
+    const openBlockerId = await insertIssue({
+      companyId,
+      identifier: "PBF-4",
+      title: "Open blocker",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: doneBlockerId, blockedIssueId: pendingOnlyDependentId });
+    await block({ companyId, blockerIssueId: doneBlockerId, blockedIssueId: mixedDependentId });
+    await block({ companyId, blockerIssueId: openBlockerId, blockedIssueId: mixedDependentId });
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: doneBlockerId,
+      phase: "worktree_prepare",
+      status: "succeeded",
+    });
+
+    const rows = (await svc.list(companyId, { status: "todo" })) as IssueListItem[];
+    const readiness = await svc.listDependencyReadiness(companyId, [pendingOnlyDependentId, mixedDependentId]);
+    const pendingOnly = rows.find((issue) => issue.id === pendingOnlyDependentId);
+    const mixed = rows.find((issue) => issue.id === mixedDependentId);
+
+    expect(pendingOnly?.blockerAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      attentionBlockerCount: 0,
+    });
+    expect(pendingOnly?.blockerAttention?.unresolvedBlockerCount).toBe(
+      readiness.get(pendingOnlyDependentId)?.unresolvedBlockerCount,
+    );
+    expect(mixed?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      unresolvedBlockerCount: 2,
+      coveredBlockerCount: 1,
+      attentionBlockerCount: 1,
+    });
+    expect(mixed?.blockerAttention?.unresolvedBlockerCount).toBe(
+      readiness.get(mixedDependentId)?.unresolvedBlockerCount,
+    );
+  });
+
+  it("does not surface terminal dependents with unresolved blockers as attention roots", async () => {
+    const { companyId, agentId } = await createCompany("PBT");
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PBT-1",
+      title: "Open blocker",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    const doneDependentId = await insertIssue({
+      companyId,
+      identifier: "PBT-2",
+      title: "Done dependent",
+      status: "done",
+      assigneeAgentId: agentId,
+    });
+    const cancelledDependentId = await insertIssue({
+      companyId,
+      identifier: "PBT-3",
+      title: "Cancelled dependent",
+      status: "cancelled",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: doneDependentId });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: cancelledDependentId });
+
+    const rows = (await svc.list(companyId, { status: "done,cancelled" })) as IssueListItem[];
+    const doneDependent = rows.find((issue) => issue.id === doneDependentId);
+    const cancelledDependent = rows.find((issue) => issue.id === cancelledDependentId);
+
+    expect(doneDependent?.blockerAttention).toMatchObject({
+      state: "none",
+      unresolvedBlockerCount: 0,
+      attentionBlockerCount: 0,
+    });
+    expect(cancelledDependent?.blockerAttention).toMatchObject({
+      state: "none",
+      unresolvedBlockerCount: 0,
+      attentionBlockerCount: 0,
+    });
   });
 
   it("covers recursive blocker chains when the downstream leaf has active work", async () => {

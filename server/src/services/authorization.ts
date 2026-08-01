@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -29,6 +29,7 @@ import {
   type TrustPresetResolution,
 } from "./trust-preset-resolver.js";
 import { ACTIVE_RECOVERY_ACTION_STATUSES } from "./issue-recovery-actions.js";
+import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 import { logger } from "../middleware/logger.js";
 
 export type AuthorizationActor =
@@ -67,6 +68,7 @@ export type AuthorizationAction =
   | "agent:wake"
   | "company_scope:read"
   | "issue:comment"
+  | "issue:coordination_metadata"
   | "issue:mutate"
   | "issue:read"
   | "project:read"
@@ -85,6 +87,13 @@ export type AuthorizationResource =
       parentIssueId?: string | null;
       assigneeAgentId?: string | null;
       assigneeUserId?: string | null;
+      /**
+       * BLO-19094: for `tasks:assign`, `assigneeAgentId` is the assignment
+       * *target*. This is the assignee the row currently carries, which the
+       * self-claim guard needs in order to distinguish an agent naming itself
+       * onto an unowned shell from one re-claiming work it already holds.
+       */
+      currentAssigneeAgentId?: string | null;
       createdByAgentId?: string | null;
       originKind?: string | null;
       originId?: string | null;
@@ -106,8 +115,10 @@ export type AuthorizationDecision = {
     | "allow_consented_change"
     | "allow_legacy_agent_creator"
     | "allow_issue_mention_grant"
+    | "allow_source_scoped_recovery_owner"
     | "allow_issue_creator"
     | "allow_recovery_handoff_grant"
+    | "allow_productivity_review_grant"
     | "allow_self"
     | "allow_company_agent"
     | "allow_company_member"
@@ -158,6 +169,12 @@ function permissionForAction(action: AuthorizationAction): PermissionKey | null 
     return null;
   }
   if (action === "issue:comment" || action === "issue:mutate") return null;
+  // BLO-18289: coordination-metadata is deliberately unmapped so it can never
+  // be satisfied by the generic `permissionKey` grant fallback at the bottom of
+  // decideBase. A bare `tasks:assign` grant is necessary but NOT sufficient —
+  // the dedicated branch also requires the actor to manage the issue assignee.
+  // Mapping it here would silently drop that second half of the check.
+  if (action === "issue:coordination_metadata") return null;
   return action;
 }
 
@@ -249,6 +266,32 @@ type IssueAuthorizationRow = {
   originKind: string | null;
   originId: string | null;
 };
+
+// Mirrors PRODUCTIVITY_REVIEW_TERMINAL_STATUSES in services/issues.ts. Kept
+// local rather than imported to avoid an authorization -> issues service import
+// cycle; the two are pinned together by
+// authorization-service.test.ts "productivity-review source-issue grant".
+const PRODUCTIVITY_REVIEW_TERMINAL_STATUSES = ["done", "cancelled"] as const;
+// Origin kinds an agent must not reach through *generic* unassigned-issue
+// access. The bar is deliberately narrow: claiming the shell has to hand the
+// claimer something beyond the shell itself.
+//   - `issueProductivityReview` — owning one grants `issue:mutate` on its
+//     source via `agentHasProductivityReviewGrantOnIssue`, so self-appointing
+//     onto an orphaned review is a privilege escalation.
+//   - `productivityReviewEscalation` — created with `assigneeAgentId: null`
+//     and `assigneeUserId` set (productivity-review.ts), i.e. addressed to a
+//     human on purpose. An agent claiming it answers the question that was
+//     asked of the user.
+// `strandedIssueRecovery` and `issueGraphLivenessEscalation` are deliberately
+// NOT here: neither confers any downstream grant, and both exist to unstick
+// stalled work. An unassigned stranded-recovery row is a normal reachable
+// state (it inherits a null assignee from its source), so denying the claim
+// would freeze the very mechanism that unfreezes the graph. Pinned by
+// "leaves recovery and liveness shells claimable" in authorization-service.test.ts.
+const AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS = new Set<string>([
+  RECOVERY_ORIGIN_KINDS.issueProductivityReview,
+  RECOVERY_ORIGIN_KINDS.productivityReviewEscalation,
+]);
 
 function evaluateAuthorizationPolicyForAssignment(
   policy: Record<string, unknown> | null | undefined,
@@ -489,7 +532,15 @@ function activeResponsibleUserCanAuthorizeIssueAction(
     membership &&
     membership.status === "active" &&
     membership.membershipRole !== "viewer" &&
-    (action === "issue:comment" || action === "issue:mutate")
+    // BLO-18289: issue:coordination_metadata belongs here for the same reason
+    // as issue:mutate — there is no board permission mapping for it, so the
+    // responsible-user intersection would otherwise deny it as an unsupported
+    // action and the agent-side decision would never be reached. It is a
+    // strict subset of issue:mutate, so it cannot be gated more loosely by
+    // sharing that action's active-non-viewer bar.
+    (action === "issue:comment"
+      || action === "issue:mutate"
+      || action === "issue:coordination_metadata")
   );
 }
 
@@ -1471,6 +1522,106 @@ export function authorizationService(db: Db) {
     });
   }
 
+  // A productivity review is assigned to a *reviewer*, but every remedy it can
+  // order — block, cancel, reassign, snooze — is a state change on the SOURCE
+  // issue, which the reviewer has no grant on. The mechanism could therefore
+  // detect and never remedy: the only verdict physically executable was prose
+  // in the review shell (BLO-19094).
+  //
+  // This is NOT covered by the manager-chain/creator allow-paths, and adding
+  // them would not cover it. `resolveReviewOwnerAgentId`
+  // (`productivity-review.ts`) picks the reviewer from, in order: the source
+  // assignee's `reportsTo`, the source issue's `createdByAgentId`, the
+  // project's `leadAgentId`, then any CTO, then any CEO. The last three are
+  // routinely neither manager nor creator of the source assignee, so an
+  // identity-shaped rule leaves the common fallback reviewer denied. The
+  // relation that actually matters is the review→source link itself, so that
+  // is what this grants on.
+  //
+  // Scope, deliberately narrow:
+  //   * relation-scoped — keyed on the review row's own `originKind` +
+  //     `originId`, the typed link the harness writes when it opens the
+  //     review. Not ancestry, not authorship, not org position.
+  //   * agent-scoped   — only the review's current `assigneeAgentId`. Peers,
+  //     managers and the source assignee's reports get nothing from here.
+  //   * state-bounded  — only while the review is open. Closing it (`done` /
+  //     `cancelled`) lapses the grant, so a finished review is not a standing
+  //     backdoor onto the issue it reviewed.
+  //   * company-scoped — both rows must sit in the acting company.
+  //
+  // Not self-grantable: `originKind` and `originId` appear on no request
+  // schema (`packages/shared/src/validators/issue.ts` is `.strict()` and omits
+  // both), so they are server-stamped only. An agent cannot mint itself a
+  // review row pointed at an arbitrary issue — which is precisely the
+  // difference between this and a creator-shaped allow-path, where the actor
+  // supplies the linking field.
+  //
+  // This clears the authorization boundary only. The route layer still applies
+  // its own another-agent's-issue gate on top, and only `PATCH /issues/:id`
+  // opts into honouring this grant there — destructive routes behind the same
+  // helper (notably `DELETE /issues/:id`) do not.
+  async function agentHasProductivityReviewGrantOnIssue(input: {
+    action: AuthorizationAction;
+    companyId: string;
+    issueId: string;
+    actorAgentId: string;
+  }) {
+    const [row] = await db
+      .select({
+        id: issues.id,
+        status: issues.status,
+      })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, input.companyId),
+        eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueProductivityReview),
+        eq(issues.originId, input.issueId),
+        eq(issues.assigneeAgentId, input.actorAgentId),
+        isNull(issues.hiddenAt),
+        isNull(issues.harnessKind),
+        notInArray(issues.status, [...PRODUCTIVITY_REVIEW_TERMINAL_STATUSES]),
+      ))
+      .limit(1);
+    if (!row) return false;
+    // A review is never its own source. Defensive: `originId` is server-written
+    // from `sourceIssue.id`, but a self-referential row would otherwise hand an
+    // agent an unbounded self-grant on the review it already owns.
+    if (row.id === input.issueId) return false;
+    logger.info({
+      actorAgentId: input.actorAgentId,
+      issueId: input.issueId,
+      companyId: input.companyId,
+      reviewIssueId: row.id,
+      grantedAction: input.action,
+      grant: "productivity_review_source",
+    }, "authorized productivity-review source-issue grant");
+    return true;
+  }
+
+  function allowProductivityReviewGrant(action: AuthorizationAction): AuthorizationDecision {
+    return allow({
+      action,
+      reason: "allow_productivity_review_grant",
+      explanation: "Allowed by an open productivity review the actor owns for this issue.",
+    });
+  }
+
+  async function recoveryOrReviewIssueBlocksUnassignedAgentClaim(
+    resource: Extract<AuthorizationResource, { type: "issue" }>,
+  ) {
+    // `undefined` means the caller did not look the field up; `null` means it
+    // looked and the issue has no origin kind. Collapsing the two with `??`
+    // would make every ordinary (origin-less) issue reload the full row here —
+    // the common case, and the one this branch exists to serve — while only
+    // issues that already carry an origin kind took the cheap path.
+    const originKind = resource.originKind !== undefined
+      ? resource.originKind
+      : resource.issueId
+        ? (await loadIssue(resource.issueId))?.originKind ?? null
+        : null;
+    return AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS.has(originKind ?? "");
+  }
+
   async function decideBase(input: {
     actor: AuthorizationActor;
     action: AuthorizationAction;
@@ -2010,6 +2161,39 @@ export function authorizationService(db: Db) {
       const policyEffect = await assignmentPolicyEffect(input.resource);
       const policyDeny = await denyForAssignmentPolicyIfNeeded(policyEffect);
       if (policyDeny) return policyDeny;
+      // BLO-19094: refuse *self-appointment* onto a shell whose ownership is
+      // itself a grant. The `issue:mutate` branch below already suppresses the
+      // generic unassigned-issue allow for these origin kinds, but that closes
+      // only the PATCH door; the door agents actually use to claim work is
+      // POST /issues/:id/checkout, which authorizes on `tasks:assign` and
+      // never reaches that branch. Without this, an unrelated agent checks out
+      // an orphaned productivity review, becomes its assignee, and
+      // `agentHasProductivityReviewGrantOnIssue` then hands it `issue:mutate`
+      // on a source issue it has no relationship to.
+      //
+      // Scoped to self-claims on purpose. `tasks:assign` also covers ordinary
+      // delegation — a manager or the harness assigning a review *to* someone
+      // — which stays allowed; what is refused is an agent naming itself. The
+      // `currentAssigneeAgentId` check keeps a reviewer able to re-check out
+      // the review it already owns.
+      const assignmentTargetsSelf =
+        input.resource.type === "issue" &&
+        !!input.resource.assigneeAgentId &&
+        input.resource.assigneeAgentId === actorAgentId &&
+        input.resource.currentAssigneeAgentId !== actorAgentId;
+      if (
+        assignmentTargetsSelf &&
+        input.resource.type === "issue" &&
+        input.resource.issueId &&
+        (await recoveryOrReviewIssueBlocksUnassignedAgentClaim(input.resource))
+      ) {
+        return deny({
+          action: input.action,
+          reason: "deny_missing_grant",
+          explanation:
+            "Agents cannot claim a recovery or review shell they were not assigned; ownership of it confers access to the issue it reviews.",
+        });
+      }
       if (policyEffect.kind === "restricted") {
         const grantDecision = await decideWithTaskAssignmentGrants("agent", actorAgentId);
         if (grantDecision.allowed) return grantDecision;
@@ -2022,6 +2206,51 @@ export function authorizationService(db: Db) {
       });
     }
 
+    // BLO-18289: coordination metadata (blocker edges, priority, project,
+    // parent, milestone) on an issue assigned to SOMEBODY ELSE. This is the
+    // narrow slice BLO-18163 asked for: the actor curating the dependency
+    // graph is structurally not the actor holding the issue, so `allow_self`
+    // never fires and the graph can only ever be curated by its own subjects.
+    //
+    // Two conditions, BOTH required:
+    //   1. an explicit `tasks:assign` / `tasks:assign_scope` grant, and
+    //   2. the actor manages the assignee in the reporting chain.
+    //
+    // (2) is not redundant. BLO-18163 keyed this on `tasks:assign` on the
+    // stated rationale that it is "board-granted, and grantable to you for
+    // your subtree". In practice the grant is issued to essentially every
+    // agent (12 of 13 active agents in the founding company hold it, all
+    // unscoped), so the grant alone would hand every agent write access to
+    // every other agent's coordination metadata — the opposite of the
+    // "no widening for ordinary agents" requirement. The manager-chain
+    // condition restores the subtree semantics the rationale assumed: a
+    // manager curates its reports' graph, a peer curates nothing.
+    //
+    // Callers must still enforce the FIELD allowlist; this decides only
+    // "may this actor touch coordination metadata on this issue at all".
+    if (input.action === "issue:coordination_metadata") {
+      const resource = input.resource.type === "issue" ? input.resource : null;
+      const assigneeAgentId = resource?.assigneeAgentId ?? null;
+      if (!assigneeAgentId || assigneeAgentId === actorAgentId) {
+        // Ordinary issue:mutate already covers self-owned and unassigned
+        // issues; this action exists purely for the cross-assignee case.
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation: "Coordination-metadata authority applies only to issues assigned to another agent.",
+        });
+      }
+      if (!(await isManagerOf(companyId, actorAgentId, assigneeAgentId))) {
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation: "Actor does not manage the issue assignee in the reporting chain.",
+        });
+      }
+      const grantDecision = await decideWithTaskAssignmentGrants("agent", actorAgentId);
+      return grantDecision;
+    }
+
     if (input.action === "issue:comment" || input.action === "issue:mutate") {
       const resource = input.resource.type === "issue" ? input.resource : null;
       if (resource?.assigneeAgentId === actorAgentId) {
@@ -2031,12 +2260,24 @@ export function authorizationService(db: Db) {
           explanation: "Allowed because the actor owns the assigned issue.",
         });
       }
+      let unassignedClaimSuppressed = false;
       if (!resource?.assigneeAgentId) {
-        return allow({
-          action: input.action,
-          reason: "allow_company_agent",
-          explanation: "Allowed because the issue has no agent assignee.",
-        });
+        // Suppress only the generic default; do NOT return here. An explicit
+        // grant below (mention, recovery handoff, productivity review) is a
+        // deliberate, auditable channel onto this specific issue, and denying
+        // it at this point would mean an agent that was actually invited to
+        // act on an orphaned review still could not. What is being closed is
+        // self-appointment through "nobody owns this", not every route in.
+        unassignedClaimSuppressed = Boolean(
+          resource && await recoveryOrReviewIssueBlocksUnassignedAgentClaim(resource),
+        );
+        if (!unassignedClaimSuppressed) {
+          return allow({
+            action: input.action,
+            reason: "allow_company_agent",
+            explanation: "Allowed because the issue has no agent assignee.",
+          });
+        }
       }
       if (
         input.action === "issue:comment" &&
@@ -2048,8 +2289,15 @@ export function authorizationService(db: Db) {
           explanation: "Allowed because the actor created this issue.",
         });
       }
+      // BLO-19094 x BLO-18797: `resource.assigneeAgentId` is narrowed to a
+      // non-null string here in master, because the unassigned branch above
+      // used to `return` unconditionally. Suppressing the claim turned that
+      // into a flag, so this line is now reachable with no assignee and the
+      // guard has to be explicit. Semantics are unchanged either way — nobody
+      // manages the assignee of an unassigned issue.
       if (
         input.action === "issue:comment" &&
+        resource?.assigneeAgentId &&
         await isManagerOf(companyId, actorAgentId, resource.assigneeAgentId)
       ) {
         return allow({
@@ -2082,6 +2330,38 @@ export function authorizationService(db: Db) {
         })
       ) {
         return allowRecoveryHandoffGrant(input.action);
+      }
+      // Unlike the two grants above this covers `issue:mutate` as well as
+      // `issue:comment`: a productivity review's entire remedy set (block,
+      // cancel, reassign, snooze) is a mutation of the source issue, so a
+      // comment-only grant would leave the mechanism exactly as unable to act
+      // as it was before (BLO-19094).
+      //
+      // Reached even when `unassignedClaimSuppressed` is set, which is safe
+      // only because of an invariant enforced in another file: a review of a
+      // review cannot exist. If one could, owning R2 whose `originId` is R1
+      // would let the actor claim R1 here and inherit R1's source. Two places
+      // in productivity-review.ts hold that line — the candidate query
+      // excludes review-origin rows, and the pre-create recheck requires
+      // `originKind !== PRODUCTIVITY_REVIEW_ORIGIN_KIND`. Relaxing review
+      // candidacy without revisiting this call site would silently reopen it.
+      if (
+        resource?.issueId &&
+        await agentHasProductivityReviewGrantOnIssue({
+          action: input.action,
+          companyId,
+          issueId: resource.issueId,
+          actorAgentId,
+        })
+      ) {
+        return allowProductivityReviewGrant(input.action);
+      }
+      if (unassignedClaimSuppressed) {
+        return deny({
+          action: input.action,
+          reason: "deny_missing_grant",
+          explanation: "Review and escalation issues cannot be claimed through generic unassigned-issue access.",
+        });
       }
     }
     if (

@@ -42,7 +42,60 @@ Ship a PR a reviewer can land without follow-up clarifying questions. The aim is
 
 ## PR body
 
-Use this structure:
+**Look for a repo-local PR template before you write anything.** When the
+repository ships one, its headings are the contract and the generic structure at
+the end of this section is only the fallback. GitHub honours a template at the
+repo root, under `.github/`, or under `docs/`, in either letter case, and a
+directory of named templates in place of a single file. Search all three
+locations case-insensitively — an enumeration that guesses the casing wrong
+prints nothing, which is indistinguishable from a repo that has no template:
+
+```sh
+find . .github docs -maxdepth 1 -iname 'pull_request_template*' 2>/dev/null
+```
+
+A `PULL_REQUEST_TEMPLATE/` **directory** is the one case with no default: GitHub
+applies none of its files unless the PR is opened with `?template=`. Read the
+repo's checker to see which file it enforces — that one is the contract. Absent a
+checker, pick the template whose headings fit the change and say which you used.
+
+Where one exists, follow it — and note that following it means more than copying
+it across:
+
+- **Reproduce every `## ` heading verbatim and in order.** A template gate matches
+  the literal heading string, so `## Risks` and `## Risk and rollback` are not
+  interchangeable, and a heading that reads as redundant is still a hard failure
+  when it is missing.
+- **Delete the instructional HTML comments as you fill each section in.** This is
+  the failure that looks most like success: your prose is sitting right there
+  under the heading, but a checker reading the *first* thing in the section finds
+  `<!--` and scores the section empty.
+- **Replace every placeholder.** A bare `-`, `_No response_`, and `<model>` are
+  precisely what these gates look for.
+- **Avoid writing a section's heading text into your prose above that section.**
+  These checkers typically find a section by plain substring search, unanchored to
+  the start of a line, so an earlier mention — even inside a fenced code block —
+  captures the match and the gate grades that fragment instead of your real
+  section. It fails confusingly when it fails, and passes for the wrong reason
+  when it does not. Quote the section name without its `##` marker.
+- **Map the advice below onto the repo's headings rather than dropping it.** The
+  section names change; what a reviewer needs to see does not.
+
+**Run the gate locally before you push.** A repo that enforces a template almost
+always ships the checker as a script that CI merely invokes, so the same verdict
+is available in a second instead of costing a push, a red check, and a rewrite:
+
+```sh
+ls .github/scripts/ .github/workflows/ 2>/dev/null   # find the checker
+# Typical shape: takes the body from a file or env var, prints JSON, exits non-zero.
+PR_BODY="$(cat pr-body.md)" node .github/scripts/<checker>.mjs
+gh pr create --body-file pr-body.md                  # only once it passes
+```
+
+Drafting the body into a file and passing `--body-file` also stops the shell
+mangling backticks and newlines on the way through.
+
+**If the repo has no template of its own**, use this structure:
 
 ```md
 ## Summary
@@ -93,11 +146,16 @@ decides whether the PR can receive a formal review at all:
 - **Default App-installation token** — identity `app/allyblockcast[bot]`. This is
   the **authoring identity**: commits, branch push, `gh pr create`, comments,
   replies, status, reads, and merges. The review bot posts its **comment-mode**
-  reviews under this identity.
+  reviews under this identity. Paperclip trusts App-authored review output when
+  it carries the canonical consolidated review body with an exact-head
+  attestation.
 - **User-seat token** — mounted at `/paperclip/.secrets/github-merge-token/token`
   when provisioned. This is the **`allyblockcast` user** account, a *distinct*
   GitHub identity from the `app/allyblockcast[bot]` App. The review bot posts its
-  **formal approvals** under this seat. It is *not* an authoring credential.
+  **formal approvals** under this seat. Paperclip trusts that seat review only
+  when it is `APPROVED` and contains the canonical consolidated review body with
+  exactly one exact-head `Reviewed head: <sha>` attestation. It is *not* an
+  authoring credential.
 
 GitHub forbids an identity from submitting a **formal review** (`APPROVE` /
 `REQUEST_CHANGES`) on a PR it authored, so the author and the reviewer must be
@@ -106,8 +164,22 @@ different identities.
 Holding the user-seat token does **not** make you a reviewer, and it is not your
 push/create credential either — the review bot's own approvals come from that very
 same login, which is both why authoring under it blocks review and why you must
-never submit a review under it (see
+never submit a review under it outside the dedicated reviewer pipeline (see
 [Why the user seat must never post a review](#why-the-user-seat-must-never-post-a-review)).
+
+The dedicated reviewer pipeline has two trusted clean-review evidence shapes:
+
+1. Post the canonical `## Ally — Consolidated PR Review` body, with exactly one
+   full `Reviewed head: <sha>` attestation, as the App identity for comment-mode
+   reviews or App-authored review output.
+2. If the review is clean and the PR is App-authored, submit the formal approval
+   under the user-seat identity with that same canonical body and exact-head
+   attestation. The approval satisfies branch protection, and the attested body
+   is the durable evidence Paperclip requires before completing the reviewer run.
+
+A seat approval without the canonical `APPROVED` exact-head attestation is
+untrusted, and an App comment cannot satisfy a repository rule that explicitly
+requires a formal approval.
 
 **Author and push under the default App token. Never author or push a PR under
 the user-seat token.** No token selection is needed — the default `gh` and `git`
@@ -314,7 +386,9 @@ gh pr merge <number> --repo <org>/<repo> --squash
 Rules:
 - Use the **default App token** for authoring, pushing, commenting, and merging.
 - **Never submit a formal review under the user-seat token.** No `gh pr review`
-  with it — not `--approve`, not `--request-changes`, not `--comment`. Never post
+  with it — not `--approve`, not `--request-changes`, not `--comment`. This rule
+  governs agents consuming this workflow; only the dedicated reviewer service may
+  produce the canonical exact-head `APPROVED` review under that seat. Never post
   an `ally-verdict:` marker or a `Reviewed head: <sha>` line under it, on a review
   or in a comment. This holds even when the review is honest and even when the
   change is yours: the prohibition is on the *credential*, not on your intent.
@@ -335,9 +409,11 @@ the reviewer's own**, to a human reader and to CI alike.
 
 The `review/ally-complete` merge gate keys off exactly that: an `APPROVED` review
 from an `allyblockcast` login. An approval posted under the seat therefore clears
-the gate for a change no reviewer ever looked at, and nothing in the audit trail
-can afterwards tell the two apart. Only the reviewer's own pipeline may produce a
-review that clears that gate.
+the gate for a change no reviewer ever looked at, and a manually forged canonical
+body is indistinguishable from the reviewer's own evidence after the fact. Only
+the reviewer's own pipeline may produce a review that clears that gate, and
+Paperclip completes that pipeline only after GitHub confirms the exact-head
+trusted evidence described above.
 
 So when you are looking at a red `review/ally-complete` on your own PR, the
 sanctioned move is to **get a review** — re-request one (see the repo's review
@@ -354,6 +430,10 @@ caught.
 - Mixing refactor and behavior change in the same PR with no separation in the body.
 - "Address feedback" commits that bundle unrelated edits. One commit per round of feedback is fine; one commit for everything in flight is not.
 - Force-pushing during active review without telling the reviewer.
+- Writing the body to this skill's generic structure in a repo that ships its own
+  PR template. The template's headings win; ours are the fallback. Discovering the
+  mismatch from a red check after pushing costs a CI run every time, and trains you
+  to read a red template gate as first-push noise.
 - Approving your own PR under the user-seat merge token to turn the review gate
   green. That is a forged review, not a merge unblock — see the credential rules
   above.

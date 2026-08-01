@@ -44,16 +44,19 @@ describe("resolveExternalLifecycleConcurrency", () => {
   });
 
   it("uses maxConcurrentRuns when enabled and under the operational slot ceiling", () => {
-    const result = resolveExternalLifecycleConcurrency({ concurrencyEnabled: true, maxConcurrentRuns: 3 });
-    expect(result).toEqual({ effectiveMaxConcurrentRuns: 3, concurrencyEnabled: true });
+    const result = resolveExternalLifecycleConcurrency({ concurrencyEnabled: true, maxConcurrentRuns: 5 });
+    expect(result).toEqual({ effectiveMaxConcurrentRuns: 5, concurrencyEnabled: true });
   });
 
   it("bounds effective concurrency to the operational slot ceiling even when enabled", () => {
-    // EXTERNAL_LIFECYCLE_SLOT_CAPACITY is 5; a misconfigured maxConcurrentRuns
+    // EXTERNAL_LIFECYCLE_SLOT_CAPACITY is 8; a misconfigured maxConcurrentRuns
     // above that must not exceed the operational ceiling.
-    const result = resolveExternalLifecycleConcurrency({ concurrencyEnabled: true, maxConcurrentRuns: 50 });
-    expect(result.effectiveMaxConcurrentRuns).toBe(5);
-    expect(result.concurrencyEnabled).toBe(true);
+    for (const maxConcurrentRuns of [8, 50]) {
+      expect(resolveExternalLifecycleConcurrency({ concurrencyEnabled: true, maxConcurrentRuns })).toEqual({
+        effectiveMaxConcurrentRuns: 8,
+        concurrencyEnabled: true,
+      });
+    }
   });
 
   it("never returns less than 1 even for a degenerate maxConcurrentRuns", () => {
