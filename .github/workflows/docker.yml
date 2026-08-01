@@ -367,10 +367,18 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Authorize this exact digest at admission time before rolling it out
-      # (BLO-19955). The cluster-scoped ValidatingAdmissionPolicy
-      # paperclip-core-service-routing reads its approved-digest list from
+      # (BLO-19955). The ValidatingAdmissionPolicy paperclip-api-image-approval
+      # reads its approved-digest list from
       # ConfigMap/paperclip-api-approved-images via paramRef, so without this
       # step helm upgrade is denied.
+      #
+      # The rotation itself lives in scripts/approve-paperclip-api-digest.sh and
+      # is deliberately NOT reimplemented here. An inline copy drifted from the
+      # committed script once already (it lacked the optimistic-concurrency
+      # guard, so two concurrent releases could silently clobber each other's
+      # approval), and only the script is covered by
+      # scripts/approve-paperclip-api-digest.test.mjs and by the real-apiserver
+      # suite in Blockcast/onprem-k8s. One implementation, one set of tests.
       #
       # This uses a SEPARATE credential from the deploy kubeconfig on purpose.
       # KUBECONFIG_PAPERCLIP_CI_DEPLOY is namespace-scoped to the deploy
@@ -382,62 +390,38 @@ jobs:
         env:
           APPROVER_KUBECONFIG: ${{ secrets.KUBECONFIG_PAPERCLIP_RELEASE_APPROVER }}
           DIGEST: ${{ steps.artifact.outputs.digest }}
-          APPROVAL_NS: paperclip-release-approvals
-          APPROVAL_CM: paperclip-api-approved-images
           # Must match maxApprovedApiDigests in the admission policy. The policy
           # denies every rollout if the window is longer, so this is a hard
           # ceiling rather than a preference.
-          MAX_APPROVED: '3'
+          PAPERCLIP_MAX_APPROVED_DIGESTS: '3'
         run: |
           set -euo pipefail
-          [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
           if [ -z "${APPROVER_KUBECONFIG}" ]; then
             echo "KUBECONFIG_PAPERCLIP_RELEASE_APPROVER is not set in the paperclip-production environment." >&2
             echo "Admission will deny this rollout until the approver credential is provisioned." >&2
             exit 1
           fi
 
+          mkdir -p "$RUNNER_TEMP/.kube"
           approver_kubeconfig="$RUNNER_TEMP/.kube/approver"
-          printf '%s' "${APPROVER_KUBECONFIG}" > "${approver_kubeconfig}"
-          chmod 600 "${approver_kubeconfig}"
+          approval_log="$RUNNER_TEMP/approval.log"
 
-          current=$(KUBECONFIG="${approver_kubeconfig}" kubectl -n "${APPROVAL_NS}" \
-            get configmap "${APPROVAL_CM}" -o jsonpath='{.data.approvedDigests}')
+          # Arm the cleanup BEFORE the credential reaches disk. This is the
+          # higher-privilege identity of the two the job handles, and the runner
+          # is a long-lived self-hosted host, so a kubectl/jq failure exiting
+          # under `set -e` must not leave it behind. umask instead of a
+          # follow-up chmod so the file is never briefly world-readable.
+          trap 'rm -f "${approver_kubeconfig}" "${approval_log}"' EXIT
+          (umask 077; printf '%s' "${APPROVER_KUBECONFIG}" > "${approver_kubeconfig}")
 
-          # Bounded ring, newest first: this digest plus the most recently
-          # approved ones. Rolling back past the window stays an explicit act,
-          # so a stale image cannot be re-pinned silently.
-          window=$(
-            {
-              printf '%s\n' "${DIGEST}"
-              printf '%s\n' "${current}" | tr -d '\r' \
-                | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-                | grep -E '^sha256:[0-9a-f]{64}$' \
-                | grep -Fxv "${DIGEST}" || true
-            } | head -n "${MAX_APPROVED}"
-          )
-
-          patch=$(jq -n --arg v "${window}" '{data: {approvedDigests: $v}}')
-          KUBECONFIG="${approver_kubeconfig}" kubectl -n "${APPROVAL_NS}" \
-            patch configmap "${APPROVAL_CM}" --type merge -p "${patch}" >/dev/null
-
-          # Read back rather than trusting the patch exit code. A 200 that did
-          # not persist would send helm upgrade into an admission denial with a
-          # far more confusing error than this one.
-          verify=$(KUBECONFIG="${approver_kubeconfig}" kubectl -n "${APPROVAL_NS}" \
-            get configmap "${APPROVAL_CM}" -o jsonpath='{.data.approvedDigests}')
-          if ! printf '%s\n' "${verify}" | tr -d '\r' \
-            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -Fxq "${DIGEST}"; then
-            echo "Approval did not persist: ${DIGEST} absent from ${APPROVAL_NS}/${APPROVAL_CM}" >&2
-            exit 1
-          fi
-          rm -f "${approver_kubeconfig}"
+          KUBECONFIG="${approver_kubeconfig}" \
+            ./scripts/approve-paperclip-api-digest.sh "${DIGEST}" | tee "${approval_log}"
 
           {
             echo "### Admission approval"
-            echo "- Approved digest: \`${DIGEST}\`"
-            echo "- Approval window (newest first):"
-            printf '%s\n' "${window}" | sed 's/^/  - `/; s/$/`/'
+            echo '```'
+            cat "${approval_log}"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Pin the manifest digest resolved above so the image inspected for the

@@ -74,6 +74,9 @@ jobs:
       - name: Validate Docker deploy timeout margin
         run: node --test ./scripts/check-docker-deploy-timeout.test.js
 
+      - name: Test admission-approval digest rotation
+        run: node --test ./scripts/approve-paperclip-api-digest.test.mjs
+
       - name: Reject git push in adapter/runtime code
         run: node ./scripts/check-no-git-push.mjs
 
