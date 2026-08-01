@@ -10196,6 +10196,10 @@ export function issueRoutes(
               ...updateFields,
               actorAgentId: actor.agentId ?? null,
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
+              expectedCurrentExecutionState:
+                existing.executionState && typeof existing.executionState === "object"
+                  ? existing.executionState
+                  : null,
               ...(delegateRecoveryPatchInFlight
                 ? {
                     expectedCurrentStatus: "blocked",
@@ -12688,7 +12692,13 @@ export function issueRoutes(
               commentOptions,
               tx,
             );
-            const updated = await svc.update(id, updatePatch, tx);
+            const updated = await svc.update(id, {
+              ...updatePatch,
+              expectedCurrentExecutionState:
+                currentIssue.executionState && typeof currentIssue.executionState === "object"
+                  ? currentIssue.executionState
+                  : null,
+            }, tx);
             if (!updated) throw new AutoApprovalIssueMissingError();
 
             if (transition.decision && decisionId) {

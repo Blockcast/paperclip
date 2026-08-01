@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -11,6 +11,7 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  issueExecutionDecisions,
   issueRelations,
   issues,
 } from "@paperclipai/db";
@@ -43,6 +44,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
 
   afterEach(async () => {
     await db.delete(issueComments);
+    await db.delete(issueExecutionDecisions);
     await db.delete(issueRelations);
     await db.delete(activityLog);
     await db.delete(issues);
@@ -1192,5 +1194,171 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         .then((rows) => rows[0]);
       expect(row).toEqual({ status: "in_progress", assigneeAgentId: agentId });
     });
+
+    it.each(["queued", "scheduled_retry"] as const)(
+      "keeps dispatch claim and %s-owner adoption mutually exclusive",
+      async (ownerStatus) => {
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+          const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+          const ownerRunId = await seedNeverStartedOwnerRun({ companyId, agentId, status: ownerStatus });
+          const issueId = await seedIssueOwnedByRun({
+            companyId,
+            agentId,
+            ownerRunId,
+            title: `${ownerStatus} dispatch race ${attempt}`,
+          });
+
+          const [patchResponse, claimed] = await Promise.all([
+            request(createApp(agentActor(companyId, agentId, currentRunId)))
+              .patch(`/api/issues/${issueId}`)
+              .send({ title: `attempt ${attempt}` }),
+            db
+              .update(heartbeatRuns)
+              .set({ status: "running", startedAt: new Date(), updatedAt: new Date() })
+              .where(
+                and(
+                  eq(heartbeatRuns.id, ownerRunId),
+                  eq(heartbeatRuns.status, ownerStatus),
+                  isNull(heartbeatRuns.startedAt),
+                ),
+              )
+              .returning({ id: heartbeatRuns.id }),
+          ]);
+
+          const owner = await db
+            .select({ status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, ownerRunId))
+            .then((rows) => rows[0]);
+          if (patchResponse.status === 200) {
+            expect(claimed).toHaveLength(0);
+            expect(owner?.status).toBe("cancelled");
+          } else {
+            expect(patchResponse.status, JSON.stringify(patchResponse.body)).toBe(409);
+            expect(claimed).toHaveLength(1);
+            expect(owner?.status).toBe("running");
+          }
+
+          await db.delete(issues).where(eq(issues.id, issueId));
+          await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, ownerRunId));
+        }
+      },
+    );
+
+    it("does not replace a divergent live execution owner during checkout adoption or release", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const queuedCheckoutRunId = await seedNeverStartedOwnerRun({ companyId, agentId, status: "queued" });
+      const liveExecutionRunId = randomUUID();
+      const issueId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: liveExecutionRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "assignment",
+        startedAt: new Date(),
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Divergent owner protection",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: queuedCheckoutRunId,
+        executionRunId: liveExecutionRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const app = createApp(agentActor(companyId, agentId, currentRunId));
+      const patchResponse = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Must not land" });
+      expect(patchResponse.status, JSON.stringify(patchResponse.body)).toBe(409);
+
+      const releaseResponse = await request(app)
+        .post(`/api/issues/${issueId}/release`)
+        .send();
+      expect(releaseResponse.status, JSON.stringify(releaseResponse.body)).toBe(409);
+
+      const row = await db
+        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        checkoutRunId: queuedCheckoutRunId,
+        executionRunId: liveExecutionRunId,
+      });
+    });
+  });
+
+  it("allows only one concurrent decision from a participant whose assignee drifted", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const divergedAssigneeAgentId = randomUUID();
+    const stageId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(agents).values({
+      id: divergedAssigneeAgentId,
+      companyId,
+      name: "DivergedAssignee",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const executionState = {
+      status: "pending",
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId },
+      returnAssignee: { type: "agent", agentId: divergedAssigneeAgentId },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    };
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Concurrent participant decision",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: divergedAssigneeAgentId,
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ type: "agent", agentId }],
+        }],
+      },
+      executionState,
+    });
+
+    const app = createApp(agentActor(companyId, agentId, currentRunId));
+    const [first, second] = await Promise.all([
+      request(app).patch(`/api/issues/${issueId}`).send({ status: "done", comment: "Approve one" }),
+      request(app).patch(`/api/issues/${issueId}`).send({ status: "done", comment: "Approve two" }),
+    ]);
+    expect(
+      [first.status, second.status].sort(),
+      JSON.stringify([first.body, second.body]),
+    ).toEqual([200, 409]);
+
+    const decisions = await db
+      .select({ id: issueExecutionDecisions.id })
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(1);
   });
 });
