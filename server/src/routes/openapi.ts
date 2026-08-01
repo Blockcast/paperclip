@@ -6005,6 +6005,14 @@ registerCurrentRoute({
   body: cancelIssueThreadInteractionSchema,
 });
 
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/interactions/{interactionId}/withdraw",
+  tags: ["issues"],
+  summary: "Withdraw an issue thread interaction",
+  body: cancelIssueThreadInteractionSchema,
+});
+
 for (const route of [
   ["get", "/api/routines/{id}/revisions", "List routine revisions"],
   ["post", "/api/routines/{id}/revisions/{revisionId}/restore", "Restore a routine revision"],
