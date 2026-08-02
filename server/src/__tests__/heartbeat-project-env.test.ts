@@ -208,6 +208,58 @@ describe("resolveExecutionRunAdapterConfig", () => {
     expect(JSON.stringify(result.resolvedConfig.env)).not.toContain("PAPERCLIP_");
   });
 
+  // Companion to the test above, and the reason GH_SEAT_TOKEN_VALUE is spelled
+  // without a `PAPERCLIP_` prefix (BLO-18927 step 2). The strip above is
+  // correct and stays; what it means is that any credential delivered by the
+  // scoped-binding path must live outside that namespace, because the strip
+  // runs *before* agent-scope resolution and removes the key with no error
+  // anywhere. A `PAPERCLIP_`-prefixed seat token is therefore not "a binding
+  // that sometimes fails" — it can never arrive at all, and the gh wrapper
+  // falls through to the fleet-wide mounted file as if nothing were configured.
+  //
+  // This asserts the key reaches resolveAdapterConfigForRuntime, which is the
+  // precise thing renaming it back would break. It is deliberately paired with
+  // a PAPERCLIP_-prefixed control in the same env block so that a future change
+  // making the strip a no-op cannot make this test pass for the wrong reason.
+  it("preserves the non-PAPERCLIP_ scoped seat-token key through agent-scope resolution", async () => {
+    const resolveAdapterConfigForRuntime = vi.fn(async (_companyId, config: Record<string, unknown>) => ({
+      config: {
+        ...config,
+        env: { ...(config.env as Record<string, unknown>) },
+      },
+      secretKeys: new Set<string>(),
+      manifest: [],
+    }));
+    const resolveEnvBindings = vi.fn(async (_companyId, env: Record<string, unknown>) => ({
+      env: Object.fromEntries(
+        Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+      ),
+      secretKeys: new Set<string>(),
+      manifest: [],
+    }));
+
+    const result = await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      executionRunConfig: {
+        env: {
+          GH_SEAT_TOKEN_VALUE: { type: "secret_ref", secretId: "secret-seat-token", version: "latest" },
+          // Control: same block, same scope, only the prefix differs.
+          PAPERCLIP_GITHUB_TOKEN_VALUE: { type: "secret_ref", secretId: "secret-seat-token", version: "latest" },
+        },
+      },
+      secretsSvc: {
+        resolveAdapterConfigForRuntime,
+        resolveEnvBindings,
+      } as any,
+    });
+
+    const agentEnvSeenByResolver = (resolveAdapterConfigForRuntime.mock.calls[0]?.[1] as any)?.env ?? {};
+    expect(agentEnvSeenByResolver).toHaveProperty("GH_SEAT_TOKEN_VALUE");
+    expect(agentEnvSeenByResolver).not.toHaveProperty("PAPERCLIP_GITHUB_TOKEN_VALUE");
+    expect(result.resolvedConfig.env).toHaveProperty("GH_SEAT_TOKEN_VALUE");
+  });
+
   it("skips project env resolution when the project has no bindings", async () => {
     const resolveAdapterConfigForRuntime = vi.fn().mockResolvedValue({
       config: { env: { AGENT_ONLY: "agent-only" } },
