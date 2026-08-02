@@ -1299,4 +1299,286 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     adapter.disarm();
     await heartbeat.drainInFlightExecutions(60_000);
   }, 600_000);
+
+  it("does not re-arm an internally scheduled head rescan when it coalesces", async () => {
+    // BLO-20396 (sixth review follow-up). A trailing head rescan is scheduled
+    // from inside the currently held agent lock. It can therefore coalesce into
+    // that active section before running. That coalescence must NOT be treated
+    // as new external demand, or the head pass re-arms itself forever after it
+    // exhausts an empty queue.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issuePrefix = `H${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const terminalIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "HeadRescanLoopCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "HeadRescanLoopAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: terminalIssueId,
+      companyId,
+      title: "Already done",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    const now = Date.now();
+    const wakeRows: Array<typeof agentWakeupRequests.$inferInsert> = [];
+    const runRows: Array<typeof heartbeatRuns.$inferInsert> = [];
+    for (let i = 0; i < 2; i += 1) {
+      const runId = randomUUID();
+      const wakeId = randomUUID();
+      const at = new Date(now + i);
+      wakeRows.push({
+        id: wakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: terminalIssueId },
+        status: "queued",
+        runId,
+        requestedAt: at,
+        updatedAt: at,
+      });
+      runRows.push({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: wakeId,
+        contextSnapshot: { issueId: terminalIssueId, wakeReason: "issue_assigned" },
+        createdAt: at,
+        updatedAt: at,
+      });
+    }
+    await db.insert(agentWakeupRequests).values(wakeRows);
+    await db.insert(heartbeatRuns).values(runRows);
+
+    let releaseFirstPass!: () => void;
+    let firstPassEntered!: () => void;
+    let directCoalesced!: () => void;
+    const releaseFirstPassPromise = new Promise<void>((resolve) => {
+      releaseFirstPass = resolve;
+    });
+    const firstPassEnteredPromise = new Promise<void>((resolve) => {
+      firstPassEntered = resolve;
+    });
+    const directCoalescedPromise = new Promise<void>((resolve) => {
+      directCoalesced = resolve;
+    });
+    let heldFirstDirectPass = false;
+    const passReasons: string[] = [];
+    const coalescedReasons: Array<{ reason: string; suppressHeadRescanDemand: boolean }> = [];
+    const boundedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 4 },
+      beforeQueuedDispatchPassForTest: async (event) => {
+        passReasons.push(event.reason);
+        if (event.reason === "direct" && !heldFirstDirectPass) {
+          heldFirstDirectPass = true;
+          firstPassEntered();
+          await releaseFirstPassPromise;
+        }
+      },
+      onQueuedDispatchCoalescedDemandForTest: (event) => {
+        coalescedReasons.push({
+          reason: event.reason,
+          suppressHeadRescanDemand: event.suppressHeadRescanDemand,
+        });
+        if (event.reason === "direct") directCoalesced();
+      },
+    });
+
+    const first = boundedHeartbeat.resumeQueuedRuns();
+    await firstPassEnteredPromise;
+    const second = boundedHeartbeat.resumeQueuedRuns();
+    await directCoalescedPromise;
+    releaseFirstPass();
+    await Promise.all([first, second]);
+    await boundedHeartbeat.drainInFlightExecutions(5_000);
+
+    expect(passReasons.filter((reason) => reason === "resume_head_rescan_after_coalesced_demand"))
+      .toHaveLength(1);
+    expect(coalescedReasons).toContainEqual({
+      reason: "resume_head_rescan_after_coalesced_demand",
+      suppressHeadRescanDemand: true,
+    });
+
+    const remainingQueued = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued")));
+    expect(remainingQueued).toHaveLength(0);
+  }, 60_000);
+  // BLO-20396 follow-up: a malformed persisted `contextSnapshot.issueId` must
+  // CONVERGE, not merely stop being fatal.
+  //
+  // Complements the priority-sort suite's "skips malformed persisted issue ids
+  // in UUID batch lookups", which covers the first half — screening the value
+  // out of the batch lookups so the pass survives and valid work still starts.
+  // This asserts the second half, which screening alone does not give you: the
+  // malformed row must leave the queue. Screened out of every batch lookup, it
+  // still reached the single-issue readiness call in claimQueuedRun and raised
+  // 22P02 there on every pass, while staying `queued` forever — a permanent
+  // poison pill against this ticket's "invalid queued rows converge to zero".
+  //
+  // The bounded scan feeds every non-empty `issueId` straight into a uuid
+  // `IN` predicate. `issues.id` is uuid, so a value like "not-a-uuid" raises
+  // PostgreSQL 22P02 (`invalid input syntax for type uuid`) as the batch is
+  // resolved — BEFORE any row is pruned or claimed. The scan cursor is a pass
+  // local, so the next pass restarts from the head of the queue, reads the
+  // same row, and aborts again: every later queued row for that agent is
+  // wedged behind one bad value, permanently.
+  //
+  // Both sibling lanes already defend this. Lane A casts uuid -> text (total
+  // and safe) precisely so untrusted text is never parsed per row, and the
+  // recovery lane UUID-screens in JS for the same reason. The main scan was
+  // the one path left undefended.
+  it("converges a malformed persisted issueId instead of retrying it forever", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issuePrefix = `M${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "MalformedCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "MalformedAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    const baseTime = Date.now() - 60 * 60 * 1000;
+
+    // The malformed row is the OLDEST, so the scan reaches it first and every
+    // later row sits behind it.
+    const badRunId = randomUUID();
+    const badWakeId = randomUUID();
+    const badAt = new Date(baseTime);
+    // A live issue the valid row can legitimately run.
+    const validIssueId = randomUUID();
+    const validRunId = randomUUID();
+    const validWakeId = randomUUID();
+    const validAt = new Date(baseTime + 60_000);
+
+    await db.insert(issues).values({
+      id: validIssueId,
+      companyId,
+      title: "Runnable work behind the malformed row",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: badWakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: "not-a-uuid" },
+        status: "queued",
+        runId: badRunId,
+        requestedAt: badAt,
+        updatedAt: badAt,
+      },
+      {
+        id: validWakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: validIssueId },
+        status: "queued",
+        runId: validRunId,
+        requestedAt: validAt,
+        updatedAt: validAt,
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: badRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: badWakeId,
+        contextSnapshot: { issueId: "not-a-uuid", wakeReason: "issue_assigned" },
+        createdAt: badAt,
+        updatedAt: badAt,
+      },
+      {
+        id: validRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: validWakeId,
+        contextSnapshot: { issueId: validIssueId, wakeReason: "issue_assigned" },
+        createdAt: validAt,
+        updatedAt: validAt,
+      },
+    ]);
+
+    // The pass must not raise. Before the fix this rejects with 22P02.
+    await expect(heartbeat.resumeQueuedRuns()).resolves.not.toThrow();
+    await heartbeat.drainInFlightExecutions(30_000);
+
+    // The valid row behind the malformed one actually started.
+    const [validAfter] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, validRunId));
+    expect(validAfter?.status).not.toBe("queued");
+
+    // The malformed row is pruned deterministically rather than retried
+    // forever: an id that cannot be a uuid can never resolve to an issue.
+    const [badAfter] = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, badRunId));
+    expect(badAfter?.status).toBe("cancelled");
+    expect(badAfter?.errorCode).toBe("invalid_context_issue_id");
+  }, 60_000);
 });

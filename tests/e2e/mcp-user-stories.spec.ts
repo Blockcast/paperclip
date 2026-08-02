@@ -430,10 +430,10 @@ test.describe.serial("MCP prod Phase 5a user-story harness", () => {
       for (const value of ["first", "second"]) {
         const pending = await testCall(request, connectionId, scout, "sheets:update_cell", { cell: "B1", value });
         expect(pending.decision).toBe("ask_first");
-        await page.goto(`/${seed.prefix}/apps/${connectionId}/review`);
-        await screenshot(page, "US-9", `review-${value}`);
         await approveActionRequest(request, seed.companyId, pending.actionRequestId!);
         await pollTestCall(request, connectionId, pending.actionRequestId!, "done");
+        await page.goto(`/${seed.prefix}/apps/${connectionId}/review`);
+        await screenshot(page, "US-9", `review-${value}`);
       }
       expect(mock.captures.filter((capture) => capture.method === "tools/call" && capture.toolName === "sheets:update_cell")).toHaveLength(2);
     } finally {

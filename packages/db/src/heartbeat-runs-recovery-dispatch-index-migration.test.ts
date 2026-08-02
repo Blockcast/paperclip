@@ -29,7 +29,8 @@ const MIGRATION_FILE = "0209_heartbeat_runs_recovery_dispatch_index.sql";
 const INDEX_NAME = "heartbeat_runs_recovery_dispatch_idx";
 const INDEX_DEFINITION =
   `ON heartbeat_runs USING btree (agent_id, created_at, id) `
-  + `WHERE status = 'queued' AND (context_snapshot ->> 'source') = 'issue_recovery_action'`;
+  + `WHERE status = 'queued' AND (context_snapshot ->> 'source') = 'issue_recovery_action' `
+  + `AND (context_snapshot ->> 'recoveryActionId') IS NOT NULL`;
 const cleanups: Array<() => Promise<void>> = [];
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -168,4 +169,40 @@ describeEmbeddedPostgres("heartbeat-run recovery dispatch index migration", () =
       pendingMigrations: [MIGRATION_FILE],
     });
   }, 60_000);
+
+  it("rejects same-name indexes with broader or wrong recovery predicates", async () => {
+    const database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-recovery-pred-shape-");
+    cleanups.push(database.cleanup);
+    const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
+    cleanups.push(async () => sql.end());
+
+    const invalidPredicates = [
+      "status = 'queued' OR (context_snapshot ->> 'source') = 'issue_recovery_action'",
+      "status = 'queued' AND (context_snapshot ->> 'source') <> 'issue_recovery_action'",
+      "status = 'queued' AND (context_snapshot ->> 'source') = 'issue_recovery_action'",
+      "status = 'queued' AND (context_snapshot ->> 'source') = 'issue_recovery_action' AND (context_snapshot ->> 'recoveryActionId') IS NULL",
+    ];
+
+    for (const predicate of invalidPredicates) {
+      await sql`
+        DELETE FROM "drizzle"."__drizzle_migrations"
+        WHERE "hash" = ${await migrationHash()}
+      `;
+      await sql.unsafe(`
+        DROP INDEX IF EXISTS ${INDEX_NAME};
+        CREATE INDEX ${INDEX_NAME}
+        ON heartbeat_runs USING btree (agent_id, created_at, id)
+        WHERE ${predicate}
+      `);
+
+      await expect(applyPendingMigrations(database.connectionString)).rejects.toMatchObject({
+        message: "migration 0209 found an invalid or incorrectly defined prerequisite index",
+        hint: expect.stringContaining(`CREATE INDEX CONCURRENTLY ${INDEX_NAME}`),
+      });
+      expect(await inspectMigrations(database.connectionString)).toMatchObject({
+        status: "needsMigrations",
+        pendingMigrations: [MIGRATION_FILE],
+      });
+    }
+  }, 90_000);
 });
