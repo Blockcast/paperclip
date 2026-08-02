@@ -4061,6 +4061,38 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(issue?.status).not.toBe("done");
   });
 
+  it("keeps a dismissed Dependabot alert issue open when the webhook only has a comment", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+    const dismissed = dependabotPayload("high", "dismissed");
+    Object.assign(dismissed.alert, {
+      dismissed_comment: "The vulnerable code path is not used in production.",
+    });
+
+    await postDependabot(app, dependabotPayload("high", "created"), "delivery-created");
+    await postDependabot(app, dismissed, "delivery-dismissed");
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(issue?.status).not.toBe("done");
+
+    const [receipt] = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issue!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+        ),
+      );
+    expect(receipt?.body).toContain("Dismissal reason: not provided in the webhook payload");
+    expect(receipt?.body).toContain(
+      'Dismissal comment: "The vulnerable code path is not used in production."',
+    );
+  });
+
   it("creates a durable closed receipt issue for an orphan terminal delivery", async () => {
     const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
     const app = buildApp({ dependabotAgentId: agentId });

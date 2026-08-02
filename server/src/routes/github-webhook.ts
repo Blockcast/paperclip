@@ -1118,8 +1118,7 @@ async function recordDependabotTerminalReceipt(
   },
 ): Promise<void> {
   const hasCompleteTerminalEvidence =
-    input.alert.action === "fixed" ||
-    Boolean(input.alert.dismissalReason || input.alert.dismissalComment);
+    input.alert.action === "fixed" || Boolean(input.alert.dismissalReason);
   let issue = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
   if (!issue) {
     issue = await db
