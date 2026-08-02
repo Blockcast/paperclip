@@ -1460,6 +1460,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
         status: "ready_for_review",
         title: "Fix BLO-40001",
       });
+      expect(rows[0]?.metadata).toMatchObject({
+        source: "github_pull_request_webhook",
+        sourceEventOrder: 10,
+      });
     });
 
     it("updates the same row on a later push instead of appending one per event", async () => {
@@ -1508,6 +1512,104 @@ describeEmbeddedPostgres("github-webhook route", () => {
         .where(eq(issueWorkProducts.issueId, issueId));
       expect(rows).toHaveLength(1);
       expect(rows[0]?.status).toBe("merged");
+    });
+
+    it("does not let a stale synchronize event overwrite a terminal merge state", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40006");
+      const app = buildApp();
+
+      await postPr(app, prPayload({ action: "opened", identifier: "BLO-40006", number: 4247 }), "wp-order-1");
+      await postPr(
+        app,
+        prPayload({
+          action: "closed",
+          identifier: "BLO-40006",
+          number: 4247,
+          merged: true,
+          headSha: "merge-head",
+        }),
+        "wp-order-2",
+      );
+      await postPr(
+        app,
+        prPayload({
+          action: "synchronize",
+          identifier: "BLO-40006",
+          number: 4247,
+          headSha: "stale-sync-head",
+        }),
+        "wp-order-3",
+      );
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("merged");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "merge-head",
+        lastEventAction: "closed",
+        sourceEventOrder: 30,
+      });
+    });
+
+    it("keeps updating a previously linked PR row after the identifier is removed", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40007");
+      const app = buildApp();
+
+      await postPr(app, prPayload({ action: "opened", identifier: "BLO-40007", number: 4248 }), "wp-link-1");
+      const syncWithoutIdentifier = await postPr(
+        app,
+        prPayload({
+          action: "synchronize",
+          identifier: "no-ticket",
+          number: 4248,
+          title: "Retitled without paperclip id",
+          headSha: "head-without-id",
+        }),
+        "wp-link-2",
+      );
+      expect(syncWithoutIdentifier.status).toBe(200);
+      expect(syncWithoutIdentifier.body).toMatchObject({ ignored: "no_matching_issue" });
+
+      let rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("ready_for_review");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "head-without-id",
+        lastEventAction: "synchronize",
+      });
+
+      const closeWithoutIdentifier = await postPr(
+        app,
+        prPayload({
+          action: "closed",
+          identifier: "no-ticket",
+          number: 4248,
+          title: "Retitled without paperclip id",
+          merged: true,
+          headSha: "merge-without-id",
+        }),
+        "wp-link-3",
+      );
+      expect(closeWithoutIdentifier.status).toBe(200);
+      expect(closeWithoutIdentifier.body).toMatchObject({ ignored: "no_matching_issue" });
+
+      rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("merged");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "merge-without-id",
+        lastEventAction: "closed",
+        sourceEventOrder: 30,
+      });
     });
 
     it("records a draft PR as draft rather than ready_for_review", async () => {

@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
@@ -101,6 +101,9 @@ type PullRequestEvidence = {
   /** Age of the newest PR event at evidence-collection time. */
   ageMs: number;
 };
+
+const PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES = new Set(["ready_for_review", "merged"]);
+const PRODUCTIVITY_REVIEW_WEBHOOK_PR_METADATA_SOURCE = "github_pull_request_webhook";
 
 type ProductivityReviewEvidence = {
   trigger: ProductivityReviewTrigger;
@@ -360,6 +363,10 @@ function isFreshPullRequest(pr: PullRequestEvidence | null): pr is PullRequestEv
   return pr !== null && pr.ageMs <= PRODUCTIVITY_REVIEW_PR_FRESH_MS;
 }
 
+function isProgressPullRequest(pr: PullRequestEvidence | null): pr is PullRequestEvidence {
+  return isFreshPullRequest(pr) && PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES.has(pr.status);
+}
+
 /**
  * Render the linked PR for the evidence pack (BLO-19566 AC4). Reads "none
  * recorded" only when the issue genuinely has no PR work product -- which is
@@ -369,7 +376,10 @@ function formatPullRequestEvidence(pr: PullRequestEvidence | null) {
   if (!pr) return "none recorded";
   const ref = pr.url ?? pr.externalId ?? pr.title;
   const freshness = isFreshPullRequest(pr) ? "non-stale" : "stale";
-  return `${ref} \`${pr.status}\`, last activity ${pr.updatedAt.toISOString()} (${msToHuman(pr.ageMs)} ago, ${freshness})`;
+  const progress = PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES.has(pr.status)
+    ? "progress-eligible"
+    : "not progress-eligible";
+  return `${ref} \`${pr.status}\`, last activity ${pr.updatedAt.toISOString()} (${msToHuman(pr.ageMs)} ago, ${freshness}, ${progress})`;
 }
 
 function isMonitorScheduledSuppression(
@@ -1097,7 +1107,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           and(
             eq(issueWorkProducts.companyId, sourceIssue.companyId),
             eq(issueWorkProducts.issueId, sourceIssue.id),
+            eq(issueWorkProducts.provider, "github"),
             eq(issueWorkProducts.type, "pull_request"),
+            isNotNull(issueWorkProducts.externalId),
+            isNotNull(issueWorkProducts.url),
+            sql`${issueWorkProducts.metadata}->>'source' = ${PRODUCTIVITY_REVIEW_WEBHOOK_PR_METADATA_SOURCE}`,
           ),
         )
         .orderBy(desc(issueWorkProducts.updatedAt))
@@ -1348,7 +1362,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       "- An assignee run-linked comment in the last 6h that contains a `Next action:` line",
       "- A non-stale PR/MR link in the source issue's evidence (created or updated in the last 24h)",
       "- A recent test result, artifact commit, or workspace deliverable in the last 6h",
-      ...(isFreshPullRequest(evidence.latestPullRequest)
+      ...(isProgressPullRequest(evidence.latestPullRequest)
         ? [
           "",
           `> The second signal is already present: ${formatPullRequestEvidence(evidence.latestPullRequest)}.`,

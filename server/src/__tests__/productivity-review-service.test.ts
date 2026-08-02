@@ -304,7 +304,13 @@ describeEmbeddedPostgres("productivity review service", () => {
   // exactly this: it reported "0/6h runs, none recorded" while PR #806 had
   // commits from that same morning.
   describe("pull-request evidence (BLO-19566)", () => {
-    async function seedIssueWithPullRequest(opts: { prUpdatedAt: Date; status?: string }) {
+    async function seedIssueWithPullRequest(opts: {
+      prUpdatedAt: Date;
+      status?: string;
+      metadata?: Record<string, unknown> | null;
+      url?: string | null;
+      createdByRunId?: string | null;
+    }) {
       const seeded = await seedAssignedIssue();
       await db.insert(issueWorkProducts).values({
         companyId: seeded.companyId,
@@ -313,8 +319,12 @@ describeEmbeddedPostgres("productivity review service", () => {
         provider: "github",
         externalId: "Blockcast/paperclip#806",
         title: "Widen the authz grant",
-        url: "https://github.com/Blockcast/paperclip/pull/806",
+        url: opts.url === undefined ? "https://github.com/Blockcast/paperclip/pull/806" : opts.url,
         status: opts.status ?? "ready_for_review",
+        metadata: opts.metadata === undefined
+          ? { source: "github_pull_request_webhook", sourceEventOrder: 10 }
+          : opts.metadata,
+        createdByRunId: opts.createdByRunId ?? null,
         createdAt: opts.prUpdatedAt,
         updatedAt: opts.prUpdatedAt,
       });
@@ -349,6 +359,109 @@ describeEmbeddedPostgres("productivity review service", () => {
       // And the manager is told the PR satisfies the second verdict criterion,
       // so a live PR is not read as "no concrete progress signal".
       expect(description).toContain("The second signal is already present");
+    });
+
+    it("does not count a freshly closed unmerged PR as concrete progress", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        status: "closed",
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request:");
+      expect(description).toContain("`closed`");
+      expect(description).toContain("non-stale");
+      expect(description).toContain("not progress-eligible");
+      expect(description).not.toContain("The second signal is already present");
+    });
+
+    it("counts a freshly merged PR as concrete progress", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        status: "merged",
+        metadata: { source: "github_pull_request_webhook", sourceEventOrder: 30 },
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("`merged`");
+      expect(description).toContain("The second signal is already present");
+    });
+
+    it("ignores actor-authored GitHub PR rows without webhook provenance", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      const runs = await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#806",
+        title: "Actor-authored PR claim",
+        url: "https://github.com/Blockcast/paperclip/pull/806",
+        status: "ready_for_review",
+        metadata: { source: "manual" },
+        createdByRunId: runs[0]?.id ?? null,
+        createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        updatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request: none recorded");
+      expect(description).not.toContain("The second signal is already present");
+    });
+
+    it("ignores webhook PR rows that do not carry an inspectable URL", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        url: null,
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request: none recorded");
+      expect(description).not.toContain("The second signal is already present");
     });
 
     it("marks a PR that has not moved in over 24h as stale", async () => {

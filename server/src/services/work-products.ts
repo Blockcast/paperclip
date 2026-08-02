@@ -1,4 +1,4 @@
-import { and, desc, eq, isNotNull } from "drizzle-orm";
+import { and, desc, eq, isNotNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueWorkProducts } from "@paperclipai/db";
 import type { IssueWorkProduct } from "@paperclipai/shared";
@@ -103,6 +103,21 @@ export function workProductService(db: Db) {
       >,
     ) => {
       const now = new Date();
+      const incomingSourceEventOrder = sql<number>`case
+        when excluded.metadata->>'sourceEventOrder' ~ '^[0-9]+$'
+          then (excluded.metadata->>'sourceEventOrder')::int
+        when excluded.status = 'merged' then 30
+        when excluded.status = 'closed' then 20
+        else 10
+      end`;
+      const existingSourceEventOrder = sql<number>`case
+        when ${issueWorkProducts.metadata}->>'sourceEventOrder' ~ '^[0-9]+$'
+          then (${issueWorkProducts.metadata}->>'sourceEventOrder')::int
+        when ${issueWorkProducts.status} = 'merged' then 30
+        when ${issueWorkProducts.status} = 'closed' then 20
+        else 10
+      end`;
+      const acceptIncoming = sql`${incomingSourceEventOrder} >= ${existingSourceEventOrder}`;
       const row = await db
         .insert(issueWorkProducts)
         .values({
@@ -124,12 +139,12 @@ export function workProductService(db: Db) {
           ],
           targetWhere: isNotNull(issueWorkProducts.externalId),
           set: {
-            title: data.title,
-            url: data.url,
-            status: data.status,
-            summary: data.summary,
-            metadata: data.metadata,
-            updatedAt: now,
+            title: sql`case when ${acceptIncoming} then excluded.title else ${issueWorkProducts.title} end`,
+            url: sql`case when ${acceptIncoming} then excluded.url else ${issueWorkProducts.url} end`,
+            status: sql`case when ${acceptIncoming} then excluded.status else ${issueWorkProducts.status} end`,
+            summary: sql`case when ${acceptIncoming} then excluded.summary else ${issueWorkProducts.summary} end`,
+            metadata: sql`case when ${acceptIncoming} then excluded.metadata else ${issueWorkProducts.metadata} end`,
+            updatedAt: sql`case when ${acceptIncoming} then ${now} else ${issueWorkProducts.updatedAt} end`,
           },
         })
         .returning()

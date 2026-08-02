@@ -30,6 +30,8 @@ export interface PullRequestWorkProductFields {
   metadata: Record<string, unknown>;
 }
 
+export const PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE = "github_pull_request_webhook";
+
 /**
  * Stable identity for a PR row: one PR in one repo. Deliberately excludes the
  * head SHA -- a push must update the existing row, not create a new one.
@@ -54,10 +56,19 @@ export function pullRequestWorkProductStatus(
   return "ready_for_review";
 }
 
+export function pullRequestWorkProductSourceEventOrder(
+  status: IssueWorkProduct["status"] | string,
+): number {
+  if (status === "merged") return 30;
+  if (status === "closed") return 20;
+  return 10;
+}
+
 export function buildPullRequestWorkProductFields(
   input: PullRequestWorkProductInput,
 ): PullRequestWorkProductFields {
   const title = input.prTitle?.trim();
+  const status = pullRequestWorkProductStatus(input);
   return {
     externalId: pullRequestExternalId(input.repoFullName, input.prNumber),
     // `title` is NOT NULL on the row; fall back to the canonical PR ref so a
@@ -66,8 +77,10 @@ export function buildPullRequestWorkProductFields(
       ? title
       : `${input.repoFullName}#${input.prNumber}`,
     url: input.prUrl ?? null,
-    status: pullRequestWorkProductStatus(input),
+    status,
     metadata: {
+      source: PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
+      sourceEventOrder: pullRequestWorkProductSourceEventOrder(status),
       repoFullName: input.repoFullName,
       prNumber: input.prNumber,
       headSha: input.headSha ?? null,

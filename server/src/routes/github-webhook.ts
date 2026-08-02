@@ -34,6 +34,7 @@ import {
   companies,
   heartbeatRuns,
   issueComments,
+  issueWorkProducts,
   issues,
 } from "@paperclipai/db";
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
@@ -60,7 +61,10 @@ import {
   type RecordMergedPullRequestInput,
 } from "../services/issue-pull-requests.js";
 import { workProductService } from "../services/work-products.js";
-import { buildPullRequestWorkProductFields } from "../services/pull-request-work-products.js";
+import {
+  buildPullRequestWorkProductFields,
+  pullRequestExternalId,
+} from "../services/pull-request-work-products.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
@@ -2313,7 +2317,51 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     })();
 
-    if (!context || context.identifiers.length === 0) {
+    if (!context) {
+      res.status(200).json({
+        ok: true,
+        ignored: "no_paperclip_identifier",
+        reviewerWakeFired,
+        reviewerRunsCancelled,
+        dependabotWakeFired,
+      });
+      return;
+    }
+
+    const pullRequestWorkProductExternalId =
+      eventName === "pull_request" &&
+      context.prNumber !== null &&
+      context.repoFullName
+        ? pullRequestExternalId(context.repoFullName, context.prNumber)
+        : null;
+    const previouslyLinkedPullRequestIssues = pullRequestWorkProductExternalId
+      ? await db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          identifier: issues.identifier,
+          assigneeAgentId: issues.assigneeAgentId,
+          status: issues.status,
+          executionState: issues.executionState,
+        })
+        .from(issueWorkProducts)
+        .innerJoin(
+          issues,
+          and(
+            eq(issues.id, issueWorkProducts.issueId),
+            eq(issues.companyId, issueWorkProducts.companyId),
+          ),
+        )
+        .where(
+          and(
+            eq(issueWorkProducts.provider, "github"),
+            eq(issueWorkProducts.type, "pull_request"),
+            eq(issueWorkProducts.externalId, pullRequestWorkProductExternalId),
+          ),
+        )
+      : [];
+
+    if (context.identifiers.length === 0 && previouslyLinkedPullRequestIssues.length === 0) {
       res.status(200).json({
         ok: true,
         ignored: "no_paperclip_identifier",
@@ -2341,6 +2389,12 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       .from(issues);
     const matched = matchedIssues.filter(
       (row) => row.identifier && context.identifiers.includes(row.identifier),
+    );
+    const pullRequestWorkProductTargets = [
+      ...matched,
+      ...previouslyLinkedPullRequestIssues,
+    ].filter((row, index, rows) =>
+      rows.findIndex((candidate) => candidate.companyId === row.companyId && candidate.id === row.id) === index
     );
 
     // Merged-PR forward-capture (BLO-9117). When a PR closes as merged, persist
@@ -2402,7 +2456,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       eventName === "pull_request" &&
       context.prNumber !== null &&
       context.repoFullName &&
-      matched.length > 0
+      pullRequestWorkProductTargets.length > 0
     ) {
       const fields = buildPullRequestWorkProductFields({
         repoFullName: context.repoFullName,
@@ -2417,7 +2471,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         action: context.prAction ?? "",
       });
       const workProducts = workProductService(db);
-      for (const issue of matched) {
+      for (const issue of pullRequestWorkProductTargets) {
         try {
           await workProducts.upsertByExternalId(
             issue.id,
