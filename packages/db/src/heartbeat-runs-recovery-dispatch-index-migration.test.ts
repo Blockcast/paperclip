@@ -29,7 +29,8 @@ const MIGRATION_FILE = "0209_heartbeat_runs_recovery_dispatch_index.sql";
 const INDEX_NAME = "heartbeat_runs_recovery_dispatch_idx";
 const INDEX_DEFINITION =
   `ON heartbeat_runs USING btree (agent_id, created_at, id) `
-  + `WHERE status = 'queued' AND (context_snapshot ->> 'source') = 'issue_recovery_action'`;
+  + `WHERE status = 'queued' AND (context_snapshot ->> 'source') = 'issue_recovery_action' `
+  + `AND (context_snapshot ->> 'recoveryActionId') IS NOT NULL`;
 const cleanups: Array<() => Promise<void>> = [];
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -178,7 +179,8 @@ describeEmbeddedPostgres("heartbeat-run recovery dispatch index migration", () =
     const invalidPredicates = [
       "status = 'queued' OR (context_snapshot ->> 'source') = 'issue_recovery_action'",
       "status = 'queued' AND (context_snapshot ->> 'source') <> 'issue_recovery_action'",
-      "status = 'queued' AND (context_snapshot ->> 'source') = 'issue_recovery_action' AND (context_snapshot ->> 'recoveryActionId') IS NOT NULL",
+      "status = 'queued' AND (context_snapshot ->> 'source') = 'issue_recovery_action'",
+      "status = 'queued' AND (context_snapshot ->> 'source') = 'issue_recovery_action' AND (context_snapshot ->> 'recoveryActionId') IS NULL",
     ];
 
     for (const predicate of invalidPredicates) {

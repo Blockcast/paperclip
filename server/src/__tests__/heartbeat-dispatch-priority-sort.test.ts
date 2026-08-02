@@ -1784,4 +1784,240 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       await partialHeartbeat.drainInFlightExecutions(60_000);
     }
   }, 180_000);
+
+  it("pages past dependency-blocked critical rows before claiming lower-priority work", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerIssueId = randomUUID();
+    const lowIssueId = randomUUID();
+    const blockedCriticalIssueIds = [randomUUID(), randomUUID()];
+    const runnableCriticalIssueId = randomUUID();
+    const runnableCriticalRunId = randomUUID();
+    const issuePrefix = `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const baseCreatedAt = new Date(Date.now() - 5 * 60 * 1000);
+    const boundedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 5 },
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "CriticalLanePagingCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CriticalLanePagingAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: blockerIssueId,
+        companyId,
+        title: "Unresolved blocker",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+        startedAt: baseCreatedAt,
+      },
+      {
+        id: lowIssueId,
+        companyId,
+        title: "Older runnable low-priority work",
+        status: "todo",
+        priority: "low",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+      ...blockedCriticalIssueIds.map((id, index) => ({
+        id,
+        companyId,
+        title: `Blocked critical ${index + 1}`,
+        status: "todo" as const,
+        priority: "critical" as const,
+        assigneeAgentId: agentId,
+        issueNumber: index + 3,
+        identifier: `${issuePrefix}-${index + 3}`,
+      })),
+      {
+        id: runnableCriticalIssueId,
+        companyId,
+        title: "Runnable critical beyond first lane page",
+        status: "todo",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 5,
+        identifier: `${issuePrefix}-5`,
+      },
+    ]);
+    await db.insert(issueRelations).values(blockedCriticalIssueIds.map((relatedIssueId) => ({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId,
+      type: "blocks" as const,
+    })));
+
+    const queuedIssues = [lowIssueId, ...blockedCriticalIssueIds, runnableCriticalIssueId];
+    for (const [index, issueId] of queuedIssues.entries()) {
+      const runId = issueId === runnableCriticalIssueId ? runnableCriticalRunId : randomUUID();
+      const wakeId = randomUUID();
+      const createdAt = new Date(baseCreatedAt.getTime() + index);
+      await db.insert(agentWakeupRequests).values({
+        id: wakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId },
+        status: "queued",
+        runId,
+        requestedAt: createdAt,
+        updatedAt: createdAt,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: wakeId,
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+        createdAt,
+        updatedAt: createdAt,
+      });
+    }
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await boundedHeartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(boundedHeartbeat, runnableCriticalRunId, 60_000);
+
+    expect(dispatchedRunIds[0]).toBe(runnableCriticalRunId);
+    expect((await boundedHeartbeat.getRun(runnableCriticalRunId))?.status).not.toBe("queued");
+    await boundedHeartbeat.drainInFlightExecutions(60_000);
+  }, 120_000);
+
+  it("skips malformed persisted issue ids in UUID batch lookups", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const validIssueId = randomUUID();
+    const malformedRunId = randomUUID();
+    const validRunId = randomUUID();
+    const issuePrefix = `M${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    let releaseValid = () => {};
+    const validReleased = new Promise<void>((resolve) => {
+      releaseValid = resolve;
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "MalformedIssueIdCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "MalformedIssueIdAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: validIssueId,
+      companyId,
+      title: "Valid runnable issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      startedAt: new Date(),
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: malformedRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId: "persisted-not-a-uuid", wakeReason: "issue_assigned" },
+        createdAt: new Date(Date.now() - 1_000),
+        updatedAt: new Date(Date.now() - 1_000),
+      },
+      {
+        id: validRunId,
+        companyId,
+        agentId,
+        invocationSource: "heartbeat",
+        triggerDetail: "timer",
+        status: "queued",
+        contextSnapshot: { issueId: validIssueId, wakeReason: "heartbeat_timer" },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ]);
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      if (args.runId === validRunId) await validReleased;
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    try {
+      await heartbeat.resumeQueuedRuns();
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline && !dispatchedRunIds.includes(validRunId)) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(dispatchedRunIds[0]).toBe(validRunId);
+      expect((await heartbeat.getRun(validRunId))?.status).toBe("running");
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "cancelled", finishedAt: new Date(), updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, malformedRunId));
+    } finally {
+      releaseValid();
+      await heartbeat.drainInFlightExecutions(60_000);
+    }
+  }, 120_000);
 });

@@ -30,10 +30,10 @@
 -- lane never reads scheduled_retry, and a tighter predicate keeps the index
 -- smaller. `status` is consequently NOT a key column — it is constant across
 -- every entry — so the keys are exactly the columns the lane orders and seeks
--- on. `recoveryActionId IS NOT NULL` is deliberately left OUT of the index
--- predicate too: it stays a post-filter, but now over an already-tiny set of
--- recovery rows rather than over the whole queue, and omitting it keeps the
--- predicate simple enough for the planner to match reliably.
+-- on. Both recovery markers belong in the predicate. Keeping malformed source-only
+-- rows out of the index means the lane's LIMIT bounds index work as well as
+-- output; otherwise an arbitrarily large malformed backlog can still be walked
+-- before the first valid recovery wake is found.
 --
 -- `context_snapshot` is jsonb, so `->>` is IMMUTABLE and legal in an index
 -- predicate. (Were it json, `->>` would be merely STABLE and this would be
@@ -61,7 +61,7 @@
 -- `pg_get_expr(indpred, indrelid, TRUE)` was MEASURED on a real PostgreSQL
 -- after this migration ran (not assumed) as:
 --
---   status = 'queued'::text AND (context_snapshot ->> 'source'::text) = 'issue_recovery_action'::text
+--   status = 'queued'::text AND (context_snapshot ->> 'source'::text) = 'issue_recovery_action'::text AND (context_snapshot ->> 'recoveryActionId'::text) IS NOT NULL
 --
 -- Note it parenthesizes the second operand but not the first, and annotates
 -- both the operator's argument and its result with ::text — which is exactly
@@ -71,7 +71,7 @@ DO $$
 DECLARE
   normalized_predicate text;
   expected_predicate constant text :=
-    'status = ''queued''::text AND (context_snapshot ->> ''source''::text) = ''issue_recovery_action''::text';
+    'status = ''queued''::text AND (context_snapshot ->> ''source''::text) = ''issue_recovery_action''::text AND (context_snapshot ->> ''recoveryActionId''::text) IS NOT NULL';
 BEGIN
   IF to_regclass('public.heartbeat_runs_recovery_dispatch_idx') IS NOT NULL THEN
     SELECT trim(regexp_replace(
@@ -105,13 +105,13 @@ BEGIN
     THEN
       RAISE EXCEPTION USING
         MESSAGE = 'migration 0209 found an invalid or incorrectly defined prerequisite index',
-        HINT = 'Run DROP INDEX CONCURRENTLY IF EXISTS heartbeat_runs_recovery_dispatch_idx; then CREATE INDEX CONCURRENTLY heartbeat_runs_recovery_dispatch_idx ON heartbeat_runs USING btree (agent_id, created_at, id) WHERE status = ''queued'' AND (context_snapshot ->> ''source'') = ''issue_recovery_action''; then retry migrations.';
+        HINT = 'Run DROP INDEX CONCURRENTLY IF EXISTS heartbeat_runs_recovery_dispatch_idx; then CREATE INDEX CONCURRENTLY heartbeat_runs_recovery_dispatch_idx ON heartbeat_runs USING btree (agent_id, created_at, id) WHERE status = ''queued'' AND (context_snapshot ->> ''source'') = ''issue_recovery_action'' AND (context_snapshot ->> ''recoveryActionId'') IS NOT NULL; then retry migrations.';
     END IF;
   ELSE
     IF EXISTS (SELECT 1 FROM "heartbeat_runs" LIMIT 1) THEN
       RAISE EXCEPTION USING
         MESSAGE = 'migration 0209 requires online index precreation',
-        HINT = 'Run CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_recovery_dispatch_idx ON heartbeat_runs USING btree (agent_id, created_at, id) WHERE status = ''queued'' AND (context_snapshot ->> ''source'') = ''issue_recovery_action'', then retry migrations.';
+        HINT = 'Run CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_recovery_dispatch_idx ON heartbeat_runs USING btree (agent_id, created_at, id) WHERE status = ''queued'' AND (context_snapshot ->> ''source'') = ''issue_recovery_action'' AND (context_snapshot ->> ''recoveryActionId'') IS NOT NULL, then retry migrations.';
     END IF;
 
     -- Close the gap between the empty-table check and CREATE INDEX without
@@ -120,7 +120,7 @@ BEGIN
     IF EXISTS (SELECT 1 FROM "heartbeat_runs" LIMIT 1) THEN
       RAISE EXCEPTION USING
         MESSAGE = 'migration 0209 requires online index precreation',
-        HINT = 'Run CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_recovery_dispatch_idx ON heartbeat_runs USING btree (agent_id, created_at, id) WHERE status = ''queued'' AND (context_snapshot ->> ''source'') = ''issue_recovery_action'', then retry migrations.';
+        HINT = 'Run CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_recovery_dispatch_idx ON heartbeat_runs USING btree (agent_id, created_at, id) WHERE status = ''queued'' AND (context_snapshot ->> ''source'') = ''issue_recovery_action'' AND (context_snapshot ->> ''recoveryActionId'') IS NOT NULL, then retry migrations.';
     END IF;
 
     CREATE INDEX "heartbeat_runs_recovery_dispatch_idx"
@@ -130,7 +130,8 @@ BEGIN
         "id"
       )
       WHERE "status" = 'queued'
-        AND ("context_snapshot" ->> 'source') = 'issue_recovery_action';
+        AND ("context_snapshot" ->> 'source') = 'issue_recovery_action'
+        AND ("context_snapshot" ->> 'recoveryActionId') IS NOT NULL;
   END IF;
 END
 $$;
