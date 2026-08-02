@@ -198,6 +198,45 @@ describe("isHintlessTransientUpstreamFault for the BLO-19879 gateway allocation 
     }
   });
 
+  // BLO-20343 — the input shape this feature shipped without coverage for.
+  //
+  // Before the fix the status gate wrapped only the resultJson scan, so an
+  // errorMessage carrying the identical bytes bypassed it and returned true
+  // while the resultJson form returned false. Reaching that split needs
+  // contradictory adapter state (a 400 gateway body alongside an authoritative
+  // non-400 status) and no producer was ever found, so this pins consistency
+  // rather than fixing an observed strand. `false` is the resolution: 401/403
+  // will not self-heal on a 2h curve, 500 is deliberately terminal above, and
+  // 429 belongs to the rate-limit family.
+  it("gates the errorMessage path on status exactly as it gates resultJson", () => {
+    const gatewayPayload = 'API Error: 400 {"error":"No allocation configured","code":"allocation_missing"}';
+
+    for (const status of [401, 403, 500] as const) {
+      expect(
+        isHintlessTransientUpstreamFault({ api_error_status: status }, { errorMessage: gatewayPayload }),
+      ).toBe(false);
+      expect(
+        isHintlessTransientUpstreamFault({ error_status: status }, { errorMessage: gatewayPayload }),
+      ).toBe(false);
+    }
+
+    // The property, stated directly: for one authoritative status the verdict
+    // must not depend on which field transports the payload.
+    for (const status of [400, 401, 403, 500] as const) {
+      expect(
+        isHintlessTransientUpstreamFault({ api_error_status: status }, { errorMessage: gatewayPayload }),
+      ).toBe(isHintlessTransientUpstreamFault({ api_error_status: status, result: gatewayPayload }));
+    }
+
+    // The gate must stay open for the two shapes that actually occur: the real
+    // fault (400) and an errorMessage with no resultJson to contradict it.
+    expect(
+      isHintlessTransientUpstreamFault({ api_error_status: 400 }, { errorMessage: gatewayPayload }),
+    ).toBe(true);
+    expect(isHintlessTransientUpstreamFault(null, { errorMessage: gatewayPayload })).toBe(true);
+    expect(isHintlessTransientUpstreamFault({}, { errorMessage: gatewayPayload })).toBe(true);
+  });
+
   it("does not match allocation_missing quotes in free-text result surfaces", () => {
     expect(
       isHintlessTransientUpstreamFault({
