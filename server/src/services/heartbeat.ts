@@ -8646,6 +8646,25 @@ export interface HeartbeatServiceOptions {
   afterRunEventAppendedInTransactionForTest?: (
     run: typeof heartbeatRuns.$inferSelect,
   ) => Promise<void> | void;
+  /**
+   * Test-only failure injection for the crash-recovery agent load. A transient
+   * `getAgent` failure must be distinguishable from a genuinely missing agent
+   * row: the first still owes the run a retry and so must keep the issue
+   * execution lock, the second never will and must release it (BLO-20822).
+   */
+  beforeCrashRecoveryAgentLoadForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
+  /**
+   * Test-only failure injection fired immediately before the terminal
+   * completion/backoff write in `recoverCrashInterruptedRun`. Throwing here is
+   * the only way to reach the "every step ran but the bookkeeping write itself
+   * failed" branch, which must report the run unresolved rather than
+   * reconciled (BLO-20822).
+   */
+  beforeCrashRecoveryTerminalWriteForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -13136,6 +13155,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let agent: typeof agents.$inferSelect | null = null;
     let agentLoadFailed = false;
     try {
+      await options.beforeCrashRecoveryAgentLoadForTest?.(run);
       agent = await getAgent(run.agentId);
       record(
         "agent_load",
@@ -13183,8 +13203,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // whole recovery is already incomplete and will be replayed in full
     // (including this release) once a later attempt succeeds at enqueueing
     // the retry.
-    if (retryEnqueueIncomplete) {
-      record("issue_release", { kind: "skipped", detail: "retry_enqueue incomplete; lock left until a retry exists" });
+    //
+    // A *transient* agent-load failure is the same situation reached one step
+    // earlier: `agent` is null so the enqueue block never ran, leaving `retry`
+    // null and `retryEnqueueIncomplete` false. Keying the release on `!retry`
+    // alone would drop the lock here too, even though a retry is still owed
+    // and the replay will create one. Note this is deliberately NOT the
+    // `agent === null` case: a genuinely missing agent row means no actor can
+    // ever retry, so releasing is the correct terminal outcome there.
+    if (retryEnqueueIncomplete || agentLoadFailed) {
+      record("issue_release", {
+        kind: "skipped",
+        detail: agentLoadFailed
+          ? "agent_load incomplete; lock left until a retry exists"
+          : "retry_enqueue incomplete; lock left until a retry exists",
+      });
     } else if (!retry) {
       try {
         await releaseIssueExecutionAndPromote(run);
@@ -13249,7 +13282,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // clobbering it. `supersededStamp` records that so the returned
     // `completed` doesn't claim a durable stamp that didn't happen.
     let supersededStamp = false;
+    let terminalWriteFailed = false;
     try {
+      await options.beforeCrashRecoveryTerminalWriteForTest?.(run);
       if (incompleteSteps.length === 0) {
         // Last write, deliberately: the durable "every required step ran"
         // marker {@link reconcileWorkerCrashedRuns} selects on. Stamping any
@@ -13307,13 +13342,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
     } catch (error) {
+      // The write itself failed (connection dropped, statement timeout). The
+      // row therefore carries neither the completion stamp nor the backoff we
+      // intended, so this recovery is NOT durable however well its steps ran:
+      // reporting `completed` here would tell the caller a run was reconciled
+      // while `crash_recovery_completed_at` is still null, and the cleanup
+      // silently replays later against a row nobody is tracking.
+      terminalWriteFailed = true;
       logger.warn({ err: error, runId: run.id }, "failed to persist crash recovery progress");
     }
 
     return {
       retryRunId: retry?.id ?? null,
       claimed: true,
-      completed: incompleteSteps.length === 0 && !supersededStamp,
+      completed: incompleteSteps.length === 0 && !supersededStamp && !terminalWriteFailed,
       incompleteSteps,
     };
   }
@@ -16367,9 +16409,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : "error";
 
     // BLO-19722 compare-and-set: refuse the write when some *other* run for
-    // this agent, created after the owner run, is either still running or
-    // finished after it. Evaluated inside the UPDATE, so the compare and the
-    // set are atomic and there is no read-then-write window.
+    // this agent currently owns the derived agent state — either because it is
+    // still running, or because it finished after the owner run did. Evaluated
+    // inside the UPDATE, so the compare and the set are atomic and there is no
+    // read-then-write window.
+    //
+    // The two alternatives are deliberately independent of `created_at`.
+    // Requiring `created_at > owner.created_at` (as this first did) misses the
+    // overlapping-run case: a run started BEFORE the crashed owner but which
+    // outlived it — still running, or finished later — is the current state of
+    // the agent, yet an older-created run fails a `created_at >` test and the
+    // stale replay overwrites it. Ordering by *finish* is what matters here,
+    // because that is what `finalizeAgentStatus` derives status from.
     //
     // The retry this very recovery just queued does not match — it is `queued`,
     // not running, and has no `finishedAt`.
@@ -16377,7 +16428,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // Dates must reach a raw `sql` fragment as ISO text with an explicit cast:
     // inside a raw fragment there is no column mapper to serialize them, and
     // postgres.js rejects a bare Date parameter.
-    const ownerCreatedAt = ownerRun ? new Date(ownerRun.createdAt).toISOString() : null;
     const ownerFinishedAt = ownerRun
       ? new Date(ownerRun.finishedAt ?? ownerRun.createdAt).toISOString()
       : null;
@@ -16386,7 +16436,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           select 1 from ${heartbeatRuns}
           where ${heartbeatRuns.agentId} = ${agentId}
             and ${heartbeatRuns.id} <> ${ownerRun.id}
-            and ${heartbeatRuns.createdAt} > ${ownerCreatedAt}::timestamptz
             and (
               ${heartbeatRuns.status} = 'running'
               or ${heartbeatRuns.finishedAt} > ${ownerFinishedAt}::timestamptz
