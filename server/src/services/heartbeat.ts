@@ -3235,12 +3235,24 @@ export function isHintlessTransientUpstreamFault(
   // actual 400 when resultJson carries an authoritative status, and match only
   // gateway-shaped payload text so agent-authored prose that merely quotes the
   // literal cannot turn terminal 401/403/etc. failures into scheduled retries.
-  if (allocationFaultStatusGate(resultJson) === "allow" && resultJson) {
-    for (const key of GATEWAY_ALLOCATION_FAULT_TEXT_KEYS) {
-      if (looksLikeGatewayAllocationFault(resultJson[key])) return true;
+  //
+  // BLO-20343: the status gate covers `errorMessage` too, not just the
+  // resultJson keys, so the same bytes classify the same way whichever field
+  // carries them. Reaching the difference needs contradictory adapter state (an
+  // errorMessage opening with a 400 gateway payload while resultJson reports an
+  // authoritative non-400), which has no known producer — `api_error_status` is
+  // only ever read here, straight off the SDK's final result event. Resolved
+  // toward `deny` because every status that reaches it is one the retry curve
+  // cannot help: 401/403 will not self-heal, 500 is deliberately terminal, and
+  // 429 belongs to the rate-limit family's flat curve.
+  if (allocationFaultStatusGate(resultJson) === "allow") {
+    if (resultJson) {
+      for (const key of GATEWAY_ALLOCATION_FAULT_TEXT_KEYS) {
+        if (looksLikeGatewayAllocationFault(resultJson[key])) return true;
+      }
     }
+    if (looksLikeGatewayAllocationFault(opts?.errorMessage)) return true;
   }
-  if (looksLikeGatewayAllocationFault(opts?.errorMessage)) return true;
 
   // Two status surfaces: the Claude SDK's final result event uses
   // `api_error_status`, while the per-attempt `api_retry` events that precede
