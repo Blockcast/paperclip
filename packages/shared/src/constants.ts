@@ -642,6 +642,20 @@ export const APPROVAL_STATUSES = [
 ] as const;
 export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
 
+/**
+ * Statuses in which an approval has not yet been answered by the board.
+ *
+ * Single source of truth for three things that MUST agree, because a drift between
+ * them turns an idempotent replay into a raw unique-violation 500:
+ *   1. the create-side dedupe lookup (`approvalService.createWithIdempotency`),
+ *   2. the partial unique indexes on `approvals.idempotency_key`,
+ *   3. which approvals can still be resolved.
+ * Migration `0208_approval_create_idempotency.sql` hardcodes this set in SQL — it is
+ * frozen history and cannot import, so a change here needs a follow-up migration.
+ */
+export const APPROVAL_UNDECIDED_STATUSES = ["pending", "revision_requested"] as const;
+export type ApprovalUndecidedStatus = (typeof APPROVAL_UNDECIDED_STATUSES)[number];
+
 export const SECRET_PROVIDERS = [
   "local_encrypted",
   "aws_secrets_manager",
