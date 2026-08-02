@@ -312,6 +312,15 @@ describe("issueRecoveryActionService", () => {
       recoveryHandoffGrantAnchorAt: staleAnchor.toISOString(),
     });
 
+    // A production recovery re-sweep sees the issue assigned to the recovery owner
+    // from the previous pass. That input must not make the owner the new grant
+    // subject or refresh the TTL anchor.
+    const recoveryOwnerChurn = await sweep("agent-owner");
+    expect(recoveryOwnerChurn).toMatchObject({ previousOwnerAgentId: "agent-previous" });
+    expect(recoveryOwnerChurn.evidence).toMatchObject({
+      recoveryHandoffGrantAnchorAt: staleAnchor.toISOString(),
+    });
+
     // Handing the issue away from a DIFFERENT agent is a real transfer: that agent
     // is owed a fresh channel, so the anchor moves to now.
     const transferred = await sweep("agent-second-previous");
@@ -1469,6 +1478,116 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(exhaustionComments).toHaveLength(2);
     expect(exhaustionComments.some((body) => body.includes(`(owner \`${managerId}\`)`))).toBe(true);
     expect(exhaustionComments.some((body) => body.includes(`(owner \`${secondManagerId}\`)`))).toBe(true);
+  });
+
+  it("does not refresh the handoff grant when recovery sweeps through its own owner churn", async () => {
+    const companyId = randomUUID();
+    const ceoId = randomUUID();
+    const ctoId = randomUUID();
+    const emId = randomUUID();
+    const engId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const prefix = `HC${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Handoff Churn Co",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const agentBase = {
+      companyId,
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    } as const;
+    await db.insert(agents).values([
+      { ...agentBase, id: ceoId, name: "CEO", role: "ceo" },
+      { ...agentBase, id: ctoId, name: "CTO", role: "cto", reportsTo: ceoId },
+      { ...agentBase, id: emId, name: "EM", role: "engineer", reportsTo: ctoId },
+      { ...agentBase, id: engId, name: "Eng", role: "engineer", reportsTo: emId },
+    ]);
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Recovery owner churn should not refresh handoff grant",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: engId,
+      issueNumber: 1,
+      identifier: `${prefix}-1`,
+    });
+
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const sweep = async () => {
+      const [fresh] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      await recovery.escalateStrandedAssignedIssue({
+        issue: fresh!,
+        previousStatus: "in_progress",
+        latestRun: {
+          id: randomUUID(),
+          agentId: engId,
+          status: "failed",
+          error: "adapter failed",
+          errorCode: "adapter_failed",
+          contextSnapshot: { retryReason: "issue_continuation_needed" },
+          livenessState: "needs_followup",
+          resultJson: null,
+          usageJson: null,
+          createdAt: new Date(),
+        },
+        comment: "Automatic continuation recovery failed.",
+      });
+    };
+    const handoffAnchor = (evidence: unknown) => {
+      expect(evidence && typeof evidence === "object" && !Array.isArray(evidence)).toBe(true);
+      return (evidence as Record<string, unknown>).recoveryHandoffGrantAnchorAt;
+    };
+
+    const firstSweepAt = new Date("2026-08-02T01:00:00.000Z");
+    const secondSweepAt = new Date("2026-08-02T05:00:00.000Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(firstSweepAt);
+      await sweep();
+      const [firstAction] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(firstAction).toMatchObject({
+        previousOwnerAgentId: engId,
+        ownerAgentId: emId,
+        returnOwnerAgentId: engId,
+      });
+      const firstAnchor = handoffAnchor(firstAction!.evidence);
+      expect(firstAnchor).toBe(firstSweepAt.toISOString());
+
+      vi.setSystemTime(secondSweepAt);
+      await sweep();
+      const [secondAction] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(secondAction).toMatchObject({
+        previousOwnerAgentId: engId,
+        ownerAgentId: ctoId,
+        returnOwnerAgentId: emId,
+      });
+      expect(handoffAnchor(secondAction!.evidence)).toBe(firstAnchor);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(enqueueWakeup.mock.calls.map((call) => call[0])).toEqual([emId, ctoId]);
+    const [sourceIssue] = await db
+      .select({ assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue?.assigneeAgentId).toBe(ctoId);
   });
 
   it("bounds the wakes even when recovery ownership ping-pongs and never spends one owner's budget", async () => {
