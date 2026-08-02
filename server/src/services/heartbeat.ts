@@ -651,7 +651,16 @@ const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON = "execution_review_part
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE = "execution_review_participant_recovery";
 const GITHUB_PR_WORKFLOW_SKILL_KEY = "paperclipai/bundled/software-development/github-pr-workflow";
 const GITHUB_PR_WORKFLOW_SKILL_SLUG = "github-pr-workflow";
-const PUSH_CAPABILITY_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN"] as const;
+// GH_SEAT_TOKEN_VALUE is a first-class member of this contract, not an
+// afterthought: it is the *only* one of the three that can be delivered without
+// mounting a credential into every Job pod (BLO-18927). Omitting it meant an
+// agent bound correctly for the scoped path was still rejected as
+// `push_write_credential_missing` before scripts/gh-token-wrapper.sh ever ran,
+// which would have made the scoped binding unusable for exactly the git-
+// sensitive local adapters this preflight guards. Widening the accepted set is
+// safe: this gate asserts that *some* push credential is configured, it does
+// not authorize anything.
+export const PUSH_CAPABILITY_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_SEAT_TOKEN_VALUE"] as const;
 // Keep this in sync with local adapters that require a git workspace before launch.
 const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "claude_local",
@@ -1277,6 +1286,43 @@ function stripPaperclipRuntimeEnvFromAdapterConfig(config: Record<string, unknow
   };
 }
 
+// Keys that select the *identity* a runtime tool authenticates as, and which
+// must therefore only ever be settable at agent scope.
+//
+// GH_SEAT_TOKEN_VALUE is read by scripts/gh-token-wrapper.sh in precedence
+// above the mounted App token, so any scope able to set it can swap the
+// identity every `gh` invocation runs as, or park whitespace there and fail
+// them all with exit 64. Environment, project and routine env are overlaid
+// *after* agent-scope resolution (see below), so without this filter the
+// lowest-trust writer would win, not the highest.
+//
+// Before BLO-18927 the `PAPERCLIP_` prefix gave this protection for free at
+// every scope. Renaming the key out of that namespace was necessary to reach
+// agent scope at all — isPaperclipRuntimeEnvKey strips the prefix *before*
+// agent resolution — and this restores the protection for the scopes that
+// never needed the exemption.
+//
+// Deliberately NOT folded into isPaperclipRuntimeEnvKey: that guard strips at
+// every scope including agent, which is precisely what this key must escape.
+const AGENT_SCOPE_ONLY_ENV_KEYS = new Set(["GH_SEAT_TOKEN_VALUE"]);
+
+function isAgentScopeOnlyEnvKey(key: string) {
+  return AGENT_SCOPE_ONLY_ENV_KEYS.has(key);
+}
+
+// Applied to environment / project / routine env only. Agent-scope env goes
+// through stripPaperclipRuntimeEnvFromAdapterConfig instead, which does not
+// filter these keys.
+function stripLowerScopeEnvBindings(envValue: unknown): Record<string, unknown> | null {
+  const record = parseObject(envValue);
+  const filtered = Object.fromEntries(
+    Object.entries(record).filter(
+      ([key]) => !isPaperclipRuntimeEnvKey(key) && !isAgentScopeOnlyEnvKey(key),
+    ),
+  );
+  return Object.keys(filtered).length > 0 ? filtered : null;
+}
+
 function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string) {
   const record = stripPaperclipRuntimeEnvBindings(envValue);
   if (!record) return;
@@ -1287,7 +1333,13 @@ function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string) {
     const isPlainBinding =
       typeof binding === "string" ||
       (typeof binding === "object" && binding !== null && binding.type === "plain");
-    if (isPlainBinding && LOW_TRUST_SENSITIVE_ENV_KEY_RE.test(key)) {
+    // Agent-scope-only keys hold a raw credential by construction, but do not
+    // match the name-shaped heuristic below (GH_SEAT_TOKEN_VALUE contains no
+    // "secret"/"auth"/"access_token" substring). Treat them as sensitive
+    // explicitly so a low-trust run cannot inline one; it must use a
+    // secret_ref. Safe to add with this PR because the key is new here — no
+    // existing config can be relying on the inline form.
+    if (isPlainBinding && (LOW_TRUST_SENSITIVE_ENV_KEY_RE.test(key) || isAgentScopeOnlyEnvKey(key))) {
       throw new HttpError(422, `Low-trust execution cannot use inline sensitive env value ${source}.${key}`, {
         code: "low_trust_inline_sensitive_env_denied",
       });
@@ -1319,9 +1371,9 @@ export async function resolveExecutionRunAdapterConfig(input: {
   };
 }) {
   const executionRunConfig = stripPaperclipRuntimeEnvFromAdapterConfig(input.executionRunConfig);
-  const environmentEnv = stripPaperclipRuntimeEnvBindings(input.environmentEnv);
-  const projectEnv = stripPaperclipRuntimeEnvBindings(input.projectEnv);
-  const routineEnv = stripPaperclipRuntimeEnvBindings(input.routineEnv);
+  const environmentEnv = stripLowerScopeEnvBindings(input.environmentEnv);
+  const projectEnv = stripLowerScopeEnvBindings(input.projectEnv);
+  const routineEnv = stripLowerScopeEnvBindings(input.routineEnv);
   const lowTrustAllowedBindingIds = input.trustPreset?.kind === "low_trust_review"
     ? input.trustPreset.boundary.allowedSecretBindingIds ?? []
     : undefined;
@@ -19887,7 +19939,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             consumerScopes: ["agent", "project"],
             reason: "push_write_credential_missing",
             remediation:
-              "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at project or agent scope.",
+              "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at project or agent scope, or GH_SEAT_TOKEN_VALUE bound at agent scope.",
           }
         : undefined,
     });

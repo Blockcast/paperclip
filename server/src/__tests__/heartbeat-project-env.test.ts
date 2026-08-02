@@ -5,8 +5,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildSkillMentionHref } from "@paperclipai/shared";
 import {
   LOW_TRUST_REVIEW_PRESET,
+  PUSH_CAPABILITY_ENV_KEYS,
   applyRunScopedMentionedSkillKeys,
   extractMentionedSkillIdsFromSources,
+  requiresPushCapabilityPreflight,
   resolveExecutionRunAdapterConfig,
 } from "../services/heartbeat.ts";
 
@@ -260,6 +262,164 @@ describe("resolveExecutionRunAdapterConfig", () => {
     expect(result.resolvedConfig.env).toHaveProperty("GH_SEAT_TOKEN_VALUE");
   });
 
+  // The rename above bought reachability at agent scope; on its own it would
+  // also have bought reachability at *every lower* scope, which is strictly
+  // worse than the PAPERCLIP_ name it replaced. Environment/project/routine env
+  // are overlaid AFTER agent resolution, so an unprotected key means the
+  // lowest-trust writer wins — and because the wrapper prefers this value over
+  // the mounted App token, that writer picks the identity every `gh` call runs
+  // as. Whitespace there fails them all with exit 64. These two tests pin the
+  // asymmetry: agent scope may set it, no lower scope may set or override it.
+  it("does not let environment, project, or routine env override an agent-scoped seat token", async () => {
+    const resolveAdapterConfigForRuntime = vi.fn().mockResolvedValue({
+      config: { env: { GH_SEAT_TOKEN_VALUE: "agent-seat-token" } },
+      secretKeys: new Set<string>(),
+      manifest: [],
+    });
+    const resolveEnvBindings = vi.fn(async (_companyId, env: Record<string, unknown>) => ({
+      env: Object.fromEntries(
+        Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+      ),
+      secretKeys: new Set<string>(),
+      manifest: [],
+    }));
+
+    const result = await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      executionRunConfig: { env: { GH_SEAT_TOKEN_VALUE: "agent-seat-token" } },
+      environmentEnv: { GH_SEAT_TOKEN_VALUE: "environment-attacker", ENV_ONLY: "environment-only" },
+      projectEnv: { GH_SEAT_TOKEN_VALUE: "project-attacker", PROJECT_ONLY: "project-only" },
+      routineEnv: { GH_SEAT_TOKEN_VALUE: "   ", ROUTINE_ONLY: "routine-only" },
+      secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
+    });
+
+    // The agent-scoped value survives all three overlays...
+    expect(result.resolvedConfig.env).toMatchObject({ GH_SEAT_TOKEN_VALUE: "agent-seat-token" });
+    // ...and the lower scopes are otherwise unaffected, so this is a targeted
+    // filter and not an accidental drop of the whole overlay.
+    expect(result.resolvedConfig.env).toMatchObject({
+      ENV_ONLY: "environment-only",
+      PROJECT_ONLY: "project-only",
+      ROUTINE_ONLY: "routine-only",
+    });
+    // The key never even reaches the binding resolver for a lower scope, so a
+    // secret_ref planted there cannot be dereferenced as a side effect.
+    for (const call of resolveEnvBindings.mock.calls) {
+      expect(call[1]).not.toHaveProperty("GH_SEAT_TOKEN_VALUE");
+    }
+  });
+
+  it("does not let a lower scope introduce a seat token the agent never had", async () => {
+    const resolveAdapterConfigForRuntime = vi.fn().mockResolvedValue({
+      config: { env: { AGENT_ONLY: "agent-only" } },
+      secretKeys: new Set<string>(),
+      manifest: [],
+    });
+    const resolveEnvBindings = vi.fn(async (_companyId, env: Record<string, unknown>) => ({
+      env: Object.fromEntries(
+        Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+      ),
+      secretKeys: new Set<string>(),
+      manifest: [],
+    }));
+
+    const result = await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      executionRunConfig: { env: { AGENT_ONLY: "agent-only" } },
+      projectEnv: { GH_SEAT_TOKEN_VALUE: "project-attacker" },
+      secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
+    });
+
+    expect(result.resolvedConfig.env).not.toHaveProperty("GH_SEAT_TOKEN_VALUE");
+  });
+
+  // Ally's finding: raw resolution preserving the key is necessary but not
+  // sufficient. requiresPushCapabilityPreflight-gated runs assert a push
+  // credential is configured BEFORE any of the above executes, and that
+  // contract listed only GH_TOKEN/GITHUB_TOKEN — so an agent bound exactly as
+  // BLO-18927 step 3 intends was rejected as push_write_credential_missing and
+  // the wrapper never ran. This exercises the real production contract by
+  // importing PUSH_CAPABILITY_ENV_KEYS rather than restating it, so the test
+  // cannot drift away from the constant it is guarding.
+  describe("push-capability preflight", () => {
+    const pushCapabilityBinding = {
+      keys: [...PUSH_CAPABILITY_ENV_KEYS],
+      consumerScopes: ["agent", "project"] as Array<"agent" | "project">,
+      reason: "push_write_credential_missing",
+      remediation: "test remediation",
+    };
+    const stubSecretsSvc = () => ({
+      resolveAdapterConfigForRuntime: vi.fn(async (_companyId, config: Record<string, unknown>) => ({
+        config: { ...config, env: { ...(config.env as Record<string, unknown>) } },
+        secretKeys: new Set<string>(),
+        manifest: [],
+      })),
+      resolveEnvBindings: vi.fn(async () => ({
+        env: {},
+        secretKeys: new Set<string>(),
+        manifest: [],
+      })),
+    });
+
+    it("gates on git-sensitive local adapters running the github-pr-workflow skill", () => {
+      expect(requiresPushCapabilityPreflight({
+        adapterType: "opencode_local",
+        issueId: "issue-1",
+        explicitRunScopedSkillKeys: ["github-pr-workflow"],
+      })).toBe(true);
+    });
+
+    it("accepts an agent-scoped GH_SEAT_TOKEN_VALUE as a push credential", async () => {
+      const result = await resolveExecutionRunAdapterConfig({
+        companyId: "company-1",
+        agentId: "agent-1",
+        executionRunConfig: {
+          env: {
+            GH_SEAT_TOKEN_VALUE: {
+              type: "secret_ref",
+              // Must be a real UUID: isConfiguredEnvBindingValue validates the
+              // binding through envBindingSchema, and a malformed secretId
+              // makes it read as "not configured" rather than as an error.
+              secretId: "6f1c0c6e-6f2e-4a1e-9c2f-2b7d3a5e8c11",
+              version: "latest",
+            },
+          },
+        },
+        requiredScopedEnvBinding: pushCapabilityBinding,
+        secretsSvc: stubSecretsSvc() as any,
+      });
+
+      expect(result.resolvedConfig.env).toHaveProperty("GH_SEAT_TOKEN_VALUE");
+    });
+
+    it("still rejects a run with no push credential at any accepted key", async () => {
+      await expect(resolveExecutionRunAdapterConfig({
+        companyId: "company-1",
+        agentId: "agent-1",
+        executionRunConfig: { env: { UNRELATED: "value" } },
+        requiredScopedEnvBinding: pushCapabilityBinding,
+        secretsSvc: stubSecretsSvc() as any,
+      })).rejects.toThrow(/configuration incomplete/i);
+    });
+
+    // The seat key is agent-scope-only, so binding it at project scope must NOT
+    // satisfy the preflight — otherwise the gate would pass on a binding the
+    // strip above guarantees never arrives, dispatching a run that then fails
+    // with no credential at all.
+    it("does not accept a project-scoped seat token, which the overlay filter strips", async () => {
+      await expect(resolveExecutionRunAdapterConfig({
+        companyId: "company-1",
+        agentId: "agent-1",
+        executionRunConfig: { env: {} },
+        projectEnv: { GH_SEAT_TOKEN_VALUE: "project-seat-token" },
+        requiredScopedEnvBinding: pushCapabilityBinding,
+        secretsSvc: stubSecretsSvc() as any,
+      })).rejects.toThrow(/configuration incomplete/i);
+    });
+  });
+
   it("skips project env resolution when the project has no bindings", async () => {
     const resolveAdapterConfigForRuntime = vi.fn().mockResolvedValue({
       config: { env: { AGENT_ONLY: "agent-only" } },
@@ -412,6 +572,41 @@ describe("resolveExecutionRunAdapterConfig", () => {
       executionRunConfig: {
         env: {
           OPENAI_API_KEY: "inline-secret",
+        },
+      },
+      projectEnv: null,
+      trustPreset: {
+        kind: "low_trust_review",
+        preset: LOW_TRUST_REVIEW_PRESET,
+        boundary: {
+          mode: LOW_TRUST_REVIEW_PRESET,
+          companyId: "company-1",
+          issueIds: ["issue-1"],
+        },
+        sourcePresets: {},
+      },
+      secretsSvc: {
+        resolveAdapterConfigForRuntime: vi.fn(),
+        resolveEnvBindings: vi.fn(),
+      } as any,
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "low_trust_inline_sensitive_env_denied" },
+    });
+  });
+
+  // GH_SEAT_TOKEN_VALUE carries a raw token but matches none of the name-shaped
+  // substrings the sensitive-key heuristic looks for, so without an explicit
+  // rule a low-trust run could inline the seat credential. Introduced with the
+  // key itself (BLO-18927) rather than left for later.
+  it("rejects an inline agent-scope-only seat token for low-trust runs", async () => {
+    await expect(resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      issueId: "issue-1",
+      executionRunConfig: {
+        env: {
+          GH_SEAT_TOKEN_VALUE: "inline-seat-token",
         },
       },
       projectEnv: null,
