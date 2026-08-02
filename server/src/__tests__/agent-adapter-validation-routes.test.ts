@@ -168,6 +168,11 @@ async function createApp() {
         ]),
       })),
     })),
+    update: vi.fn(() => ({
+      set: vi.fn(() => ({
+        where: vi.fn(async () => []),
+      })),
+    })),
   };
   app.use("/api", agentRoutes(db as any));
   app.use(errorHandler);
@@ -426,6 +431,66 @@ describe("agent routes adapter validation", () => {
         }),
       }),
     }));
+  });
+
+  it("keeps adapter-only updates sparse so the service can use the locked runtime config", async () => {
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ adapterType: "opencode_k8s" }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toEqual(expect.objectContaining({
+      adapterType: "opencode_k8s",
+    }));
+    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).not.toHaveProperty("runtimeConfig");
+  });
+
+  it("does not overwrite a concurrent runtime update during an adapter-only route update", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...(await mockAgentService.getById()),
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+    let lockedRuntimeConfig = { heartbeat: { maxConcurrentRuns: 15 } };
+    let signalUpdateStarted!: () => void;
+    const updateStarted = new Promise<void>((resolve) => {
+      signalUpdateStarted = resolve;
+    });
+    let releaseUpdate!: () => void;
+    const updateGate = new Promise<void>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    mockAgentService.update.mockImplementationOnce(async (_id: string, patch: Record<string, unknown>) => {
+      signalUpdateStarted();
+      await updateGate;
+      const runtimeConfig = (patch.runtimeConfig as typeof lockedRuntimeConfig | undefined) ?? lockedRuntimeConfig;
+      const maxConcurrentRuns = runtimeConfig.heartbeat.maxConcurrentRuns;
+      if (patch.adapterType === "opencode_k8s" && maxConcurrentRuns > 16) {
+        const { unprocessable } = await import("../errors.js");
+        throw unprocessable("heartbeat.maxConcurrentRuns must not exceed 16 for external-lifecycle adapters");
+      }
+      return {
+        ...(await mockAgentService.getById()),
+        ...patch,
+        runtimeConfig,
+      };
+    });
+    const app = await createApp();
+    const response = requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ adapterType: "opencode_k8s" }),
+    );
+
+    await updateStarted;
+    lockedRuntimeConfig = { heartbeat: { maxConcurrentRuns: 50 } };
+    releaseUpdate();
+    const res = await response;
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).not.toHaveProperty("runtimeConfig");
   });
 
   it("does not inject CODEX_HOME or OPENAI_API_KEY when creating a keyless codex_local agent", async () => {

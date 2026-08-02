@@ -3371,10 +3371,10 @@ export function agentRoutes(
       );
       assertNoAgentRuntimeConfigAdapterConfigMutation(req, requestedRuntimeConfig);
     }
-    if (requestedRuntimeConfig || requestedAdapterType !== existing.adapterType) {
+    if (requestedRuntimeConfig) {
       requestedRuntimeConfig = normalizeExternalLifecycleRuntimeConfig(
         requestedAdapterType,
-        requestedRuntimeConfig ?? existing.runtimeConfig,
+        requestedRuntimeConfig,
       );
       if (
         hasOwn(patchData, "runtimeConfig")
