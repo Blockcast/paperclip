@@ -17,10 +17,10 @@ import {
 
 /** Stand-in for `process` so tests never install real handlers. */
 function fakeProcess() {
-  const emitter = new EventEmitter();
+  const emitter = Object.assign(new EventEmitter(), { exitCode: undefined as number | undefined });
   // Node warns past 10 listeners; these tests intentionally add/remove many.
   emitter.setMaxListeners(50);
-  return emitter as unknown as Pick<NodeJS.Process, "on" | "off"> & EventEmitter;
+  return emitter as unknown as Pick<NodeJS.Process, "on" | "off" | "exitCode"> & EventEmitter;
 }
 
 function fakeLogger() {
@@ -94,6 +94,7 @@ describe("installProcessCrashGuard (BLO-19722)", () => {
     const exit = vi.fn();
     const onCrash = vi.fn().mockResolvedValue(undefined);
     const logger = fakeLogger();
+    const realExitCode = process.exitCode;
 
     installProcessCrashGuard({ logger, onCrash, exit, processRef });
     processRef.emit("uncaughtException", new Error("null socket write"));
@@ -105,6 +106,8 @@ describe("installProcessCrashGuard (BLO-19722)", () => {
     // labelled, not Node's default bare-stack teardown.
     expect(exit).toHaveBeenCalledWith(CRASH_GUARD_EXIT_CODE);
     expect(logger.error).toHaveBeenCalled();
+    expect(processRef.exitCode).toBe(CRASH_GUARD_EXIT_CODE);
+    expect(process.exitCode).toBe(realExitCode);
   });
 
   it("treats an unhandled rejection the same way", async () => {
@@ -204,6 +207,29 @@ describe("installProcessCrashGuard (BLO-19722)", () => {
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(CRASH_GUARD_EXIT_CODE));
     expect(onCrash).toHaveBeenCalledTimes(1);
     releaseFirst?.();
+  });
+
+  it("handles the strict-mode uncaughtException/unhandledRejection pair once", async () => {
+    const processRef = fakeProcess();
+    const exit = vi.fn();
+    let releaseCrash: (() => void) | null = null;
+    const onCrash = vi.fn().mockReturnValue(
+      new Promise<void>((resolve) => {
+        releaseCrash = resolve;
+      }),
+    );
+    const rejection = new Error("strict rejection");
+
+    installProcessCrashGuard({ logger: fakeLogger(), onCrash, exit, processRef, timeoutMs: 10_000 });
+    processRef.emit("uncaughtException", rejection, "unhandledRejection");
+    processRef.emit("unhandledRejection", rejection, Promise.resolve());
+
+    expect(onCrash).toHaveBeenCalledTimes(1);
+    expect(onCrash.mock.calls[0]![0]).toMatchObject({ kind: "unhandledRejection" });
+    expect(exit).not.toHaveBeenCalled();
+
+    releaseCrash?.();
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(CRASH_GUARD_EXIT_CODE));
   });
 
   it("still exits when no bookkeeping hook is supplied", async () => {

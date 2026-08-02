@@ -83,7 +83,7 @@ export interface InstallCrashGuardOptions {
   /** Seams for tests; default to the real process. */
   exit?: (code: number) => void;
   setExitCode?: (code: number) => void;
-  processRef?: Pick<NodeJS.Process, "on" | "off">;
+  processRef?: Pick<NodeJS.Process, "on" | "off" | "exitCode">;
 }
 
 const MAX_CAUSE_DEPTH = 10;
@@ -176,11 +176,11 @@ export function installProcessCrashGuard(options: InstallCrashGuardOptions): () 
     logger,
     onCrash,
     timeoutMs = DEFAULT_CRASH_GUARD_TIMEOUT_MS,
+    processRef = process,
     exit = (code: number) => process.exit(code),
     setExitCode = (code: number) => {
-      process.exitCode = code;
+      processRef.exitCode = code;
     },
-    processRef = process,
   } = options;
 
   // Re-entrancy is the failure mode that turns a crash into a hang: `onCrash`
@@ -284,8 +284,28 @@ export function installProcessCrashGuard(options: InstallCrashGuardOptions): () 
     })();
   };
 
-  const onUncaught = (error: unknown) => handle("uncaughtException", error);
-  const onRejection = (reason: unknown) => handle("unhandledRejection", reason);
+  let strictUnhandledRejection: unknown;
+  let strictUnhandledRejectionPending = false;
+  const onUncaught = (error: unknown, origin?: string) => {
+    if (origin === "unhandledRejection") {
+      // In strict mode Node emits this event before `unhandledRejection` for
+      // the same reason. Handle it once so the second event cannot take the
+      // crash guard's immediate re-entry path and truncate diagnostics.
+      strictUnhandledRejection = error;
+      strictUnhandledRejectionPending = true;
+      handle("unhandledRejection", error);
+      return;
+    }
+    handle("uncaughtException", error);
+  };
+  const onRejection = (reason: unknown) => {
+    if (strictUnhandledRejectionPending && Object.is(reason, strictUnhandledRejection)) {
+      strictUnhandledRejectionPending = false;
+      strictUnhandledRejection = undefined;
+      return;
+    }
+    handle("unhandledRejection", reason);
+  };
 
   processRef.on("uncaughtException", onUncaught as NodeJS.UncaughtExceptionListener);
   processRef.on("unhandledRejection", onRejection as NodeJS.UnhandledRejectionListener);

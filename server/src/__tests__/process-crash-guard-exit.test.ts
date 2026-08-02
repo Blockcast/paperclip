@@ -41,9 +41,15 @@ interface StalledCrashResult {
   elapsedMs: number;
 }
 
-function runFixture(kind: "throw" | "reject", padBytes: number): Promise<CrashResult> {
+function runFixture(kind: "throw" | "reject", padBytes: number, strictRejections = false): Promise<CrashResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(tsx, [fixture, kind, String(padBytes)], {
+      env: strictRejections
+        ? {
+            ...process.env,
+            NODE_OPTIONS: [process.env.NODE_OPTIONS, "--unhandled-rejections=strict"].filter(Boolean).join(" "),
+          }
+        : process.env,
       stdio: ["ignore", "ignore", "pipe"],
     });
 
@@ -136,5 +142,14 @@ describe("process crash guard — real process exit", () => {
 
     expect(code).toBe(1);
     expect(elapsedMs).toBeLessThan(1_500);
+  });
+
+  it("flushes one complete crash record for a strict unhandled rejection", async () => {
+    const { code, stderr } = await runFixture("reject", PIPE_PRESSURE_BYTES, true);
+
+    expect(code).toBe(1);
+    expect(stderr).toContain("[shutdown] unhandledRejection: Error: BOOM_SENTINEL");
+    expect(stderr).toContain("[shutdown] exiting 1 after unhandledRejection");
+    expect(stderr).not.toContain("crash-guard re-entered");
   });
 });
