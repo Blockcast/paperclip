@@ -635,6 +635,51 @@ export function shouldUseRepoLessFallbackWorkspaceSource(input: {
   if (!adapterType) return false;
   return K8S_GIT_SENSITIVE_ADAPTER_TYPES.has(adapterType) && input.k8sIsolationMode === "run";
 }
+
+// BLO-18760 (review follow-up): is a saved session cwd the workspace-less
+// fallback dir belonging to the *other* k8s isolation mode?
+//
+// The session cwd is persisted per (agent, adapter, task) and replayed on every
+// resume, but isolation is decided per *run*. The saved-cwd early return in
+// `resolveWorkspaceForRun` is otherwise screened only by
+// `isUnsafeSessionWorkspaceCwd`, which rejects system temp roots and knows
+// nothing about isolation — so a cwd chosen under one mode is silently
+// inherited by a run in the other. Both directions break:
+//
+//   shared -> run:  the persistent agent home (carrying a real `.git` from
+//     unrelated prior runs) returns as `task_session`, the repo-less selection
+//     never runs, and the BLO-18147 dispatch guard parks the run — re-opening,
+//     via a resumed session, the exact strand BLO-18760 closes.
+//
+//   run -> shared:  a shared run adopts `empty-workspaces/<agent>` as its *live*
+//     working directory and writes a `.git` into it. That directory's
+//     repo-less-ness is an invariant introduced by BLO-18760 and is load-bearing
+//     for every later run-isolated launch, which the same guard would then park.
+//     The session/workspace mismatch check downstream fires only after
+//     `executionWorkspace` is realized, so it does not prevent the inheritance,
+//     and the breakage surfaces on a later, different run.
+//
+// Deliberately narrow: true only for the two workspace-less fallback dirs. Any
+// other resumable cwd — project workspace, per-run worktree, operator branch —
+// is left alone, so warm-session continuity for workspace-bound issues is
+// unaffected.
+export function isWorkspaceLessFallbackCwdForOtherIsolationMode(input: {
+  sessionCwd: string | null | undefined;
+  agentId: string;
+  adapterType: string | null | undefined;
+  k8sIsolationMode: "shared" | "run" | "workspace" | null | undefined;
+}): boolean {
+  const sessionCwd = readNonEmptyString(input.sessionCwd);
+  if (!sessionCwd) return false;
+  const useRepoLessFallbackSource = shouldUseRepoLessFallbackWorkspaceSource({
+    adapterType: input.adapterType,
+    k8sIsolationMode: input.k8sIsolationMode,
+  });
+  const mismatchedFallbackDir = useRepoLessFallbackSource
+    ? resolveDefaultAgentWorkspaceDir(input.agentId)
+    : resolveAgentEmptyWorkspaceSourceDir(input.agentId);
+  return sameResolvedPath(sessionCwd, mismatchedFallbackDir);
+}
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -10551,9 +10596,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
+    // BLO-18760: which workspace-less fallback dir does *this* run want? Decided
+    // before the saved-session early return below, because that return has to be
+    // screened against it — see the isolation-mismatch check.
+    const useRepoLessFallbackSource = shouldUseRepoLessFallbackWorkspaceSource({
+      adapterType: agent.adapterType,
+      k8sIsolationMode: opts?.k8sIsolationMode ?? null,
+    });
+    const agentHomeFallbackDir = resolveDefaultAgentWorkspaceDir(agent.id);
+    const repoLessFallbackDir = resolveAgentEmptyWorkspaceSourceDir(agent.id);
+
     const sessionCwd = readNonEmptyString(previousSessionParams?.cwd);
     const sessionCwdLooksUnsafe = isUnsafeSessionWorkspaceCwd(sessionCwd);
-    if (sessionCwd && !sessionCwdLooksUnsafe) {
+
+    // BLO-18760 (review follow-up): the saved-session early return below is
+    // isolation-blind — `isUnsafeSessionWorkspaceCwd` screens system temp roots
+    // only. Decline a saved cwd that is the workspace-less fallback dir of the
+    // *other* isolation mode, in both directions; see
+    // `isWorkspaceLessFallbackCwdForOtherIsolationMode` for why each direction
+    // breaks. Every other resumable cwd is untouched.
+    const sessionCwdIsMismatchedFallback = isWorkspaceLessFallbackCwdForOtherIsolationMode({
+      sessionCwd,
+      agentId: agent.id,
+      adapterType: agent.adapterType,
+      k8sIsolationMode: opts?.k8sIsolationMode ?? null,
+    });
+
+    if (sessionCwd && !sessionCwdLooksUnsafe && !sessionCwdIsMismatchedFallback) {
       const sessionCwdExists = await fs
         .stat(sessionCwd)
         .then((stats) => stats.isDirectory())
@@ -10590,13 +10659,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // paths and this cwd serves *only* as the clone source. `shared` and
     // `workspace` isolation keep the persistent agent home, so warm-session
     // continuity is untouched.
-    const useRepoLessFallbackSource = shouldUseRepoLessFallbackWorkspaceSource({
-      adapterType: agent.adapterType,
-      k8sIsolationMode: opts?.k8sIsolationMode ?? null,
-    });
-    const cwd = useRepoLessFallbackSource
-      ? resolveAgentEmptyWorkspaceSourceDir(agent.id)
-      : resolveDefaultAgentWorkspaceDir(agent.id);
+    const cwd = useRepoLessFallbackSource ? repoLessFallbackDir : agentHomeFallbackDir;
     await fs.mkdir(cwd, { recursive: true });
     const warnings: string[] = [];
     const fallbackSuffix = useRepoLessFallbackSource
@@ -10605,6 +10668,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (sessionCwd && sessionCwdLooksUnsafe) {
       warnings.push(
         `Saved session workspace "${sessionCwd}" points at a system temp root and was rejected as untrusted.${fallbackSuffix}`,
+      );
+    } else if (sessionCwd && sessionCwdIsMismatchedFallback) {
+      // Name the real cause: the directory exists and is readable, we declined it
+      // on purpose because it belongs to the other isolation mode.
+      warnings.push(
+        `Saved session workspace "${sessionCwd}" is the workspace-less fallback for a different k8s isolation mode ` +
+          `(this run resolves isolation as "${opts?.k8sIsolationMode ?? "unset"}") and was not reused.${fallbackSuffix}`,
       );
     } else if (sessionCwd) {
       warnings.push(

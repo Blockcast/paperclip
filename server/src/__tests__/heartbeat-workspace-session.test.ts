@@ -26,6 +26,7 @@ import {
   deriveTaskKeyWithHeartbeatFallback,
   evaluatePreferredProjectWorkspaceRealization,
   isNonPrimaryWorkspaceTarget,
+  isWorkspaceLessFallbackCwdForOtherIsolationMode,
   isK8sIsolationRetryDeferred,
   logK8sGuardDecision,
   resolveProjectPrimaryWorkspaceId,
@@ -782,6 +783,94 @@ describe("shouldUseRepoLessFallbackWorkspaceSource", () => {
         shouldUseRepoLessFallbackWorkspaceSource({ adapterType, k8sIsolationMode: "run" }),
       ).toBe(false);
     }
+  });
+});
+
+// BLO-18760 (review follow-up): the saved-session cwd early return in
+// `resolveWorkspaceForRun` is screened only by `isUnsafeSessionWorkspaceCwd`,
+// which knows about system temp roots and nothing about isolation. The session
+// cwd is persisted per (agent, adapter, task) and replayed on every resume,
+// while isolation is decided per *run* — so without this predicate a cwd chosen
+// under one mode is silently inherited by a run in the other.
+describe("isWorkspaceLessFallbackCwdForOtherIsolationMode", () => {
+  const agentId = "blo-18760-isolation-mismatch-agent";
+  const agentHomeDir = resolveDefaultAgentWorkspaceDir(agentId);
+  const repoLessDir = resolveAgentEmptyWorkspaceSourceDir(agentId);
+  const check = (
+    sessionCwd: string | null | undefined,
+    k8sIsolationMode: "shared" | "run" | "workspace" | null | undefined,
+    adapterType: string | null | undefined = "claude_k8s",
+  ) =>
+    isWorkspaceLessFallbackCwdForOtherIsolationMode({
+      sessionCwd,
+      agentId,
+      adapterType,
+      k8sIsolationMode,
+    });
+
+  it("declines the persistent agent home when the run wants a repo-less source (shared -> run)", () => {
+    // The agent home carries a real `.git` from unrelated prior runs. Reused
+    // here it would skip the repo-less selection entirely and get the run
+    // parked by the BLO-18147 dispatch guard — re-opening the strand this
+    // change exists to close, just reached via a resumed session.
+    expect(check(agentHomeDir, "run")).toBe(true);
+  });
+
+  it("declines the repo-less source when the run wants the agent home (run -> shared)", () => {
+    // The decisive direction: a shared run would adopt empty-workspaces/<agent>
+    // as its *live* cwd and write a `.git` into it, destroying the repo-less
+    // invariant every later run-isolated launch depends on. The downstream
+    // session/workspace mismatch check fires only after executionWorkspace is
+    // realized, so it cannot prevent this inheritance.
+    for (const mode of ["shared", "workspace", null, undefined] as const) {
+      expect(check(repoLessDir, mode)).toBe(true);
+    }
+  });
+
+  it("allows each fallback dir under the mode that actually selects it", () => {
+    // Not a blanket ban on the fallback dirs — only on crossing modes.
+    expect(check(repoLessDir, "run")).toBe(false);
+    expect(check(agentHomeDir, "shared")).toBe(false);
+    expect(check(agentHomeDir, "workspace")).toBe(false);
+  });
+
+  it("leaves every other resumable cwd alone", () => {
+    // AC #3: workspace-bound issues must not regress. Project workspaces,
+    // per-run worktrees and operator branches are none of our business, and
+    // neither is another agent's fallback dir.
+    const otherAgentHome = resolveDefaultAgentWorkspaceDir("some-other-agent");
+    const otherAgentRepoLess = resolveAgentEmptyWorkspaceSourceDir("some-other-agent");
+    for (const cwd of [
+      "/paperclip/instances/default/projects/acme/checkout",
+      "/runtime-cache/paperclip-runs/run-123/workspace",
+      otherAgentHome,
+      otherAgentRepoLess,
+      "",
+      null,
+      undefined,
+    ]) {
+      for (const mode of ["run", "shared", "workspace", null] as const) {
+        expect(check(cwd, mode)).toBe(false);
+      }
+    }
+  });
+
+  it("is inert for adapters that do not take the repo-less path", () => {
+    // Non-cloning adapters never select empty-workspaces, so their saved agent
+    // home stays reusable under every mode. Their repo-less dir is still
+    // declined: nothing should ever be running live out of it.
+    for (const adapterType of ["opencode_k8s", "codex_local", "claude_local", null] as const) {
+      expect(check(agentHomeDir, "run", adapterType)).toBe(false);
+      expect(check(repoLessDir, "run", adapterType)).toBe(true);
+    }
+  });
+
+  it("normalizes paths rather than comparing raw strings", () => {
+    // A trailing slash or a `..` hop is the same directory; the screen must not
+    // be defeated by however the cwd happened to be serialized into the session.
+    expect(check(`${repoLessDir}/`, "shared")).toBe(true);
+    expect(check(path.join(repoLessDir, "..", path.basename(repoLessDir)), "shared")).toBe(true);
+    expect(check(`${agentHomeDir}/`, "run")).toBe(true);
   });
 });
 
