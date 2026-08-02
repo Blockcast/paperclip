@@ -84,6 +84,7 @@ import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js"
 import {
   isZeroTokenStartupFailureRun,
   isZeroTokenSessionResetRetryRun,
+  SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS,
   ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
 } from "./zero-token-startup-failure.js";
 import { clearAgentTaskSessions } from "./session-reset.js";
@@ -325,7 +326,7 @@ type ResolvedDependencyWakeBackstopOptions = {
 
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
-  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState" | "resultJson" | "usageJson" | "createdAt"
+  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState" | "resultJson" | "usageJson" | "scheduledRetryAttempt" | "createdAt"
 > | null;
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" };
 
@@ -1232,6 +1233,7 @@ export function recoveryService(
     livenessState: heartbeatRuns.livenessState,
     resultJson: heartbeatRuns.resultJson,
     usageJson: heartbeatRuns.usageJson,
+    scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
     createdAt: heartbeatRuns.createdAt,
   } as const;
 
@@ -1388,6 +1390,7 @@ export function recoveryService(
         livenessState: heartbeatRuns.livenessState,
         resultJson: heartbeatRuns.resultJson,
         usageJson: heartbeatRuns.usageJson,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
         createdAt: heartbeatRuns.createdAt,
       })
       .from(heartbeatRuns)
@@ -1609,6 +1612,7 @@ export function recoveryService(
         livenessState: heartbeatRuns.livenessState,
         resultJson: heartbeatRuns.resultJson,
         usageJson: heartbeatRuns.usageJson,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
         createdAt: heartbeatRuns.createdAt,
       })
       .from(heartbeatRuns)
@@ -5236,8 +5240,12 @@ export function recoveryService(
   async function resetSessionAndRetryZeroTokenFailure(input: {
     issue: typeof issues.$inferSelect;
     agent: typeof agents.$inferSelect;
-    latestRun: LatestIssueRun;
+    latestRun: NonNullable<LatestIssueRun>;
   }) {
+    const scheduledRetryAttempt = Math.min(
+      (input.latestRun.scheduledRetryAttempt ?? 0) + 1,
+      SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS,
+    );
     await clearAgentTaskSessions(db, input.issue.companyId, input.agent.id, {
       taskKey: input.issue.id,
       adapterType: input.agent.adapterType,
@@ -5250,8 +5258,15 @@ export function recoveryService(
       retryReason: ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
       source: "issue.zero_token_session_reset_recovery",
       retryOfRunId: input.latestRun?.id ?? null,
+      extraContext: { scheduledRetryAttempt },
     });
     if (!queued) return null;
+
+    const [retryRun] = await db
+      .update(heartbeatRuns)
+      .set({ scheduledRetryAttempt, updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, queued.id))
+      .returning();
 
     await issuesSvc.addComment(
       input.issue.id,
@@ -5263,7 +5278,7 @@ export function recoveryService(
       { authorType: "system" },
     );
 
-    return queued;
+    return retryRun ?? queued;
   }
 
   async function persistAdapterFailureRecoveryClassification(
@@ -5898,7 +5913,10 @@ export function recoveryService(
 
         if (
           latestRun.agentId === agentId &&
-          isZeroTokenStartupFailureRun({ ...latestRun, adapterType: agent.adapterType })
+          isZeroTokenStartupFailureRun({
+            ...latestRun,
+            adapterType: readNonEmptyString(parseObject(latestRun.contextSnapshot).adapterType),
+          })
         ) {
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
             // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
@@ -6153,7 +6171,10 @@ export function recoveryService(
       }
       if (
         latestRun?.agentId === agentId &&
-        isZeroTokenStartupFailureRun({ ...latestRun, adapterType: agent.adapterType })
+        isZeroTokenStartupFailureRun({
+          ...latestRun,
+          adapterType: readNonEmptyString(parseObject(latestRun.contextSnapshot).adapterType),
+        })
       ) {
         if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
           // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.

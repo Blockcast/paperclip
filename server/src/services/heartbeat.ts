@@ -302,6 +302,8 @@ import {
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import {
   runUsageTokenCounts,
+  SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS,
+  SESSION_UNAVAILABLE_RECOVERY_RETRY_REASON,
   ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
 } from "./recovery/zero-token-startup-failure.js";
 import { clearAgentTaskSessions } from "./recovery/session-reset.js";
@@ -635,10 +637,11 @@ export const JOB_FAILED_HEARTBEAT_RETRY_WAKE_REASON = "job_failed_retry";
 export const JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS = 4;
 // The adapter already makes one fresh-session attempt in-process. These are a
 // bounded backstop for control-plane/process loss around that transition.
-const SESSION_UNAVAILABLE_HEARTBEAT_RETRY_REASON = "session_unavailable";
+const SESSION_UNAVAILABLE_HEARTBEAT_RETRY_REASON = SESSION_UNAVAILABLE_RECOVERY_RETRY_REASON;
 const SESSION_UNAVAILABLE_HEARTBEAT_RETRY_WAKE_REASON = "session_unavailable_retry";
 export const SESSION_UNAVAILABLE_HEARTBEAT_RETRY_DELAY_MS = 30 * 1000;
-export const SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS = 2;
+export const SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS =
+  SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS;
 export const DEP_BLOCKED_RETRY_REASON = "dependency_blocked";
 export const DEP_BLOCKED_BASE_DELAY_MS = 5 * 60 * 1000;
 export const DEP_BLOCKED_MAX_DELAY_MS = 60 * 60 * 1000;
@@ -22018,6 +22021,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const persistedRunWrite = await setRunStatusIfRunning(run.id, status, {
         finishedAt: new Date(),
+        contextSnapshot: {
+          ...parseObject(run.contextSnapshot),
+          adapterType: agent.adapterType,
+        },
         error: runErrorMessage,
         errorCode: runErrorCode,
         exitCode: adapterResult.exitCode,

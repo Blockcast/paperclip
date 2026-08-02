@@ -1614,6 +1614,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
     await heartbeat.__test_executeRunForTesting(runId);
 
+    const failedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
     const retryRun = await db
       .select()
       .from(heartbeatRuns)
@@ -1625,6 +1630,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       wakeReason: "session_unavailable_retry",
       scheduledRetryAttempt: 1,
     });
+    expect(failedRun?.contextSnapshot).toMatchObject({ adapterType: "codex_local" });
   });
 
   // BLO-9147 AC1 — thin-snapshot adapter_failed retry gate

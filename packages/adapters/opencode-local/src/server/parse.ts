@@ -89,13 +89,20 @@ export function parseOpenCodeJsonl(stdout: string) {
 }
 
 export function isOpenCodeUnknownSessionError(stdout: string, stderr: string): boolean {
-  const haystack = `${stdout}\n${stderr}`
+  const rawHaystack = `${stdout}\n${stderr}`
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
     .join("\n");
 
-  return /unknown\s+session|session\s+unavailable|session\b.*\bnot\s+found|resource\s+not\s+found:.*[\\/]session[\\/].*\.json|notfounderror|no session/i.test(
-    haystack,
-  );
+  if (
+    /unknown\s+session|session\b.*\bnot\s+found|resource\s+not\s+found:.*[\\/]session[\\/].*\.json|notfounderror|no session/i.test(
+      rawHaystack,
+    )
+  ) {
+    return true;
+  }
+
+  const structuredError = parseOpenCodeJsonl(stdout).errorMessage ?? "";
+  return /session\s+unavailable/i.test(`${structuredError}\n${stderr}`);
 }

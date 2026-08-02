@@ -98,6 +98,8 @@ export function isZeroTokenStartupFailureRun(
 // reset-and-retry attempt for a zero-token startup failure (see
 // resetSessionAndRetryZeroTokenFailure in recovery/service.ts).
 export const ZERO_TOKEN_SESSION_RESET_RETRY_REASON = "zero_token_session_reset";
+export const SESSION_UNAVAILABLE_RECOVERY_RETRY_REASON = "session_unavailable";
+export const SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS = 2;
 
 // True when the latest run was itself dispatched as that one-shot
 // reset-and-retry attempt and failed again with the same zero-token
@@ -107,10 +109,17 @@ export const ZERO_TOKEN_SESSION_RESET_RETRY_REASON = "zero_token_session_reset";
 // when the wedge isn't actually session-poisoning (e.g. a genuinely
 // oversized workspace tripping context_overflow every time).
 export function isZeroTokenSessionResetRetryRun(
-  run: { contextSnapshot?: Record<string, unknown> | null } | null | undefined,
+  run: {
+    contextSnapshot?: Record<string, unknown> | null;
+    scheduledRetryAttempt?: number | null;
+  } | null | undefined,
 ): boolean {
   const context = run?.contextSnapshot;
   if (!context || typeof context !== "object") return false;
   const retryReason = context.retryReason;
-  return typeof retryReason === "string" && retryReason === ZERO_TOKEN_SESSION_RESET_RETRY_REASON;
+  if (retryReason === ZERO_TOKEN_SESSION_RESET_RETRY_REASON) return true;
+  return (
+    retryReason === SESSION_UNAVAILABLE_RECOVERY_RETRY_REASON &&
+    (run?.scheduledRetryAttempt ?? 0) >= SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS
+  );
 }

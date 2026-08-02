@@ -828,7 +828,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   async function seedStrandedIssueFixture(input: {
     status: "todo" | "in_progress";
     runStatus: "failed" | "timed_out" | "cancelled" | "succeeded";
-    retryReason?: "assignment_recovery" | "issue_continuation_needed" | "execution_review_participant_recovery" | null;
+    retryReason?: "assignment_recovery" | "issue_continuation_needed" | "execution_review_participant_recovery" | "session_unavailable" | "zero_token_session_reset" | null;
     runSource?: string | null;
     assignToUser?: boolean;
     activePauseHold?: boolean;
@@ -900,6 +900,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       contextSnapshot: {
         issueId,
         taskId: issueId,
+        adapterType: input.adapterType ?? "codex_local",
         wakeReason: input.retryReason === "assignment_recovery"
           ? "issue_assignment_recovery"
           : input.retryReason ?? "issue_assigned",
@@ -7550,6 +7551,48 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await expect(
       db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId)),
     ).resolves.toHaveLength(1);
+  });
+
+  it("does not reclassify a historical non-OpenCode failure after adapter reconfiguration", async () => {
+    const { agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "adapter_failed",
+      runError: "Session unavailable",
+      adapterType: "claude_k8s",
+    });
+    await db.update(agents).set({ adapterType: "opencode_k8s" }).where(eq(agents.id, agentId));
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(0);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+  });
+
+  it("blocks an exhausted ordinary session-unavailable chain without starting a reset chain", async () => {
+    const { agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "session_unavailable",
+      runErrorCode: "session_unavailable",
+      runError: "Session unavailable",
+      runUsageJson: { inputTokens: 0, outputTokens: 0 },
+      adapterType: "opencode_k8s",
+      scheduledRetryAttempt: 2,
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(0);
+    expect(result.zeroTokenStartupFailureBlocked).toBe(1);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+    const wakeRows = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeRows.some((row) => row.reason === "issue_zero_token_session_reset")).toBe(false);
   });
 
   it("blocks an exhausted session-unavailable reset chain without another wake", async () => {
