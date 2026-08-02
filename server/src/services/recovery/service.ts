@@ -579,7 +579,7 @@ function readProviderCapacityResetAt(
   return advertised ? { resetAt: advertised, is429Capacity: false } : null;
 }
 
-export function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
+export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Date.now()) {
   if (!run) return null;
 
   const errorCode = readNonEmptyString(run.errorCode)?.trim() ?? null;
@@ -598,16 +598,28 @@ export function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
   // families also cover 401 cap-windows and legacy quota signals, so a bare
   // advertised `retryNotBefore` gets the honest "rate-limit/quota window"
   // phrasing instead of a status code we cannot substantiate.
+  //
+  // The horizon is also only load-bearing while it is still in the future.
+  // Recovery sweeps run on their own cadence and routinely read a run that
+  // failed hours earlier, so an unconditional present-tense "waiting on that
+  // reset … self-healing" tells agents to sit out a window that already
+  // reopened — the exact misdiagnosis this summary exists to prevent, pointed
+  // the other way. Past the instant, the throttle is history: name it as
+  // context and send the reader looking for a cause after it.
   const capacityReset = readProviderCapacityResetAt(run);
   if (capacityReset) {
     const suffix = errorCode ? ` (surfaced as \`${errorCode}\`)` : "";
     const cause = capacityReset.is429Capacity
       ? `provider capacity throttle (429) — the provider advertised a capacity reset at ${capacityReset.resetAt}`
       : `provider rate-limit/quota window — the provider advertised availability no earlier than ${capacityReset.resetAt}`;
-    return (
-      ` Latest retry failure: ${cause}${suffix}. This is transient and self-healing; ` +
-      `the issue is waiting on that reset, not on a broken runtime.`
-    );
+    const resetAtMs = Date.parse(capacityReset.resetAt);
+    const windowStillOpen = Number.isFinite(resetAtMs) && resetAtMs > now;
+    return windowStillOpen
+      ? ` Latest retry failure: ${cause}${suffix}. This is transient and self-healing; ` +
+          `the issue is waiting on that reset, not on a broken runtime.`
+      : ` Latest retry failure: ${cause}${suffix}. That window has since elapsed, so the ` +
+          `throttle is historical context rather than the current blocker; if this issue is ` +
+          `still stalled, the cause is something after ${capacityReset.resetAt}.`;
   }
 
   // Prefer the JSON `"message": "..."` field if the error body is a JSON
