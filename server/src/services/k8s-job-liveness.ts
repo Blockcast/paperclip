@@ -19,6 +19,30 @@ const K8S_JOB_LIVENESS_TIMEOUT_SECONDS = Math.max(
   Math.ceil(K8S_JOB_LIVENESS_TIMEOUT_MS / 1000),
 );
 
+// BLO-20801 (Ally review round 3): an accepted DELETE response is not proof
+// the Job is gone -- with Background propagation the API server only
+// acknowledges the request, and the Job's own controller reconciliation can
+// still be in flight and create/retry a pod before the object actually
+// disappears. `deleteStaleTerminalJob` re-reads the exact Job by name after
+// issuing the delete and only trusts the waiver once that read confirms a
+// 404, bounded by this small retry budget so a still-terminating Job fails
+// closed (stays blocking) rather than being trusted on the DELETE response
+// alone.
+const STALE_JOB_DELETE_CONFIRM_ATTEMPTS = Math.max(
+  1,
+  Number(process.env.PAPERCLIP_K8S_STALE_JOB_DELETE_CONFIRM_ATTEMPTS ?? "3"),
+);
+const STALE_JOB_DELETE_CONFIRM_DELAY_MS = Math.max(
+  0,
+  Number(
+    process.env.PAPERCLIP_K8S_STALE_JOB_DELETE_CONFIRM_DELAY_MS ?? (IS_TEST_ENVIRONMENT ? "0" : "150"),
+  ),
+);
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // Agent Job manifests carry app.kubernetes.io/managed-by=paperclip and a
 // paperclip.io/run-id label that maps directly to heartbeat_runs.id. The
 // adapters set both unconditionally; see paperclip-adapter-claude-k8s
@@ -695,6 +719,17 @@ export async function deleteAgentJobExact(
  * as still-blocking (fail closed) -- this is a stricter, purpose-built
  * sibling of `deleteAgentJobExact` and does not change that function's
  * existing reaper call sites.
+ *
+ * BLO-20801 (Ally review round 3): a DELETE response of 200/202 only means
+ * the API server accepted the request -- with `propagationPolicy: Background`
+ * the Job's own controller reconciliation can still be mid-flight and create
+ * a pod before the object is actually removed. Treating the accepted DELETE
+ * itself as proof of absence would reopen the exact double-execution race
+ * this function exists to close. So after issuing the delete, this re-reads
+ * the exact Job by name with a small bounded retry until that read confirms
+ * a 404 (`"deleted"`), sees the Job gained an active pod in the meantime
+ * (`"still-active"`), or exhausts the retry budget without either -- which
+ * fails closed (`null`) exactly like any other unconfirmed outcome.
  */
 export async function deleteStaleTerminalJob(
   identity: ExactAgentJobIdentity,
@@ -737,7 +772,6 @@ export async function deleteStaleTerminalJob(
       },
       requestOptionsWithTimeout(),
     );
-    return "deleted";
   } catch (error) {
     if (isKubernetesNotFoundError(error)) return "missing";
     logger.warn(
@@ -746,6 +780,37 @@ export async function deleteStaleTerminalJob(
     );
     return null;
   }
+
+  for (let attempt = 0; attempt < STALE_JOB_DELETE_CONFIRM_ATTEMPTS; attempt++) {
+    if (attempt > 0) await sleepMs(STALE_JOB_DELETE_CONFIRM_DELAY_MS);
+    try {
+      const reread = await state.batchApi.readNamespacedJob(
+        { name: identity.name, namespace: PAPERCLIP_K8S_NAMESPACE },
+        requestOptionsWithTimeout(),
+      );
+      if ((reread.status?.active ?? 0) > 0) {
+        logger.debug(
+          { identity, attempt },
+          "BLO-20801: Job gained an active pod before deletion was confirmed; failing closed",
+        );
+        return "still-active";
+      }
+      // Still present (e.g. finalizers pending) but not yet active -- keep
+      // polling until the retry budget confirms absence or is exhausted.
+    } catch (error) {
+      if (isKubernetesNotFoundError(error)) return "deleted";
+      logger.warn(
+        { identity, attempt, error: error instanceof Error ? error.message : String(error) },
+        "stale-terminal k8s Job re-read after delete failed (BLO-20801)",
+      );
+      return null;
+    }
+  }
+  logger.debug(
+    { identity, attempts: STALE_JOB_DELETE_CONFIRM_ATTEMPTS },
+    "BLO-20801: stale-terminal Job deletion not confirmed within retry budget; failing closed",
+  );
+  return null;
 }
 
 export async function deleteAgentPodExact(identity: {
