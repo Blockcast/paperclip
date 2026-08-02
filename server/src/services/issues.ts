@@ -5640,8 +5640,15 @@ export function issueService(db: Db) {
         reason: "Cancelled because the issue checkout was adopted by the current execution run",
         errorCode: "issue_checkout_adopted",
       };
+      // BLO-6869: adoption is authorised by EITHER limb of the gate above, so the
+      // reap must only be demanded of the limb that needs it. A same-agent retry
+      // inherits the lock from its own parent run, which is still `running` and
+      // therefore never reapable — requiring it to be cancellable-as-never-started
+      // made that limb dead code and answered the retry with 409. When staleness
+      // is what authorises adoption the reap is still mandatory, so a never-started
+      // owner cannot start later against a state the adopter has since changed.
       if (
-        !(await cancelNeverStartedOwnerRun(tx, existingRun, cancellation)) ||
+        (stale && !(await cancelNeverStartedOwnerRun(tx, existingRun, cancellation))) ||
         (lockedIssue.executionRunId !== input.expectedCheckoutRunId &&
           lockedIssue.executionRunId !== input.actorRunId &&
           !(await cancelNeverStartedOwnerRun(tx, executionOwnerRun, cancellation)))
