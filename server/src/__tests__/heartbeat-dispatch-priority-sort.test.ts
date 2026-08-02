@@ -1795,9 +1795,22 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const runnableCriticalRunId = randomUUID();
     const issuePrefix = `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const baseCreatedAt = new Date(Date.now() - 5 * 60 * 1000);
+    const criticalContinuationSchedules: Array<{
+      reason: string;
+      suppressCriticalLaneHeadRescanDemand: boolean;
+    }> = [];
     const boundedHeartbeat = heartbeatService(db, {
       penstockGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 5 },
+      onQueuedDispatchScheduledForTest: (event) => {
+        if (event.reason === "resume_critical_lane") {
+          criticalContinuationSchedules.push({
+            reason: event.reason,
+            suppressCriticalLaneHeadRescanDemand:
+              event.suppressCriticalLaneHeadRescanDemand,
+          });
+        }
+      },
     });
 
     await db.insert(companies).values({
@@ -1919,6 +1932,13 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
 
     expect(dispatchedRunIds[0]).toBe(runnableCriticalRunId);
     expect((await boundedHeartbeat.getRun(runnableCriticalRunId))?.status).not.toBe("queued");
+    expect(criticalContinuationSchedules.length).toBeGreaterThan(0);
+    expect(criticalContinuationSchedules).toEqual(
+      criticalContinuationSchedules.map(() => ({
+        reason: "resume_critical_lane",
+        suppressCriticalLaneHeadRescanDemand: true,
+      })),
+    );
     await boundedHeartbeat.drainInFlightExecutions(60_000);
   }, 120_000);
 

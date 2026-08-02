@@ -13,7 +13,7 @@
  * used to join issues through `context_snapshot ->> 'issueId' = cast(issues.id
  * as text)`, whose LIMIT bounded returned rows rather than rows inspected; the
  * zero-match case is the worst case, because nothing lets the executor stop
- * early. Both the old shape and the two bounded statements that replaced it are
+ * early. Both the old shape and the bounded statements that replaced it are
  * measured here, so the improvement is executable evidence rather than a claim
  * in a review comment.
  */
@@ -237,28 +237,26 @@ const PRIORITY_LANE_BEFORE = `
 `;
 
 /**
- * The lane as the dispatcher issues it TODAY: split in two, so each predicate
- * can reach an index and each kind of row gets its own budget.
+ * The lane as the dispatcher issues it TODAY: split in two, so each kind of
+ * row gets its own budget.
  *
- * Lane A — critical issues. Pulling `priority = 'critical'` out of the OR is
- * what lets the planner use the pre-existing `issues_company_priority_idx`.
- * The join moved to the stored generated column `context_issue_id`
- * (migration 0079). Note the cast direction: uuid -> text is total, whereas
- * `issues.id = context_issue_id::uuid` would parse untrusted text per outer
- * row and can raise `invalid input syntax for type uuid`.
+ * Lane A — critical issues. The dispatcher first reads a fixed-size indexed
+ * page of queued runs, then UUID-screens and resolves only that page's issues.
+ * Filtering critical priority after the bounded read is what makes the
+ * zero-match case independent of total queue depth.
  */
-const PRIORITY_LANE_CRITICAL = `
-  SELECT heartbeat_runs.*, issues.id, issues.status, issues.priority
-    FROM heartbeat_runs
-    INNER JOIN issues
-      ON issues.company_id = '${COMPANY}'::uuid
-     AND heartbeat_runs.context_issue_id = cast(issues.id as text)
-   WHERE heartbeat_runs.agent_id = '${AGENT}'::uuid
+const PRIORITY_LANE_CRITICAL_CANDIDATES = `
+  SELECT * FROM heartbeat_runs
+   WHERE agent_id = '${AGENT}'::uuid
      AND heartbeat_runs.status = 'queued'
-     AND issues.priority = 'critical'
-     AND issues.status NOT IN ('done', 'cancelled')
-   ORDER BY heartbeat_runs.created_at ASC, heartbeat_runs.id ASC
+   ORDER BY created_at ASC, id ASC
    LIMIT ${SCAN_LIMIT}
+`;
+
+const PRIORITY_LANE_CRITICAL_ISSUE_LOOKUP = `
+  SELECT id, status, priority FROM issues
+   WHERE company_id = '${COMPANY}'::uuid
+     AND id IN (${LANE_ISSUE_IDS.slice(0, SCAN_LIMIT).map((id) => `'${id}'::uuid`).join(", ")})
 `;
 
 /**
@@ -341,8 +339,11 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     const laneBefore = await explain(sql, PRIORITY_LANE_BEFORE);
     record("priority lane BEFORE (single query, OR, JSON->text join)", laneBefore);
 
-    const laneCritical = await explain(sql, PRIORITY_LANE_CRITICAL);
-    record("priority lane A (critical, split out of the OR)", laneCritical);
+    const laneCriticalCandidates = await explain(sql, PRIORITY_LANE_CRITICAL_CANDIDATES);
+    record("priority lane A step 1 (bounded queued candidates)", laneCriticalCandidates);
+
+    const laneCriticalIssues = await explain(sql, PRIORITY_LANE_CRITICAL_ISSUE_LOOKUP);
+    record("priority lane A step 2 (critical issues by primary key)", laneCriticalIssues);
 
     const laneRecovery = await explain(sql, PRIORITY_LANE_RECOVERY);
     record("priority lane B (recovery, run-side only)", laneRecovery);
@@ -360,11 +361,22 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     // fail CI here for no reason. What must hold is the bound on the lanes the
     // dispatcher actually issues, asserted absolutely below.
 
-    // Lane A: with `priority = 'critical'` as its own predicate the issues side
-    // is index-driven, so the company's issue table is no longer read whole.
-    // Coverage is unchanged — a critical row is still found at any queue depth,
-    // which is why this is a split rather than a bounded re-read of the head.
-    expect(scanKinds(laneCritical.root)).not.toContain("Seq Scan");
+    // Lane A step 1 is absolutely bounded by SCAN_LIMIT even when no queued
+    // run targets a critical issue. The dispatcher keyset-pages this statement
+    // across detached passes, so the bound does not sacrifice any-depth
+    // coverage.
+    expect(indexesUsed(laneCriticalCandidates.root)).toContain(DISPATCH_INDEX);
+    expect(scanKinds(laneCriticalCandidates.root)).not.toContain("Seq Scan");
+    expect(rowsInspected(laneCriticalCandidates.root)).toBeLessThanOrEqual(SCAN_LIMIT * 3);
+
+    // Lane A step 2 resolves at most SCAN_LIMIT UUID-screened ids by primary
+    // key, then filters priority/status in JS. Keeping those predicates out of
+    // SQL is intentional: otherwise PostgreSQL may drive from the company-wide
+    // priority index and inspect every critical issue before applying the id
+    // list. This shape never joins against or walks either total backlog.
+    expect(indexesUsed(laneCriticalIssues.root)).toContain("issues_pkey");
+    expect(scanKinds(laneCriticalIssues.root)).not.toContain("Seq Scan");
+    expect(rowsInspected(laneCriticalIssues.root)).toBeLessThanOrEqual(SCAN_LIMIT * 3);
 
     // Lane B needs no join at all, and since migration 0209 its predicate is
     // index-restricted rather than filtered over the agent's queued rows. The
@@ -377,29 +389,10 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     expect(indexesUsed(laneIssues.root)).toContain("issues_pkey");
     expect(scanKinds(laneIssues.root)).not.toContain("Seq Scan");
 
-    // The property that actually matters, stated as an absolute: every lane the
-    // dispatcher issues is bounded by the AGENT'S QUEUE DEPTH and not by the
-    // company's issue count. TOTAL_ISSUES is 20k here and configurable up to
-    // 100k via BLO20396_ISSUES, so a lane that regressed to scanning issues
-    // fails this at either scale — which is the real acceptance criterion, and
-    // it holds no matter what the superseded query does.
-    //
-    // The multiplier is derived from the measured lane A plan, not picked:
-    // the runs side is an index scan of the agent's queued rows, the issues
-    // side is an index scan over the company's CRITICAL issues (one, here),
-    // and the nested loop then materialises that inner side once per outer row
-    // and discards the non-matches — so the queue-depth term is counted about
-    // three times over. Measured 1051, identical at 20k and 100k issues.
-    //
-    // Note what this does and does not claim. Lane A is O(agent queue depth),
-    // the same order as the dispatch scan beside it and independent of company
-    // size — but it is NOT O(SCAN_LIMIT): in the zero-match worst case measured
-    // here nothing lets the LIMIT stop the scan early.
-    const LANE_BOUND = AGENT_QUEUED_ROWS * 4;
-    expect(LANE_BOUND).toBeLessThan(TOTAL_ISSUES / 4);
-    expect(rowsInspected(laneCritical.root)).toBeLessThanOrEqual(LANE_BOUND);
-    expect(rowsInspected(laneRecovery.root)).toBeLessThanOrEqual(LANE_BOUND);
-    expect(rowsInspected(laneIssues.root)).toBeLessThanOrEqual(LANE_BOUND);
+    // The bound is stated independently of AGENT_QUEUED_ROWS. Growing the
+    // backlog therefore cannot make a single critical-lane query inspect more
+    // work while the start lock is held.
+    expect(SCAN_LIMIT * 3).toBeLessThan(TOTAL_ISSUES / 4);
   }, 900_000);
 
   /**
