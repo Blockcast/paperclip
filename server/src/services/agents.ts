@@ -968,7 +968,7 @@ export function agentService(db: Db) {
           approvedRuntimeConfig
             ? requestedRuntimeConfig
               ? mergeApprovedRuntimeConfig(existing.runtimeConfig, requestedRuntimeConfig, approvedRuntimeConfig)
-              : mergeRuntimeConfigPatch(existing.runtimeConfig, approvedRuntimeConfig)
+              : approvedRuntimeConfig
             : existing.runtimeConfig,
         );
         if (

@@ -396,6 +396,46 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     });
   });
 
+  it("keeps legacy approval runtime payloads as full replacements", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Legacy Approval Runtime Replacement",
+      status: "pending_approval",
+      adapterType: "opencode_k8s",
+      runtimeConfig: {
+        heartbeat: { enabled: true, wakeOnDemand: true, maxConcurrentRuns: 15 },
+      },
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      requestedByUserId: "requester",
+      payload: {
+        agentId,
+        name: "Legacy Approval Runtime Replacement",
+        role: "engineer",
+        adapterType: "opencode_k8s",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { enabled: true, maxConcurrentRuns: 15 } },
+        budgetMonthlyCents: 0,
+      },
+      updatedAt: new Date(),
+    });
+
+    await expect(approvalService(db).approve(approvalId, "board-user", "Approved")).resolves.toMatchObject({
+      applied: true,
+    });
+    await expect(agentService(db).getById(agentId)).resolves.toMatchObject({
+      status: "idle",
+      runtimeConfig: { heartbeat: { enabled: true, maxConcurrentRuns: 15 } },
+    });
+    const activated = await agentService(db).getById(agentId);
+    expect(activated?.runtimeConfig).not.toHaveProperty("heartbeat.wakeOnDemand");
+  });
+
   it("creates agent secret bindings when a new agent persists secret_ref env", async () => {
     const companyId = await seedCompany();
     const secrets = secretService(db);
