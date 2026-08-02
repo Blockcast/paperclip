@@ -790,7 +790,7 @@ export function normalizeExternalAdapter(adapter: string | null | undefined): st
  *
  * Buckets deliberately span the EXTERNAL_LIFECYCLE_STALE_MS (15m) /
  * EXTERNAL_LIFECYCLE_HARD_STALE_MS (45m) decision range with resolution where
- * it matters, so a `histogram_quantile` against the `completed` population can
+ * it matters, so a `histogram_quantile` against the `succeeded` population can
  * be compared directly against the 45m destructive-kill floor.
  */
 export const EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC = "paperclip_external_lifecycle_run_silence_gap_seconds";
@@ -798,6 +798,26 @@ export const EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC = "paperclip_external_lif
 export const EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_BUCKETS_SECONDS = [
   60, 300, 600, 900, 1200, 1800, 2700, 3600, 5400, 7200,
 ];
+
+/**
+ * Companion last-value gauge to {@link EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}
+ * (BLO-20815 review follow-up, Ally/gstack-review on PR #947): a classic
+ * Prometheus Histogram cannot expose an exact max — values above the last
+ * finite bucket collapse into `+Inf`, and the exported bucket/count/sum series
+ * retain no per-observation maximum. This gauge is set to the *last observed*
+ * silence-gap value per adapter/status on every {@link recordExternalLifecycleRunSilenceGap}
+ * call. Reset/window semantics: it is a plain last-write gauge with no reset
+ * or decay — the true rolling max is recovered at query time via
+ * `max_over_time(...[7d])`, which reads every scraped sample in the window
+ * (a process restart only affects samples *after* the restart; earlier peak
+ * samples already persisted in Prometheus TSDB are unaffected). The one
+ * accepted gap: two observations for the same adapter/status landing within a
+ * single scrape interval can have the smaller one overwritten before it is
+ * ever scraped — acceptable given external-lifecycle run finalizations are
+ * infrequent relative to the scrape interval.
+ */
+export const EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC =
+  "paperclip_external_lifecycle_run_silence_gap_seconds_last";
 
 /**
  * Bounded terminal-status allow-list for {@link EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}.
@@ -889,6 +909,7 @@ let externalRuntimeReservationOldestAge: Gauge | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let externalLifecycleRunSilenceGap: Histogram<"adapter" | "status"> | null = null;
+let externalLifecycleRunSilenceGapLast: Gauge<"adapter" | "status"> | null = null;
 let processLostLivenessNull: Counter | null = null;
 let orphanedManagedPodReaped: Counter<"adapter"> | null = null;
 let githubReviewRequestDelivery: Counter<"state" | "reason"> | null = null;
@@ -912,6 +933,7 @@ function ensureRegistry(): {
   processLostTotalCounter: Counter<"adapter" | "error_bucket" | "classification">;
   externalLifecycleRunningRunsGauge: Gauge<"adapter">;
   externalLifecycleRunSilenceGapHistogram: Histogram<"adapter" | "status">;
+  externalLifecycleRunSilenceGapLastGauge: Gauge<"adapter" | "status">;
   processLostLivenessNullCounter: Counter;
   orphanedManagedPodReapedCounter: Counter<"adapter">;
   githubReviewRequestDeliveryCounter: Counter<"state" | "reason">;
@@ -935,6 +957,7 @@ function ensureRegistry(): {
     || !processLostTotal
     || !externalLifecycleRunningRuns
     || !externalLifecycleRunSilenceGap
+    || !externalLifecycleRunSilenceGapLast
     || !processLostLivenessNull
     || !orphanedManagedPodReaped
     || !githubReviewRequestDelivery
@@ -1045,6 +1068,17 @@ function ensureRegistry(): {
         + "kill floor leaves a safe margin.",
       labelNames: ["adapter", "status"],
       buckets: EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_BUCKETS_SECONDS,
+      registers: [registry],
+    });
+    externalLifecycleRunSilenceGapLast = new Gauge({
+      name: EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC,
+      help:
+        "Last-observed silence-gap seconds per adapter/status, companion to "
+        + EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC + " (BLO-20815): a classic "
+        + "Histogram cannot expose an exact max (values above the last finite "
+        + "bucket collapse into +Inf). Read the true rolling max via "
+        + "max_over_time(...[7d]) against this gauge instead.",
+      labelNames: ["adapter", "status"],
       registers: [registry],
     });
     processLostLivenessNull = new Counter({
@@ -1253,6 +1287,7 @@ function ensureRegistry(): {
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     externalLifecycleRunSilenceGapHistogram: externalLifecycleRunSilenceGap,
+    externalLifecycleRunSilenceGapLastGauge: externalLifecycleRunSilenceGapLast,
     processLostLivenessNullCounter: processLostLivenessNull,
     orphanedManagedPodReapedCounter: orphanedManagedPodReaped,
     githubReviewRequestDeliveryCounter: githubReviewRequestDelivery,
@@ -1487,6 +1522,11 @@ export function setExternalLifecycleRunningRuns(byAdapter: Record<string, number
  * signal timestamp at all — a queued/scheduled_retry run cancelled before it
  * ever started has no meaningful silence gap to report. Otherwise returns the
  * normalized labels and the observed value (useful for logging/tests).
+ *
+ * Also updates {@link EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC}, the
+ * last-value companion gauge that makes the population max queryable via
+ * `max_over_time(...[7d])` (the histogram alone cannot answer that — see the
+ * gauge's own doc comment).
  */
 export function recordExternalLifecycleRunSilenceGap(input: {
   adapter: string | null | undefined;
@@ -1500,9 +1540,12 @@ export function recordExternalLifecycleRunSilenceGap(input: {
     adapter: normalizeExternalAdapter(input.adapter),
     status: normalizeExternalLifecycleTerminalStatus(input.status),
   };
-  ensureRegistry().externalLifecycleRunSilenceGapHistogram.observe(labels, silenceGapSeconds);
+  const registered = ensureRegistry();
+  registered.externalLifecycleRunSilenceGapHistogram.observe(labels, silenceGapSeconds);
+  registered.externalLifecycleRunSilenceGapLastGauge.set(labels, silenceGapSeconds);
   return { ...labels, silenceGapSeconds };
 }
+
 
 /** Record one reap cycle that was blind to kube (BLO-16184 denominator #2). */
 export function recordProcessLostLivenessNull(): void {
@@ -1739,6 +1782,7 @@ export function __resetMetricsForTest(): void {
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;
+  externalLifecycleRunSilenceGapLast = null;
   processLostLivenessNull = null;
   orphanedManagedPodReaped = null;
   githubReviewRequestDelivery = null;
