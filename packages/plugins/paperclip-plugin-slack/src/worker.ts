@@ -828,18 +828,122 @@ async function validateSlackConfig(
   return { ok: errors.length === 0, warnings, errors };
 }
 
-// Resolves the token a scheduled job should post with. Job handlers are
-// registered unconditionally in setup() (BLO-20959) so credential resolution
-// can't gate registration itself; this is the per-tick guard that keeps a
-// job from running with no token, warning once instead of throwing.
-function requireSlackToken(jobKey: string): string | null {
-  if (!pluginToken) {
-    pluginCtx.logger.warn(
-      `Slack job "${jobKey}" skipped — plugin not configured (missing slackTokenRef)`,
+/**
+ * Is the daily digest enabled for this company?
+ *
+ * Answered from the company's own config row for the same reason
+ * `resolveCompanyJobScope` does: the `setup()` snapshot is always `{}`, so the
+ * old `if (config.enableDailyDigest)` gate around the listener registration was
+ * never true and the digest could only ever report 0.00.
+ *
+ * `cost_event.created` is high-frequency, so the answer is cached per company
+ * for `DIGEST_FLAG_TTL_MS`. That bounds config RPCs to one per company per
+ * minute while still keeping cost state out of companies that have the digest
+ * switched off. A config change takes effect within the TTL.
+ */
+const DIGEST_FLAG_TTL_MS = 60_000;
+const digestEnabledCache = new Map<
+  string,
+  { value: boolean; expiresAt: number }
+>();
+
+async function isDailyDigestEnabled(
+  ctx: PluginContext,
+  companyId: string,
+): Promise<boolean> {
+  const cached = digestEnabledCache.get(companyId);
+  const now = Date.now();
+  if (cached && cached.expiresAt > now) return cached.value;
+  let value = false;
+  try {
+    const raw = await ctx.config.get(companyId);
+    value = Boolean(
+      (raw as unknown as SlackPluginConfig | null)?.enableDailyDigest,
+    );
+  } catch (err) {
+    // Treat an unreadable config as "off" rather than accumulating state we
+    // may never use; retried after the TTL.
+    ctx.logger.debug("Could not read digest flag for company", {
+      companyId,
+      err,
+    });
+  }
+  digestEnabledCache.set(companyId, {
+    value,
+    expiresAt: now + DIGEST_FLAG_TTL_MS,
+  });
+  return value;
+}
+
+export interface CompanyJobScope {
+  config: SlackPluginConfig;
+  token: string;
+}
+
+/**
+ * Resolve the config + bot token a scheduled job should use for one company.
+ *
+ * Deliberately does NOT read the `setup()` snapshot. `plugin-loader.ts` builds
+ * the worker's bootstrap config as a literal `{}` ("Plugin configuration is
+ * company-scoped. Workers receive an empty bootstrap config and must use
+ * ctx.config.get(companyId) at runtime"), so the snapshot never carries a
+ * `slackTokenRef` and `setup()` can never populate a module-level token. A job
+ * that trusted that snapshot would no-op forever on every install — registered
+ * but permanently inert, which is a quieter version of the same outage
+ * BLO-20959 reported. This mirrors the per-delivery resolution BLO-20467 landed
+ * for paperclip-plugin-alertmanager (`config-scope.ts`).
+ *
+ * Returns `null` — never throws — so one company's bad config cannot abort the
+ * tick for the others in the loop. Log level is graded by whether an operator
+ * needs to act: a company that simply does not use Slack is `debug`, an actual
+ * misconfiguration or a failed secret resolution is `warn`.
+ */
+async function resolveCompanyJobScope(
+  ctx: PluginContext,
+  companyId: string,
+  jobKey: string,
+): Promise<CompanyJobScope | null> {
+  let raw: Record<string, unknown> | null | undefined;
+  try {
+    raw = await ctx.config.get(companyId);
+  } catch (err) {
+    ctx.logger.warn(
+      `Slack job "${jobKey}" skipped for company ${companyId} — could not load config`,
+      { err },
     );
     return null;
   }
-  return pluginToken;
+  if (!raw || Object.keys(raw).length === 0) {
+    // Expected steady state for any company that has not installed Slack.
+    ctx.logger.debug(
+      `Slack job "${jobKey}" skipped for company ${companyId} — no stored config`,
+    );
+    return null;
+  }
+  const config = raw as unknown as SlackPluginConfig;
+  if (!config.slackTokenRef) {
+    ctx.logger.warn(
+      `Slack job "${jobKey}" skipped for company ${companyId} — config has no slackTokenRef`,
+    );
+    return null;
+  }
+  let token: string;
+  try {
+    token = await ctx.secrets.resolve(config.slackTokenRef, { companyId });
+  } catch (err) {
+    ctx.logger.warn(
+      `Slack job "${jobKey}" skipped for company ${companyId} — could not resolve slackTokenRef`,
+      { err },
+    );
+    return null;
+  }
+  if (!token) {
+    ctx.logger.warn(
+      `Slack job "${jobKey}" skipped for company ${companyId} — slackTokenRef resolved to an empty value`,
+    );
+    return null;
+  }
+  return { config, token };
 }
 
 // --- Plugin definition ---
@@ -858,19 +962,26 @@ const plugin = definePlugin({
     // =========================================================================
     // Registered unconditionally, before the slackTokenRef check below, so a
     // worker start with an unresolved config still leaves the scheduler with
-    // a handler for every jobKey in manifest.ts (BLO-20959). Each handler
-    // resolves its own token via requireSlackToken() and no-ops with a warn
-    // when the plugin isn't configured, rather than vanishing.
-    // Daily digest. Gate the work on `enableDailyDigest` inside the handler.
-    // Without this, instances that leave `enableDailyDigest` at its default
-    // (false) log a "No handler registered for job 'daily-digest'" error
-    // every day.
+    // a handler for every jobKey in manifest.ts (BLO-20959).
+    //
+    // Registration alone is not enough to make a job *work*: the `config` in
+    // scope here is the setup() snapshot, which the host always builds as `{}`.
+    // Each handler therefore resolves the delivering company's own config and
+    // token via resolveCompanyJobScope() on every tick, and skips just that
+    // company when it has none — rather than reading a module-level token that
+    // nothing on this path can ever populate.
     ctx.jobs.register("daily-digest", async () => {
-      if (!config.enableDailyDigest) return;
-      const token = requireSlackToken("daily-digest");
-      if (!token) return;
       const companies = await listTargetCompanies(ctx);
+      let posted = false;
       for (const company of companies) {
+        const scope = await resolveCompanyJobScope(
+          ctx,
+          company.id,
+          "daily-digest",
+        );
+        if (!scope) continue;
+        const { config, token } = scope;
+        if (!config.enableDailyDigest) continue;
         const channelId = await resolveChannel(
           ctx,
           company.id,
@@ -937,6 +1048,7 @@ const plugin = definePlugin({
             topAgent,
           }),
         );
+        posted = true;
         // Clean up previous day's cost state
         const yesterday = new Date(now.getTime() - 86400000)
           .toISOString()
@@ -952,59 +1064,68 @@ const plugin = definePlugin({
           stateKey: STATE_KEYS.dailyAgentCosts(yesterday),
         });
       }
-      ctx.logger.info("Daily digest posted to Slack");
-      await ctx.metrics.write("slack.digest.sent", 1);
+      if (posted) {
+        ctx.logger.info("Daily digest posted to Slack");
+        await ctx.metrics.write("slack.digest.sent", 1);
+      }
     });
-    if (config.enableDailyDigest) {
-      // Accumulate costs
-      ctx.events.on("cost_event.created", async (event) => {
-        const payload = event.payload as Record<string, unknown>;
-        const cost = Number(payload.cost ?? 0);
-        if (cost <= 0) return;
-        const dateKey = new Date().toISOString().slice(0, 10);
-        const currentTotal = await ctx.state.get({
+    // Accumulate costs for the daily digest. Registered unconditionally — the
+    // old `if (config.enableDailyDigest)` gate read the always-empty setup
+    // snapshot, so it never fired and the digest had no data to report. The
+    // per-company flag is checked inside instead (cached; see
+    // isDailyDigestEnabled), so no state is written for companies that have
+    // the digest switched off.
+    ctx.events.on("cost_event.created", async (event) => {
+      const payload = event.payload as Record<string, unknown>;
+      const cost = Number(payload.cost ?? 0);
+      if (cost <= 0) return;
+      if (!(await isDailyDigestEnabled(ctx, event.companyId))) return;
+      const dateKey = new Date().toISOString().slice(0, 10);
+      const currentTotal = await ctx.state.get({
+        scopeKind: "company",
+        scopeId: event.companyId,
+        stateKey: STATE_KEYS.dailyCost(dateKey),
+      });
+      await ctx.state.set(
+        {
           scopeKind: "company",
           scopeId: event.companyId,
           stateKey: STATE_KEYS.dailyCost(dateKey),
-        });
-        await ctx.state.set(
-          {
-            scopeKind: "company",
-            scopeId: event.companyId,
-            stateKey: STATE_KEYS.dailyCost(dateKey),
-          },
-          ((currentTotal as number | null) ?? 0) + cost,
-        );
-        const agentName = String(
-          payload.agentName ?? payload.name ?? event.entityId,
-        );
-        const agentCosts = await ctx.state.get({
+        },
+        ((currentTotal as number | null) ?? 0) + cost,
+      );
+      const agentName = String(
+        payload.agentName ?? payload.name ?? event.entityId,
+      );
+      const agentCosts = await ctx.state.get({
+        scopeKind: "company",
+        scopeId: event.companyId,
+        stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
+      });
+      const costs = (agentCosts as Record<string, number> | null) ?? {};
+      costs[agentName] = (costs[agentName] ?? 0) + cost;
+      await ctx.state.set(
+        {
           scopeKind: "company",
           scopeId: event.companyId,
           stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
-        });
-        const costs =
-          (agentCosts as Record<string, number> | null) ?? {};
-        costs[agentName] = (costs[agentName] ?? 0) + cost;
-        await ctx.state.set(
-          {
-            scopeKind: "company",
-            scopeId: event.companyId,
-            stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
-          },
-          costs,
-        );
-      });
-      ctx.logger.info("Daily digest job registered (9am daily)");
-    }
+        },
+        costs,
+      );
+    });
     // Escalation timeout job
     ctx.jobs.register("check-escalation-timeouts", async () => {
-      const token = requireSlackToken("check-escalation-timeouts");
-      if (!token) return;
       const companies = await listTargetCompanies(ctx);
-      const timeoutMs = config.escalationTimeoutMs ?? 900000;
       const now = Date.now();
       for (const company of companies) {
+        const scope = await resolveCompanyJobScope(
+          ctx,
+          company.id,
+          "check-escalation-timeouts",
+        );
+        if (!scope) continue;
+        const { config, token } = scope;
+        const timeoutMs = config.escalationTimeoutMs ?? 900000;
         const openEscalationsRaw = await ctx.state.get({
           scopeKind: "company",
           scopeId: company.id,
@@ -1079,10 +1200,15 @@ const plugin = definePlugin({
     });
     // Phase 5: Check watches job
     ctx.jobs.register("check-watches", async () => {
-      const token = requireSlackToken("check-watches");
-      if (!token) return;
       const companies = await listTargetCompanies(ctx);
       for (const company of companies) {
+        const scope = await resolveCompanyJobScope(
+          ctx,
+          company.id,
+          "check-watches",
+        );
+        if (!scope) continue;
+        const { token } = scope;
         // Get recent events from state (populated by event listeners below)
         const recentEventsRaw = await ctx.state.get({
           scopeKind: "company",
@@ -1113,10 +1239,15 @@ const plugin = definePlugin({
     // elapsed (BLO-8861 two-phase resolve). Backstop for reactors who add ✅/❌
     // and never remove it; durable across worker restarts via the pending index.
     ctx.jobs.register("commit-pending-approvals", async () => {
-      const token = requireSlackToken("commit-pending-approvals");
-      if (!token) return;
       const companies = await listTargetCompanies(ctx);
       for (const company of companies) {
+        const scope = await resolveCompanyJobScope(
+          ctx,
+          company.id,
+          "commit-pending-approvals",
+        );
+        if (!scope) continue;
+        const { config, token } = scope;
         try {
           const { committed } = await commitDuePendingApprovals(ctx, token, {
             companyId: company.id,
@@ -1141,7 +1272,21 @@ const plugin = definePlugin({
       ctx.logger.warn("No slackTokenRef configured, notifications disabled");
       return;
     }
-    const token = await ctx.secrets.resolve(config.slackTokenRef);
+    // Guarded: an unhandled rejection here would reject setup() itself, which
+    // on a retry-capable host can leave the worker failed rather than running
+    // with the handlers registered above. Degrade to "no interactive surface"
+    // instead — the scheduled jobs resolve their own credentials per company
+    // and keep working regardless of what happens on this path.
+    let token: string;
+    try {
+      token = await ctx.secrets.resolve(config.slackTokenRef);
+    } catch (err) {
+      ctx.logger.warn(
+        "Could not resolve slackTokenRef — tools and webhooks disabled; scheduled jobs continue with per-company credentials",
+        { err },
+      );
+      return;
+    }
     pluginToken = token;
     // Resolve Slack signing secret for webhook signature verification
     if (config.slackSigningSecretRef) {
