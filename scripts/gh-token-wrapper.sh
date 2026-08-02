@@ -46,12 +46,17 @@ REAL_GH="${GH_TOKEN_WRAPPER_REAL_GH:-/usr/bin/gh.real}"
 #
 # Precedence: value > file. Both are *explicit caller selections* of an identity
 # for one invocation — the same trust model the FILE variable already had, since
-# a caller could always point that at a file it wrote. Note the widened reach
-# that follows from the rename: a non-`PAPERCLIP_` key can now be set from
-# project/environment/routine env, not just agent scope. That is a downgrade
-# vector, not an escalation one — it can only swap in a credential the setter
-# already holds, never read the mounted one — but it does mean `gh` identity
-# selection is only as tight as write access to those env scopes.
+# a caller could always point that at a file it wrote.
+#
+# Dropping the `PAPERCLIP_` prefix would otherwise have widened who can set this
+# key: environment/project/routine env are overlaid *after* agent-scope
+# resolution, so the lowest-trust writer would win and could swap the identity
+# `gh` runs as, or park whitespace here and fail every invocation with exit 64.
+# The prefix used to prevent that for free. It is now prevented explicitly
+# instead: AGENT_SCOPE_ONLY_ENV_KEYS in server/src/services/heartbeat.ts strips
+# this key from environment, project and routine env, so only an agent-scoped
+# secret binding can set it. Keep those two in sync — renaming here without
+# renaming there silently reopens the hole.
 #
 # This is deliberately NOT GH_TOKEN: the override below must keep clobbering
 # GH_TOKEN unconditionally (BLO-13241), so GH_TOKEN cannot double as an input
