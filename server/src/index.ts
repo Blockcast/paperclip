@@ -67,7 +67,11 @@ import { createApiTierPluginWorkerManagerStub } from "./services/plugin-worker-m
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
-import { logShutdownSignal, writeShutdownBreadcrumb } from "./shutdown-log.js";
+import {
+  logShutdownSignal,
+  writeShutdownBreadcrumb,
+  writeShutdownBreadcrumbsBounded,
+} from "./shutdown-log.js";
 import { installProcessCrashGuard } from "./process-crash-guard.js";
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 import { plugins } from "@paperclipai/db";
@@ -1768,7 +1772,7 @@ export async function startServer(): Promise<StartedServer> {
         }
       }
 
-      writeShutdownBreadcrumb(`handler complete; exiting (signal=${signal})`);
+      await writeShutdownBreadcrumbsBounded([`handler complete; exiting (signal=${signal})`]);
       logger.info({ signal }, "Shutdown handler complete; exiting");
 
       // Flush pino's async buffer before process.exit. Otherwise the trailing

@@ -11,18 +11,27 @@
  *           stack breadcrumb, past the 64 KB pipe buffer. Real postgres errors
  *           embed query text and get large; padding makes the pressure
  *           deterministic instead of hoping a stack is big enough.
+ * argv[4] — "prefill-stderr" fills the pipe first and reports observed stream
+ *           backpressure on stdout before triggering the crash.
  */
 
 import { installProcessCrashGuard } from "../../process-crash-guard.js";
 
 const kind = process.argv[2] ?? "throw";
 const padBytes = Number(process.argv[3] ?? 0);
+const prefillStderr = process.argv[4] === "prefill-stderr";
 
 // A silent logger keeps stderr to breadcrumbs only, so the assertions pin the
 // synchronous path rather than incidental pino output.
 installProcessCrashGuard({
   logger: { error: () => {}, flush: () => {} },
 });
+
+if (prefillStderr) {
+  const accepted = process.stderr.write("P".repeat(200_000));
+  if (accepted) throw new Error("stderr did not report backpressure");
+  process.stdout.write("BACKPRESSURE\n");
+}
 
 const message = `BOOM_SENTINEL${padBytes > 0 ? ` ${"P".repeat(padBytes)}` : ""}`;
 

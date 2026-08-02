@@ -62,21 +62,38 @@ function runFixture(kind: "throw" | "reject", padBytes: number): Promise<CrashRe
 
 function runFixtureWithStalledStderr(): Promise<StalledCrashResult> {
   return new Promise((resolve, reject) => {
-    const startedAt = Date.now();
-    const child = spawn(tsx, [fixture, "throw", String(PIPE_PRESSURE_BYTES)], {
-      stdio: ["ignore", "ignore", "pipe"],
+    const child = spawn(tsx, [fixture, "throw", "0", "prefill-stderr"], {
+      stdio: ["ignore", "pipe", "pipe"],
     });
     child.stderr.pause();
 
-    const watchdog = setTimeout(() => {
+    let startedAt: number | undefined;
+    let watchdog: NodeJS.Timeout | undefined;
+    const startupWatchdog = setTimeout(() => {
       child.kill("SIGKILL");
-      reject(new Error("crash guard did not exit while stderr was stalled"));
+      reject(new Error("fixture did not observe stderr backpressure"));
     }, 2_000);
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      if (startedAt !== undefined || !chunk.includes("BACKPRESSURE")) return;
+      clearTimeout(startupWatchdog);
+      startedAt = Date.now();
+      watchdog = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error("crash guard did not exit while stderr was stalled"));
+      }, 2_000);
+    });
 
     child.on("error", reject);
     child.on("exit", (code) => {
-      clearTimeout(watchdog);
+      clearTimeout(startupWatchdog);
+      if (watchdog) clearTimeout(watchdog);
       child.stderr.destroy();
+      if (startedAt === undefined) {
+        reject(new Error("fixture exited before reporting stderr backpressure"));
+        return;
+      }
       resolve({ code, elapsedMs: Date.now() - startedAt });
     });
   });
