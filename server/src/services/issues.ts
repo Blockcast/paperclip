@@ -7852,11 +7852,12 @@ export function issueService(db: Db) {
       // statement or transaction) and validated its status before deciding to mutate
       // has no guarantee that status is still current by the time this runs -- any
       // non-lock-holding writer (a human reviewer's PATCH, a different code path) can
-      // land in between. `expectedStatus` folds that check into the UPDATE's WHERE
-      // clause so the write is atomic: if the row's status has moved on, zero rows
-      // match, the update is a no-op, and this returns null exactly like "row missing"
-      // does today -- instead of unconditionally overwriting whatever the row now says.
-      options?: { expectedStatus?: string[] },
+      // land in between. `expectedStatus` and `expectedUpdatedAt` fold those checks
+      // into the UPDATE's WHERE clause so the write is atomic: if the row's status or
+      // freshness marker has moved on, zero rows match, the update is a no-op, and this
+      // returns null exactly like "row missing" does today -- instead of
+      // unconditionally overwriting whatever the row now says.
+      options?: { expectedStatus?: string[]; expectedUpdatedAt?: Date },
     ) => {
       const existing = await dbOrTx
         .select()
@@ -8131,14 +8132,18 @@ export function issueService(db: Db) {
           projectGoalId: nextProjectGoalId,
           defaultGoalId: defaultCompanyGoal?.id ?? null,
         });
+        const expectedPredicates = [eq(issues.id, id)];
+        if (options?.expectedStatus) {
+          expectedPredicates.push(inArray(issues.status, options.expectedStatus));
+        }
+        if (options?.expectedUpdatedAt) {
+          expectedPredicates.push(eq(issues.updatedAt, options.expectedUpdatedAt));
+        }
+
         const updated = await tx
           .update(issues)
           .set(patch)
-          .where(
-            options?.expectedStatus
-              ? and(eq(issues.id, id), inArray(issues.status, options.expectedStatus))
-              : eq(issues.id, id),
-          )
+          .where(and(...expectedPredicates))
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;

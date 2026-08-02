@@ -3810,6 +3810,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }) {
     try {
       const run = await deps.enqueueWakeup(input.agentId, input.opts);
+      if (!run) {
+        logger.warn(
+          { agentId: input.agentId, outboxRowId: input.outboxRowId },
+          "stranded recovery wake dispatch returned no run; left durable for reconcileFailedWakeDispatches",
+        );
+        return null;
+      }
       const now = new Date();
       await db
         .update(agentWakeupRequests)
@@ -4756,7 +4763,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         // Pinning to `fresh.status` keeps the steady-state retry working (a reread
         // that already found `blocked` expects `blocked`) while rejecting a
         // transition into `blocked` that lands after the reread.
-        { expectedStatus: [fresh.status] },
+        //
+        // Ally follow-up: status alone is not enough. A concurrent writer can keep
+        // the same status while changing blockers or ownership, so include the
+        // observed freshness marker too.
+        { expectedStatus: [fresh.status], expectedUpdatedAt: fresh.updatedAt },
       );
       // BLO-18829: throw rather than `return null`. Returning would COMMIT the
       // transaction, which is exactly the bug: the recovery action, monitor, and wake
@@ -4792,46 +4803,42 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const { fresh, action, isProviderQuotaWait, recoveryCause, blockerIds, needsHumanDecision } =
       postCommitNotifications;
 
-    if (!isProviderQuotaWait) {
-      const prefix = await getCompanyIssuePrefix(fresh.companyId);
-      const recoveryOwner = action.ownerAgentId ? await getAgent(action.ownerAgentId) : null;
-      const sourceAssignee = fresh.assigneeAgentId ? await getAgent(fresh.assigneeAgentId) : null;
-      let notice: SuccessfulRunHandoffNotice | null = null;
-      if (recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON && input.successfulRunHandoffEvidence) {
-        notice = buildSuccessfulRunHandoffExhaustedNotice({
-          issue: fresh,
-          sourceRun: input.successfulRunHandoffEvidence.sourceRunId
-            ? { id: input.successfulRunHandoffEvidence.sourceRunId, status: "succeeded" }
-            : null,
-          correctiveRun: input.latestRun ? { id: input.latestRun.id, status: input.latestRun.status } : null,
-          sourceAssignee,
-          recoveryIssue: null,
-          recoveryActionId: action.id,
-          recoveryOwner,
-          latestIssueStatus: fresh.status,
-          latestHandoffRunStatus: input.latestRun?.status ?? "unknown",
-          missingDisposition: input.successfulRunHandoffEvidence.missingDisposition,
-        });
-      }
-      const recoveryLine = action.ownerAgentId
-        ? [
-          "",
-          `- Recovery action: \`${action.id}\``,
-          `- Recovery owner: ${agentUiLink(recoveryOwner, prefix)}`,
-          "- Next action: the recovery owner should restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
-        ].join("\n")
-        : [
-          "",
-          `- Recovery action: \`${action.id}\``,
-          "- Recovery owner: board escalation, because Paperclip could not find an invokable manager, creator, or executive owner with budget available.",
-          "- Next action: a board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
-        ].join("\n");
+    try {
+      if (!isProviderQuotaWait) {
+        const prefix = await getCompanyIssuePrefix(fresh.companyId);
+        const recoveryOwner = action.ownerAgentId ? await getAgent(action.ownerAgentId) : null;
+        const sourceAssignee = fresh.assigneeAgentId ? await getAgent(fresh.assigneeAgentId) : null;
+        let notice: SuccessfulRunHandoffNotice | null = null;
+        if (recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON && input.successfulRunHandoffEvidence) {
+          notice = buildSuccessfulRunHandoffExhaustedNotice({
+            issue: fresh,
+            sourceRun: input.successfulRunHandoffEvidence.sourceRunId
+              ? { id: input.successfulRunHandoffEvidence.sourceRunId, status: "succeeded" }
+              : null,
+            correctiveRun: input.latestRun ? { id: input.latestRun.id, status: input.latestRun.status } : null,
+            sourceAssignee,
+            recoveryIssue: null,
+            recoveryActionId: action.id,
+            recoveryOwner,
+            latestIssueStatus: fresh.status,
+            latestHandoffRunStatus: input.latestRun?.status ?? "unknown",
+            missingDisposition: input.successfulRunHandoffEvidence.missingDisposition,
+          });
+        }
+        const recoveryLine = action.ownerAgentId
+          ? [
+            "",
+            `- Recovery action: \`${action.id}\``,
+            `- Recovery owner: ${agentUiLink(recoveryOwner, prefix)}`,
+            "- Next action: the recovery owner should restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
+          ].join("\n")
+          : [
+            "",
+            `- Recovery action: \`${action.id}\``,
+            "- Recovery owner: board escalation, because Paperclip could not find an invokable manager, creator, or executive owner with budget available.",
+            "- Next action: a board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
+          ].join("\n");
 
-      const shouldPostEscalationComment =
-        action.attemptCount === 1 ||
-        recoveryCause === "workspace_validation_failed" ||
-        recoveryCause === "configuration_incomplete";
-      if (shouldPostEscalationComment) {
         const escalationCommentMarker = `Recovery action: \`${action.id}\``;
         const hasEscalationComment = await db
           .select({ id: issueComments.id, body: issueComments.body, metadata: issueComments.metadata })
@@ -4846,7 +4853,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             ),
           );
 
-        if (!hasEscalationComment) {
+        const shouldPostEscalationComment =
+          !hasEscalationComment &&
+          (
+            action.attemptCount === 1 ||
+            recoveryCause === "workspace_validation_failed" ||
+            recoveryCause === "configuration_incomplete" ||
+            action.attemptCount > 1
+          );
+        if (shouldPostEscalationComment) {
           if (notice) {
             await issuesSvc.addComment(fresh.id, notice.body, {}, {
               authorType: "system",
@@ -4862,60 +4877,65 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             );
           }
         }
-      }
 
-      await logActivity(db, {
-        companyId: fresh.companyId,
-        actorType: "system",
-        actorId: "system",
-        agentId: null,
-        runId: null,
-        action: recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
-          ? "issue.successful_run_handoff_escalated"
-          : "issue.updated",
-        entityType: "issue",
-        entityId: fresh.id,
-        details: {
-          identifier: fresh.identifier,
-          status: "blocked",
-          previousStatus: input.previousStatus,
-          source: recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
-            ? "recovery.reconcile_successful_run_handoff_missing_state"
-            : recoveryCause === "workspace_validation_failed"
-              ? "recovery.reconcile_workspace_validation_failed"
-              : recoveryCause === "configuration_incomplete"
-                ? "recovery.reconcile_configuration_incomplete"
-                : recoveryCause === "execution_review_participant_recovery"
-                  ? "recovery.reconcile_execution_review_participant"
-              : "recovery.reconcile_stranded_assigned_issue",
-          recoveryCause,
-          latestRunId: input.latestRun?.id ?? null,
-          latestRunStatus: input.latestRun?.status ?? null,
-          latestRunErrorCode: input.latestRun?.errorCode ?? null,
-          recoveryActionId: action.id,
-          recoveryActionAttemptCount: action.attemptCount,
-          recoveryOwnerAgentId: action.ownerAgentId,
-          previousOwnerAgentId: action.previousOwnerAgentId,
-          returnOwnerAgentId: action.returnOwnerAgentId,
-          blockerIssueIds: blockerIds,
-        },
-      });
-
-      if (needsHumanDecision) {
-        const assigneeAgent = fresh.assigneeAgentId
-          ? await db
-            .select({ name: agents.name })
-            .from(agents)
-            .where(and(eq(agents.companyId, fresh.companyId), eq(agents.id, fresh.assigneeAgentId)))
-            .limit(1)
-            .then((rows) => rows[0] ?? null)
-          : null;
-        await emitNeedsHumanDecisionEscalationEvent({
-          issue: fresh,
-          assigneeAgentName: assigneeAgent?.name ?? null,
-          blockedByIssueIds: blockerIds,
+        await logActivity(db, {
+          companyId: fresh.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: null,
+          action: recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
+            ? "issue.successful_run_handoff_escalated"
+            : "issue.updated",
+          entityType: "issue",
+          entityId: fresh.id,
+          details: {
+            identifier: fresh.identifier,
+            status: "blocked",
+            previousStatus: input.previousStatus,
+            source: recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
+              ? "recovery.reconcile_successful_run_handoff_missing_state"
+              : recoveryCause === "workspace_validation_failed"
+                ? "recovery.reconcile_workspace_validation_failed"
+                : recoveryCause === "configuration_incomplete"
+                  ? "recovery.reconcile_configuration_incomplete"
+                  : recoveryCause === "execution_review_participant_recovery"
+                    ? "recovery.reconcile_execution_review_participant"
+                : "recovery.reconcile_stranded_assigned_issue",
+            recoveryCause,
+            latestRunId: input.latestRun?.id ?? null,
+            latestRunStatus: input.latestRun?.status ?? null,
+            latestRunErrorCode: input.latestRun?.errorCode ?? null,
+            recoveryActionId: action.id,
+            recoveryActionAttemptCount: action.attemptCount,
+            recoveryOwnerAgentId: action.ownerAgentId,
+            previousOwnerAgentId: action.previousOwnerAgentId,
+            returnOwnerAgentId: action.returnOwnerAgentId,
+            blockerIssueIds: blockerIds,
+          },
         });
+
+        if (needsHumanDecision) {
+          const assigneeAgent = fresh.assigneeAgentId
+            ? await db
+              .select({ name: agents.name })
+              .from(agents)
+              .where(and(eq(agents.companyId, fresh.companyId), eq(agents.id, fresh.assigneeAgentId)))
+              .limit(1)
+              .then((rows) => rows[0] ?? null)
+            : null;
+          await emitNeedsHumanDecisionEscalationEvent({
+            issue: fresh,
+            assigneeAgentName: assigneeAgent?.name ?? null,
+            blockedByIssueIds: blockerIds,
+          });
+        }
       }
+    } catch (err) {
+      logger.warn(
+        { err, issueId: fresh.id, recoveryActionId: action.id },
+        "stranded recovery post-commit notification failed; wake dispatch will still run",
+      );
     }
 
     // The escalation is durable, and the outbox row means the wake is owed even if this

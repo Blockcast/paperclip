@@ -1270,6 +1270,38 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(dispatchRetry?.originalOpts).toMatchObject({ reason: "source_scoped_recovery_action" });
   });
 
+  it("BLO-18829: a null post-commit wake dispatch leaves the outbox row retryable", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const escalation = await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      },
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    expect(escalation?.status).toBe("blocked");
+    expect(enqueueWakeup).toHaveBeenCalled();
+
+    const wakeRows = await db.select().from(agentWakeupRequests);
+    expect(wakeRows).toHaveLength(1);
+    expect(wakeRows[0]?.status).toBe("dispatch_failed");
+    expect(wakeRows[0]?.finishedAt).toBeNull();
+  });
+
   it("does not create nested recovery artifacts when issue-backed fallback work itself fails", async () => {
     const { companyId, managerId, sourceIssueId, prefix } = await seedCompany();
     const recoveryIssueId = randomUUID();
