@@ -3088,6 +3088,58 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     );
     expect(steadyState?.status).toBe("blocked");
   });
+
+  it("update() with expectedUpdatedAt rejects a same-status write after any intervening mutation", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Same-status stale snapshot",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      updatedAt: new Date("2026-07-30T12:00:00.000Z"),
+    });
+    const observed = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+
+    await db
+      .update(issues)
+      .set({
+        title: "Human changed ownership context",
+        updatedAt: new Date("2026-07-30T12:00:01.000Z"),
+      })
+      .where(eq(issues.id, issueId));
+
+    const result = await svc.update(
+      issueId,
+      { status: "blocked", title: "Recovery stale write" },
+      db,
+      { expectedStatus: ["blocked"], expectedUpdatedAt: observed.updatedAt },
+    );
+    expect(result).toBeNull();
+
+    const after = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(after.title).toBe("Human changed ownership context");
+  });
 });
 
 describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
