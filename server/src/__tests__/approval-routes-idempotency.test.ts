@@ -132,10 +132,15 @@ describe("approval routes idempotent retries", () => {
     // args the route builds — keep working unchanged, and tests that exercise a replay
     // override this implementation.
     mockApprovalService.createWithIdempotency.mockImplementation(
-      async (companyId: string, data: Record<string, unknown>) => ({
-        approval: await mockApprovalService.create(companyId, data),
-        deduplicated: false,
-      }),
+      async (
+        companyId: string,
+        data: Record<string, unknown>,
+        options?: { afterCreate?: (txDb: unknown, approval: Record<string, unknown>) => Promise<void> },
+      ) => {
+        const approval = await mockApprovalService.create(companyId, data);
+        await options?.afterCreate?.({ tx: true }, approval);
+        return { approval, deduplicated: false };
+      },
     );
     mockApprovalService.approve.mockReset();
     mockApprovalService.reject.mockReset();
@@ -481,12 +486,12 @@ describe("approval routes idempotent retries", () => {
     );
   });
 
-  it("honours a body-supplied requestedByAgentId from a user actor", async () => {
+  it("ignores a body-supplied requestedByAgentId from a user actor", async () => {
     mockApprovalService.create.mockResolvedValue({
       id: "approval-attr-user",
       companyId: "company-1",
       type: "request_board_approval",
-      requestedByAgentId: "00000000-0000-0000-0000-0000000000ff",
+      requestedByAgentId: null,
       requestedByUserId: "user-1",
       status: "pending",
       payload: { title: "Approve hosting spend" },
@@ -509,7 +514,7 @@ describe("approval routes idempotent retries", () => {
     expect(mockApprovalService.create).toHaveBeenCalledWith(
       "company-1",
       expect.objectContaining({
-        requestedByAgentId: "00000000-0000-0000-0000-0000000000ff",
+        requestedByAgentId: null,
         requestedByUserId: "user-1",
       }),
     );
@@ -667,23 +672,28 @@ describe("approval routes idempotent retries", () => {
     expect(mockApprovalService.createWithIdempotency).toHaveBeenCalledWith(
       "company-1",
       expect.objectContaining({ idempotencyKey: "rotate-creds-blo-18969" }),
+      expect.objectContaining({ afterCreate: expect.any(Function) }),
     );
     // A genuinely new filing still notifies.
     expect(mockLogActivity).toHaveBeenCalled();
   });
 
-  it("serves a count-only listing without touching the payload-bearing list", async () => {
+  it("serves a count-only listing with every accepted filter", async () => {
     mockApprovalService.countBy.mockResolvedValue(63);
 
     const res = await request(await createApp())
-      .get("/api/companies/company-1/approvals?view=count&status=pending");
+      .get(
+        "/api/companies/company-1/approvals?view=count&status=pending&type=request_board_approval&issueId=00000000-0000-0000-0000-000000000001&requestedByAgentId=00000000-0000-0000-0000-000000000002&idempotencyKey=rotate-creds",
+      );
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toEqual({ count: 63 });
     expect(mockApprovalService.countBy).toHaveBeenCalledWith("company-1", {
       status: "pending",
-      type: undefined,
-      requestedByAgentId: undefined,
+      type: "request_board_approval",
+      issueId: "00000000-0000-0000-0000-000000000001",
+      requestedByAgentId: "00000000-0000-0000-0000-000000000002",
+      idempotencyKey: "rotate-creds",
     });
     // The expensive path must not run.
     expect(mockApprovalService.list).not.toHaveBeenCalled();
@@ -719,6 +729,9 @@ describe("approval routes idempotent retries", () => {
       expect.objectContaining({
         status: "pending",
         issueId: "00000000-0000-0000-0000-000000000001",
+        type: undefined,
+        requestedByAgentId: undefined,
+        idempotencyKey: undefined,
       }),
     );
     expect(mockApprovalService.list).not.toHaveBeenCalled();
@@ -756,7 +769,31 @@ describe("approval routes idempotent retries", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body[0]).toHaveProperty("payload");
-    expect(mockApprovalService.list).toHaveBeenCalledWith("company-1", "pending");
+    expect(mockApprovalService.list).toHaveBeenCalledWith("company-1", {
+      status: "pending",
+      type: undefined,
+      issueId: undefined,
+      requestedByAgentId: undefined,
+      idempotencyKey: undefined,
+    });
+  });
+
+  it("applies every accepted filter to the full listing", async () => {
+    mockApprovalService.list.mockResolvedValue([]);
+
+    const res = await request(await createApp())
+      .get(
+        "/api/companies/company-1/approvals?view=full&status=pending&type=request_board_approval&issueId=00000000-0000-0000-0000-000000000001&requestedByAgentId=00000000-0000-0000-0000-000000000002&idempotencyKey=rotate-creds",
+      );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockApprovalService.list).toHaveBeenCalledWith("company-1", {
+      status: "pending",
+      type: "request_board_approval",
+      issueId: "00000000-0000-0000-0000-000000000001",
+      requestedByAgentId: "00000000-0000-0000-0000-000000000002",
+      idempotencyKey: "rotate-creds",
+    });
   });
 
   it("blocks status-only recovery runs from creating approvals", async () => {

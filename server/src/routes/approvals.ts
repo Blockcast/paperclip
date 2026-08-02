@@ -130,25 +130,26 @@ export function approvalRoutes(
 
     // `count` and `summary` exist so that checking whether an ask is already filed is
     // cheaper than filing it again. The default `full` view is unchanged.
+    const filters = {
+      status,
+      type,
+      issueId,
+      requestedByAgentId,
+      idempotencyKey,
+    };
     if (view === "count") {
-      const count = await svc.countBy(companyId, { status, type, requestedByAgentId });
+      const count = await svc.countBy(companyId, filters);
       res.json({ count });
       return;
     }
 
     if (view === "summary") {
-      const rows = await svc.listSummary(companyId, {
-        status,
-        type,
-        issueId,
-        requestedByAgentId,
-        idempotencyKey,
-      });
+      const rows = await svc.listSummary(companyId, filters);
       res.json(rows);
       return;
     }
 
-    const result = await svc.list(companyId, status);
+    const result = await svc.list(companyId, filters);
     res.json(result.map((approval) => redactApprovalPayload(approval)));
   });
 
@@ -190,32 +191,71 @@ export function approvalRoutes(
     }
 
     const actor = getActorInfo(req);
+    const requestedByAgentId = actor.actorType === "agent" ? actor.actorId : null;
+    const requestedByUserId = actor.actorType === "user" ? actor.actorId : null;
+    const payloadObj =
+      typeof normalizedPayload === "object" && normalizedPayload !== null
+        ? (normalizedPayload as Record<string, unknown>)
+        : {};
+    const approvalTitle =
+      typeof payloadObj.title === "string" ? payloadObj.title : undefined;
+    const approvalDescription =
+      typeof payloadObj.description === "string"
+        ? payloadObj.description
+        : typeof payloadObj.note === "string"
+          ? payloadObj.note
+          : undefined;
+
     const { approval, deduplicated } = await svc.createWithIdempotency(companyId, {
       ...approvalInput,
       payload: normalizedPayload,
-      requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
-      // An agent actor cannot nominate a different requester. The body field stays honoured for
-      // user actors (a human filing on an agent's behalf), but letting an agent set it would make
-      // `requestedByAgentId` unusable as an attribution signal — anything downstream that reasons
-      // about who asked for an approval could be pointed at an innocent agent.
-      requestedByAgentId:
-        actor.actorType === "agent"
-          ? actor.actorId
-          : (approvalInput.requestedByAgentId ?? null),
+      // Requester identity is derived only from the authenticated actor, and exactly one
+      // requester column is populated. Letting a user also nominate `requestedByAgentId`
+      // makes the idempotency key ambiguous because both requester-scoped unique indexes
+      // would apply to the same row.
+      requestedByAgentId,
+      requestedByUserId,
       status: "pending",
       decisionNote: null,
       decidedByUserId: null,
       decidedAt: null,
       updatedAt: new Date(),
+    }, {
+      afterCreate: async (txDb, createdApproval) => {
+        if (uniqueIssueIds.length > 0) {
+          await issueApprovalService(txDb).linkManyForApproval(createdApproval.id, uniqueIssueIds, {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          });
+        }
+
+        await logActivity(txDb, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          action: "approval.created",
+          entityType: "approval",
+          entityId: createdApproval.id,
+          details: {
+            type: createdApproval.type,
+            approvalId: createdApproval.id,
+            issueIds: uniqueIssueIds,
+            ...(approvalTitle !== undefined ? { title: approvalTitle } : {}),
+            ...(approvalDescription !== undefined
+              ? { description: approvalDescription }
+              : {}),
+          },
+        });
+      },
     });
 
     // Issue links are applied on both paths. The insert is onConflictDoNothing, so
     // re-linking the same issues is a no-op, and a retry that names a new issue still
-    // gets it attached rather than silently losing it. What must NOT repeat is the
-    // approval row and the activity log below — the latter is what puts a card in
-    // front of a human, and re-notifying about an ask the board has already been shown
-    // is the exact harm this ticket is about.
-    if (uniqueIssueIds.length > 0) {
+    // gets it attached rather than silently losing it. New filings link inside the
+    // create transaction above, with the human-facing activity log; replays must not
+    // emit another activity card.
+    if (deduplicated && uniqueIssueIds.length > 0) {
       await issueApprovalsSvc.linkManyForApproval(approval.id, uniqueIssueIds, {
         agentId: actor.agentId,
         userId: actor.actorType === "user" ? actor.actorId : null,
@@ -241,45 +281,6 @@ export function approvalRoutes(
       });
       return;
     }
-
-    // Surface the approval's human-facing title/description in the activity
-    // details so the plugin domain event (built from `details` in logActivity)
-    // carries them to notifiers. Without this the Slack approval card renders
-    // only `Type` — every board approval looks identical (every card is just
-    // `request_board_approval`). `payload` is free-form (z.record), so accept
-    // either `description` or the common `note` alias. The Slack formatter reads
-    // `approvalId`, `title`, `description`.
-    const payloadObj =
-      typeof normalizedPayload === "object" && normalizedPayload !== null
-        ? (normalizedPayload as Record<string, unknown>)
-        : {};
-    const approvalTitle =
-      typeof payloadObj.title === "string" ? payloadObj.title : undefined;
-    const approvalDescription =
-      typeof payloadObj.description === "string"
-        ? payloadObj.description
-        : typeof payloadObj.note === "string"
-          ? payloadObj.note
-          : undefined;
-
-    await logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      action: "approval.created",
-      entityType: "approval",
-      entityId: approval.id,
-      details: {
-        type: approval.type,
-        approvalId: approval.id,
-        issueIds: uniqueIssueIds,
-        ...(approvalTitle !== undefined ? { title: approvalTitle } : {}),
-        ...(approvalDescription !== undefined
-          ? { description: approvalDescription }
-          : {}),
-      },
-    });
 
     res.status(201).json(redactApprovalPayload(approval));
   });
