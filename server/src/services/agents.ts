@@ -254,6 +254,22 @@ function normalizeRuntimeConfigForNewAgent(
   return normalizeExternalLifecycleRuntimeConfig(adapterType, normalizedRuntimeConfig);
 }
 
+function mergeRuntimeConfigPatch(
+  existingRuntimeConfig: unknown,
+  requestedRuntimeConfig: unknown,
+): Record<string, unknown> {
+  const requested = isPlainRecord(requestedRuntimeConfig) ? requestedRuntimeConfig : {};
+  const merged = { ...requested };
+  if (isPlainRecord(requested.heartbeat)) {
+    const existingHeartbeat = isPlainRecord(existingRuntimeConfig)
+      && isPlainRecord(existingRuntimeConfig.heartbeat)
+      ? existingRuntimeConfig.heartbeat
+      : {};
+    merged.heartbeat = { ...existingHeartbeat, ...requested.heartbeat };
+  }
+  return merged;
+}
+
 function diffConfigSnapshot(
   before: AgentConfigSnapshot,
   after: AgentConfigSnapshot,
@@ -578,16 +594,6 @@ export function agentService(db: Db) {
         { adapterType: (normalizedPatch.adapterType ?? existing.adapterType) as string },
       );
     }
-    if (
-      Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterType")
-      || Object.prototype.hasOwnProperty.call(normalizedPatch, "runtimeConfig")
-    ) {
-      assertExternalLifecycleConcurrencyPolicy(
-        (normalizedPatch.adapterType ?? existing.adapterType) as string,
-        normalizedPatch.runtimeConfig ?? existing.runtimeConfig,
-      );
-    }
-
     return db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${id} for update`);
@@ -629,7 +635,7 @@ export function agentService(db: Db) {
         txPatch.runtimeConfig = normalizeExternalLifecycleRuntimeConfig(
           nextAdapterType,
           Object.prototype.hasOwnProperty.call(txPatch, "runtimeConfig")
-            ? txPatch.runtimeConfig
+            ? mergeRuntimeConfigPatch(locked.runtimeConfig, txPatch.runtimeConfig)
             : locked.runtimeConfig,
         );
       }

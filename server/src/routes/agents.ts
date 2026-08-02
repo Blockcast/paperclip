@@ -1336,19 +1336,6 @@ export function agentRoutes(
     return normalizeExternalLifecycleRuntimeConfig(adapterType, normalizedRuntimeConfig);
   }
 
-  function mergeRuntimeConfigPatchForAgentUpdate(
-    existingRuntimeConfig: unknown,
-    requestedRuntimeConfig: Record<string, unknown>,
-  ): Record<string, unknown> {
-    const mergedRuntimeConfig = { ...requestedRuntimeConfig };
-    const requestedHeartbeat = asRecord(requestedRuntimeConfig.heartbeat);
-    if (requestedHeartbeat) {
-      const existingHeartbeat = asRecord(asRecord(existingRuntimeConfig)?.heartbeat) ?? {};
-      mergedRuntimeConfig.heartbeat = { ...existingHeartbeat, ...requestedHeartbeat };
-    }
-    return mergedRuntimeConfig;
-  }
-
   function restoreRedactedRuntimeConfigValues(
     existingRuntimeConfig: unknown,
     requestedRuntimeConfig: Record<string, unknown>,
@@ -3367,21 +3354,9 @@ export function agentRoutes(
       }
       requestedRuntimeConfig = restoreRedactedRuntimeConfigValues(
         existing.runtimeConfig,
-        mergeRuntimeConfigPatchForAgentUpdate(existing.runtimeConfig, runtimeConfig),
+        runtimeConfig,
       );
       assertNoAgentRuntimeConfigAdapterConfigMutation(req, requestedRuntimeConfig);
-    }
-    if (requestedRuntimeConfig) {
-      requestedRuntimeConfig = normalizeExternalLifecycleRuntimeConfig(
-        requestedAdapterType,
-        requestedRuntimeConfig,
-      );
-      if (
-        hasOwn(patchData, "runtimeConfig")
-        || EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(requestedAdapterType)
-      ) {
-        patchData.runtimeConfig = requestedRuntimeConfig;
-      }
     }
     const touchesAdapterConfiguration =
       hasOwn(patchData, "adapterType") ||

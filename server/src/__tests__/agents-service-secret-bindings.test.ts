@@ -245,6 +245,62 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     });
   });
 
+  it("merges partial runtime patches against the locked row", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Concurrent Partial Runtime Update",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15, wakeOnDemand: false } },
+    });
+    const service = agentService(db);
+
+    let pendingUpdate!: ReturnType<typeof service.update>;
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
+      pendingUpdate = service.update(agentId, {
+        runtimeConfig: { heartbeat: { wakeOnDemand: true } },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await tx.update(agents).set({
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 12, wakeOnDemand: false } },
+      }).where(eq(agents.id, agentId));
+    });
+
+    await expect(pendingUpdate).resolves.toMatchObject({
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 12, wakeOnDemand: true } },
+    });
+  });
+
+  it("does not reject from an invalid runtime snapshot repaired before locking", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Legacy Invalid External Runtime",
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 17 } },
+    });
+    const service = agentService(db);
+
+    let pendingUpdate!: ReturnType<typeof service.update>;
+    let settled = false;
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
+      pendingUpdate = service.update(agentId, { adapterType: "opencode_k8s" });
+      void pendingUpdate.finally(() => {
+        settled = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(settled).toBe(false);
+      await tx.update(agents).set({
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+      }).where(eq(agents.id, agentId));
+    });
+
+    await expect(pendingUpdate).resolves.toMatchObject({
+      adapterType: "opencode_k8s",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15 } },
+    });
+  });
+
   it("creates agent secret bindings when a new agent persists secret_ref env", async () => {
     const companyId = await seedCompany();
     const secrets = secretService(db);

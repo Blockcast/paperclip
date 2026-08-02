@@ -371,7 +371,7 @@ describe("agent routes adapter validation", () => {
     }));
   });
 
-  it("rejects over-cap runtime updates for existing external-lifecycle agents", async () => {
+  it("passes over-cap runtime updates to persistence validation", async () => {
     mockAgentService.getById.mockResolvedValue({
       ...(await mockAgentService.getById()),
       adapterType: "opencode_k8s",
@@ -384,11 +384,13 @@ describe("agent routes adapter validation", () => {
         .send({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 17 } } }),
     );
 
-    expect(res.status, JSON.stringify(res.body)).toBe(422);
-    expect(mockAgentService.update).not.toHaveBeenCalled();
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toEqual({
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 17 } },
+    });
   });
 
-  it("normalizes empty runtime updates for existing external-lifecycle agents", async () => {
+  it("keeps empty runtime updates sparse for locked-row normalization", async () => {
     mockAgentService.getById.mockResolvedValue({
       ...(await mockAgentService.getById()),
       adapterType: "opencode_k8s",
@@ -402,18 +404,14 @@ describe("agent routes adapter validation", () => {
     );
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toEqual(expect.objectContaining({
-      runtimeConfig: expect.objectContaining({
-        heartbeat: expect.objectContaining({ maxConcurrentRuns: 16 }),
-      }),
-    }));
+    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toEqual({ runtimeConfig: {} });
   });
 
-  it("normalizes partial runtime updates for external-lifecycle agents without a concurrency field", async () => {
+  it("keeps partial heartbeat updates sparse for locked-row merging", async () => {
     mockAgentService.getById.mockResolvedValue({
       ...(await mockAgentService.getById()),
       adapterType: "opencode_k8s",
-      runtimeConfig: {},
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 15, wakeOnDemand: false } },
     });
     const app = await createApp();
     const res = await requestApp(app, (baseUrl) =>
@@ -423,14 +421,9 @@ describe("agent routes adapter validation", () => {
     );
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toEqual(expect.objectContaining({
-      runtimeConfig: expect.objectContaining({
-        heartbeat: expect.objectContaining({
-          maxConcurrentRuns: 16,
-          wakeOnDemand: true,
-        }),
-      }),
-    }));
+    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toEqual({
+      runtimeConfig: { heartbeat: { wakeOnDemand: true } },
+    });
   });
 
   it("keeps adapter-only updates sparse so the service can use the locked runtime config", async () => {
