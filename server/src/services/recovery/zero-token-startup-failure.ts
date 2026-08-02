@@ -20,6 +20,7 @@ export const ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES = new Set<string>([
 ]);
 
 const LEGACY_SESSION_UNAVAILABLE_ERROR_RE = /\bsession\s+unavailable\b/i;
+const OPENCODE_ADAPTER_TYPES = new Set(["opencode_local", "opencode_k8s"]);
 
 // Heartbeat-run terminal statuses that represent an unsuccessful outcome.
 // Mirrors UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES in heartbeat.ts /
@@ -70,6 +71,35 @@ export function runUsageTokenCounts(
   };
 }
 
+function readAdapterType(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+export function isLegacySessionUnavailableAdapterFailure(
+  run: Pick<NonNullable<ZeroTokenStartupFailureRunInput>, "error" | "errorCode"> | null | undefined,
+): boolean {
+  const errorCode = typeof run?.errorCode === "string" ? run.errorCode.trim() : "";
+  return (
+    errorCode === "adapter_failed" &&
+    typeof run?.error === "string" &&
+    LEGACY_SESSION_UNAVAILABLE_ERROR_RE.test(run.error)
+  );
+}
+
+export function isLegacySessionUnavailableAdapterMismatch(input: {
+  run: ZeroTokenStartupFailureRunInput;
+  currentAdapterType?: string | null;
+}): boolean {
+  const historicalAdapterType = readAdapterType(input.run?.adapterType);
+  const currentAdapterType = readAdapterType(input.currentAdapterType);
+  return Boolean(
+    historicalAdapterType &&
+      currentAdapterType &&
+      historicalAdapterType !== currentAdapterType &&
+      isLegacySessionUnavailableAdapterFailure(input.run),
+  );
+}
+
 // True when a run's most recent terminal failure is a structural, pre-model
 // startup wedge that produced zero token usage. The recovery sweep uses this
 // to gate `stranded_issue_recovery` wrapper creation: for this family the
@@ -82,10 +112,8 @@ export function isZeroTokenStartupFailureRun(
   if (!run.status || !UNSUCCESSFUL_TERMINAL_STATUSES.has(run.status)) return false;
   const errorCode = typeof run.errorCode === "string" ? run.errorCode.trim() : "";
   const isLegacySessionUnavailable =
-    (run.adapterType === "opencode_local" || run.adapterType === "opencode_k8s") &&
-    errorCode === "adapter_failed" &&
-    typeof run.error === "string" &&
-    LEGACY_SESSION_UNAVAILABLE_ERROR_RE.test(run.error);
+    OPENCODE_ADAPTER_TYPES.has(readAdapterType(run.adapterType) ?? "") &&
+    isLegacySessionUnavailableAdapterFailure(run);
   if (!isLegacySessionUnavailable && (!errorCode || !ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has(errorCode))) {
     return false;
   }

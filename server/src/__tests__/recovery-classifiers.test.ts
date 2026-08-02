@@ -10,6 +10,7 @@ import {
   buildRunLivenessContinuationIdempotencyKey,
   classifyIssueGraphLiveness,
   decideRunLivenessContinuation,
+  isLegacySessionUnavailableAdapterMismatch,
   isStrandedIssueRecoveryOriginKind,
   isZeroTokenStartupFailureRun,
   isZeroTokenSessionResetRetryRun,
@@ -311,6 +312,42 @@ describe("zero-token startup-failure classifier (BLO-5681)", () => {
         status: "failed",
         errorCode: "adapter_failed",
         error: "Session unavailable",
+      }),
+    ).toBe(false);
+  });
+
+  it("detects legacy session-unavailable failures whose recorded adapter no longer matches the current agent", () => {
+    expect(
+      isLegacySessionUnavailableAdapterMismatch({
+        run: {
+          adapterType: "claude_k8s",
+          status: "failed",
+          errorCode: "adapter_failed",
+          error: "Session unavailable",
+        },
+        currentAdapterType: "opencode_k8s",
+      }),
+    ).toBe(true);
+    expect(
+      isLegacySessionUnavailableAdapterMismatch({
+        run: {
+          adapterType: "opencode_k8s",
+          status: "failed",
+          errorCode: "adapter_failed",
+          error: "Session unavailable",
+        },
+        currentAdapterType: "opencode_k8s",
+      }),
+    ).toBe(false);
+    expect(
+      isLegacySessionUnavailableAdapterMismatch({
+        run: {
+          adapterType: "claude_k8s",
+          status: "failed",
+          errorCode: "adapter_failed",
+          error: "Provider unavailable",
+        },
+        currentAdapterType: "opencode_k8s",
       }),
     ).toBe(false);
   });
