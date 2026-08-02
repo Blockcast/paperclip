@@ -23,13 +23,14 @@
  * because it was the only candidate in the queue.
  */
 import { randomUUID } from "node:crypto";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
   agentWakeupRequests,
   companies,
   createDb,
+  externalRuntimeReservations,
   heartbeatRuns,
   issueRelations,
   issues,
@@ -1810,9 +1811,15 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       name: "ConcurrentDispatchTestAgent",
       role: "engineer",
       status: "idle",
-      adapterType: "codex_local",
+      adapterType: "opencode_k8s",
       adapterConfig: {},
-      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 15 } },
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 15,
+          concurrencyEnabled: true,
+        },
+      },
       permissions: {},
     });
     await db.insert(heartbeatRuns).values(runIds.map((id, index) => ({
@@ -1847,8 +1854,16 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
         .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
         .from(heartbeatRuns)
         .where(inArray(heartbeatRuns.id, runIds));
+      const activeReservations = await db
+        .select({ runId: externalRuntimeReservations.runId })
+        .from(externalRuntimeReservations)
+        .where(and(
+          inArray(externalRuntimeReservations.runId, runIds),
+          isNull(externalRuntimeReservations.releasedAt),
+        ));
       expect(activeRuns.filter((run) => run.status === "running")).toHaveLength(15);
       expect(activeRuns.filter((run) => run.status === "queued")).toHaveLength(5);
+      expect(activeReservations).toHaveLength(15);
     } finally {
       releaseExecutions();
       await heartbeat.drainInFlightExecutions(10_000);
