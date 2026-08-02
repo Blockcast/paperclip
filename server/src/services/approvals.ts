@@ -191,13 +191,6 @@ export function approvalService(db: Db) {
         return { approval: updated, applied, hireApprovedAgentId };
       });
 
-      if (result.approval.type === "hire_agent") {
-        const payload = result.approval.payload as Record<string, unknown>;
-        if (typeof payload.agentId === "string") {
-          await reconcileApprovedBuiltInAgent(result.approval.companyId, payload);
-        }
-      }
-
       if (result.hireApprovedAgentId) {
         void notifyHireApproved(db, {
           companyId: result.approval.companyId,
@@ -206,6 +199,13 @@ export function approvalService(db: Db) {
           sourceId: id,
           approvedAt: now,
         }).catch(() => {});
+      }
+
+      if (result.approval.type === "hire_agent") {
+        const payload = result.approval.payload as Record<string, unknown>;
+        if (typeof payload.agentId === "string") {
+          await reconcileApprovedBuiltInAgent(result.approval.companyId, payload);
+        }
       }
 
       return { approval: result.approval, applied: result.applied };

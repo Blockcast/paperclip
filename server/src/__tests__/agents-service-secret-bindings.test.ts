@@ -23,9 +23,14 @@ import { approvalService } from "../services/approvals.ts";
 import { secretService } from "../services/secrets.js";
 
 const mockEnsureBuiltInAgent = vi.hoisted(() => vi.fn());
+const mockNotifyHireApproved = vi.hoisted(() => vi.fn());
 
 vi.mock("../services/built-in-agents.js", () => ({
   builtInAgentService: () => ({ ensure: mockEnsureBuiltInAgent }),
+}));
+
+vi.mock("../services/hire-hook.js", () => ({
+  notifyHireApproved: mockNotifyHireApproved,
 }));
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -53,6 +58,7 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
 
   afterEach(async () => {
     mockEnsureBuiltInAgent.mockReset();
+    mockNotifyHireApproved.mockReset();
     await db.delete(companySecretBindings);
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
@@ -566,6 +572,7 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     mockEnsureBuiltInAgent
       .mockRejectedValueOnce(new Error("injected filesystem failure"))
       .mockResolvedValueOnce(undefined);
+    mockNotifyHireApproved.mockResolvedValue(undefined);
 
     await expect(
       approvalService(db).approve(approvalId, "board-user", "Approved"),
@@ -576,11 +583,13 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     await expect(agentService(db).getById(agentId)).resolves.toMatchObject({
       status: "idle",
     });
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
 
     await expect(
       approvalService(db).approve(approvalId, "board-user", "Approved"),
     ).resolves.toMatchObject({ applied: false });
     expect(mockEnsureBuiltInAgent).toHaveBeenCalledTimes(2);
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
   });
 
   it("creates agent secret bindings when a new agent persists secret_ref env", async () => {
