@@ -16,6 +16,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService, type HeartbeatEnvironmentRuntime } from "../services/heartbeat.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { runningProcesses } from "../adapters/index.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -79,7 +80,12 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     } as unknown as HeartbeatEnvironmentRuntime;
   }
 
-  function service(options: { environmentRuntime?: HeartbeatEnvironmentRuntime } = {}) {
+  function service(options: {
+    environmentRuntime?: HeartbeatEnvironmentRuntime;
+    beforeProcessLossRetryEnqueueForTest?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void> | void;
+    afterRunEventAppendedInTransactionForTest?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void> | void;
+    workerCrashRecoveryProviderTimeoutMsForTest?: number;
+  } = {}) {
     // skipQueuedRunDispatch keeps issue promotion from spawning background
     // executeRun work that would race this suite's delete-based cleanup.
     return heartbeatService(db, { skipQueuedRunDispatch: true, ...options });
@@ -562,5 +568,93 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     // update), not a bare release — the point under test is only that this
     // did not happen prematurely on the failed pass above.
     expect(issueAfterRecovery!.executionRunId).toBe(retries[0]!.id);
+  });
+
+  // ---- (g) the one unbounded call cannot outlive the claim lease -----------
+
+  it("bounds the provider lease release so recovery cannot run past its own claim", async () => {
+    // The compare-and-set on the terminal writes (test (e)) makes an overrun
+    // *safe*; this bound is what makes it rare. Recovery's only call that
+    // leaves the database is the environment-lease release, and it has no
+    // inherent timeout — a provider that hangs would hold a recovery open past
+    // `WORKER_CRASH_RECOVERY_CLAIM_TTL_MS` and let a second replica in. A
+    // timeout turns that into an ordinary incomplete required step: backed
+    // off, not stamped, replayed later.
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const run = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
+
+    let releaseHungCall: () => void;
+    const hungCall = new Promise<never[]>((resolve) => {
+      // Resolved in `finally` so the abandoned promise cannot outlive the test
+      // and leak into a later one.
+      releaseHungCall = () => resolve([]);
+    });
+
+    const heartbeat = service({
+      environmentRuntime: { releaseRunLeases: () => hungCall } as unknown as HeartbeatEnvironmentRuntime,
+      workerCrashRecoveryProviderTimeoutMsForTest: 50,
+    });
+
+    try {
+      const result = await heartbeat.reconcileWorkerCrashedRuns();
+
+      // Pre-fix this call never returns — the assertion below is only
+      // reachable because the release is bounded.
+      expect(result.unresolvedRunIds).toEqual([run.id]);
+      expect(result.reconciledRunIds).toEqual([]);
+
+      const after = await readRun(run.id);
+      expect(after.crashRecoveryCompletedAt).toBeNull();
+      expect(after.crashRecoveryLastError).toContain("environment_leases");
+      expect(after.crashRecoveryLastError).toContain("50ms");
+    } finally {
+      releaseHungCall!();
+    }
+  });
+
+  // ---- (h) a rolled-back event append must not escape to subscribers -------
+
+  it("does not publish a run event whose transaction rolled back", async () => {
+    // `appendRunEvent` used to publish the live event and mutate runtime
+    // progress inline, while the caller's transaction was still open. If that
+    // transaction then rolled back, subscribers had already been handed an
+    // event for a row that never became visible. Publication is now a closure
+    // the atomic-seq caller invokes only after commit.
+    //
+    // The hook below throws *after* a successful insert — the only ordering
+    // that distinguishes the two designs. An insert that fails on its own
+    // never reached the old publish call either, so it would not discriminate.
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const run = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
+
+    // Scoped to this run: recovery also enqueues a *retry* run, whose own
+    // "queued automatic retry" event is appended on a pooled, autocommitting
+    // executor and is published correctly. The rolled-back append under test
+    // is the crash lifecycle line on `run` itself.
+    const published: string[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+      const payload = event.payload as { runId?: string; message?: string };
+      if (event.type === "heartbeat.run.event" && payload.runId === run.id) {
+        published.push(payload.message ?? "");
+      }
+    });
+
+    try {
+      const heartbeat = service({
+        afterRunEventAppendedInTransactionForTest: () => {
+          throw new Error("commit interrupted");
+        },
+      });
+      // Recovery treats the lifecycle append as best-effort, so this resolves
+      // rather than throwing; the assertions are about what escaped, not about
+      // recovery's own outcome.
+      await heartbeat.reconcileWorkerCrashedRuns();
+
+      expect(published).toEqual([]);
+      const rows = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, run.id));
+      expect(rows).toEqual([]);
+    } finally {
+      unsubscribe();
+    }
   });
 });

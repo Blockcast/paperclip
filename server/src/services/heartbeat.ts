@@ -1193,8 +1193,49 @@ const WORKER_CRASH_RECOVERY_BACKOFF_MAX_MS = 6 * 60 * 60 * 1000;
 // (a handful of queries plus one provider release), short enough that a crashed
 // holder's work is picked up on a later start rather than left indefinitely.
 const WORKER_CRASH_RECOVERY_CLAIM_TTL_MS = 10 * 60 * 1000;
+// The claim lease above is only honest if the work it covers cannot outlast it.
+// Every other recovery step is a pooled query with its own statement timeout;
+// the environment-lease release is the one call that reaches a provider and has
+// no inherent bound. Capping it at half the lease keeps the whole recovery
+// inside its claim by construction, so the compare-and-set on the terminal
+// writes is a backstop for the pathological case rather than the only thing
+// standing between two live recoverers. Renewing the lease from a timer was the
+// alternative; it was rejected because it adds a second liveness mechanism (and
+// a background timer per in-flight recovery) to protect a call we can simply
+// bound, and a stalled renewal query would fail in exactly the cases a stalled
+// provider call does.
+const WORKER_CRASH_RECOVERY_PROVIDER_RELEASE_TIMEOUT_MS = WORKER_CRASH_RECOVERY_CLAIM_TTL_MS / 2;
 // Keep the durable diagnostic small; it is a breadcrumb, not a log sink.
 const WORKER_CRASH_RECOVERY_ERROR_MAX_CHARS = 500;
+
+/**
+ * Race `work` against `timeoutMs`, converting a timeout into the same shape a
+ * failed call would produce (via `onTimeout`) rather than throwing. Used for
+ * the single provider call inside crash recovery, so the recovery cannot run
+ * past the claim lease it took. The abandoned promise is left to settle on its
+ * own — there is no cancellation contract on the provider side.
+ */
+async function withRecoveryProviderTimeout<T>(
+  label: string,
+  work: Promise<T>,
+  onTimeout: (detail: string) => T,
+  timeoutMs: number = WORKER_CRASH_RECOVERY_PROVIDER_RELEASE_TIMEOUT_MS,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((resolve) => {
+    timer = setTimeout(
+      () => resolve(onTimeout(`${label} exceeded ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    // Never hold the event loop open on behalf of a recovery timeout.
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 function workerCrashRecoveryBackoffMs(attempts: number): number {
   // Cap the exponent, not the resulting scale: 2**31 * five minutes already
@@ -8589,6 +8630,22 @@ export interface HeartbeatServiceOptions {
   beforeProcessLossRetryEnqueueForTest?: (
     run: typeof heartbeatRuns.$inferSelect,
   ) => Promise<void> | void;
+  /**
+   * Test-only override for the crash-recovery provider-release timeout, whose
+   * production value is half the ten-minute claim lease. Lets a test prove the
+   * bound exists without waiting five minutes for it.
+   */
+  workerCrashRecoveryProviderTimeoutMsForTest?: number;
+  /**
+   * Test-only failure injection: fired inside `appendRunEventAtomicSeq`'s
+   * transaction, after the event row has been inserted but before commit.
+   * Throwing here rolls the insert back, which is the only case that can
+   * distinguish publishing inside the transaction from publishing after it
+   * (BLO-20822).
+   */
+  afterRunEventAppendedInTransactionForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -11922,7 +11979,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .select({ maxSeq: sql<number | null>`max(${heartbeatRunEvents.seq})` })
         .from(heartbeatRunEvents)
         .where(eq(heartbeatRunEvents.runId, run.id));
-      return appendRunEvent(run, Number(row?.maxSeq ?? 0) + 1, event, tx);
+      const appended = await appendRunEvent(run, Number(row?.maxSeq ?? 0) + 1, event, tx);
+      // Test-only: the append has succeeded but the transaction has not
+      // committed. Throwing here is the only way to reach the rollback-after-
+      // successful-insert case, which is precisely the one where publishing
+      // early would leak a phantom event.
+      await options.afterRunEventAppendedInTransactionForTest?.(run);
+      return appended;
     });
     publish();
   }
@@ -13038,13 +13101,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     // REQUIRED. A lease left `active` keeps the run's environment reserved.
-    const leaseRelease = await releaseEnvironmentLeasesForRun({
-      runId: run.id,
-      companyId: run.companyId,
-      agentId: run.agentId,
-      status: run.status,
-      failureReason: run.error ?? undefined,
-    });
+    //
+    // Bounded, because this is the only step that leaves the database: an
+    // unbounded provider call could outlive the claim lease taken above and
+    // leave two replicas recovering the same run. On timeout the step is
+    // `incomplete` like any other failure, so the run is backed off and
+    // replayed rather than stamped. The abandoned call may still land — that
+    // is the pre-existing at-least-once provider-release contract tracked by
+    // BLO-20795, not something this timeout introduces.
+    const leaseRelease = await withRecoveryProviderTimeout(
+      "environment lease release",
+      releaseEnvironmentLeasesForRun({
+        runId: run.id,
+        companyId: run.companyId,
+        agentId: run.agentId,
+        status: run.status,
+        failureReason: run.error ?? undefined,
+      }),
+      (detail) => ({ fullyReleased: false as const, failureReason: detail }),
+      options.workerCrashRecoveryProviderTimeoutMsForTest,
+    );
     record(
       "environment_leases",
       leaseRelease.fullyReleased
