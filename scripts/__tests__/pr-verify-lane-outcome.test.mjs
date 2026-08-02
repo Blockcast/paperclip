@@ -44,12 +44,18 @@ test("verify step passes when every lane succeeds", () => {
   assert.equal(result.status, 0);
 });
 
-test("verify step exits non-zero and annotates infrastructure cancellation, not failure, for a cancelled lane", () => {
+test("verify step exits non-zero and annotates a cancelled lane without asserting a specific cause", () => {
   const result = runVerifyStep({ general_tests: "cancelled" });
   assert.notEqual(result.status, 0);
-  assert.match(result.stdout, /::error title=verify: infrastructure cancellation::/);
+  assert.match(result.stdout, /::error title=verify: lane cancelled::/);
   assert.match(result.stdout, /general_tests/);
+  // The annotation must not claim the cancellation IS infrastructure — only
+  // that it's a possible cause. A manual cancel or another source is also
+  // possible, and this job cannot tell them apart from here (gstack review,
+  // BLO-20867 PR #964).
+  assert.doesNotMatch(result.stdout, /This is a CI infrastructure interruption/);
   assert.doesNotMatch(result.stdout, /::error title=verify: lane failure::/);
+  assert.doesNotMatch(result.stdout, /::error title=verify: lane skipped::/);
 });
 
 test("verify step exits non-zero and annotates a real lane failure distinctly from a cancellation", () => {
@@ -57,11 +63,42 @@ test("verify step exits non-zero and annotates a real lane failure distinctly fr
   assert.notEqual(result.status, 0);
   assert.match(result.stdout, /::error title=verify: lane failure::/);
   assert.match(result.stdout, /build/);
-  assert.doesNotMatch(result.stdout, /::error title=verify: infrastructure cancellation::/);
+  assert.doesNotMatch(result.stdout, /::error title=verify: lane cancelled::/);
 });
 
 test("verify step reports failure, not cancellation, when a run has both a failed and a cancelled lane", () => {
   const result = runVerifyStep({ build: "failure", general_tests: "cancelled" });
   assert.notEqual(result.status, 0);
   assert.match(result.stdout, /::error title=verify: lane failure::/);
+  assert.doesNotMatch(result.stdout, /::error title=verify: lane cancelled::/);
+});
+
+test("verify step annotates a skipped lane as an unmet dependency, not a failure", () => {
+  const result = runVerifyStep({ worktree_install: "skipped" });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout, /::error title=verify: lane skipped::/);
+  assert.match(result.stdout, /worktree_install/);
+  assert.match(result.stdout, /policy/);
+  assert.doesNotMatch(result.stdout, /::error title=verify: lane failure::/);
+});
+
+test("verify step reports skipped, not cancelled, when a run has both a skipped and a cancelled lane", () => {
+  const result = runVerifyStep({ worktree_install: "skipped", general_tests: "cancelled" });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout, /::error title=verify: lane skipped::/);
+  assert.doesNotMatch(result.stdout, /::error title=verify: lane cancelled::/);
+});
+
+test("verify step reports failure, not skipped, when a run has both a failed and a skipped lane", () => {
+  const result = runVerifyStep({ build: "failure", worktree_install: "skipped" });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout, /::error title=verify: lane failure::/);
+  assert.doesNotMatch(result.stdout, /::error title=verify: lane skipped::/);
+});
+
+test("verify step exits non-zero for an unrecognized result and treats it as a failure", () => {
+  const result = runVerifyStep({ general_tests: "timed_out" });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout, /::error title=verify: lane failure::/);
+  assert.match(result.stdout, /general_tests/);
 });

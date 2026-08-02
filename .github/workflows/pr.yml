@@ -356,13 +356,19 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      # BLO-20867: an upstream lane can end up `cancelled` rather than `failure`
-      # when CI infrastructure (e.g. an ARC runner-scale-set listener bounce)
-      # interrupts it before it produces a result. That is not a code problem
-      # with the PR, but a plain `test "$X" = "success"` makes both cases look
-      # like an identical failing required check, so authors misattribute
-      # infra outages to their own diff. Separate the two outcomes here so the
-      # annotation on this job says which one actually happened.
+      # BLO-20867: an upstream lane can end up `cancelled` or `skipped` rather
+      # than `failure`. A plain `test "$X" = "success"` makes every one of
+      # these look like an identical failing required check, so authors
+      # misattribute the outcome to their own diff. Separate them here so the
+      # annotation on this job says which one actually happened:
+      #   - failure:   the lane ran and reported a real problem with the diff.
+      #   - cancelled: the lane was interrupted before it produced a result —
+      #     possibly a CI infrastructure interruption (see BLO-20867), but
+      #     also possibly a manual cancellation or another cause this job
+      #     cannot distinguish from here. Not evidence of a diff problem.
+      #   - skipped:   the lane never ran because a dependency it needs
+      #     (typically `policy`) did not succeed. The defect, if any, is in
+      #     that dependency, not in this lane.
       - name: Fail if any split verify lane failed
         env:
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
@@ -378,22 +384,29 @@ jobs:
           )
 
           cancelled_lanes=()
+          skipped_lanes=()
           failed_lanes=()
           for lane in "${!lane_results[@]}"; do
             case "${lane_results[$lane]}" in
               success) ;;
               cancelled) cancelled_lanes+=("$lane") ;;
+              skipped) skipped_lanes+=("$lane") ;;
               *) failed_lanes+=("$lane") ;;
             esac
           done
 
           if [ "${#failed_lanes[@]}" -gt 0 ]; then
-            echo "::error title=verify: lane failure::Upstream lane(s) failed: ${failed_lanes[*]}. This reflects a real problem with the PR diff."
+            echo "::error title=verify: lane failure::Upstream lane(s) failed: ${failed_lanes[*]}. This reflects a real problem with the PR diff — check that lane's own logs."
+            exit 1
+          fi
+
+          if [ "${#skipped_lanes[@]}" -gt 0 ]; then
+            echo "::error title=verify: lane skipped::Upstream lane(s) did not run: ${skipped_lanes[*]}. GitHub Actions skips a lane when a job it needs (typically 'policy') did not succeed — check that dependency's logs, not this lane's."
             exit 1
           fi
 
           if [ "${#cancelled_lanes[@]}" -gt 0 ]; then
-            echo "::error title=verify: infrastructure cancellation::Upstream lane(s) were CANCELLED, not failed: ${cancelled_lanes[*]}. This is a CI infrastructure interruption (see BLO-20867), not a problem with this PR's diff. Re-run the job once CI is stable."
+            echo "::error title=verify: lane cancelled::Upstream lane(s) were CANCELLED, not failed: ${cancelled_lanes[*]}. This is not a report of a defect in this PR's diff — the lane was interrupted before it could produce a result (possible causes include a CI infrastructure interruption, see BLO-20867, or a manual cancellation). Re-run the job to get a real result."
             exit 1
           fi
 
