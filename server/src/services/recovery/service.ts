@@ -307,6 +307,8 @@ type RecoveryWakeupOptions = {
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
+  retryOfRunId?: string | null;
+  scheduledRetryAttempt?: number;
 };
 
 type RecoveryWakeup = (
@@ -1700,20 +1702,12 @@ export function recoveryService(
         ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
         ...(input.extraContext ?? {}),
       }, "normal_model"),
+      retryOfRunId: input.retryOfRunId,
+      scheduledRetryAttempt:
+        typeof input.extraContext?.scheduledRetryAttempt === "number"
+          ? input.extraContext.scheduledRetryAttempt
+          : undefined,
     });
-
-    if (queued && input.retryOfRunId) {
-      return db
-        .update(heartbeatRuns)
-        .set({
-          retryOfRunId: input.retryOfRunId,
-          updatedAt: new Date(),
-        })
-        .where(eq(heartbeatRuns.id, queued.id))
-        .returning()
-        .then((rows) => rows[0] ?? queued);
-    }
-
     return queued;
   }
 
@@ -5263,12 +5257,6 @@ export function recoveryService(
     });
     if (!queued) return null;
 
-    const [retryRun] = await db
-      .update(heartbeatRuns)
-      .set({ scheduledRetryAttempt, updatedAt: new Date() })
-      .where(eq(heartbeatRuns.id, queued.id))
-      .returning();
-
     await issuesSvc.addComment(
       input.issue.id,
       "Paperclip detected a zero-token startup wedge on this assigned issue's last run " +
@@ -5279,7 +5267,7 @@ export function recoveryService(
       { authorType: "system" },
     );
 
-    return retryRun ?? queued;
+    return queued;
   }
 
   function sessionUnavailableAdapterMismatch(input: {

@@ -7484,6 +7484,85 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeRows.some((row) => row.reason === "issue_zero_token_session_reset")).toBe(true);
   });
 
+  it("accounts for a session reset attempt before a fast claimant can schedule another retry", async () => {
+    const { agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "session_unavailable",
+      runError: "Session unavailable",
+      adapterType: "opencode_k8s",
+    });
+
+    let raced = false;
+    let observedAttempt: number | null = null;
+    let secondScheduleOutcome: string | null = null;
+    let raceHeartbeat!: ReturnType<typeof heartbeatService>;
+    raceHeartbeat = createHeartbeat({
+      penstockAvailabilityGate: allowPenstockGate,
+      skipQueuedRunDispatch: true,
+      beforeQueuedRunDispatchForTest: async (queuedRun) => {
+        if (raced || queuedRun.contextSnapshot?.retryReason !== "zero_token_session_reset") return;
+        raced = true;
+        observedAttempt = queuedRun.scheduledRetryAttempt;
+
+        await db
+          .update(issues)
+          .set({ executionRunId: queuedRun.id })
+          .where(eq(issues.id, issueId));
+        const failedReset = await db
+          .update(heartbeatRuns)
+          .set({
+            status: "failed",
+            errorCode: "session_unavailable",
+            error: "Session unavailable",
+            usageJson: { inputTokens: 0, outputTokens: 0 },
+            finishedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, queuedRun.id))
+          .returning()
+          .then((rows) => rows[0]!);
+        const firstSchedule = await raceHeartbeat.scheduleBoundedRetry(failedReset.id, {
+          retryReason: "session_unavailable",
+          wakeReason: "session_unavailable_retry",
+          maxAttempts: 2,
+          delayMs: 30_000,
+        });
+        if (firstSchedule.outcome !== "scheduled") {
+          throw new Error(`Expected the fast claimant to schedule attempt 2: ${JSON.stringify(firstSchedule)}`);
+        }
+
+        await db
+          .update(heartbeatRuns)
+          .set({
+            status: "failed",
+            errorCode: "session_unavailable",
+            error: "Session unavailable",
+            usageJson: { inputTokens: 0, outputTokens: 0 },
+            finishedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, firstSchedule.run.id));
+        const secondSchedule = await raceHeartbeat.scheduleBoundedRetry(firstSchedule.run.id, {
+          retryReason: "session_unavailable",
+          wakeReason: "session_unavailable_retry",
+          maxAttempts: 2,
+          delayMs: 30_000,
+        });
+        secondScheduleOutcome = secondSchedule.outcome;
+      },
+    });
+
+    const result = await raceHeartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.zeroTokenSessionResetRetried).toBe(1);
+    expect(observedAttempt).toBe(1);
+    expect(secondScheduleOutcome).toBe("retry_exhausted");
+    const retryRuns = await db
+      .select({ attempt: heartbeatRuns.scheduledRetryAttempt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(retryRuns.filter((run) => run.attempt > 0).map((run) => run.attempt).sort()).toEqual([1, 2]);
+  });
+
   it("does not clear the current assignee session from an older assignee failure", async () => {
     const { companyId, agentId: previousAgentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",

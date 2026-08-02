@@ -3020,6 +3020,8 @@ interface WakeupOptions {
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
+  retryOfRunId?: string | null;
+  scheduledRetryAttempt?: number;
 }
 
 type UsageTotals = {
@@ -8553,6 +8555,10 @@ export interface HeartbeatServiceOptions {
   ) => Promise<void> | void;
   /** Test-only failure injection immediately before refusal status re-read. */
   beforeQueuedDispatchRefusalStatusReadForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
+  /** Test-only hook after a queued run commits and before dispatch can claim it. */
+  beforeQueuedRunDispatchForTest?: (
     run: typeof heartbeatRuns.$inferSelect,
   ) => Promise<void> | void;
 }
@@ -23494,6 +23500,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const contextSnapshot: Record<string, unknown> = { ...(opts.contextSnapshot ?? {}) };
     const reason = opts.reason ?? null;
     const payload = opts.payload ?? null;
+    const hasInitialRetryMetadata =
+      opts.retryOfRunId !== undefined || opts.scheduledRetryAttempt !== undefined;
     const {
       contextSnapshot: enrichedContextSnapshot,
       issueIdFromPayload,
@@ -24703,6 +24711,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
           if (
             isSameExecutionAgent &&
+            !hasInitialRetryMetadata &&
             !shouldDeferFollowupWake &&
             !shouldQueueFollowupForRunningWake &&
             !shouldDeferCrossPrReviewWake &&
@@ -24980,7 +24989,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // wake may already have queued the single follow-up while this
         // transaction waited on the issue lock; absorb into that pending task
         // scope before inserting another follow-up.
-        const coalescedTaskScopeRun = await coalescePendingTaskScopeWake({
+        const coalescedTaskScopeRun = hasInitialRetryMetadata ? null : await coalescePendingTaskScopeWake({
           tx,
           companyId: agent.companyId,
           agentId,
@@ -24998,7 +25007,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return { kind: "coalesced" as const, run: coalescedTaskScopeRun };
         }
 
-        const coalescedGithubStateRun = await coalesceQueuedGithubStateWake({
+        const coalescedGithubStateRun = hasInitialRetryMetadata ? null : await coalesceQueuedGithubStateWake({
           tx,
           companyId: agent.companyId,
           agentId,
@@ -25050,6 +25059,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             contextSnapshot: enrichedContextSnapshot,
             sessionIdBefore: sessionBefore,
             continuationAttempt,
+            retryOfRunId: opts.retryOfRunId,
+            scheduledRetryAttempt: opts.scheduledRetryAttempt,
           })
           .returning()
           .then((rows) => rows[0]);
@@ -25088,6 +25099,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
 
+      await options.beforeQueuedRunDispatchForTest?.(newRun);
       await startNextQueuedRunForAgent(agent.id);
       return newRun;
     }
@@ -25173,7 +25185,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // common case. Re-check after acquiring it so a queued run or a
       // capacity-deferred scheduled retry that appeared meanwhile absorbs the
       // new wake. Keep a coalesced wake row for audit, but only one run.
-      const coalescedTaskScopeRun = await coalescePendingTaskScopeWake({
+      const coalescedTaskScopeRun = hasInitialRetryMetadata ? null : await coalescePendingTaskScopeWake({
         tx,
         companyId: agent.companyId,
         agentId,
@@ -25237,7 +25249,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { kind: "skipped" as const };
       }
 
-      const coalescedGithubStateRun = await coalesceQueuedGithubStateWake({
+      const coalescedGithubStateRun = hasInitialRetryMetadata ? null : await coalesceQueuedGithubStateWake({
         tx,
         companyId: agent.companyId,
         agentId,
@@ -25287,6 +25299,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           contextSnapshot: enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,
           continuationAttempt,
+          retryOfRunId: opts.retryOfRunId,
+          scheduledRetryAttempt: opts.scheduledRetryAttempt,
         })
         .returning()
         .then((rows) => rows[0]);
@@ -25318,6 +25332,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
 
+    await options.beforeQueuedRunDispatchForTest?.(newRun);
     await startNextQueuedRunForAgent(agent.id);
 
     return newRun;
