@@ -3,6 +3,7 @@ import {
   REDACTED_EVENT_VALUE,
   redactAgentConfigPayload,
   redactApprovalPayloadByType,
+  redactApprovalPayloadForDisplay,
   redactEventPayload,
   redactSensitiveText,
   sanitizeRecord,
@@ -162,6 +163,98 @@ describe("redaction", () => {
 
     expect(result?.args).toEqual(["--api-key", "not-a-command-secret"]);
     expect(result?.argv).toEqual(["--api-key", REDACTED_EVENT_VALUE]);
+  });
+});
+
+// BLO-20810: `SECRET_PAYLOAD_KEY_RE` matches secret-ish *substrings* anywhere
+// in a key name by design (so compound keys like `webhookAuthToken` still
+// trigger), but that means "author" trips on "auth" and "no_secrets_in_payload"
+// trips on "secret" even though neither value is a credential. The value must
+// also look opaque/credential-shaped before it gets blanked.
+describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
+  it("does not redact prose or evidence links under a key that merely contains a secret-ish substring", () => {
+    const input = {
+      ask_2_author_identity: "PR #1898 was authored by the app account, not a human.",
+      no_secrets_in_payload: "No secret values are present in this payload.",
+      "links.PR_1898_app_authored": "https://github.com/Blockcast/paperclip/pull/1898",
+    };
+
+    expect(redactEventPayload(structuredClone(input))).toEqual(input);
+  });
+
+  it("still redacts a real key/token-shaped value under the same kind of key", () => {
+    const result = redactEventPayload({
+      ask_2_author_identity: "ghp_1234567890abcdefghijklmnopqrstuvwxyz",
+      requestedAuthorization: "sk-live-abc123def456",
+    });
+
+    expect(result?.ask_2_author_identity).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.requestedAuthorization).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("still redacts an Authorization header value with a Bearer scheme prefix", () => {
+    // Mirrors mcpServers.*.headers.Authorization, which must stay redacted —
+    // a scheme prefix ("Bearer ") shouldn't be enough to read as prose.
+    const result = redactEventPayload({ Authorization: "Bearer gbrain_at_secret_12345" });
+
+    expect(result?.Authorization).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("recurses into non-string values under a secret-ish key instead of nuking the whole structure", () => {
+    const result = redactEventPayload({
+      authorInfo: {
+        note: "Verified via GitHub App identity.",
+        token: "ghp_abcdefghijklmnopqrstuvwxyz123456",
+      },
+      authoredPrLinks: ["https://github.com/x/y/pull/1", "sk-live-not-a-url-secret"],
+    });
+
+    expect(result?.authorInfo).toEqual({
+      note: "Verified via GitHub App identity.",
+      token: REDACTED_EVENT_VALUE,
+    });
+    expect(result?.authoredPrLinks).toEqual([
+      "https://github.com/x/y/pull/1",
+      REDACTED_EVENT_VALUE,
+    ]);
+  });
+});
+
+describe("redactApprovalPayloadForDisplay (BLO-20810)", () => {
+  it("names the scrubbed field instead of an ambiguous bare sentinel, and reports it", () => {
+    const payload = {
+      ask_2_author_identity: "PR #1898 was authored by the app account, not a human.",
+      requestedAuthorization: "sk-live-abc123def456",
+    };
+
+    const { payload: displayed, redactedFields } = redactApprovalPayloadForDisplay(
+      "request_board_approval",
+      payload,
+    );
+
+    expect(displayed.ask_2_author_identity).toBe(payload.ask_2_author_identity);
+    expect(displayed.requestedAuthorization).toBe(
+      "[redacted by secret scanner: requestedAuthorization]",
+    );
+    expect(redactedFields).toEqual(["requestedAuthorization"]);
+  });
+
+  it("returns no redactedFields when nothing was actually scrubbed", () => {
+    const { payload, redactedFields } = redactApprovalPayloadForDisplay("request_board_approval", {
+      note: "everything here is plain prose",
+    });
+
+    expect(payload).toEqual({ note: "everything here is plain prose" });
+    expect(redactedFields).toEqual([]);
+  });
+
+  it("leaves hire_agent's structural redaction as the bare sentinel (BLO-18969 contract)", () => {
+    const { payload, redactedFields } = redactApprovalPayloadForDisplay("hire_agent", {
+      adapterConfig: { env: { FOO: "value-under-a-key-no-regex-matches" } },
+    });
+
+    expect(payload).toEqual({ adapterConfig: { env: { FOO: REDACTED_EVENT_VALUE } } });
+    expect(redactedFields).toEqual([]);
   });
 });
 
