@@ -86,6 +86,17 @@ export interface InstallCrashGuardOptions {
   processRef?: Pick<NodeJS.Process, "on" | "off" | "exitCode">;
 }
 
+export interface ProcessCrashGuardHandle {
+  /** Remove the listeners installed by this guard. */
+  (): void;
+  /**
+   * Returns the bounded crash path once fatal handling has started, otherwise
+   * `null`. Graceful shutdown uses this to yield exit ownership so it cannot
+   * truncate the crash record with an earlier `process.exit`.
+   */
+  waitForCrashExit: () => Promise<void> | null;
+}
+
 const MAX_CAUSE_DEPTH = 10;
 
 /**
@@ -171,7 +182,7 @@ function renderBreadcrumb(kind: CrashKind, chain: SerializedError[]): string {
  * Installs the crash handlers. Returns an uninstall function so tests (and any
  * embedded use) can restore the previous state.
  */
-export function installProcessCrashGuard(options: InstallCrashGuardOptions): () => void {
+export function installProcessCrashGuard(options: InstallCrashGuardOptions): ProcessCrashGuardHandle {
   const {
     logger,
     onCrash,
@@ -187,6 +198,8 @@ export function installProcessCrashGuard(options: InstallCrashGuardOptions): () 
   // touches the DB, and if that throws we are called again mid-handling. The
   // second crash must exit immediately rather than start another bounded wait.
   let handling = false;
+  let crashExit: Promise<void> | null = null;
+  let resolveCrashExit: (() => void) | null = null;
 
   const handle = (kind: CrashKind, error: unknown): void => {
     if (handling) {
@@ -199,6 +212,9 @@ export function installProcessCrashGuard(options: InstallCrashGuardOptions): () 
       return;
     }
     handling = true;
+    crashExit = new Promise<void>((resolve) => {
+      resolveCrashExit = resolve;
+    });
     try {
       setExitCode(CRASH_GUARD_EXIT_CODE);
     } catch {
@@ -245,6 +261,7 @@ export function installProcessCrashGuard(options: InstallCrashGuardOptions): () 
             `exiting ${CRASH_GUARD_EXIT_CODE} after ${kind}`,
           ]);
         } finally {
+          resolveCrashExit?.();
           exit(CRASH_GUARD_EXIT_CODE);
         }
       })();
@@ -310,8 +327,11 @@ export function installProcessCrashGuard(options: InstallCrashGuardOptions): () 
   processRef.on("uncaughtException", onUncaught as NodeJS.UncaughtExceptionListener);
   processRef.on("unhandledRejection", onRejection as NodeJS.UnhandledRejectionListener);
 
-  return () => {
+  const uninstall = () => {
     processRef.off("uncaughtException", onUncaught as NodeJS.UncaughtExceptionListener);
     processRef.off("unhandledRejection", onRejection as NodeJS.UnhandledRejectionListener);
   };
+  return Object.assign(uninstall, {
+    waitForCrashExit: () => crashExit,
+  });
 }

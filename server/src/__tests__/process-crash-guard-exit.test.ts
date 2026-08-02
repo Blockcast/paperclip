@@ -54,13 +54,21 @@ function runFixture(kind: "throw" | "reject", padBytes: number, strictRejections
     });
 
     let stderr = "";
+    const watchdog = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`crash fixture timed out (${kind})`));
+    }, 5_000);
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
     });
 
-    child.on("error", reject);
+    child.on("error", (error) => {
+      clearTimeout(watchdog);
+      reject(error);
+    });
     child.on("close", (code) => {
+      clearTimeout(watchdog);
       resolve({ code, stderr });
     });
   });

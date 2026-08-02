@@ -72,7 +72,7 @@ import {
   writeShutdownBreadcrumb,
   writeShutdownBreadcrumbsBounded,
 } from "./shutdown-log.js";
-import { installProcessCrashGuard } from "./process-crash-guard.js";
+import { installProcessCrashGuard, type ProcessCrashGuardHandle } from "./process-crash-guard.js";
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 import { plugins } from "@paperclipai/db";
 import {
@@ -89,6 +89,8 @@ import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
 } from "./routes/instance-database-backups.js";
+
+let mainProcessCrashGuard: ProcessCrashGuardHandle | undefined;
 
 async function autoInstallBundledPlugins(
   _db: import("@paperclipai/db").Db,
@@ -1785,9 +1787,14 @@ export async function startServer(): Promise<StartedServer> {
       // await the exporter's final batch is dropped on exit.
       await shutdownInstrumentation();
 
-      // A fatal error can arrive while the asynchronous shutdown work above is
-      // still draining. The crash guard records that by setting exitCode = 1;
-      // do not let the graceful continuation overwrite it with a clean exit.
+      // A fatal error can arrive while shutdown is draining. Once active, the
+      // crash guard owns process exit; wait for its bounded breadcrumb path so
+      // this graceful continuation cannot truncate the crash stack or exit line.
+      const crashExit = mainProcessCrashGuard?.waitForCrashExit();
+      if (crashExit) {
+        await crashExit;
+        return;
+      }
       process.exit(process.exitCode ?? 0);
     };
 
@@ -1846,7 +1853,7 @@ if (isMainModule(import.meta.url)) {
   // `markRunsInterruptedByWorkerCrash` and lands with the crash-recovery
   // change; it plugs in as an injected `onCrash` callback, which is why this
   // module keeps no dependency edge on the heartbeat service.
-  installProcessCrashGuard({ logger });
+  mainProcessCrashGuard = installProcessCrashGuard({ logger });
 
   void startServer().catch((err) => {
     logger.error({ err }, "Paperclip server failed to start");

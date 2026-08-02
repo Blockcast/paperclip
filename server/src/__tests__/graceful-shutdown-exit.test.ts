@@ -14,6 +14,10 @@ describe("graceful shutdown — real process exit", () => {
       const child = spawn(tsx, [fixture], { stdio: ["ignore", "pipe", "pipe"] });
       let stdout = "";
       let stderr = "";
+      const watchdog = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error("graceful shutdown fixture timed out"));
+      }, 5_000);
 
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
@@ -23,8 +27,14 @@ describe("graceful shutdown — real process exit", () => {
       child.stderr.on("data", (chunk: string) => {
         stderr += chunk;
       });
-      child.on("error", reject);
-      child.on("close", (code) => resolve({ code, stdout, stderr }));
+      child.on("error", (error) => {
+        clearTimeout(watchdog);
+        reject(error);
+      });
+      child.on("close", (code) => {
+        clearTimeout(watchdog);
+        resolve({ code, stdout, stderr });
+      });
     });
 
     expect(result.stdout).toContain("BACKPRESSURE");
@@ -33,7 +43,7 @@ describe("graceful shutdown — real process exit", () => {
     expect(result.stderr).toContain("[shutdown] handler complete; exiting (signal=SIGTERM)\n");
   });
 
-  it("preserves a fatal exit that races the final shutdown breadcrumb", async () => {
+  it("flushes a fatal record when the crash starts after the final shutdown breadcrumb", async () => {
     const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
       const child = spawn(process.execPath, ["--import", "tsx", fixture, "crash-during-shutdown"], {
         cwd: serverRoot,
@@ -73,5 +83,6 @@ describe("graceful shutdown — real process exit", () => {
     expect(result.code).toBe(1);
     expect(result.stderr).toContain("[shutdown] uncaughtException: Error: SHUTDOWN_CRASH_SENTINEL");
     expect(result.stderr).toContain("[shutdown] handler complete; exiting (signal=SIGTERM)\n");
+    expect(result.stderr).toContain("[shutdown] exiting 1 after uncaughtException");
   });
 });
