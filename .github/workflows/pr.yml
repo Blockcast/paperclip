@@ -98,6 +98,9 @@ jobs:
       - name: Test release verify workflow wiring
         run: node --test ./scripts/__tests__/release-verify-workflow.test.mjs
 
+      - name: Test verify job cancelled-vs-failed lane outcome
+        run: node --test ./scripts/__tests__/pr-verify-lane-outcome.test.mjs
+
       - name: Test standalone package build concurrency
         run: node --test ./scripts/__tests__/build-standalone-concurrency.test.mjs
 
@@ -353,6 +356,13 @@ jobs:
     timeout-minutes: 5
 
     steps:
+      # BLO-20867: an upstream lane can end up `cancelled` rather than `failure`
+      # when CI infrastructure (e.g. an ARC runner-scale-set listener bounce)
+      # interrupts it before it produces a result. That is not a code problem
+      # with the PR, but a plain `test "$X" = "success"` makes both cases look
+      # like an identical failing required check, so authors misattribute
+      # infra outages to their own diff. Separate the two outcomes here so the
+      # annotation on this job says which one actually happened.
       - name: Fail if any split verify lane failed
         env:
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
@@ -360,10 +370,32 @@ jobs:
           WORKTREE_INSTALL_RESULT: ${{ needs.worktree_install.result }}
           BUILD_RESULT: ${{ needs.build.result }}
         run: |
-          test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"
-          test "$GENERAL_TESTS_RESULT" = "success"
-          test "$WORKTREE_INSTALL_RESULT" = "success"
-          test "$BUILD_RESULT" = "success"
+          declare -A lane_results=(
+            [typecheck_release_registry]="$TYPECHECK_RELEASE_REGISTRY_RESULT"
+            [general_tests]="$GENERAL_TESTS_RESULT"
+            [worktree_install]="$WORKTREE_INSTALL_RESULT"
+            [build]="$BUILD_RESULT"
+          )
+
+          cancelled_lanes=()
+          failed_lanes=()
+          for lane in "${!lane_results[@]}"; do
+            case "${lane_results[$lane]}" in
+              success) ;;
+              cancelled) cancelled_lanes+=("$lane") ;;
+              *) failed_lanes+=("$lane") ;;
+            esac
+          done
+
+          if [ "${#failed_lanes[@]}" -gt 0 ]; then
+            echo "::error title=verify: lane failure::Upstream lane(s) failed: ${failed_lanes[*]}. This reflects a real problem with the PR diff."
+            exit 1
+          fi
+
+          if [ "${#cancelled_lanes[@]}" -gt 0 ]; then
+            echo "::error title=verify: infrastructure cancellation::Upstream lane(s) were CANCELLED, not failed: ${cancelled_lanes[*]}. This is a CI infrastructure interruption (see BLO-20867), not a problem with this PR's diff. Re-run the job once CI is stable."
+            exit 1
+          fi
 
   build:
     name: Build
