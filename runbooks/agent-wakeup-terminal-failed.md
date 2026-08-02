@@ -67,6 +67,13 @@ suppressing itself to 0 — that shape is the most page-worthy one here.
 
 ### Step 1 — find the rows
 
+This query mirrors the gauge's own predicates, so it returns **exactly the
+population that fired the alert** and nothing else. The earlier version of this
+step selected every `status='failed'` wake in the last 24 hours, which also
+returns non-PR wakes and PR wakes the successor exclusion deliberately covers —
+mid-incident that sends you to unrelated or already-retried rows while the page
+asserts the selected PR has no review.
+
 ```sql
 select w.id,
        w.agent_id,
@@ -74,13 +81,43 @@ select w.id,
        w.error,
        w.payload ->> 'taskKey' as task_key,
        w.finished_at,
+       now() - w.finished_at as age,
        r.error_code
 from agent_wakeup_requests w
 left join heartbeat_runs r on r.id = w.run_id
 where w.status = 'failed'
   and w.finished_at > now() - interval '24 hours'
-order by w.finished_at desc;
+  -- scope="pr_review": the webhook writes this prefix literally.
+  and coalesce(w.payload ->> 'taskKey' like 'pr\_review:%', false)
+  -- No successor WAKE proving the taskKey was picked back up. Positive
+  -- allowlist, not `!= 'failed'`: skipped / cancelled /
+  -- dispatch_failed_exhausted / dispatch_superseded never ran a review.
+  and not exists (
+    select 1
+    from agent_wakeup_requests s
+    where s.payload ->> 'taskKey' = w.payload ->> 'taskKey'
+      and s.id <> w.id
+      and s.requested_at > w.finished_at
+      and s.status in ('queued', 'claimed', 'running',
+                       'scheduled', 'deferred_issue_execution', 'completed')
+  )
+  -- No successor RUN either (this is what the BLO-18030 bounded retry writes).
+  and not exists (
+    select 1
+    from heartbeat_runs sr
+    where sr.context_task_key = w.payload ->> 'taskKey'
+      and sr.created_at > w.finished_at
+      and sr.status in ('queued', 'running', 'scheduled_retry', 'succeeded')
+  )
+order by w.finished_at asc;
 ```
+
+Ordered oldest-first: the alert thresholds the **oldest** unresolved row, so the
+first row returned is the one whose age tripped it.
+
+To sanity-check the count series instead, drop the two `not exists` blocks and
+`group by` the scope — but never triage from that wider set, because it includes
+rows that are already covered.
 
 `task_key` has the shape `pr_review:<owner>/<repo>:<prNumber>` — that is the PR
 to look at.

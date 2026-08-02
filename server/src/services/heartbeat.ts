@@ -24527,15 +24527,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   /**
    * Per-scope scan budget for {@link publishAgentWakeupTerminalFailedGauge}.
    *
+   * This bounds the COUNT series only. The age series the alert actually
+   * thresholds is computed by an uncapped aggregate
+   * (`selectOldestUnresolvedFinishedAt`) precisely so that no scan budget can
+   * hide an old row from it.
+   *
    * The cap is applied PER SCOPE, with a separate query each, and that split is
    * load-bearing rather than cosmetic. A single global `limit` ordered by
    * `finishedAt desc` is resolved by Postgres before anything in this function
    * can look at `payload->>'taskKey'`, so the scope a row belongs to is not yet
    * known when rows are discarded. One noisy hour of ordinary wake failures
-   * would then evict an older unresolved `pr_review` failure from the candidate
-   * set and drive the alertable series to zero — the alert would go quiet
-   * exactly when the fleet is least healthy. Giving `pr_review` its own budget
-   * means non-review volume, however large, cannot consume it.
+   * would then evict unresolved `pr_review` failures from the candidate set and
+   * drive the alertable count to zero. Giving `pr_review` its own budget means
+   * non-review volume, however large, cannot consume it.
+   *
+   * Within a scope the count remains a bounded sample: past the budget it
+   * saturates rather than climbing. That is acceptable where a truncated MIN
+   * was not — a saturated count is still non-zero and still pages, whereas a
+   * truncated oldest-age is simply the wrong number and reads as healthy.
    *
    * `other` is dashboard-only (nothing pages on it), so its budget exists to
    * bound the query rather than to guarantee completeness.
@@ -24657,15 +24666,109 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .orderBy(desc(agentWakeupRequests.finishedAt))
           .limit(limit);
 
-      const [prReviewRows, otherRows] = await Promise.all([
+      /**
+       * Oldest unresolved terminal-`failed` wake per scope, computed with NO
+       * row cap (BLO-20255, Ally round 3).
+       *
+       * This exists because the alert thresholds the OLDEST unresolved age
+       * while `selectCandidates` is ordered `finishedAt desc` and capped. Those
+       * two facts compose into a silent failure: during a sustained burst of
+       * `pr_review` failures — roughly 17/min is enough to refill a 500-row
+       * budget inside the 30m threshold — every row older than the threshold is
+       * discarded before this function sees it, so the published age is
+       * permanently young and the alert stays quiet during exactly the outage
+       * it was built to detect. Raising the cap only moves the burst rate that
+       * defeats it; the cap has to be off the age path entirely.
+       *
+       * It is an aggregate, so "uncapped" costs one row per scope, not a scan
+       * proportional to the failure count. The count series keeps its bounded
+       * scan: a count is a magnitude and a truncated magnitude still pages,
+       * whereas a truncated MIN is simply the wrong number.
+       *
+       * The successor predicates are built from the SAME
+       * TERMINAL_FAILED_WAKE_SUCCESSOR_* constants the JS path uses. That is
+       * deliberate — the round-2 critical on this file was a successor
+       * vocabulary that had drifted out of step, and hand-copying the statuses
+       * into SQL would have recreated exactly that bug with a second source of
+       * truth. A row with a null taskKey cannot be matched by either subquery,
+       * so `not exists` holds and it counts as unresolved, matching the JS path.
+       */
+      const successorStatusList = (statuses: readonly string[]) =>
+        sql.join(
+          statuses.map((status) => sql`${status}`),
+          sql`, `,
+        );
+      const selectOldestUnresolvedFinishedAt = async () => {
+        const scopeExpr = sql<boolean>`${isPrReviewTaskKey}`;
+        const aggregated = await db
+          .select({
+            isPrReview: scopeExpr,
+            oldest: sql<string | Date | null>`min(${agentWakeupRequests.finishedAt})`,
+          })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.status, "failed"),
+              gte(agentWakeupRequests.finishedAt, cutoff),
+              sql`not exists (
+                select 1
+                from agent_wakeup_requests successor_wake
+                where successor_wake.payload ->> 'taskKey' = ${wakeTaskKey}
+                  and successor_wake.id <> ${agentWakeupRequests.id}
+                  and successor_wake.requested_at > ${agentWakeupRequests.finishedAt}
+                  and successor_wake.status in (${successorStatusList(
+                    TERMINAL_FAILED_WAKE_SUCCESSOR_WAKE_STATUSES,
+                  )})
+              )`,
+              sql`not exists (
+                select 1
+                from heartbeat_runs successor_run
+                where successor_run.context_task_key = ${wakeTaskKey}
+                  and successor_run.created_at > ${agentWakeupRequests.finishedAt}
+                  and successor_run.status in (${successorStatusList(
+                    TERMINAL_FAILED_WAKE_SUCCESSOR_RUN_STATUSES,
+                  )})
+              )`,
+            ),
+          )
+          .groupBy(scopeExpr);
+
+        const out: Array<{ scope: string; finishedAt: Date }> = [];
+        for (const row of aggregated) {
+          // Same parse-at-the-boundary rule as noteSuccessor(): the driver
+          // returns a `min(timestamptz)` aggregate as a STRING regardless of
+          // the TS annotation, and an unparsed string would silently produce a
+          // NaN age.
+          if (!row.oldest) continue;
+          const parsed = row.oldest instanceof Date ? row.oldest : new Date(row.oldest);
+          if (Number.isNaN(parsed.getTime())) continue;
+          out.push({ scope: row.isPrReview ? "pr_review" : "other", finishedAt: parsed });
+        }
+        return out;
+      };
+
+      const [prReviewRows, otherRows, oldestUnresolvedByScope] = await Promise.all([
         selectCandidates("pr_review", TERMINAL_FAILED_WAKE_GAUGE_SCAN_LIMIT_PR_REVIEW),
         selectCandidates("other", TERMINAL_FAILED_WAKE_GAUGE_SCAN_LIMIT_OTHER),
+        selectOldestUnresolvedFinishedAt(),
       ]);
       const rows = [...prReviewRows, ...otherRows];
 
+      // The age series is published from the UNBOUNDED aggregate, so it is
+      // correct even when the detail scan above is saturated. Publishing it
+      // before the early return also means "no candidates at all" and "no
+      // unresolved candidates" agree: both zero every scope.
+      const oldestAges = oldestUnresolvedByScope.map(({ scope, finishedAt }) => ({
+        scope,
+        // Clamped at 0 so a row finishing a scrape into the future (clock skew
+        // between the app and the DB) cannot publish a negative age that reads
+        // as "brand new" forever.
+        ageSeconds: Math.max(0, Math.floor((now.getTime() - finishedAt.getTime()) / 1000)),
+      }));
+      setAgentWakeupTerminalFailedOldestAgeSeconds(oldestAges);
+
       if (rows.length === 0) {
         setAgentWakeupTerminalFailedUnresolved([]);
-        setAgentWakeupTerminalFailedOldestAgeSeconds([]);
         return;
       }
 
@@ -24754,11 +24857,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const counts = new Map<string, { errorCode: string | null; scope: string; count: number }>();
-      // Oldest surviving failure per scope, in seconds. This is what the alert
-      // thresholds on -- see setAgentWakeupTerminalFailedOldestAgeSeconds for
-      // why a Prometheus `for:` cannot express "one row has been failed for
-      // 30m".
-      const oldestAgeSecondsByScope = new Map<string, number>();
       for (const row of rows) {
         const finishedAt = row.finishedAt;
         if (row.taskKey && finishedAt) {
@@ -24773,23 +24871,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const existing = counts.get(key);
         if (existing) existing.count += 1;
         else counts.set(key, { errorCode, scope, count: 1 });
-
-        if (finishedAt) {
-          // Clamped at 0 so a row finishing a scrape into the future (clock
-          // skew between the app and the DB) cannot publish a negative age
-          // that reads as "brand new" forever.
-          const ageSeconds = Math.max(0, Math.floor((now.getTime() - finishedAt.getTime()) / 1000));
-          const currentOldest = oldestAgeSecondsByScope.get(scope);
-          if (currentOldest === undefined || ageSeconds > currentOldest) {
-            oldestAgeSecondsByScope.set(scope, ageSeconds);
-          }
-        }
       }
 
       setAgentWakeupTerminalFailedUnresolved([...counts.values()]);
-      setAgentWakeupTerminalFailedOldestAgeSeconds(
-        [...oldestAgeSecondsByScope].map(([scope, ageSeconds]) => ({ scope, ageSeconds })),
-      );
     } catch (err) {
       logger.warn({ err }, "failed to publish terminal-failed wake gauge (BLO-20255)");
     }

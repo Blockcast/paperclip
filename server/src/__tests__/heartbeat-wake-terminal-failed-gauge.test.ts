@@ -751,4 +751,54 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
     expect(await gaugeTotal({ scope: "pr_review" })).toBe(1);
     expect(await oldestAgeSeconds("pr_review")).toBeGreaterThan(7_000);
   });
+
+  it("reports the oldest pr_review age even when newer SAME-scope failures exceed the scan budget", async () => {
+    // The same-scope half of the crowd-out problem, and the one that survived
+    // the per-scope split. Giving pr_review its own budget stops `other` from
+    // consuming it, but does nothing about pr_review failures crowding out
+    // each other: the detail scan is ordered `finished_at desc`, so once more
+    // than TERMINAL_FAILED_WAKE_GAUGE_SCAN_LIMIT_PR_REVIEW (500) newer
+    // PR-review failures exist, every row older than them is discarded before
+    // the age is computed. The published age is then permanently young and the
+    // alert -- which thresholds age > 30m -- stays silent during exactly the
+    // review-wake outage it exists to detect. At the ~17 failures/min that
+    // refills a 500-row budget inside 30m, that silence is indefinite.
+    //
+    // The fix is that the age comes from an uncapped aggregate rather than
+    // from the bounded scan. Reverting that makes this assertion read ~60s.
+    const { agentId, companyId } = await seedCompanyAndAgent();
+    const now = new Date();
+    await seedFailedWake({
+      companyId,
+      agentId,
+      finishedAt: new Date(now.getTime() - 7_200_000),
+      taskKey: PR_TASK_KEY,
+      errorCode: "external_lifecycle_stale_killed",
+    });
+
+    // Distinct taskKeys so each flood row is genuinely unresolved rather than
+    // vouching for its siblings, and all NEWER than the row above.
+    const flood = Array.from({ length: 520 }, (_unused, index) => ({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "github_pr_review_requested",
+      status: "failed",
+      finishedAt: new Date(now.getTime() - 60_000 + index),
+      payload: { taskKey: `pr_review:crowd-${index}` },
+    }));
+    for (let offset = 0; offset < flood.length; offset += 100) {
+      await db.insert(agentWakeupRequests).values(flood.slice(offset, offset + 100));
+    }
+
+    await heartbeat.reconcileFailedWakeDispatches(now);
+
+    // The count saturates at the scan budget -- acceptable, because a
+    // saturated count is still non-zero and still pages.
+    expect(await gaugeTotal({ scope: "pr_review" })).toBeGreaterThanOrEqual(500);
+    // The age must be the real oldest row, not the newest 500's floor.
+    expect(await oldestAgeSeconds("pr_review")).toBeGreaterThan(7_000);
+  });
 });
