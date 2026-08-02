@@ -56,7 +56,7 @@ describe("paperclip agent Dockerfile", () => {
     expect(dockerfileRuntime).toContain("FROM ${RUNTIME_BASE_IMAGE}");
     expect(dockerfileRuntime).toContain("ARG CLAUDE_CODE_VERSION=2.1.210");
     expect(dockerfileRuntime).toContain("ARG CODEX_CLI_VERSION=0.144.4");
-    expect(dockerfileRuntime).toContain("ARG OPENCODE_AI_VERSION=1.15.12");
+    expect(dockerfileRuntime).toContain("ARG OPENCODE_AI_VERSION=1.18.11");
     expect(dockerfileRuntime).toContain("ARG GEMINI_CLI_VERSION=0.50.0");
     expect(dockerfileRuntime).not.toContain("@latest");
   });

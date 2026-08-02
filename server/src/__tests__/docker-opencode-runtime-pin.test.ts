@@ -22,9 +22,9 @@ const designerPackageLock = readFileSync(path.join(repoRoot, "packages/services/
 
 describe("production Dockerfile k8s adapter runtime pins", () => {
   it("pins opencode-ai and asserts the installed version", () => {
-    expect(runtimeDockerfile).toContain("ARG OPENCODE_AI_VERSION=1.15.12");
-    expect(runtimeDockerfile).toContain("reasoning output items");
-    expect(runtimeDockerfile).toContain("UnknownError/exit 1");
+    expect(runtimeDockerfile).toContain("ARG OPENCODE_AI_VERSION=1.18.11");
+    expect(runtimeDockerfile).toContain("response.in_progress");
+    expect(runtimeDockerfile).toContain("opencode-responses-replay.mjs");
     expect(runtimeDockerfile).toContain('"opencode-ai@${OPENCODE_AI_VERSION}"');
     expect(runtimeDockerfile).toContain('test "$(opencode --version)" = "${OPENCODE_AI_VERSION}"');
     expect(runtimeDockerfile).not.toMatch(/npm install[^\n]*\sopencode-ai(?:\s|\\)/);
