@@ -121,6 +121,96 @@ function isSdkInstallRaceError(err: unknown): boolean {
   );
 }
 
+/**
+ * Transient worker-startup failures (BLO-20410).
+ *
+ * `startWorker()` runs the `initialize` RPC under INITIALIZE_TIMEOUT_MS (60s,
+ * plugin-worker-manager.ts) and throws `Worker initialize failed for "<id>":
+ * RPC call "initialize" timed out after 60000ms` when the budget is blown. That
+ * failure used to latch the plugin at `status='error'` on the first attempt,
+ * where nothing ever retried it — four of eleven plugins (including
+ * `lucitra.plugin-secrets`) sat dead for 9+ hours and all four recovered from a
+ * single manual `/enable` with no other change.
+ *
+ * The timeout is a symptom of boot contention, not of a broken plugin, so it is
+ * retried rather than latched. Deliberately narrow: only the initialize budget
+ * and a worker that died during startup qualify. A plugin that reports a real
+ * fault (`initialize returned ok=false`, a manifest error, a missing
+ * entrypoint) still fails closed on the first attempt.
+ */
+const TRANSIENT_ACTIVATION_ERR_MARKERS = [
+  "timed out after",
+  "Worker initialize failed",
+  "Worker exited during startup",
+];
+
+export function isTransientActivationError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  // An explicit ok=false is the plugin answering "I am broken" inside the
+  // budget — a real fault, not contention. Never retry it.
+  if (msg.includes("initialize returned ok=false")) return false;
+  return TRANSIENT_ACTIVATION_ERR_MARKERS.some((marker) => msg.includes(marker));
+}
+
+/**
+ * Each attempt can burn the full 60s initialize budget, so this schedule is
+ * deliberately short: two extra attempts, ~10s of added delay. Bounded boot
+ * concurrency (PLUGIN_ACTIVATION_CONCURRENCY) removes most of the contention
+ * that causes these timeouts; this is the safety net for what slips through.
+ */
+export const TRANSIENT_ACTIVATION_RETRY_DELAYS_MS = [2_000, 8_000];
+
+/**
+ * Boot-time activation was an unbounded `Promise.allSettled` over every ready
+ * plugin, so all eleven raced for the same 60s initialize window and the losers
+ * latched `error`. Enabling them one at a time afterwards succeeded every time,
+ * which is what identifies this as contention rather than per-plugin slowness.
+ *
+ * `loadAll()` is fire-and-forget at boot (app.ts) so serializing does not delay
+ * readiness.
+ */
+const DEFAULT_PLUGIN_ACTIVATION_CONCURRENCY = 4;
+
+export function resolveActivationConcurrency(): number {
+  const raw = process.env.PAPERCLIP_PLUGIN_ACTIVATION_CONCURRENCY;
+  if (!raw) return DEFAULT_PLUGIN_ACTIVATION_CONCURRENCY;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return DEFAULT_PLUGIN_ACTIVATION_CONCURRENCY;
+  }
+  return parsed;
+}
+
+/**
+ * Run `task` over `items` with at most `limit` in flight, preserving input
+ * order in the result. Never rejects: like `Promise.allSettled`, each slot
+ * captures its own failure so one bad plugin cannot abort the rest.
+ */
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  task: (item: T, index: number) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results = new Array<PromiseSettledResult<R>>(items.length);
+  let cursor = 0;
+
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      try {
+        results[index] = { status: "fulfilled", value: await task(items[index]!, index) };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  };
+
+  const slots = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: slots }, () => worker()));
+  return results;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -2279,9 +2369,18 @@ export function pluginLoader(
         "plugin-loader: found ready plugins to load",
       );
 
-      // Load plugins in parallel
-      const results = await Promise.allSettled(
-        readyPlugins.map((plugin) => activatePlugin(plugin))
+      // Activate with bounded concurrency. An unbounded fan-out here put every
+      // ready plugin into the same 60s `initialize` window and the losers
+      // latched status='error' permanently (BLO-20410).
+      const concurrency = resolveActivationConcurrency();
+      log.info(
+        { count: readyPlugins.length, concurrency },
+        "plugin-loader: activating plugins with bounded concurrency",
+      );
+      const results = await mapWithConcurrency(
+        readyPlugins,
+        concurrency,
+        (plugin) => activatePlugin(plugin),
       );
 
       const loadResults = results.map((r, i) => {
@@ -2608,38 +2707,73 @@ export function pluginLoader(
         };
       }
 
-      for (let attempt = 0; ; attempt++) {
+      // Two independent retry budgets share this loop: the SDK install race
+      // (module not found, cheap to retry) and a transient startup failure such
+      // as the 60s `initialize` timeout (BLO-20410, expensive to retry). They
+      // are counted separately so exhausting one does not consume the other.
+      let sdkRaceAttempt = 0;
+      let transientAttempt = 0;
+      for (;;) {
         try {
           if (workerManager.getWorker(pluginId)) {
             await workerManager.stopWorker(pluginId);
           }
           await workerManager.startWorker(pluginId, workerOptions);
-          if (attempt > 0) {
+          if (sdkRaceAttempt > 0 || transientAttempt > 0) {
             log.info(
-              { pluginId, pluginKey, attempt },
-              "plugin-loader: worker started after SDK install race retry",
+              { pluginId, pluginKey, sdkRaceAttempt, transientAttempt },
+              "plugin-loader: worker started after activation retry",
             );
           }
           break;
         } catch (err) {
           if (
-            !isSdkInstallRaceError(err) ||
-            attempt >= SDK_INSTALL_RACE_RETRY_DELAYS_MS.length
+            isSdkInstallRaceError(err) &&
+            sdkRaceAttempt < SDK_INSTALL_RACE_RETRY_DELAYS_MS.length
           ) {
-            throw err;
+            const delay = SDK_INSTALL_RACE_RETRY_DELAYS_MS[sdkRaceAttempt]!;
+            sdkRaceAttempt += 1;
+            log.warn(
+              {
+                pluginId,
+                pluginKey,
+                attempt: sdkRaceAttempt,
+                delayMs: delay,
+                err: err instanceof Error ? err.message : String(err),
+              },
+              "plugin-loader: SDK install race detected, retrying worker spawn",
+            );
+            await sleep(delay);
+            continue;
           }
-          const delay = SDK_INSTALL_RACE_RETRY_DELAYS_MS[attempt]!;
-          log.warn(
-            {
-              pluginId,
-              pluginKey,
-              attempt: attempt + 1,
-              delayMs: delay,
-              err: err instanceof Error ? err.message : String(err),
-            },
-            "plugin-loader: SDK install race detected, retrying worker spawn",
-          );
-          await sleep(delay);
+
+          // An SDK install race that has exhausted its own budget must not fall
+          // through and borrow the transient budget as well — a crashed-at-import
+          // worker matches both classifiers, and chaining them would silently
+          // give the SDK race 7 attempts instead of 5.
+          if (
+            !isSdkInstallRaceError(err) &&
+            isTransientActivationError(err) &&
+            transientAttempt < TRANSIENT_ACTIVATION_RETRY_DELAYS_MS.length
+          ) {
+            const delay = TRANSIENT_ACTIVATION_RETRY_DELAYS_MS[transientAttempt]!;
+            transientAttempt += 1;
+            log.warn(
+              {
+                pluginId,
+                pluginKey,
+                attempt: transientAttempt,
+                maxAttempts: TRANSIENT_ACTIVATION_RETRY_DELAYS_MS.length,
+                delayMs: delay,
+                err: err instanceof Error ? err.message : String(err),
+              },
+              "plugin-loader: transient worker startup failure, retrying before marking plugin errored",
+            );
+            await sleep(delay);
+            continue;
+          }
+
+          throw err;
         }
       }
       registered.worker = true;
