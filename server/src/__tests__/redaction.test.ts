@@ -306,6 +306,32 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
     expect(result?.base_url).toBe(REDACTED_EVENT_VALUE);
   });
 
+  // CTO finding (#943 review, post-tiering): the URL branch returned "safe"
+  // for any URL without `user:pass@` userinfo or a `?token=`-style query, so
+  // a capability URL that embeds its credential directly in the path (a
+  // Slack incoming-webhook shape: no userinfo, no query string) displayed in
+  // full under a Tier-2 key. `base_url` is Tier 2, so unlike the `apiKey`
+  // case above (Tier 1, redacts unconditionally without ever reaching
+  // `looksLikeCredentialValue`), this is the case that actually exercises
+  // the URL branch's path-segment gate. Mutation check: reverting only the
+  // `hasOpaqueUrlPathSegment` gate (i.e. the pre-fix URL branch) makes this
+  // assertion fail while every other test in this file still passes.
+  it("still redacts a Tier-2 key's URL that embeds its credential as a bare path segment", () => {
+    const result = redactEventPayload({
+      base_url: "https://hooks.slack.test/services/T000/B000/AbCdEfGhIjKlMnOpQrSt99",
+    });
+
+    expect(result?.base_url).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("does not redact a Tier-2 key's URL whose path segments are all short", () => {
+    const result = redactEventPayload({
+      base_url: "https://github.com/Blockcast/paperclip/pull/1898",
+    });
+
+    expect(result?.base_url).toBe("https://github.com/Blockcast/paperclip/pull/1898");
+  });
+
   // Ally review (#943): a spaced passphrase or cookie value was exempted by
   // the old whitespace check. Both key stems are Tier-1 now, so the value
   // shape never matters.
