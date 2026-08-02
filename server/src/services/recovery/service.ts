@@ -5101,7 +5101,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         // Pinning to `fresh.status` keeps the steady-state retry working (a reread
         // that already found `blocked` expects `blocked`) while rejecting a
         // transition into `blocked` that lands after the reread.
-        { expectedStatus: [fresh.status] },
+        //
+        // Ally follow-up: status alone is not enough. A concurrent writer can keep
+        // the same status while changing blockers or ownership, so include the
+        // observed freshness marker too.
+        { expectedStatus: [fresh.status], expectedUpdatedAt: fresh.updatedAt },
       );
       // BLO-18829: throw rather than `return null`. Returning would COMMIT the
       // transaction, which is exactly the bug: the recovery action, monitor, and wake
@@ -5139,77 +5143,78 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const { fresh, action, isProviderQuotaWait, recoveryCause, blockerIds, needsHumanDecision } =
       postCommitNotifications;
 
-    if (!isProviderQuotaWait) {
-      const prefix = await getCompanyIssuePrefix(fresh.companyId);
-      const workspacePreflightHandoffCause = describeWorkspacePreflightRecoveryCause(input.latestRun);
-      const recoveryOwner = action.ownerAgentId ? await getAgent(action.ownerAgentId) : null;
-      const sourceAssignee = fresh.assigneeAgentId ? await getAgent(fresh.assigneeAgentId) : null;
-      let notice: SuccessfulRunHandoffNotice | null = null;
-      if (recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON && input.successfulRunHandoffEvidence) {
-        notice = buildSuccessfulRunHandoffExhaustedNotice({
-          issue: fresh,
-          sourceRun: input.successfulRunHandoffEvidence.sourceRunId
-            ? { id: input.successfulRunHandoffEvidence.sourceRunId, status: "succeeded" }
-            : null,
-          correctiveRun: input.latestRun ? { id: input.latestRun.id, status: input.latestRun.status } : null,
-          sourceAssignee,
-          recoveryIssue: null,
-          recoveryActionId: action.id,
-          recoveryOwner,
-          latestIssueStatus: fresh.status,
-          latestHandoffRunStatus: input.latestRun?.status ?? "unknown",
-          missingDisposition: input.successfulRunHandoffEvidence.missingDisposition,
-        });
-      }
-      // BLO-18860: a recovery escalation that moves the issue to a NEW owner is
-      // a transfer of write access away from the previous assignee — after it,
-      // that agent's `allow_self` grant is gone and its next PATCH/comment on
-      // the issue 403s. Make the transfer legible in the issue history (naming
-      // the recovery action AND the cause) instead of only in
-      // `activeRecoveryAction`, so the previous owner and any reader can see
-      // who owns it now and why. `fresh` was read before the status/assignee
-      // update below, so its `assigneeAgentId` is the pre-transfer owner.
-      const reassignsAssignee = Boolean(
-        action.ownerAgentId && action.ownerAgentId !== fresh.assigneeAgentId,
-      );
-      // Stable dedup key for the transfer announcement: one comment per
-      // (recovery action, new owner), so a repeated escalation to the SAME
-      // owner stays silent while a transfer to a new owner is always announced.
-      const reassignmentMarker = `Reassigned by recovery action \`${action.id}\` to owner \`${action.ownerAgentId}\``;
-      const recoveryLine = action.ownerAgentId
-        ? [
-          "",
-          `- Recovery action: \`${action.id}\` (cause \`${recoveryCause}\`, attempt ${action.attemptCount})`,
-          `- Recovery owner: ${agentUiLink(recoveryOwner, prefix)}`,
-          ...(reassignsAssignee
-            ? [
-              `- ${reassignmentMarker}: taken over from ${agentUiLink(sourceAssignee, prefix)}, which can no longer PATCH or comment on this issue as its assignee.`,
-            ]
-            : []),
-          workspacePreflightHandoffCause
-            ? `- Next action: ${workspacePreflightHandoffCause}`
-            : "- Next action: the recovery owner should restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
-        ].join("\n")
-        : [
-          "",
-          `- Recovery action: \`${action.id}\` (cause \`${recoveryCause}\`, attempt ${action.attemptCount})`,
-          "- Recovery owner: board escalation, because Paperclip could not find an invokable manager, creator, or executive owner with budget available.",
-          "- Next action: a board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
-        ].join("\n");
+    try {
+      if (!isProviderQuotaWait) {
+        const prefix = await getCompanyIssuePrefix(fresh.companyId);
+        const workspacePreflightHandoffCause = describeWorkspacePreflightRecoveryCause(input.latestRun);
+        const recoveryOwner = action.ownerAgentId ? await getAgent(action.ownerAgentId) : null;
+        const sourceAssignee = fresh.assigneeAgentId ? await getAgent(fresh.assigneeAgentId) : null;
+        let notice: SuccessfulRunHandoffNotice | null = null;
+        if (recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON && input.successfulRunHandoffEvidence) {
+          notice = buildSuccessfulRunHandoffExhaustedNotice({
+            issue: fresh,
+            sourceRun: input.successfulRunHandoffEvidence.sourceRunId
+              ? { id: input.successfulRunHandoffEvidence.sourceRunId, status: "succeeded" }
+              : null,
+            correctiveRun: input.latestRun ? { id: input.latestRun.id, status: input.latestRun.status } : null,
+            sourceAssignee,
+            recoveryIssue: null,
+            recoveryActionId: action.id,
+            recoveryOwner,
+            latestIssueStatus: fresh.status,
+            latestHandoffRunStatus: input.latestRun?.status ?? "unknown",
+            missingDisposition: input.successfulRunHandoffEvidence.missingDisposition,
+          });
+        }
+        // BLO-18860: a recovery escalation that moves the issue to a NEW owner is
+        // a transfer of write access away from the previous assignee — after it,
+        // that agent's `allow_self` grant is gone and its next PATCH/comment on
+        // the issue 403s. Make the transfer legible in the issue history (naming
+        // the recovery action AND the cause) instead of only in
+        // `activeRecoveryAction`, so the previous owner and any reader can see
+        // who owns it now and why. `fresh` was read before the status/assignee
+        // update below, so its `assigneeAgentId` is the pre-transfer owner.
+        const reassignsAssignee = Boolean(
+          action.ownerAgentId && action.ownerAgentId !== fresh.assigneeAgentId,
+        );
+        // Stable dedup key for the transfer announcement: one comment per
+        // (recovery action, new owner), so a repeated escalation to the SAME
+        // owner stays silent while a transfer to a new owner is always announced.
+        const reassignmentMarker = `Reassigned by recovery action \`${action.id}\` to owner \`${action.ownerAgentId}\``;
+        const recoveryLine = action.ownerAgentId
+          ? [
+            "",
+            `- Recovery action: \`${action.id}\` (cause \`${recoveryCause}\`, attempt ${action.attemptCount})`,
+            `- Recovery owner: ${agentUiLink(recoveryOwner, prefix)}`,
+            ...(reassignsAssignee
+              ? [
+                `- ${reassignmentMarker}: taken over from ${agentUiLink(sourceAssignee, prefix)}, which can no longer PATCH or comment on this issue as its assignee.`,
+              ]
+              : []),
+            workspacePreflightHandoffCause
+              ? `- Next action: ${workspacePreflightHandoffCause}`
+              : "- Next action: the recovery owner should restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
+          ].join("\n")
+          : [
+            "",
+            `- Recovery action: \`${action.id}\` (cause \`${recoveryCause}\`, attempt ${action.attemptCount})`,
+            "- Recovery owner: board escalation, because Paperclip could not find an invokable manager, creator, or executive owner with budget available.",
+            "- Next action: a board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
+          ].join("\n");
 
-      // A later attempt normally stays silent (one comment per action), but a
-      // reassignment on that attempt must still be announced. The notice path
-      // keeps its own metadata-based dedup, so leave it on the original gate.
-      const announcesReassignment = reassignsAssignee && !notice;
-      const shouldPostEscalationComment =
-        action.attemptCount === 1 ||
-        recoveryCause === "workspace_validation_failed" ||
-        recoveryCause === "configuration_incomplete" ||
-        announcesReassignment;
-      if (shouldPostEscalationComment) {
-        const escalationCommentMarker = announcesReassignment
-          ? reassignmentMarker
-          : `Recovery action: \`${action.id}\``;
+        // A later attempt normally stays silent (one comment per action), but a
+        // reassignment on that attempt must still be announced. The notice path
+        // keeps its own metadata-based dedup, so leave it on the original gate.
+        const announcesReassignment = reassignsAssignee && !notice;
+        const shouldPostEscalationComment =
+          action.attemptCount === 1 ||
+          recoveryCause === "workspace_validation_failed" ||
+          recoveryCause === "configuration_incomplete" ||
+          announcesReassignment;
+        if (shouldPostEscalationComment) {
+          const escalationCommentMarker = announcesReassignment
+            ? reassignmentMarker
+            : `Recovery action: \`${action.id}\``;
         const hasEscalationComment = await db
           .select({ id: issueComments.id, body: issueComments.body, metadata: issueComments.metadata })
           .from(issueComments)
@@ -5239,8 +5244,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             );
           }
         }
-      }
-
+        }
       // BLO-18996: the wake budget is spent, so no further sweep will wake anyone for
       // this action. Say so once, on the source issue, rather than letting the loop go
       // quiet with no explanation — a silent stop reads exactly like a silent re-fire to
@@ -5376,6 +5380,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           blockedByIssueIds: blockerIds,
         });
       }
+      }
+    } catch (err) {
+      logger.warn(
+        { err, issueId: fresh.id, recoveryActionId: action.id },
+        "stranded recovery post-commit notification failed; wake dispatch will still run",
+      );
     }
 
     // The escalation is durable, and the outbox row means the wake is owed even if this
