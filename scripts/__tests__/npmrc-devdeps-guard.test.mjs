@@ -100,5 +100,12 @@ test("pr.yml guards the install against an ambient NODE_ENV=production", () => {
     "The legacy required verify job must depend on worktree_install so the guard gates merges.",
   );
   assert.match(verifyBody, /WORKTREE_INSTALL_RESULT:\s*\${{\s*needs\.worktree_install\.result\s*}}/);
-  assert.match(verifyBody, /test "\$WORKTREE_INSTALL_RESULT" = "success"/);
+
+  // BLO-20867: the pass/fail check moved from a flat `test "$X" = "success"`
+  // per lane to a lane_results map so cancelled and failed lanes can be
+  // reported distinctly (see scripts/__tests__/pr-verify-lane-outcome.test.mjs
+  // for the actual pass/fail behavior). Confirm worktree_install still feeds
+  // that map — otherwise a non-success worktree_install result could stop
+  // gating merges entirely.
+  assert.match(verifyBody, /\[worktree_install\]="\$WORKTREE_INSTALL_RESULT"/);
 });
