@@ -133,7 +133,11 @@ interface MockClients {
 
 const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
   const aggregates = new Map<string, Record<string, unknown>>();
-  const members = new Map<string, { firing: boolean; lastFiredAt: string }>();
+  const members = new Map<string, {
+    firing: boolean;
+    lastFiredAt: string;
+    resolvedAt: string | null;
+  }>();
   const stateValues = new Map<string, unknown>();
   const stateKey = (ref: { scopeKind: string; scopeId?: string; stateKey: string }) =>
     `${ref.scopeKind}:${ref.scopeId ?? ""}:${ref.stateKey}`;
@@ -141,45 +145,65 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
     db: {
       namespace: "alertmanager_test",
       execute: vi.fn(async (sql: string, params: unknown[] = []) => {
-        if (sql.includes("INSERT INTO") && sql.includes("alert_aggregates")) {
+        if (sql.trim().startsWith("INSERT INTO") && sql.includes("alert_aggregates")) {
+          const [key, companyId, alertname, severity] = params as string[];
+          const aggregateId = `${companyId}:${key}`;
+          if (!aggregates.has(aggregateId)) {
+            aggregates.set(aggregateId, {
+              aggregate_key: key,
+              company_id: companyId,
+              paperclip_issue_id: null,
+              alertname,
+              severity,
+              assignee_user_id: null,
+              assignee_agent_id: null,
+              final_resolved_at: null,
+              resolution_claim: null,
+              resolution_claimed_at: null,
+              resolution_generation: null,
+              resolution_requested_at: null,
+              reopen_required: false,
+              generation: 0,
+              active_fingerprints: [],
+            });
+            return { rowCount: 1 };
+          }
+          return { rowCount: 0 };
+        }
+        if (sql.includes("WITH accepted_member AS")) {
           const [key, companyId, alertname, severity, fingerprint, firedAt] = params as string[];
           const aggregateId = `${companyId}:${key}`;
           const current = aggregates.get(aggregateId);
+          const member = members.get(`${companyId}:${key}:${fingerprint}`);
+          if (
+            member?.resolvedAt &&
+            Date.parse(member.resolvedAt) >= Date.parse(firedAt)
+          ) {
+            return { rowCount: 0 };
+          }
           const reopenRequired = Boolean(
             current?.reopen_required ||
               current?.resolution_claim ||
               current?.final_resolved_at,
           );
-          aggregates.set(aggregateId, {
-            aggregate_key: key,
-            company_id: companyId,
-            paperclip_issue_id: current?.paperclip_issue_id ?? null,
+          Object.assign(current!, {
             alertname,
             severity,
-            assignee_user_id: current?.assignee_user_id ?? null,
-            assignee_agent_id: current?.assignee_agent_id ?? null,
             final_resolved_at: null,
-            resolution_claim: current?.resolution_claim ?? null,
-            resolution_claimed_at: current?.resolution_claimed_at ?? null,
-            resolution_generation: current?.resolution_generation ?? null,
-            resolution_requested_at: current?.resolution_requested_at ?? null,
             reopen_required: reopenRequired,
-            generation: Number(current?.generation ?? 0) + (current ? 1 : 0),
-            active_fingerprints: current
-              ? Array.from(
-                  new Set([
-                    ...((current.active_fingerprints as string[]) ?? []),
-                    fingerprint,
-                  ]),
-                )
-              : [fingerprint],
+            generation: Number(current?.generation ?? 0) + 1,
+            active_fingerprints: Array.from(
+              new Set([
+                ...((current?.active_fingerprints as string[]) ?? []),
+                fingerprint,
+              ]),
+            ),
           });
-          if (sql.includes("alert_members")) {
-            members.set(`${companyId}:${key}:${fingerprint}`, {
-              firing: true,
-              lastFiredAt: firedAt,
-            });
-          }
+          members.set(`${companyId}:${key}:${fingerprint}`, {
+            firing: true,
+            lastFiredAt: firedAt,
+            resolvedAt: null,
+          });
           return { rowCount: 1 };
         }
         if (sql.includes("INSERT INTO") && sql.includes("alert_members")) {
@@ -187,6 +211,7 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
           members.set(`${companyId}:${key}:${fingerprint}`, {
             firing: true,
             lastFiredAt: params[3] as string,
+            resolvedAt: null,
           });
           return { rowCount: 1 };
         }
@@ -295,7 +320,7 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
       }),
       query: vi.fn(async (sql: string, params: unknown[] = []) => {
         const [companyId, key, fingerprint] = params as string[];
-        if (sql.includes("WITH resolved_aggregate AS")) {
+        if (sql.includes("WITH resolved_member AS")) {
           const claim = params[3] as string;
           const resolvedAt = params[4] as string;
           const aggregate = aggregates.get(`${companyId}:${key}`);
@@ -322,6 +347,7 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
           }
           if (member) {
             member.firing = false;
+            member.resolvedAt = resolvedAt;
           }
           return [{ resolution_claim: aggregate.resolution_claim }];
         }
@@ -1820,9 +1846,9 @@ describe("handleWebhook — aggregate lifecycle", () => {
 
     await joinAggregate(ctx, "company-1", aggregateAlerts()[0]);
 
-    expect(mocks.db.execute).toHaveBeenCalledTimes(1);
-    const [sql] = mocks.db.execute.mock.calls[0] as [string];
-    expect(sql).toContain("WITH activated_aggregate AS");
+    expect(mocks.db.execute).toHaveBeenCalledTimes(2);
+    const [sql] = mocks.db.execute.mock.calls[1] as [string];
+    expect(sql).toContain("accepted_member AS");
     expect(sql).toContain("alert_aggregates");
     expect(sql).toContain("alert_members");
   });
@@ -1857,8 +1883,8 @@ describe("handleWebhook — aggregate lifecycle", () => {
 
     expect(mocks.db.execute).not.toHaveBeenCalled();
     const [sql] = mocks.db.query.mock.calls[0] as [string];
-    expect(sql).toContain("WITH resolved_aggregate AS");
-    expect(sql).toContain("resolved_member AS");
+    expect(sql).toContain("WITH resolved_member AS");
+    expect(sql).toContain("resolved_aggregate AS");
   });
 
   it("keeps identical aggregate keys isolated by company", async () => {
@@ -1890,7 +1916,10 @@ describe("handleWebhook — aggregate lifecycle", () => {
       .mockResolvedValueOnce({ id: "issue-1", status: "todo" })
       .mockResolvedValueOnce({ id: "issue-1", status: "cancelled" });
     mocks.db.beforeComplete = async () => {
-      await joinAggregate(ctx, "company-1", alert);
+      await joinAggregate(ctx, "company-1", {
+        ...alert,
+        startsAt: "2026-04-29T11:00:00Z",
+      });
     };
 
     const resolved = { ...alert, status: "resolved" as const, endsAt: "2026-04-29T10:00:00Z" };
@@ -2010,6 +2039,26 @@ describe("handleWebhook — aggregate lifecycle", () => {
   it("re-closes an issue when a stale reopen resumes after final resolution", async () => {
     const { ctx, mocks } = mkCtx();
     const alert = aggregateAlerts()[0];
+    const coverTransitions: Array<"firing" | "resolved"> = [];
+    const query = mocks.db.query.getMockImplementation()!;
+    mocks.db.query.mockImplementation(async (sql: string, params: unknown[] = []) => {
+      if (sql.includes("SELECT true AS present") && sql.includes("alert_escalation_cover_members")) {
+        return [{ present: true }];
+      }
+      return query(sql, params);
+    });
+    const execute = mocks.db.execute.getMockImplementation()!;
+    mocks.db.execute.mockImplementation(async (sql: string, params: unknown[] = []) => {
+      if (sql.includes("SET resolved_at = NULL") && sql.includes("alert_escalation_cover_members")) {
+        coverTransitions.push("firing");
+        return { rowCount: 1 };
+      }
+      if (sql.includes("SET resolved_at = COALESCE") && sql.includes("alert_escalation_cover_members")) {
+        coverTransitions.push("resolved");
+        return { rowCount: 1 };
+      }
+      return execute(sql, params);
+    });
     const aggregate = await joinAggregate(ctx, "company-1", alert);
     await bindAggregateIssue(ctx, "company-1", aggregate.aggregateKey, "issue-1", {});
     await resolveAggregateMember(
@@ -2067,6 +2116,7 @@ describe("handleWebhook — aggregate lifecycle", () => {
       "cancelled",
     ]);
     expect(issueStatus).toBe("cancelled");
+    expect(coverTransitions).toEqual(["resolved", "firing", "resolved"]);
   });
 
   it("ignores a delayed resolution from the firing generation before a re-fire", async () => {
@@ -2114,6 +2164,49 @@ describe("handleWebhook — aggregate lifecycle", () => {
     );
   });
 
+  it("ignores a delayed firing delivery from a finalized generation", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alert = aggregateAlerts()[0];
+    await handleWebhook(
+      ctx,
+      baseConfig({ autoCloseOnResolve: true }),
+      TOKEN,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+    await handleWebhook(
+      ctx,
+      baseConfig({ autoCloseOnResolve: true }),
+      TOKEN,
+      baseInput({
+        parsedBody: baseEnvelope({
+          status: "resolved",
+          alerts: [{
+            ...alert,
+            status: "resolved",
+            endsAt: "2026-04-29T10:00:00Z",
+          }],
+        }),
+      }),
+    );
+    mocks.issues.update.mockClear();
+    mocks.state.set.mockClear();
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ autoCloseOnResolve: true }),
+      TOKEN,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.aggregate.stale_firing",
+      1,
+      { alertname: "HindsightConsolidationStalled" },
+    );
+  });
+
   it("repairs escalation-cover membership before releasing the reopen claim", async () => {
     const { ctx, mocks } = mkCtx();
     const alert = aggregateAlerts()[0];
@@ -2139,7 +2232,10 @@ describe("handleWebhook — aggregate lifecycle", () => {
     });
     mocks.issues.get.mockResolvedValue({ id: "issue-1", status: "cancelled" });
     mocks.db.beforeComplete = async () => {
-      await joinAggregate(ctx, "company-1", alert);
+      await joinAggregate(ctx, "company-1", {
+        ...alert,
+        startsAt: "2026-04-29T11:00:00Z",
+      });
     };
 
     const resolved = {
@@ -2178,7 +2274,10 @@ describe("handleWebhook — aggregate lifecycle", () => {
       .mockResolvedValueOnce({ id: "issue-1", status: "todo" })
       .mockResolvedValue(null);
     mocks.db.beforeComplete = async () => {
-      await joinAggregate(ctx, "company-1", alert);
+      await joinAggregate(ctx, "company-1", {
+        ...alert,
+        startsAt: "2026-04-29T11:00:00Z",
+      });
     };
     const resolved = {
       ...alert,
@@ -2214,7 +2313,10 @@ describe("handleWebhook — aggregate lifecycle", () => {
     }));
     mocks.issues.update.mockImplementationOnce(async () => {
       issueStatus = "cancelled";
-      await joinAggregate(ctx, "company-1", alert);
+      await joinAggregate(ctx, "company-1", {
+        ...alert,
+        startsAt: "2026-04-29T11:00:00Z",
+      });
       throw new Error("worker died after external close");
     });
     const resolved = {

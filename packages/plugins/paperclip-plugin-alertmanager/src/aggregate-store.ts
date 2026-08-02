@@ -57,7 +57,7 @@ export async function joinAggregate(
   ctx: Pick<PluginContext, "db">,
   companyId: string,
   alert: AlertmanagerAlert,
-): Promise<AlertAggregateRecord> {
+): Promise<AlertAggregateRecord & { firingAccepted: boolean }> {
   const aggregateKey = aggregateKeyForAlert(alert);
   const alertname = alert.labels.alertname ?? "UnnamedAlert";
   const severity = alert.labels.severity ?? "unknown";
@@ -66,12 +66,27 @@ export async function joinAggregate(
   const members = table(ctx, "alert_members");
 
   await ctx.db.execute(
-    `WITH activated_aggregate AS (
-      INSERT INTO ${aggregates} AS aggregate
-       (aggregate_key, company_id, alertname, severity, active_fingerprints)
-      VALUES ($1, $2, $3, $4, ARRAY[$5]::text[])
-      ON CONFLICT (company_id, aggregate_key) DO UPDATE SET
-        severity = EXCLUDED.severity,
+    `INSERT INTO ${aggregates}
+       (aggregate_key, company_id, alertname, severity)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (company_id, aggregate_key) DO NOTHING`,
+    [aggregateKey, companyId, alertname, severity],
+  );
+  const activation = await ctx.db.execute(
+    `WITH accepted_member AS (
+      INSERT INTO ${members} AS member
+       (company_id, aggregate_key, fingerprint, firing, first_seen_at, last_fired_at, resolved_at)
+      VALUES ($2, $1, $5, true, $6::timestamptz, $6::timestamptz, NULL)
+      ON CONFLICT (company_id, aggregate_key, fingerprint) DO UPDATE SET
+        firing = true,
+        last_fired_at = GREATEST(member.last_fired_at, EXCLUDED.last_fired_at),
+        resolved_at = NULL
+      WHERE member.resolved_at IS NULL
+         OR member.resolved_at < EXCLUDED.last_fired_at
+      RETURNING company_id, aggregate_key
+    )
+    UPDATE ${aggregates} AS aggregate
+       SET severity = $4,
         active_fingerprints = CASE
           WHEN $5 = ANY(aggregate.active_fingerprints)
             THEN aggregate.active_fingerprints
@@ -83,16 +98,9 @@ export async function joinAggregate(
           OR aggregate.final_resolved_at IS NOT NULL,
         final_resolved_at = NULL,
         updated_at = now()
-      RETURNING company_id, aggregate_key
-    )
-    INSERT INTO ${members} AS member
-       (company_id, aggregate_key, fingerprint, firing, first_seen_at, last_fired_at, resolved_at)
-    SELECT company_id, aggregate_key, $5, true, $6::timestamptz, $6::timestamptz, NULL
-      FROM activated_aggregate
-    ON CONFLICT (company_id, aggregate_key, fingerprint) DO UPDATE SET
-      firing = true,
-      last_fired_at = GREATEST(member.last_fired_at, EXCLUDED.last_fired_at),
-      resolved_at = NULL`,
+      FROM accepted_member
+     WHERE aggregate.company_id = accepted_member.company_id
+       AND aggregate.aggregate_key = accepted_member.aggregate_key`,
     [aggregateKey, companyId, alertname, severity, alert.fingerprint, firedAt],
   );
 
@@ -104,7 +112,7 @@ export async function joinAggregate(
     [companyId, aggregateKey],
   );
   if (!row) throw new Error(`Aggregate disappeared after join: ${aggregateKey}`);
-  return fromRow(row);
+  return { ...fromRow(row), firingAccepted: activation.rowCount === 1 };
 }
 
 export async function bindAggregateIssue(
@@ -169,7 +177,15 @@ export async function resolveAggregateMember(
   const members = table(ctx, "alert_members");
   const claim = randomUUID();
   const [elected] = await ctx.db.query<{ resolution_claim: string | null }>(
-    `WITH resolved_aggregate AS (
+    `WITH resolved_member AS (
+       UPDATE ${members} AS member
+          SET firing = false, resolved_at = $5::timestamptz
+        WHERE member.company_id = $1
+          AND member.aggregate_key = $2
+          AND member.fingerprint = $3
+          AND member.last_fired_at <= $5::timestamptz
+      RETURNING member.company_id, member.aggregate_key
+    ), resolved_aggregate AS (
       UPDATE ${aggregates} AS aggregate
          SET active_fingerprints = array_remove(aggregate.active_fingerprints, $3),
             resolution_claim = CASE
@@ -217,15 +233,9 @@ export async function resolveAggregateMember(
               ELSE aggregate.resolution_requested_at
             END,
             updated_at = now()
-       WHERE aggregate.company_id = $1
-         AND aggregate.aggregate_key = $2
-         AND EXISTS (
-           SELECT 1 FROM ${members} AS member
-            WHERE member.company_id = aggregate.company_id
-              AND member.aggregate_key = aggregate.aggregate_key
-              AND member.fingerprint = $3
-              AND member.last_fired_at <= $5::timestamptz
-         )
+        FROM resolved_member
+       WHERE aggregate.company_id = resolved_member.company_id
+         AND aggregate.aggregate_key = resolved_member.aggregate_key
          AND (
           $3 = ANY(aggregate.active_fingerprints) OR
           EXISTS (
@@ -235,15 +245,7 @@ export async function resolveAggregateMember(
              AND member.fingerprint = $3
            )
          )
-      RETURNING aggregate.company_id, aggregate.aggregate_key, aggregate.resolution_claim
-    ), resolved_member AS (
-      UPDATE ${members} AS member
-         SET firing = false, resolved_at = $5::timestamptz
-        FROM resolved_aggregate
-       WHERE member.company_id = resolved_aggregate.company_id
-         AND member.aggregate_key = resolved_aggregate.aggregate_key
-         AND member.fingerprint = $3
-      RETURNING member.fingerprint
+      RETURNING aggregate.resolution_claim
     )
     SELECT resolution_claim FROM resolved_aggregate`,
     [companyId, aggregateKey, fingerprint, claim, resolvedAt],

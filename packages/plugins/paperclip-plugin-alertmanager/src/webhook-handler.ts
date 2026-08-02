@@ -239,7 +239,15 @@ export async function handleFiring(
         assigneeAgentId: stateRecord?.assigneeAgentId ?? null,
         reopenRequired: false,
         resolutionClaim: null,
+        firingAccepted: true,
       };
+  if (!aggregate.firingAccepted) {
+    ctx.logger.info(
+      `Alertmanager: ignored stale firing delivery for ${alert.fingerprint} in aggregate ${aggregate.aggregateKey}`,
+    );
+    await ctx.metrics.write("alertmanager.aggregate.stale_firing", 1, { alertname });
+    return;
+  }
   const recovered = stateRecord
     ? null
     : await recoverStateFromIssue(ctx, config, alert);

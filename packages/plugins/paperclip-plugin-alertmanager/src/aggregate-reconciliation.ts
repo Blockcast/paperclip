@@ -193,6 +193,7 @@ async function enforceFinalizedAggregate(
       `Alert resolved at ${work.resolvedAt}.`,
     );
   }
+  await recordSourceResolvedAndCloseCovers(ctx, work.companyId, issueId);
   await markFinalizedAggregateReconciled(ctx, work.companyId, work.aggregateKey);
 }
 
