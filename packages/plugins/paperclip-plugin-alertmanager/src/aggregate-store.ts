@@ -106,7 +106,7 @@ export async function bindAggregateIssue(
   aggregateKey: string,
   issueId: string,
   assignee: { assigneeUserId?: string; assigneeAgentId?: string },
-): Promise<void> {
+): Promise<string> {
   const aggregates = table(ctx, "alert_aggregates");
   await ctx.db.execute(
     `UPDATE ${aggregates}
@@ -123,6 +123,12 @@ export async function bindAggregateIssue(
       assignee.assigneeAgentId ?? null,
     ],
   );
+  const [binding] = await ctx.db.query<{ paperclip_issue_id: string | null }>(
+    `SELECT paperclip_issue_id FROM ${aggregates}
+      WHERE company_id = $1 AND aggregate_key = $2`,
+    [companyId, aggregateKey],
+  );
+  return binding?.paperclip_issue_id ?? issueId;
 }
 
 export async function getAggregate(
@@ -151,9 +157,10 @@ export async function resolveAggregateMember(
   const aggregates = table(ctx, "alert_aggregates");
   const members = table(ctx, "alert_members");
   const claim = randomUUID();
-  const elected = await ctx.db.execute(
-    `UPDATE ${aggregates} AS aggregate
-        SET active_fingerprints = array_remove(aggregate.active_fingerprints, $3),
+  const [elected] = await ctx.db.query<{ resolution_claim: string | null }>(
+    `WITH resolved_aggregate AS (
+      UPDATE ${aggregates} AS aggregate
+         SET active_fingerprints = array_remove(aggregate.active_fingerprints, $3),
             resolution_claim = CASE
               WHEN cardinality(array_remove(aggregate.active_fingerprints, $3)) = 0
                 AND aggregate.paperclip_issue_id IS NOT NULL
@@ -199,8 +206,8 @@ export async function resolveAggregateMember(
               ELSE aggregate.resolution_requested_at
             END,
             updated_at = now()
-      WHERE aggregate.company_id = $1
-        AND aggregate.aggregate_key = $2
+       WHERE aggregate.company_id = $1
+         AND aggregate.aggregate_key = $2
         AND (
           $3 = ANY(aggregate.active_fingerprints) OR
           EXISTS (
@@ -208,27 +215,27 @@ export async function resolveAggregateMember(
            WHERE member.company_id = aggregate.company_id
              AND member.aggregate_key = aggregate.aggregate_key
              AND member.fingerprint = $3
-          )
-        )`,
+           )
+         )
+      RETURNING aggregate.company_id, aggregate.aggregate_key, aggregate.resolution_claim
+    ), resolved_member AS (
+      UPDATE ${members} AS member
+         SET firing = false, resolved_at = $5::timestamptz
+        FROM resolved_aggregate
+       WHERE member.company_id = resolved_aggregate.company_id
+         AND member.aggregate_key = resolved_aggregate.aggregate_key
+         AND member.fingerprint = $3
+      RETURNING member.fingerprint
+    )
+    SELECT resolution_claim FROM resolved_aggregate`,
     [companyId, aggregateKey, fingerprint, claim, resolvedAt],
   );
-  if (elected.rowCount === 0) {
+  if (!elected) {
     return { memberKnown: false, finalResolutionClaim: null };
   }
-  await ctx.db.execute(
-    `UPDATE ${members}
-        SET firing = false, resolved_at = $4
-      WHERE company_id = $1 AND aggregate_key = $2 AND fingerprint = $3 AND firing`,
-    [companyId, aggregateKey, fingerprint, resolvedAt],
-  );
-  const [aggregate] = await ctx.db.query<{ resolution_claim: string | null }>(
-    `SELECT resolution_claim FROM ${aggregates}
-      WHERE company_id = $1 AND aggregate_key = $2`,
-    [companyId, aggregateKey],
-  );
   return {
     memberKnown: true,
-    finalResolutionClaim: aggregate?.resolution_claim === claim ? claim : null,
+    finalResolutionClaim: elected.resolution_claim === claim ? claim : null,
   };
 }
 

@@ -28,7 +28,7 @@ import type {
   AlertStateRecord,
 } from "../types.js";
 import type { PluginContext, PluginWebhookInput } from "@paperclipai/plugin-sdk";
-import { joinAggregate } from "../aggregate-store.js";
+import { bindAggregateIssue, joinAggregate, resolveAggregateMember } from "../aggregate-store.js";
 import { reconcileAggregateLifecycle } from "../aggregate-reconciliation.js";
 
 // ---------------------------------------------------------------------------
@@ -270,6 +270,34 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
       }),
       query: vi.fn(async (sql: string, params: unknown[] = []) => {
         const [companyId, key, fingerprint] = params as string[];
+        if (sql.includes("WITH resolved_aggregate AS")) {
+          const claim = params[3] as string;
+          const resolvedAt = params[4] as string;
+          const aggregate = aggregates.get(`${companyId}:${key}`);
+          const member = members.get(`${companyId}:${key}:${fingerprint}`);
+          const known =
+            (aggregate?.active_fingerprints as string[] | undefined)?.includes(fingerprint) ||
+            Boolean(member);
+          if (!aggregate || !known) return [];
+          aggregate.active_fingerprints = (
+            (aggregate.active_fingerprints as string[]) ?? []
+          ).filter((value) => value !== fingerprint);
+          const hasFiring = (aggregate.active_fingerprints as string[]).length > 0;
+          if (
+            !hasFiring &&
+            (!aggregate.resolution_claim || mocks.db.allowClaimSteal) &&
+            !aggregate.final_resolved_at
+          ) {
+            aggregate.resolution_claim = claim;
+            aggregate.resolution_claimed_at = new Date().toISOString();
+            aggregate.resolution_generation = aggregate.generation;
+            aggregate.resolution_requested_at = resolvedAt;
+          }
+          if (member) {
+            member.firing = false;
+          }
+          return [{ resolution_claim: aggregate.resolution_claim }];
+        }
         if (sql.includes("WITH candidates AS")) {
           const claim = params[2] as string;
           const rows = [...aggregates.values()].filter(
@@ -1735,6 +1763,40 @@ describe("handleWebhook — aggregate lifecycle", () => {
     expect(sql).toContain("WITH activated_aggregate AS");
     expect(sql).toContain("alert_aggregates");
     expect(sql).toContain("alert_members");
+  });
+
+  it("returns one authoritative binding across concurrent legacy candidates", async () => {
+    const { ctx } = mkCtx();
+    const alert = aggregateAlerts()[0];
+    const aggregate = await joinAggregate(ctx, "company-1", alert);
+
+    const bindings = await Promise.all([
+      bindAggregateIssue(ctx, "company-1", aggregate.aggregateKey, "legacy-a", {}),
+      bindAggregateIssue(ctx, "company-1", aggregate.aggregateKey, "legacy-b", {}),
+    ]);
+
+    expect(new Set(bindings)).toEqual(new Set(["legacy-a"]));
+  });
+
+  it("resolves aggregate authority and member audit state in one statement", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alert = aggregateAlerts()[0];
+    const aggregate = await joinAggregate(ctx, "company-1", alert);
+    mocks.db.execute.mockClear();
+    mocks.db.query.mockClear();
+
+    await resolveAggregateMember(
+      ctx,
+      "company-1",
+      aggregate.aggregateKey,
+      alert.fingerprint,
+      "2026-04-29T10:00:00Z",
+    );
+
+    expect(mocks.db.execute).not.toHaveBeenCalled();
+    const [sql] = mocks.db.query.mock.calls[0] as [string];
+    expect(sql).toContain("WITH resolved_aggregate AS");
+    expect(sql).toContain("resolved_member AS");
   });
 
   it("keeps identical aggregate keys isolated by company", async () => {

@@ -281,14 +281,25 @@ export async function handleFiring(
     aggregateStateRef,
   )) as AlertStateRecord | null;
 
-  const existingIssueId =
+  let existingIssueId =
     aggregate.paperclipIssueId ?? existing?.paperclipIssueId ?? null;
   const existingCompanyId = existing?.paperclipCompanyId ?? aggregate.companyId;
   if (existingIssueId) {
-    const supersededLegacyIssueId =
+    let supersededLegacyIssueId =
       aggregate.paperclipIssueId && legacyExisting?.paperclipIssueId !== aggregate.paperclipIssueId
         ? legacyExisting?.paperclipIssueId
         : null;
+    if (!aggregate.paperclipIssueId) {
+      const candidateIssueId = existingIssueId;
+      existingIssueId = await bindAggregateIssue(
+        ctx,
+        companyId,
+        aggregate.aggregateKey,
+        candidateIssueId,
+        { assigneeUserId: existing?.assigneeUserId ?? undefined },
+      );
+      if (candidateIssueId !== existingIssueId) supersededLegacyIssueId = candidateIssueId;
+    }
     if (supersededLegacyIssueId) {
       const legacyIssue = await ctx.issues.get(supersededLegacyIssueId, companyId);
       if (legacyIssue && legacyIssue.status !== "done" && legacyIssue.status !== "cancelled") {
@@ -305,11 +316,6 @@ export async function handleFiring(
           severity,
         });
       }
-    }
-    if (!aggregate.paperclipIssueId) {
-      await bindAggregateIssue(ctx, companyId, aggregate.aggregateKey, existingIssueId, {
-        assigneeUserId: existing?.assigneeUserId ?? undefined,
-      });
     }
     // Re-fire: refresh body and reopen a terminal aggregate issue.
     const newDescription = buildIssueDescription(alert);
@@ -506,10 +512,17 @@ export async function handleFiring(
     created = false;
   }
   if ((ctx as Partial<PluginContext>).db) {
-    await bindAggregateIssue(ctx, companyId, aggregate.aggregateKey, issue.id, {
+    const candidateIssueId = issue.id;
+    const authoritativeIssueId = await bindAggregateIssue(ctx, companyId, aggregate.aggregateKey, candidateIssueId, {
       assigneeUserId: createAssigneeUserId,
       assigneeAgentId: createAssigneeAgentId,
     });
+    if (authoritativeIssueId !== candidateIssueId) {
+      await ctx.issues.update(candidateIssueId, { status: "cancelled" }, companyId);
+      const authoritativeIssue = await ctx.issues.get(authoritativeIssueId, companyId);
+      issue = authoritativeIssue ?? { ...issue, id: authoritativeIssueId };
+      created = false;
+    }
   }
 
   const record: AlertStateRecord = {
@@ -615,7 +628,7 @@ export async function handleResolved(
     );
     return;
   }
-  const issueId = aggregate?.paperclipIssueId ?? existing?.paperclipIssueId;
+  let issueId = aggregate?.paperclipIssueId ?? existing?.paperclipIssueId;
   const companyId = aggregate?.companyId ?? existing?.paperclipCompanyId;
   const alertname =
     aggregate?.alertname ?? existing?.alertname ?? alert.labels.alertname ?? "unknown";
@@ -659,7 +672,7 @@ export async function handleResolved(
       return;
     }
     const staged = await joinAggregate(ctx, companyId, alert);
-    await bindAggregateIssue(ctx, companyId, aggregateKey, issueId, {
+    issueId = await bindAggregateIssue(ctx, companyId, aggregateKey, issueId, {
       assigneeUserId: existing.assigneeUserId ?? undefined,
       assigneeAgentId: existing.assigneeAgentId ?? undefined,
     });
@@ -823,18 +836,24 @@ async function recoverStateFromIssue(
   if (!issue) return null;
   if (issue.status === "done" || issue.status === "cancelled") return null;
 
+  let issueId = issue.id;
+  let boundIssue = issue;
   if ((ctx as Partial<PluginContext>).db) {
-    await bindAggregateIssue(ctx, companyId, aggregateKey, issue.id, {
+    issueId = await bindAggregateIssue(ctx, companyId, aggregateKey, issue.id, {
       assigneeUserId: issue.assigneeUserId ?? undefined,
       assigneeAgentId: issue.assigneeAgentId ?? undefined,
     });
+    if (issueId !== issue.id) {
+      await ctx.issues.update(issue.id, { status: "cancelled" }, companyId);
+      boundIssue = (await ctx.issues.get(issueId, companyId)) ?? issue;
+    }
   }
 
   return {
-    paperclipIssueId: issue.id,
+    paperclipIssueId: issueId,
     paperclipCompanyId: companyId,
-    assigneeUserId: issue.assigneeUserId ?? null,
-    assigneeAgentId: issue.assigneeAgentId ?? null,
+    assigneeUserId: boundIssue.assigneeUserId ?? null,
+    assigneeAgentId: boundIssue.assigneeAgentId ?? null,
     alertname: alert.labels.alertname ?? "UnnamedAlert",
     severity: alert.labels.severity ?? "unknown",
     firstSeenAt: alert.startsAt || new Date().toISOString(),
