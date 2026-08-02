@@ -240,6 +240,9 @@ export async function handleFiring(
         reopenRequired: false,
         resolutionClaim: null,
       };
+  const recovered = stateRecord
+    ? null
+    : await recoverStateFromIssue(ctx, config, alert);
   // A bound aggregate is the durable recovery record for a create/bind that
   // committed before its state write. Only query issue origin when binding did
   // not commit either; that closes the create-success/bind-failure window
@@ -264,7 +267,12 @@ export async function handleFiring(
         escalationComplete: false,
         escalationIntervalMs: escalationDeadlineMs(alert, config),
       }
-    : await recoverStateFromIssue(ctx, config, alert));
+    : recovered);
+  const legacyExisting = stateRecord ?? (
+    aggregate.paperclipIssueId && recovered?.paperclipIssueId === aggregate.paperclipIssueId
+      ? await recoverStateFromIssue(ctx, config, alert, true)
+      : recovered
+  );
   const aggregateStateRef = {
     scopeKind: "instance" as const,
     stateKey: STATE_KEYS.aggregate(companyId, aggregate.aggregateKey),
@@ -278,8 +286,8 @@ export async function handleFiring(
   const existingCompanyId = existing?.paperclipCompanyId ?? aggregate.companyId;
   if (existingIssueId) {
     const supersededLegacyIssueId =
-      aggregate.paperclipIssueId && stateRecord?.paperclipIssueId !== aggregate.paperclipIssueId
-        ? stateRecord?.paperclipIssueId
+      aggregate.paperclipIssueId && legacyExisting?.paperclipIssueId !== aggregate.paperclipIssueId
+        ? legacyExisting?.paperclipIssueId
         : null;
     if (supersededLegacyIssueId) {
       const legacyIssue = await ctx.issues.get(supersededLegacyIssueId, companyId);
@@ -789,17 +797,20 @@ async function recoverStateFromIssue(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
+  legacyOnly = false,
 ): Promise<AlertStateRecord | null> {
   const companyId = config.defaultCompanyId;
   if (!companyId) return null;
 
   const aggregateKey = aggregateKeyForAlert(alert);
-  let matches = await ctx.issues.list({
-    companyId,
-    originKind: ORIGIN_KIND,
-    originId: aggregateKey,
-    limit: 1,
-  });
+  let matches = legacyOnly
+    ? []
+    : await ctx.issues.list({
+        companyId,
+        originKind: ORIGIN_KIND,
+        originId: aggregateKey,
+        limit: 1,
+      });
   if (matches.length === 0) {
     matches = await ctx.issues.list({
       companyId,

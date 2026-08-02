@@ -174,6 +174,9 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
                 )
               : [fingerprint],
           });
+          if (sql.includes("alert_members")) {
+            members.set(`${companyId}:${key}:${fingerprint}`, { firing: true });
+          }
           return { rowCount: 1 };
         }
         if (sql.includes("INSERT INTO") && sql.includes("alert_members")) {
@@ -1525,6 +1528,8 @@ describe("handleWebhook — aggregate lifecycle", () => {
     expect(mocks.issues.list.mock.calls.map(([input]) => input.originId)).toEqual([
       'alert-aggregate:v1:["HindsightConsolidationStalled",null]',
       "fp-a",
+      'alert-aggregate:v1:["HindsightConsolidationStalled",null]',
+      "fp-b",
     ]);
   });
 
@@ -1683,6 +1688,53 @@ describe("handleWebhook — aggregate lifecycle", () => {
       paperclipIssueId: "legacy-issue",
       aggregateKey: 'alert-aggregate:v1:["HindsightConsolidationStalled",null]',
     }));
+  });
+
+  it("retires every stateless legacy issue that loses aggregate adoption", async () => {
+    const { ctx, mocks } = mkCtx();
+    const [alertA, alertB] = aggregateAlerts();
+    const legacyIssues = new Map([
+      [alertA.fingerprint, { id: "legacy-a", status: "todo", assigneeAgentId: "agent-fallback" }],
+      [alertB.fingerprint, { id: "legacy-b", status: "todo", assigneeAgentId: "agent-fallback" }],
+    ]);
+    mocks.issues.list.mockImplementation(async (input: { originId: string }) => {
+      const issue = legacyIssues.get(input.originId);
+      return issue ? [issue] : [];
+    });
+    mocks.issues.get.mockImplementation(async (issueId: string) => ({ id: issueId, status: "todo" }));
+
+    for (const alert of [alertA, alertB]) {
+      await handleWebhook(
+        ctx,
+        baseConfig(),
+        TOKEN,
+        baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+      );
+    }
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "legacy-b",
+      { status: "cancelled" },
+      "company-1",
+    );
+    expect(await mocks.state.get({
+      scopeKind: "company",
+      scopeId: "company-1",
+      stateKey: `alert:${alertB.fingerprint}`,
+    })).toEqual(expect.objectContaining({ paperclipIssueId: "legacy-a" }));
+  });
+
+  it("activates aggregate authority and member audit state in one statement", async () => {
+    const { ctx, mocks } = mkCtx();
+
+    await joinAggregate(ctx, "company-1", aggregateAlerts()[0]);
+
+    expect(mocks.db.execute).toHaveBeenCalledTimes(1);
+    const [sql] = mocks.db.execute.mock.calls[0] as [string];
+    expect(sql).toContain("WITH activated_aggregate AS");
+    expect(sql).toContain("alert_aggregates");
+    expect(sql).toContain("alert_members");
   });
 
   it("keeps identical aggregate keys isolated by company", async () => {

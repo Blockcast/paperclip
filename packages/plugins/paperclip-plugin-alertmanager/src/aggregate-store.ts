@@ -59,35 +59,34 @@ export async function joinAggregate(
   const members = table(ctx, "alert_members");
 
   await ctx.db.execute(
-    `INSERT INTO ${aggregates} AS aggregate
+    `WITH activated_aggregate AS (
+      INSERT INTO ${aggregates} AS aggregate
        (aggregate_key, company_id, alertname, severity, active_fingerprints)
-     VALUES ($1, $2, $3, $4, ARRAY[$5]::text[])
+      VALUES ($1, $2, $3, $4, ARRAY[$5]::text[])
       ON CONFLICT (company_id, aggregate_key) DO UPDATE SET
         severity = EXCLUDED.severity,
-       active_fingerprints = CASE
-         WHEN $5 = ANY(aggregate.active_fingerprints)
-           THEN aggregate.active_fingerprints
-         ELSE array_append(aggregate.active_fingerprints, $5)
-       END,
+        active_fingerprints = CASE
+          WHEN $5 = ANY(aggregate.active_fingerprints)
+            THEN aggregate.active_fingerprints
+          ELSE array_append(aggregate.active_fingerprints, $5)
+        END,
         generation = aggregate.generation + 1,
         reopen_required = aggregate.reopen_required
           OR aggregate.resolution_claim IS NOT NULL
           OR aggregate.final_resolved_at IS NOT NULL,
         final_resolved_at = NULL,
-       updated_at = now()`,
-    [aggregateKey, companyId, alertname, severity, alert.fingerprint],
-  );
-  // This table is retained for audit and retry recognition. The aggregate's
-  // active_fingerprints array above is the atomic lifecycle authority.
-  await ctx.db.execute(
-    `INSERT INTO ${members}
+        updated_at = now()
+      RETURNING company_id, aggregate_key
+    )
+    INSERT INTO ${members}
        (company_id, aggregate_key, fingerprint, firing, first_seen_at, last_fired_at, resolved_at)
-     VALUES ($1, $2, $3, true, $4, now(), NULL)
-     ON CONFLICT (company_id, aggregate_key, fingerprint) DO UPDATE SET
-       firing = true,
-       last_fired_at = now(),
-       resolved_at = NULL`,
-    [companyId, aggregateKey, alert.fingerprint, firedAt],
+    SELECT company_id, aggregate_key, $5, true, $6, now(), NULL
+      FROM activated_aggregate
+    ON CONFLICT (company_id, aggregate_key, fingerprint) DO UPDATE SET
+      firing = true,
+      last_fired_at = now(),
+      resolved_at = NULL`,
+    [aggregateKey, companyId, alertname, severity, alert.fingerprint, firedAt],
   );
 
   const [row] = await ctx.db.query<AggregateRow>(
