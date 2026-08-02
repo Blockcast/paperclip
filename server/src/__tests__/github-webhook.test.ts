@@ -55,6 +55,7 @@ import {
   __resetMetricsForTest,
   getMetricsRegistry,
 } from "../services/metrics.js";
+import { resolveOwningPaperclipIdentifiers } from "../services/paperclip-identifiers.js";
 
 /**
  * Sum {@link GITHUB_REVIEW_REQUEST_DELIVERY_METRIC} across every `reason`
@@ -117,6 +118,56 @@ describe("github-webhook pure helpers", () => {
     // Punctuation around match is fine.
     expect(__test_extractPaperclipIdentifiers("(BLO-3182): work")).toEqual(["BLO-3182"]);
   });
+
+  it("resolves the PR's OWNING identifier as branch > title > labeled Fixes:/Closes:/Refs: body line, never a bare Related: mention (BLO-20886)", () => {
+    // Branch wins even when the body disagrees.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        branch: "fix/BLO-1-thing",
+        title: "irrelevant",
+        body: "Related: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    // No branch: title wins over a labeled body line.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        branch: null,
+        title: "fix BLO-1 thing",
+        body: "Refs: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    // No branch/title: a Fixes:/Closes:/Resolves:/Refs: labeled line counts,
+    // colon optional -- this repo's own PR bodies use both "Closes: BLO-1"
+    // and the natural-language "Closes BLO-1 and BLO-2" (multiple owners).
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "Fixes: BLO-1" }),
+    ).toEqual({ owning: ["BLO-1"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "Closes BLO-1 and BLO-2" }),
+    ).toEqual({ owning: ["BLO-1", "BLO-2"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "closed: BLO-1" }),
+    ).toEqual({ owning: ["BLO-1"] }); // case-insensitive, closing-keyword variant
+
+    // The exact incident shape: Refs: wins, Related: never counts as owning.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Refs:    BLO-19132\nRelated: BLO-20810, BLO-20129, BLO-19079\n",
+      }),
+    ).toEqual({ owning: ["BLO-19132"] });
+
+    // A bare Related: list with no owning line at all resolves to nothing --
+    // not to the first (or any) Related: entry.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "Related: BLO-20810, BLO-20129" }),
+    ).toEqual({ owning: [] });
+
+    // Nothing anywhere.
+    expect(resolveOwningPaperclipIdentifiers({})).toEqual({ owning: [] });
+  });
+
 
   it("rejects payloads with bad signatures and accepts ones with good signatures", () => {
     const secret = "test-webhook-secret-do-not-use-in-prod";
@@ -3029,6 +3080,146 @@ describeEmbeddedPostgres("github-webhook route", () => {
         ":Blockcast/paperclip:582:github_pr_review_requested:comment:4871387911",
       ),
     });
+  });
+
+  it("routes an author wake to the PR's owning Refs: issue, never an unrelated Related: backlink assignee (BLO-20886)", async () => {
+    // Reproduces the live incident (Blockcast/paperclip#953): the PR body
+    // carried `Refs: BLO-19132` (the owning issue) plus
+    // `Related: BLO-20810, BLO-20129, BLO-19079` -- three bare informational
+    // mentions. Before this fix, the author-wake loop treated every matched
+    // identifier as equally-weighted and woke BLO-20129's assignee (the
+    // THIRD Related: entry) with a "push a follow-up commit" directive for a
+    // PR that agent had no relationship to at all.
+    //
+    // All four identifiers share the BLO prefix (as in the real incident),
+    // so they're seeded as four issues under ONE company/agent set --
+    // seedIssueWithIdentifier creates a fresh company per call and company
+    // issue_prefix is unique, so four BLO- calls would collide.
+    const { companyId } = await seedCompanyAndAgent();
+    async function seedBloIssue(identifier: string) {
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: `Agent-${identifier}`,
+        role: "engineer",
+        status: "idle",
+        adapterType: "claude_k8s",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Test issue",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: Number(identifier.split("-")[1]),
+        identifier,
+      });
+      return { agentId, issueId };
+    }
+    const refsIssue = await seedBloIssue("BLO-19132");
+    const relatedB = await seedBloIssue("BLO-20810");
+    const relatedC = await seedBloIssue("BLO-20129");
+    const relatedD = await seedBloIssue("BLO-19079");
+    const app = buildApp();
+    const payload = {
+      action: "created",
+      issue: {
+        number: 953,
+        title: "approval dedupe v2",
+        body: "Refs:    BLO-19132\nRelated: BLO-20810, BLO-20129, BLO-19079\n",
+        html_url: "https://github.com/Blockcast/paperclip/pull/953",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/953" },
+        user: { login: "kkroo" },
+      },
+      comment: {
+        id: 5156328634,
+        body: "@ally review exact head d9f28c1e0e6595ce8de9515bf0158b04d136a204",
+        html_url: "https://github.com/Blockcast/paperclip/pull/953#issuecomment-5156328634",
+        user: { login: "kkroo" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-blo-20886")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.wakes).toEqual([{ issueIdentifier: "BLO-19132", agentId: refsIssue.agentId }]);
+
+    const allWakes = await db
+      .select({ agentId: agentWakeupRequests.agentId })
+      .from(agentWakeupRequests)
+      .where(inArray(agentWakeupRequests.agentId, [
+        refsIssue.agentId,
+        relatedB.agentId,
+        relatedC.agentId,
+        relatedD.agentId,
+      ]));
+    // Only the Refs: owner was ever woken -- not one of the three Related:
+    // assignees, and specifically never BLO-20129's (relatedC), the one that
+    // fired live.
+    expect(allWakes.map((w) => w.agentId)).toEqual([refsIssue.agentId]);
+  });
+
+  it("suppresses the author wake with a logged reason when a PR carries only Related: mentions and no owning reference (BLO-20886)", async () => {
+    // No Refs:/Fixes:/Closes:/Resolves: line and no branch/title ref -- the
+    // PR names issues but doesn't claim ownership of any of them. Acceptance
+    // criterion: this must drop with a suppressionReason, not fall through to
+    // an arbitrary Related: assignee.
+    const relatedOnly = await seedIssueWithIdentifier("BLO-20811");
+    const app = buildApp();
+    const payload = {
+      action: "created",
+      issue: {
+        number: 954,
+        title: "misc cleanup",
+        body: "Related: BLO-20811\n",
+        html_url: "https://github.com/Blockcast/paperclip/pull/954",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/954" },
+        user: { login: "kkroo" },
+      },
+      comment: {
+        id: 5156328700,
+        body: "@ally review please",
+        html_url: "https://github.com/Blockcast/paperclip/pull/954#issuecomment-5156328700",
+        user: { login: "kkroo" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-blo-20886-no-owner")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.wakes).toEqual([]);
+    expect(res.body.skipped).toContainEqual({
+      issueIdentifier: null,
+      reason: "no_owning_reference",
+    });
+
+    const wakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, relatedOnly.agentId));
+    expect(wakes).toHaveLength(0);
   });
 
   it("dedupes an @ally comment redelivery on the author wake after it completed or was cancelled (BLO-18953)", async () => {

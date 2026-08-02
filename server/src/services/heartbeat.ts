@@ -7942,32 +7942,54 @@ export function buildPaperclipTaskMarkdown(input: {
     }
     if (prReview.event) lines.push(`- GitHub event: ${quoteTaskScalar(prReview.event)}`);
     if (prReview.prRole === "author") {
-      const reviewerLabel = prReview.reviewAuthorLogin ?? "A reviewer";
-      const stateLabel = prReview.reviewState ? prReview.reviewState.toUpperCase() : null;
-      lines.push(
-        "",
-        "GitHub PR review feedback directive:",
-        stateLabel
-          ? `${reviewerLabel} just submitted a review on YOUR pull request (state: ${stateLabel}).`
-          : `${reviewerLabel} just posted findings on YOUR pull request.`,
-      );
-      if (prReview.reviewBody) {
-        lines.push("", "Latest review body:", fenceTaskText(prReview.reviewBody));
+      // BLO-20886: only wakeReasons that structurally guarantee a review
+      // actually exists (a submitted pull_request_review, or an actionable
+      // review-feedback comment) may claim "a reviewer just posted findings"
+      // and instruct a push. github_pr_review_requested fires on a bare
+      // `@ally review` ASK -- no review has been posted yet -- and the
+      // author-role wake loop also covers plain PR lifecycle events
+      // (opened/reopened/synchronize/ready_for_review) that carry no review
+      // data at all. Observed live: PR #953 had zero reviews
+      // (`gh api .../pulls/953/reviews` empty) when this directive told the
+      // woken agent "a reviewer just posted findings on YOUR pull request"
+      // and to push a follow-up commit.
+      const hasReviewContent =
+        prReview.wakeReason === "github_pr_review_submitted" ||
+        prReview.wakeReason === "github_pr_review_feedback";
+      if (!hasReviewContent) {
+        lines.push(
+          "",
+          "GitHub PR event directive:",
+          `Wake reason: ${quoteTaskScalar(prReview.wakeReason)}. No review findings are recorded for this PR yet, so do not push new commits on the strength of unconfirmed feedback. If you are this PR's author, confirm current state with \`gh pr view\` / \`gh api repos/<owner>/<repo>/pulls/${prReview.prNumber}/reviews\` before acting. Do NOT close the PR or self-approve. The PR's status is your responsibility this run; don't bounce to inbox-only mode.`,
+        );
+      } else {
+        const reviewerLabel = prReview.reviewAuthorLogin ?? "A reviewer";
+        const stateLabel = prReview.reviewState ? prReview.reviewState.toUpperCase() : null;
+        lines.push(
+          "",
+          "GitHub PR review feedback directive:",
+          stateLabel
+            ? `${reviewerLabel} just submitted a review on YOUR pull request (state: ${stateLabel}).`
+            : `${reviewerLabel} just posted findings on YOUR pull request.`,
+        );
+        if (prReview.reviewBody) {
+          lines.push("", "Latest review body:", fenceTaskText(prReview.reviewBody));
+        }
+        // BLO-19067: the closing instruction must agree with the review state.
+        // It used to unconditionally say "push a follow-up commit addressing
+        // them", so an APPROVED review told the author to make an implementation
+        // pass that has no findings to act on. A no-op push invalidates the
+        // approval it just earned and restarts CI, looping for hours.
+        const normalizedReviewState = prReview.reviewState?.trim().toLowerCase().replace(/-/g, "_") ?? null;
+        const commonClosing =
+          "Do NOT close the PR or self-approve. The PR's status is your responsibility this run; don't bounce to inbox-only mode.";
+        lines.push(
+          "",
+          normalizedReviewState === "approved"
+            ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). It APPROVED your PR, so no implementation pass is required: do NOT push a no-op or invented follow-up commit, because any new push invalidates this approval and restarts CI. Act on a note only if it identifies a real defect; otherwise proceed to merge once required checks pass. ${commonClosing}`
+            : `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. ${commonClosing}`,
+        );
       }
-      // BLO-19067: the closing instruction must agree with the review state.
-      // It used to unconditionally say "push a follow-up commit addressing
-      // them", so an APPROVED review told the author to make an implementation
-      // pass that has no findings to act on. A no-op push invalidates the
-      // approval it just earned and restarts CI, looping for hours.
-      const normalizedReviewState = prReview.reviewState?.trim().toLowerCase().replace(/-/g, "_") ?? null;
-      const commonClosing =
-        "Do NOT close the PR or self-approve. The PR's status is your responsibility this run; don't bounce to inbox-only mode.";
-      lines.push(
-        "",
-        normalizedReviewState === "approved"
-          ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). It APPROVED your PR, so no implementation pass is required: do NOT push a no-op or invented follow-up commit, because any new push invalidates this approval and restarts CI. Act on a note only if it identifies a real defect; otherwise proceed to merge once required checks pass. ${commonClosing}`
-          : `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. ${commonClosing}`,
-      );
     } else {
       lines.push(
         "",

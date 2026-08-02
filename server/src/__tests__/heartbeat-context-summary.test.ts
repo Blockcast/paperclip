@@ -191,6 +191,64 @@ describe("buildPaperclipTaskMarkdown", () => {
     expect(authorMarkdown).not.toContain("Latest review body:");
   });
 
+  // BLO-20886: github_pr_review_requested fires on a bare `@ally review` ASK
+  // -- no review has been posted -- and the author-role wake loop also
+  // covers plain PR lifecycle events with no review data at all. Both used
+  // to render the review-feedback directive unconditionally, telling the
+  // woken agent "a reviewer just posted findings on YOUR pull request" and
+  // to push a follow-up commit against a PR with zero recorded reviews
+  // (observed live: Blockcast/paperclip#953).
+  it("does not assert 'YOUR pull request' or instruct a push when no review has actually been submitted", () => {
+    const requestedMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_requested",
+        prNumber: 953,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+      },
+    });
+    expect(requestedMarkdown).not.toContain("YOUR pull request");
+    expect(requestedMarkdown).not.toContain("push a follow-up commit");
+    expect(requestedMarkdown).not.toContain("GitHub PR review feedback directive:");
+    expect(requestedMarkdown).toContain("GitHub PR event directive:");
+    expect(requestedMarkdown).toContain('"github_pr_review_requested"');
+    expect(requestedMarkdown).toContain("No review findings are recorded for this PR yet");
+
+    const openedMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_opened",
+        prNumber: 35,
+        repoFullName: "Blockcast/paperclip",
+        event: "pull_request",
+        prRole: "author",
+      },
+    });
+    expect(openedMarkdown).not.toContain("YOUR pull request");
+    expect(openedMarkdown).not.toContain("push a follow-up commit");
+  });
+
+  // Real review content must still get the author-shaped directive -- this
+  // fix narrows WHEN "YOUR pull request" fires, it doesn't remove it.
+  it("still asserts 'YOUR pull request' for an actionable review-feedback comment wake", () => {
+    const feedbackMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_feedback",
+        prNumber: 953,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+        reviewBody: "Critical: missing null check.",
+        reviewAuthorLogin: "ally",
+      },
+    });
+    expect(feedbackMarkdown).toContain("GitHub PR review feedback directive:");
+    expect(feedbackMarkdown).toContain("YOUR pull request");
+  });
+
   it("adds accepted-plan continuation guidance for standard-work issues when the wake is flagged as a plan continuation", () => {
     const acceptedConfirmation = buildPaperclipTaskMarkdown({
       issue: {

@@ -47,7 +47,11 @@ import {
 } from "../services/dependabot-alert-issues.js";
 import { logger } from "../middleware/logger.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
-import { extractPaperclipIdentifiers } from "../services/paperclip-identifiers.js";
+import {
+  extractPaperclipIdentifiers,
+  resolveOwningPaperclipIdentifiers,
+  type OwningIdentifierResolution,
+} from "../services/paperclip-identifiers.js";
 import {
   githubListIssueCommentBodies,
   githubPostIssueComment,
@@ -466,6 +470,12 @@ async function countPrReviewFeedbackCycles(
 
 interface ResolvedEventContext {
   identifiers: string[];
+  // BLO-20886: the identifier(s) that OWN this PR (branch/title/labeled
+  // Fixes:/Closes:/Refs: line), as opposed to `identifiers` which is every
+  // BLO-#### mentioned anywhere, including an informational `Related:` list.
+  // Only wakeReasons that drive an author-directed ("prRole: author") wake
+  // consult this -- see resolveOwningPaperclipIdentifiers for the rule.
+  owningIdentifiers?: string[];
   wakeReason: string;
   prNumber: number | null;
   repoFullName: string | null;
@@ -550,6 +560,7 @@ function resolveEventContext(
     if (!pr) {
       return {
         ids: [] as string[],
+        owning: { owning: [] } as OwningIdentifierResolution,
         number: null as number | null,
         title: null as string | null,
         url: null as string | null,
@@ -569,6 +580,7 @@ function resolveEventContext(
     const user = pr.user as Record<string, unknown> | undefined;
     return {
       ids: extractPaperclipIdentifiers(branch, title, body),
+      owning: resolveOwningPaperclipIdentifiers({ branch, title, body }),
       number,
       title: title ?? null,
       url: githubPrUrl(repoFullName, number, readStringField(pr, "html_url")),
@@ -744,16 +756,20 @@ function resolveEventContext(
       const prNumber = (issue.number as number | undefined) ?? null;
       const prUrl = githubPrUrl(repoFullName, prNumber, readStringField(issue, "html_url"));
       const commentUrl = readStringField(comment, "html_url");
+      const issueTitle = issue.title as string | undefined;
+      const issueBody = issue.body as string | undefined;
+      // Owning resolution deliberately excludes commentBody: the comment is
+      // the @ally ASK that triggered this event, not an ownership claim about
+      // the PR (see resolveOwningPaperclipIdentifiers). No branch tier here
+      // either -- issue_comment payloads don't carry pull_request.head.ref.
+      const owning = resolveOwningPaperclipIdentifiers({ title: issueTitle, body: issueBody });
       return {
-        identifiers: extractPaperclipIdentifiers(
-          issue.title as string | undefined,
-          issue.body as string | undefined,
-          commentBody,
-        ),
+        identifiers: extractPaperclipIdentifiers(issueTitle, issueBody, commentBody),
+        owningIdentifiers: owning.owning,
         wakeReason: reviewerRequest ? "github_pr_review_requested" : "github_pr_review_feedback",
         prNumber,
         repoFullName,
-        prTitle: (issue.title as string | undefined) ?? null,
+        prTitle: issueTitle ?? null,
         prUrl,
         eventUrl: commentUrl ?? prUrl,
         commentId: (comment?.id as number | undefined) ?? null,
@@ -778,6 +794,7 @@ function resolveEventContext(
       const reviewUrl = readStringField(review, "html_url");
       return {
         identifiers: collected.ids,
+        owningIdentifiers: collected.owning.owning,
         wakeReason: "github_pr_review_submitted",
         prNumber: collected.number,
         repoFullName,
@@ -829,6 +846,7 @@ function resolveEventContext(
       const merged = pr?.merged === true;
       return {
         identifiers: collected.ids,
+        owningIdentifiers: collected.owning.owning,
         wakeReason: reasonByAction[action] ?? "github_pull_request",
         prNumber: collected.number,
         repoFullName,
@@ -2543,7 +2561,50 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       );
     }
 
-    for (const issue of suppressAuthorWake ? [] : matched) {
+    // BLO-20886: an author-directed wake (prRole: "author", set below via
+    // isPrWake) asserts ownership of the PR ("YOUR pull request") and, for
+    // review-shaped reasons, instructs a push. Firing it for every issue in
+    // `matched` -- which includes issues named only via an informational
+    // `Related:` mention -- sent that directive to the assignee of an issue
+    // with no relationship to the PR at all (observed live: PR #953 matched
+    // BLO-19132 via `Refs:` and BLO-20810/BLO-20129/BLO-19079 via `Related:`;
+    // the wake landed on BLO-20129's assignee). Restrict the author-wake loop
+    // to the PR's OWNING issue(s) only -- resolveOwningPaperclipIdentifiers's
+    // branch > title > labeled Fixes:/Closes:/Refs: rule. `matched` keeps its
+    // full breadth for the back-link comment and merged-PR forward-capture
+    // above, which are informational and correctly link every mentioned
+    // issue. When no owning issue resolves (none found), the author wake is
+    // dropped with a logged suppressionReason rather than falling through to
+    // a lower-priority or unlabeled mention.
+    const isPrWake = context.wakeReason.startsWith("github_pr_") && context.prNumber !== null;
+    let authorWakeCandidates = matched;
+    if (isPrWake) {
+      const owning = context.owningIdentifiers ?? [];
+      if (owning.length === 0) {
+        authorWakeCandidates = [];
+        if (matched.length > 0) {
+          const suppressionReason = "no_owning_reference";
+          skipped.push({ issueIdentifier: null, reason: suppressionReason });
+          logger.info(
+            {
+              deliveryId,
+              event: eventName,
+              wakeReason: context.wakeReason,
+              prNumber: context.prNumber,
+              repoFullName: context.repoFullName,
+              identifiers: context.identifiers,
+              matchedIdentifiers: matched.map((m) => m.identifier),
+              suppressionReason,
+            },
+            "github webhook suppressed author-directed PR wake: no confidently-resolved owning issue",
+          );
+        }
+      } else {
+        authorWakeCandidates = matched.filter((m) => m.identifier && owning.includes(m.identifier));
+      }
+    }
+
+    for (const issue of suppressAuthorWake ? [] : authorWakeCandidates) {
       // Terminal-status issues don't need to wake -- the assignee
       // shouldn't reopen `done`/`cancelled` work just because a stale
       // CI ping arrived.
@@ -2621,9 +2682,8 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       // PR-shaped wakes carry an `prRole: "author"` marker so the
       // heartbeat directive flips from reviewer-shaped ("review this PR")
       // to author-shaped ("a reviewer just posted findings on YOUR PR").
-      // Non-PR wakes (CI completion, etc.) leave prRole unset.
-      const isPrWake =
-        context.wakeReason.startsWith("github_pr_") && context.prNumber !== null;
+      // Non-PR wakes (CI completion, etc.) leave prRole unset. (isPrWake is
+      // hoisted above this loop -- see the authorWakeCandidates comment.)
 
       // BLO-13247: the actionableReviewFeedback branch above already
       // precheck-and-skips on its own idempotency key before this point, but
