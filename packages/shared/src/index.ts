@@ -1705,6 +1705,7 @@ export {
 export type { Milestone, CreateMilestoneInput, UpdateMilestoneInput } from "./types/milestone.js";
 export {
   createApprovalSchema,
+  listApprovalsQuerySchema,
   upsertBudgetPolicySchema,
   resolveBudgetIncidentSchema,
   resolveApprovalSchema,
@@ -1713,6 +1714,7 @@ export {
   withdrawApprovalSchema,
   addApprovalCommentSchema,
   type CreateApproval,
+  type ListApprovalsQuery,
   type UpsertBudgetPolicy,
   type ResolveBudgetIncident,
   type ResolveApproval,
