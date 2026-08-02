@@ -702,6 +702,56 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     }
   });
 
+  it("recovers an abandoned notification claim without concurrent redelivery", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgentRow(companyId, {
+      name: "Built-in Abandoned Claim",
+      status: "idle",
+      adapterType: "codex_local",
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "approved",
+      requestedByUserId: "requester",
+      decidedByUserId: "board-user",
+      decidedAt: new Date(Date.now() - 10 * 60_000),
+      payload: {
+        agentId,
+        name: "Built-in Abandoned Claim",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        budgetMonthlyCents: 0,
+        sourceBuiltInAgentKey: "briefs",
+      },
+      updatedAt: new Date(),
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "system",
+      actorId: "approval_service",
+      action: "approval.hire_notification_claimed",
+      entityType: "approval",
+      entityId: approvalId,
+      agentId,
+      createdAt: new Date(Date.now() - 10 * 60_000),
+    });
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).resolves.toMatchObject({ applied: false });
+    expect(mockEnsureBuiltInAgent).not.toHaveBeenCalled();
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", "Approved"),
+    ).resolves.toMatchObject({ applied: false });
+    expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+  });
+
   it("creates agent secret bindings when a new agent persists secret_ref env", async () => {
     const companyId = await seedCompany();
     const secrets = secretService(db);

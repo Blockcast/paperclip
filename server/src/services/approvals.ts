@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, approvalComments, approvals } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
@@ -7,6 +7,8 @@ import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
 import { instanceSettingsService } from "./instance-settings.js";
+
+const HIRE_NOTIFICATION_CLAIM_LEASE_MS = 5 * 60_000;
 
 export function approvalService(db: Db) {
   const agentsSvc = agentService(db);
@@ -42,25 +44,42 @@ export function approvalService(db: Db) {
     const shouldNotify = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(sql`select ${approvals.id} from ${approvals} where ${approvals.id} = ${approval.id} for update`);
-      const notificationClaim = await txDb
+      const completed = await txDb
         .select({ id: activityLog.id })
         .from(activityLog)
         .where(
           and(
             eq(activityLog.companyId, approval.companyId),
-            inArray(activityLog.action, [
-              "approval.hire_notification_claimed",
-              "approval.hire_post_commit_completed",
-            ]),
+            eq(activityLog.action, "approval.hire_post_commit_completed"),
             eq(activityLog.entityType, "approval"),
             eq(activityLog.entityId, approval.id),
           ),
         )
         .then((rows) => rows[0] ?? null);
-      if (notificationClaim) return false;
+      if (completed) return false;
+
+      const latestClaim = await txDb
+        .select({ createdAt: activityLog.createdAt })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, approval.companyId),
+            eq(activityLog.action, "approval.hire_notification_claimed"),
+            eq(activityLog.entityType, "approval"),
+            eq(activityLog.entityId, approval.id),
+          ),
+        )
+        .orderBy(desc(activityLog.createdAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (latestClaim && latestClaim.createdAt.getTime() > Date.now() - HIRE_NOTIFICATION_CLAIM_LEASE_MS) {
+        return false;
+      }
 
       const payload = approval.payload as Record<string, unknown>;
-      await reconcileApprovedBuiltInAgent(txDb, approval.companyId, payload);
+      if (!latestClaim) {
+        await reconcileApprovedBuiltInAgent(txDb, approval.companyId, payload);
+      }
       await txDb.insert(activityLog).values({
         companyId: approval.companyId,
         actorType: "system",
@@ -69,7 +88,10 @@ export function approvalService(db: Db) {
         entityType: "approval",
         entityId: approval.id,
         agentId,
-        details: { sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey },
+        details: {
+          sourceBuiltInAgentKey: payload.sourceBuiltInAgentKey,
+          leaseMs: HIRE_NOTIFICATION_CLAIM_LEASE_MS,
+        },
       });
       return true;
     });

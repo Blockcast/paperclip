@@ -52,6 +52,7 @@ export async function notifyHireApproved(
     agentName: row.name,
     adapterType,
     source,
+    idempotencyKey: `${source}:${sourceId}`,
     sourceId,
     approvedAt: approvedAt.toISOString(),
     message: HIRE_APPROVED_MESSAGE,

@@ -351,6 +351,8 @@ export interface HireApprovedPayload {
   adapterType: string;
   /** "join_request" | "approval" */
   source: "join_request" | "approval";
+  /** Stable delivery key. Hooks must deduplicate retries with this value. */
+  idempotencyKey: string;
   sourceId: string;
   approvedAt: string;
   /** Canonical operator-facing message for cloud adapters to show the user. */
