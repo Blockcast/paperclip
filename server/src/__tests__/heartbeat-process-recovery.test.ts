@@ -5417,6 +5417,34 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(lockedIssue?.executionRunId).toBe(activeRunId);
   });
 
+  it("counts old in-flight assignment recovery reservations against the per-agent cap", async () => {
+    const { companyId, agentId } = await seedAssignedTodoNoRunFixture({
+      agentStatus: "running",
+    });
+    const oldReservationTime = new Date(Date.now() - 10 * 60_000);
+    await db.insert(agentWakeupRequests).values(
+      Array.from({ length: ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT }, () => ({
+        companyId,
+        agentId,
+        source: "automation" as const,
+        triggerDetail: "system",
+        reason: "issue_assignment_recovery_capacity_reservation",
+        status: "assignment_recovery_capacity_reserved",
+        createdAt: oldReservationTime,
+        updatedAt: oldReservationTime,
+      })),
+    );
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.assignmentDispatched).toBe(0);
+    const recoveryRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(recoveryRuns).toHaveLength(0);
+  });
+
   it("does not duplicate initial assigned todo dispatch when a queued wake already exists", async () => {
     const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture();
     await db.insert(agentWakeupRequests).values({

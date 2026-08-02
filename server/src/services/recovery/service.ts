@@ -108,7 +108,6 @@ export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
 export const ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT = 5;
 const ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_STATUS = "assignment_recovery_capacity_reserved";
-const ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_TTL_MS = 5 * 60 * 1000;
 // BLO-19941: the same backstop, for a holder wedged at `running`.
 //
 // `running` is neither missing nor terminal, so isCleanable() is false forever
@@ -1719,10 +1718,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           eq(agentWakeupRequests.companyId, issue.companyId),
           eq(agentWakeupRequests.agentId, agentId),
           eq(agentWakeupRequests.status, ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_STATUS),
-          gte(
-            agentWakeupRequests.createdAt,
-            new Date(Date.now() - ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_TTL_MS),
-          ),
         ))
         .then((rows) => Number(rows[0]?.count ?? 0));
 
@@ -2469,6 +2464,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       },
     };
     const finalizedRun = await db.transaction(async (tx) => {
+      await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(eq(issues.id, input.sourceIssue.id), eq(issues.companyId, input.run.companyId)))
+        .for("update");
+
       const [updatedRun] = await tx
         .update(heartbeatRuns)
         .set({

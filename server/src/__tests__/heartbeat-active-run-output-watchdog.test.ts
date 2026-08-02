@@ -560,6 +560,48 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(event?.message).toContain("Source-resolved watchdog fold");
   });
 
+  it("locks the source issue before its run during source-resolved folding", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, issueId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+      sourceStatus: "done",
+      sameRunTerminalEvidence: "activity",
+    });
+    let releaseIssueLock!: () => void;
+    let issueLockHeld!: () => void;
+    const issueLockHeldPromise = new Promise<void>((resolve) => {
+      issueLockHeld = resolve;
+    });
+    const releaseIssueLockPromise = new Promise<void>((resolve) => {
+      releaseIssueLock = resolve;
+    });
+    const checkoutOrderTransaction = db.transaction(async (tx) => {
+      await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .for("update");
+      issueLockHeld();
+      await releaseIssueLockPromise;
+      await tx
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .for("update");
+    });
+
+    await issueLockHeldPromise;
+    const foldPromise = heartbeat.scanSilentActiveRuns({ now, companyId });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    releaseIssueLock();
+
+    await expect(checkoutOrderTransaction).resolves.toBeUndefined();
+    await expect(foldPromise).resolves.toMatchObject({ folded: 1 });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("succeeded");
+  });
+
   it("still escalates terminal source issues without same-run terminal evidence", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const { companyId, runId } = await seedRunningRun({
