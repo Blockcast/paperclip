@@ -1124,7 +1124,7 @@ describe("github-webhook pure helpers", () => {
     expect(description).toContain("A GitHub alert-state receipt is sufficient but not required");
     expect(description).toContain("terminal dismissal webhook receipt");
     expect(description).toMatch(
-      /^1\. The remediation PR merges into the default branch of `Blockcast\/paperclip`, AND the default-branch manifest `packages\/mcp-gateway\/package\.json` resolves vitest at 3\.2\.6 or newer, with advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429 cited in the evidence\.$/m,
+      /^1\. The default-branch manifest `packages\/mcp-gateway\/package\.json` in `Blockcast\/paperclip` resolves vitest at 3\.2\.6 or newer, outside the vulnerable range < 3\.2\.6, with advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429 cited in the evidence\.$/m,
     );
   });
 
@@ -3833,13 +3833,15 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
     // All three sufficient branches survive, each on its own numbered line.
     expect(description).toContain("Any ONE of the following is sufficient and complete evidence");
-    expect(description).toMatch(/^1\. The remediation PR merges into the default branch/m);
+    expect(description).toMatch(/^1\. The default-branch manifest/m);
     expect(description).toMatch(/^2\. .*shows `state: fixed` for advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429\.$/m);
-    expect(description).toMatch(/^3\. .*shows `state: dismissed` for advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429/m);
-    // Branch 1 names the concrete manifest + patched version, so it is actionable
-    // without re-deriving anything from the alert page.
     expect(description).toMatch(
-      /^1\. The remediation PR merges into the default branch of `Blockcast\/paperclip`, AND the default-branch manifest `packages\/mcp-gateway\/package\.json` resolves vitest at 3\.2\.6 or newer, with advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429 cited in the evidence\.$/m,
+      /^3\. A documented dismissal reason is recorded, and either a terminal dismissal webhook receipt on this issue or .*shows `state: dismissed` for advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429\.$/m,
+    );
+    // Branch 1 names the same concrete closure fields as remediation acceptance,
+    // so it is actionable without re-deriving anything from the alert page.
+    expect(description).toMatch(
+      /^1\. The default-branch manifest `packages\/mcp-gateway\/package\.json` in `Blockcast\/paperclip` resolves vitest at 3\.2\.6 or newer, outside the vulnerable range < 3\.2\.6, with advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429 cited in the evidence\.$/m,
     );
 
     // Acceptance criteria split remediation from dismissal instead of implying
@@ -3849,7 +3851,9 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(description).toMatch(
       /^- Remediation path: the default-branch manifest `packages\/mcp-gateway\/package\.json` in `Blockcast\/paperclip` resolves vitest at 3\.2\.6 or newer, outside the vulnerable range < 3\.2\.6, and the evidence cites advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429\. A GitHub alert-state receipt is sufficient but not required\.$/m,
     );
-    expect(description).toContain("terminal dismissal webhook receipt");
+    expect(description).toMatch(
+      /^- Dismissal path: a documented dismissal reason is recorded, and either a terminal dismissal webhook receipt on this issue or direct terminal-state observation from GitHub shows the alert is dismissed for advisory GHSA-5xrq-8626-4rwp \/ CVE-2026-47429\.$/m,
+    );
     expect(description).not.toContain("alert's state on GitHub moves to `fixed`");
     expect(description).not.toContain("alert's state on GitHub is `dismissed`");
 
