@@ -25,6 +25,7 @@ import {
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { resolveAssigneeUserId } from "./owner-resolver.js";
 import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
+import { recordCredentialResolution } from "./credential-health.js";
 import {
   ORIGIN_KIND,
   type AlertStateRecord,
@@ -570,6 +571,11 @@ export async function handleWebhook(
     );
     return;
   }
+
+  // Config-resolution outcome, not request-auth outcome: this reflects
+  // whether the company has a usable credential configured at all, not
+  // whether THIS request presented it correctly (BLO-20572).
+  recordCredentialResolution(input.companyId, resolvedToken);
 
   if (!verifyBearerToken(input.headers, resolvedToken)) {
     ctx.logger.warn(
