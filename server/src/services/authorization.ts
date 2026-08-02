@@ -475,9 +475,9 @@ async function scopeAllows(
     if (!matchesSubtree) return false;
   }
 
-  // Unknown metadata keys do not constrain the grant. Recognized constraints
-  // return false above when they fail to match the requested assignment scope.
-  return !constrained ? true : constrained;
+  // A non-empty scope must contain at least one recognized constraint. Unknown
+  // keys cannot silently turn a purportedly scoped grant into a broad grant.
+  return constrained;
 }
 
 function allow(input: Omit<AuthorizationDecision, "allowed">): AuthorizationDecision {

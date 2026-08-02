@@ -168,7 +168,7 @@ describeEmbeddedPostgres("additive agent grant route", () => {
     const added = await request(app).patch(path).send({
       operation: "add",
       permissionKey: "agents:configure",
-      scope: { environmentIds: ["environment-1"] },
+      scope: { agentIds: [agent.id] },
     });
 
     expect(added.status, JSON.stringify(added.body)).toBe(200);
@@ -176,7 +176,7 @@ describeEmbeddedPostgres("additive agent grant route", () => {
     expect(added.body.grants).toEqual(expect.arrayContaining([
       expect.objectContaining({
         permissionKey: "agents:configure",
-        scope: { environmentIds: ["environment-1"] },
+        scope: { agentIds: [agent.id] },
         grantedByUserId: ownerId,
       }),
       expect.objectContaining({
@@ -199,7 +199,7 @@ describeEmbeddedPostgres("additive agent grant route", () => {
     const replayed = await request(app).patch(path).send({
       operation: "add",
       permissionKey: "agents:configure",
-      scope: { environmentIds: ["different-replay-scope"] },
+      scope: { agentIds: [randomUUID()] },
     });
     expect(replayed.status, JSON.stringify(replayed.body)).toBe(200);
 
@@ -215,7 +215,7 @@ describeEmbeddedPostgres("additive agent grant route", () => {
     expect(afterReplay).toHaveLength(1);
     expect(afterReplay[0]).toMatchObject({
       id: firstGrant.id,
-      scope: { environmentIds: ["environment-1"] },
+      scope: { agentIds: [agent.id] },
       grantedByUserId: ownerId,
       createdAt: firstGrant.createdAt,
     });
@@ -302,6 +302,80 @@ describeEmbeddedPostgres("additive agent grant route", () => {
 
     expect(response.status, JSON.stringify(response.body)).toBe(403);
     expect(response.body.error).toBe("Board access required");
+  });
+
+  it("rejects grants for missing and inactive agent memberships", async () => {
+    const { company, ownerId, agent, membership } = await seedCompanyOwnerAndAgent(db);
+    const app = await createApp(db, company.id, ownerId);
+    const path = `/api/companies/${company.id}/agents/${agent.id}/grants`;
+
+    await db
+      .update(companyMemberships)
+      .set({ status: "suspended" })
+      .where(eq(companyMemberships.id, membership.id));
+    const inactive = await request(app)
+      .patch(path)
+      .send({ operation: "add", permissionKey: "agents:configure" });
+    expect(inactive.status, JSON.stringify(inactive.body)).toBe(404);
+
+    await db.delete(companyMemberships).where(eq(companyMemberships.id, membership.id));
+    const missing = await request(app)
+      .patch(path)
+      .send({ operation: "add", permissionKey: "agents:configure" });
+    expect(missing.status, JSON.stringify(missing.body)).toBe(404);
+
+    const grants = await db
+      .select()
+      .from(principalPermissionGrants)
+      .where(and(
+        eq(principalPermissionGrants.companyId, company.id),
+        eq(principalPermissionGrants.principalType, "agent"),
+        eq(principalPermissionGrants.principalId, agent.id),
+      ));
+    expect(grants).toHaveLength(0);
+  });
+
+  it("rechecks membership after waiting on a concurrent teardown lock", async () => {
+    const { company, ownerId, agent, membership } = await seedCompanyOwnerAndAgent(db);
+    const app = await createApp(db, company.id, ownerId);
+    let releaseTeardown!: () => void;
+    let teardownLocked!: () => void;
+    const release = new Promise<void>((resolve) => { releaseTeardown = resolve; });
+    const locked = new Promise<void>((resolve) => { teardownLocked = resolve; });
+
+    const teardown = db.transaction(async (tx) => {
+      await tx
+        .update(companyMemberships)
+        .set({ status: "suspended" })
+        .where(eq(companyMemberships.id, membership.id));
+      teardownLocked();
+      await release;
+    });
+    await locked;
+
+    const grantRequest = request(app)
+      .patch(`/api/companies/${company.id}/agents/${agent.id}/grants`)
+      .send({ operation: "add", permissionKey: "agents:configure" })
+      .then((response) => response);
+    const stateBeforeRelease = await Promise.race([
+      grantRequest.then(() => "settled" as const),
+      new Promise<"waiting">((resolve) => setTimeout(() => resolve("waiting"), 50)),
+    ]);
+    expect(stateBeforeRelease).toBe("waiting");
+    releaseTeardown();
+    await teardown;
+
+    const response = await grantRequest;
+    expect(response.status, JSON.stringify(response.body)).toBe(404);
+    const grants = await db
+      .select()
+      .from(principalPermissionGrants)
+      .where(and(
+        eq(principalPermissionGrants.companyId, company.id),
+        eq(principalPermissionGrants.principalType, "agent"),
+        eq(principalPermissionGrants.principalId, agent.id),
+      ));
+    expect(grants).toHaveLength(0);
   });
 
   it("rolls back the grant when its audit record cannot be persisted", async () => {

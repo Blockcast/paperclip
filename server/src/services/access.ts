@@ -7,7 +7,7 @@ import {
   principalPermissionGrants,
 } from "@paperclipai/db";
 import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
-import { conflict } from "../errors.js";
+import { conflict, notFound } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
@@ -661,6 +661,23 @@ export function accessService(db: Db) {
     activity: LogActivityInput,
   ) {
     return db.transaction(async (tx) => {
+      if (input.operation === "add" && principalType === "agent") {
+        const activeMembership = await tx
+          .select({ id: companyMemberships.id })
+          .from(companyMemberships)
+          .where(
+            and(
+              eq(companyMemberships.companyId, companyId),
+              eq(companyMemberships.principalType, "agent"),
+              eq(companyMemberships.principalId, principalId),
+              eq(companyMemberships.status, "active"),
+            ),
+          )
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!activeMembership) throw notFound("Active agent membership not found");
+      }
+
       let changed = false;
       if (input.operation === "remove") {
         const removed = await tx

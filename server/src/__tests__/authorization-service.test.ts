@@ -2691,7 +2691,7 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(denied.explanation).toContain("does not cover the requested scope");
   });
 
-  it("treats unknown grant scope metadata as unconstrained", async () => {
+  it("fails closed when a persisted grant scope has only unknown keys", async () => {
     const company = await createCompany(db, "UnknownScopeMetadata");
     const actorAgent = await createAgent(db, company.id);
     const targetAgent = await createAgent(db, company.id);
@@ -2709,8 +2709,8 @@ describeEmbeddedPostgres("authorization service", () => {
     });
 
     expect(decision).toMatchObject({
-      allowed: true,
-      grant: { permissionKey: "tasks:assign_scope" },
+      allowed: false,
+      reason: "deny_scope",
     });
   });
 
