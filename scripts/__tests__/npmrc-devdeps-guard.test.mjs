@@ -100,5 +100,25 @@ test("pr.yml guards the install against an ambient NODE_ENV=production", () => {
     "The legacy required verify job must depend on worktree_install so the guard gates merges.",
   );
   assert.match(verifyBody, /WORKTREE_INSTALL_RESULT:\s*\${{\s*needs\.worktree_install\.result\s*}}/);
-  assert.match(verifyBody, /test "\$WORKTREE_INSTALL_RESULT" = "success"/);
+
+  // BLO-21078: verify now classifies each lane's result into success /
+  // cancelled / failed instead of a bare `test ... = success` chain, so a
+  // GitHub-side runner kill can be told apart from a real test failure. The
+  // guard's job is unchanged though: a broken from-scratch install must still
+  // fail the job, whichever bucket it lands in.
+  assert.match(
+    verifyBody,
+    /\["Worktree install"\]="\$WORKTREE_INSTALL_RESULT"/,
+    "worktree_install's result must feed the verify lane-result table so a broken install is still classified.",
+  );
+  assert.match(
+    verifyBody,
+    /\*\)\s*failed_lanes\+=/,
+    "A worktree_install result other than success/cancelled must be classified as failed.",
+  );
+  assert.match(
+    verifyBody,
+    /\n\s*exit 1\s*$/,
+    "verify must still exit non-zero when worktree_install (or any lane) isn't success.",
+  );
 });
