@@ -1,6 +1,6 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { approvalComments, approvals } from "@paperclipai/db";
+import { approvalComments, approvals, issueApprovals } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { agentService } from "./agents.js";
@@ -92,6 +92,84 @@ export function approvalService(db: Db) {
       return db.select().from(approvals).where(and(...conditions));
     },
 
+    /**
+     * Existence-check listing. Selects an explicit column set that excludes `payload`
+     * — the whole point is that checking for an already-filed ask must cost far less
+     * than re-filing it. `label` is derived server-side so the caller still gets
+     * something triageable without shipping the payload body.
+     *
+     * `issueId` filters through the issue_approvals join table.
+     */
+    listSummary: async (
+      companyId: string,
+      filters: {
+        status?: string;
+        type?: string;
+        issueId?: string;
+        requestedByAgentId?: string;
+        idempotencyKey?: string;
+      } = {},
+    ) => {
+      const conditions = [eq(approvals.companyId, companyId)];
+      if (filters.status) conditions.push(eq(approvals.status, filters.status));
+      if (filters.type) conditions.push(eq(approvals.type, filters.type));
+      if (filters.requestedByAgentId) {
+        conditions.push(eq(approvals.requestedByAgentId, filters.requestedByAgentId));
+      }
+      if (filters.idempotencyKey) {
+        conditions.push(eq(approvals.idempotencyKey, filters.idempotencyKey));
+      }
+      if (filters.issueId) {
+        conditions.push(
+          sql`EXISTS (SELECT 1 FROM ${issueApprovals} WHERE ${issueApprovals.approvalId} = ${approvals.id} AND ${issueApprovals.issueId} = ${filters.issueId})`,
+        );
+      }
+
+      const rows = await db
+        .select({
+          id: approvals.id,
+          type: approvals.type,
+          status: approvals.status,
+          requestedByAgentId: approvals.requestedByAgentId,
+          requestedByUserId: approvals.requestedByUserId,
+          idempotencyKey: approvals.idempotencyKey,
+          createdAt: approvals.createdAt,
+          decidedAt: approvals.decidedAt,
+          // Derived label. `payload->>'title'` can be the literal "***REDACTED***"
+          // (the field-name redactor, tracked separately on BLO-20810), and it can be
+          // absent entirely, so fall back through summary and finally to a synthetic
+          // identifier. A human triaging the queue always gets something to read.
+          label: sql<string>`COALESCE(
+            NULLIF(NULLIF(${approvals.payload} ->> 'title', ''), '***REDACTED***'),
+            NULLIF(NULLIF(${approvals.payload} ->> 'summary', ''), '***REDACTED***'),
+            NULLIF(NULLIF(${approvals.payload} ->> 'description', ''), '***REDACTED***'),
+            ${approvals.type} || ' ' || left(${approvals.id}::text, 8)
+          )`,
+        })
+        .from(approvals)
+        .where(and(...conditions))
+        .orderBy(asc(approvals.createdAt));
+
+      return rows;
+    },
+
+    countBy: async (
+      companyId: string,
+      filters: { status?: string; type?: string; requestedByAgentId?: string } = {},
+    ) => {
+      const conditions = [eq(approvals.companyId, companyId)];
+      if (filters.status) conditions.push(eq(approvals.status, filters.status));
+      if (filters.type) conditions.push(eq(approvals.type, filters.type));
+      if (filters.requestedByAgentId) {
+        conditions.push(eq(approvals.requestedByAgentId, filters.requestedByAgentId));
+      }
+      const rows = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(approvals)
+        .where(and(...conditions));
+      return rows[0]?.count ?? 0;
+    },
+
     getById: (id: string) =>
       db
         .select()
@@ -120,6 +198,70 @@ export function approvalService(db: Db) {
         .values({ ...data, companyId })
         .returning()
         .then((rows) => rows[0]),
+
+    /**
+     * Create, replaying an existing undecided approval when the same requester reuses
+     * an idempotency key. Returns `{ approval, deduplicated }` so the route can answer
+     * 200-with-readback instead of 201, which is the signal a requester currently
+     * lacks — silence today is indistinguishable from "not yet decided", so retrying
+     * is the only way to find out, which is exactly what floods the queue.
+     *
+     * Race safety comes from the advisory lock, matching the issue-create path
+     * (server/src/services/issues.ts). The partial unique indexes are the backstop.
+     */
+    createWithIdempotency: async (
+      companyId: string,
+      data: Omit<typeof approvals.$inferInsert, "companyId">,
+    ): Promise<{ approval: ApprovalRecord; deduplicated: boolean }> => {
+      const idempotencyKey = typeof data.idempotencyKey === "string"
+        ? data.idempotencyKey.trim() || null
+        : null;
+
+      if (!idempotencyKey) {
+        const approval = await db
+          .insert(approvals)
+          .values({ ...data, companyId, idempotencyKey: null })
+          .returning()
+          .then((rows) => rows[0]);
+        return { approval, deduplicated: false };
+      }
+
+      // The requester identity that scopes the key. Exactly one of these is set by the
+      // route; scoping to the requester means two agents filing similar asks never
+      // collide, while one agent retrying always does.
+      const requesterColumn = data.requestedByAgentId
+        ? approvals.requestedByAgentId
+        : approvals.requestedByUserId;
+      const requesterValue = data.requestedByAgentId ?? data.requestedByUserId ?? null;
+
+      return db.transaction(async (tx) => {
+        const guardKey = `approval-create:idempotency:${companyId}:${requesterValue ?? "anonymous"}:${idempotencyKey}`;
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${guardKey}, 0))`);
+
+        if (requesterValue !== null) {
+          const existing = await tx
+            .select()
+            .from(approvals)
+            .where(
+              and(
+                eq(approvals.companyId, companyId),
+                eq(approvals.idempotencyKey, idempotencyKey),
+                eq(requesterColumn, requesterValue),
+                inArray(approvals.status, resolvableStatuses),
+              ),
+            )
+            .limit(1);
+          if (existing[0]) return { approval: existing[0], deduplicated: true };
+        }
+
+        const approval = await tx
+          .insert(approvals)
+          .values({ ...data, companyId, idempotencyKey })
+          .returning()
+          .then((rows) => rows[0]);
+        return { approval, deduplicated: false };
+      });
+    },
 
     approve: async (id: string, decidedByUserId: string, decisionNote?: string | null) => {
       const { approval: updated, applied } = await resolveApproval(

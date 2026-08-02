@@ -1,4 +1,5 @@
-import { pgTable, uuid, text, timestamp, jsonb, index } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, jsonb, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 
@@ -12,6 +13,9 @@ export const approvals = pgTable(
     requestedByUserId: text("requested_by_user_id"),
     status: text("status").notNull().default("pending"),
     payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
+    // Requester-supplied dedupe token. Scoped to (company, requester, key) and only
+    // enforced while the approval is still undecided — see the partial indexes below.
+    idempotencyKey: text("idempotency_key"),
     decisionNote: text("decision_note"),
     decidedByUserId: text("decided_by_user_id"),
     decidedAt: timestamp("decided_at", { withTimezone: true }),
@@ -24,5 +28,19 @@ export const approvals = pgTable(
       table.status,
       table.type,
     ),
+    // Two indexes rather than one because the requester is stored in one of two
+    // mutually exclusive columns. Both are scoped to the undecided statuses: once the
+    // board has answered an ask, re-filing the same key is a legitimately new request
+    // (the answer may have changed the situation), so the key is released on decision.
+    companyAgentIdempotencyIdx: uniqueIndex("approvals_company_agent_idempotency_idx")
+      .on(table.companyId, table.requestedByAgentId, table.idempotencyKey)
+      .where(
+        sql`${table.idempotencyKey} IS NOT NULL AND ${table.requestedByAgentId} IS NOT NULL AND ${table.status} IN ('pending', 'revision_requested')`,
+      ),
+    companyUserIdempotencyIdx: uniqueIndex("approvals_company_user_idempotency_idx")
+      .on(table.companyId, table.requestedByUserId, table.idempotencyKey)
+      .where(
+        sql`${table.idempotencyKey} IS NOT NULL AND ${table.requestedByUserId} IS NOT NULL AND ${table.status} IN ('pending', 'revision_requested')`,
+      ),
   }),
 );

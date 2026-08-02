@@ -4,8 +4,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockApprovalService = vi.hoisted(() => ({
   list: vi.fn(),
+  listSummary: vi.fn(),
+  countBy: vi.fn(),
   getById: vi.fn(),
   create: vi.fn(),
+  createWithIdempotency: vi.fn(),
   approve: vi.fn(),
   reject: vi.fn(),
   requestRevision: vi.fn(),
@@ -119,8 +122,21 @@ describe("approval routes idempotent retries", () => {
     registerModuleMocks();
     vi.clearAllMocks();
     mockApprovalService.list.mockReset();
+    mockApprovalService.listSummary.mockReset();
+    mockApprovalService.countBy.mockReset();
     mockApprovalService.getById.mockReset();
     mockApprovalService.create.mockReset();
+    mockApprovalService.createWithIdempotency.mockReset();
+    // The route calls createWithIdempotency; the non-dedupe branch is behaviourally
+    // identical to the old create, so delegate. Existing assertions on `create` — the
+    // args the route builds — keep working unchanged, and tests that exercise a replay
+    // override this implementation.
+    mockApprovalService.createWithIdempotency.mockImplementation(
+      async (companyId: string, data: Record<string, unknown>) => ({
+        approval: await mockApprovalService.create(companyId, data),
+        deduplicated: false,
+      }),
+    );
     mockApprovalService.approve.mockReset();
     mockApprovalService.reject.mockReset();
     mockApprovalService.requestRevision.mockReset();
@@ -497,6 +513,192 @@ describe("approval routes idempotent retries", () => {
         requestedByUserId: "user-1",
       }),
     );
+  });
+
+  // ---------------------------------------------------------------------------
+  // BLO-19132: create-side dedupe and the cheap existence check.
+  //
+  // The defect these cover: filing a duplicate approval was cheaper than checking
+  // whether one already existed, and a pending approval emitted nothing back to its
+  // requester, so retrying was the only way to learn anything. Three asks for one PR
+  // review landed inside 73 minutes because of it.
+  // ---------------------------------------------------------------------------
+
+  it("replays the original approval when an agent reuses an idempotency key", async () => {
+    const existing = {
+      id: "approval-original",
+      companyId: "company-1",
+      type: "request_board_approval",
+      requestedByAgentId: "agent-1",
+      requestedByUserId: null,
+      status: "pending",
+      payload: { title: "Trigger exact-head human review for MOQtail PR #312" },
+      idempotencyKey: "moqtail-312-exact-head-review",
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      createdAt: new Date(Date.now() - 73 * 60 * 1000),
+      updatedAt: new Date(),
+    };
+    mockApprovalService.createWithIdempotency.mockResolvedValue({
+      approval: existing,
+      deduplicated: true,
+    });
+
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        issueIds: ["00000000-0000-0000-0000-000000000001"],
+        payload: { title: "Trigger exact-head human review for MOQtail PR #312" },
+        idempotencyKey: "moqtail-312-exact-head-review",
+      });
+
+    // 200, not 201: nothing was created.
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toMatchObject({
+      id: "approval-original",
+      deduplicated: true,
+      deduplicationReason: "idempotency_key",
+    });
+    // The readback is the signal that makes retrying unnecessary.
+    expect(res.body.statusReadback).toContain("still pending");
+    expect(res.body.statusReadback).toContain("No duplicate was created");
+    expect(res.body.pendingForMs).toBeGreaterThan(60 * 60 * 1000);
+
+    // Issue links are idempotent (onConflictDoNothing), so applying the caller's links
+    // to the ORIGINAL approval is correct — a retry naming a new issue still attaches
+    // it. What must not repeat is the board notification.
+    expect(mockIssueApprovalService.linkManyForApproval).toHaveBeenCalledWith(
+      "approval-original",
+      ["00000000-0000-0000-0000-000000000001"],
+      { agentId: "agent-1", userId: null },
+    );
+    // Re-logging would put a second card in front of a human for an ask they have
+    // already been shown — the exact harm this ticket is about.
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("forwards the idempotency key to the service on a first filing", async () => {
+    mockApprovalService.create.mockResolvedValue({
+      id: "approval-first",
+      companyId: "company-1",
+      type: "request_board_approval",
+      requestedByAgentId: "agent-1",
+      requestedByUserId: null,
+      status: "pending",
+      payload: { title: "Rotate credentials" },
+      idempotencyKey: "rotate-creds-blo-18969",
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      createdAt: new Date("2026-08-02T00:00:00.000Z"),
+      updatedAt: new Date("2026-08-02T00:00:00.000Z"),
+    });
+
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Rotate credentials" },
+        idempotencyKey: "rotate-creds-blo-18969",
+      });
+
+    expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
+    expect(res.body.deduplicated).toBeUndefined();
+    expect(mockApprovalService.createWithIdempotency).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({ idempotencyKey: "rotate-creds-blo-18969" }),
+    );
+    // A genuinely new filing still notifies.
+    expect(mockLogActivity).toHaveBeenCalled();
+  });
+
+  it("serves a count-only listing without touching the payload-bearing list", async () => {
+    mockApprovalService.countBy.mockResolvedValue(63);
+
+    const res = await request(await createApp())
+      .get("/api/companies/company-1/approvals?view=count&status=pending");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toEqual({ count: 63 });
+    expect(mockApprovalService.countBy).toHaveBeenCalledWith("company-1", {
+      status: "pending",
+      type: undefined,
+      requestedByAgentId: undefined,
+    });
+    // The expensive path must not run.
+    expect(mockApprovalService.list).not.toHaveBeenCalled();
+  });
+
+  it("serves a summary listing that omits payload and filters by linked issue", async () => {
+    mockApprovalService.listSummary.mockResolvedValue([
+      {
+        id: "approval-1",
+        type: "request_board_approval",
+        status: "pending",
+        requestedByAgentId: "agent-1",
+        requestedByUserId: null,
+        idempotencyKey: "k1",
+        createdAt: new Date("2026-08-02T00:00:00.000Z"),
+        decidedAt: null,
+        label: "Rotate credentials",
+      },
+    ]);
+
+    const res = await request(await createApp())
+      .get(
+        "/api/companies/company-1/approvals?view=summary&status=pending&issueId=00000000-0000-0000-0000-000000000001",
+      );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].label).toBe("Rotate credentials");
+    // The payload body is what makes the full listing expensive; it must be absent.
+    expect(res.body[0]).not.toHaveProperty("payload");
+    expect(mockApprovalService.listSummary).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        status: "pending",
+        issueId: "00000000-0000-0000-0000-000000000001",
+      }),
+    );
+    expect(mockApprovalService.list).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unknown view rather than silently falling back to the expensive listing", async () => {
+    const res = await request(await createApp())
+      .get("/api/companies/company-1/approvals?view=everything");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(mockApprovalService.list).not.toHaveBeenCalled();
+    expect(mockApprovalService.listSummary).not.toHaveBeenCalled();
+  });
+
+  it("keeps the default listing unchanged when no view is given", async () => {
+    mockApprovalService.list.mockResolvedValue([
+      {
+        id: "approval-1",
+        companyId: "company-1",
+        type: "request_board_approval",
+        status: "pending",
+        payload: { title: "Approve hosting spend" },
+        requestedByAgentId: "agent-1",
+        requestedByUserId: null,
+        decisionNote: null,
+        decidedByUserId: null,
+        decidedAt: null,
+        createdAt: new Date("2026-08-02T00:00:00.000Z"),
+        updatedAt: new Date("2026-08-02T00:00:00.000Z"),
+      },
+    ]);
+
+    const res = await request(await createApp())
+      .get("/api/companies/company-1/approvals?status=pending");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body[0]).toHaveProperty("payload");
+    expect(mockApprovalService.list).toHaveBeenCalledWith("company-1", "pending");
   });
 
   it("blocks status-only recovery runs from creating approvals", async () => {
