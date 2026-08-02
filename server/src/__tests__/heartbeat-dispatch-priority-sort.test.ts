@@ -1584,4 +1584,204 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     // test and race the shared afterEach cleanup.
     await cappedHeartbeat.drainInFlightExecutions(60_000);
   }, 180_000);
+
+  it("continues the bounded scan when a pass claims fewer runs than it has slots", async () => {
+    // BLO-20396 (review follow-up): a PARTIALLY filled dispatch pass used to
+    // abandon its continuation. advanceOrClearResumeCursor stored the forward
+    // cursor and returned false whenever anything was claimed, and the caller
+    // scheduled nothing, on the reasoning that "a claim re-triggers dispatch
+    // when it completes".
+    //
+    // That reasoning only covers the slot the claim occupied. The geometry
+    // below is the case it misses, and it is the one this fleet actually hits:
+    //
+    //   slots:  2 free
+    //   window: [ claimable-but-long-running , dependency-blocked ]
+    //   beyond: [ runnable ]                       <- never examined
+    //
+    // The pass claims one run, refuses the other, and stops with a slot still
+    // free — not because it ran out of capacity, but because it ran out of
+    // candidates IN THIS WINDOW. Nothing then looks past the cursor: no
+    // completion fires for a slot that never started, and nothing was pruned,
+    // so the prune follow-up does not fire either. The runnable row waits for
+    // the long-running claim to finish, which on Ally means a ~50-minute
+    // review.
+    //
+    // The hold below is what makes this a real regression test rather than a
+    // coincidence: run #1 never completes during the test, so the only thing
+    // that can dispatch the third run is the continuation itself.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerIssueId = randomUUID();
+    const holdIssueId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const beyondIssueId = randomUUID();
+    const holdRunId = randomUUID();
+    const blockedRunId = randomUUID();
+    const beyondRunId = randomUUID();
+    const issuePrefix = `P${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const baseCreatedAt = new Date(Date.now() - 90 * 60 * 1000);
+
+    // A two-row window with a third row behind it. maxScanBatches: 1 makes the
+    // first pass stop after exactly two rows with the cursor set and the scan
+    // NOT exhausted, which is the state that owes a continuation.
+    const dispatchBounds = { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 5 };
+    const partialHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      queuedRunDispatchBounds: dispatchBounds,
+    });
+
+    let releaseHold = () => {};
+    const holdReleased = new Promise<void>((resolve) => {
+      releaseHold = resolve;
+    });
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "PartialPassCo",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "PartialPassAgent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        // Two slots is the whole point: one claim must leave one free.
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 2 } },
+        permissions: {},
+      });
+
+      await db.insert(issues).values([
+        {
+          id: blockerIssueId,
+          companyId,
+          title: "Unresolved blocker",
+          status: "in_progress",
+          priority: "high",
+          assigneeAgentId: agentId,
+          issueNumber: 1,
+          identifier: `${issuePrefix}-1`,
+          startedAt: baseCreatedAt,
+        },
+        {
+          id: holdIssueId,
+          companyId,
+          title: "Long-running claim that occupies one slot",
+          status: "todo",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          issueNumber: 2,
+          identifier: `${issuePrefix}-2`,
+        },
+        {
+          id: blockedIssueId,
+          companyId,
+          title: "Dependency-blocked row that fills the rest of the window",
+          status: "todo",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          issueNumber: 3,
+          identifier: `${issuePrefix}-3`,
+        },
+        {
+          id: beyondIssueId,
+          companyId,
+          title: "Runnable work beyond the scan cursor",
+          status: "todo",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          issueNumber: 4,
+          identifier: `${issuePrefix}-4`,
+        },
+      ]);
+
+      // Only the middle row is blocked, so it is refused without being claimed.
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerIssueId,
+        relatedIssueId: blockedIssueId,
+        type: "blocks",
+      });
+
+      const queued: Array<{ runId: string; issueId: string; offset: number }> = [
+        { runId: holdRunId, issueId: holdIssueId, offset: 0 },
+        { runId: blockedRunId, issueId: blockedIssueId, offset: 1 },
+        { runId: beyondRunId, issueId: beyondIssueId, offset: 2 },
+      ];
+      for (const { runId, issueId, offset } of queued) {
+        const wakeId = randomUUID();
+        const createdAt = new Date(baseCreatedAt.getTime() + offset);
+        await db.insert(agentWakeupRequests).values({
+          id: wakeId,
+          companyId,
+          agentId,
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: { issueId },
+          status: "queued",
+          runId,
+          requestedAt: createdAt,
+          updatedAt: createdAt,
+        });
+        await db.insert(heartbeatRuns).values({
+          id: runId,
+          companyId,
+          agentId,
+          invocationSource: "assignment",
+          triggerDetail: "system",
+          status: "queued",
+          wakeupRequestId: wakeId,
+          contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+          createdAt,
+          updatedAt: createdAt,
+        });
+      }
+
+      const dispatchedRunIds: string[] = [];
+      mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+        dispatchedRunIds.push(args.runId);
+        // Hold the first slot open for the whole test.
+        if (args.runId === holdRunId) await holdReleased;
+        return {
+          exitCode: 0,
+          signal: null as string | null,
+          timedOut: false,
+          errorMessage: null as string | null,
+          resultJson: { exitCode: 0 },
+          provider: "test",
+          model: "test-model",
+        };
+      });
+
+      await partialHeartbeat.resumeQueuedRuns();
+
+      // Wait for the run BEYOND the cursor to be dispatched. Deliberately not
+      // waitForRunToSettle: that drains in-flight executions, and the held run
+      // is in-flight by construction.
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline && !dispatchedRunIds.includes(beyondRunId)) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+
+      // The claim that occupied slot 1 happened...
+      expect(dispatchedRunIds).toContain(holdRunId);
+      // ...and it is still running, so nothing it did could have re-triggered
+      // dispatch. Any dispatch of the third run came from the continuation.
+      expect((await partialHeartbeat.getRun(holdRunId))?.status).toBe("running");
+      // The pre-fix failure: this row sat queued behind a slot that was free.
+      expect(dispatchedRunIds).toContain(beyondRunId);
+      expect((await partialHeartbeat.getRun(beyondRunId))?.status).not.toBe("queued");
+    } finally {
+      releaseHold();
+      await partialHeartbeat.drainInFlightExecutions(60_000);
+    }
+  }, 180_000);
 });

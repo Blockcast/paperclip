@@ -26,10 +26,26 @@ import {
 } from "./test-embedded-postgres.js";
 
 const DISPATCH_INDEX = "heartbeat_runs_agent_dispatch_idx";
+const RECOVERY_INDEX = "heartbeat_runs_recovery_dispatch_idx";
 const SCAN_LIMIT = 200;
 const TOTAL_RUNS = 200_000;
 const TOTAL_ISSUES = Number(process.env.BLO20396_ISSUES ?? 20_000);
 const AGENT_QUEUED_ROWS = 350;
+/**
+ * Backlog depth for the recovery-lane bound test — several times SCAN_LIMIT on
+ * purpose. At 1.75x (the depth the first fixture uses) a filtered walk inspects
+ * 350 rows and reads as "a bit over the limit", which is not distinguishable
+ * from a bounded plan; at 25x the two answers differ by orders of magnitude.
+ */
+const DEEP_BACKLOG_ROWS = 5_000;
+/** Recovery rows owned by OTHER agents, so the recovery index is not empty. */
+const OTHER_AGENT_RECOVERY_ROWS = 2_000;
+/**
+ * What the recovery lane may inspect REGARDLESS of queue depth, once its
+ * predicate is index-restricted (migration 0209). Deliberately NOT derived from
+ * the backlog size: being independent of it is the property under test.
+ */
+const RECOVERY_LANE_ABSOLUTE_BOUND = 50;
 /**
  * The issue ids the agent's queued rows point at — the exact set the
  * dispatcher screens for UUID shape and then passes to the lookup below.
@@ -280,8 +296,12 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     await seed(sql);
 
     const report: string[] = [];
+    // Flushed on every record rather than once at the end: these plans are the
+    // diagnostic you most want when an assertion below FAILS, and a single
+    // write placed after the assertions produces no report in exactly that case.
     const record = (title: string, plan: { text: string; root: Record<string, unknown> }) => {
       report.push(`\n===== ${title} =====\n${plan.text}\n-- rows inspected: ${rowsInspected(plan.root)}`);
+      if (PLAN_REPORT) fs.writeFileSync(PLAN_REPORT, report.join("\n"));
     };
 
     // --- AC: the dispatch query uses the new index -------------------------
@@ -330,8 +350,6 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     const laneIssues = await explain(sql, PRIORITY_LANE_ISSUE_LOOKUP);
     record("priority lane B step 2 (issues by primary key)", laneIssues);
 
-    if (PLAN_REPORT) fs.writeFileSync(PLAN_REPORT, report.join("\n"));
-
     // The superseded lane is MEASURED but deliberately NOT asserted on. It is
     // recorded in the plan report as the justification for the split — at the
     // time of the change it seq-scanned the company's whole issue table on
@@ -348,8 +366,11 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     // which is why this is a split rather than a bounded re-read of the head.
     expect(scanKinds(laneCritical.root)).not.toContain("Seq Scan");
 
-    // Lane B needs no join at all, so it is bounded by the dispatch index.
-    expect(indexesUsed(laneRecovery.root)).toContain(DISPATCH_INDEX);
+    // Lane B needs no join at all, and since migration 0209 its predicate is
+    // index-restricted rather than filtered over the agent's queued rows. The
+    // absolute bound this buys is asserted in its own test below, on a backlog
+    // deep enough for the difference to be visible.
+    expect(indexesUsed(laneRecovery.root)).toContain(RECOVERY_INDEX);
     expect(scanKinds(laneRecovery.root)).not.toContain("Seq Scan");
 
     // Resolving lane B's issues stays on the primary key.
@@ -380,4 +401,92 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     expect(rowsInspected(laneRecovery.root)).toBeLessThanOrEqual(LANE_BOUND);
     expect(rowsInspected(laneIssues.root)).toBeLessThanOrEqual(LANE_BOUND);
   }, 900_000);
+
+  /**
+   * Review follow-up: the bound above is O(agent queue depth), and for lane B
+   * that is not good enough.
+   *
+   * Lane B's predicate is entirely run-side, so before migration 0209 the
+   * planner could only supply the agent's queued rows in dispatch order and
+   * filter each one on two unindexed jsonb expressions. In the zero-match case
+   * — the common one, since most agents have no recovery work — there is
+   * nothing for the LIMIT to stop early on, so PostgreSQL walks the agent's
+   * ENTIRE queued set to return nothing, while the strict per-agent start lock
+   * is held.
+   *
+   * A separate fixture rather than a deeper version of the one above, for two
+   * reasons. It needs a backlog several times SCAN_LIMIT to tell a bounded plan
+   * from an unbounded one, and it needs no issues, no join and no 200k-row bulk
+   * — so a focused fixture is both a sharper test and a much faster one. It
+   * also keeps this measurement from perturbing the plans the first test
+   * calibrates: those assertions are sensitive to the agent's row count and to
+   * how the rows are physically clustered, and changing either to serve this
+   * question would silently recalibrate them.
+   */
+  it("bounds the recovery lane absolutely, not by the agent's queue depth", async () => {
+    const database = await startEmbeddedPostgresTestDatabase("paperclip-blo20396-recovery-");
+    cleanups.push(database.cleanup);
+    const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
+    cleanups.push(async () => sql.end());
+
+    await sql.unsafe(`SET session_replication_role = replica`);
+    // The agent under test: a deep queued backlog with NO recovery work in it.
+    await sql.unsafe(`
+      INSERT INTO heartbeat_runs (company_id, agent_id, status, created_at, updated_at, context_snapshot)
+      SELECT
+        '${COMPANY}'::uuid,
+        '${AGENT}'::uuid,
+        'queued',
+        now() - ((${DEEP_BACKLOG_ROWS} - series) || ' seconds')::interval,
+        now(),
+        jsonb_build_object(
+          'issueId', '00000000-0000-4000-8000-' || lpad(series::text, 12, '0'),
+          'source', 'github_pr_review_requested'
+        )
+      FROM generate_series(1, ${DEEP_BACKLOG_ROWS}) AS series
+    `);
+    // Other agents' recovery wakes. Without these the recovery index would be
+    // globally EMPTY, and "inspected ~0 rows" would prove nothing — every plan
+    // is cheap against an empty index. With them, the measured property is the
+    // real one: the lane is bounded by this agent's slice of the index, not by
+    // the index as a whole.
+    await sql.unsafe(`
+      INSERT INTO heartbeat_runs (company_id, agent_id, status, created_at, updated_at, context_snapshot)
+      SELECT
+        '${COMPANY}'::uuid,
+        ('44444444-4444-4444-8444-' || lpad((series % 25)::text, 12, '0'))::uuid,
+        'queued',
+        now() - ((series % 5000) || ' seconds')::interval,
+        now(),
+        jsonb_build_object(
+          'issueId', '00000000-0000-4000-8000-' || lpad(series::text, 12, '0'),
+          'source', 'issue_recovery_action',
+          'recoveryActionId', gen_random_uuid()
+        )
+      FROM generate_series(1, ${OTHER_AGENT_RECOVERY_ROWS}) AS series
+    `);
+    await sql.unsafe(`SET session_replication_role = origin`);
+    await sql.unsafe(`ANALYZE heartbeat_runs`);
+
+    const laneRecovery = await explain(sql, PRIORITY_LANE_RECOVERY);
+    if (PLAN_REPORT) {
+      fs.writeFileSync(
+        `${PLAN_REPORT}.recovery`,
+        `\n===== recovery lane, ${DEEP_BACKLOG_ROWS}-row non-recovery backlog =====\n`
+          + `${laneRecovery.text}\n-- rows inspected: ${rowsInspected(laneRecovery.root)}`,
+      );
+    }
+
+    // The fixture has to be deep enough that a filtered walk and a bounded scan
+    // are actually distinguishable; asserting a ceiling against a shallow
+    // backlog proves nothing.
+    expect(DEEP_BACKLOG_ROWS).toBeGreaterThan(SCAN_LIMIT * 4);
+    expect(indexesUsed(laneRecovery.root)).toContain(RECOVERY_INDEX);
+    expect(scanKinds(laneRecovery.root)).not.toContain("Seq Scan");
+
+    // The point of the whole exercise: a FIXED ceiling, not one that grows with
+    // the queue. Pre-0209 this inspected DEEP_BACKLOG_ROWS.
+    expect(rowsInspected(laneRecovery.root)).toBeLessThanOrEqual(RECOVERY_LANE_ABSOLUTE_BOUND);
+    expect(RECOVERY_LANE_ABSOLUTE_BOUND).toBeLessThan(DEEP_BACKLOG_ROWS / 10);
+  }, 300_000);
 });

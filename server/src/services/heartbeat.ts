@@ -18141,6 +18141,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (claimedCount > 0) {
           dispatchResumeCursorByAgent.set(agentId, { ...scanCursor, passes: resumeState?.passes ?? 0 });
           clearDelayedResumeCapRetry(agentId);
+          /**
+           * A PARTIALLY filled pass still owes a continuation.
+           *
+           * "A claim re-triggers dispatch on completion" only covers the slot
+           * the claim occupied. When this pass claimed fewer runs than it had
+           * slots for, the claim loop ran out of *candidates in this window*,
+           * not out of capacity — every remaining row here was pruned,
+           * deduped, or refused. The rows beyond the cursor were never
+           * examined by anything, and nothing else is going to look at them:
+           * no completion fires for a slot that never started, and a pass that
+           * pruned nothing does not schedule the prune follow-up either. So a
+           * free slot idles until an unrelated wake arrives — which on this
+           * fleet means until a ~50-minute review finishes.
+           *
+           * Terminates for the same reason the no-claim chain does, plus a
+           * second bound: the cursor only moves forward through a finite
+           * queue, AND each claim CAS-flips a row to `running`, so the next
+           * pass recomputes a strictly smaller `availableSlots` and the chain
+           * dead-ends at the `availableSlots <= 0` return within at most the
+           * slot count. `passes` is therefore carried forward rather than
+           * incremented: this pass made real progress, but leaving the counter
+           * untouched still lets an alternating claim/no-claim queue converge
+           * on the resume cap instead of resetting it forever.
+           */
+          if (claimedCount < availableSlots) {
+            scheduleDetachedDispatchPass(agentId, "resume_bounded_scan");
+            return true;
+          }
           return false;
         }
         const passes = (resumeState?.passes ?? 0) + 1;
@@ -18359,8 +18387,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         finishPassWithoutClaims();
         return [];
       }
-      // A claim means work started; its completion re-triggers dispatch from
-      // the head of the queue, which is where the next pass should look.
+      // Settle continuation bookkeeping for a pass that DID claim. A pass that
+      // filled every slot needs nothing further — each claim's completion
+      // re-triggers dispatch. A pass that filled only some of them schedules a
+      // cursor continuation instead; see advanceOrClearResumeCursor.
       advanceOrClearResumeCursor(claimedRuns.length);
 
       for (const claimedRun of claimedRuns) {
