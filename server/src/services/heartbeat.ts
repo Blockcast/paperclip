@@ -8336,6 +8336,30 @@ export interface HeartbeatServiceOptions {
   beforeGithubReviewCoalescedTallyUpdateForTest?: (
     run: typeof heartbeatRuns.$inferSelect,
   ) => Promise<void> | void;
+  /**
+   * Test-only hook for queued-dispatch continuation regressions. Production
+   * leaves this unset.
+   */
+  beforeQueuedDispatchPassForTest?: (
+    input: {
+      agentId: string;
+      reason: string;
+      resumeContinuation: boolean;
+      suppressHeadRescanDemand: boolean;
+    },
+  ) => Promise<void> | void;
+  /**
+   * Test-only hook fired when a queued-dispatch request folds into an already
+   * running pass.
+   */
+  onQueuedDispatchCoalescedDemandForTest?: (
+    input: {
+      agentId: string;
+      reason: string;
+      resumeContinuation: boolean;
+      suppressHeadRescanDemand: boolean;
+    },
+  ) => void;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -17656,6 +17680,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       startNextQueuedRunForAgent(agentId, {
         resumeContinuation:
           reason === "resume_bounded_scan" || reason === "resume_bounded_scan_after_cap",
+        suppressHeadRescanDemand: reason === "resume_head_rescan_after_coalesced_demand",
+        reason,
       }).catch((err) => {
         logger.error(
           { err, agentId, reason },
@@ -17686,10 +17712,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function startNextQueuedRunForAgent(
     agentId: string,
-    dispatchPassOptions: { resumeContinuation?: boolean } = {},
+    dispatchPassOptions: {
+      resumeContinuation?: boolean;
+      suppressHeadRescanDemand?: boolean;
+      reason?: string;
+    } = {},
   ) {
     if (options.skipQueuedRunDispatch || dispatchStopped) return [];
-    if (!dispatchPassOptions.resumeContinuation && dispatchResumeCursorByAgent.has(agentId)) {
+    if (
+      !dispatchPassOptions.resumeContinuation
+      && !dispatchPassOptions.suppressHeadRescanDemand
+      && dispatchResumeCursorByAgent.has(agentId)
+    ) {
       dispatchHeadRescanDemandByAgent.add(agentId);
     }
     // Failure-B fence (BLO-9089): the api tier never claims/executes runs — it
@@ -17711,6 +17745,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     return withAgentStartLock(agentId, async () => {
       if (dispatchStopped) return [];
+      await options.beforeQueuedDispatchPassForTest?.({
+        agentId,
+        reason: dispatchPassOptions.reason ?? "direct",
+        resumeContinuation: dispatchPassOptions.resumeContinuation === true,
+        suppressHeadRescanDemand: dispatchPassOptions.suppressHeadRescanDemand === true,
+      });
       let agent = await getAgent(agentId);
       if (!agent) return [];
       const invokability = await getAgentInvokability(agent);
@@ -18443,7 +18483,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // (see packages/db/src/heartbeat-dispatch-query-plan.test.ts). The
         // chain terminates: a trailing pass that takes no new demand clears the
         // marker and schedules nothing.
-        if (!dispatchPassOptions.resumeContinuation) {
+        options.onQueuedDispatchCoalescedDemandForTest?.({
+          agentId,
+          reason: dispatchPassOptions.reason ?? "direct",
+          resumeContinuation: dispatchPassOptions.resumeContinuation === true,
+          suppressHeadRescanDemand: dispatchPassOptions.suppressHeadRescanDemand === true,
+        });
+        if (!dispatchPassOptions.resumeContinuation && !dispatchPassOptions.suppressHeadRescanDemand) {
           dispatchHeadRescanDemandByAgent.add(agentId);
         }
       },

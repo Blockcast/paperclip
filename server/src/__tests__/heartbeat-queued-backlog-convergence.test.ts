@@ -1299,4 +1299,137 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     adapter.disarm();
     await heartbeat.drainInFlightExecutions(60_000);
   }, 600_000);
+
+  it("does not re-arm an internally scheduled head rescan when it coalesces", async () => {
+    // BLO-20396 (sixth review follow-up). A trailing head rescan is scheduled
+    // from inside the currently held agent lock. It can therefore coalesce into
+    // that active section before running. That coalescence must NOT be treated
+    // as new external demand, or the head pass re-arms itself forever after it
+    // exhausts an empty queue.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issuePrefix = `H${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const terminalIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "HeadRescanLoopCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "HeadRescanLoopAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: terminalIssueId,
+      companyId,
+      title: "Already done",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    const now = Date.now();
+    const wakeRows: Array<typeof agentWakeupRequests.$inferInsert> = [];
+    const runRows: Array<typeof heartbeatRuns.$inferInsert> = [];
+    for (let i = 0; i < 2; i += 1) {
+      const runId = randomUUID();
+      const wakeId = randomUUID();
+      const at = new Date(now + i);
+      wakeRows.push({
+        id: wakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: terminalIssueId },
+        status: "queued",
+        runId,
+        requestedAt: at,
+        updatedAt: at,
+      });
+      runRows.push({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: wakeId,
+        contextSnapshot: { issueId: terminalIssueId, wakeReason: "issue_assigned" },
+        createdAt: at,
+        updatedAt: at,
+      });
+    }
+    await db.insert(agentWakeupRequests).values(wakeRows);
+    await db.insert(heartbeatRuns).values(runRows);
+
+    let releaseFirstPass!: () => void;
+    let firstPassEntered!: () => void;
+    let directCoalesced!: () => void;
+    const releaseFirstPassPromise = new Promise<void>((resolve) => {
+      releaseFirstPass = resolve;
+    });
+    const firstPassEnteredPromise = new Promise<void>((resolve) => {
+      firstPassEntered = resolve;
+    });
+    const directCoalescedPromise = new Promise<void>((resolve) => {
+      directCoalesced = resolve;
+    });
+    let heldFirstDirectPass = false;
+    const passReasons: string[] = [];
+    const coalescedReasons: Array<{ reason: string; suppressHeadRescanDemand: boolean }> = [];
+    const boundedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 4 },
+      beforeQueuedDispatchPassForTest: async (event) => {
+        passReasons.push(event.reason);
+        if (event.reason === "direct" && !heldFirstDirectPass) {
+          heldFirstDirectPass = true;
+          firstPassEntered();
+          await releaseFirstPassPromise;
+        }
+      },
+      onQueuedDispatchCoalescedDemandForTest: (event) => {
+        coalescedReasons.push({
+          reason: event.reason,
+          suppressHeadRescanDemand: event.suppressHeadRescanDemand,
+        });
+        if (event.reason === "direct") directCoalesced();
+      },
+    });
+
+    const first = boundedHeartbeat.resumeQueuedRuns();
+    await firstPassEnteredPromise;
+    const second = boundedHeartbeat.resumeQueuedRuns();
+    await directCoalescedPromise;
+    releaseFirstPass();
+    await Promise.all([first, second]);
+    await boundedHeartbeat.drainInFlightExecutions(5_000);
+
+    expect(passReasons.filter((reason) => reason === "resume_head_rescan_after_coalesced_demand"))
+      .toHaveLength(1);
+    expect(coalescedReasons).toContainEqual({
+      reason: "resume_head_rescan_after_coalesced_demand",
+      suppressHeadRescanDemand: true,
+    });
+
+    const remainingQueued = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued")));
+    expect(remainingQueued).toHaveLength(0);
+  }, 60_000);
 });

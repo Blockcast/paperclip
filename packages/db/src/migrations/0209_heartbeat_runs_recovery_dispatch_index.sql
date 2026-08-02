@@ -51,18 +51,15 @@
 -- definition is rejected rather than silently accepted. Empty databases (tests,
 -- bootstrap) build it inline, where there is nothing to block.
 --
--- On the predicate check: the key-column list is compared exactly, but the
--- WHERE clause is verified structurally (normalized whitespace, required
--- components) rather than against one hardcoded pretty-printed string. An exact
--- match would have to hardcode PostgreSQL's chosen parenthesization and cast
--- annotations for a two-clause AND; guessing that wrong fails the migration for
--- an operator who precreated the index correctly, which is a worse outcome than
--- a check that accepts an equivalent rendering. The components asserted still
--- reject a name-squatting index, a wrong-column index, and a wrong-constant
--- index, which is what this guard is for.
+-- Predicate guard: fail closed. Earlier versions checked three independent
+-- LIKE tokens, which accepted broader/wrong predicates such as
+-- `status = 'queued' OR source = 'issue_recovery_action'` or
+-- `source <> 'issue_recovery_action'`. Either shape restores the scan this
+-- index exists to remove, so the precreated index must match PostgreSQL's
+-- measured canonical predicate exactly.
 --
--- For reference, `pg_get_expr(indpred, indrelid, TRUE)` was MEASURED on a real
--- PostgreSQL after this migration ran (not assumed) as:
+-- `pg_get_expr(indpred, indrelid, TRUE)` was MEASURED on a real PostgreSQL
+-- after this migration ran (not assumed) as:
 --
 --   status = 'queued'::text AND (context_snapshot ->> 'source'::text) = 'issue_recovery_action'::text
 --
@@ -73,11 +70,13 @@
 DO $$
 DECLARE
   normalized_predicate text;
+  expected_predicate constant text :=
+    'status = ''queued''::text AND (context_snapshot ->> ''source''::text) = ''issue_recovery_action''::text';
 BEGIN
   IF to_regclass('public.heartbeat_runs_recovery_dispatch_idx') IS NOT NULL THEN
-    SELECT regexp_replace(
+    SELECT trim(regexp_replace(
              coalesce(pg_get_expr(index_metadata.indpred, index_metadata.indrelid, TRUE), ''),
-             '\s+', ' ', 'g')
+             '\s+', ' ', 'g'))
       INTO normalized_predicate
       FROM pg_index AS index_metadata
      WHERE index_metadata.indexrelid = to_regclass('public.heartbeat_runs_recovery_dispatch_idx');
@@ -101,9 +100,7 @@ BEGIN
           ORDER BY key_position
         ) = ARRAY['agent_id', 'created_at', 'id']
         AND index_metadata.indoption = '0 0 0'::int2vector
-        AND normalized_predicate LIKE '%status = ''queued''%'
-        AND normalized_predicate LIKE '%context_snapshot ->> ''source''%'
-        AND normalized_predicate LIKE '%''issue_recovery_action''%'
+        AND normalized_predicate = expected_predicate
     )
     THEN
       RAISE EXCEPTION USING
