@@ -2021,6 +2021,165 @@ describeEmbeddedPostgres("pipelineService", () => {
     );
   });
 
+  it("re-reads automation issue ownership after waiting for its lock", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Locked stage retirement");
+    const pipeline = await svc.createPipeline({
+      companyId: company.id,
+      key: "locked-stage-retirement",
+      name: "Locked stage retirement",
+      actor: userActor,
+      stages: [
+        { key: "intake", name: "Intake", kind: "open" },
+        { key: "drafting", name: "Drafting", kind: "working", config: { onEnter: { type: "run_routine", routineId: routine.id } } },
+        { key: "review", name: "Review", kind: "working" },
+        { key: "done", name: "Done", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    });
+    const created = await svc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "locked-stage-retirement",
+      title: "Locked stage retirement",
+      actor: userActor,
+    });
+    const entered = await svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "drafting",
+      expectedVersion: created.case.version,
+      actor: userActor,
+    });
+    const issueId = entered.automationExecution.status === "succeeded"
+      ? entered.automationExecution.execution.executionIssueId!
+      : "";
+    const heartbeatRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: heartbeatRunId,
+      companyId: company.id,
+      agentId: routine.assigneeAgentId!,
+      status: "running",
+      invocationSource: "assignment",
+      contextSnapshot: { issueId },
+    });
+
+    let reportLockAcquired!: () => void;
+    let releaseLock!: () => void;
+    const lockAcquired = new Promise<void>((resolve) => {
+      reportLockAcquired = resolve;
+    });
+    const releaseSignal = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const lockHolder = db.transaction(async (tx) => {
+      await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`);
+      reportLockAcquired();
+      await releaseSignal;
+      await tx
+        .update(issues)
+        .set({ status: "in_progress", executionRunId: heartbeatRunId, checkoutRunId: heartbeatRunId })
+        .where(eq(issues.id, issueId));
+    });
+    await lockAcquired;
+
+    const transition = svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "review",
+      expectedVersion: entered.case.version,
+      actor: userActor,
+    });
+    const completedBeforeRelease = await Promise.race([
+      transition.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 100)),
+    ]);
+    expect(completedBeforeRelease).toBe(false);
+    releaseLock();
+    await lockHolder;
+    await transition;
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, heartbeatRunId));
+    expect(issue).toMatchObject({ status: "cancelled", executionRunId: null, checkoutRunId: null });
+    expect(run).toMatchObject({ status: "cancelled", errorCode: "pipeline_stage_exited" });
+    expect(cancelRun).toHaveBeenCalledWith(
+      heartbeatRunId,
+      expect.any(String),
+      expect.objectContaining({ errorCode: "pipeline_stage_exited" }),
+    );
+  });
+
+  it("cancels a legacy running issue-context heartbeat without an issue lock pointer", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Legacy running stage retirement");
+    const pipeline = await svc.createPipeline({
+      companyId: company.id,
+      key: "legacy-running-stage-retirement",
+      name: "Legacy running stage retirement",
+      actor: userActor,
+      stages: [
+        { key: "intake", name: "Intake", kind: "open" },
+        { key: "drafting", name: "Drafting", kind: "working", config: { onEnter: { type: "run_routine", routineId: routine.id } } },
+        { key: "review", name: "Review", kind: "working" },
+        { key: "done", name: "Done", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    });
+    const created = await svc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "legacy-running-stage-retirement",
+      title: "Legacy running stage retirement",
+      actor: userActor,
+    });
+    const entered = await svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "drafting",
+      expectedVersion: created.case.version,
+      actor: userActor,
+    });
+    const issueId = entered.automationExecution.status === "succeeded"
+      ? entered.automationExecution.execution.executionIssueId!
+      : "";
+    const heartbeatRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: heartbeatRunId,
+      companyId: company.id,
+      agentId: routine.assigneeAgentId!,
+      status: "running",
+      invocationSource: "assignment",
+      contextSnapshot: { issueId },
+    });
+    await db
+      .update(issues)
+      .set({ status: "in_progress", executionRunId: null, checkoutRunId: null })
+      .where(eq(issues.id, issueId));
+
+    await svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "review",
+      expectedVersion: entered.case.version,
+      actor: userActor,
+    });
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, heartbeatRunId));
+    expect(issue).toMatchObject({ status: "cancelled", executionRunId: null });
+    expect(run).toMatchObject({
+      status: "cancelled",
+      errorCode: "pipeline_stage_exited",
+      resultJson: { pipelineStageExitCancellationRequestedAt: expect.any(String) },
+    });
+    expect(cancelRun).toHaveBeenCalledWith(
+      heartbeatRunId,
+      expect.any(String),
+      expect.objectContaining({ errorCode: "pipeline_stage_exited" }),
+    );
+  });
+
   it("retires the automation link without cancelling a repurposed issue", async () => {
     const company = await seedCompany();
     const routine = await seedRoutine(company.id, "Repurposed stage issue");
