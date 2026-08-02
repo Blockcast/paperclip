@@ -6,6 +6,7 @@ import {
 
 describe("sensitive env detection", () => {
   it.each([
+    "TOKEN",
     "WEBFLOW_BOT_CONTROL_TOKEN",
     "ORC8R_CERTIFIER_TOKEN",
     "GENERIC_TOKEN",
