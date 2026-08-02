@@ -264,9 +264,7 @@ export async function handleFiring(
         escalationComplete: false,
         escalationIntervalMs: escalationDeadlineMs(alert, config),
       }
-    : (ctx as Partial<PluginContext>).db
-      ? null
-      : await recoverStateFromIssue(ctx, config, alert));
+    : await recoverStateFromIssue(ctx, config, alert));
   const aggregateStateRef = {
     scopeKind: "instance" as const,
     stateKey: STATE_KEYS.aggregate(companyId, aggregate.aggregateKey),
@@ -795,17 +793,25 @@ async function recoverStateFromIssue(
   const companyId = config.defaultCompanyId;
   if (!companyId) return null;
 
-  const matches = await ctx.issues.list({
+  const aggregateKey = aggregateKeyForAlert(alert);
+  let matches = await ctx.issues.list({
     companyId,
     originKind: ORIGIN_KIND,
-    originId: aggregateKeyForAlert(alert),
+    originId: aggregateKey,
     limit: 1,
   });
+  if (matches.length === 0) {
+    matches = await ctx.issues.list({
+      companyId,
+      originKind: ORIGIN_KIND,
+      originId: alert.fingerprint,
+      limit: 1,
+    });
+  }
   const issue = matches[0];
   if (!issue) return null;
   if (issue.status === "done" || issue.status === "cancelled") return null;
 
-  const aggregateKey = aggregateKeyForAlert(alert);
   if ((ctx as Partial<PluginContext>).db) {
     await bindAggregateIssue(ctx, companyId, aggregateKey, issue.id, {
       assigneeUserId: issue.assigneeUserId ?? undefined,

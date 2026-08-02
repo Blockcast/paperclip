@@ -1522,7 +1522,10 @@ describe("handleWebhook — aggregate lifecycle", () => {
 
     expect(issuesByOrigin).toHaveLength(1);
     expect(mocks.issues.create).toHaveBeenCalledTimes(1);
-    expect(mocks.issues.list).not.toHaveBeenCalled();
+    expect(mocks.issues.list.mock.calls.map(([input]) => input.originId)).toEqual([
+      'alert-aggregate:v1:["HindsightConsolidationStalled",null]',
+      "fp-a",
+    ]);
   });
 
   it("applies resolution only after the final firing member resolves", async () => {
@@ -1640,6 +1643,46 @@ describe("handleWebhook — aggregate lifecycle", () => {
       scopeId: "company-1",
       stateKey: `alert:${alertB.fingerprint}`,
     })).toEqual(expect.objectContaining({ paperclipIssueId: "legacy-issue-a" }));
+  });
+
+  it("adopts an open legacy fingerprint issue when plugin state is missing", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alert = aggregateAlerts()[0];
+    const legacyIssue = {
+      id: "legacy-issue",
+      status: "todo",
+      assigneeUserId: null,
+      assigneeAgentId: "agent-fallback",
+    };
+    mocks.issues.list.mockImplementation(async (input: { originId: string }) =>
+      input.originId === alert.fingerprint ? [legacyIssue] : [],
+    );
+    mocks.issues.get.mockResolvedValue(legacyIssue);
+
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      TOKEN,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+
+    expect(mocks.issues.list).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      companyId: "company-1",
+      originId: 'alert-aggregate:v1:["HindsightConsolidationStalled",null]',
+    }));
+    expect(mocks.issues.list).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      companyId: "company-1",
+      originId: alert.fingerprint,
+    }));
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(await mocks.state.get({
+      scopeKind: "company",
+      scopeId: "company-1",
+      stateKey: `alert:${alert.fingerprint}`,
+    })).toEqual(expect.objectContaining({
+      paperclipIssueId: "legacy-issue",
+      aggregateKey: 'alert-aggregate:v1:["HindsightConsolidationStalled",null]',
+    }));
   });
 
   it("keeps identical aggregate keys isolated by company", async () => {
