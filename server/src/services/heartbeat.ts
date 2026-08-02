@@ -1248,6 +1248,27 @@ function workerCrashRecoveryBackoffMs(attempts: number): number {
   return Math.min(WORKER_CRASH_RECOVERY_BACKOFF_BASE_MS * 2 ** exponent, WORKER_CRASH_RECOVERY_BACKOFF_MAX_MS);
 }
 
+/**
+ * Normalize an injected `now` into a clock that is read at each point of use.
+ *
+ * Crash-recovery batches are serial and a single row can sit for minutes inside
+ * a provider RPC, so one batch-start timestamp is not a safe basis for anything
+ * carrying a deadline. A lease derived from it is already partly — or entirely —
+ * spent by the time a later row is claimed, which hands that row to any peer
+ * replica as immediately reclaimable and defeats the single-owner guarantee the
+ * claim exists for; a backoff derived from it is short by the batch's elapsed
+ * time, and its claim guard is correspondingly stale.
+ *
+ * Tests that inject a fixed `Date` still observe exactly that instant at every
+ * call, so assertions pinned to an injected clock keep holding. Tests that need
+ * time to advance mid-batch inject a function instead.
+ */
+function resolveCrashRecoveryClock(now: Date | (() => Date) | undefined): () => Date {
+  if (typeof now === "function") return now;
+  if (now) return () => now;
+  return () => new Date();
+}
+
 function describeRecoveryError(error: unknown): string {
   const text = error instanceof Error
     ? `${error.name}: ${error.message}`
@@ -12903,6 +12924,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reason: string;
     now?: Date;
   }): Promise<{ markedRunIds: string[] }> {
+    const clock = resolveCrashRecoveryClock(input.now);
+    // One instant for the marking writes: every run in this batch is being
+    // terminalized because the *same* process death took them, so they share a
+    // `finished_at`. The recovery that follows each mark is what needs a live
+    // clock, and gets one.
     const now = input.now ?? new Date();
     // Union of both live-execution registries — the same pair `liveRunExecutions`
     // consults, but enumerated rather than probed.
@@ -12999,7 +13025,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const { retryRunId } = await recoverCrashInterruptedRun(claimed, {
         reason: input.reason,
         message,
-        now,
+        clock,
       });
       if (retryRunId) retryRunIds.push(retryRunId);
     }
@@ -13046,9 +13072,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    */
   async function recoverCrashInterruptedRun(
     run: typeof heartbeatRuns.$inferSelect,
-    context: { reason: string; message: string; now: Date },
+    context: { reason: string; message: string; clock: () => Date },
   ): Promise<{ retryRunId: string | null; claimed: boolean; completed: boolean; incompleteSteps: string[] }> {
-    const { reason, message, now } = context;
+    const { reason, message, clock } = context;
+    // Claim time, read here rather than taken from the caller's batch scan.
+    // Callers drive this serially over a batch and each row can spend minutes in
+    // a provider RPC, so a batch-start timestamp would date this row's lease,
+    // claim guard and backoff to a moment already long past. See
+    // {@link resolveCrashRecoveryClock}.
+    const now = clock();
 
     // Durable per-run recovery claim. One atomic UPDATE ... RETURNING decides
     // ownership: the winner gets the row back, every loser gets zero rows and
@@ -13285,6 +13317,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let terminalWriteFailed = false;
     try {
       await options.beforeCrashRecoveryTerminalWriteForTest?.(run);
+      // Re-read the clock: everything between the claim and here — notably the
+      // bounded provider release — can have consumed a large fraction of the
+      // lease. Dating the completion stamp, and especially the backoff, to claim
+      // time would make the backoff short by exactly that elapsed time, so a row
+      // that just burned minutes failing becomes re-eligible sooner than its
+      // attempt count intends. The CAS token below stays `claimLeaseUntil`; only
+      // the values being written move forward.
+      const terminalNow = clock();
       if (incompleteSteps.length === 0) {
         // Last write, deliberately: the durable "every required step ran"
         // marker {@link reconcileWorkerCrashedRuns} selects on. Stamping any
@@ -13295,10 +13335,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const stamped = await db
           .update(heartbeatRuns)
           .set({
-            crashRecoveryCompletedAt: now,
+            crashRecoveryCompletedAt: terminalNow,
             crashRecoveryNextAttemptAt: null,
             crashRecoveryLastError: null,
-            updatedAt: now,
+            updatedAt: terminalNow,
           })
           .where(and(
             eq(heartbeatRuns.id, run.id),
@@ -13319,9 +13359,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const backedOff = await db
           .update(heartbeatRuns)
           .set({
-            crashRecoveryNextAttemptAt: new Date(now.getTime() + workerCrashRecoveryBackoffMs(attempts)),
+            crashRecoveryNextAttemptAt: new Date(terminalNow.getTime() + workerCrashRecoveryBackoffMs(attempts)),
             crashRecoveryLastError: describeRecoveryError(incompleteSteps.join("; ")),
-            updatedAt: now,
+            updatedAt: terminalNow,
           })
           .where(and(
             eq(heartbeatRuns.id, run.id),
@@ -13386,12 +13426,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * progress — with the backoff filter ensuring "oldest-first" cannot be
    * captured by rows that will never succeed.
    */
-  async function reconcileWorkerCrashedRuns(options: { maxRuns?: number; now?: Date } = {}): Promise<{
+  async function reconcileWorkerCrashedRuns(options: { maxRuns?: number; now?: Date | (() => Date) } = {}): Promise<{
     reconciledRunIds: string[];
     retryRunIds: string[];
     unresolvedRunIds: string[];
   }> {
-    const now = options.now ?? new Date();
+    const clock = resolveCrashRecoveryClock(options.now);
+    const now = clock();
     const maxRuns = options.maxRuns ?? WORKER_CRASH_RECONCILE_MAX_RUNS;
 
     const candidates = await db
@@ -13425,7 +13466,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const { retryRunId, claimed, completed } = await recoverCrashInterruptedRun(run, {
         reason: "worker crash recovery incomplete at previous exit",
         message: run.error ?? "Interrupted by worker process crash",
-        now,
+        clock,
       });
       if (!claimed) continue;
       if (completed) reconciledRunIds.push(run.id);

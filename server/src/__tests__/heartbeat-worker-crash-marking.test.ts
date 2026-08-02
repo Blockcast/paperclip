@@ -84,6 +84,7 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     environmentRuntime?: HeartbeatEnvironmentRuntime;
     beforeProcessLossRetryEnqueueForTest?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void> | void;
     afterRunEventAppendedInTransactionForTest?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void> | void;
+    beforeCrashRecoveryTerminalWriteForTest?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void> | void;
     workerCrashRecoveryProviderTimeoutMsForTest?: number;
   } = {}) {
     // skipQueuedRunDispatch keeps issue promotion from spawning background
@@ -789,5 +790,84 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     // Declining to write is a `superseded` finalization, not a failure, so the
     // run is still stamped and does not replay at every startup.
     expect(await readRun(stale.id).then((r) => r.crashRecoveryCompletedAt)).not.toBeNull();
+  });
+
+  // ---- (l) each claim's lease is measured from its own claim time -----------
+
+  it("gives every claim in a batch a lease and backoff measured from its own claim time", async () => {
+    // `reconcileWorkerCrashedRuns` drains its batch serially, and a single row
+    // can sit for minutes inside the (bounded) provider release. Pre-fix the
+    // whole batch shared one batch-start `now`: every claim's lease was
+    // `batchStart + TTL`, so by the time a later row was claimed its lease was
+    // mostly — or entirely — spent. A peer replica scanning at that moment sees
+    // an expired lease and reclaims a run this pass still owns, which is exactly
+    // the double-recovery the durable claim exists to prevent. The same stale
+    // timestamp also shortened the failure backoff by the batch's elapsed time.
+    //
+    // Two runs, and an 11-minute stall charged to the first one — longer than
+    // the 10-minute TTL, so pre-fix the second run's lease is already in the
+    // past at the instant it is claimed.
+    const TTL_MS = 10 * 60 * 1000;
+    const BACKOFF_BASE_MS = 5 * 60 * 1000;
+    const STALL_MS = 11 * 60 * 1000;
+
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const older = await seedCrashMarkedRun({
+      companyId,
+      agentId,
+      finishedAt: new Date(Date.now() - 60 * 60 * 1000),
+    });
+    const newer = await seedCrashMarkedRun({
+      companyId,
+      agentId,
+      finishedAt: new Date(Date.now() - 60_000),
+    });
+
+    const batchStart = new Date("2026-08-02T12:00:00.000Z");
+    let current = new Date(batchStart);
+    const clock = () => new Date(current);
+
+    // What each run's lease looked like at the moment it was about to write its
+    // terminal bookkeeping, paired with the clock reading at that same moment.
+    // The hook fires after the claim and before the terminal write, and nothing
+    // else moves this clock, so the paired reading *is* that run's claim time.
+    const observed = new Map<string, { lease: Date | null; at: Date }>();
+
+    // Lease release throws, so every run leaves a required step incomplete and
+    // takes the backoff branch — which keeps `crashRecoveryNextAttemptAt`
+    // readable afterwards instead of being nulled by a completion stamp.
+    const heartbeat = service({
+      environmentRuntime: failingEnvironmentRuntime(),
+      beforeCrashRecoveryTerminalWriteForTest: async (run) => {
+        observed.set(run.id, {
+          lease: await readRun(run.id).then((r) => r.crashRecoveryNextAttemptAt),
+          at: clock(),
+        });
+        current = new Date(current.getTime() + STALL_MS);
+      },
+    });
+
+    const result = await heartbeat.reconcileWorkerCrashedRuns({ now: clock });
+    expect(result.unresolvedRunIds).toEqual([older.id, newer.id]);
+
+    // The property that matters: every claim owns its row for a full TTL from
+    // the moment it claimed it. Pre-fix the newer run scored -1 minute here.
+    for (const runId of [older.id, newer.id]) {
+      const seen = observed.get(runId);
+      expect(seen?.lease).not.toBeNull();
+      expect(seen!.lease!.getTime() - seen!.at.getTime()).toBe(TTL_MS);
+    }
+
+    // And the backoff runs from the write, not from batch start, so a row that
+    // just burned eleven minutes failing does not become re-eligible early.
+    const afterOlder = await readRun(older.id);
+    const afterNewer = await readRun(newer.id);
+    expect(afterOlder.crashRecoveryNextAttemptAt!.getTime()).toBe(
+      batchStart.getTime() + STALL_MS + BACKOFF_BASE_MS,
+    );
+    // Pre-fix both rows backed off to the identical batchStart + base instant.
+    expect(afterNewer.crashRecoveryNextAttemptAt!.getTime()).toBe(
+      batchStart.getTime() + 2 * STALL_MS + BACKOFF_BASE_MS,
+    );
   });
 });

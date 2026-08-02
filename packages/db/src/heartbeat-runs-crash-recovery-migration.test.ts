@@ -196,4 +196,47 @@ describeEmbeddedPostgres("heartbeat-run crash-recovery migration phases", () => 
       message: `migration 0211 found an invalid or incorrectly defined ${INDEX_NAME}`,
     });
   }, 120_000);
+
+  it("rejects a same-type crash-recovery column that carries a default", async () => {
+    // Phase A adds every column with `ADD COLUMN IF NOT EXISTS`, so a
+    // pre-existing column of the *same type* survives untouched with whatever
+    // default it already had. `crash_recovery_completed_at DEFAULT now()` is the
+    // dangerous shape: it type-matches, Phase A no-ops, and then every newly
+    // crash-marked run is born already "completed" — so the reconciler's
+    // `crash_recovery_completed_at IS NULL` scan matches nothing and crash
+    // recovery silently never runs. Validating the type alone let this through.
+    const { database, sql } = await freshDatabase("paperclip-crash-recovery-default-column-");
+    await seedOneRun(sql);
+    await rewindToPre0208(sql);
+    await sql.unsafe(`
+      ALTER TABLE heartbeat_runs
+      ADD COLUMN crash_recovery_completed_at timestamp with time zone DEFAULT now();
+    `);
+
+    await expect(applyPendingMigrations(database.connectionString)).rejects.toMatchObject({
+      message: expect.stringContaining("migration 0210"),
+      hint: expect.stringContaining("carry no default"),
+    });
+    expect(await inspectMigrations(database.connectionString)).toMatchObject({
+      status: "needsMigrations",
+    });
+  }, 120_000);
+
+  it("rejects a same-type crash-recovery column declared NOT NULL", async () => {
+    // The other half of the contract. NOT NULL type-matches too, but every one
+    // of these columns encodes "absent" as NULL — `crash_recovery_attempts` is
+    // read as `?? 0`, and the completion stamp writes NULL back into
+    // `crash_recovery_next_attempt_at` and `crash_recovery_last_error`, which a
+    // NOT NULL column rejects at runtime. Left empty here so the column is
+    // addable without also needing a default, isolating nullability.
+    const { database, sql } = await freshDatabase("paperclip-crash-recovery-notnull-column-");
+    await rewindToPre0208(sql);
+    await sql.unsafe(`
+      ALTER TABLE heartbeat_runs ADD COLUMN crash_recovery_attempts integer NOT NULL;
+    `);
+
+    await expect(applyPendingMigrations(database.connectionString)).rejects.toMatchObject({
+      message: expect.stringContaining("crash_recovery_attempts"),
+    });
+  }, 120_000);
 });

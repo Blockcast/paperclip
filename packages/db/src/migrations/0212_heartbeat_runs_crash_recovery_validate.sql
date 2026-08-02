@@ -16,13 +16,38 @@
 -- and then misbehave at runtime. Failing the deploy is the right response, and
 -- unlike a missing index it is a real, operator-fixable defect rather than a
 -- deliberate intermediate state.
+--
+-- WHY THIS CHECKS NULLABILITY AND DEFAULTS, NOT JUST TYPE.
+--
+-- Phase A adds every column with `ADD COLUMN IF NOT EXISTS`, so a pre-existing
+-- column of the *same type* silently survives with whatever nullability and
+-- default it already carried. Type equality alone therefore does not establish
+-- the contract recovery depends on, and the failure it lets through is silent
+-- rather than loud:
+--
+--   * `crash_recovery_completed_at timestamptz DEFAULT now()` type-matches, but
+--     every newly crash-marked run is then born already "completed", and the
+--     `crash_recovery_completed_at IS NULL` scan in `reconcileWorkerCrashedRuns`
+--     matches nothing. Crash recovery would be a no-op on every run, forever,
+--     with no error anywhere — precisely the class of defect this file exists
+--     to turn into a failed deploy.
+--   * `NOT NULL` type-matches too, but the completion marker and the backoff
+--     columns are all read as "absent" via NULL (`crash_recovery_attempts` is
+--     consumed as `?? 0`), and the completion stamp writes NULL back into
+--     `crash_recovery_next_attempt_at`/`crash_recovery_last_error` — which a
+--     NOT NULL column rejects at runtime.
+--
+-- So the required shape is: exact type, nullable, and no default. All three are
+-- asserted below.
 DO $$
 DECLARE
-  missing_columns text;
+  invalid_columns text;
   index_present boolean;
 BEGIN
-  SELECT string_agg(required.column_name || ' ' || required.data_type, ', ' ORDER BY required.column_name)
-  INTO missing_columns
+  SELECT string_agg(
+           required.column_name || ' ' || required.data_type || ' (nullable, no default)',
+           ', ' ORDER BY required.column_name)
+  INTO invalid_columns
   FROM (
     VALUES
       ('crash_recovery_completed_at', 'timestamp with time zone'),
@@ -37,12 +62,14 @@ BEGIN
       AND actual.table_name = 'heartbeat_runs'
       AND actual.column_name = required.column_name
       AND actual.data_type = required.data_type
+      AND actual.is_nullable = 'YES'
+      AND actual.column_default IS NULL
   );
 
-  IF missing_columns IS NOT NULL THEN
+  IF invalid_columns IS NOT NULL THEN
     RAISE EXCEPTION USING
-      MESSAGE = 'migration 0212: heartbeat_runs is missing crash-recovery columns after 0210: ' || missing_columns,
-      HINT = 'Phase A (0210) did not apply cleanly. Inspect heartbeat_runs for pre-existing columns of a conflicting type, drop or fix them, then retry migrations.';
+      MESSAGE = 'migration 0212: heartbeat_runs crash-recovery columns are missing or do not match the required shape after 0210: ' || invalid_columns,
+      HINT = 'Phase A (0210) did not apply cleanly, or a pre-existing column survived its ADD COLUMN IF NOT EXISTS. Each column must have the stated type, be nullable, and carry no default; a default on crash_recovery_completed_at silently excludes every crash-marked run from recovery. Inspect heartbeat_runs, drop or ALTER the offending columns, then retry migrations.';
   END IF;
 
   -- Reported, never required. On a populated database the index is created by
