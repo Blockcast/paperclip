@@ -190,6 +190,28 @@ function detectTailnetBindHost(): string | undefined {
   }
 }
 
+/**
+ * Configured PR reviewer agents, purely env-derived (no config-file input).
+ *
+ * Split out of loadConfig() so callers on hot paths can read it without paying
+ * loadConfig()'s synchronous config-file read — the duplicate-PR-review issue
+ * guard consults this on every agent-assigned issue creation (BLO-20526).
+ */
+export function readGithubPrReviewerAgentIds(): string[] {
+  return [
+    ...new Set(
+      (
+        process.env.PAPERCLIP_PR_REVIEWER_AGENT_IDS ??
+        process.env.PAPERCLIP_PR_REVIEWER_AGENT_ID ??
+        ""
+      )
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
 export function loadConfig(): Config {
   const fileConfig = readConfigFile();
   const fileDatabaseMode =
@@ -470,18 +492,7 @@ export function loadConfig(): Config {
     // identifier, so PRs without a BLO-XXX in the branch/title/body still
     // get reviewed. The plural CSV setting takes precedence; the singular
     // setting remains supported for existing deployments.
-    githubPrReviewerAgentIds: [
-      ...new Set(
-        (
-          process.env.PAPERCLIP_PR_REVIEWER_AGENT_IDS ??
-          process.env.PAPERCLIP_PR_REVIEWER_AGENT_ID ??
-          ""
-        )
-          .split(",")
-          .map((value) => value.trim())
-          .filter(Boolean),
-      ),
-    ],
+    githubPrReviewerAgentIds: readGithubPrReviewerAgentIds(),
     githubDependabotAgentId: process.env.PAPERCLIP_DEPENDABOT_AGENT_ID ?? "",
     githubDependabotMinSeverity: process.env.PAPERCLIP_DEPENDABOT_MIN_SEVERITY ?? "high",
     // GitHub App creds for server-side installation-token minting (PR-review

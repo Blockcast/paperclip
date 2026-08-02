@@ -92,6 +92,7 @@ import {
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { assertNotDuplicatePrReviewIssue } from "./pr-review-duplicate-issue-guard.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
@@ -7876,6 +7877,16 @@ export function issueService(db: Db) {
       }
       if (data.assigneeAgentId) {
         await assertAssignableAgent(db, companyId, data.assigneeAgentId, { kind: "work" });
+        // Guarded here rather than in routes/issues.ts so every create path is
+        // covered — POST /issues, POST /issues/:id/children, and the
+        // accepted-plan decomposition bulk create all funnel through here
+        // (BLO-20526).
+        await assertNotDuplicatePrReviewIssue(db, {
+          companyId,
+          assigneeAgentId: data.assigneeAgentId,
+          title: issueData.title,
+          description: issueData.description,
+        });
       }
       if (data.assigneeUserId) {
         await assertAssignableUser(companyId, data.assigneeUserId);
