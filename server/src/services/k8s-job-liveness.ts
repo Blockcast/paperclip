@@ -766,12 +766,47 @@ export function classifyManagedAgentPod(pod: k8s.V1Pod): ManagedAgentPod | null 
 }
 
 /**
+ * BLO-20801: `hasActiveJobForAgent`'s Job-status check is agent-scoped only
+ * (no run-id awareness), so a Job that survives a worker crash after its run
+ * was already stamped terminal in the DB blocks dispatch for the full
+ * `EXTERNAL_LIFECYCLE_HARD_STALE_MS` reaper ceiling. A Job whose `runId`
+ * label is in `terminalRunIds` is known-terminal at the DB layer and must not
+ * count as active, regardless of its own (possibly stale/zeroed/missing)
+ * status subresource. Jobs with no run-id label, or whose run-id is not in
+ * `terminalRunIds` (live, unknown, or the caller opted out of the lookup),
+ * fall through to the original status-counter heuristic unchanged.
+ */
+export function jobBlocksDispatch(job: k8s.V1Job, terminalRunIds: ReadonlySet<string>): boolean {
+  const runId = job.metadata?.labels?.[RUN_ID_LABEL]?.trim() || null;
+  if (runId && terminalRunIds.has(runId)) return false;
+  const status = job.status;
+  if (!status) return true;
+  const active = status.active ?? 0;
+  const succeeded = status.succeeded ?? 0;
+  const failed = status.failed ?? 0;
+  return active > 0 || (succeeded === 0 && failed === 0);
+}
+
+export type HasActiveJobForAgentOptions = {
+  /**
+   * Given the distinct, non-null run-id labels found on this agent's Jobs,
+   * returns the subset whose heartbeat_runs row is already terminal in the
+   * DB. Omit to preserve the pre-BLO-20801 behavior of never excluding a Job
+   * by run-id (every candidate Job counts purely on its k8s status).
+   */
+  isRunTerminal?: (runIds: readonly string[]) => Promise<ReadonlySet<string>>;
+};
+
+/**
  * Returns true when there is at least one active (not yet completed) Job for
  * the given agent in the paperclip namespace. Returns false when the kube API
  * is unavailable (not in cluster, RBAC missing, transient error) so the
  * caller can degrade to DB-only in-flight detection.
  */
-export async function hasActiveJobForAgent(agentId: string): Promise<boolean> {
+export async function hasActiveJobForAgent(
+  agentId: string,
+  options?: HasActiveJobForAgentOptions,
+): Promise<boolean> {
   const state = initClient();
   if (state.kind !== "ready") return false;
   try {
@@ -784,20 +819,27 @@ export async function hasActiveJobForAgent(agentId: string): Promise<boolean> {
       requestOptionsWithTimeout(),
     );
     const items = res.items ?? [];
-    const hasActiveJob = items.some((job) => {
-      const status = job.status;
-      if (!status) return true;
-      const active = status.active ?? 0;
-      const succeeded = status.succeeded ?? 0;
-      const failed = status.failed ?? 0;
-      return active > 0 || (succeeded === 0 && failed === 0);
-    });
+    const candidateRunIds = [
+      ...new Set(
+        items
+          .map((job) => job.metadata?.labels?.[RUN_ID_LABEL]?.trim() || null)
+          .filter((runId): runId is string => Boolean(runId)),
+      ),
+    ];
+    const terminalRunIds = candidateRunIds.length > 0 && options?.isRunTerminal
+      ? await options.isRunTerminal(candidateRunIds)
+      : new Set<string>();
+    const hasActiveJob = items.some((job) => jobBlocksDispatch(job, terminalRunIds));
     if (hasActiveJob) {
       return true;
     }
 
     // A just-deleted Job can already look terminal while its Pod is still
-    // terminating and holding a ReadWriteOnce agent PVC on the old node.
+    // terminating and holding a ReadWriteOnce agent PVC on the old node. This
+    // probe is deliberately NOT filtered by terminalRunIds/run-id: a run
+    // being terminal in the DB says nothing about whether its pod has
+    // released the PVC yet, and folding the two gates together would let a
+    // new pod dispatch into a multi-attach wedge.
     const podRes = await state.coreApi.listNamespacedPod(
       {
         namespace: PAPERCLIP_K8S_NAMESPACE,
