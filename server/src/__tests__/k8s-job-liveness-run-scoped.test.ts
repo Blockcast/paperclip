@@ -145,4 +145,24 @@ describe("hasActiveJobForAgent run-id awareness (BLO-20801)", () => {
 
     expect(result).toBe(false);
   });
+
+  it("fails closed (returns true, still blocking) when isRunTerminal rejects after an active Job was observed", async () => {
+    // Kubernetes itself is healthy and returned a real active-phase Job -- this
+    // must NOT be mistaken for a kube-API failure and fail open. Regression for
+    // https://github.com/Blockcast/paperclip/pull/946#issuecomment-5156164869:
+    // a DB-lookup rejection landing in the outer catch used to report `false`
+    // (no active Job), letting startNextQueuedRunForAgent dispatch overlapping
+    // work onto a Job that was, in fact, still active.
+    mockListNamespacedJob.mockResolvedValue({
+      items: [terminalJob("run-unknown", { active: 1, succeeded: 0, failed: 0 })],
+    });
+
+    const result = await hasActiveJobForAgent("agent-1", {
+      isRunTerminal: async () => {
+        throw new Error("db connection reset");
+      },
+    });
+
+    expect(result).toBe(true);
+  });
 });
