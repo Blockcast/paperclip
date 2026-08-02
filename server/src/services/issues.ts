@@ -5369,11 +5369,21 @@ export function issueService(db: Db) {
     blockedByIssueIds: string[],
     actor: { agentId?: string | null; userId?: string | null } = {},
     dbOrTx: any = db,
-  ) {
+  ): Promise<void> {
+    if (dbOrTx === db) {
+      return db.transaction((tx) =>
+        syncBlockedByIssueIds(issueId, companyId, blockedByIssueIds, actor, tx),
+      );
+    }
+
     const deduped = [...new Set(blockedByIssueIds)];
     if (deduped.some((candidate) => candidate === issueId)) {
       throw unprocessable("Issue cannot be blocked by itself");
     }
+
+    await dbOrTx.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:issue-blockers:${companyId}:${issueId}`}, 0))`,
+    );
 
     const lockedIssueIds = [issueId, ...deduped].sort();
     await dbOrTx.execute(

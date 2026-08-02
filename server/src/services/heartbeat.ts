@@ -14712,6 +14712,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         claimedIssueLock = await db.transaction(async (tx) => {
           let blockerIssueIds: string[] = [];
           if (autoCheckoutWake) {
+            await tx.execute(
+              sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:issue-blockers:${claimed.companyId}:${claimedIssueId}`}, 0))`,
+            );
             const blockerRows = await tx
               .select({ id: issueRelations.issueId })
               .from(issueRelations)
