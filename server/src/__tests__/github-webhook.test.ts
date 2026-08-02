@@ -4109,6 +4109,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(issue?.status).toBe("done");
     expect(issue?.title).toContain("terminal receipt");
     expect(issue?.description).toContain("delivery-dismissed");
+    expect(issue?.description).toContain(
+      "has a documented dismissal reason from a permitted webhook delivery",
+    );
+    expect(issue?.description).not.toContain("dismissal reason or comment");
     const receiptIssues = await db
       .select({ id: issues.id })
       .from(issues)

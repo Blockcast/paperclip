@@ -1147,7 +1147,7 @@ async function recordDependabotTerminalReceipt(
         "## Acceptance criteria",
         ...(input.alert.action === "fixed"
           ? [`- Dependabot alert #${input.alert.alertNumber} is recorded as fixed from a permitted webhook delivery.`]
-          : [`- Dependabot alert #${input.alert.alertNumber} has a documented dismissal reason or comment from a permitted webhook delivery.`]),
+          : [`- Dependabot alert #${input.alert.alertNumber} has a documented dismissal reason from a permitted webhook delivery.`]),
         "",
         "## Verifying signal",
         `- GitHub delivery \`${input.deliveryId ?? "unavailable"}\` and its terminal evidence are preserved in the system comment on this issue.`,
