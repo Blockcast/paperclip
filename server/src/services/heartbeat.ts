@@ -8457,6 +8457,7 @@ export interface HeartbeatServiceOptions {
       resumeContinuation: boolean;
       suppressHeadRescanDemand: boolean;
       suppressCriticalLaneHeadRescanDemand: boolean;
+      suppressRecoveryLaneHeadRescanDemand: boolean;
     },
   ) => void;
   /** Test-only hook fired when a detached queued-dispatch pass is scheduled. */
@@ -17871,6 +17872,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     { createdAt: Date; id: string }
   >();
   const dispatchCriticalLaneHeadRescanDemandByAgent = new Set<string>();
+  const dispatchRecoveryLaneCursorByAgent = new Map<
+    string,
+    { createdAt: Date; id: string }
+  >();
+  const dispatchRecoveryLaneHeadRescanDemandByAgent = new Set<string>();
   const dispatchResumeCapRetryTimersByAgent = new Map<string, ReturnType<typeof setTimeout>>();
 
   /** Run one more dispatch pass for `agentId`, detached from this critical section. */
@@ -17885,13 +17891,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         resumeContinuation:
           reason === "resume_bounded_scan"
           || reason === "resume_bounded_scan_after_cap"
-          || reason === "resume_critical_lane",
+          || reason === "resume_critical_lane"
+          || reason === "resume_recovery_lane",
         suppressHeadRescanDemand: reason === "resume_head_rescan_after_coalesced_demand",
         // This call is dispatcher-owned continuation work, not a new wake.
         // If it coalesces with the pass that scheduled it, re-arming the
-        // critical head marker makes every continuation restart from the head
-        // instead of advancing its saved cursor.
+        // an emergency-lane head marker makes every continuation restart from
+        // the head instead of advancing its saved cursor.
         suppressCriticalLaneHeadRescanDemand: true,
+        suppressRecoveryLaneHeadRescanDemand: true,
         reason,
       }).catch((err) => {
         logger.error(
@@ -17927,13 +17935,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       resumeContinuation?: boolean;
       suppressHeadRescanDemand?: boolean;
       suppressCriticalLaneHeadRescanDemand?: boolean;
+      suppressRecoveryLaneHeadRescanDemand?: boolean;
       reason?: string;
     } = {},
   ) {
     if (options.skipQueuedRunDispatch || dispatchStopped) return [];
-    if (dispatchPassOptions.reason !== "resume_critical_lane") {
-      dispatchCriticalLaneCursorByAgent.delete(agentId);
-      dispatchCriticalLaneHeadRescanDemandByAgent.delete(agentId);
+    if (
+      dispatchPassOptions.reason !== "resume_critical_lane"
+      && !dispatchPassOptions.suppressCriticalLaneHeadRescanDemand
+      && dispatchCriticalLaneCursorByAgent.has(agentId)
+    ) {
+      dispatchCriticalLaneHeadRescanDemandByAgent.add(agentId);
+    }
+    if (
+      dispatchPassOptions.reason !== "resume_recovery_lane"
+      && !dispatchPassOptions.suppressRecoveryLaneHeadRescanDemand
+      && dispatchRecoveryLaneCursorByAgent.has(agentId)
+    ) {
+      dispatchRecoveryLaneHeadRescanDemandByAgent.add(agentId);
     }
     if (
       !dispatchPassOptions.resumeContinuation
@@ -18330,16 +18349,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (foundReadyCritical || criticalLaneExhausted) break;
       }
 
-      if (dispatchCriticalLaneHeadRescanDemandByAgent.has(agentId)) {
-        dispatchCriticalLaneCursorByAgent.delete(agentId);
-        dispatchCriticalLaneHeadRescanDemandByAgent.delete(agentId);
-        scheduleDetachedDispatchPass(agentId, "resume_critical_lane");
-        await options.afterQueuedDispatchContinuationScheduledForTest?.({
-          agentId,
-          reason: "resume_critical_lane",
-        });
-        return [];
-      }
       if (!foundReadyCritical && !criticalLaneExhausted && criticalLaneCursor) {
         dispatchCriticalLaneCursorByAgent.set(agentId, criticalLaneCursor);
         scheduleDetachedDispatchPass(agentId, "resume_critical_lane");
@@ -18350,6 +18359,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return [];
       }
       dispatchCriticalLaneCursorByAgent.delete(agentId);
+      if (dispatchCriticalLaneHeadRescanDemandByAgent.delete(agentId)) {
+        scheduleDetachedDispatchPass(agentId, "resume_critical_lane");
+        await options.afterQueuedDispatchContinuationScheduledForTest?.({
+          agentId,
+          reason: "resume_critical_lane",
+        });
+        if (!foundReadyCritical) return [];
+      }
 
       // Lane B — recovery-action wakes. Recovery-ness is a property of the RUN,
       // not of the issue, so this needs no join at all: the agent's queued rows
@@ -18360,40 +18377,89 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // `LIMIT 200` applied BEFORE dispatch ranking, so more than 200 older
       // recovery rows could push a newer runnable critical row out of the lane
       // entirely — the exact priority inversion the lane exists to prevent.
-      const recoveryLaneRows = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(and(
-          eq(heartbeatRuns.agentId, agentId),
-          sql`${heartbeatRuns.status} = 'queued'`,
-          cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
-          sql`${heartbeatRuns.contextSnapshot} ->> 'source' = 'issue_recovery_action'`,
-          sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' is not null`,
-        ))
-        .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
-        .limit(queuedRunDispatchScanLimit);
-
-      const recoveryIssueIdsToLoad = new Set<string>();
-      for (const run of recoveryLaneRows) {
-        const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
-        // UUID-screened in JS so a malformed id is a skipped row rather than a
-        // cast error inside the lookup.
-        if (!issueId || !UUID_PATTERN.test(issueId) || issueById.has(issueId)) continue;
-        recoveryIssueIdsToLoad.add(issueId);
+      const recoveryLaneRows: Array<typeof heartbeatRuns.$inferSelect> = [];
+      let recoveryLaneCursor = dispatchRecoveryLaneCursorByAgent.get(agentId) ?? null;
+      let recoveryLaneExhausted = false;
+      let foundReadyRecovery = false;
+      let recoveryLaneBatches = 0;
+      if (!recoveryLaneCursor) {
+        dispatchRecoveryLaneHeadRescanDemandByAgent.delete(agentId);
       }
-      if (recoveryIssueIdsToLoad.size > 0) {
-        const recoveryIssueRows = await db
-          .select({
-            id: issues.id,
-            status: issues.status,
-            priority: issues.priority,
-          })
-          .from(issues)
+
+      while (recoveryLaneBatches < queuedRunDispatchMaxScanBatches) {
+        recoveryLaneBatches += 1;
+        const batch = await db
+          .select()
+          .from(heartbeatRuns)
           .where(and(
-            eq(issues.companyId, agent.companyId),
-            inArray(issues.id, [...recoveryIssueIdsToLoad]),
-          ));
-        for (const issueRow of recoveryIssueRows) issueById.set(issueRow.id, issueRow);
+            eq(heartbeatRuns.agentId, agentId),
+            sql`${heartbeatRuns.status} = 'queued'`,
+            cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'source' = 'issue_recovery_action'`,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' is not null`,
+            recoveryLaneCursor
+              ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${recoveryLaneCursor.createdAt.toISOString()}::timestamptz, ${recoveryLaneCursor.id}::uuid)`
+              : undefined,
+          ))
+          .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+          .limit(queuedRunDispatchScanLimit);
+        if (batch.length === 0) {
+          recoveryLaneExhausted = true;
+          break;
+        }
+        const lastRun = batch[batch.length - 1]!;
+        recoveryLaneCursor = { createdAt: lastRun.createdAt, id: lastRun.id };
+        if (batch.length < queuedRunDispatchScanLimit) recoveryLaneExhausted = true;
+
+        const issueIdsToLoad = new Set<string>();
+        for (const run of batch) {
+          const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+          if (!issueId || !UUID_PATTERN.test(issueId) || issueById.has(issueId)) continue;
+          issueIdsToLoad.add(issueId);
+        }
+        if (issueIdsToLoad.size > 0) {
+          const issueRows = await db
+            .select({ id: issues.id, status: issues.status, priority: issues.priority })
+            .from(issues)
+            .where(and(
+              eq(issues.companyId, agent.companyId),
+              inArray(issues.id, [...issueIdsToLoad]),
+            ));
+          for (const issueRow of issueRows) issueById.set(issueRow.id, issueRow);
+        }
+
+        const candidates = batch.filter((run) => {
+          const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+          const issue = issueId ? issueById.get(issueId) : null;
+          return Boolean(issue && !TERMINAL_ISSUE_STATUSES.has(issue.status));
+        });
+        recoveryLaneRows.push(...candidates);
+        const batchReadiness = await listQueuedRunDependencyReadiness(agent.companyId, candidates);
+        for (const [issueId, readiness] of batchReadiness) dependencyReadiness.set(issueId, readiness);
+        foundReadyRecovery = candidates.some((run) => {
+          const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+          return Boolean(issueId && (batchReadiness.get(issueId)?.isDependencyReady ?? true));
+        });
+        if (foundReadyRecovery || recoveryLaneExhausted) break;
+      }
+
+      if (!foundReadyRecovery && !recoveryLaneExhausted && recoveryLaneCursor) {
+        dispatchRecoveryLaneCursorByAgent.set(agentId, recoveryLaneCursor);
+        scheduleDetachedDispatchPass(agentId, "resume_recovery_lane");
+        await options.afterQueuedDispatchContinuationScheduledForTest?.({
+          agentId,
+          reason: "resume_recovery_lane",
+        });
+        return [];
+      }
+      dispatchRecoveryLaneCursorByAgent.delete(agentId);
+      if (dispatchRecoveryLaneHeadRescanDemandByAgent.delete(agentId)) {
+        scheduleDetachedDispatchPass(agentId, "resume_recovery_lane");
+        await options.afterQueuedDispatchContinuationScheduledForTest?.({
+          agentId,
+          reason: "resume_recovery_lane",
+        });
+        if (!foundReadyRecovery) return [];
       }
 
       const priorityLaneRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
@@ -18779,9 +18845,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           suppressHeadRescanDemand: dispatchPassOptions.suppressHeadRescanDemand === true,
           suppressCriticalLaneHeadRescanDemand:
             dispatchPassOptions.suppressCriticalLaneHeadRescanDemand === true,
+          suppressRecoveryLaneHeadRescanDemand:
+            dispatchPassOptions.suppressRecoveryLaneHeadRescanDemand === true,
         });
         if (!dispatchPassOptions.suppressCriticalLaneHeadRescanDemand) {
           dispatchCriticalLaneHeadRescanDemandByAgent.add(agentId);
+        }
+        if (!dispatchPassOptions.suppressRecoveryLaneHeadRescanDemand) {
+          dispatchRecoveryLaneHeadRescanDemandByAgent.add(agentId);
         }
         if (!dispatchPassOptions.resumeContinuation && !dispatchPassOptions.suppressHeadRescanDemand) {
           dispatchHeadRescanDemandByAgent.add(agentId);

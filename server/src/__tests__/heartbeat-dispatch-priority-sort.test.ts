@@ -1795,6 +1795,8 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const runnableCriticalRunId = randomUUID();
     const issuePrefix = `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const baseCreatedAt = new Date(Date.now() - 5 * 60 * 1000);
+    let criticalResumePasses = 0;
+    let criticalResumePassesAtDispatch = Number.POSITIVE_INFINITY;
     const criticalContinuationSchedules: Array<{
       reason: string;
       suppressCriticalLaneHeadRescanDemand: boolean;
@@ -1812,9 +1814,17 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const coalescedContinuationObserved = new Promise<void>((resolve) => {
       observeCoalescedContinuation = resolve;
     });
-    const boundedHeartbeat = heartbeatService(db, {
+    let boundedHeartbeat!: ReturnType<typeof heartbeatService>;
+    boundedHeartbeat = heartbeatService(db, {
       penstockGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 5 },
+      beforeQueuedDispatchPassForTest: async (event) => {
+        if (event.reason !== "resume_critical_lane") return;
+        criticalResumePasses += 1;
+        // External wakes arriving while the continuation owns the lock must
+        // request one eventual head rescan without erasing forward progress.
+        if (criticalResumePasses <= 2) await boundedHeartbeat.resumeQueuedRuns();
+      },
       onQueuedDispatchScheduledForTest: (event) => {
         if (event.reason === "resume_critical_lane") {
           criticalContinuationSchedules.push({
@@ -1942,6 +1952,9 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const dispatchedRunIds: string[] = [];
     mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
       dispatchedRunIds.push(args.runId);
+      if (args.runId === runnableCriticalRunId) {
+        criticalResumePassesAtDispatch = criticalResumePasses;
+      }
       return {
         exitCode: 0,
         signal: null as string | null,
@@ -1960,6 +1973,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     await waitForRunToSettle(boundedHeartbeat, runnableCriticalRunId, 60_000);
 
     expect(dispatchedRunIds[0]).toBe(runnableCriticalRunId);
+    expect(criticalResumePassesAtDispatch).toBeLessThanOrEqual(2);
     expect((await boundedHeartbeat.getRun(runnableCriticalRunId))?.status).not.toBe("queued");
     expect(criticalContinuationSchedules.length).toBeGreaterThan(0);
     expect(criticalContinuationSchedules).toEqual(
@@ -1973,6 +1987,194 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       resumeContinuation: true,
       suppressCriticalLaneHeadRescanDemand: true,
     });
+    await boundedHeartbeat.drainInFlightExecutions(60_000);
+  }, 120_000);
+
+  it("pages past invalid and blocked recovery rows before ordinary work", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerIssueId = randomUUID();
+    const terminalIssueId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const recoveryIssueId = randomUUID();
+    const ordinaryIssueId = randomUUID();
+    const recoveryRunId = randomUUID();
+    const ordinaryRunId = randomUUID();
+    const issuePrefix = `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const baseCreatedAt = new Date(Date.now() - 5 * 60 * 1000);
+    const boundedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 5 },
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "RecoveryLanePagingCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "RecoveryLanePagingAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: blockerIssueId,
+        companyId,
+        title: "Unresolved blocker",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+        startedAt: baseCreatedAt,
+      },
+      {
+        id: terminalIssueId,
+        companyId,
+        title: "Terminal recovery target",
+        status: "done",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked recovery target",
+        status: "todo",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 3,
+        identifier: `${issuePrefix}-3`,
+      },
+      {
+        id: recoveryIssueId,
+        companyId,
+        title: "Runnable recovery beyond invalid pages",
+        status: "todo",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 4,
+        identifier: `${issuePrefix}-4`,
+      },
+      {
+        id: ordinaryIssueId,
+        companyId,
+        title: "Ordinary work visible to the main scan",
+        status: "todo",
+        priority: "low",
+        assigneeAgentId: agentId,
+        issueNumber: 5,
+        identifier: `${issuePrefix}-5`,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+
+    const recoveryIssueIds = [
+      "persisted-not-a-uuid",
+      randomUUID(),
+      terminalIssueId,
+      blockedIssueId,
+      recoveryIssueId,
+    ];
+    for (const [index, issueId] of recoveryIssueIds.entries()) {
+      const runId = issueId === recoveryIssueId ? recoveryRunId : randomUUID();
+      const wakeId = randomUUID();
+      const recoveryActionId = randomUUID();
+      const createdAt = new Date(baseCreatedAt.getTime() + index);
+      await db.insert(agentWakeupRequests).values({
+        id: wakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "source_scoped_recovery_action",
+        payload: { issueId, recoveryActionId },
+        status: "queued",
+        runId,
+        requestedAt: createdAt,
+        updatedAt: createdAt,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: wakeId,
+        contextSnapshot: {
+          issueId,
+          wakeReason: "source_scoped_recovery_action",
+          source: "issue_recovery_action",
+          recoveryActionId,
+        },
+        createdAt,
+        updatedAt: createdAt,
+      });
+    }
+
+    const ordinaryWakeId = randomUUID();
+    const ordinaryCreatedAt = new Date(baseCreatedAt.getTime() - 1);
+    await db.insert(agentWakeupRequests).values({
+      id: ordinaryWakeId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: ordinaryIssueId },
+      status: "queued",
+      runId: ordinaryRunId,
+      requestedAt: ordinaryCreatedAt,
+      updatedAt: ordinaryCreatedAt,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: ordinaryRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: ordinaryWakeId,
+      contextSnapshot: { issueId: ordinaryIssueId, wakeReason: "issue_assigned" },
+      createdAt: ordinaryCreatedAt,
+      updatedAt: ordinaryCreatedAt,
+    });
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await boundedHeartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(boundedHeartbeat, recoveryRunId, 60_000);
+
+    expect(dispatchedRunIds[0]).toBe(recoveryRunId);
     await boundedHeartbeat.drainInFlightExecutions(60_000);
   }, 120_000);
 
