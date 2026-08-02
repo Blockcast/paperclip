@@ -141,6 +141,42 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # The chart tests under deploy/helm/paperclip/tests/ were never wired into any
+  # workflow -- 21 assertions about the manifests we actually ship (Penstock
+  # routing, ServiceMonitor RBAC, runtime caches, probes) that no CI run has ever
+  # executed. This job runs them, and gates the BLO-20733 approval-plan marker:
+  # the release channel's completion check is bound to a marker computed from an
+  # unstamped render, which is only sound while stamping perturbs nothing else.
+  #
+  # Deliberately its own job rather than a step in `policy`: it needs helm and
+  # kubectl, and a tooling regression in provisioning those should not take down
+  # the gate that every unrelated PR depends on.
+  helm_chart:
+    name: Helm chart
+    runs-on: arc-light
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install helm
+        uses: azure/setup-helm@v4
+
+      # Only ever invoked as `kubectl create --dry-run=client -o json`, i.e. as
+      # an offline YAML reader so the render comparisons are structural rather
+      # than textual. No cluster credential is used or needed.
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Test Helm chart renders
+        run: node --test ./deploy/helm/paperclip/tests/*.test.mjs
+
   typecheck_release_registry:
     name: Typecheck + Release Registry
     needs: [policy]

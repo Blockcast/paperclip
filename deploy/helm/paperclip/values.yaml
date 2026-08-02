@@ -87,6 +87,16 @@ api:
   # -- Soft anti-affinity to spread API replicas across nodes. Falls back to
   # co-located if the cluster has only one schedulable paperclip node.
   spreadAcrossNodes: true
+  # -- Approval plan marker (BLO-20733), stamped onto the API pod template as
+  # `paperclip.blockcast.net/approval-plan-sha256`. 64 lowercase hex, or empty
+  # to render no annotation (the default -- local and non-Blockcast deploys do
+  # not go through the admission approval channel).
+  #
+  # Set ONLY by the release job, and never by hand: the value is the SHA-256 of
+  # the canonical rendered Deployment with this annotation removed, so it can
+  # only be obtained by rendering the chart unstamped first. A hand-set value
+  # makes `approve-paperclip-api-digest.sh` refuse the plan.
+  approvalPlanSha256: ""
 
 # -- Kubernetes Service exposing the HTTP UI/API.
 service:
