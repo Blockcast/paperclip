@@ -70,9 +70,13 @@
     "postinstall": "node scripts/link-plugin-dev-sdk.mjs"
   },
   "devDependencies": {
+    "@paperclipai/db": "workspace:^",
+    "@paperclipai/shared": "workspace:^",
     "@playwright/test": "^1.58.2",
     "cross-env": "^10.1.0",
+    "drizzle-orm": "0.45.2",
     "esbuild": "^0.28.1",
+    "tsx": "^4.23.1",
     "typescript": "^5.7.3",
     "vitest": "^4.1.8"
   },
