@@ -184,6 +184,46 @@ function sanitizeCommandArgs(args: unknown[], options?: SanitizeOptions): unknow
   });
 }
 
+const OPAQUE_VALUE_SCHEME_PREFIX_RE = /^(?:bearer|basic|token)\s+/i;
+const URL_LIKE_VALUE_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+/**
+ * Whether a plain string sitting under a secret-ish-named key is itself
+ * opaque/credential-shaped, as opposed to prose or a link that merely lives
+ * under a key whose name happens to contain a trigger substring — "author"
+ * contains "auth", "no_secrets_in_payload" contains "secret" (BLO-20810).
+ * A real credential (optionally after a "Bearer "/"Basic "/"Token " scheme
+ * prefix) is a single opaque token; natural-language prose and URLs are not.
+ */
+function looksLikeSecretValue(value: string): boolean {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return false;
+  if (URL_LIKE_VALUE_RE.test(trimmed)) return false;
+  const withoutScheme = trimmed.replace(OPAQUE_VALUE_SCHEME_PREFIX_RE, "");
+  if (withoutScheme.length === 0) return false;
+  return !/\s/.test(withoutScheme);
+}
+
+/**
+ * Applies key-based redaction to a value already known to sit under a
+ * secret-ish-named key, without assuming the value is a bare string —
+ * recurses into arrays/objects so a name collision on the parent key (e.g.
+ * `ask_2_author_identity`, `links.PR_1898_app_authored`) doesn't destroy
+ * structured or non-opaque content nested beneath it.
+ */
+function sanitizeSecretMatchedValue(value: unknown, options?: SanitizeOptions): unknown {
+  if (typeof value === "string") {
+    return looksLikeSecretValue(value) ? REDACTED_EVENT_VALUE : value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => sanitizeSecretMatchedValue(entry, options));
+  }
+  if (isPlainObject(value)) {
+    return sanitizeRecord(value, options);
+  }
+  return value;
+}
+
 export function sanitizeRecord(record: Record<string, unknown>, options?: SanitizeOptions): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
@@ -212,7 +252,7 @@ export function sanitizeRecord(record: Record<string, unknown>, options?: Saniti
         redacted[key] = { type: "plain", value: REDACTED_EVENT_VALUE };
         continue;
       }
-      redacted[key] = REDACTED_EVENT_VALUE;
+      redacted[key] = sanitizeSecretMatchedValue(value, options);
       continue;
     }
     if (typeof value === "string" && JWT_VALUE_RE.test(value)) {
@@ -260,6 +300,57 @@ export function redactApprovalPayloadByType(type: unknown, payload: unknown): Re
   if (!payload || !isPlainObject(payload)) return {};
   if (type === "hire_agent") return redactAgentConfigPayload(payload) ?? {};
   return redactEventPayload(payload) ?? {};
+}
+
+/**
+ * Approval payloads are a human-facing escalation channel (BLO-20810), so a
+ * field the scanner actually blanked must read differently from one the
+ * filer simply left empty — a bare `***REDACTED***` is ambiguous on its own.
+ * This walks the already-redacted output next to the untouched original —
+ * never round-tripped back into approval decisions, see `services/approvals.ts`
+ * `approve()`, which reads the raw DB row rather than this display payload —
+ * and swaps each genuinely-scrubbed leaf for a message naming the field,
+ * while also returning the list of paths so the filer can restate them in a
+ * comment (comment bodies aren't scanned).
+ *
+ * Scoped to the generic, key-name-triggered redaction path only. `hire_agent`
+ * goes through `redactAgentConfigPayload`'s unconditional structural rules
+ * (BLO-18969: every `env` value and `plain` binding is credential material by
+ * construction, not a name-collision false positive) and keeps the bare
+ * sentinel — other code treats that exact string as a contract, e.g. the
+ * `agents-pending-approval-config` test suite and the persistence guard in
+ * `secrets.ts`.
+ */
+export function redactApprovalPayloadForDisplay(
+  type: unknown,
+  payload: unknown,
+): { payload: Record<string, unknown>; redactedFields: string[] } {
+  const redacted = redactApprovalPayloadByType(type, payload);
+  if (type === "hire_agent") return { payload: redacted, redactedFields: [] };
+
+  const redactedFields: string[] = [];
+  const original = isPlainObject(payload) ? payload : {};
+
+  function annotate(originalValue: unknown, redactedValue: unknown, path: string): unknown {
+    if (redactedValue === REDACTED_EVENT_VALUE && originalValue !== REDACTED_EVENT_VALUE) {
+      redactedFields.push(path);
+      return `[redacted by secret scanner: ${path}]`;
+    }
+    if (Array.isArray(redactedValue) && Array.isArray(originalValue)) {
+      return redactedValue.map((entry, i) => annotate(originalValue[i], entry, `${path}[${i}]`));
+    }
+    if (isPlainObject(redactedValue) && isPlainObject(originalValue)) {
+      const out: Record<string, unknown> = {};
+      for (const k of Object.keys(redactedValue)) {
+        out[k] = annotate(originalValue[k], redactedValue[k], path ? `${path}.${k}` : k);
+      }
+      return out;
+    }
+    return redactedValue;
+  }
+
+  const displayPayload = annotate(original, redacted, "") as Record<string, unknown>;
+  return { payload: displayPayload, redactedFields };
 }
 
 export function redactSensitiveText(input: string): string {
